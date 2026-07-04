@@ -1919,6 +1919,39 @@ impl RethEnv {
         self.worker_fee_configs_inner(&header)
     }
 
+    /// Read the [`ConsensusRegistry`] [`EpochInfo`](ConsensusRegistry::EpochInfo) for `epoch` at
+    /// the block identified by `block_hash`.
+    ///
+    /// Builds an EVM pinned to `block_hash`'s state and issues a single `getEpochInfo(uint32)`
+    /// call. The registry keeps a ring buffer of the four most recent epochs and reverts
+    /// (`InvalidEpoch`) for anything outside it, so a successful return is guaranteed to be the
+    /// requested epoch's record. Used by the epoch manager to recover the previous epoch's block
+    /// range from its closing block when deriving next-epoch base fees.
+    ///
+    /// Fails with a descriptive error if `block_hash` does not resolve to a sealed header or the
+    /// registry call does not succeed.
+    pub fn get_epoch_info_at_block(
+        &self,
+        epoch: Epoch,
+        block_hash: B256,
+    ) -> eyre::Result<ConsensusRegistry::EpochInfo> {
+        let header = self
+            .sealed_header_by_hash(block_hash)?
+            .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut tn_evm = self
+            .inner
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, self.inner.evm_config.evm_env(&header)?);
+
+        let calldata = ConsensusRegistry::getEpochInfoCall { epoch }.abi_encode().into();
+        self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)
+            .map_err(Into::into)
+    }
+
     /// Read worker fee configs from the [`WorkerConfigs`] contract at the canonical tip.
     ///
     /// The returned `Vec`'s length is the on-chain `numWorkers()` at the canonical tip (the

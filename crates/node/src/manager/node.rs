@@ -28,10 +28,12 @@ use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueCh
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
-    deconstruct_nonce, gas_accumulator::GasAccumulator, BlsPublicKey, BootstrapServer, Committee,
-    ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
-    Database as TNDatabase, EngineUpdate, Epoch, Notifier, SealedHeader, TaskError, TaskManager,
-    TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
+    deconstruct_nonce,
+    gas_accumulator::{GasAccumulator, WorkerFeeConfig},
+    BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
+    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier,
+    SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, B256,
+    DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -298,6 +300,164 @@ pub(crate) fn latest_base_fee_per_worker(headers: &[SealedHeader]) -> HashMap<Wo
         }
     }
     fees
+}
+
+/// True when `header` is a genuine worker batch block.
+///
+/// Two on-chain block shapes are NOT worker batch blocks and must be excluded from per-worker
+/// fee/gas attribution:
+/// - the genesis block (`number == 0`), which carries no worker payload, and
+/// - the synthetic empty-close block the engine builds when an epoch closes with no batches. That
+///   block is stamped worker 0 and copies its PARENT's base fee (see `tn_engine`'s
+///   `execute_consensus_output`), so attributing it would poison worker 0 with another worker's
+///   fee. It is identified by `ommers_hash == B256::ZERO`: the header's `ommers_hash` carries the
+///   batch digest, and only the synthetic block passes `B256::ZERO` (real batch digests are never
+///   zero).
+///
+/// A non-empty epoch-closing block built from real batches has a non-zero `ommers_hash` and IS a
+/// genuine worker block.
+pub(crate) fn is_worker_batch_block(header: &SealedHeader) -> bool {
+    header.number != 0 && header.ommers_hash != B256::ZERO
+}
+
+/// Sum `gas_used` per worker over `headers`.
+///
+/// Blocks with `gas_used == 0` are skipped, mirroring [`GasAccumulator::inc_block`]'s early
+/// return, so a fold over one epoch's genuine worker blocks is arithmetically identical to the
+/// gas totals the live accumulator held at that epoch's close (header `gas_used` counts only user
+/// transactions; system calls never touch it). Workers with no gas-consuming block in the range
+/// are absent from the returned map.
+pub(crate) fn gas_used_per_worker(headers: &[SealedHeader]) -> HashMap<WorkerId, u64> {
+    let mut totals: HashMap<WorkerId, u64> = HashMap::new();
+    for header in headers {
+        if header.gas_used == 0 {
+            continue;
+        }
+        let worker_id = worker_id_from_header(header);
+        *totals.entry(worker_id).or_default() += header.gas_used;
+    }
+    totals
+}
+
+/// Fold each configured worker's next-epoch base fee from the fee it held and the gas it used
+/// during the epoch that just closed.
+///
+/// One slot per entry in `configs` (the on-chain `WorkerConfigs` order, indexed by worker id).
+/// A worker present in `held_fees` folds through `next_base_fee_for_config` — the SAME formula
+/// `adjust_base_fees` (in the `run_epoch` module) applies at a live epoch close, so entry
+/// derivation and close-time adjustment produce identical values from identical inputs. A worker
+/// absent from `held_fees` (no genuine block in the scanned range, so the chain does not reveal
+/// the fee it held) yields `None`: callers must leave that worker's container untouched.
+pub fn fold_next_epoch_base_fees(
+    configs: &[WorkerFeeConfig],
+    held_fees: &HashMap<WorkerId, u64>,
+    gas_totals: &HashMap<WorkerId, u64>,
+) -> Vec<Option<u64>> {
+    configs
+        .iter()
+        .enumerate()
+        .map(|(worker_id, config)| {
+            let worker_id = worker_id as WorkerId;
+            held_fees.get(&worker_id).map(|&held_fee| {
+                let gas_used = gas_totals.get(&worker_id).copied().unwrap_or_default();
+                run_epoch::next_base_fee_for_config(*config, held_fee, gas_used)
+            })
+        })
+        .collect()
+}
+
+/// Per-worker base fees for an entered epoch, derived purely from the previous epoch's on-chain
+/// state by [`derive_base_fees_for_entered_epoch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedBaseFees {
+    /// The on-chain worker count read from `WorkerConfigs` at the previous epoch's closing block
+    /// (i.e. the count for the entered epoch).
+    pub num_workers: usize,
+    /// One slot per configured worker: `Some(fee)` to install, `None` when the worker produced no
+    /// genuine block in the scanned range (leave its container untouched).
+    pub fees: Vec<Option<u64>>,
+    /// The previous epoch's per-worker `gas_used` totals from the header scan. Exposed so tests
+    /// can pin scan ≡ [`GasAccumulator::inc_block`] equivalence.
+    pub gas_totals: HashMap<WorkerId, u64>,
+}
+
+impl DerivedBaseFees {
+    /// Install the derived fees into `gas_accumulator`.
+    ///
+    /// Resizes the accumulator to `num_workers` FIRST (so every configured slot exists), then
+    /// sets the base fee for `Some` slots only; `None` slots keep their current value. Gas
+    /// counters are deliberately untouched — the entered epoch starts at zero gas.
+    pub fn apply(&self, gas_accumulator: &GasAccumulator) {
+        gas_accumulator.set_num_workers(self.num_workers);
+        for (worker_id, fee) in self.fees.iter().enumerate() {
+            if let Some(fee) = fee {
+                gas_accumulator.base_fee(worker_id as WorkerId).set_base_fee(*fee);
+            }
+        }
+    }
+}
+
+/// Derive the per-worker base fees for `entered_epoch` from the previous epoch's on-chain state.
+///
+/// The entered epoch's fee is a PURE function of prior-epoch chain data: the previous epoch's
+/// per-worker gas totals, each worker's last held fee (both read from that epoch's genuine worker
+/// blocks), and the `WorkerConfigs` strategies at `closing_header` (the previous epoch's closing
+/// block). Live producers crossing the boundary, restarted nodes, and re-entering nodes therefore
+/// all converge on the identical value through this one seam — including the recovery shapes
+/// where `close_epoch(None, ..)` skipped the close-time adjustment entirely.
+///
+/// Steps:
+/// 1. `getEpochInfo(entered_epoch - 1)` at `closing_header` yields the previous epoch's first block
+///    (clamped to 1: constructor-seeded epochs report `blockHeight = 0`).
+/// 2. Scan the sealed headers `first..=closing`, keeping only genuine worker batch blocks
+///    ([`is_worker_batch_block`] — excludes genesis and the synthetic empty-close block).
+/// 3. Extract each worker's last held fee ([`latest_base_fee_per_worker`]) and gas total
+///    ([`gas_used_per_worker`]) from the filtered slice.
+/// 4. Fold through the per-worker strategies read at `closing_header`
+///    ([`fold_next_epoch_base_fees`]).
+///
+/// Errors (registry/config read failures, unresolvable headers) must bubble: fees are exact-match
+/// consensus values, so producing with an unverifiable fee is a safety failure while halting is
+/// only a single-node liveness failure.
+pub fn derive_base_fees_for_entered_epoch(
+    reth_env: &RethEnv,
+    entered_epoch: Epoch,
+    closing_header: &SealedHeader,
+) -> eyre::Result<DerivedBaseFees> {
+    let scan_start = std::time::Instant::now();
+    let prior_epoch = entered_epoch
+        .checked_sub(1)
+        .ok_or_else(|| eyre!("cannot derive base fees for entered epoch 0: no prior epoch"))?;
+
+    // the previous epoch's block range, read from the registry AT the closing block (the ring
+    // buffer holds the four most recent epochs, so the prior epoch is always resolvable here)
+    let epoch_info = reth_env.get_epoch_info_at_block(prior_epoch, closing_header.hash())?;
+    let range = epoch_info.blockHeight.max(1)..=closing_header.number;
+    let range_len = range.end().saturating_sub(*range.start()).saturating_add(1);
+
+    let headers = reth_env.blocks_for_range(range.clone())?;
+    let genuine: Vec<SealedHeader> = headers.into_iter().filter(is_worker_batch_block).collect();
+
+    let held_fees = latest_base_fee_per_worker(&genuine);
+    let gas_totals = gas_used_per_worker(&genuine);
+
+    // worker strategies and count at the closing block = the entered epoch's configuration
+    let (num_workers, configs) = reth_env.get_worker_fee_configs_at_block(closing_header.hash())?;
+    let fees = fold_next_epoch_base_fees(&configs, &held_fees, &gas_totals);
+
+    info!(
+        target: "epoch-manager",
+        entered_epoch,
+        prior_epoch,
+        range = ?range,
+        range_len,
+        genuine_blocks = genuine.len(),
+        num_workers,
+        elapsed = ?scan_start.elapsed(),
+        "derived entered-epoch base fees from prior epoch chain state"
+    );
+
+    Ok(DerivedBaseFees { num_workers, fees, gas_totals })
 }
 
 /// Open the process-lifetime consensus DB, creating its directory if absent.
@@ -904,5 +1064,138 @@ where
             error!(target: "engine", "engine updates ended, node will exit");
             Err(TaskError::from_message("engine updates ended, node will exit"))
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tn_types::{
+        gas_accumulator::compute_next_base_fee_eip1559, ExecHeader, MIN_PROTOCOL_BASE_FEE, U256,
+    };
+
+    /// Build a sealed header shaped like an executed worker block for scan tests.
+    ///
+    /// `worker_id` lands in the low 16 bits of `difficulty` (matching the payload builder's
+    /// `batch_index << 16 | worker_id` encoding read back by `worker_id_from_header`).
+    fn scan_header(
+        number: u64,
+        worker_id: WorkerId,
+        gas_used: u64,
+        base_fee: u64,
+        ommers_hash: B256,
+    ) -> SealedHeader {
+        let header = ExecHeader {
+            number,
+            gas_used,
+            difficulty: U256::from(worker_id),
+            base_fee_per_gas: Some(base_fee),
+            ommers_hash,
+            ..Default::default()
+        };
+        SealedHeader::new(header, B256::repeat_byte(0xab))
+    }
+
+    /// Non-zero stand-in for a real batch digest carried in `ommers_hash`.
+    fn batch_digest() -> B256 {
+        B256::repeat_byte(1)
+    }
+
+    #[test]
+    fn is_worker_batch_block_excludes_genesis_and_synthetic_close() {
+        // a real executed batch block: non-genesis number, non-zero batch digest
+        let genuine = scan_header(5, 0, 21_000, 7, batch_digest());
+        assert!(is_worker_batch_block(&genuine));
+
+        // genesis carries no worker payload
+        let genesis = scan_header(0, 0, 0, 7, batch_digest());
+        assert!(!is_worker_batch_block(&genesis));
+
+        // the synthetic empty-close block passes batch digest B256::ZERO (and is stamped
+        // worker 0 with its parent's fee - the poison the filter exists to exclude)
+        let synthetic = scan_header(9, 0, 0, 7, B256::ZERO);
+        assert!(!is_worker_batch_block(&synthetic));
+    }
+
+    #[test]
+    fn gas_used_per_worker_sums_per_worker_and_ignores_zero_gas() {
+        let headers = vec![
+            scan_header(1, 0, 100, 7, batch_digest()),
+            scan_header(2, 1, 50, 7, batch_digest()),
+            scan_header(3, 0, 200, 7, batch_digest()),
+            // zero-gas blocks are skipped, mirroring GasAccumulator::inc_block's early return
+            scan_header(4, 1, 0, 7, batch_digest()),
+            // a worker whose only block used zero gas is absent entirely
+            scan_header(5, 2, 0, 7, batch_digest()),
+        ];
+
+        let totals = gas_used_per_worker(&headers);
+
+        assert_eq!(totals.get(&0), Some(&300));
+        assert_eq!(totals.get(&1), Some(&50));
+        assert_eq!(totals.get(&2), None);
+        assert_eq!(totals.len(), 2);
+    }
+
+    #[test]
+    fn fold_next_epoch_fees_multi_worker_mixed_strategies() {
+        // worker 0 Static, worker 1 Eip1559 - each slot folds independently from its own
+        // held fee and gas total
+        let configs = [
+            WorkerFeeConfig::Static { fee: 12_345 },
+            WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 },
+        ];
+        let held_fees = HashMap::from([(0u16, 999u64), (1u16, 1_000_000u64)]);
+        let gas_totals = HashMap::from([(0u16, 5_000u64), (1u16, 2_000_000u64)]);
+
+        let fees = fold_next_epoch_base_fees(&configs, &held_fees, &gas_totals);
+
+        assert_eq!(fees.len(), 2);
+        // static pins to the governance value regardless of held fee and gas
+        assert_eq!(fees[0], Some(12_345));
+        // eip1559 at 2x target rises by the max 12.5%
+        assert_eq!(fees[1], Some(1_125_000));
+        assert_eq!(fees[1], Some(compute_next_base_fee_eip1559(1_000_000, 2_000_000, 1_000_000)));
+    }
+
+    #[test]
+    fn fold_next_epoch_fees_absent_worker_is_none() {
+        // worker 1 has a config but produced no genuine block in the scanned range, so the
+        // chain does not reveal the fee it held: its slot must be None (container untouched)
+        let configs = [WorkerFeeConfig::Static { fee: 500 }, WorkerFeeConfig::Static { fee: 600 }];
+        let held_fees = HashMap::from([(0u16, 7u64)]);
+        let gas_totals = HashMap::from([(0u16, 100u64)]);
+
+        let fees = fold_next_epoch_base_fees(&configs, &held_fees, &gas_totals);
+
+        assert_eq!(fees, vec![Some(500), None]);
+    }
+
+    #[test]
+    fn fold_matches_next_base_fee_for_config() {
+        // THE single-formula pin: for identical (config, held fee, gas) inputs the entry
+        // derivation's fold must equal next_base_fee_for_config - the function the live
+        // producer's close-time adjust_base_fees applies - so entry derivation ≡ close-time
+        // adjustment.
+        let cases = [
+            (WorkerFeeConfig::Static { fee: 12_345 }, MIN_PROTOCOL_BASE_FEE, 0u64),
+            (WorkerFeeConfig::Static { fee: 1 }, 1_000_000, 42),
+            (WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 }, 1_000_000, 2_000_000),
+            (WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 }, 1_000_000, 0),
+            (WorkerFeeConfig::Eip1559 { target_gas: u64::MAX }, MIN_PROTOCOL_BASE_FEE, 5_000_000),
+        ];
+
+        for (config, held_fee, gas_used) in cases {
+            let fees = fold_next_epoch_base_fees(
+                &[config],
+                &HashMap::from([(0u16, held_fee)]),
+                &HashMap::from([(0u16, gas_used)]),
+            );
+            assert_eq!(
+                fees,
+                vec![Some(run_epoch::next_base_fee_for_config(config, held_fee, gas_used))],
+                "fold diverged from next_base_fee_for_config for {config:?}",
+            );
+        }
     }
 }

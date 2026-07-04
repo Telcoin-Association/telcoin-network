@@ -15,7 +15,9 @@ use tn_engine::ExecutorEngine;
 use tn_executor::subscriber::spawn_subscriber;
 use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
-use tn_node::{catchup_accumulator, sync_num_workers_from_chain};
+use tn_node::{
+    catchup_accumulator, derive_base_fees_for_entered_epoch, sync_num_workers_from_chain,
+};
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
     network::PrimaryNetworkHandle,
@@ -24,8 +26,9 @@ use tn_primary::{
 use tn_reth::{
     payload::TNPayload,
     test_utils::{
-        seeded_genesis_from_random_batches, test_genesis_with_consensus_registry,
-        test_genesis_with_consensus_registry_and_workers, TransactionFactory,
+        create_committee_from_state, seeded_genesis_from_random_batches,
+        test_genesis_with_consensus_registry, test_genesis_with_consensus_registry_and_workers,
+        TransactionFactory,
     },
     ExecutedBlock, NewCanonicalChain, RethChainSpec, RethEnv,
 };
@@ -35,11 +38,13 @@ use tn_test_utils::{
     create_signed_certificates_for_rounds, default_test_execution_node, CommitteeFixture,
 };
 use tn_types::{
-    adiri_genesis, gas_accumulator::GasAccumulator, Address, Batch, BlsSignature, Certificate,
-    CommittedSubDag, ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
-    Epoch, EpochCertificate, EpochDigest, EpochRecord, ExecHeader, GenesisAccount, Notifier,
-    ReputationScores, SealedHeader, SignatureVerificationState, TaskManager, TnReceiver as _,
-    TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE, U256,
+    adiri_genesis,
+    gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator},
+    Address, Batch, BlsSignature, Certificate, CommittedSubDag, ConsensusHeader,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochCertificate, EpochDigest,
+    EpochRecord, ExecHeader, GenesisAccount, Notifier, ReputationScores, SealedHeader,
+    SignatureVerificationState, TaskManager, TnReceiver as _, TnSender as _, WorkerId, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::{
@@ -915,6 +920,411 @@ async fn test_catchup_restores_fees_when_finality_lags_canonical_tip() -> eyre::
     // and the pinned range was non-empty: blocks were scanned into the gas stats
     let (blocks_counted, _gas_used, _gas_limit) = recovered.get_values(worker_id);
     assert!(blocks_counted > 0, "pinned range must not be empty");
+
+    Ok(())
+}
+
+/// F1 regression, flipped to RECOVERS: after an epoch closes, a node whose finalized tip is the
+/// closing block derives the entered epoch's per-worker base fees purely from the closed epoch's
+/// chain state. This is the entry state shared by all three `close_epoch(None, ..)` shapes -
+/// replay-and-close, crash-after-close, and the live leftover-drain - which previously skipped
+/// both the close-time `adjust_base_fees` and the epoch-entry seeding, leaving a fresh
+/// accumulator stuck at `MIN_PROTOCOL_BASE_FEE` while the committee agreed on the configured fee.
+///
+/// Worker 0 is configured `Static { fee: 12_345 }` in the genesis `WorkerConfigs`. A full epoch
+/// of batches executes and the last output is flagged as the epoch close (so the closing block
+/// runs `concludeEpoch`). A fresh accumulator then follows the production entry order -
+/// `sync_num_workers_from_chain`, `derive_base_fees_for_entered_epoch`, `apply` - and must land
+/// on 12_345. Also pins gas equivalence (header scan ≡ the live accumulator's `inc_block`
+/// totals) and derivation idempotence (the fee is a pure function of the closing block).
+#[tokio::test]
+async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("derive_base_fees_boundary").unwrap();
+    // create deterministic committee fixture and use first authority's components
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let consensus_bus = ConsensusBus::new();
+    let committee = config.committee().clone();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).await.unwrap();
+
+    // make certificates with batches of txs (all worker 0)
+    let max_round = 21;
+    let (certificates, _next_parents, batches) =
+        create_signed_certificates_for_rounds(1..=max_round, &fixture, &[]);
+
+    // worker 0 configured Static { fee: 12_345 } (strategy 1) in the genesis WorkerConfigs;
+    // fund the batch senders so txs execute
+    let static_fee = 12_345u64;
+    let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(1u8, static_fee)]);
+    let all_batches: Vec<_> = batches.values().cloned().collect();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1);
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    // manually create engine
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
+    // consensus needs 1 extra round to commit; the engine stops after executing this round
+    let last_executed_round = max_round as u64 - 1;
+    let parent = chain.sealed_genesis_header();
+
+    // start engine
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        Some(last_executed_round),
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+    let (tx, mut rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        debug!(target: "gas-test", ?res, "res:");
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    // subscribe to output early
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    // spawn consensus to send output to engine for full execution
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        &task_manager,
+        consensus_chain.clone(),
+    )
+    .await;
+
+    // send certificates to trigger subdag commit
+    for certificate in certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    // forward consensus output to engine, flagging the final output as the epoch close so the
+    // closing block runs the boundary system calls (mirrors process_output's boundary flag)
+    loop {
+        tokio::select! {
+            Some(mut output) = consensus_output.recv() => {
+                if output.leader_round() as u64 >= last_executed_round {
+                    output.set_epoch_close();
+                }
+                to_engine.send(output).await?;
+            }
+            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
+                assert!(engine_task.is_ok());
+                break;
+            }
+        }
+    }
+
+    // production preconditions shared by every F1 shape: the pinned tip IS the closed epoch's
+    // closing block (nonce still carries epoch 0) while the registry state it holds already
+    // reports the entered epoch
+    let closing = reth_env.finalized_header()?.expect("closing block finalized");
+    assert_eq!(
+        RethEnv::extract_epoch_from_header(&closing),
+        0,
+        "closing block's nonce carries the closed epoch",
+    );
+    let entered_state = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(entered_state.epoch, 1, "registry state crossed to the entered epoch");
+    assert_eq!(
+        entered_state.epoch_info.blockHeight,
+        closing.number + 1,
+        "entered epoch starts on the block after the closing block",
+    );
+
+    // simulate the F1 restart shapes: fresh accumulator recovered in the production entry order
+    let recovered = GasAccumulator::new(1);
+    sync_num_workers_from_chain(&reth_env, &recovered, entered_state.epoch_info.blockHeight);
+    assert_eq!(recovered.num_workers(), 1);
+    assert_eq!(
+        recovered.base_fee(0).base_fee(),
+        MIN_PROTOCOL_BASE_FEE,
+        "the F1 failure state: a fresh accumulator holds the MIN default before derivation",
+    );
+
+    let derived = derive_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
+    derived.apply(&recovered);
+
+    // the committee-agreed fee is recovered instead of running the epoch at MIN
+    assert_eq!(derived.num_workers, 1);
+    assert_eq!(derived.fees, vec![Some(static_fee)]);
+    assert_eq!(
+        recovered.base_fee(0).base_fee(),
+        static_fee,
+        "entry derivation must recover the governance-set static fee",
+    );
+
+    // gas equivalence: the filtered header scan reproduces the live accumulator's inc_block
+    // totals for the closed epoch (apply() must NOT have copied them - entered epoch starts
+    // at zero gas)
+    let (_blocks, live_gas_used, _limit) = gas_accumulator.get_values(0);
+    assert!(live_gas_used > 0, "epoch accumulated real gas");
+    assert_eq!(
+        derived.gas_totals.get(&0).copied().unwrap_or_default(),
+        live_gas_used,
+        "header scan must equal the live accumulator's inc_block gas total",
+    );
+    assert_eq!(recovered.get_values(0), (0, 0, 0), "apply must not touch gas counters");
+
+    // idempotence: the fee is a pure function of the closing block's chain state
+    let derived_again = derive_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
+    assert_eq!(derived, derived_again, "derivation must be deterministic and idempotent");
+
+    Ok(())
+}
+
+/// Eip1559 variant of [`test_derive_base_fees_recovers_committee_fee_at_boundary`]: with worker 0
+/// configured `Eip1559 { target_gas }`, the derived entry fee must equal the tn-types oracle
+/// `compute_next_base_fee_eip1559(held_fee, gas_total, target)` where `held_fee` is the fee the
+/// chain's last genuine block carries and `gas_total` is the live accumulator's epoch total -
+/// i.e. exactly the inputs the live producer's close-time `adjust_base_fees` folded.
+#[tokio::test]
+async fn test_derive_base_fees_eip1559_variant_matches_oracle() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("derive_base_fees_eip1559").unwrap();
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let consensus_bus = ConsensusBus::new();
+    let committee = config.committee().clone();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).await.unwrap();
+
+    let max_round = 21;
+    let (certificates, _next_parents, batches) =
+        create_signed_certificates_for_rounds(1..=max_round, &fixture, &[]);
+
+    // worker 0 configured Eip1559 (strategy 0) with a small target the epoch's gas far exceeds,
+    // so the derived fee must move instead of staying floored at MIN
+    let target_gas = 1_000_000u64;
+    let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(0u8, target_gas)]);
+    let all_batches: Vec<_> = batches.values().cloned().collect();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1);
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
+    let last_executed_round = max_round as u64 - 1;
+    let parent = chain.sealed_genesis_header();
+
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        Some(last_executed_round),
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+    let (tx, mut rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        debug!(target: "gas-test", ?res, "res:");
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        &task_manager,
+        consensus_chain.clone(),
+    )
+    .await;
+
+    for certificate in certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    loop {
+        tokio::select! {
+            Some(mut output) = consensus_output.recv() => {
+                if output.leader_round() as u64 >= last_executed_round {
+                    output.set_epoch_close();
+                }
+                to_engine.send(output).await?;
+            }
+            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
+                assert!(engine_task.is_ok());
+                break;
+            }
+        }
+    }
+
+    let closing = reth_env.finalized_header()?.expect("closing block finalized");
+    assert_eq!(RethEnv::extract_epoch_from_header(&closing), 0);
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1);
+
+    let derived = derive_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
+
+    // scan ≡ inc_block, then the fold must match the tn-types oracle for the same inputs
+    let (_blocks, live_gas_used, _limit) = gas_accumulator.get_values(0);
+    assert!(live_gas_used > 0, "epoch accumulated real gas");
+    assert_eq!(derived.gas_totals.get(&0).copied().unwrap_or_default(), live_gas_used);
+
+    // the fee held during the closed epoch is the one its last genuine block carries (the
+    // closing block was built from real batches, so it is that block)
+    let held_fee = closing.base_fee_per_gas.expect("executed blocks carry a base fee");
+    let expected = compute_next_base_fee_eip1559(held_fee, live_gas_used, target_gas);
+    assert_eq!(derived.fees, vec![Some(expected)]);
+    // gas far above target: the derived fee must have actually moved off the held value
+    assert!(expected > held_fee, "gas above target must raise the fee");
+
+    let recovered = GasAccumulator::new(1);
+    derived.apply(&recovered);
+    assert_eq!(recovered.base_fee(0).base_fee(), expected);
+
+    Ok(())
+}
+
+/// The synthetic empty-close block must be excluded from fee/gas attribution when deriving
+/// entered-epoch base fees.
+///
+/// An epoch that closes with NO batches makes the engine build a synthetic block that is stamped
+/// worker 0 and copies its PARENT's base fee (`batch_digest = B256::ZERO`, carried in
+/// `ommers_hash`). Without the genuine-block filter, `derive_base_fees_for_entered_epoch` would
+/// treat that block as worker 0's latest and fold a fee for it (`Some(..)`); with the filter the
+/// scanned range holds no genuine block, so worker 0's slot is `None`, gas totals are empty, and
+/// `apply` leaves the container untouched.
+#[tokio::test]
+async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("derive_excludes_synthetic").unwrap();
+    // registry + WorkerConfigs genesis: worker 0 Static { fee: 12_345 }
+    let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(1u8, 12_345u64)]);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+    // the empty-close path resolves the leader's execution address through the rewards
+    // counter's committee, so build the committee from on-chain registry state
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    // consensus output with NO batches and close_epoch: true -> the engine executes the single
+    // synthetic block to close the epoch
+    let mut leader = Certificate::default();
+    leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        BlsSignature::default(),
+    ));
+    leader.update_header_round_for_test(0);
+    leader.update_header_epoch_for_test(0);
+    leader.update_header_created_at_for_test(tn_types::now());
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag =
+        CommittedSubDag::new(vec![leader.clone()], leader, 0, ReputationScores::default(), None);
+    let output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true, // close_epoch
+        VecDeque::new(),
+        vec![],
+    );
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        None,
+        from_consensus,
+        parent.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+
+    to_engine.send(output).await?;
+    // drop the sending channel so the engine drains and exits
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+    let engine_result = timeout(Duration::from_secs(30), rx).await??;
+    assert!(engine_result.is_err(), "engine should return error when stream closes");
+
+    // the closing block is the synthetic empty-close shape: worker-0 stamped, zero batch
+    // digest in ommers_hash, parent's base fee copied, zero user gas
+    let closing = reth_env.finalized_header()?.expect("closing block finalized");
+    assert_eq!(closing.number, 1);
+    assert_eq!(RethEnv::extract_epoch_from_header(&closing), 0);
+    assert_eq!(closing.ommers_hash, B256::ZERO, "synthetic block carries a zero batch digest");
+    assert_eq!(
+        closing.base_fee_per_gas, parent.base_fee_per_gas,
+        "synthetic block copies its parent's base fee - the attribution poison",
+    );
+    assert_eq!(closing.gas_used, 0, "system calls never count toward gas_used");
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch closed");
+
+    let derived = derive_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
+
+    // without the is_worker_batch_block filter this would be vec![Some(..)]: the synthetic
+    // block's parent-copied fee attributed to worker 0 and folded through its config
+    assert_eq!(derived.num_workers, 1);
+    assert_eq!(derived.fees, vec![None], "synthetic close block must not attribute a fee");
+    assert!(derived.gas_totals.is_empty(), "no genuine blocks -> no gas attribution");
+
+    // applying a None slot must leave the worker's container untouched
+    let recovered = GasAccumulator::new(1);
+    recovered.base_fee(0).set_base_fee(4242);
+    derived.apply(&recovered);
+    assert_eq!(recovered.base_fee(0).base_fee(), 4242, "None slot must not touch the container");
 
     Ok(())
 }

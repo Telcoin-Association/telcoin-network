@@ -150,15 +150,25 @@ where
         // inc_block, so both operate on a correctly sized accumulator.
         super::sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_info.blockHeight);
 
-        // Base-fee-from-chain seeding: if the canonical tip is already in the epoch we are
-        // entering, adopt each worker's latest on-chain base fee rather than recomputing. This
-        // covers syncing and restarting nodes: they execute the fee already baked into the chain.
-        // A live producer crossing N->N+1 still has its tip in N here, so seeding is skipped and
-        // the value adjust_base_fees computed at the boundary is kept. (See gas_accumulator docs.)
+        // Base-fee-from-chain at entry: classify the pinned finalized tip against the epoch
+        // being entered.
+        //  - tip already IN the entered epoch: a syncing/restarting node adopts each worker's
+        //    latest on-chain base fee (the fee is already baked into this epoch's blocks).
+        //  - tip is the PREVIOUS epoch's closing block: derive the entered epoch's fees as a pure
+        //    function of the prior epoch's chain state. This is the single seam every boundary
+        //    shape converges on: the live producer that just crossed (recomputing the identical
+        //    value adjust_base_fees produced at close) and every close_epoch(None) recovery shape
+        //    (replay-and-close, crash-after-close, leftover-drain), which previously skipped both
+        //    the close-time adjustment and the entry seeding and silently ran the epoch on default
+        //    fees.
+        //  - anything else: the node's chain view is inconsistent - halt rather than produce
+        //    batches with unverifiable consensus-affecting fees.
+        //  - no finalized tip at all (fresh genesis, no blocks executed): keep MIN defaults.
         {
+            let entered = committee.epoch();
             if let Some(tip) = reth_env.finalized_header()? {
                 let tip_epoch = RethEnv::extract_epoch_from_header(&tip);
-                let chain_fees = if tip_epoch == committee.epoch() {
+                if tip_epoch == entered {
                     // The range START, range END, and the epoch classification above all derive
                     // from the ONE pinned finalized header: `tip_epoch` from its nonce, the
                     // epoch's start height from the epoch state read AT that header, and the end
@@ -170,16 +180,25 @@ where
                     let epoch_state = reth_env.epoch_state_at_header(&tip)?;
                     let blocks = reth_env
                         .blocks_for_range(epoch_state.epoch_info.blockHeight..=tip.number)?;
-                    super::latest_base_fee_per_worker(&blocks)
+                    let chain_fees = super::latest_base_fee_per_worker(&blocks);
+                    seed_base_fees_from_chain(entered, tip_epoch, &chain_fees, &gas_accumulator);
+                } else if entered > 0 && tip_epoch == entered - 1 {
+                    // The tip IS the previous epoch's closing block: its nonce still carries the
+                    // old epoch while the registry state it holds already reports the new one.
+                    // Derivation failure is a hard error: fees are exact-match consensus values,
+                    // so producing with an unverifiable fee is a safety failure while halting is
+                    // only a single-node liveness failure.
+                    super::derive_base_fees_for_entered_epoch(&reth_env, entered, &tip)?
+                        .apply(&gas_accumulator);
                 } else {
-                    HashMap::new()
-                };
-                seed_base_fees_from_chain(
-                    committee.epoch(),
-                    tip_epoch,
-                    &chain_fees,
-                    &gas_accumulator,
-                );
+                    // Unreachable by construction (`entered` is read from registry state at the
+                    // canonical tip and finality tracks executed output), so reaching this means
+                    // the node's finalized and canonical views genuinely disagree.
+                    return Err(eyre::eyre!(
+                        "epoch-entry base-fee seeding: finalized tip epoch {tip_epoch} is \
+                         neither the entered epoch {entered} nor its predecessor"
+                    ));
+                }
             }
         }
         // Produce a "dummy" epoch 0 EpochRecord if missing.
@@ -590,9 +609,13 @@ where
     /// parallel while the engine finishes executing up to `target_hash`, then blocks until that
     /// execution is confirmed. On the live boundary path it then recomputes each worker's
     /// next-epoch base fee ([`adjust_base_fees`]); the restart replay-and-close and leftover-drain
-    /// paths (which pass `None`) skip that forward computation and instead adopt the chain's fee
-    /// via epoch-start seeding, preserving the base-fee-from-chain invariant. Finally it clears the
-    /// [`GasAccumulator`] so the next epoch starts from zero.
+    /// paths (which pass `None`) skip that forward computation — the next `run_epoch` entry
+    /// derives the identical fees from the closed epoch's chain state
+    /// (`derive_base_fees_for_entered_epoch`), preserving the base-fee-from-chain invariant. The
+    /// live path's close-time computation is kept (rather than relying solely on the entry
+    /// derivation) so the accumulator holds correct fees for the whole window between close and
+    /// the next entry. Finally it clears the [`GasAccumulator`] so the next epoch starts from
+    /// zero.
     async fn close_epoch(
         &self,
         shutdown_consensus: Option<Notifier>,
@@ -673,7 +696,16 @@ fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) {
 /// `Eip1559 { target_gas }` nudges the fee toward the gas target via
 /// [`compute_next_base_fee_eip1559`] (floored at `MIN_PROTOCOL_BASE_FEE`); `Static { fee }` pins
 /// the fee to the governance-set value, ignoring gas usage.
-fn next_base_fee_for_config(config: WorkerFeeConfig, current_base_fee: u64, gas_used: u64) -> u64 {
+///
+/// This is the ONE fee formula: [`adjust_base_fees`] applies it at a live epoch close and
+/// `fold_next_epoch_base_fees` (in the parent module) applies it when deriving the entered
+/// epoch's fees from the previous epoch's chain state, so both seams produce identical values
+/// from identical inputs.
+pub(crate) fn next_base_fee_for_config(
+    config: WorkerFeeConfig,
+    current_base_fee: u64,
+    gas_used: u64,
+) -> u64 {
     match config {
         WorkerFeeConfig::Eip1559 { target_gas } => {
             compute_next_base_fee_eip1559(current_base_fee, gas_used, target_gas)
@@ -686,10 +718,13 @@ fn next_base_fee_for_config(config: WorkerFeeConfig, current_base_fee: u64, gas_
 ///
 /// When `tip_epoch == entered_epoch` the canonical tip is already in the epoch being entered, so
 /// the node is syncing/restarting and adopts each worker's latest on-chain base fee from
-/// `chain_fees`. When the epochs differ the node is the live producer that just crossed the
-/// boundary (its tip is still in the previous epoch), so the value [`adjust_base_fees`] computed
-/// is kept untouched. Workers absent from `chain_fees` (no block produced this epoch) are left
-/// as-is.
+/// `chain_fees`. When the epochs differ the values already held are kept untouched. Workers
+/// absent from `chain_fees` (no block produced this epoch) are left as-is.
+///
+/// NOTE: `run_epoch` now only calls this on the `tip_epoch == entered_epoch` branch; a tip on
+/// the previous epoch's closing block routes through `derive_base_fees_for_entered_epoch`
+/// instead. The differing-epoch early return is kept as defense-in-depth for the helper's
+/// contract (a caller must never have chain fees from one epoch overwrite another's).
 fn seed_base_fees_from_chain(
     entered_epoch: Epoch,
     tip_epoch: Epoch,
