@@ -284,7 +284,15 @@ impl GasAccumulator {
             return;
         }
         let inner = self.inner.read();
-        let mut guard = inner.get(worker_id as usize).expect("valid worker id").gas.lock();
+        let accumulated = inner.get(worker_id as usize).unwrap_or_else(|| {
+            panic!(
+                "inc_block: worker id {worker_id} out of range for accumulator with {} workers - \
+                 the on-chain worker-count sync may have failed or lagged (check epoch-manager \
+                 warnings at epoch entry)",
+                inner.len()
+            )
+        });
+        let mut guard = accumulated.gas.lock();
         guard.blocks += 1;
         guard.gas_used += gas_used;
         guard.gas_limit += gas_limit;
@@ -315,7 +323,19 @@ impl GasAccumulator {
     /// Return the shared [`BaseFeeContainer`] for `worker_id`. Mutations are visible to all
     /// holders of the returned clone.
     pub fn base_fee(&self, worker_id: WorkerId) -> BaseFeeContainer {
-        self.inner.read().get(worker_id as usize).expect("valid worker id").base_fee.clone()
+        let inner = self.inner.read();
+        inner
+            .get(worker_id as usize)
+            .unwrap_or_else(|| {
+                panic!(
+                    "base_fee: worker id {worker_id} out of range for accumulator with {} workers \
+                     - the on-chain worker-count sync may have failed or lagged (check \
+                     epoch-manager warnings at epoch entry)",
+                    inner.len()
+                )
+            })
+            .base_fee
+            .clone()
     }
 
     /// Return the number of workers in the accumulator.
@@ -536,6 +556,17 @@ mod tests {
         let acc = GasAccumulator::new(2);
         acc.set_num_workers(0);
         assert_eq!(acc.num_workers(), 1);
+    }
+
+    /// LIVE-execution tripwire: a batch carrying a worker id the accumulator no longer covers
+    /// must halt (see `inc_block`'s Panics doc - halting beats silently diverging gas totals).
+    /// Pins a fragment of the panic message so a refactor cannot silently soften the tripwire.
+    #[test]
+    #[should_panic(expected = "worker id 1 out of range")]
+    fn inc_block_after_shrink_panics() {
+        let acc = GasAccumulator::new(2);
+        acc.set_num_workers(1);
+        acc.inc_block(1, 10, 20);
     }
 
     #[test]
