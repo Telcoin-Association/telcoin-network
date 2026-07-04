@@ -558,6 +558,8 @@ pub(crate) fn get_balance_above_with_retry(
 }
 
 /// Create, sign and submit a TXN to transfer TEL from key's account to to_account.
+/// Returns the submitted transaction's hash as reported by `eth_sendRawTransaction`, so callers
+/// can attribute the tx to its exact block via the receipt.
 pub(crate) fn send_tel(
     node: &str,
     key: &str,
@@ -566,7 +568,7 @@ pub(crate) fn send_tel(
     gas_price: u128,
     gas: u128,
     nonce: u128,
-) -> eyre::Result<()> {
+) -> eyre::Result<String> {
     let mut to_addr = [0_u8; 20];
     //const_hex::decode_to_slice(to_account, &mut to_addr[..])?;
     to_addr.copy_from_slice(to_account.as_slice());
@@ -594,7 +596,7 @@ pub(crate) fn send_tel(
         transaction_bytes,
     )?;
     info!(target: "restart-test", "Submitted TEL transfer from {from_account} to {to_account} for {amount}: {res_str}");
-    Ok(())
+    Ok(res_str)
 }
 
 /// Decode a secret key into it's public key and account.

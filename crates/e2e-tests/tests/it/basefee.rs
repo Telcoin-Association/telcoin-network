@@ -28,9 +28,10 @@
 //! The deterministic assertion every test makes is therefore: *a transaction that confirms inside
 //! epoch ≥ 1 produces a block whose `base_fee_per_gas` equals the configured fee.*
 
-use std::{path::Path, time::Duration};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use alloy::providers::{Provider, ProviderBuilder};
+use jsonrpsee::rpc_params;
 use serde_json::Value;
 use tn_reth::system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS};
 use tn_types::{
@@ -41,7 +42,7 @@ use tokio::time::Instant;
 use tracing::info;
 
 use crate::common::{
-    address_from_word, get_balance, get_block, get_block_number, get_key, kill_child,
+    address_from_word, call_rpc, get_balance, get_block, get_block_number, get_key, kill_child,
     network_advancing, send_tel, start_validator, ProcessGuard,
 };
 
@@ -579,8 +580,9 @@ async fn land_cheap_tx_mid_epoch(
     land_tx_and_read_fee(node, funded_key, to, nonce, 250).await
 }
 
-/// Submit a transfer, wait for it to confirm (recipient balance grows), then read the new tip
-/// block's base fee. Returns `(tip_block_number, base_fee)`.
+/// Submit a transfer, wait for it to confirm (recipient balance grows), then read the base fee of
+/// the block that ACTUALLY included the tx, taken from its receipt. Returns
+/// `(block_number, base_fee)`.
 async fn land_tx_and_read_fee(
     node: &str,
     funded_key: &str,
@@ -589,10 +591,13 @@ async fn land_tx_and_read_fee(
     gas_price: u128,
 ) -> eyre::Result<(u64, u64)> {
     let before_bal = get_balance(node, &to.to_string(), 1).unwrap_or(0);
-    send_tel(node, funded_key, to, TRANSFER_AMOUNT, gas_price, 21_000, nonce)?;
+    let tx_hash = send_tel(node, funded_key, to, TRANSFER_AMOUNT, gas_price, 21_000, nonce)?;
 
     // Wait for the transfer to confirm. Two epoch durations covers a tx that gets orphaned at a
-    // boundary and re-injected into the next epoch.
+    // boundary and re-injected into the next epoch. The rising balance is only the LANDING
+    // signal: attribution comes from the receipt below, because the tip can move (e.g. an
+    // epoch-close block) between the 1s-granularity balance poll and a tip read, and a
+    // late-landing stale tx could satisfy the balance check.
     let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 2 + 5);
     loop {
         let bal = get_balance(node, &to.to_string(), 1).unwrap_or(before_bal);
@@ -608,10 +613,36 @@ async fn land_tx_and_read_fee(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    // The block that included the transfer is the current tip (single worker, low traffic).
-    let tip = get_block_number(node)?;
-    let fee = read_base_fee(node, tip)?;
-    Ok((tip, fee))
+    // Exact attribution: the receipt names the block that included THIS tx.
+    let block = get_tx_receipt_block(node, &tx_hash)?;
+    let fee = read_base_fee(node, block)?;
+    Ok((block, fee))
+}
+
+/// Fetch the receipt for `tx_hash` from `node` via `eth_getTransactionReceipt` and return the
+/// `blockNumber` it landed in.
+///
+/// Retries briefly: the balance-based landing signal and receipt indexing can race by a moment.
+fn get_tx_receipt_block(node: &str, tx_hash: &str) -> eyre::Result<u64> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let receipt: Option<HashMap<String, Value>> =
+            call_rpc(node, "eth_getTransactionReceipt", rpc_params!(tx_hash), 3, tx_hash)?;
+        if let Some(receipt) = receipt {
+            let raw = receipt.get("blockNumber").ok_or_else(|| {
+                eyre::eyre!("receipt for tx {tx_hash} on {node} has no blockNumber field")
+            })?;
+            return parse_hex_u64(raw).ok_or_else(|| {
+                eyre::eyre!(
+                    "receipt for tx {tx_hash} on {node} blockNumber is not a hex u64: {raw:?}"
+                )
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(eyre::eyre!("no receipt for confirmed tx {tx_hash} on {node} within 10s"));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Read the `timestamp` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
