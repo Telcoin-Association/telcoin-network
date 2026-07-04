@@ -1178,6 +1178,186 @@ async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Res
     Ok(())
 }
 
+/// F17 / P1-13 regression (`report.md` F17, gap G25): pin the closing-block identity that BOTH
+/// base-fee config-read sites silently depend on. The close-time read (`adjust_base_fees`, at the
+/// canonical tip) and the entry-time read (`derive_base_fees_for_entered_epoch`, at the finalized
+/// closing block) resolve to the same closing block ONLY because `concludeEpoch` stamps the entered
+/// epoch's `blockHeight = closing block + 1` (ConsensusRegistry) AND the close system call is
+/// pinned to the LAST batch of the boundary output (`ConsensusOutput::close_epoch_for_last_batch`).
+/// Nothing else asserts it, so a future multi-block-boundary or contract change could break it
+/// silently.
+///
+/// This drives a REAL epoch close through the ExecutorEngine/`spawn_consensus` scaffold where the
+/// boundary output is MULTI-BLOCK (its committed subdag flattens to more than one batch, so it
+/// executes as more than one block), then pins:
+/// - `canonical_tip().number + 1 == epoch_info.blockHeight`, with the epoch info read AT the tip
+///   via `epoch_state_from_canonical_tip` — exactly the read the close-time tripwire in
+///   `adjust_base_fees` performs (`epoch_state_at_header(&canonical_tip())`), so this exercises
+///   that tripwire's happy path on a real boundary (the check returns `Ok` here);
+/// - the close is pinned to the LAST batch: the boundary output's penultimate block has NOT yet
+///   advanced the epoch, so the tip IS the boundary output's last (closing) block. This is why the
+///   identity holds even for a multi-block boundary output — the exact fact the F17 refutation
+///   rests on.
+#[tokio::test]
+async fn epoch_block_height_is_closing_block_plus_one() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("epoch_block_height_identity").unwrap();
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let consensus_bus = ConsensusBus::new();
+    let committee = config.committee().clone();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).await.unwrap();
+
+    // full epoch of certificates with batches (all worker 0), so the committed boundary subdag
+    // flattens to several batches -> a multi-block boundary output
+    let max_round = 21;
+    let (certificates, _next_parents, batches) =
+        create_signed_certificates_for_rounds(1..=max_round, &fixture, &[]);
+
+    // worker 0 configured Static { fee } so the close-time config read at the tip returns a real
+    // per-worker config (mirrors the derive-boundary fixture)
+    let static_fee = 7_777u64;
+    let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(1u8, static_fee)]);
+    let all_batches: Vec<_> = batches.values().cloned().collect();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1);
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
+    // consensus needs 1 extra round to commit; the engine stops after executing this round
+    let last_executed_round = max_round as u64 - 1;
+    let parent = chain.sealed_genesis_header();
+
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        Some(last_executed_round),
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+    let (tx, mut rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        debug!(target: "gas-test", ?res, "res:");
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        &task_manager,
+        consensus_chain.clone(),
+    )
+    .await;
+
+    for certificate in certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    // forward outputs, flagging the boundary output as the epoch close (mirrors process_output);
+    // stash the FIRST flagged output - the engine stops right after executing it (max_round), so
+    // it is THE boundary output whose LAST batch runs concludeEpoch
+    let mut boundary_output: Option<ConsensusOutput> = None;
+    loop {
+        tokio::select! {
+            Some(mut output) = consensus_output.recv() => {
+                if output.leader_round() as u64 >= last_executed_round {
+                    output.set_epoch_close();
+                    if boundary_output.is_none() {
+                        boundary_output = Some(output.clone());
+                    }
+                }
+                let _ = to_engine.send(output).await;
+            }
+            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
+                assert!(engine_task.is_ok());
+                break;
+            }
+        }
+    }
+
+    let boundary_output = boundary_output.expect("a boundary output was flagged and executed");
+
+    // the boundary output is MULTI-BLOCK: a non-empty committed subdag flattens to one block per
+    // batch, so this pins the identity across a boundary output that produced more than one block
+    let boundary_blocks = boundary_output.flatten_batches().len();
+    assert!(
+        boundary_blocks >= 2,
+        "regression requires a multi-block boundary output, got {boundary_blocks} block(s)",
+    );
+
+    // the canonical tip is the closing block (last executed); its nonce still carries the closed
+    // epoch while the registry state it holds already reports the entered epoch
+    let closing = reth_env.canonical_tip();
+    let closed_epoch = RethEnv::extract_epoch_from_header(&closing);
+    assert_eq!(closed_epoch, 0, "closing block's nonce carries the closed epoch");
+    assert_eq!(
+        reth_env.finalized_header()?.expect("closing block finalized").number,
+        closing.number,
+        "canonical tip is the finalized closing block",
+    );
+
+    // THE IDENTITY, read AT the tip via `epoch_state_from_canonical_tip` == the close-time
+    // tripwire's `epoch_state_at_header(&canonical_tip())`: the entered epoch's on-chain
+    // blockHeight is the closing block + 1. This is that tripwire's happy path on a real
+    // multi-block boundary - the check returns Ok here.
+    let entered_state = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(
+        entered_state.epoch,
+        closed_epoch + 1,
+        "registry state crossed to the entered epoch",
+    );
+    assert_eq!(
+        closing.number + 1,
+        entered_state.epoch_info.blockHeight,
+        "F17: canonical tip + 1 must equal the entered epoch's blockHeight",
+    );
+
+    // the close is pinned to the LAST batch of the boundary output: because the output is
+    // multi-block, its penultimate block (closing.number - 1) is one of ITS batches, and that block
+    // must NOT have advanced the epoch yet - concludeEpoch runs only in the last batch (the tip).
+    // So the tip IS the boundary output's last block, and the identity holds despite >1 block.
+    let penultimate = reth_env
+        .sealed_header_by_number(closing.number - 1)?
+        .expect("penultimate boundary block exists");
+    assert_eq!(
+        reth_env.epoch_state_at_header(&penultimate)?.epoch,
+        closed_epoch,
+        "epoch must not advance until the boundary output's LAST batch (the tip is that block)",
+    );
+
+    // the close-time tripwire's second read (worker configs at the SAME tip) also resolves: the one
+    // configured worker is present at the closing block
+    let (num_workers, configs) = reth_env.get_worker_fee_configs_at_block(closing.hash())?;
+    assert_eq!(num_workers, 1, "one configured worker at the closing block");
+    assert_eq!(configs.len(), 1, "config arity matches the worker count");
+
+    Ok(())
+}
+
 /// Eip1559 variant of [`test_derive_base_fees_recovers_committee_fee_at_boundary`]: with worker 0
 /// configured `Eip1559 { target_gas }`, the derived entry fee must equal the tn-types oracle
 /// `compute_next_base_fee_eip1559(held_fee, gas_total, target)` where `held_fee` is the fee the

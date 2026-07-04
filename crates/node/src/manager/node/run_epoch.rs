@@ -216,6 +216,34 @@ where
                     // Derivation failure is a hard error: fees are exact-match consensus values,
                     // so producing with an unverifiable fee is a safety failure while halting is
                     // only a single-node liveness failure.
+                    //
+                    // F17 ENTRY-TIME IDENTITY: the derivation trusts `tip` to be E-1's closing
+                    // block, which holds only because `concludeEpoch` stamps the entered epoch's
+                    // `blockHeight = closing block + 1` (ConsensusRegistry) - i.e. `tip` is the
+                    // block right before the entered epoch's first block. That identity is
+                    // otherwise implicit; assert `tip.number + 1 == blockHeight` (entered epoch's
+                    // info read at THIS pinned tip, same header the derivation scans) before
+                    // deriving, so a broken `+1` convention or a future multi-block-boundary
+                    // change trips here instead of silently deriving fees off the wrong block.
+                    let entered_info = reth_env.get_epoch_info_at_block(entered, tip.hash())?;
+                    debug_assert_eq!(
+                        tip.number + 1,
+                        entered_info.blockHeight,
+                        "epoch-entry base-fee identity: closing-block tip {} + 1 != entered-epoch \
+                         {entered} blockHeight {}",
+                        tip.number,
+                        entered_info.blockHeight,
+                    );
+                    if tip.number + 1 != entered_info.blockHeight {
+                        return Err(eyre::eyre!(
+                            "epoch-entry closing-block identity violated: finalized tip {} + 1 != \
+                             entered-epoch {entered} blockHeight {} at tip {:?} - refusing to \
+                             derive base fees off a non-closing block",
+                            tip.number,
+                            entered_info.blockHeight,
+                            tip.hash(),
+                        ));
+                    }
                     super::derive_base_fees_for_entered_epoch(&reth_env, entered, &tip)?
                         .apply(&gas_accumulator);
                 } else {
@@ -663,7 +691,7 @@ where
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
         // adjust basefees after final execution
         if live_boundary {
-            adjust_base_fees(reth_env, gas_accumulator);
+            adjust_base_fees(reth_env, gas_accumulator)?;
         }
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())
@@ -685,21 +713,68 @@ where
 /// just added get their configured fee (e.g. `Static`) computed here rather than defaulting to
 /// MIN; epoch-entry sync then confirms the same count from the same block.
 ///
-/// Infallible: if the contract read fails, the current per-worker base fees and worker count are
-/// kept unchanged instead of aborting the epoch close (see the FAIL-OPEN note in the body).
+/// Fails ONLY on an F17 identity violation (below). If a contract read fails, the current
+/// per-worker base fees and worker count are kept unchanged instead of aborting the epoch close
+/// (see the FAIL-OPEN note in the body).
 ///
 /// Inert on existing chains: the genesis fee strategy is `Eip1559 { target_gas: u64::MAX }`, which
 /// floors every worker at `MIN_PROTOCOL_BASE_FEE`. Fees only move once governance sets a real
 /// per-worker target.
-fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) {
+fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) -> eyre::Result<()> {
+    // F16 one-header discipline: pin the canonical tip ONCE. Inside `Self::close_epoch` (after
+    // `wait_for_consensus_execution`) this IS the epoch's closing block; the F17 identity check
+    // and the WorkerConfigs read below both resolve against this single header.
+    let tip = reth_env.canonical_tip();
+
+    // F17 CLOSE-TIME IDENTITY: `concludeEpoch` stamps the newly-entered epoch's `blockHeight` as
+    // `closing block + 1` (ConsensusRegistry), so this read (canonical tip = closing block) prices
+    // fees for the epoch whose `blockHeight` is exactly `tip + 1`. That identity is otherwise
+    // implicit - it silently depends on the contract's `+1` convention and on no block executing
+    // between the close and this read. Assert it against the newly-recorded epoch info at the SAME
+    // pinned tip before touching fees, so a future multi-block-boundary or contract change trips
+    // loudly here instead of pricing fees off a non-closing block. A read failure is fail-open
+    // (keep current fees, like the config read); only a proven VIOLATION halts.
+    match reth_env.epoch_state_at_header(&tip) {
+        Ok(epoch_state) => {
+            let block_height = epoch_state.epoch_info.blockHeight;
+            debug_assert_eq!(
+                tip.number + 1,
+                block_height,
+                "close-time base-fee identity: canonical tip {} + 1 != entered-epoch {} \
+                 blockHeight {block_height}",
+                tip.number,
+                epoch_state.epoch,
+            );
+            if tip.number + 1 != block_height {
+                return Err(eyre::eyre!(
+                    "close-time base-fee identity violated: canonical tip {} + 1 != entered-epoch \
+                     {} blockHeight {block_height} at tip {:?} - refusing to price base fees off a \
+                     non-closing block",
+                    tip.number,
+                    epoch_state.epoch,
+                    tip.hash(),
+                ));
+            }
+        }
+        Err(e) => {
+            warn!(
+                target: "epoch-manager",
+                ?e,
+                tip_number = tip.number,
+                "failed to read epoch state at canonical tip for the close-time base-fee identity check - keeping current per-worker base fees and worker count"
+            );
+            return Ok(());
+        }
+    }
+
     // FAIL-OPEN: a contract-read failure must not abort the epoch close. Keep the current
     // per-worker base fees and worker count untouched -- both are already consensus-consistent
     // (seeded from the same chain at epoch entry, then held deterministic within the epoch), so
     // every committee member that hits the same read failure lands on the same state. The count
     // self-heals at the next epoch entry via `sync_num_workers_from_chain`, which fails open the
-    // same way.
-    match reth_env.get_worker_fee_configs() {
-        Ok(configs) => {
+    // same way. Pinned to the SAME `tip` the identity check validated (F16 one-header discipline).
+    match reth_env.get_worker_fee_configs_at_block(tip.hash()) {
+        Ok((_num_workers, configs)) => {
             gas_accumulator.set_num_workers(configs.len());
             for (worker_id, config) in configs.into_iter().enumerate() {
                 let worker_id = worker_id as u16;
@@ -717,6 +792,7 @@ fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) {
             );
         }
     }
+    Ok(())
 }
 
 /// Apply a worker's [`WorkerFeeConfig`] to compute its next-epoch base fee.
