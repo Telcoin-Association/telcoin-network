@@ -16,10 +16,10 @@
 //!
 //! - Epoch 0 always uses `MIN_PROTOCOL_BASE_FEE`. The new fee for epoch N is computed at the close
 //!   of epoch N-1 by the live producer and applied to blocks produced *inside* epoch N.
-//! - These testnets run with skip-empty-execution: blocks are produced only when transactions
-//!   exist or an epoch closes. The epoch-boundary/close blocks are produced by the *closing*
-//!   producer and carry the chain-seeded (previous-epoch) fee — they do **not** reflect the new
-//!   fee. The new fee first appears on a **transaction-bearing block committed inside the epoch**.
+//! - These testnets run with skip-empty-execution: blocks are produced only when transactions exist
+//!   or an epoch closes. The epoch-boundary/close blocks are produced by the *closing* producer and
+//!   carry the chain-seeded (previous-epoch) fee — they do **not** reflect the new fee. The new fee
+//!   first appears on a **transaction-bearing block committed inside the epoch**.
 //! - The testnet is single-worker (worker 0), so every block's `base_fee_per_gas` is worker 0's
 //!   fee. A submitted transaction must carry a `gas_price >= base_fee` or the pool treats it as
 //!   underpriced and it never lands — for the static-fee tests we price transactions above the
@@ -373,6 +373,24 @@ async fn test_mid_epoch_restart_recovers_static_fee() -> eyre::Result<()> {
             kill_idx + 1
         );
     }
+
+    // 3) The regression this test exists for: the restarted node's LOCAL fee state. Blocks served
+    //    above could come from pure state sync (headers reproduce `base_fee_per_gas` regardless of
+    //    the local `BaseFeeContainer`), and the healthy 3-node quorum certifies txs submitted via
+    //    validator-1 even if the restarted node recovered MIN. Routing a priced tx through the
+    //    restarted node's OWN RPC exercises its local pool/batch path: a node that recovered MIN
+    //    instead of the on-chain static fee would misprice the tx and diverge on its batch path.
+    let local_to = address_from_word("basefee-restart-local");
+    let (local_block, local_fee) =
+        land_tx_and_read_fee(&client_urls[kill_idx], &funded_key, local_to, 2, HIGH_GAS_PRICE)
+            .await?;
+    assert_eq!(
+        local_fee,
+        STATIC_FEE,
+        "tx routed through restarted validator-{}'s own RPC landed in block {local_block} with \
+         fee {local_fee}, expected static {STATIC_FEE}",
+        kill_idx + 1
+    );
 
     guard.kill_all();
     Ok(())
