@@ -153,6 +153,13 @@ pub(crate) struct EpochManager<P, DB> {
 ///    because [`EpochManager::replay_missed_consensus`] will re-execute them, which increments
 ///    leader counts through the normal payload-builder path.
 ///
+/// Before stages 1 and 2 write, the accumulator is grown (with a warning) to cover the highest
+/// worker id observed in the scanned headers. The [`sync_num_workers_from_chain`] call that
+/// precedes this one is fail-open, so a failed `WorkerConfigs` read can leave the accumulator at
+/// its 1-slot startup default on a multi-worker chain; committed blocks are evidence the
+/// committee accepted those worker ids, so growing restores every observed worker instead of
+/// panicking on the first out-of-range id.
+///
 /// Every chain-derived input (the block scan range's start and end, and the epoch used to bound
 /// leader counting) is pinned to the single finalized [`SealedHeader`], so the restore cannot be
 /// silently skipped by a finalized header and canonical tip that disagree (see
@@ -177,6 +184,27 @@ pub async fn catchup_accumulator(
 
         let blocks =
             reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
+
+        // Grow the accumulator to cover every worker id the scanned headers reference BEFORE the
+        // per-worker writes below. The worker-count sync that precedes this call is fail-open, so
+        // a failed `WorkerConfigs` read can leave the accumulator at its 1-slot startup default
+        // on a multi-worker chain; committed blocks are evidence the committee accepted those
+        // worker ids, so growing restores every observed worker instead of panicking on the
+        // first out-of-range id.
+        if let Some(max_worker_id) = blocks.iter().map(worker_id_from_header).max() {
+            let num_workers = gas_accumulator.num_workers();
+            if max_worker_id as usize >= num_workers {
+                warn!(
+                    target: "epoch-manager",
+                    observed_max_worker_id = max_worker_id,
+                    previous_count = num_workers,
+                    new_count = max_worker_id as usize + 1,
+                    "scanned headers reference worker ids beyond the accumulator - growing to \
+                     cover them; the on-chain worker-count sync may have failed or lagged"
+                );
+                gas_accumulator.set_num_workers(max_worker_id as usize + 1);
+            }
+        }
 
         // Restore each worker's base fee from its latest on-chain block this epoch (the
         // base-fee-from-chain invariant). Workers that produced no block keep the default (MIN).

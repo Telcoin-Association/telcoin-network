@@ -1006,6 +1006,144 @@ async fn test_catchup_restores_fees_when_finality_lags_canonical_tip() -> eyre::
     Ok(())
 }
 
+/// F5 regression (review gap G12): a FAILED worker-count sync on a multi-worker chain must not
+/// make catchup panic. [`sync_num_workers_from_chain`] is fail-open (any read failure keeps the
+/// current count), so startup can reach [`catchup_accumulator`] holding the hardcoded
+/// `GasAccumulator::new(1)` while the pinned epoch range contains worker-1 blocks. The old code
+/// indexed those block-derived ids unclamped and died on the first worker-1 datum -
+/// `GasAccumulator::base_fee(1)`'s `.expect("valid worker id")` (or `inc_block`'s for a
+/// gas-bearing header) - a crash-loop for as long as the read kept failing. Catchup now grows
+/// the accumulator to the max block-observed worker id (committed blocks are committee-accepted
+/// evidence) and restores ALL observed workers.
+///
+/// Chain shape (manual blocks like the F16 finality-lag test, worker ids stamped directly,
+/// because the consensus-driven 2-worker scaffold only ever puts worker-0 blocks on chain):
+/// - block 1 (epoch 0): worker 0, non-MIN fee, one executed transfer (real gas);
+/// - block 2 (epoch 0): worker 1, a different non-MIN fee, one executed transfer - the datum the
+///   old code panicked on. Canonical AND finalized.
+///
+/// The sync step is SKIPPED (simulating the failed read) and catchup runs directly on a fresh
+/// 1-slot accumulator: it must grow to 2 and restore both workers' fees and gas. A control
+/// accumulator then runs the healthy sync-then-catchup order over the same chain and must land
+/// on identical state, pinning growth-recovery == healthy-startup equivalence.
+#[tokio::test]
+async fn catchup_after_failed_sync_on_multiworker_chain_recovers() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("catchup_failed_sync_multiworker")?;
+    // committee fixture only backs the consensus-chain handle catchup takes
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+
+    // 2-worker WorkerConfigs at genesis (the sync-then-catchup chain shape) with a funded sender
+    // so both blocks carry real gas
+    let mut tx_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
+    let genesis = test_genesis_with_consensus_registry_and_workers(
+        4,
+        vec![(0u8, 30_000_000u64), (1u8, 500u64)],
+    )
+    .extend_accounts([(
+        tx_factory.address(),
+        GenesisAccount::default().with_balance(U256::from(1_000_000_000_000_000_000u64)),
+    )]);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // distinct non-MIN fees so the restore provably reads each worker's own block
+    let worker0_fee = MIN_PROTOCOL_BASE_FEE + 77;
+    let worker1_fee = MIN_PROTOCOL_BASE_FEE + 500;
+
+    // block 1 (epoch 0): worker 0 with one executed transfer. Leader round 0 keeps catchup's
+    // leader-count stage (gated on `last_executed_round > 0`) out of scope; this test pins the
+    // fee-restore and gas-stat stages.
+    let transfer0 = tx_factory.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        1_000,
+        Some(Address::random()),
+        U256::from(1),
+        Default::default(),
+    );
+    let genesis_header = chain.sealed_genesis_header();
+    let output1 = manual_consensus_output(0, 0, 1, false);
+    let payload1 = payload_with_base_fee(genesis_header.clone(), &output1, worker0_fee, 0);
+    let block1 = reth_env.build_block_from_batch_payload(
+        payload1,
+        &vec![transfer0],
+        genesis_header.hash(),
+        &[],
+    )?;
+    let block1_header = extend_canonical_chain(&reth_env, block1)?;
+
+    // block 2 (epoch 0): worker 1 with one executed transfer - the worker-1 datum the old
+    // unclamped catchup panicked on. Canonical AND finalized so the pinned scan covers it.
+    let transfer1 = tx_factory.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        1_000,
+        Some(Address::random()),
+        U256::from(1),
+        Default::default(),
+    );
+    let output2 = manual_consensus_output(0, 0, 2, false);
+    let payload2 = payload_with_base_fee(block1_header.clone(), &output2, worker1_fee, 1);
+    let block2 = reth_env.build_block_from_batch_payload(
+        payload2,
+        &vec![transfer1],
+        block1_header.hash(),
+        &[],
+    )?;
+    let block2_header = extend_canonical_chain(&reth_env, block2)?;
+    reth_env.finalize_block(block2_header.clone())?;
+
+    // the scanned range genuinely carries worker-1 data (the old panic precondition)
+    assert!(block2_header.gas_used > 0, "worker 1's block must carry real gas");
+
+    // recovery with the sync step SKIPPED: the fail-open sync kept the startup default, so
+    // catchup starts 1 slot short of the ids on chain and must grow instead of panicking
+    let recovered = GasAccumulator::new(1);
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+
+    assert_eq!(
+        recovered.num_workers(),
+        2,
+        "catchup must grow the accumulator to cover the max block-observed worker id",
+    );
+    assert_eq!(recovered.base_fee(0).base_fee(), worker0_fee);
+    assert_eq!(recovered.base_fee(1).base_fee(), worker1_fee);
+    let (blocks0, gas0, limit0) = recovered.get_values(0);
+    assert_eq!((blocks0, gas0), (1, block1_header.gas_used));
+    assert_eq!(limit0, block1_header.gas_limit);
+    let (blocks1, gas1, limit1) = recovered.get_values(1);
+    assert_eq!((blocks1, gas1), (1, block2_header.gas_used));
+    assert_eq!(limit1, block2_header.gas_limit);
+
+    // control: the healthy startup order (sync succeeds, then catchup) over the same chain must
+    // land on identical state - growth-recovery converges with a working count sync
+    let control = GasAccumulator::new(1);
+    let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
+    sync_num_workers_from_chain(&reth_env, &control, epoch_first_block);
+    assert_eq!(control.num_workers(), 2, "the on-chain WorkerConfigs declares 2 workers");
+    catchup_accumulator(reth_env.clone(), &control, &mut consensus_chain).await?;
+    assert_eq!(recovered.num_workers(), control.num_workers());
+    for worker_id in 0..2u16 {
+        assert_eq!(
+            recovered.base_fee(worker_id).base_fee(),
+            control.base_fee(worker_id).base_fee()
+        );
+        assert_eq!(recovered.get_values(worker_id), control.get_values(worker_id));
+    }
+
+    Ok(())
+}
+
 /// F1 regression, flipped to RECOVERS: after an epoch closes, a node whose finalized tip is the
 /// closing block derives the entered epoch's per-worker base fees purely from the closed epoch's
 /// chain state. This is the entry state shared by all three `close_epoch(None, ..)` shapes -
