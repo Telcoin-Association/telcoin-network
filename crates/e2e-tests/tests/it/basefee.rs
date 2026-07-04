@@ -150,9 +150,10 @@ async fn test_static_fee_applied_at_epoch_boundary() -> eyre::Result<()> {
 /// above it for the handful of boundaries crossed here.
 ///
 /// This test depends on transactions confirming in specific epochs, which is more timing-sensitive
-/// than the static tests under parallel CI load. The assertions are defensive (monotonic
-/// non-decreasing, plus a single strict-increase-above-MIN requirement). The deterministic `Static`
-/// tests remain the robust core if this one proves flaky.
+/// than the static tests under parallel CI load. A tx that misses its confirmation deadline fails
+/// the test immediately: a skipped (empty) epoch would *decrease* the fee and poison the
+/// monotonic assertion, so every recorded epoch carries exactly one tx by construction. The
+/// deterministic `Static` tests remain the robust core if this one proves flaky.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 async fn test_eip1559_fee_rises_at_epoch_boundaries() -> eyre::Result<()> {
@@ -199,16 +200,20 @@ async fn test_eip1559_fee_rises_at_epoch_boundaries() -> eyre::Result<()> {
     for i in 0..=target_boundaries {
         let nonce = i as u128;
         // Cheap gas price is fine: the EIP-1559 fee stays tiny (single/low double digits) across
-        // these few epochs. Best-effort: an epoch where the tx fails to land is skipped, not fatal.
-        match land_cheap_tx_mid_epoch(&client_urls[0], &funded_key, to, nonce).await {
-            Ok((block, fee)) => {
-                info!(target: "basefee-test", epoch = current.epoch_id, block, fee, "recorded epoch fee");
-                fees.push((current.epoch_id, block, fee));
-            }
-            Err(e) => {
-                info!(target: "basefee-test", epoch = current.epoch_id, ?e, "no tx landed this epoch (skipped)");
-            }
-        }
+        // these few epochs. A tx that misses its deadline is FATAL: skipping an epoch lets empty
+        // 10s epochs pass (each *decreasing* the fee against `target_gas = 1`), which would
+        // poison the monotonic assertion below. Every recorded epoch must land exactly one tx.
+        let (block, fee) = land_cheap_tx_mid_epoch(&client_urls[0], &funded_key, to, nonce)
+            .await
+            .map_err(|e| {
+                eyre::eyre!(
+                    "epoch {}: gas-generating tx (nonce {nonce}) missed its {}s confirmation deadline: {e}. Check test_logs/basefee_eip1559/",
+                    current.epoch_id,
+                    EPOCH_DURATION * 2 + 5
+                )
+            })?;
+        info!(target: "basefee-test", epoch = current.epoch_id, block, fee, "recorded epoch fee");
+        fees.push((current.epoch_id, block, fee));
 
         if i < target_boundaries {
             current = wait_for_epoch_at_least(&provider, current.epoch_id + 1).await?;
