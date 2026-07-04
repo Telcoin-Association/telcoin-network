@@ -665,13 +665,15 @@ where
     /// parallel while the engine finishes executing up to `target_hash`, then blocks until that
     /// execution is confirmed. On the live boundary path it then recomputes each worker's
     /// next-epoch base fee ([`adjust_base_fees`]); the restart replay-and-close and leftover-drain
-    /// paths (which pass `None`) skip that forward computation — the next `run_epoch` entry
-    /// derives the identical fees from the closed epoch's chain state
-    /// (`derive_base_fees_for_entered_epoch`), preserving the base-fee-from-chain invariant. The
-    /// live path's close-time computation is kept (rather than relying solely on the entry
-    /// derivation) so the accumulator holds correct fees for the whole window between close and
-    /// the next entry. Finally it clears the [`GasAccumulator`] so the next epoch starts from
-    /// zero.
+    /// paths (which pass `None`) skip that forward computation. Neither shape can strand the next
+    /// epoch on stale fees: the next `run_epoch` entry re-derives every worker's fee from the
+    /// closed epoch's chain state (`derive_base_fees_for_entered_epoch`) — the same pure function
+    /// of the same inputs the live close applies, so both produce the identical value — and
+    /// hard-errors (halting the node) when that state cannot be read or verified, rather than
+    /// running on fees the chain does not support. The live path's close-time computation is
+    /// therefore redundant with the entry derivation but kept so the accumulator holds correct
+    /// fees for the window between close and the next entry. Finally it clears the
+    /// [`GasAccumulator`] so the next epoch starts from zero.
     async fn close_epoch(
         &self,
         shutdown_consensus: Option<Notifier>,
@@ -680,8 +682,9 @@ where
         target_hash: ConsensusHeaderDigest,
     ) -> eyre::Result<()> {
         // Only the live producer (Some(shutdown)) holds a complete accumulator for the epoch it
-        // just closed and may compute the next fee forward. Restart/leftover paths (None) defer to
-        // epoch-start chain seeding so a catching-up node never diverges from the chain.
+        // just closed and computes the next fee forward here. The None paths (replay-and-close,
+        // leftover-drain) skip it: the next run_epoch entry derives the identical fees from the
+        // closed epoch's chain state (derive_base_fees_for_entered_epoch) and halts if it cannot.
         let mut live_boundary = false;
         // begin consensus shutdown while engine executes
         if let Some(s) = shutdown_consensus {
@@ -1005,8 +1008,11 @@ mod tests {
 
     #[test]
     fn seed_base_fees_keeps_computed_value_for_live_producer() {
-        // Live producer crossing into a new epoch: the tip is still in the previous epoch, so the
-        // value adjust_base_fees computed at the boundary is kept and the chain is NOT consulted.
+        // Helper contract (defense-in-depth): when the tip epoch differs from the entered epoch,
+        // held values (e.g. what adjust_base_fees computed at a live close) must not be
+        // overwritten with another epoch's chain fees. run_epoch no longer reaches this helper on
+        // that branch - a tip on the previous epoch's closing block routes through
+        // derive_base_fees_for_entered_epoch instead.
         let acc = GasAccumulator::new(2);
         acc.base_fee(0).set_base_fee(1000);
         acc.base_fee(1).set_base_fee(2000);

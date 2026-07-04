@@ -35,12 +35,19 @@
 //!
 //! ## Base fee on sync and restart (the base-fee-from-chain invariant)
 //!
-//! Base fee is consensus-affecting, so a node that is merely catching up must never recompute it
-//! and risk diverging from the value already baked into the chain. At epoch entry, if the
-//! canonical tip is already in the epoch being entered, each worker's [`BaseFeeContainer`] is
-//! seeded from its most recent on-chain block (`latest_base_fee_per_worker`); otherwise the
-//! container keeps the value the live producer just computed at the boundary. Only the live
-//! producer crossing the boundary computes the next fee forward; everyone else reads the chain.
+//! Base fee is consensus-affecting, so a node must never produce with a fee it cannot verify
+//! against the chain. The entered epoch's fees are therefore always rederivable from chain state
+//! at epoch entry (`run_epoch` in `node::manager`): when the finalized tip is already in the
+//! epoch being entered, each worker's [`BaseFeeContainer`] adopts its most recent on-chain
+//! block's fee (`latest_base_fee_per_worker`); when the tip is the previous epoch's closing
+//! block — a live producer crossing the boundary, or any restart shape that closed the epoch
+//! without adjusting fees — every worker's fee is derived as a pure function of the previous
+//! epoch's chain state (`derive_base_fees_for_entered_epoch`); workers with no block to read
+//! from walk back through earlier closing blocks (`derive_idle_worker_fee`). Any other tip state
+//! is an error: the node halts rather than run on fees it cannot verify. The live producer's
+//! close-time computation (`adjust_base_fees`) folds the same formula over the same inputs, so
+//! the value it carries between close and the next entry is identical to what entry derivation
+//! recomputes.
 
 use crate::{AuthorityIdentifier, Committee, WorkerId};
 
