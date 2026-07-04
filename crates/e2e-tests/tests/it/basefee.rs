@@ -364,15 +364,23 @@ async fn test_mid_epoch_restart_recovers_static_fee() -> eyre::Result<()> {
         "post-restart tx block {after_block} carried fee {after_fee}, expected static {STATIC_FEE}"
     );
 
-    // The restarted node must also serve that post-restart block at the same fee.
-    if let Some(f) = wait_for_block_fee(&client_urls[kill_idx], after_block, EPOCH_DURATION * 4)? {
-        assert_eq!(
-            f,
-            STATIC_FEE,
-            "restarted validator-{} block {after_block} fee {f}, expected static {STATIC_FEE}",
-            kill_idx + 1
-        );
-    }
+    // The restarted node must also serve that post-restart block at the same fee. Not reaching
+    // the block within the budget is a hard failure — silently skipping the assert would let a
+    // restarted node that never catches up pass the test.
+    let f = wait_for_block_fee(&client_urls[kill_idx], after_block, EPOCH_DURATION * 4)?
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "restarted validator-{} did not reach post-restart block {after_block} within {}s. Check test_logs/basefee_restart/",
+                kill_idx + 1,
+                EPOCH_DURATION * 4
+            )
+        })?;
+    assert_eq!(
+        f,
+        STATIC_FEE,
+        "restarted validator-{} block {after_block} fee {f}, expected static {STATIC_FEE}",
+        kill_idx + 1
+    );
 
     // 3) The regression this test exists for: the restarted node's LOCAL fee state. Blocks served
     //    above could come from pure state sync (headers reproduce `base_fee_per_gas` regardless of
