@@ -154,7 +154,8 @@ pub struct KeygenArgs {
     #[arg(long = "rpc-http", value_name = "URL", value_parser = clap_url_parser)]
     pub rpc_http: Option<Url>,
 
-    /// Optional WebSocket JSON-RPC endpoint (e.g. wss://validator.example.com:8546/). Requires `--rpc-http`.
+    /// Optional WebSocket JSON-RPC endpoint (e.g. wss://validator.example.com:8546/). Requires
+    /// `--rpc-http`.
     #[arg(long = "rpc-ws", value_name = "URL", value_parser = clap_url_parser, requires = "rpc_http")]
     pub rpc_ws: Option<Url>,
 }

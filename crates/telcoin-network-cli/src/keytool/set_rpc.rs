@@ -27,7 +27,7 @@ use url::Url;
 /// Build a validated worker `RpcInfo` from the `--http`/`--ws` (or `--rpc-http`/`--rpc-ws`) flags.
 ///
 /// Returns `Ok(None)` when no HTTP endpoint was provided (nothing to advertise). Applies the same
-/// validation node startup runs (`node.rs:624`), so a bad scheme/length fails at CLI time. Shared by
+/// validation node startup runs (`node.rs`), so a bad scheme/length fails at CLI time. Shared by
 /// `set-rpc` and `generate validator|observer`.
 pub(crate) fn build_worker_rpc(
     http: Option<Url>,
