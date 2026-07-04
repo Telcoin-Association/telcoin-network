@@ -706,6 +706,18 @@ pub fn test_genesis_with_consensus_registry_and_workers(
     num_validators: usize,
     worker_configs: Vec<(u8, u64)>,
 ) -> Genesis {
+    try_test_genesis_with_consensus_registry_and_workers(num_validators, worker_configs)
+        .expect("create consensus registry genesis accounts")
+}
+
+/// Fallible [`test_genesis_with_consensus_registry_and_workers`]: returns the genesis-creation
+/// error instead of panicking, so tests can assert that a ceremony with contract-illegal
+/// `worker_configs` (strategy > `MAX_STRATEGY`, empty list) fails loudly instead of committing
+/// a reverted constructor's empty storage.
+pub fn try_test_genesis_with_consensus_registry_and_workers(
+    num_validators: usize,
+    worker_configs: Vec<(u8, u64)>,
+) -> eyre::Result<Genesis> {
     // deterministic committee-eligible validator addresses (0x11.., 0x22.., ...)
     let all_validators: Vec<Address> = (1..=num_validators)
         .map(|i| Address::from_slice(&[(i as u8).wrapping_mul(0x11); 20]))
@@ -761,5 +773,4 @@ pub fn test_genesis_with_consensus_registry_and_workers(
         governance,
         worker_configs,
     )
-    .expect("create consensus registry genesis accounts")
 }
