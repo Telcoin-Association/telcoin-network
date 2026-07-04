@@ -151,6 +151,11 @@ pub(crate) struct EpochManager<P, DB> {
 ///    because [`EpochManager::replay_missed_consensus`] will re-execute them, which increments
 ///    leader counts through the normal payload-builder path.
 ///
+/// Every chain-derived input (the block scan range's start and end, and the epoch used to bound
+/// leader counting) is pinned to the single finalized [`SealedHeader`], so the restore cannot be
+/// silently skipped by a finalized header and canonical tip that disagree (see
+/// `issues/dual-header-read-robustness.md`).
+///
 /// If there is no finalized header (fresh genesis), this is a no-op.
 pub async fn catchup_accumulator(
     reth_env: RethEnv,
@@ -158,7 +163,12 @@ pub async fn catchup_accumulator(
     consensus_chain: &mut ConsensusChain,
 ) -> eyre::Result<()> {
     if let Some(block) = reth_env.finalized_header()? {
-        let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
+        // Pin the range start and the epoch classification to the SAME sealed header that
+        // supplies the range end: the epoch state is read AT the finalized header rather than
+        // at the canonical tip, so an inconsistent (finalized, canonical-tip) pair can never
+        // yield a silently empty range that drops the per-worker fee restore. The epoch-entry
+        // seeding in `run_epoch` pins the same way.
+        let epoch_state = reth_env.epoch_state_at_header(&block)?;
 
         let nonce: u64 = block.nonce.into();
         let (last_executed_epoch, last_executed_round) = deconstruct_nonce(nonce);

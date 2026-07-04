@@ -159,13 +159,15 @@ where
             if let Some(tip) = reth_env.finalized_header()? {
                 let tip_epoch = RethEnv::extract_epoch_from_header(&tip);
                 let chain_fees = if tip_epoch == committee.epoch() {
-                    // The range END (`tip.number`) comes from `finalized_header()` above, while the
-                    // range START (`epoch_info.blockHeight`) comes from the canonical-tip epoch
-                    // state. These reference the same block under this node's instant BFT finality
-                    // (the payload builder finalizes the header it just made canonical), so the
-                    // range is well-formed. If finality ever lags the canonical tip, pin both ends
-                    // to one header (the same dual-reference pattern lives in catchup_accumulator).
-                    let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
+                    // The range START, range END, and the epoch classification above all derive
+                    // from the ONE pinned finalized header: `tip_epoch` from its nonce, the
+                    // epoch's start height from the epoch state read AT that header, and the end
+                    // from its number. If finality ever lags the canonical tip the pair stays
+                    // internally consistent instead of collapsing to a silently empty range that
+                    // drops the fee restore (`catchup_accumulator` pins the same way). `tip` is
+                    // sealed - number and hash from one read - so follow-up contract reads can
+                    // also pin to `tip.hash()`.
+                    let epoch_state = reth_env.epoch_state_at_header(&tip)?;
                     let blocks = reth_env
                         .blocks_for_range(epoch_state.epoch_info.blockHeight..=tip.number)?;
                     super::latest_base_fee_per_worker(&blocks)

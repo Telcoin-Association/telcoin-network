@@ -1038,15 +1038,18 @@ impl RethEnv {
         Ok(self.inner.blockchain_provider.database_provider_ro()?.header_by_number(block_num)?)
     }
 
-    /// Return the finalalized execution header if available.
-    pub fn finalized_header(&self) -> TnRethResult<Option<ExecHeader>> {
-        let finalized_block_num_hash =
-            self.inner.blockchain_provider.finalized_block_num_hash().unwrap_or_default();
-        if let Some(finalized_block_num_hash) = finalized_block_num_hash {
-            Ok(self.inner.blockchain_provider.header(finalized_block_num_hash.hash)?)
-        } else {
-            Ok(None)
-        }
+    /// Return the finalized header, sealed with its hash, if available.
+    ///
+    /// Number and hash come from one logical read (the finalized num/hash pair, then the header
+    /// looked up by that hash), so callers can pin block ranges, epoch classification, and state
+    /// reads to this single header without consulting a second source (see `catchup_accumulator`
+    /// and the epoch-entry base-fee seeding in the epoch manager, which pair this with
+    /// [`Self::epoch_state_at_header`]).
+    pub fn finalized_header(&self) -> TnRethResult<Option<SealedHeader>> {
+        let Some(finalized_num_hash) = self.finalized_block_num_hash()? else {
+            return Ok(None);
+        };
+        self.sealed_header_by_hash(finalized_num_hash.hash)
     }
 
     /// Return the latest canonical block number.
@@ -1583,26 +1586,36 @@ impl RethEnv {
     /// - getValidator token id by address
     /// - getValidator info by token id
     pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
-        // create EVM with latest state
         let canonical_tip = self.canonical_tip();
         debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        self.epoch_state_at_header(&canonical_tip)
+    }
+
+    /// Read the committee and epoch information from the [ConsensusRegistry] at `header`.
+    ///
+    /// The registry state, the EVM environment, and therefore the returned epoch, epoch info,
+    /// and committee all derive from this ONE header. Recovery paths that scan
+    /// `epoch_info.blockHeight..=header.number` (catchup and epoch-entry base-fee seeding) rely
+    /// on this pin: reading the range start from a different header (e.g. the canonical tip)
+    /// could yield a silently empty range if finality ever lags the canonical tip.
+    pub fn epoch_state_at_header(&self, header: &SealedHeader) -> eyre::Result<EpochState> {
+        // create EVM with the state at the pinned header
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
-        debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
+        debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state at header");
         let mut tn_evm = self
             .inner
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
+            .create_evm(&mut db, self.inner.evm_config.evm_env(header)?);
 
         // current epoch number
         let epoch = self.get_current_epoch_number(&mut tn_evm)?;
 
         // current epoch info
         let epoch_info = self.get_current_epoch_info(&mut tn_evm)?;
-        debug!(target: "engine", ?epoch, ?epoch_info, "retrieved epoch info from canonical tip for next epoch");
+        debug!(target: "engine", ?epoch, ?epoch_info, "retrieved epoch info at header");
 
         // retrieve closing timestamp for previous epoch
         let epoch_start = self
@@ -1614,7 +1627,7 @@ impl RethEnv {
         let validators = self.get_committee_validators_by_epoch(epoch, &mut tn_evm)?;
         let bls_pubkeys = self.get_committee_bls_pubkeys_by_epoch(epoch, &mut tn_evm)?;
         let epoch_state = EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start };
-        debug!(target: "engine", ?epoch_state, "returning epoch state from canonical tip");
+        debug!(target: "engine", ?epoch_state, "returning epoch state at header");
 
         Ok(epoch_state)
     }

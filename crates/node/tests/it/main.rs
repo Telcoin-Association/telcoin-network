@@ -22,11 +22,12 @@ use tn_primary::{
     ConsensusBus,
 };
 use tn_reth::{
+    payload::TNPayload,
     test_utils::{
         seeded_genesis_from_random_batches, test_genesis_with_consensus_registry,
-        test_genesis_with_consensus_registry_and_workers,
+        test_genesis_with_consensus_registry_and_workers, TransactionFactory,
     },
-    RethChainSpec,
+    ExecutedBlock, NewCanonicalChain, RethChainSpec, RethEnv,
 };
 use tn_rpc::{EngineToPrimary, RpcNodeInfo};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
@@ -34,10 +35,11 @@ use tn_test_utils::{
     create_signed_certificates_for_rounds, default_test_execution_node, CommitteeFixture,
 };
 use tn_types::{
-    adiri_genesis, gas_accumulator::GasAccumulator, Batch, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusNumHash, Epoch, EpochCertificate, EpochDigest, EpochRecord, ExecHeader, Notifier,
-    SealedHeader, TaskManager, TnReceiver as _, TnSender as _, WorkerId, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE,
+    adiri_genesis, gas_accumulator::GasAccumulator, Address, Batch, BlsSignature, Certificate,
+    CommittedSubDag, ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
+    Epoch, EpochCertificate, EpochDigest, EpochRecord, ExecHeader, GenesisAccount, Notifier,
+    ReputationScores, SealedHeader, SignatureVerificationState, TaskManager, TnReceiver as _,
+    TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::{
@@ -736,6 +738,183 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
         gas_accumulator.rewards_counter().get_address_counts(),
         recovered.rewards_counter().get_address_counts()
     );
+
+    Ok(())
+}
+
+/// Minimal consensus output for driving the payload builder directly (no live consensus).
+///
+/// Mirrors the shape `tn-reth`'s close-epoch tests use: a default leader certificate with a
+/// verified (default) BLS signature so `CommittedSubDag::new` derives deterministic randomness.
+fn manual_consensus_output(
+    round: u32,
+    epoch: Epoch,
+    number: u64,
+    close_epoch: bool,
+) -> ConsensusOutput {
+    let mut leader = Certificate::default();
+    leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        BlsSignature::default(),
+    ));
+    leader.update_header_round_for_test(round);
+    leader.update_header_epoch_for_test(epoch);
+    leader.update_header_created_at_for_test(tn_types::now());
+    let sub_dag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        number,
+        ReputationScores::default(),
+        None,
+    );
+    ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        number,
+        close_epoch,
+        VecDeque::new(),
+        vec![],
+    )
+}
+
+/// Build a payload extending `parent` with an explicit worker base fee (mirrors
+/// `TNPayload::new_for_test` but lets the test choose the fee the chain carries).
+fn payload_with_base_fee(
+    parent: SealedHeader,
+    output: &ConsensusOutput,
+    base_fee_per_gas: u64,
+    worker_id: WorkerId,
+) -> TNPayload {
+    let gas_limit = parent.gas_limit;
+    TNPayload::new(
+        parent,
+        Address::random(),
+        0,
+        B256::random(),
+        output,
+        B256::ZERO,
+        base_fee_per_gas,
+        gas_limit,
+        B256::random(),
+        worker_id,
+    )
+}
+
+/// Make an executed block canonical, mirroring `tn_engine`'s payload-builder chain update.
+///
+/// Finalization is intentionally left to the caller so tests can construct a chain whose
+/// finality lags the canonical tip.
+fn extend_canonical_chain(reth_env: &RethEnv, block: ExecutedBlock) -> eyre::Result<SealedHeader> {
+    let header = block.recovered_block.clone_sealed_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    canonical_in_memory_state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
+    canonical_in_memory_state.set_canonical_head(header.clone());
+    reth_env.finish_executing_output(vec![block], None)?;
+    Ok(header)
+}
+
+/// F16 regression (`issues/dual-header-read-robustness.md`): catchup derives the block scan
+/// range AND the epoch classification from the ONE pinned finalized header, so a canonical tip
+/// that advanced past finality across an epoch boundary can no longer produce a silently empty
+/// range that drops per-worker base-fee restoration.
+///
+/// Chain shape: block 1 (epoch 0, worker 0, non-default base fee) is canonical AND finalized;
+/// block 2 closes epoch 0 and is canonical but NOT finalized. The old dual-source read took the
+/// range start from the canonical tip's epoch state (epoch 1's first block, past the tip) and
+/// the range end from the finalized header (block 1), yielding an empty range and silently
+/// skipping the restore. The pinned read derives both ends from the finalized header's own epoch
+/// state and restores worker 0's fee. The epoch-entry seeding in `run_epoch` derives its range
+/// the same pinned way.
+#[tokio::test]
+async fn test_catchup_restores_fees_when_finality_lags_canonical_tip() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("catchup_pinned_finalized")?;
+    // committee fixture only backs the consensus-chain handle catchup takes
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+
+    // registry-backed genesis (so the epoch-closing system call can run at block 2) with a
+    // funded sender so block 1 carries real gas
+    let mut tx_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
+    let genesis = test_genesis_with_consensus_registry(4).extend_accounts([(
+        tx_factory.address(),
+        GenesisAccount::default().with_balance(U256::from(1_000_000_000_000_000_000u64)),
+    )]);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // worker 0's on-chain fee for epoch 0: distinguishable from MIN and from the poison below
+    let worker_id: WorkerId = 0;
+    let chain_fee = MIN_PROTOCOL_BASE_FEE + 77;
+
+    // block 1: mid-epoch-0 block carrying worker 0's fee and one executed transfer (so gas
+    // stats accumulate) - canonical AND finalized. Leader round 0 keeps catchup's leader-count
+    // stage (gated on `last_executed_round > 0`) out of scope; this test pins the fee-restore
+    // and gas-stat stages.
+    let transfer = tx_factory.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(Address::random()),
+        U256::from(1),
+        Default::default(),
+    );
+    let output1 = manual_consensus_output(0, 0, 1, false);
+    let genesis_header = chain.sealed_genesis_header();
+    let payload1 = payload_with_base_fee(genesis_header.clone(), &output1, chain_fee, worker_id);
+    let block1 = reth_env.build_block_from_batch_payload(
+        payload1,
+        &vec![transfer],
+        genesis_header.hash(),
+        &[],
+    )?;
+    let block1_header = extend_canonical_chain(&reth_env, block1)?;
+    reth_env.finalize_block(block1_header.clone())?;
+
+    // block 2: closes epoch 0 - canonical but NOT finalized (finality lags the canonical tip)
+    let no_txs: Vec<Vec<u8>> = vec![];
+    let output2 = manual_consensus_output(1, 0, 2, true);
+    let payload2 = payload_with_base_fee(block1_header.clone(), &output2, chain_fee, worker_id);
+    let block2 =
+        reth_env.build_block_from_batch_payload(payload2, &no_txs, block1_header.hash(), &[])?;
+    extend_canonical_chain(&reth_env, block2)?;
+
+    // precondition: the OLD code's two sources now genuinely disagree - the canonical tip's
+    // epoch state places the epoch start PAST the finalized header, i.e. the old
+    // (canonical-tip start ..= finalized end) range is empty
+    let finalized = reth_env.finalized_header()?.expect("finalized header");
+    assert_eq!(finalized.number, block1_header.number, "finality pinned at block 1");
+    assert_eq!(finalized.hash(), block1_header.hash(), "pinned header carries its hash");
+    let tip_state = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(tip_state.epoch, 1, "canonical tip state crossed the epoch boundary");
+    assert!(
+        tip_state.epoch_info.blockHeight > finalized.number,
+        "old dual-source range start ({}) must exceed the finalized range end ({})",
+        tip_state.epoch_info.blockHeight,
+        finalized.number,
+    );
+
+    // recovery: catchup must restore worker 0's fee from the finalized header's own epoch range
+    let recovered = GasAccumulator::new(1);
+    recovered.base_fee(worker_id).set_base_fee(chain_fee + 999); // poison
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+
+    assert_eq!(
+        recovered.base_fee(worker_id).base_fee(),
+        chain_fee,
+        "catchup must restore the fee from the range pinned to the finalized header, not \
+         silently skip on an inconsistent (finalized, canonical-tip) pair",
+    );
+    // and the pinned range was non-empty: blocks were scanned into the gas stats
+    let (blocks_counted, _gas_used, _gas_limit) = recovered.get_values(worker_id);
+    assert!(blocks_counted > 0, "pinned range must not be empty");
 
     Ok(())
 }
