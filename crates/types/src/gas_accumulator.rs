@@ -331,9 +331,19 @@ impl GasAccumulator {
     /// (`MIN_PROTOCOL_BASE_FEE` fee, zero gas); shrinking truncates, discarding the removed
     /// workers' totals and fees. Existing slots and the [`RewardsCounter`] are untouched.
     ///
-    /// Callers must only invoke this while no consensus output is executing (startup before
-    /// catchup, epoch entry before replay, epoch close after final execution): a resize that
-    /// races `inc_block` for a removed worker id panics there by design.
+    /// # Concurrency
+    ///
+    /// The write lock makes the resize atomic with respect to concurrent
+    /// [`GasAccumulator::inc_block`] / [`GasAccumulator::base_fee`] calls (read lock), and a
+    /// call with the current size returns without resizing. Callers need not quiesce execution;
+    /// the one safety bound is that the count must never shrink to or below a worker id still
+    /// present in in-flight consensus output - `inc_block` panics on the truncated id by
+    /// design. Grows are index-stable (existing slots keep their index and state), so they are
+    /// always safe. The epoch-entry callers uphold the bound through value-stability rather
+    /// than quiescence: they pin the count read to the previous epoch's closing block, so a
+    /// mid-epoch (ModeChange) re-entry re-reads the identical count and no-ops here while the
+    /// engine may still be executing leftover output - whose worker ids are all below that
+    /// count.
     pub fn set_num_workers(&self, num_workers: usize) {
         // a chain always has at least worker 0.
         if num_workers == 0 {

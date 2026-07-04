@@ -144,6 +144,19 @@ where
 
         let reth_env = engine.get_reth_env().await;
 
+        // ENTRY-READ INVARIANT (F18): the previous epoch's closing state rules the entire epoch,
+        // so every worker-count/config read in this entry flow is pinned to the previous epoch's
+        // closing block (or an earlier epoch's closing block via the walk-back) - never the live
+        // mid-epoch tip - and the epoch-info/committee reads resolve values written once at the
+        // boundary. The fees the adopt branch reads off mid-epoch blocks are likewise constants
+        // within the epoch. A ModeChange re-entry therefore re-reads IDENTICAL values even though
+        // `send_leftover_consensus_output_to_engine` forwards leftover output without waiting for
+        // execution: the engine may still be executing (calling `inc_block`) while this entry
+        // runs, and safety comes from that value-stability (the count resize no-ops, the fee
+        // writes rewrite the same values) plus `set_num_workers`' no-shrink-below-in-flight-id
+        // bound - NOT from quiescence. See `GasAccumulator::set_num_workers` and the
+        // `mode_change_reentry_is_idempotent` IT.
+
         // Size the accumulator to the on-chain worker count for the epoch being entered (read at
         // the epoch's first block's parent - the previous epoch's closing block). Runs on every
         // entry mode, before fee seeding (which loops 0..num_workers) and before replay drives

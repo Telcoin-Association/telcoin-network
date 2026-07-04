@@ -1559,6 +1559,180 @@ async fn test_derive_idle_worker_fee_eip1559_decays_from_last_produced_epoch() -
     Ok(())
 }
 
+/// One epoch-entry pass over the accumulator exactly as `run_epoch` performs it on the
+/// mid-epoch (adopt) branch: sync the worker count from the previous epoch's closing block,
+/// adopt each worker's latest on-chain fee over the pinned tip's epoch range, then fill
+/// configured-but-absent workers from prior closing-block state.
+fn run_epoch_entry_sequence(
+    reth_env: &RethEnv,
+    gas_accumulator: &GasAccumulator,
+) -> eyre::Result<()> {
+    // run_epoch reads the entered epoch's info from the canonical tip; the values are written
+    // once at the boundary, so any mid-epoch tip serves identical ones
+    let entered_state = reth_env.epoch_state_from_canonical_tip()?;
+    sync_num_workers_from_chain(reth_env, gas_accumulator, entered_state.epoch_info.blockHeight);
+
+    // the pinned finalized tip classifies the entry; mid-epoch it is the adopt branch
+    let tip = reth_env.finalized_header()?.expect("finalized tip");
+    assert_eq!(
+        RethEnv::extract_epoch_from_header(&tip),
+        entered_state.epoch,
+        "mid-epoch tip -> the adopt entry branch",
+    );
+    let epoch_state = reth_env.epoch_state_at_header(&tip)?;
+    let blocks = reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=tip.number)?;
+    // mirrors `latest_base_fee_per_worker`: worker id from difficulty's low 16 bits, the last
+    // block seen per worker wins
+    let mut chain_fees: HashMap<WorkerId, u64> = HashMap::new();
+    for header in &blocks {
+        let worker_id = (header.difficulty.into_limbs()[0] & 0xffff) as WorkerId;
+        if let Some(fee) = header.base_fee_per_gas {
+            chain_fees.insert(worker_id, fee);
+        }
+    }
+    // adopt (mirrors run_epoch's `seed_base_fees_from_chain`)
+    for worker_id in 0..gas_accumulator.num_workers() as WorkerId {
+        if let Some(&fee) = chain_fees.get(&worker_id) {
+            gas_accumulator.base_fee(worker_id).set_base_fee(fee);
+        }
+    }
+    fill_absent_worker_fees(reth_env, entered_state.epoch, &tip, &chain_fees, gas_accumulator)?;
+    Ok(())
+}
+
+/// F18 / G15 regression: a ModeChange re-entry re-runs the epoch-entry sequence mid-epoch while
+/// the engine may still be executing leftover consensus output
+/// (`send_leftover_consensus_output_to_engine` forwards it WITHOUT waiting for execution). What
+/// makes that safe is NOT quiescence but value-stability: every count/config read in the entry
+/// flow is pinned to the previous epoch's closing block (or resolves a value written once at
+/// the boundary), so the re-entry re-reads identical values - the resize no-ops and the fee
+/// writes rewrite the same values - while in-flight `inc_block` calls (ids < count) keep
+/// landing.
+///
+/// Chain shape (2 static workers so both entry sub-paths carry non-MIN fees):
+/// - block 1 closes epoch 0 (worker 0 at MIN - the live epoch-0 fee; statics activate entering
+///   epoch 1);
+/// - block 2 (epoch 1): worker 0 at its static fee - the pinned tip for the first entry;
+/// - block 3 (epoch 1): the "leftover" executed between the entries, advancing the pinned tip.
+///
+/// The first entry seeds count = 2 and fees [700 (adopted), 500 (filled - worker 1 is idle)].
+/// Live gas accumulates, block 3 lands, then the re-entry runs while a hammer thread plays the
+/// engine still executing leftovers - `inc_block`/`base_fee` for both workers (worker 1 =
+/// count - 1 pins the no-shrink-below-in-flight-id bound). Asserts: count unchanged, every fee
+/// unchanged, accumulated gas exactly preserved (sequential + concurrent increments), no panic.
+/// The thread overlap is best-effort; every assertion is timing-independent.
+#[tokio::test]
+async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
+    const WORKER0_FEE: u64 = 700;
+    const WORKER1_FEE: u64 = 500;
+    const HAMMER_BLOCKS: u64 = 20_000;
+
+    let temp_dir = TempDir::with_prefix("mode_change_reentry").unwrap();
+    // 2-worker WorkerConfigs, both Static (strategy 1) so the epoch-1 fees are non-MIN and
+    // self-consistent across every entry seam (adopt, fill, derive)
+    let genesis = test_genesis_with_consensus_registry_and_workers(
+        4,
+        vec![(1u8, WORKER0_FEE), (1u8, WORKER1_FEE)],
+    );
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+    let no_txs: Vec<Vec<u8>> = vec![];
+
+    // block 1: closes epoch 0 (worker 0 at MIN - containers hold MIN until the first close)
+    let genesis_header = chain.sealed_genesis_header();
+    let output1 = manual_consensus_output(1, 0, 1, true);
+    let payload1 =
+        payload_with_base_fee(genesis_header.clone(), &output1, MIN_PROTOCOL_BASE_FEE, 0);
+    let block1 =
+        reth_env.build_block_from_batch_payload(payload1, &no_txs, genesis_header.hash(), &[])?;
+    let block1_header = extend_canonical_chain(&reth_env, block1)?;
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 closed");
+
+    // block 2 (epoch 1): worker 0 produces at its now-active static fee; worker 1 stays idle
+    let output2 = manual_consensus_output(0, 1, 2, false);
+    let payload2 = payload_with_base_fee(block1_header.clone(), &output2, WORKER0_FEE, 0);
+    let block2 =
+        reth_env.build_block_from_batch_payload(payload2, &no_txs, block1_header.hash(), &[])?;
+    let block2_header = extend_canonical_chain(&reth_env, block2)?;
+    reth_env.finalize_block(block2_header.clone())?;
+
+    // FIRST entry (mid-epoch-1): sync count -> adopt-seed -> fill absent
+    let gas_accumulator = GasAccumulator::new(1);
+    let block_height_first = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
+    run_epoch_entry_sequence(&reth_env, &gas_accumulator)?;
+    assert_eq!(gas_accumulator.num_workers(), 2, "count synced from the closing block's configs");
+    assert_eq!(
+        gas_accumulator.base_fee(0).base_fee(),
+        WORKER0_FEE,
+        "worker 0 adopted its fee from this epoch's chain blocks",
+    );
+    assert_eq!(
+        gas_accumulator.base_fee(1).base_fee(),
+        WORKER1_FEE,
+        "idle worker 1 filled from prior closing-block state",
+    );
+
+    // live execution before the mode change: deterministic totals the re-entry must preserve
+    gas_accumulator.inc_block(0, 100_000, 150_000);
+    gas_accumulator.inc_block(1, 42_000, 60_000);
+
+    // a leftover output executes between the exit and the re-entry (there is no execution
+    // wait): block 3 extends epoch 1 at the SAME fee - mid-epoch fees are constants
+    let output3 = manual_consensus_output(1, 1, 3, false);
+    let payload3 = payload_with_base_fee(block2_header.clone(), &output3, WORKER0_FEE, 0);
+    let block3 =
+        reth_env.build_block_from_batch_payload(payload3, &no_txs, block2_header.hash(), &[])?;
+    let block3_header = extend_canonical_chain(&reth_env, block3)?;
+    reth_env.finalize_block(block3_header)?;
+
+    // the count-read input is value-stable across the advanced tip: epoch info is written once
+    // at the boundary
+    let block_height_second = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
+    assert_eq!(block_height_second, block_height_first, "entry reads pin the same closing block");
+
+    // RE-ENTRY (ModeChange): re-run the entry sequence while a hammer thread drives in-flight
+    // execution - inc_block for both workers (worker 1 = count - 1 pins the id bound) plus fee
+    // reads that must only ever observe the seeded epoch values
+    let hammer_accumulator = gas_accumulator.clone();
+    let hammer = std::thread::spawn(move || {
+        for _ in 0..HAMMER_BLOCKS {
+            hammer_accumulator.inc_block(0, 21_000, 30_000_000);
+            hammer_accumulator.inc_block(1, 10_000, 30_000_000);
+            assert_eq!(hammer_accumulator.base_fee(0).base_fee(), WORKER0_FEE);
+            assert_eq!(hammer_accumulator.base_fee(1).base_fee(), WORKER1_FEE);
+        }
+    });
+    let reentry = run_epoch_entry_sequence(&reth_env, &gas_accumulator);
+    hammer.join().expect("in-flight inc_block/base_fee must not panic across the re-entry");
+    reentry?;
+
+    // idempotent: the resize is a no-op and every per-worker fee is unchanged
+    assert_eq!(gas_accumulator.num_workers(), 2, "re-entry resize must be a no-op");
+    assert_eq!(gas_accumulator.base_fee(0).base_fee(), WORKER0_FEE, "re-seed rewrites same value");
+    assert_eq!(gas_accumulator.base_fee(1).base_fee(), WORKER1_FEE, "re-fill rewrites same value");
+
+    // the epoch's accumulated gas is exactly preserved: sequential + concurrent increments,
+    // nothing cleared or overwritten by the re-entry
+    assert_eq!(
+        gas_accumulator.get_values(0),
+        (1 + HAMMER_BLOCKS, 100_000 + HAMMER_BLOCKS * 21_000, 150_000 + HAMMER_BLOCKS * 30_000_000,),
+        "worker 0's live gas totals must survive the re-entry",
+    );
+    assert_eq!(
+        gas_accumulator.get_values(1),
+        (1 + HAMMER_BLOCKS, 42_000 + HAMMER_BLOCKS * 10_000, 60_000 + HAMMER_BLOCKS * 30_000_000),
+        "worker 1's live gas totals must survive the re-entry",
+    );
+
+    Ok(())
+}
+
 /// Helper to spawn consensus components.
 async fn spawn_consensus(
     fixture: &CommitteeFixture<MemDatabase>,

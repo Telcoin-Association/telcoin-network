@@ -220,9 +220,10 @@ pub async fn catchup_accumulator(
 /// warning and keeps the accumulator's current size, so the node behaves exactly as it did
 /// before worker counts were chain-derived.
 ///
-/// Callers must only invoke this while no consensus output is executing (startup before
-/// [`catchup_accumulator`], epoch entry before replay) - see
-/// [`GasAccumulator::set_num_workers`].
+/// Reading at the closing block also makes the count value-stable for the whole epoch: a
+/// mid-epoch (ModeChange) re-entry re-reads the identical count while the engine may still be
+/// executing leftover output, so the resize is a no-op - the value-stability contract on
+/// [`GasAccumulator::set_num_workers`]. No caller needs to quiesce execution first.
 pub fn sync_num_workers_from_chain(
     reth_env: &RethEnv,
     gas_accumulator: &GasAccumulator,
