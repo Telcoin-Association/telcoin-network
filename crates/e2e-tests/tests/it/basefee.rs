@@ -328,17 +328,13 @@ async fn test_mid_epoch_restart_recovers_static_fee() -> eyre::Result<()> {
         epoch1.epoch_id
     );
 
-    // Step into a fresh epoch, then sleep ~half an epoch so the kill lands MID-epoch (away from
-    // both the boundary we just crossed and the next one).
-    let kill_epoch = wait_for_epoch_at_least(&provider, epoch1.epoch_id + 1).await?;
-    tokio::time::sleep(Duration::from_secs(EPOCH_DURATION / 2)).await;
-    let mid = current_epoch(&provider).await?;
-    assert_eq!(
-        mid.epoch_id, kill_epoch.epoch_id,
-        "expected to still be mid-epoch {} when killing, but epoch advanced to {}",
-        kill_epoch.epoch_id, mid.epoch_id
-    );
-    info!(target: "basefee-test", epoch = mid.epoch_id, "killing validator-3 mid-epoch");
+    // Step into a fresh epoch, then position the kill MID-epoch by MEASURED phase (host clock vs
+    // the boundary block's timestamp), retrying until inside a safe window. A blind
+    // half-epoch sleep followed by a hard assert would fail under scheduling/RPC drift before
+    // the restart under test even happens.
+    wait_for_epoch_at_least(&provider, epoch1.epoch_id + 1).await?;
+    let kill_epoch = wait_for_mid_epoch(&provider, &client_urls[0]).await?;
+    info!(target: "basefee-test", epoch = kill_epoch.epoch_id, "killing validator-3 mid-epoch");
 
     // Kill validator index 2 (validator-3).
     let kill_idx = 2usize;
@@ -434,13 +430,16 @@ async fn test_mid_epoch_restart_recovers_static_fee() -> eyre::Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-/// Minimal snapshot of an epoch's identity and its first EL block.
+/// Minimal snapshot of an epoch's identity, its first EL block, and its duration.
 #[derive(Debug, Clone, Copy)]
 struct EpochSnapshot {
     epoch_id: u32,
-    /// First EL block of the epoch (the block at which the committee became active).
-    #[allow(dead_code)]
+    /// First EL block of the epoch (the block at which the committee became active). Under
+    /// skip-empty-execution this block may not exist yet; the block BEFORE it is the previous
+    /// epoch's closing block, produced exactly at the boundary.
     block_height: u64,
+    /// The epoch's configured duration in seconds.
+    epoch_duration: u64,
 }
 
 /// Start `NUM_VALIDATORS` validators against the genesis already written under `temp_path`.
@@ -480,7 +479,11 @@ async fn wait_for_rpc<P: Provider>(provider: &P) -> eyre::Result<()> {
 async fn current_epoch<P: Provider>(provider: &P) -> eyre::Result<EpochSnapshot> {
     let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider);
     let info = registry.getCurrentEpochInfo().call().await?;
-    Ok(EpochSnapshot { epoch_id: info.epochId, block_height: info.blockHeight })
+    Ok(EpochSnapshot {
+        epoch_id: info.epochId,
+        block_height: info.blockHeight,
+        epoch_duration: u64::from(info.epochDuration),
+    })
 }
 
 /// Poll the `ConsensusRegistry` until the current epoch id is at least `target`, returning the
@@ -500,6 +503,52 @@ async fn wait_for_epoch_at_least<P: Provider>(
             return Err(eyre::eyre!(
                 "epoch did not reach {target} within timeout (stuck at {})",
                 snap.epoch_id
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Wait until the host clock sits inside a measured mid-epoch window and return that epoch's
+/// snapshot.
+///
+/// `EpochInfo` exposes no epoch-start timestamp, but the previous epoch's closing block
+/// (`block_height - 1`) is produced exactly at the boundary, so its timestamp measures when the
+/// current epoch started (the registry records `block.number + 1` at `concludeEpoch`). All
+/// testnet nodes run on this host, which makes host-clock vs block-timestamp comparison sound.
+/// Re-checks on a bounded 1s cadence — instead of a blind sleep followed by a hard assert —
+/// until the measured phase is at least `MIN_PHASE` seconds into the epoch and at least
+/// `END_MARGIN` seconds before the next boundary.
+async fn wait_for_mid_epoch<P: Provider>(provider: &P, node: &str) -> eyre::Result<EpochSnapshot> {
+    /// Seconds past the boundary before the mid-epoch window opens.
+    const MIN_PHASE: u64 = 2;
+    /// Seconds of margin demanded before the next boundary.
+    const END_MARGIN: u64 = 4;
+
+    let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 4);
+    loop {
+        let snap = current_epoch(provider).await?;
+        let boundary_block = snap.block_height.saturating_sub(1);
+        let epoch_start = read_block_timestamp(node, boundary_block)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("host clock is after the unix epoch")
+            .as_secs();
+        let phase = now.saturating_sub(epoch_start);
+        if phase >= MIN_PHASE && phase + END_MARGIN <= snap.epoch_duration {
+            info!(
+                target: "basefee-test",
+                epoch = snap.epoch_id, phase, duration = snap.epoch_duration,
+                "measured mid-epoch phase"
+            );
+            return Ok(snap);
+        }
+        if Instant::now() >= deadline {
+            return Err(eyre::eyre!(
+                "no mid-epoch window observed within {}s: epoch {} at phase {phase}s of {}s",
+                EPOCH_DURATION * 4,
+                snap.epoch_id,
+                snap.epoch_duration
             ));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -563,6 +612,17 @@ async fn land_tx_and_read_fee(
     let tip = get_block_number(node)?;
     let fee = read_base_fee(node, tip)?;
     Ok((tip, fee))
+}
+
+/// Read the `timestamp` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
+fn read_block_timestamp(node: &str, block_number: u64) -> eyre::Result<u64> {
+    let block = get_block(node, Some(block_number))?;
+    let raw = block
+        .get("timestamp")
+        .ok_or_else(|| eyre::eyre!("block {block_number} on {node} has no timestamp field"))?;
+    parse_hex_u64(raw).ok_or_else(|| {
+        eyre::eyre!("block {block_number} on {node} timestamp is not a hex u64: {raw:?}")
+    })
 }
 
 /// Read the `baseFeePerGas` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
