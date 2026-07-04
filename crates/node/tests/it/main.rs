@@ -16,7 +16,8 @@ use tn_executor::subscriber::spawn_subscriber;
 use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
 use tn_node::{
-    catchup_accumulator, derive_base_fees_for_entered_epoch, sync_num_workers_from_chain,
+    catchup_accumulator, derive_base_fees_for_entered_epoch, derive_idle_worker_fee,
+    fill_absent_worker_fees, sync_num_workers_from_chain,
 };
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
@@ -609,12 +610,20 @@ async fn test_sync_num_workers_fail_open_when_contract_absent() -> eyre::Result<
     Ok(())
 }
 
-/// Mid-epoch recovery on a chain whose `WorkerConfigs` declares 2 workers, mirroring the startup
-/// order: `sync_num_workers_from_chain` sizes the accumulator first, then `catchup_accumulator`
-/// restores per-worker state into the correctly sized slots.
+/// Recovery on a chain whose `WorkerConfigs` declares 2 workers, staged so one chain pins both
+/// entry shapes for the idle worker (consensus still only produces worker-0 blocks; worker
+/// spawning is a follow-up):
 ///
-/// Consensus still only produces worker-0 blocks (worker spawning is a follow-up), so worker 0
-/// must match the live accumulator exactly while worker 1 carries an idle default slot.
+/// 1. MID-EPOCH-0: hold the epoch-closing output back and recover in the startup order —
+///    `sync_num_workers_from_chain` sizes the accumulator, `catchup_accumulator` restores
+///    per-worker state. Worker 0 must match the live accumulator exactly; idle worker 1 holds
+///    `MIN_PROTOCOL_BASE_FEE`, which IS the committee value during epoch 0 (containers hold the MIN
+///    default until the FIRST close, pinned via `derive_idle_worker_fee(_, 0, _)`).
+/// 2. Close epoch 0 with the held output.
+/// 3. RESTART-AFTER-CLOSE (the F1 crash-after-close shape on a 2-worker chain): catchup no-ops at a
+///    closing-block tip, so post-catchup worker 1 still holds MIN — the F6 failure state — and the
+///    entry derivation must flip it to the governance-set `Static { fee: 500 }`. That final
+///    assertion was `== MIN_PROTOCOL_BASE_FEE` before the F6 walk-back fix.
 #[tokio::test]
 async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("sync_then_catchup").unwrap();
@@ -655,17 +664,18 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
 
     // manually create engine
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
-    let max = Some(max_round as u64 - 1); // consensus needs 1 extra round to commit
+    // consensus needs 1 extra round to commit; the engine stops after executing this round
+    let last_executed_round = max_round as u64 - 1;
     let parent = chain.sealed_genesis_header();
 
     // start engine
     let shutdown = Notifier::default();
     let task_manager = TaskManager::default();
     let reth_env = execution_node.get_reth_env().await;
-    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
     let engine = ExecutorEngine::new(
         reth_env.clone(),
-        max,
+        Some(last_executed_round),
         from_consensus,
         parent,
         shutdown.subscribe(),
@@ -700,17 +710,31 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
         consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
     }
 
-    // forward consensus output to engine until `max_round`
+    // PHASE 1 (mid-epoch-0): collect the committed outputs, holding the epoch-closing one back
+    // so recovery is exercised against a mid-epoch chain first
+    let mut outputs = Vec::new();
     loop {
-        tokio::select! {
-            Some(output) = consensus_output.recv() => {
-                to_engine.send(output).await?;
-            }
-            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
-                assert!(engine_task.is_ok());
-                break;
-            }
+        let output = timeout(Duration::from_secs(30), consensus_output.recv())
+            .await?
+            .expect("consensus output");
+        let done = output.leader_round() as u64 >= last_executed_round;
+        outputs.push(output);
+        if done {
+            break;
         }
+    }
+    let mut closing_output = outputs.pop().expect("epoch-closing output");
+
+    // forward every pre-close output, then wait for the engine to execute each (the engine
+    // sends exactly one update per consensus output) so recovery scans a settled chain
+    let sent = outputs.len();
+    for output in outputs {
+        to_engine.send(output).await?;
+    }
+    for _ in 0..sent {
+        timeout(Duration::from_secs(30), engine_update_rx.recv())
+            .await?
+            .expect("engine update per output");
     }
 
     // simulate node recovery in the startup order: sync worker count first, then catchup
@@ -742,6 +766,64 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
     assert_eq!(
         gas_accumulator.rewards_counter().get_address_counts(),
         recovered.rewards_counter().get_address_counts()
+    );
+
+    // epoch-0 base case: mid-epoch-0 the walk-back also reports MIN for EVERY worker — the
+    // containers hold the MIN default until the FIRST close, so worker 1's Static { fee: 500 }
+    // activates entering epoch 1, not during epoch 0 (recovery mirrors live behavior)
+    assert_eq!(derive_idle_worker_fee(&reth_env, 0, 0)?, MIN_PROTOCOL_BASE_FEE);
+    assert_eq!(derive_idle_worker_fee(&reth_env, 0, 1)?, MIN_PROTOCOL_BASE_FEE);
+
+    // PHASE 2: close epoch 0 with the held-back output (mirrors process_output's boundary flag)
+    closing_output.set_epoch_close();
+    to_engine.send(closing_output).await?;
+    let engine_task = timeout(Duration::from_secs(30), &mut rx).await;
+    assert!(engine_task.is_ok(), "engine exits at max round after executing the epoch close");
+
+    // PHASE 3 (restart after close — the F1 crash-after-close shape on a 2-worker chain): the
+    // pinned tip IS epoch 0's closing block, so catchup scans an empty range and restores
+    // nothing; the entry derivation alone must recover every configured worker's fee.
+    let closing = reth_env.finalized_header()?.expect("closing block finalized");
+    assert_eq!(
+        RethEnv::extract_epoch_from_header(&closing),
+        0,
+        "closing block's nonce carries the closed epoch",
+    );
+    let entered_state = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(entered_state.epoch, 1, "registry state crossed to the entered epoch");
+
+    let restarted = GasAccumulator::new(1);
+    restarted.rewards_counter().set_committee(fixture.committee());
+    sync_num_workers_from_chain(&reth_env, &restarted, entered_state.epoch_info.blockHeight);
+    assert_eq!(restarted.num_workers(), 2);
+    catchup_accumulator(reth_env.clone(), &restarted, &mut consensus_chain).await?;
+    // post-catchup: idle worker 1 still holds MIN — the F6 failure state the fill closes
+    assert_eq!(restarted.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
+
+    let derived = derive_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
+    derived.apply(&restarted);
+
+    // worker 1 never produced a block, yet its governance-set Static { fee: 500 } is recovered
+    // from the closing block's WorkerConfigs. NOTE: this assertion was
+    // `== MIN_PROTOCOL_BASE_FEE` before the F6 walk-back fix — restarting nodes now converge
+    // with the fee the live committee computed at the boundary.
+    assert_eq!(derived.fees[1], Some(500), "idle worker's fee derives from chain, not MIN");
+    assert_eq!(restarted.base_fee(1).base_fee(), 500);
+    // the standalone walk-back seam agrees
+    assert_eq!(derive_idle_worker_fee(&reth_env, 1, 1)?, 500);
+
+    // worker 0 folds from the fee its last genuine block carries and the epoch's real gas
+    let held_fee = closing.base_fee_per_gas.expect("executed blocks carry a base fee");
+    let (_blocks, live_gas_used, _limit) = gas_accumulator.get_values(0);
+    assert!(live_gas_used > 0, "epoch accumulated real gas");
+    assert_eq!(
+        derived.gas_totals.get(&0).copied().unwrap_or_default(),
+        live_gas_used,
+        "header scan must equal the live accumulator's inc_block gas total",
+    );
+    assert_eq!(
+        derived.fees[0],
+        Some(compute_next_base_fee_eip1559(held_fee, live_gas_used, 30_000_000)),
     );
 
     Ok(())
@@ -1223,15 +1305,22 @@ async fn test_derive_base_fees_eip1559_variant_matches_oracle() -> eyre::Result<
 ///
 /// An epoch that closes with NO batches makes the engine build a synthetic block that is stamped
 /// worker 0 and copies its PARENT's base fee (`batch_digest = B256::ZERO`, carried in
-/// `ommers_hash`). Without the genuine-block filter, `derive_base_fees_for_entered_epoch` would
-/// treat that block as worker 0's latest and fold a fee for it (`Some(..)`); with the filter the
-/// scanned range holds no genuine block, so worker 0's slot is `None`, gas totals are empty, and
-/// `apply` leaves the container untouched.
+/// `ommers_hash`). Genesis carries a non-MIN base fee here, so that copied fee is a
+/// distinguishable poison: without the genuine-block filter, `derive_base_fees_for_entered_epoch`
+/// would treat the synthetic block as worker 0's latest and fold its `Eip1559` config from the
+/// poison fee (a non-MIN result); with the filter the scanned range holds no genuine block, gas
+/// totals stay empty, and the F6 walk-back prices the worker from the epoch-0 MIN base case —
+/// `Some(MIN_PROTOCOL_BASE_FEE)`, exactly what the live committee held.
 #[tokio::test]
 async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("derive_excludes_synthetic").unwrap();
-    // registry + WorkerConfigs genesis: worker 0 Static { fee: 12_345 }
-    let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(1u8, 12_345u64)]);
+    // registry + WorkerConfigs genesis: worker 0 Eip1559 { target_gas: 30M } (strategy 0), with
+    // a genesis base fee the synthetic block will copy — provably different from the walk-back's
+    // epoch-0 MIN base case AND from any fold of it
+    let poison_fee = MIN_PROTOCOL_BASE_FEE + 777;
+    let mut genesis =
+        test_genesis_with_consensus_registry_and_workers(4, vec![(0u8, 30_000_000u64)]);
+    genesis.base_fee_per_gas = Some(poison_fee as u128);
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     let gas_accumulator = GasAccumulator::new(1);
@@ -1300,31 +1389,172 @@ async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<
     assert!(engine_result.is_err(), "engine should return error when stream closes");
 
     // the closing block is the synthetic empty-close shape: worker-0 stamped, zero batch
-    // digest in ommers_hash, parent's base fee copied, zero user gas
+    // digest in ommers_hash, parent's (non-MIN) base fee copied, zero user gas
     let closing = reth_env.finalized_header()?.expect("closing block finalized");
     assert_eq!(closing.number, 1);
     assert_eq!(RethEnv::extract_epoch_from_header(&closing), 0);
     assert_eq!(closing.ommers_hash, B256::ZERO, "synthetic block carries a zero batch digest");
     assert_eq!(
-        closing.base_fee_per_gas, parent.base_fee_per_gas,
+        closing.base_fee_per_gas,
+        Some(poison_fee),
         "synthetic block copies its parent's base fee - the attribution poison",
     );
+    assert_eq!(closing.base_fee_per_gas, parent.base_fee_per_gas);
     assert_eq!(closing.gas_used, 0, "system calls never count toward gas_used");
     assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch closed");
 
     let derived = derive_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
 
-    // without the is_worker_batch_block filter this would be vec![Some(..)]: the synthetic
-    // block's parent-copied fee attributed to worker 0 and folded through its config
-    assert_eq!(derived.num_workers, 1);
-    assert_eq!(derived.fees, vec![None], "synthetic close block must not attribute a fee");
-    assert!(derived.gas_totals.is_empty(), "no genuine blocks -> no gas attribution");
+    // the value a BROKEN filter would produce: the synthetic block's parent-copied fee
+    // attributed to worker 0 and folded through its Eip1559 config - provably distinct from
+    // the genuine walk-back result (the epoch-0 MIN base case)
+    let poisoned_fold = compute_next_base_fee_eip1559(poison_fee, 0, 30_000_000);
+    assert_ne!(
+        poisoned_fold, MIN_PROTOCOL_BASE_FEE,
+        "setup: the poison fold must be distinguishable from the walk-back value",
+    );
 
-    // applying a None slot must leave the worker's container untouched
+    // with the filter, the scanned range holds no genuine block, so worker 0's fee comes from
+    // the F6 walk-back: idle all of epoch 0 -> the epoch-0 base case -> MIN (the committee
+    // value; containers hold the MIN default until the first close)
+    assert_eq!(derived.num_workers, 1);
+    assert_eq!(
+        derived.fees,
+        vec![Some(MIN_PROTOCOL_BASE_FEE)],
+        "synthetic close block must not attribute a fee - the walk-back prices the worker",
+    );
+    assert!(derived.gas_totals.is_empty(), "no genuine blocks -> no gas attribution");
+    // the standalone walk-back seam agrees
+    assert_eq!(derive_idle_worker_fee(&reth_env, 1, 0)?, MIN_PROTOCOL_BASE_FEE);
+
+    // the fill guarantees apply() now writes EVERY configured worker: a stale container value
+    // is overwritten with the derived fee (before F6 the None slot left 4242 in place)
     let recovered = GasAccumulator::new(1);
     recovered.base_fee(0).set_base_fee(4242);
     derived.apply(&recovered);
-    assert_eq!(recovered.base_fee(0).base_fee(), 4242, "None slot must not touch the container");
+    assert_eq!(
+        recovered.base_fee(0).base_fee(),
+        MIN_PROTOCOL_BASE_FEE,
+        "apply must install the derived fee for every configured worker",
+    );
+
+    Ok(())
+}
+
+/// The walk-back reconstructs an idle worker's `Eip1559` fee across multiple boundaries: it
+/// anchors at the fee of the worker's last genuine block (in the last epoch it produced), then
+/// decays once per idle boundary — the exact `compute_next_base_fee_eip1559` chain the live
+/// committee's per-close `adjust_base_fees` ran.
+///
+/// Manual two-epoch chain (worker ids and fees stamped directly, like the F16 finality-lag
+/// test):
+/// - block 1 (epoch 0): worker 1's ONLY block, carrying a non-MIN fee — the anchor;
+/// - block 2: closes epoch 0 (worker 0);
+/// - block 3 (epoch 1): worker 0 only — worker 1 is idle;
+/// - block 4: closes epoch 1 (worker 0).
+///
+/// Pins both entry paths for the idle worker:
+/// - mid-epoch-1 (adopt path): `fill_absent_worker_fees` derives worker 1's fee = ONE boundary
+///   folded from the block-1 anchor;
+/// - entering epoch 2 (boundary path): `derive_idle_worker_fee` and the
+///   `derive_base_fees_for_entered_epoch` fill both equal the TWO-boundary oracle chain.
+#[tokio::test]
+async fn test_derive_idle_worker_fee_eip1559_decays_from_last_produced_epoch() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("derive_idle_eip1559").unwrap();
+    // 2-worker WorkerConfigs: worker 0 Eip1559 { 30M }, worker 1 Eip1559 { 1M } (strategy 0)
+    let target_gas = 1_000_000u64;
+    let genesis = test_genesis_with_consensus_registry_and_workers(
+        4,
+        vec![(0u8, 30_000_000u64), (0u8, target_gas)],
+    );
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // worker 1 held this fee during epoch 0: its only genuine block carries it on-chain
+    let worker1_fee = 1_000_000u64;
+    let no_txs: Vec<Vec<u8>> = vec![];
+
+    // block 1 (epoch 0): worker 1's only block
+    let genesis_header = chain.sealed_genesis_header();
+    let output1 = manual_consensus_output(0, 0, 1, false);
+    let payload1 = payload_with_base_fee(genesis_header.clone(), &output1, worker1_fee, 1);
+    let block1 =
+        reth_env.build_block_from_batch_payload(payload1, &no_txs, genesis_header.hash(), &[])?;
+    let block1_header = extend_canonical_chain(&reth_env, block1)?;
+
+    // block 2: closes epoch 0 (worker 0 at MIN)
+    let output2 = manual_consensus_output(1, 0, 2, true);
+    let payload2 = payload_with_base_fee(block1_header.clone(), &output2, MIN_PROTOCOL_BASE_FEE, 0);
+    let block2 =
+        reth_env.build_block_from_batch_payload(payload2, &no_txs, block1_header.hash(), &[])?;
+    let block2_header = extend_canonical_chain(&reth_env, block2)?;
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 closed");
+
+    // block 3 (epoch 1): worker 0 only - worker 1 goes idle
+    let output3 = manual_consensus_output(0, 1, 3, false);
+    let payload3 = payload_with_base_fee(block2_header.clone(), &output3, MIN_PROTOCOL_BASE_FEE, 0);
+    let block3 =
+        reth_env.build_block_from_batch_payload(payload3, &no_txs, block2_header.hash(), &[])?;
+    let block3_header = extend_canonical_chain(&reth_env, block3)?;
+    reth_env.finalize_block(block3_header.clone())?;
+
+    // one boundary folded from the block-1 anchor (its block carried no user gas)
+    let fee_entering_1 = compute_next_base_fee_eip1559(worker1_fee, 0, target_gas);
+    assert!(
+        fee_entering_1 > MIN_PROTOCOL_BASE_FEE,
+        "decay from a non-MIN anchor must stay non-MIN for the oracle to be meaningful",
+    );
+
+    // mid-epoch-1 restart (the adopt entry path): worker 1 has no block this epoch, so
+    // seed-from-chain has nothing to adopt; the fill derives its fee from the epoch-0 anchor.
+    // `chain_fees` mirrors what the entry scan reads from epoch 1's only block (worker 0, MIN).
+    let recovered = GasAccumulator::new(1);
+    let chain_fees = HashMap::from([(0u16, MIN_PROTOCOL_BASE_FEE)]);
+    fill_absent_worker_fees(&reth_env, 1, &block3_header, &chain_fees, &recovered)?;
+    assert_eq!(recovered.num_workers(), 2, "fill resizes to the on-chain worker count");
+    assert_eq!(
+        recovered.base_fee(1).base_fee(),
+        fee_entering_1,
+        "adopt-path fill derives the idle worker's fee from its last produced epoch",
+    );
+    assert_eq!(
+        recovered.base_fee(0).base_fee(),
+        MIN_PROTOCOL_BASE_FEE,
+        "workers present in chain_fees are not touched by the fill",
+    );
+    // the standalone seam agrees mid-epoch
+    assert_eq!(derive_idle_worker_fee(&reth_env, 1, 1)?, fee_entering_1);
+
+    // block 4: closes epoch 1 (worker 0 at MIN)
+    let output4 = manual_consensus_output(1, 1, 4, true);
+    let payload4 = payload_with_base_fee(block3_header.clone(), &output4, MIN_PROTOCOL_BASE_FEE, 0);
+    let block4 =
+        reth_env.build_block_from_batch_payload(payload4, &no_txs, block3_header.hash(), &[])?;
+    let block4_header = extend_canonical_chain(&reth_env, block4)?;
+    reth_env.finalize_block(block4_header.clone())?;
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 2, "epoch 1 closed");
+
+    // entering epoch 2: TWO boundaries folded from the anchor - the oracle decay chain
+    let fee_entering_2 = compute_next_base_fee_eip1559(fee_entering_1, 0, target_gas);
+    assert_ne!(fee_entering_2, fee_entering_1, "the second boundary must decay again");
+    assert_eq!(
+        derive_idle_worker_fee(&reth_env, 2, 1)?,
+        fee_entering_2,
+        "walk-back must equal the per-boundary eip1559 oracle chain",
+    );
+
+    // and the boundary-entry fill installs the same value for the idle worker
+    let derived = derive_base_fees_for_entered_epoch(&reth_env, 2, &block4_header)?;
+    assert_eq!(derived.num_workers, 2);
+    assert_eq!(derived.fees[1], Some(fee_entering_2), "entry fill covers the idle worker");
+    // worker 0 produced in epoch 1 (blocks 3 and 4 at MIN, zero gas): folds to MIN
+    assert_eq!(derived.fees[0], Some(MIN_PROTOCOL_BASE_FEE));
 
     Ok(())
 }

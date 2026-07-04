@@ -33,7 +33,7 @@ use tn_types::{
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier,
     SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, B256,
-    DEFAULT_WORKER_ID,
+    DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -373,8 +373,11 @@ pub struct DerivedBaseFees {
     /// The on-chain worker count read from `WorkerConfigs` at the previous epoch's closing block
     /// (i.e. the count for the entered epoch).
     pub num_workers: usize,
-    /// One slot per configured worker: `Some(fee)` to install, `None` when the worker produced no
-    /// genuine block in the scanned range (leave its container untouched).
+    /// One slot per configured worker. [`derive_base_fees_for_entered_epoch`] fills EVERY slot:
+    /// workers with a genuine block in the scanned range fold from that block's fee, and workers
+    /// without one derive from earlier closing-block state via [`derive_idle_worker_fee`]. `None`
+    /// (leave the container untouched) survives only as `fold_next_epoch_base_fees`' intermediate
+    /// for callers that fold without the walk-back fill.
     pub fees: Vec<Option<u64>>,
     /// The previous epoch's per-worker `gas_used` totals from the header scan. Exposed so tests
     /// can pin scan ≡ [`GasAccumulator::inc_block`] equivalence.
@@ -415,6 +418,11 @@ impl DerivedBaseFees {
 ///    ([`gas_used_per_worker`]) from the filtered slice.
 /// 4. Fold through the per-worker strategies read at `closing_header`
 ///    ([`fold_next_epoch_base_fees`]).
+/// 5. Any worker WITHOUT a genuine block in the scanned range (the fold's `None` slots) derives its
+///    fee from earlier closing-block state instead ([`derive_idle_worker_fee`]), so `apply`
+///    installs a fee for EVERY configured worker. Leaving such a slot at the fresh-restart MIN
+///    default would diverge from the live committee, whose close-time `adjust_base_fees` computed
+///    the idle worker's fee in memory.
 ///
 /// Errors (registry/config read failures, unresolvable headers) must bubble: fees are exact-match
 /// consensus values, so producing with an unverifiable fee is a safety failure while halting is
@@ -443,7 +451,22 @@ pub fn derive_base_fees_for_entered_epoch(
 
     // worker strategies and count at the closing block = the entered epoch's configuration
     let (num_workers, configs) = reth_env.get_worker_fee_configs_at_block(closing_header.hash())?;
-    let fees = fold_next_epoch_base_fees(&configs, &held_fees, &gas_totals);
+    let mut fees = fold_next_epoch_base_fees(&configs, &held_fees, &gas_totals);
+
+    // Workers with no genuine block in the prior epoch still have a chain-derivable fee: walk
+    // back through earlier closing blocks (last-produced anchor / `Static` pin / slot-creation
+    // anchor / epoch-0 MIN base case) so every configured worker recovers the value the live
+    // committee holds in memory.
+    for (worker_id, fee) in fees.iter_mut().enumerate() {
+        if fee.is_none() {
+            *fee = Some(derive_idle_worker_fee_at(
+                reth_env,
+                entered_epoch,
+                worker_id as WorkerId,
+                closing_header,
+            )?);
+        }
+    }
 
     info!(
         target: "epoch-manager",
@@ -458,6 +481,226 @@ pub fn derive_base_fees_for_entered_epoch(
     );
 
     Ok(DerivedBaseFees { num_workers, fees, gas_totals })
+}
+
+/// One boundary record collected by [`derive_idle_worker_fee`]'s backward walk.
+///
+/// A step describes the boundary INTO some epoch `k`: the worker's strategy read at epoch
+/// `k - 1`'s closing block, plus what epoch `k - 1`'s genuine blocks reveal about the worker.
+/// Folding a step ([`fold_forward`]) reproduces the `next_base_fee_for_config` application the
+/// live committee ran at that boundary's close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EpochFeeStep {
+    /// The worker's [`WorkerFeeConfig`] in force for the entered epoch, read at the boundary's
+    /// closing block (the only state allowed to define an epoch's configuration).
+    config: WorkerFeeConfig,
+    /// The base fee carried by the worker's LAST genuine block in the epoch that closed at this
+    /// boundary. `None` when the worker produced no genuine block — the chain does not reveal
+    /// the fee it held, so the walk must continue to an earlier anchor.
+    held_fee: Option<u64>,
+    /// The worker's summed `gas_used` over that epoch's genuine blocks (zero when idle).
+    gas_used: u64,
+}
+
+/// Fold a worker's base fee forward through boundary `steps` in CHRONOLOGICAL order.
+///
+/// Starting from `anchor` — the fee the worker held during the epoch below the earliest step's
+/// boundary — each step applies `next_base_fee_for_config(step.config, current, step.gas_used)`,
+/// the SAME formula a live `adjust_base_fees` ran at that boundary. The result is the fee the
+/// worker holds entering the epoch above the last step's boundary.
+pub(crate) fn fold_forward(anchor: u64, steps: &[EpochFeeStep]) -> u64 {
+    steps.iter().fold(anchor, |current, step| {
+        run_epoch::next_base_fee_for_config(step.config, current, step.gas_used)
+    })
+}
+
+/// Derive the base fee worker `worker_id` holds during `epoch` purely from on-chain state —
+/// including workers whose fee is NOT observable from `epoch`'s own blocks because they never
+/// produced one.
+///
+/// `latest_base_fee_per_worker`-style recovery only sees workers with on-chain blocks; an idle
+/// (or governance-added) worker's fee exists solely in live nodes' memory until its first block.
+/// This walk reconstructs that value: starting at the boundary into `epoch`, it steps backward
+/// one epoch boundary at a time, collecting one [`EpochFeeStep`] per boundary, until it reaches a
+/// chain-observable anchor, then folds forward ([`fold_forward`]) through the collected steps.
+///
+/// The walk resolves its first boundary from the pinned finalized header; see
+/// [`derive_idle_worker_fee_at`] for the per-boundary anchor rules and the closing-block pinning
+/// discipline. Errors bubble (same policy as [`derive_base_fees_for_entered_epoch`]): fees are
+/// exact-match consensus values, so halting beats producing with an unverifiable fee.
+pub fn derive_idle_worker_fee(
+    reth_env: &RethEnv,
+    epoch: Epoch,
+    worker_id: WorkerId,
+) -> eyre::Result<u64> {
+    // epoch-0 base case short-circuits before any chain read (see derive_idle_worker_fee_at)
+    if epoch == 0 {
+        return Ok(MIN_PROTOCOL_BASE_FEE);
+    }
+    let entry_header = reth_env.finalized_header()?.ok_or_else(|| {
+        eyre!("no finalized header to derive worker {worker_id}'s base fee for epoch {epoch}")
+    })?;
+    derive_idle_worker_fee_at(reth_env, epoch, worker_id, &entry_header)
+}
+
+/// [`derive_idle_worker_fee`] with the walk's first epoch-info read pinned to `entry_header`
+/// instead of a fresh `finalized_header()` read, so entry paths that already hold the pinned
+/// header keep every read on one source.
+///
+/// `entry_header` must carry registry state whose 4-epoch ring buffer covers `epoch` — true for
+/// both production entry shapes (the previous epoch's closing block, whose registry state IS
+/// `epoch`; or a mid-`epoch` tip). Every read is self-validating: `getEpochInfo` reverts on an
+/// epoch outside the ring buffer, so a revert means the walk's assumptions were genuinely
+/// violated and the error bubbles.
+///
+/// Walking `k = epoch, epoch - 1, ..`, each step resolves `S` = epoch `k - 1`'s closing block
+/// (`getEpochInfo(k).blockHeight - 1`; `concludeEpoch` stamps the entered epoch's first block at
+/// the close), reads the worker's strategy at `S` — configuration reads happen ONLY at closing
+/// blocks, because the previous epoch's closing state rules the entire epoch — and scans epoch
+/// `k - 1`'s genuine blocks. First match wins:
+/// 1. The worker produced in `k - 1`: anchor at its last genuine block's fee (fees only move at
+///    boundaries, so that block reveals the fee held all epoch) with the epoch's summed gas.
+/// 2. The strategy at `S` is `Static`: stop — the collected step pins the fee regardless of
+///    anything deeper (the anchor value is irrelevant; `fold_forward_static_anchor_absorbs_history`
+///    pins this).
+/// 3. The slot does not exist at `S`: the worker was governance-added at the first boundary ABOVE
+///    this one (already collected), so anchor at the fresh-slot MIN default — folding the earliest
+///    collected step then applies `next(config, MIN, 0)`, exactly how a live `adjust_base_fees`
+///    prices a governance-added worker at its first boundary.
+/// 4. Otherwise (an `Eip1559` strategy and no blocks): record the idle step and keep walking.
+/// 5. Reaching epoch 0 anchors at `MIN_PROTOCOL_BASE_FEE` for every worker and strategy, with no
+///    config read at genesis: containers hold the MIN default until the FIRST epoch close, so
+///    configured fees activate entering epoch 1 — recovery must mirror that live behavior.
+///
+/// `k` strictly decreases to an anchor or epoch 0, so the walk terminates in at most `epoch`
+/// steps; real walks are short (producing workers anchor in one step, `Static` absorbs
+/// immediately, new slots anchor at creation). Each step costs one epoch-info read, one config
+/// read, and one header-range scan. NOTE: the walk reads historical headers and historical
+/// contract state; TN nodes run reth in archive mode (no pruning), so full history is available.
+pub(crate) fn derive_idle_worker_fee_at(
+    reth_env: &RethEnv,
+    epoch: Epoch,
+    worker_id: WorkerId,
+    entry_header: &SealedHeader,
+) -> eyre::Result<u64> {
+    // Epoch-0 base case: every container holds MIN until the first close (rule 5). Do NOT price
+    // the genesis configuration here — it activates entering epoch 1.
+    if epoch == 0 {
+        return Ok(MIN_PROTOCOL_BASE_FEE);
+    }
+    let walk_start = std::time::Instant::now();
+
+    // steps collect newest-boundary-first; reversed into chronological order for the fold
+    let mut steps: Vec<EpochFeeStep> = Vec::new();
+    let mut k = epoch;
+    // epoch info for `k`, read at the current pinned state of the walk (initially the entry
+    // header, then each boundary's closing block — always within the registry's ring buffer)
+    let mut epoch_info = reth_env.get_epoch_info_at_block(k, entry_header.hash())?;
+
+    let anchor = loop {
+        // S = epoch k-1's closing block; a zero blockHeight for a started epoch k >= 1 means
+        // the chain view is genuinely inconsistent
+        let closing_number = epoch_info.blockHeight.checked_sub(1).ok_or_else(|| {
+            eyre!("epoch {k} reports blockHeight 0 while deriving worker {worker_id}'s base fee")
+        })?;
+        let closing = reth_env.sealed_header_by_number(closing_number)?.ok_or_else(|| {
+            eyre!("missing sealed header {closing_number} (epoch {} closing block)", k - 1)
+        })?;
+
+        // the strategy in force for epoch k, read at the closing block ONLY
+        let (_num_workers, configs) = reth_env.get_worker_fee_configs_at_block(closing.hash())?;
+        let Some(config) = configs.get(worker_id as usize).copied() else {
+            // rule 3: slot absent at this boundary — anchor at the fresh-slot MIN default
+            break MIN_PROTOCOL_BASE_FEE;
+        };
+
+        // scan epoch k-1's genuine worker blocks for this worker's last fee and summed gas
+        let prior_info = reth_env.get_epoch_info_at_block(k - 1, closing.hash())?;
+        let headers = reth_env.blocks_for_range(prior_info.blockHeight.max(1)..=closing_number)?;
+        let genuine: Vec<SealedHeader> =
+            headers.into_iter().filter(is_worker_batch_block).collect();
+        let held_fee = latest_base_fee_per_worker(&genuine).get(&worker_id).copied();
+        let gas_used = gas_used_per_worker(&genuine).get(&worker_id).copied().unwrap_or_default();
+
+        steps.push(EpochFeeStep { config, held_fee, gas_used });
+
+        // rule 1: the worker produced in k-1 — its last genuine block anchors the fold
+        if let Some(held) = steps.last().and_then(|step| step.held_fee) {
+            break held;
+        }
+        // rule 2: Static pins regardless of deeper history — the pushed step absorbs the anchor
+        if matches!(config, WorkerFeeConfig::Static { .. }) {
+            break MIN_PROTOCOL_BASE_FEE;
+        }
+
+        // rule 4: idle Eip1559 — continue to the previous boundary
+        k -= 1;
+        if k == 0 {
+            // rule 5: epoch-0 base case
+            break MIN_PROTOCOL_BASE_FEE;
+        }
+        epoch_info = prior_info;
+    };
+
+    steps.reverse();
+    let fee = fold_forward(anchor, &steps);
+
+    debug!(
+        target: "epoch-manager",
+        epoch,
+        worker_id,
+        anchor,
+        fee,
+        walk_depth = steps.len(),
+        elapsed = ?walk_start.elapsed(),
+        "derived idle worker base fee from prior closing-block configs"
+    );
+
+    Ok(fee)
+}
+
+/// Install chain-derived base fees for configured workers absent from `chain_fees` — the
+/// adopt-from-chain entry path's counterpart to [`derive_base_fees_for_entered_epoch`]'s fill.
+///
+/// A node entering mid-epoch adopts each worker's latest on-chain fee, but a configured worker
+/// with no block this epoch has nothing to adopt: after a restart its container holds the MIN
+/// default while the live committee holds the fee `adjust_base_fees` computed at the boundary.
+/// Each such worker's fee is derived from prior closing-block state instead
+/// ([`derive_idle_worker_fee_at`], pinned to the same `entry_header` the caller scanned with).
+///
+/// "Configured workers" is the `WorkerConfigs` count read at the previous epoch's closing block
+/// (`getEpochInfo(entered).blockHeight - 1`) — the same block [`sync_num_workers_from_chain`]
+/// reads, pinned per the closing-state rule. The accumulator is resized to that count first
+/// (normally a no-op after the entry's worker-count sync) so every configured slot exists.
+/// Workers present in `chain_fees` are untouched.
+///
+/// Errors bubble (same policy as [`derive_base_fees_for_entered_epoch`]): fees are exact-match
+/// consensus values, so halting beats producing with an unverifiable fee.
+pub fn fill_absent_worker_fees(
+    reth_env: &RethEnv,
+    entered_epoch: Epoch,
+    entry_header: &SealedHeader,
+    chain_fees: &HashMap<WorkerId, u64>,
+    gas_accumulator: &GasAccumulator,
+) -> eyre::Result<()> {
+    let epoch_info = reth_env.get_epoch_info_at_block(entered_epoch, entry_header.hash())?;
+    // constructor-seeded epoch 0 reports blockHeight 0; its "closing block" is genesis
+    let closing_number = epoch_info.blockHeight.saturating_sub(1);
+    let closing = reth_env.sealed_header_by_number(closing_number)?.ok_or_else(|| {
+        eyre!("missing sealed header {closing_number} (previous epoch's closing block)")
+    })?;
+    let (num_workers, _configs) = reth_env.get_worker_fee_configs_at_block(closing.hash())?;
+
+    gas_accumulator.set_num_workers(num_workers);
+    for worker_id in 0..num_workers {
+        let worker_id = worker_id as WorkerId;
+        if chain_fees.contains_key(&worker_id) {
+            continue;
+        }
+        let fee = derive_idle_worker_fee_at(reth_env, entered_epoch, worker_id, entry_header)?;
+        gas_accumulator.base_fee(worker_id).set_base_fee(fee);
+    }
+    Ok(())
 }
 
 /// Open the process-lifetime consensus DB, creating its directory if absent.
@@ -1197,5 +1440,85 @@ mod tests {
                 "fold diverged from next_base_fee_for_config for {config:?}",
             );
         }
+    }
+
+    /// An idle boundary step for the walk-back fold: no blocks, no gas.
+    fn idle_step(config: WorkerFeeConfig) -> EpochFeeStep {
+        EpochFeeStep { config, held_fee: None, gas_used: 0 }
+    }
+
+    #[test]
+    fn fold_forward_decays_eip1559_per_idle_epoch() {
+        // a worker idle for N epochs under an Eip1559 strategy decays once per boundary: each
+        // step applies next_base_fee_for_config(cfg, current, 0), exactly the chain a live
+        // committee's per-close adjust_base_fees would have run
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 };
+        let steps = [idle_step(cfg); 3];
+        let anchor = 1_000_000u64;
+
+        let mut oracle = anchor;
+        for _ in 0..steps.len() {
+            oracle = compute_next_base_fee_eip1559(oracle, 0, 1_000_000);
+        }
+
+        assert_eq!(fold_forward(anchor, &steps), oracle);
+        // the decay is real: three idle boundaries move a non-MIN fee down (and never below MIN)
+        assert!((MIN_PROTOCOL_BASE_FEE..anchor).contains(&oracle));
+        // and each boundary equals the one-formula seam
+        assert_eq!(
+            fold_forward(anchor, &steps[..1]),
+            run_epoch::next_base_fee_for_config(cfg, anchor, 0),
+        );
+    }
+
+    #[test]
+    fn fold_forward_static_anchor_absorbs_history() {
+        // a Static boundary pins the fee regardless of anything deeper: two wildly different
+        // anchors converge to the same result. This property is what lets the walk stop at a
+        // Static config without resolving deeper history.
+        let eip = idle_step(WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 });
+        let steps = [idle_step(WorkerFeeConfig::Static { fee: 500 }), eip, eip];
+
+        assert_eq!(fold_forward(MIN_PROTOCOL_BASE_FEE, &steps), fold_forward(9_999_999, &steps));
+        // and the result is exactly the fold from the pinned 500 through the later boundaries
+        assert_eq!(fold_forward(MIN_PROTOCOL_BASE_FEE, &steps), fold_forward(500, &steps[1..]));
+    }
+
+    #[test]
+    fn fold_forward_from_min_stays_min() {
+        // Eip1559 decay from MIN floors at MIN, so a never-produced worker walking to the
+        // epoch-0 base case folds trivially: MIN in, MIN out, any number of idle boundaries
+        let steps = [idle_step(WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 }); 4];
+        assert_eq!(fold_forward(MIN_PROTOCOL_BASE_FEE, &steps), MIN_PROTOCOL_BASE_FEE);
+    }
+
+    #[test]
+    fn fold_forward_anchors_min_at_worker_creation_boundary() {
+        // a slot that first appears at boundary S' anchors at MIN below it, so the earliest
+        // step applies next(config@S', MIN, 0) — how a live adjust_base_fees prices a
+        // governance-added worker at its first boundary
+        let creation_static = idle_step(WorkerFeeConfig::Static { fee: 800 });
+        assert_eq!(
+            fold_forward(MIN_PROTOCOL_BASE_FEE, &[creation_static]),
+            run_epoch::next_base_fee_for_config(
+                WorkerFeeConfig::Static { fee: 800 },
+                MIN_PROTOCOL_BASE_FEE,
+                0,
+            ),
+        );
+
+        // an Eip1559 creation strategy prices the new worker at MIN
+        let creation_eip = idle_step(WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 });
+        assert_eq!(fold_forward(MIN_PROTOCOL_BASE_FEE, &[creation_eip]), MIN_PROTOCOL_BASE_FEE);
+
+        // later boundaries fold from the creation-priced fee
+        assert_eq!(
+            fold_forward(MIN_PROTOCOL_BASE_FEE, &[creation_static, creation_eip]),
+            run_epoch::next_base_fee_for_config(
+                WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 },
+                800,
+                0,
+            ),
+        );
     }
 }

@@ -153,7 +153,10 @@ where
         // Base-fee-from-chain at entry: classify the pinned finalized tip against the epoch
         // being entered.
         //  - tip already IN the entered epoch: a syncing/restarting node adopts each worker's
-        //    latest on-chain base fee (the fee is already baked into this epoch's blocks).
+        //    latest on-chain base fee (the fee is already baked into this epoch's blocks);
+        //    configured workers WITHOUT a block this epoch derive theirs from prior closing-block
+        //    state (`fill_absent_worker_fees`) — the value otherwise lives only in live nodes'
+        //    memory.
         //  - tip is the PREVIOUS epoch's closing block: derive the entered epoch's fees as a pure
         //    function of the prior epoch's chain state. This is the single seam every boundary
         //    shape converges on: the live producer that just crossed (recomputing the identical
@@ -182,6 +185,18 @@ where
                         .blocks_for_range(epoch_state.epoch_info.blockHeight..=tip.number)?;
                     let chain_fees = super::latest_base_fee_per_worker(&blocks);
                     seed_base_fees_from_chain(entered, tip_epoch, &chain_fees, &gas_accumulator);
+                    // Configured workers absent from the epoch's blocks have no fee to adopt:
+                    // derive theirs from prior closing-block state (pinned to the same `tip`)
+                    // so this node converges with the live committee for EVERY worker.
+                    // Derivation failure is a hard error for the same reason as the boundary
+                    // branch below.
+                    super::fill_absent_worker_fees(
+                        &reth_env,
+                        entered,
+                        &tip,
+                        &chain_fees,
+                        &gas_accumulator,
+                    )?;
                 } else if entered > 0 && tip_epoch == entered - 1 {
                     // The tip IS the previous epoch's closing block: its nonce still carries the
                     // old epoch while the registry state it holds already reports the new one.
@@ -719,7 +734,9 @@ pub(crate) fn next_base_fee_for_config(
 /// When `tip_epoch == entered_epoch` the canonical tip is already in the epoch being entered, so
 /// the node is syncing/restarting and adopts each worker's latest on-chain base fee from
 /// `chain_fees`. When the epochs differ the values already held are kept untouched. Workers
-/// absent from `chain_fees` (no block produced this epoch) are left as-is.
+/// absent from `chain_fees` (no block produced this epoch) are left as-is BY THIS HELPER — the
+/// `run_epoch` call site follows up with `fill_absent_worker_fees`, which derives those workers'
+/// fees from prior closing-block state (their value is not observable from this epoch's blocks).
 ///
 /// NOTE: `run_epoch` now only calls this on the `tip_epoch == entered_epoch` branch; a tip on
 /// the previous epoch's closing block routes through `derive_base_fees_for_entered_epoch`
