@@ -33,7 +33,10 @@ use std::{path::Path, time::Duration};
 use alloy::providers::{Provider, ProviderBuilder};
 use serde_json::Value;
 use tn_reth::system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS};
-use tn_types::{get_available_tcp_port, Address, MIN_PROTOCOL_BASE_FEE};
+use tn_types::{
+    gas_accumulator::compute_next_base_fee_eip1559, get_available_tcp_port, Address,
+    MIN_PROTOCOL_BASE_FEE,
+};
 use tokio::time::Instant;
 use tracing::info;
 
@@ -227,7 +230,8 @@ async fn test_eip1559_fee_rises_at_epoch_boundaries() -> eyre::Result<()> {
          Check test_logs/basefee_eip1559/."
     );
 
-    // Assertion 1: monotonic non-decreasing, never below the protocol floor.
+    // Assertion 1: monotonic non-decreasing, never below the protocol floor (smoke checks), and
+    // the EXACT oracle step for consecutive-epoch records.
     for window in fees.windows(2) {
         let (pe, pb, pf) = window[0];
         let (ne, nb, nf) = window[1];
@@ -236,6 +240,23 @@ async fn test_eip1559_fee_rises_at_epoch_boundaries() -> eyre::Result<()> {
             "base fee decreased: epoch {pe} block {pb} fee {pf} -> epoch {ne} block {nb} fee {nf}; series {fees:?}"
         );
         assert!(nf >= MIN_PROTOCOL_BASE_FEE, "fee below MIN at epoch {ne}: {nf}");
+
+        // Exact-step check: when two records are exactly one epoch apart, epoch `pe` carried the
+        // one 21k-gas tx landed above (hard-fail guarantees it), so epoch `ne`'s fee must equal
+        // the tn-types oracle output precisely. A wrong denominator, a double-applied adjustment,
+        // or a fee applied one epoch late all satisfy the inequalities but not this. (With
+        // `target_gas = 1` the oracle clamps `gas_used` to the 2-gas elasticity bound, so the
+        // expected step is insensitive to any extra gas that lands in the epoch.)
+        // `wait_for_epoch_at_least` can overshoot boundaries between records, so non-consecutive
+        // pairs are covered only by the inequalities above.
+        if ne == pe + 1 {
+            let expected = compute_next_base_fee_eip1559(pf, 21_000, 1);
+            assert_eq!(
+                nf, expected,
+                "exact EIP-1559 step violated: epoch {pe} fee {pf} (21k gas against target 1) \
+                 must yield {expected} in epoch {ne}, got {nf}; series {fees:?}"
+            );
+        }
     }
 
     // Assertion 2: by the last recorded epoch the fee strictly exceeds MIN (gas drove it up).
