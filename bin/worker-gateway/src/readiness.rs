@@ -148,7 +148,26 @@ pub(crate) async fn run_poller(
                                 poll_timeout,
                             )
                             .await;
-                            upstream.ready.store(ready, Ordering::Relaxed);
+                            let previous = upstream.ready.swap(ready, Ordering::Relaxed);
+                            // Log transitions at an operator-visible level (the
+                            // default filter is `info`); per-poll noise stays at
+                            // debug. Without this, a 503 `/ready` is
+                            // undiagnosable from the default logs.
+                            if previous != ready {
+                                if ready {
+                                    tracing::info!(
+                                        target: "gateway::readiness",
+                                        worker_id = upstream.worker_id,
+                                        "upstream worker became ready"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        target: "gateway::readiness",
+                                        worker_id = upstream.worker_id,
+                                        "upstream worker became not-ready"
+                                    );
+                                }
+                            }
                             false
                         }
                     })

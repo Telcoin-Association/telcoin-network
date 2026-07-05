@@ -1,6 +1,11 @@
 //! Command-line interface and resolved runtime settings.
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
+    path::PathBuf,
+    time::Duration,
+};
 
 use clap::Parser;
 use url::Url;
@@ -21,7 +26,7 @@ pub(crate) struct Cli {
     #[arg(
         long,
         env = "WORKER_GATEWAY_CONFIG",
-        conflicts_with_all = ["upstream_rpc_url", "upstream_readiness_url"]
+        conflicts_with_all = ["upstream_rpc_url", "upstream_readiness_url", "worker_id"]
     )]
     pub(crate) config: Option<PathBuf>,
 
@@ -76,10 +81,25 @@ pub(crate) struct Cli {
     )]
     pub(crate) upstream_request_timeout: Duration,
 
+    /// How long a new connection may take to send its complete request headers
+    /// before it is disconnected (slow-loris guard).
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_HEADER_READ_TIMEOUT",
+        default_value = "10s",
+        value_parser = humantime::parse_duration
+    )]
+    pub(crate) header_read_timeout: Duration,
+
+    /// Maximum concurrently-open inbound connections; further connections wait
+    /// in the OS accept backlog until a slot frees up.
+    #[arg(long, env = "WORKER_GATEWAY_MAX_CONNECTIONS", default_value = "500")]
+    pub(crate) max_connections: NonZeroUsize,
+
     /// How long to drain in-flight requests on SIGTERM before forcing close.
     #[arg(
         long,
-        env = "GRACEFUL_SHUTDOWN_TIMEOUT",
+        env = "WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT",
         default_value = "30s",
         value_parser = humantime::parse_duration
     )]
@@ -105,6 +125,10 @@ pub(crate) struct Settings {
     pub(crate) upstream_connect_timeout: Duration,
     /// Upstream per-request deadline.
     pub(crate) upstream_request_timeout: Duration,
+    /// Inbound header read deadline (slow-loris guard).
+    pub(crate) header_read_timeout: Duration,
+    /// Maximum concurrently-open inbound connections.
+    pub(crate) max_connections: NonZeroUsize,
     /// Graceful-shutdown drain deadline.
     pub(crate) graceful_shutdown_timeout: Duration,
 }
@@ -117,7 +141,9 @@ impl Cli {
         eyre::ensure!(!upstreams.is_empty(), "no upstream workers configured");
         upstreams.iter().try_for_each(|upstream| {
             ensure_http_scheme(&upstream.rpc_url)?;
-            ensure_http_scheme(&upstream.readiness_url)
+            ensure_http_scheme(&upstream.readiness_url)?;
+            ensure_not_gateway(self.listen_addr, &upstream.rpc_url)?;
+            ensure_not_gateway(self.listen_addr, &upstream.readiness_url)
         })?;
         Ok(Settings {
             listen_addr: self.listen_addr,
@@ -126,6 +152,8 @@ impl Cli {
             readiness_poll_timeout: self.readiness_poll_timeout,
             upstream_connect_timeout: self.upstream_connect_timeout,
             upstream_request_timeout: self.upstream_request_timeout,
+            header_read_timeout: self.header_read_timeout,
+            max_connections: self.max_connections,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
         })
     }
@@ -168,6 +196,43 @@ fn ensure_http_scheme(url: &Url) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Reject an upstream URL that can only point back at the gateway itself (a
+/// loopback/unspecified host, or the listen interface, on the listen port):
+/// forwarding to it would loop. The default listen port (`8545`) matches the
+/// worker's default RPC port, so a single-host setup left on defaults hits
+/// this. The runtime hop-header guard (see [`crate::proxy`]) catches the
+/// loops this startup check cannot see, e.g. a VIP that fronts the gateways.
+fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
+    let same_port = url.port_or_known_default() == Some(listen_addr.port());
+    let listen_ip = listen_addr.ip();
+    let hits_gateway = url_host_ip(url)
+        .map(|ip| {
+            let same_family = ip.is_ipv4() == listen_ip.is_ipv4();
+            ip == listen_ip
+                || (same_family && ip.is_unspecified())
+                || (same_family && ip.is_loopback() && listen_ip.is_unspecified())
+        })
+        .unwrap_or(false);
+    eyre::ensure!(
+        !(same_port && hits_gateway),
+        "upstream URL `{url}` points at the gateway's own listen address ({listen_addr}), \
+         so forwarding to it would loop; change the upstream URL or --listen-addr"
+    );
+    Ok(())
+}
+
+/// The upstream host as an IP when it names one (`localhost` counts; other
+/// domain names cannot be checked without resolving them).
+fn url_host_ip(url: &Url) -> Option<IpAddr> {
+    url.host().and_then(|host| match host {
+        url::Host::Domain(name) => {
+            name.eq_ignore_ascii_case("localhost").then_some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        }
+        url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
+        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,8 +255,41 @@ mod tests {
     fn inline_upstream_resolves() -> eyre::Result<()> {
         let settings = cli_with(
             None,
+            Some("http://127.0.0.1:8544"),
+            Some("http://127.0.0.1:8551/health/workers"),
+        )
+        .into_settings()?;
+        assert_eq!(settings.upstreams.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_id_conflicts_with_config() {
+        let result =
+            Cli::try_parse_from(["worker-gateway", "--config=gateway.yaml", "--worker-id=3"]);
+        assert!(result.is_err(), "--worker-id alongside --config must error, not be ignored");
+    }
+
+    #[test]
+    fn self_pointing_upstream_is_rejected() {
+        // Default listen address is 0.0.0.0:8545; a loopback upstream on the
+        // same port is the gateway itself, and forwarding to it would loop.
+        let result = cli_with(
+            None,
             Some("http://127.0.0.1:8545"),
             Some("http://127.0.0.1:8551/health/workers"),
+        )
+        .into_settings();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn same_port_on_another_host_is_accepted() -> eyre::Result<()> {
+        // Port reuse across hosts is the normal deployment shape.
+        let settings = cli_with(
+            None,
+            Some("http://10.0.0.7:8545"),
+            Some("http://10.0.0.7:8551/health/workers"),
         )
         .into_settings()?;
         assert_eq!(settings.upstreams.len(), 1);

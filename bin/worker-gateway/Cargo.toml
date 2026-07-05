@@ -25,13 +25,17 @@ tokio = { workspace = true, features = [
     "sync",
     "signal",
     "macros",
+    "io-util",
 ] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi", "std"] }
 
 # http server + client
 axum = { workspace = true, features = ["json", "tokio", "http1"] }
-reqwest = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+tower-http = { workspace = true }
 
 # config + serde
 serde = { workspace = true }

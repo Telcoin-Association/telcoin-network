@@ -1,10 +1,12 @@
 # worker-gateway
 
 A stateless reverse proxy that fronts a Telcoin Network worker's JSON-RPC
-endpoint. It forwards the full JSON-RPC surface (`eth_*` / `net_*` / `web3_*` /
-`tn_*`) verbatim to a ready upstream worker, gates traffic on a polled
-per-worker readiness signal, and exposes its own liveness and readiness
-endpoints so an orchestrator can route around it.
+endpoint. It forwards the full JSON-RPC method surface (`eth_*` / `net_*` /
+`web3_*` / `tn_*`) unchanged to a ready upstream worker, gates traffic on a
+polled per-worker readiness signal, and exposes its own liveness and readiness
+endpoints so an orchestrator can route around it. "Unchanged" applies to the
+request method, JSON-RPC body, and content type; the header contract is
+deliberately minimal (see Scope).
 
 Because every instance is stateless and identical, the gateway can be scaled
 horizontally: any replica can serve any request. This is PR2 of the epic
@@ -24,6 +26,15 @@ observability/deployment (Prometheus, Dockerfile, k8s/HPA) land in PR3 and PR4.
   without a config change; v1 implements none of that selection.
 - TLS termination and auth/API keys are out of scope; run the gateway behind
   your own ingress/mTLS.
+- Header forwarding is minimal. Upstream gets the request method, body, and
+  `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (real client
+  identity) and the `X-TN-Gateway` hop marker (loop protection). The client
+  gets the upstream status, body, and `Content-Type`. All other headers are
+  dropped in both directions; in particular CORS is not terminated here, so
+  browser dApps need CORS handled at the ingress (or a later PR).
+- The request path and query string are not forwarded: every request goes to
+  the configured upstream base URL (JSON-RPC carries its method in the body,
+  so `POST /` is the whole HTTP surface).
 
 ## Readiness contract
 
@@ -53,10 +64,17 @@ Inline:
 
 ```
 worker-gateway \
+  --listen-addr 0.0.0.0:8080 \
   --upstream-rpc-url http://127.0.0.1:8545 \
   --upstream-readiness-url http://127.0.0.1:8551/health/workers \
   --worker-id 0
 ```
+
+The default listen port (`8545`) deliberately matches the worker's default RPC
+port so the gateway is a drop-in edge for clients; on a single host that means
+`--listen-addr` must be set (as above). An upstream URL that points back at
+the gateway's own listen address is rejected at startup, so defaults plus a
+loopback upstream fail fast instead of looping.
 
 YAML (`--config gateway.yaml`):
 
@@ -82,10 +100,31 @@ Every flag has an environment-variable fallback.
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
 | `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `30s` | Upstream per-request deadline. |
-| `--graceful-shutdown-timeout` | `GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
+| `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
+| `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
+| `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 
 Durations use `humantime` syntax (`5s`, `2m`, `500ms`).
+
+## Connection handling
+
+Every inbound connection is served with a header read deadline
+(`--header-read-timeout`), `TCP_NODELAY`, and a global concurrency cap
+(`--max-connections`; further connections wait in the OS accept backlog).
+Each request additionally has a whole-request deadline of
+`--upstream-request-timeout` + `--header-read-timeout` covering the body read
+and the upstream response headers, so a request body trickled in below the
+size limit cannot hold a slot indefinitely.
+
+Upstream response bodies are streamed through, never buffered whole, so
+response size does not translate into gateway memory; a stalled stream is
+bounded by the upstream request timeout.
+
+Every forwarded request carries the `X-TN-Gateway` hop marker, and an inbound
+request that already carries it is rejected (HTTP `508`), so a misconfigured
+upstream or VIP that points back at a gateway breaks the loop at the first
+revisit instead of exhausting file descriptors.
 
 ## Gateway endpoints
 
@@ -105,6 +144,15 @@ echoed when it can be recovered.
 | No upstream ready | `503` | `-32000` |
 | Upstream unreachable | `502` | `-32001` |
 | Upstream request timed out | `504` | `-32002` |
+| Request body too large | `413` | `-32003` |
+| Proxy loop detected | `508` | `-32004` |
+| Request deadline exceeded | `408` | `-32005` |
+| Request body unreadable (client aborted) | `400` | `-32600` |
+
+The gateway's own codes sit in the JSON-RPC server-error range
+(`-32000..=-32099`), which upstream servers also use for their errors;
+disambiguate by HTTP status and message, not by code alone (`-32600` is the
+spec's standard "Invalid Request" code).
 
 ## Graceful shutdown
 

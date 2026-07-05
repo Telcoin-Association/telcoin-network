@@ -10,7 +10,7 @@ use tracing::info;
 use crate::{
     cli::Settings,
     readiness::{run_poller, GatewayReadiness},
-    server::{serve, AppState},
+    server::{serve, AppState, ServerLimits},
 };
 
 /// Run the gateway until SIGTERM / ctrl-c.
@@ -26,6 +26,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         readiness_poll_timeout,
         upstream_connect_timeout,
         upstream_request_timeout,
+        header_read_timeout,
+        max_connections,
         graceful_shutdown_timeout,
     } = settings;
 
@@ -69,15 +71,19 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         ),
     );
 
+    let limits = ServerLimits {
+        header_read_timeout,
+        // One deadline must fit the body read plus the upstream response
+        // headers: the upstream hop is bounded by its own request timeout, and
+        // the body read gets a header-scale budget on top, so a trickled body
+        // cannot hold a request slot indefinitely.
+        request_deadline: upstream_request_timeout.saturating_add(header_read_timeout),
+        max_connections,
+    };
+
     spawner.spawn_critical_task(
         "gateway-server",
-        serve(
-            listen_addr,
-            state,
-            graceful_shutdown_timeout,
-            shutdown.subscribe(),
-            shutdown.subscribe(),
-        ),
+        serve(listen_addr, state, limits, graceful_shutdown_timeout, shutdown.subscribe()),
     );
 
     task_manager.join_until_exit(shutdown).await?;

@@ -1,11 +1,11 @@
 //! Telcoin Network worker gateway.
 //!
 //! A stateless reverse proxy that fronts the worker JSON-RPC endpoint. It
-//! forwards the full JSON-RPC surface (`eth_*` / `net_*` / `web3_*` / `tn_*`)
-//! verbatim to a ready upstream worker, gates traffic on a polled per-worker
-//! readiness signal (`GET /health/workers`), and exposes its own liveness and
-//! readiness endpoints for orchestration. See the crate `README.md` for the
-//! configuration and readiness contract.
+//! forwards the full JSON-RPC method surface (`eth_*` / `net_*` / `web3_*` /
+//! `tn_*`) unchanged to a ready upstream worker, gates traffic on a polled
+//! per-worker readiness signal (`GET /health/workers`), and exposes its own
+//! liveness and readiness endpoints for orchestration. See the crate
+//! `README.md` for the configuration, forwarding, and readiness contracts.
 
 mod app;
 mod cli;

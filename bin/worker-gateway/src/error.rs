@@ -14,9 +14,11 @@ use serde_json::{json, Value};
 
 /// JSON-RPC 2.0 error codes used by the gateway.
 ///
-/// These sit in the implementation-defined server-error range
-/// (`-32000..=-32099`) reserved by the JSON-RPC 2.0 spec, so they never
-/// collide with an upstream worker's own application error codes.
+/// The gateway-specific codes sit in the implementation-defined server-error
+/// range (`-32000..=-32099`) of the JSON-RPC 2.0 spec. Upstream servers use
+/// the same range for their own errors (jsonrpsee's call errors start at
+/// `-32000`), so a code alone does not identify the gateway as the source;
+/// clients should disambiguate by the HTTP status and message.
 mod code {
     /// No upstream worker is currently ready to serve the request.
     pub(super) const NO_UPSTREAM_READY: i32 = -32000;
@@ -26,6 +28,13 @@ mod code {
     pub(super) const UPSTREAM_TIMEOUT: i32 = -32002;
     /// The request body exceeded the gateway's size limit.
     pub(super) const REQUEST_TOO_LARGE: i32 = -32003;
+    /// The request already passed through a worker gateway (forwarding loop).
+    pub(super) const LOOP_DETECTED: i32 = -32004;
+    /// The request did not complete within the gateway's request deadline.
+    pub(super) const REQUEST_TIMEOUT: i32 = -32005;
+    /// The request body could not be read. This is the spec-defined
+    /// "Invalid Request" code, not a gateway-range code.
+    pub(super) const INVALID_REQUEST: i32 = -32600;
 }
 
 /// A gateway-side failure surfaced to the client as a JSON-RPC error.
@@ -39,6 +48,12 @@ pub(crate) enum GatewayError {
     UpstreamTimeout,
     /// The request body exceeded the gateway's size limit.
     RequestTooLarge,
+    /// The request already carried the gateway's hop marker (forwarding loop).
+    LoopDetected,
+    /// The request did not complete within the gateway's request deadline.
+    RequestTimeout,
+    /// The request body could not be read (e.g. the client aborted mid-body).
+    UnreadableBody,
 }
 
 impl GatewayError {
@@ -49,6 +64,9 @@ impl GatewayError {
             Self::UpstreamUnreachable => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::LoopDetected => StatusCode::LOOP_DETECTED,
+            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
+            Self::UnreadableBody => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -59,6 +77,9 @@ impl GatewayError {
             Self::UpstreamUnreachable => code::UPSTREAM_UNREACHABLE,
             Self::UpstreamTimeout => code::UPSTREAM_TIMEOUT,
             Self::RequestTooLarge => code::REQUEST_TOO_LARGE,
+            Self::LoopDetected => code::LOOP_DETECTED,
+            Self::RequestTimeout => code::REQUEST_TIMEOUT,
+            Self::UnreadableBody => code::INVALID_REQUEST,
         }
     }
 
@@ -69,6 +90,11 @@ impl GatewayError {
             Self::UpstreamUnreachable => "upstream worker unreachable",
             Self::UpstreamTimeout => "upstream worker request timed out",
             Self::RequestTooLarge => "request body too large",
+            Self::LoopDetected => {
+                "proxy loop detected: request already passed through a worker gateway"
+            }
+            Self::RequestTimeout => "request did not complete within the gateway's deadline",
+            Self::UnreadableBody => "request body could not be read",
         }
     }
 }
@@ -148,6 +174,18 @@ mod tests {
         assert_eq!(
             error_response(&GatewayError::UpstreamTimeout, b"{}").status(),
             StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
+            error_response(&GatewayError::LoopDetected, b"{}").status(),
+            StatusCode::LOOP_DETECTED
+        );
+        assert_eq!(
+            error_response(&GatewayError::RequestTimeout, b"{}").status(),
+            StatusCode::REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            error_response(&GatewayError::UnreadableBody, b"{}").status(),
+            StatusCode::BAD_REQUEST
         );
     }
 }
