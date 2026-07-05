@@ -1593,7 +1593,7 @@ where
                     .put(record)
                     .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
                 trace!(target: "network-kad", "Got record {key} {value:?}");
-                self.swarm.behaviour_mut().peer_manager.add_known_peer(key, value.info);
+                self.swarm.behaviour_mut().peer_manager.add_discovered_peer(key, value.info);
             } else {
                 // A peer republishing a slightly stale (but signature-valid) record is
                 // expected after restarts and benign — the local store keeps the newer
@@ -1683,7 +1683,7 @@ where
                 self.swarm
                     .behaviour_mut()
                     .peer_manager
-                    .add_known_peer(query.request, node_record.info);
+                    .add_discovered_peer(query.request, node_record.info);
             }
         }
     }

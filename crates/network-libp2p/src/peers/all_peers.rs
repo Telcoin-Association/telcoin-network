@@ -1136,6 +1136,19 @@ impl AllPeers {
         self.apply_committee_membership(committee)
     }
 
+    /// Whether `bls_key` sits in any tracked committee slot (previous, current, or next).
+    ///
+    /// Committee membership is set every epoch from authoritative consensus state, so this is the
+    /// authority on whether a peer record is worth retaining: a key in no slot is neither a
+    /// current, outgoing, nor incoming validator. Used to bound the peer manager's `known_peers`
+    /// cache against records for arbitrary keys (see
+    /// [`super::manager::PeerManager::add_discovered_peer`]).
+    pub(super) fn is_committee_member(&self, bls_key: &BlsPublicKey) -> bool {
+        self.previous_committee.contains(bls_key)
+            || self.current_committee.contains(bls_key)
+            || self.next_committee.contains(bls_key)
+    }
+
     /// Lazily apply committee membership to a single member the moment its network identity is
     /// learned.
     ///
@@ -1149,10 +1162,7 @@ impl AllPeers {
         &mut self,
         bls_key: BlsPublicKey,
     ) -> Vec<(PeerId, PeerAction)> {
-        if self.previous_committee.contains(&bls_key)
-            || self.current_committee.contains(&bls_key)
-            || self.next_committee.contains(&bls_key)
-        {
+        if self.is_committee_member(&bls_key) {
             self.apply_committee_membership(std::iter::once(bls_key))
         } else {
             Vec::new()

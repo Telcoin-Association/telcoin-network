@@ -733,6 +733,86 @@ async fn test_add_known_peer_closes_validator_gap_on_discovery() {
     );
 }
 
+/// Build a well-formed [`NetworkInfo`] with a fresh, random network identity.
+fn random_network_info() -> NetworkInfo {
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    }
+}
+
+#[tokio::test]
+async fn test_discovered_peers_bounded_to_committee_membership() {
+    // Regression (issue #827): a flood of signature-valid kad records for fresh, non-committee keys
+    // must not grow `known_peers`. Only records whose key is a tracked committee member are cached.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a single legitimate current-committee member, tracked by bls before its identity is known
+    let mut rng = StdRng::from_seed([11; 32]);
+    let committee_bls = *BlsKeypair::generate(&mut rng).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([committee_bls]), HashSet::new());
+    assert!(peer_manager.known_peers.is_empty(), "no records cached before discovery");
+
+    // an attacker publishes many valid records for endless fresh keys it controls; none are
+    // committee members, so every one is dropped and `known_peers` never grows
+    let mut attacker_rng = StdRng::from_seed([42; 32]);
+    for _ in 0..1_000 {
+        let attacker_bls = *BlsKeypair::generate(&mut attacker_rng).public();
+        peer_manager.add_discovered_peer(attacker_bls, random_network_info());
+    }
+    assert!(
+        peer_manager.known_peers.is_empty(),
+        "non-committee discovered records must all be dropped"
+    );
+
+    // the legitimate committee member's record, arriving via the same discovery path, IS cached
+    peer_manager.add_discovered_peer(committee_bls, random_network_info());
+    assert!(
+        peer_manager.known_peers.contains_key(&committee_bls),
+        "a committee member discovered via kad must be cached"
+    );
+    assert!(peer_manager.known_peers.len() == 1, "only the committee member is cached");
+}
+
+#[tokio::test]
+async fn test_known_peers_pruned_on_rotation_but_pinned_survive() {
+    // Regression (issue #827): committee members discovered in one epoch must not accumulate across
+    // rotations, while operator-provisioned (pinned) peers must never be evicted.
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([13; 32]);
+
+    // an operator/bootstrap peer added via `add_known_peer` is pinned even though it is never a
+    // committee member
+    let pinned_bls = *BlsKeypair::generate(&mut rng).public();
+    peer_manager.add_known_peer(pinned_bls, random_network_info());
+
+    // a committee member discovered this epoch via the kad path
+    let member_bls = *BlsKeypair::generate(&mut rng).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([member_bls]), HashSet::new());
+    peer_manager.add_discovered_peer(member_bls, random_network_info());
+    assert!(peer_manager.known_peers.contains_key(&member_bls), "member cached while in committee");
+    assert!(peer_manager.known_peers.contains_key(&pinned_bls), "pinned peer cached");
+
+    // next epoch: `member_bls` falls out of every slot (a member still in `previous` would be kept
+    // one more epoch); a fresh committee replaces it
+    let mut next_rng = StdRng::from_seed([99; 32]);
+    let new_member = *BlsKeypair::generate(&mut next_rng).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([new_member]), HashSet::new());
+
+    // the rotated-out member is pruned; the pinned operator peer survives
+    assert!(
+        !peer_manager.known_peers.contains_key(&member_bls),
+        "rotated-out member must be pruned"
+    );
+    assert!(
+        peer_manager.known_peers.contains_key(&pinned_bls),
+        "pinned operator peer must survive rotation"
+    );
+}
+
 #[tokio::test]
 async fn test_register_outgoing_connection() {
     let mut peer_manager = create_test_peer_manager(None);
