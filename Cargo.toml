@@ -201,7 +201,7 @@ ouroboros = "0.17"
 proc-macro2 = "1.0.47"
 uint = "0.10"
 cfg-if = "1.0.0"
-lru = "0.10"
+lru = "0.16"
 tokio-stream = { version = "0.1.14", features = ["sync", "net"] }
 serde_yaml = "0.8.26"
 byteorder = "1.4.3"
