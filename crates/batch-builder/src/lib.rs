@@ -672,10 +672,9 @@ mod tests {
             // all 3 transactions present
             assert_eq!(sealed_batch.batch().transactions().len(), 3 + subdag_index);
 
-            // send non-fatal error
-            let _ = ack.send(Err(error));
-
-            // submit another tx to pool
+            // submit another tx to pool before acking so the builder's next rebuild
+            // (whenever it wakes) is guaranteed to see the new tx - the builder can't
+            // rebuild while it still awaits this ack
             tx_factory
                 .create_and_submit_eip1559_pool_tx(
                     chain.clone(),
@@ -697,8 +696,8 @@ mod tests {
             // update values for next loop
             parent = final_header;
 
-            // sleep to ensure canonical update received before ack
-            let _ = tokio::time::sleep(Duration::from_secs(1)).await;
+            // send non-fatal error
+            let _ = ack.send(Err(error));
         }
 
         // wait for next block
