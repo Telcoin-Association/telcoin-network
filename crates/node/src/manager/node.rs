@@ -31,7 +31,7 @@ use tn_types::{
     deconstruct_nonce, gas_accumulator::GasAccumulator, BlsPublicKey, BootstrapServer, Committee,
     ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
     Database as TNDatabase, EngineUpdate, Epoch, Notifier, SealedHeader, TaskError, TaskManager,
-    TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
+    TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -140,8 +140,8 @@ pub(crate) struct EpochManager<P, DB> {
 /// [`tn_types::gas_accumulator`] for the full picture). It runs once at startup, before
 /// execution resumes, and performs the following:
 ///
-/// 1. **Base fee** — sets worker 0's base fee from the finalized reth header. In a multi-worker
-///    configuration this will need per-worker restoration.
+/// 1. **Base fee** — restores each worker's base fee from its latest on-chain block this epoch (via
+///    [`latest_base_fee_per_worker`]), preserving the base-fee-from-chain invariant.
 /// 2. **Gas stats** — iterates every reth block from the epoch's start height through the finalized
 ///    tip, extracting the worker id from each block's `difficulty` field and calling
 ///    [`GasAccumulator::inc_block`] to rebuild per-worker gas totals.
@@ -160,25 +160,24 @@ pub async fn catchup_accumulator(
     if let Some(block) = reth_env.finalized_header()? {
         let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
 
-        // Note WORKER: In a single worker world this should be suffecient to set the base fee.
-        // In a multi-worker world (future) this will NOT work and needs updating.
-        gas_accumulator
-            .base_fee(0)
-            .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
-
         let nonce: u64 = block.nonce.into();
         let (last_executed_epoch, last_executed_round) = deconstruct_nonce(nonce);
 
         let blocks =
             reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
 
+        // Restore each worker's base fee from its latest on-chain block this epoch (the
+        // base-fee-from-chain invariant). Workers that produced no block keep the default (MIN).
+        // Generalizes the previous worker-0-only restore now that there can be multiple workers.
+        for (worker_id, base_fee) in latest_base_fee_per_worker(&blocks) {
+            gas_accumulator.base_fee(worker_id).set_base_fee(base_fee);
+        }
+
         // loop through blocks to accumulate gas stats
         for current in blocks {
             let gas = current.gas_used;
             let limit = current.gas_limit;
 
-            // difficulty contains the worker id and batch index:
-            // `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
             let worker_id = worker_id_from_header(&current);
             gas_accumulator.inc_block(worker_id, gas, limit);
         }

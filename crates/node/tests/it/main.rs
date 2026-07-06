@@ -150,7 +150,24 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     // initialize a new gas accumulator to simulate node recovery
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
+
+    // Catchup must restore each worker's base fee from the chain. Capture the chain's
+    // finalized base fee, poison the recovered accumulator with a different value, and confirm
+    // catchup overwrites it with the value read from the chain (not left at the stale value).
+    let expected_base_fee = reth_env
+        .finalized_header()?
+        .expect("finalized header exists after producing blocks")
+        .base_fee_per_gas
+        .expect("executed blocks carry a base fee");
+    recovered.base_fee(worker_id).set_base_fee(expected_base_fee + 999);
+
     catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+
+    assert_eq!(
+        recovered.base_fee(worker_id).base_fee(),
+        expected_base_fee,
+        "catchup must restore the worker's base fee from the chain, overwriting the stale value",
+    );
     // assert recovered and active track the same expected values
     //      G48pDy85GhyGMp9afPBvWgaNzgPAnvBtMxjReQTe1NiN: 3,
     //      Agv7rsffEbxoa7ybTJj57TiAHchf27ia7ziB5CVrHNTk: 3,
