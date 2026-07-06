@@ -21,7 +21,7 @@ use crate::{
 };
 use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
@@ -30,8 +30,8 @@ use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce, gas_accumulator::GasAccumulator, BlsPublicKey, BootstrapServer, Committee,
     ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
-    Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner,
-    TimestampSec, DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
+    Database as TNDatabase, EngineUpdate, Epoch, Notifier, SealedHeader, TaskError, TaskManager,
+    TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -179,8 +179,7 @@ pub async fn catchup_accumulator(
 
             // difficulty contains the worker id and batch index:
             // `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
-            let lower64 = current.difficulty.into_limbs()[0];
-            let worker_id = (lower64 & 0xffff) as u16;
+            let worker_id = worker_id_from_header(&current);
             gas_accumulator.inc_block(worker_id, gas, limit);
         }
 
@@ -194,6 +193,33 @@ pub async fn catchup_accumulator(
     };
 
     Ok(())
+}
+
+/// Worker id encoded in a header's `difficulty` (low 16 bits of `batch_index << 16 | worker_id`).
+pub(crate) fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
+    (header.difficulty.into_limbs()[0] & 0xffff) as u16
+}
+
+/// Return the most recent on-chain `base_fee_per_gas` for each worker that produced a block in
+/// `headers`.
+///
+/// `headers` are the executed reth blocks for the current epoch (epoch-start height..=tip), in
+/// ascending block-number order, so the last header seen for a worker is its latest block. The
+/// worker id is read from each header's `difficulty` field (lower 16 bits, matching how
+/// [`GasAccumulator::inc_block`] callers encode it). Workers that produced no block in the range
+/// are absent from the returned map.
+///
+/// Used to seed per-worker base fees from the chain on sync and restart, preserving the
+/// base-fee-from-chain invariant (see the [`tn_types::gas_accumulator`] module docs).
+pub(crate) fn latest_base_fee_per_worker(headers: &[SealedHeader]) -> HashMap<WorkerId, u64> {
+    let mut fees = HashMap::new();
+    for header in headers {
+        let worker_id = worker_id_from_header(header);
+        if let Some(base_fee) = header.base_fee_per_gas {
+            fees.insert(worker_id, base_fee);
+        }
+    }
+    fees
 }
 
 /// Open the process-lifetime consensus DB, creating its directory if absent.

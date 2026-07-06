@@ -17,15 +17,19 @@
 //! [`ReplayResult`] types that thread control flow through the loop.
 
 use crate::{engine::ExecutionNode, manager::EpochManager, worker::worker_task_manager_name};
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::ConsensusBus;
+use tn_reth::RethEnv;
 use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
     gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator},
-    BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase,
-    EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
+    BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
+    EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver, WorkerId,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -137,6 +141,38 @@ where
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
         self.metrics.current.set(committee.epoch() as f64);
         self.metrics.boundary_timestamp_seconds.set(self.epoch_boundary as f64);
+
+        // Base-fee-from-chain seeding: if the canonical tip is already in the epoch we are
+        // entering, adopt each worker's latest on-chain base fee rather than recomputing. This
+        // covers syncing and restarting nodes: they execute the fee already baked into the chain.
+        // A live producer crossing N->N+1 still has its tip in N here, so seeding is skipped and
+        // the value adjust_base_fees computed at the boundary is kept. (See gas_accumulator docs.)
+        {
+            let reth_env = engine.get_reth_env().await;
+            if let Some(tip) = reth_env.finalized_header()? {
+                let tip_epoch = RethEnv::extract_epoch_from_header(&tip);
+                let chain_fees = if tip_epoch == committee.epoch() {
+                    // The range END (`tip.number`) comes from `finalized_header()` above, while the
+                    // range START (`epoch_info.blockHeight`) comes from the canonical-tip epoch
+                    // state. These reference the same block under this node's instant BFT finality
+                    // (the payload builder finalizes the header it just made canonical), so the
+                    // range is well-formed. If finality ever lags the canonical tip, pin both ends
+                    // to one header (the same dual-reference pattern lives in catchup_accumulator).
+                    let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
+                    let blocks = reth_env
+                        .blocks_for_range(epoch_state.epoch_info.blockHeight..=tip.number)?;
+                    super::latest_base_fee_per_worker(&blocks)
+                } else {
+                    HashMap::new()
+                };
+                seed_base_fees_from_chain(
+                    committee.epoch(),
+                    tip_epoch,
+                    &chain_fees,
+                    &gas_accumulator,
+                );
+            }
+        }
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
         if !self.consensus_chain.epochs().contains_epoch(0).await {
@@ -538,22 +574,31 @@ where
     ///
     /// Begins shutting consensus down (when a [`Notifier`] is supplied) so it winds down in
     /// parallel while the engine finishes executing up to `target_hash`, then blocks until that
-    /// execution is confirmed. Afterward it runs the (currently no-op) base fee adjustment and
-    /// clears the [`GasAccumulator`] so the next epoch starts from zero. Called both on the
-    /// normal boundary path and on the restart replay-and-close path, which passes `None`
-    /// because there is no live consensus to stop.
+    /// execution is confirmed. On the live boundary path it then recomputes each worker's
+    /// next-epoch base fee ([`adjust_base_fees`]); the restart replay-and-close and leftover-drain
+    /// paths (which pass `None`) skip that forward computation and instead adopt the chain's fee
+    /// via epoch-start seeding, preserving the base-fee-from-chain invariant. Finally it clears the
+    /// [`GasAccumulator`] so the next epoch starts from zero.
     async fn close_epoch(
         &self,
         shutdown_consensus: Option<Notifier>,
         gas_accumulator: &GasAccumulator,
         target_hash: ConsensusHeaderDigest,
     ) -> eyre::Result<()> {
+        // Only the live producer (Some(shutdown)) holds a complete accumulator for the epoch it
+        // just closed and may compute the next fee forward. Restart/leftover paths (None) defer to
+        // epoch-start chain seeding so a catching-up node never diverges from the chain.
+        let mut live_boundary = false;
         // begin consensus shutdown while engine executes
         if let Some(s) = shutdown_consensus {
-            s.notify()
+            s.notify();
+            live_boundary = true;
         }
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
-        adjust_base_fees(gas_accumulator);
+        // adjust basefees after final execution
+        if live_boundary {
+            adjust_base_fees(gas_accumulator);
+        }
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())
     }
@@ -573,9 +618,34 @@ fn adjust_base_fees(gas_accumulator: &GasAccumulator) {
         let worker_id = worker_id as u16;
         let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
         let base_fee = gas_accumulator.base_fee(worker_id);
-        // u64::MAX target => inert: floors at MIN until governance targets are read (PR6).
+        // u64::MAX target => inert: floors at MIN until governance targets are read.
         let next_base_fee = compute_next_base_fee_eip1559(base_fee.base_fee(), gas_used, u64::MAX);
         base_fee.set_base_fee(next_base_fee);
+    }
+}
+
+/// Seed per-worker base fees from the chain at epoch entry (the base-fee-from-chain invariant).
+///
+/// When `tip_epoch == entered_epoch` the canonical tip is already in the epoch being entered, so
+/// the node is syncing/restarting and adopts each worker's latest on-chain base fee from
+/// `chain_fees`. When the epochs differ the node is the live producer that just crossed the
+/// boundary (its tip is still in the previous epoch), so the value [`adjust_base_fees`] computed
+/// is kept untouched. Workers absent from `chain_fees` (no block produced this epoch) are left
+/// as-is.
+fn seed_base_fees_from_chain(
+    entered_epoch: Epoch,
+    tip_epoch: Epoch,
+    chain_fees: &HashMap<WorkerId, u64>,
+    gas_accumulator: &GasAccumulator,
+) {
+    if tip_epoch != entered_epoch {
+        // new epoch - calculate fees from accumulated epoch gas
+        return;
+    }
+    for worker_id in 0..gas_accumulator.num_workers() as u16 {
+        if let Some(&fee) = chain_fees.get(&worker_id) {
+            gas_accumulator.base_fee(worker_id).set_base_fee(fee);
+        }
     }
 }
 
@@ -588,8 +658,7 @@ mod tests {
     fn adjust_base_fees_keeps_workers_at_min() {
         // Production starting point: every worker's base fee defaults to MIN. With the u64::MAX
         // target the fee can only ratchet down and is floored at MIN, so a worker that starts at
-        // MIN stays at MIN regardless of how much gas it used. This is the inert guarantee that
-        // keeps PR1-PR5 behavior-preserving.
+        // MIN stays at MIN regardless of how much gas it used.
         let acc = GasAccumulator::new(2);
         assert_eq!(acc.base_fee(0).base_fee(), MIN_PROTOCOL_BASE_FEE);
         assert_eq!(acc.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
@@ -626,5 +695,49 @@ mod tests {
             prev = now;
         }
         assert!(reached_min, "fee should ratchet all the way down to MIN");
+    }
+
+    #[test]
+    fn seed_base_fees_adopts_chain_fee_when_tip_in_entered_epoch() {
+        // Syncing/restarting node: the tip is already in the epoch being entered, so each worker
+        // adopts its latest on-chain base fee, overwriting any locally-held value.
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(1000);
+        acc.base_fee(1).set_base_fee(2000);
+        let chain_fees = HashMap::from([(0u16, 111u64), (1u16, 222u64)]);
+
+        seed_base_fees_from_chain(5, 5, &chain_fees, &acc);
+
+        assert_eq!(acc.base_fee(0).base_fee(), 111);
+        assert_eq!(acc.base_fee(1).base_fee(), 222);
+    }
+
+    #[test]
+    fn seed_base_fees_keeps_computed_value_for_live_producer() {
+        // Live producer crossing into a new epoch: the tip is still in the previous epoch, so the
+        // value adjust_base_fees computed at the boundary is kept and the chain is NOT consulted.
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(1000);
+        acc.base_fee(1).set_base_fee(2000);
+        let chain_fees = HashMap::from([(0u16, 111u64), (1u16, 222u64)]);
+
+        seed_base_fees_from_chain(5, 4, &chain_fees, &acc);
+
+        assert_eq!(acc.base_fee(0).base_fee(), 1000);
+        assert_eq!(acc.base_fee(1).base_fee(), 2000);
+    }
+
+    #[test]
+    fn seed_base_fees_leaves_workers_without_chain_blocks_untouched() {
+        // A worker that produced no block this epoch is absent from chain_fees and keeps its value.
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(1000);
+        acc.base_fee(1).set_base_fee(2000);
+        let chain_fees = HashMap::from([(0u16, 111u64)]); // only worker 0 produced a block
+
+        seed_base_fees_from_chain(7, 7, &chain_fees, &acc);
+
+        assert_eq!(acc.base_fee(0).base_fee(), 111); // seeded from chain
+        assert_eq!(acc.base_fee(1).base_fee(), 2000); // untouched
     }
 }
