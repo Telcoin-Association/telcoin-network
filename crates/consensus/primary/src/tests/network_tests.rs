@@ -12,6 +12,7 @@ use crate::{
 };
 use assert_matches::assert_matches;
 use rand::{rngs::StdRng, SeedableRng};
+use roaring::RoaringBitmap;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -56,6 +57,25 @@ fn test_missing_certs_request() {
         missing_req.get_bounds().expect("decode missing bounds");
     assert_eq!(expected_gc_round, decoded_gc_round);
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
+}
+
+#[test]
+// for primary::network::message
+fn test_missing_certs_request_skip_round_overflow() {
+    let mut serialized = Vec::new();
+    [1u32, 2]
+        .into_iter()
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    // `exclusive_lower_bound + 2` exceeds u32::MAX and must surface as an invalid request
+    // instead of wrapping (release) or panicking (debug) on peer-supplied input
+    let missing_req = MissingCertificatesRequest {
+        exclusive_lower_bound: Round::MAX - 1,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 10,
+    };
+    assert_matches!(missing_req.get_bounds(), Err(PrimaryNetworkError::InvalidRequest(_)));
 }
 
 /// The type for holding testng components.

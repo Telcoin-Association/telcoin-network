@@ -137,8 +137,15 @@ impl MissingCertificatesRequest {
             .map(|(k, serialized)| {
                 let rounds = RoaringBitmap::deserialize_from(&serialized[..])?
                     .into_iter()
-                    .map(|r| self.exclusive_lower_bound + r as Round)
-                    .collect::<BTreeSet<Round>>();
+                    .map(|r| {
+                        // r: u32 == Round; reject rather than wrap (release) or panic (debug)
+                        self.exclusive_lower_bound.checked_add(r).ok_or_else(|| {
+                            PrimaryNetworkError::InvalidRequest(
+                                "skip round exceeds u32 round space".into(),
+                            )
+                        })
+                    })
+                    .collect::<PrimaryNetworkResult<BTreeSet<Round>>>()?;
                 Ok((k.clone(), rounds))
             })
             .collect::<PrimaryNetworkResult<BTreeMap<_, _>>>()?;
