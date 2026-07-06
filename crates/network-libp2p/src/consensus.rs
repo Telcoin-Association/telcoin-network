@@ -1593,7 +1593,14 @@ where
                     .put(record)
                     .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
                 trace!(target: "network-kad", "Got record {key} {value:?}");
-                self.swarm.behaviour_mut().peer_manager.add_discovered_peer(key, value.info);
+                // a peer pushing its own record over its own connection (source == the record's
+                // network identity) also confirms its identity so a live non-committee connection
+                // (e.g. an nvv in the gossip mesh) is retained; relayed and non-self records stay
+                // committee-gated (issue #827).
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .add_self_advertised_peer(source, key, value.info);
             } else {
                 // A peer republishing a slightly stale (but signature-valid) record is
                 // expected after restarts and benign — the local store keeps the newer

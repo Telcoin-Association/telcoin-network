@@ -778,6 +778,81 @@ async fn test_discovered_peers_bounded_to_committee_membership() {
 }
 
 #[tokio::test]
+async fn test_self_advertised_connected_peer_confirmed_not_cached_and_bounded() {
+    // Issue #827 gate refinement: a non-committee peer that pushes its OWN record over its own
+    // authenticated connection (kad-put `source` == the record's advertised network identity) has
+    // its bls<->peer-id identity confirmed so a live connection (e.g. an nvv in the gossip mesh) is
+    // retained, but it is NOT added to the committee-only `known_peers` cache. A relayed record
+    // (source != identity) confirms nothing, and a flood of fresh keys over one connection stays
+    // bounded because the peer store re-keys by peer id.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a non-committee peer self-advertises its own record: source == the advertised network id
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let self_peer_id: PeerId = netkey.clone().into();
+    let info = NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+        rpc: None,
+    };
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([7; 32])).public();
+    peer_manager.add_self_advertised_peer(self_peer_id, bls, info);
+
+    // identity confirmed in the peer store (resolvable by peer id) ...
+    assert_eq!(
+        peer_manager.peer_to_bls(&self_peer_id),
+        Some(bls),
+        "self-advertised connected peer must have its identity confirmed"
+    );
+    // ... but NOT cached in the committee-only known_peers
+    assert!(
+        peer_manager.known_peers.is_empty(),
+        "self-advertised non-committee peer must not enter the committee-only known_peers cache"
+    );
+
+    // a relayed record (source is not the advertised identity) confirms nothing and is not cached,
+    // so a peer can never displace an identity it does not control
+    let relayed = random_network_info();
+    let relayed_bls = *BlsKeypair::generate(&mut StdRng::from_seed([8; 32])).public();
+    let unrelated_source = PeerId::random();
+    peer_manager.add_self_advertised_peer(unrelated_source, relayed_bls, relayed);
+    assert_eq!(
+        peer_manager.peer_to_bls(&unrelated_source),
+        None,
+        "a relayed record must not confirm an identity the sender does not control"
+    );
+    assert!(peer_manager.known_peers.is_empty(), "relayed record must not be cached");
+
+    // a flood of fresh bls keys all self-advertised over ONE connection stays bounded: the peer
+    // store re-keys by peer id (one confirmed identity per connection) so only the latest survives,
+    // and known_peers never grows
+    let flood_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let flood_peer_id: PeerId = flood_netkey.clone().into();
+    let mut attacker_rng = StdRng::from_seed([42; 32]);
+    let last_bls = (0..1_000).fold(bls, |_, _| {
+        let next_bls = *BlsKeypair::generate(&mut attacker_rng).public();
+        let info = NetworkInfo {
+            pubkey: flood_netkey.clone(),
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+            rpc: None,
+        };
+        peer_manager.add_self_advertised_peer(flood_peer_id, next_bls, info);
+        next_bls
+    });
+    assert!(
+        peer_manager.known_peers.is_empty(),
+        "a self-advertised flood must never grow the committee-only known_peers cache"
+    );
+    assert_eq!(
+        peer_manager.peer_to_bls(&flood_peer_id),
+        Some(last_bls),
+        "the flooded connection retains exactly one (the latest) confirmed identity, not 1000"
+    );
+}
+
+#[tokio::test]
 async fn test_known_peers_pruned_on_rotation_but_pinned_survive() {
     // Regression (issue #827): committee members discovered in one epoch must not accumulate across
     // rotations, while operator-provisioned (pinned) peers must never be evicted.

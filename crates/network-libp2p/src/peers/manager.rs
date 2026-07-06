@@ -796,6 +796,47 @@ impl PeerManager {
         self.cache_known_peer(bls_key, info);
     }
 
+    /// Admit a peer record pushed to us over the peer's own authenticated connection (a kad PUT
+    /// whose `source` is the sending peer).
+    ///
+    /// A committee member is cached in `known_peers` exactly as via [`Self::add_discovered_peer`].
+    /// A non-committee peer that advertises its OWN record - the authenticated kad-put `source`
+    /// equals the record's advertised network identity, so libp2p has already proven the sender
+    /// owns that transport key - has only its `bls_key <-> peer_id` identity confirmed in the peer
+    /// store, so a live connection (for example an nvv joining the gossip mesh) is retained. It is
+    /// deliberately NOT inserted into the committee-only `known_peers` cache. Because
+    /// [`AllPeers::upsert_peer`] re-keys by peer id, a peer can only ever hold ONE confirmed
+    /// identity for its own connection, so this is bounded by the live connection count and keeps
+    /// the issue #827 bound against unbounded record injection intact. A relayed record (`source`
+    /// != the advertised identity) cannot confirm an identity the sender does not control and is
+    /// dropped, so this never lets a peer displace another peer's identity.
+    pub(crate) fn add_self_advertised_peer(
+        &mut self,
+        source: PeerId,
+        bls_key: BlsPublicKey,
+        info: NetworkInfo,
+    ) {
+        let advertised: PeerId = info.pubkey.clone().into();
+        if self.peers.is_committee_member(&bls_key) {
+            self.cache_known_peer(bls_key, info);
+        } else if source == advertised {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                ?source,
+                "confirming self-advertised connected peer identity"
+            );
+            self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);
+        } else {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                ?source,
+                "dropping non-committee relayed peer record"
+            );
+        }
+    }
+
     /// Validate the advertised endpoint, register the peer's network identity, cache its info, and
     /// close the committee trust window if it belongs to a tracked slot.
     ///
