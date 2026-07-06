@@ -7,6 +7,7 @@ use crate::common::{
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
+use futures::StreamExt as _;
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::num::NonZeroUsize;
 use tn_config::{ConsensusConfig, NetworkConfig};
@@ -232,29 +233,38 @@ async fn wait_for_peer_discovery<Req: TNMessage, Res: TNMessage>(
 ///
 /// A bounded, self-synchronizing replacement for a fixed `sleep` that only guesses
 /// at how long an asynchronous swarm event (gossip mesh grafting, subscription
-/// propagation, connection teardown plus pending-request cleanup) takes. It waits
-/// for the real observable condition and fails with a clear message on timeout
-/// rather than asserting against not-yet-settled state. Mirrors the poll shape of
+/// propagation, connection teardown plus pending-request cleanup) takes. It folds
+/// over a bounded sequence of ~10ms poll attempts, carrying the first resolved
+/// verdict forward: `Some(Ok(()))` once the condition holds, `Some(Err(_))` if a
+/// poll itself errors, and `None` while still waiting. An exhausted fold (still
+/// `None`) means the deadline passed. Mirrors the poll shape of
 /// [`wait_for_peer_discovery`] but is generic over the polled condition.
 async fn wait_until<F, Fut>(
     timeout_duration: Duration,
     description: &str,
-    mut condition: F,
+    condition: F,
 ) -> eyre::Result<()>
 where
-    F: FnMut() -> Fut,
+    F: Fn() -> Fut,
     Fut: std::future::Future<Output = eyre::Result<bool>>,
 {
-    let deadline = tokio::time::Instant::now() + timeout_duration;
-    loop {
-        if condition().await? {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(eyre!("timed out waiting for condition: {description}"));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    let attempts = (timeout_duration.as_millis() / POLL_INTERVAL.as_millis()).max(1);
+    let condition = &condition;
+
+    futures::stream::iter(0..attempts)
+        .fold(None, move |resolved: Option<eyre::Result<()>>, attempt| async move {
+            if resolved.is_some() {
+                resolved
+            } else {
+                if attempt > 0 {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                condition().await.map(|met| met.then_some(())).transpose()
+            }
+        })
+        .await
+        .unwrap_or_else(|| Err(eyre!("timed out waiting for condition: {description}")))
 }
 
 #[tokio::test]
