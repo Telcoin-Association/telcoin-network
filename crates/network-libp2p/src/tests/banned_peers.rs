@@ -314,3 +314,50 @@ fn test_remove_validator_ip_for_never_banned_member_preserves_total() {
         "clearing a never-banned validator IP must not change the banned total"
     );
 }
+
+#[test]
+fn test_remove_banned_peer_prunes_zero_count_keys() {
+    let mut banned_peers = BannedPeers::default();
+
+    // ban a single peer on each of many distinct IPs
+    let ips: Vec<IpAddr> = (0..64).map(|_| random_ip_addr()).collect();
+    for ip in &ips {
+        banned_peers.add_banned_peer(&create_peer_with_ips(vec![*ip]));
+    }
+
+    // every distinct IP now holds an entry
+    assert_eq!(banned_peers.banned_peers_by_ip.len(), ips.len());
+
+    // unban every peer again
+    for ip in &ips {
+        assert_eq!(banned_peers.remove_banned_peer(std::iter::once(*ip)), vec![*ip]);
+    }
+
+    // the map must shrink back to empty rather than leaking a permanent
+    // zero-count entry per distinct banned IP
+    assert!(
+        banned_peers.banned_peers_by_ip.is_empty(),
+        "zero-count keys should be pruned, found {} lingering entries",
+        banned_peers.banned_peers_by_ip.len()
+    );
+}
+
+#[test]
+fn test_remove_banned_peer_keeps_entry_until_zero() {
+    let mut banned_peers = BannedPeers::default();
+    let ip = random_ip_addr();
+
+    // two banned peers share the same IP
+    for _ in 0..2 {
+        banned_peers.add_banned_peer(&create_peer_with_ips(vec![ip]));
+    }
+    assert_eq!(banned_peers.banned_peers_by_ip.get(&ip), Some(&2));
+
+    // first removal decrements but must keep the entry (count still above zero)
+    banned_peers.remove_banned_peer(std::iter::once(ip));
+    assert_eq!(banned_peers.banned_peers_by_ip.get(&ip), Some(&1));
+
+    // second removal drives the count to zero and must prune the entry
+    banned_peers.remove_banned_peer(std::iter::once(ip));
+    assert!(!banned_peers.banned_peers_by_ip.contains_key(&ip));
+}
