@@ -2545,6 +2545,126 @@ mod tests {
         Ok(())
     }
 
+    /// In-protocol `ConsensusRegistry` fork over the PRE-fork testnet registry.
+    ///
+    /// `test_genesis()` embeds the committed testnet `genesis.yaml`, whose `ConsensusRegistry`
+    /// account carries the pre-fork runtime code and validator storage with NO per-status sets —
+    /// the exact on-chain shape the fork upgrades in place. The epoch-closing block that
+    /// concludes `FORK_EPOCH - 1` swaps in the new runtime and runs `migrateValidatorSets()`
+    /// FIRST, then the rewards + conclude calls run on the new code over the byte-identical
+    /// preserved storage.
+    ///
+    /// Asserts: the pre-fork code does not answer the new-ABI eligible-count call; post-fork the
+    /// new code is live and the migration populated a non-empty eligible set; a preserved BLS
+    /// pubkey survives the swap as 96-byte compressed; and the fork block's `state_root` is
+    /// identical across two independent executions (determinism — every node re-derives the
+    /// same root).
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_consensus_registry_fork_swaps_code_and_migrates() -> eyre::Result<()> {
+        // pre-fork fixture: old registry code + validator storage, no per-status sets
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let genesis_header = chain.sealed_genesis_header();
+
+        // fork fires when the concluding epoch + 1 == FORK_EPOCH
+        let concluding_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH - 1;
+
+        // one payload, cloned across both executions, so the determinism check compares
+        // byte-identical inputs (`new_for_test` otherwise randomizes
+        // beneficiary/mix_hash/digest per call)
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        // --- env 1: pre-fork state must NOT answer the new-ABI eligible-count call (old code) ---
+        let tmp1 = TempDir::new().unwrap();
+        let tm1 = TaskManager::new("fork test env1");
+        let env1 = RethEnv::new_for_temp_chain(chain.clone(), tmp1.path(), &tm1, None).unwrap();
+        {
+            let state = StateProviderDatabase::new(env1.latest()?);
+            let mut cached = CachedReads::default();
+            let mut db = State::builder()
+                .with_database(cached.as_db_mut(state))
+                .with_bundle_update()
+                .build();
+            let mut evm = env1
+                .inner
+                .evm_config
+                .evm_factory()
+                .create_evm(&mut db, env1.inner.evm_config.evm_env(genesis_header.header())?);
+            let pre = env1.call_consensus_registry::<_, U256>(
+                &mut evm,
+                ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+            );
+            assert!(
+                pre.is_err(),
+                "pre-fork registry (old code) must not expose getEligibleValidatorCount"
+            );
+        }
+
+        // --- produce the fork boundary block on the production path ---
+        let block = execute_payload_and_update_canonical_chain(&env1, payload.clone(), vec![])?;
+        let header = block.recovered_block.clone_sealed_header();
+        let produced_state_root = header.state_root;
+
+        // --- post-fork: new code is live and the sets are migrated ---
+        {
+            let state = StateProviderDatabase::new(env1.latest()?);
+            let mut cached = CachedReads::default();
+            let mut db = State::builder()
+                .with_database(cached.as_db_mut(state))
+                .with_bundle_update()
+                .build();
+            let mut evm = env1
+                .inner
+                .evm_config
+                .evm_factory()
+                .create_evm(&mut db, env1.inner.evm_config.evm_env(header.header())?);
+
+            let eligible = env1
+                .call_consensus_registry::<_, U256>(
+                    &mut evm,
+                    ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+                )
+                .expect("post-fork getEligibleValidatorCount must succeed on the swapped-in code");
+            assert!(eligible > U256::ZERO, "migration must populate a non-zero eligible count");
+
+            // getValidators(Active) now returns address[] (new ABI) from the migrated set
+            let active = env1
+                .call_consensus_registry::<_, Vec<Address>>(
+                    &mut evm,
+                    ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
+                        .abi_encode()
+                        .into(),
+                )
+                .expect("getValidators(Active) must succeed on new code");
+            assert!(!active.is_empty(), "migrated Active set must be non-empty");
+
+            // stored BLS pubkey survives the code swap untouched: still 96-byte compressed
+            let bls = env1
+                .call_consensus_registry::<_, Bytes>(
+                    &mut evm,
+                    ConsensusRegistry::getBlsPubkeyCall { validatorAddress: active[0] }
+                        .abi_encode()
+                        .into(),
+                )
+                .expect("getBlsPubkey must succeed");
+            assert_eq!(bls.len(), 96, "preserved BLS pubkey must remain 96-byte compressed");
+        }
+
+        // --- determinism: an independent execution of the identical block yields the same root ---
+        let tmp2 = TempDir::new().unwrap();
+        let tm2 = TaskManager::new("fork test env2");
+        let env2 = RethEnv::new_for_temp_chain(chain.clone(), tmp2.path(), &tm2, None).unwrap();
+        let block2 = execute_payload_and_update_canonical_chain(&env2, payload, vec![])?;
+        assert_eq!(
+            block2.recovered_block.clone_sealed_header().state_root,
+            produced_state_root,
+            "fork block state_root must be identical across independent executions"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_close_epochs() -> eyre::Result<()> {
         let validator_1 = Address::from_slice(&[0x11; 20]);
