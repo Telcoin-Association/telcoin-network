@@ -27,7 +27,7 @@ use tn_primary::ConsensusBus;
 use tn_reth::RethEnv;
 use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
-    gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator},
+    gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator, WorkerFeeConfig},
     BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
     EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver, WorkerId,
 };
@@ -147,8 +147,8 @@ where
         // covers syncing and restarting nodes: they execute the fee already baked into the chain.
         // A live producer crossing N->N+1 still has its tip in N here, so seeding is skipped and
         // the value adjust_base_fees computed at the boundary is kept. (See gas_accumulator docs.)
+        let reth_env = engine.get_reth_env().await;
         {
-            let reth_env = engine.get_reth_env().await;
             if let Some(tip) = reth_env.finalized_header()? {
                 let tip_epoch = RethEnv::extract_epoch_from_header(&tip);
                 let chain_fees = if tip_epoch == committee.epoch() {
@@ -208,7 +208,7 @@ where
             if let Some(target_hash) = replay.take_epoch_close_hash() {
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
-                self.close_epoch(None, &gas_accumulator, target_hash).await?;
+                self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
                 self.clear_consensus_db_for_next_epoch()?;
                 return Ok(RunEpochMode::NewEpoch);
             }
@@ -335,8 +335,13 @@ where
                 let target_hash = res.inspect_err(|e| {
                     error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
                 })?;
-                self.close_epoch(Some(consensus_shutdown.clone()), &gas_accumulator, target_hash)
-                    .await?;
+                self.close_epoch(
+                    Some(consensus_shutdown.clone()),
+                    &reth_env,
+                    &gas_accumulator,
+                    target_hash,
+                )
+                .await?;
 
                 // Write the epoch record to DB and save in manager for next epoch.
                 self.write_epoch_record(&primary, engine).await?;
@@ -393,7 +398,7 @@ where
         {
             // If things go down at exactly the wrong time we might have reached the epoch end
             // so account for that.
-            self.close_epoch(None, &gas_accumulator, target_hash).await?;
+            self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
             res = RunEpochMode::NewEpoch;
             clear_tables_for_next_epoch = true;
         } else {
@@ -582,6 +587,7 @@ where
     async fn close_epoch(
         &self,
         shutdown_consensus: Option<Notifier>,
+        reth_env: &RethEnv,
         gas_accumulator: &GasAccumulator,
         target_hash: ConsensusHeaderDigest,
     ) -> eyre::Result<()> {
@@ -597,30 +603,73 @@ where
         self.consensus_bus.wait_for_consensus_execution(target_hash).await?;
         // adjust basefees after final execution
         if live_boundary {
-            adjust_base_fees(gas_accumulator);
+            adjust_base_fees(reth_env, gas_accumulator);
         }
         gas_accumulator.clear(); // Clear the accumlated values for next epoch.
         Ok(())
     }
 }
 
-/// Recompute each worker's next-epoch base fee from the gas it accumulated this epoch.
+/// Recompute each worker's next-epoch base fee from the gas it accumulated this epoch and the
+/// worker's fee strategy read from the `WorkerConfigs` contract.
 ///
-/// Applies the EIP-1559-style adjustment ([`compute_next_base_fee_eip1559`]) per worker. The
-/// target gas is currently hardcoded to `u64::MAX`, which keeps the adjustment inert: against an
-/// unreachable target the fee can only ratchet *down*, and the formula floors every result at
-/// `MIN_PROTOCOL_BASE_FEE`. Because workers start at `MIN`, the fee stays at `MIN` everywhere.
+/// Reads one [`WorkerFeeConfig`] per worker at the canonical tip — which inside
+/// [`Self::close_epoch`] (after `wait_for_consensus_execution`) is exactly the epoch's closing
+/// block — then applies the strategy via [`next_base_fee_for_config`] and writes the result back to
+/// each worker's base-fee container. This is the deterministic seam every committee member runs
+/// identically at the boundary.
 ///
-/// The real per-worker target (from the WorkerConfigs contract) is wired in later; this is the
-/// deterministic seam every committee member runs identically at the epoch boundary.
-fn adjust_base_fees(gas_accumulator: &GasAccumulator) {
-    for worker_id in 0..gas_accumulator.num_workers() {
-        let worker_id = worker_id as u16;
-        let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
-        let base_fee = gas_accumulator.base_fee(worker_id);
-        // u64::MAX target => inert: floors at MIN until governance targets are read.
-        let next_base_fee = compute_next_base_fee_eip1559(base_fee.base_fee(), gas_used, u64::MAX);
-        base_fee.set_base_fee(next_base_fee);
+/// Infallible: if the contract read fails, worker 0's fee is pinned to [`FALLBACK_BASE_FEE`]
+/// instead of aborting the epoch close (see the FAIL-OPEN note in the body).
+///
+/// Inert on existing chains: the genesis fee strategy is `Eip1559 { target_gas: u64::MAX }`, which
+/// floors every worker at `MIN_PROTOCOL_BASE_FEE`. Fees only move once governance sets a real
+/// per-worker target.
+fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) {
+    let num_workers = gas_accumulator.num_workers();
+    // num_workers is the count the GasAccumulator was sized to at startup; get_worker_fee_configs
+    // validates it against the on-chain numWorkers() and errors on drift.
+    //
+    // FAIL-OPEN: a contract-read revert or a numWorkers() drift must not abort the epoch close
+    // The fallback is deterministic (a fixed 1 GWEI for worker 0), so
+    // every committee member that hits the same on-chain condition lands on the same fee and
+    // consensus should not diverge.
+    match reth_env.get_worker_fee_configs(num_workers) {
+        Ok(configs) => {
+            for (worker_id, config) in configs.into_iter().enumerate() {
+                let worker_id = worker_id as u16;
+                let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
+                let base_fee = gas_accumulator.base_fee(worker_id);
+                let next_base_fee = next_base_fee_for_config(config, base_fee.base_fee(), gas_used);
+                base_fee.set_base_fee(next_base_fee);
+            }
+        }
+        Err(e) => {
+            warn!(
+                target: "epoch-manager",
+                ?e,
+                "failed to read worker fee configs at epoch close - falling back to {FALLBACK_BASE_FEE} wei for worker 0"
+            );
+            gas_accumulator.base_fee(0).set_base_fee(FALLBACK_BASE_FEE);
+        }
+    }
+}
+
+/// Deterministic base fee (1 GWEI) applied to worker 0 when the `WorkerConfigs` contract read
+/// fails at epoch close.
+const FALLBACK_BASE_FEE: u64 = 1_000_000_000;
+
+/// Apply a worker's [`WorkerFeeConfig`] to compute its next-epoch base fee.
+///
+/// `Eip1559 { target_gas }` nudges the fee toward the gas target via
+/// [`compute_next_base_fee_eip1559`] (floored at `MIN_PROTOCOL_BASE_FEE`); `Static { fee }` pins
+/// the fee to the governance-set value, ignoring gas usage.
+fn next_base_fee_for_config(config: WorkerFeeConfig, current_base_fee: u64, gas_used: u64) -> u64 {
+    match config {
+        WorkerFeeConfig::Eip1559 { target_gas } => {
+            compute_next_base_fee_eip1559(current_base_fee, gas_used, target_gas)
+        }
+        WorkerFeeConfig::Static { fee } => fee,
     }
 }
 
@@ -655,46 +704,46 @@ mod tests {
     use tn_types::MIN_PROTOCOL_BASE_FEE;
 
     #[test]
-    fn adjust_base_fees_keeps_workers_at_min() {
-        // Production starting point: every worker's base fee defaults to MIN. With the u64::MAX
-        // target the fee can only ratchet down and is floored at MIN, so a worker that starts at
-        // MIN stays at MIN regardless of how much gas it used.
-        let acc = GasAccumulator::new(2);
-        assert_eq!(acc.base_fee(0).base_fee(), MIN_PROTOCOL_BASE_FEE);
-        assert_eq!(acc.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
-
-        // worker 0 used a lot of gas; worker 1 used none
-        acc.inc_block(0, 5_000_000, 30_000_000);
-
-        adjust_base_fees(&acc);
-
-        assert_eq!(acc.base_fee(0).base_fee(), MIN_PROTOCOL_BASE_FEE);
-        assert_eq!(acc.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
+    fn eip1559_config_with_max_target_is_inert_at_min() {
+        // Genesis/default strategy: Eip1559 { target_gas: u64::MAX }. Against an unreachable target
+        // the fee can only ratchet down and floors at MIN, so a worker at MIN stays at MIN
+        // regardless of gas used -- the inert guarantee that keeps existing chains unchanged.
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: u64::MAX };
+        assert_eq!(
+            next_base_fee_for_config(cfg, MIN_PROTOCOL_BASE_FEE, 5_000_000),
+            MIN_PROTOCOL_BASE_FEE
+        );
+        // a non-MIN fee ratchets down (and never below MIN)
+        let down = next_base_fee_for_config(cfg, MIN_PROTOCOL_BASE_FEE * 1000, 0);
+        assert!((MIN_PROTOCOL_BASE_FEE..MIN_PROTOCOL_BASE_FEE * 1000).contains(&down));
     }
 
     #[test]
-    fn adjust_base_fees_ratchets_non_min_fee_down_to_min() {
-        // A worker that somehow holds a non-MIN fee is pulled back down toward MIN every epoch
-        // (proving compute_next_base_fee_eip1559 is wired into adjust_base_fees) and is floored at
-        // MIN. Zero gas used each epoch applies maximal downward pressure against the unreachable
-        // u64::MAX target so the fee converges cleanly to the floor.
-        let acc = GasAccumulator::new(1);
-        acc.base_fee(0).set_base_fee(MIN_PROTOCOL_BASE_FEE * 1000);
+    fn eip1559_config_moves_fee_with_gas_vs_target() {
+        let target = 1_000_000u64;
+        let current = 1_000_000u64;
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: target };
+        // gas above target -> fee increases; below -> decreases; at target -> unchanged.
+        assert!(next_base_fee_for_config(cfg, current, 2_000_000) > current);
+        assert!(next_base_fee_for_config(cfg, current, 0) < current);
+        assert_eq!(next_base_fee_for_config(cfg, current, target), current);
+    }
 
-        let mut prev = acc.base_fee(0).base_fee();
-        let mut reached_min = false;
-        for _ in 0..500 {
-            adjust_base_fees(&acc);
-            let now = acc.base_fee(0).base_fee();
-            assert!(now <= prev, "fee is non-increasing with a u64::MAX target");
-            assert!(now >= MIN_PROTOCOL_BASE_FEE, "fee never drops below MIN");
-            if now == MIN_PROTOCOL_BASE_FEE {
-                reached_min = true;
-                break;
-            }
-            prev = now;
-        }
-        assert!(reached_min, "fee should ratchet all the way down to MIN");
+    #[test]
+    fn static_config_pins_to_configured_fee() {
+        // Static ignores gas usage and the current fee, always returning the governance-set value.
+        assert_eq!(
+            next_base_fee_for_config(
+                WorkerFeeConfig::Static { fee: 12_345 },
+                MIN_PROTOCOL_BASE_FEE,
+                999_999
+            ),
+            12_345
+        );
+        assert_eq!(
+            next_base_fee_for_config(WorkerFeeConfig::Static { fee: 500 }, 1_000_000, 0),
+            500
+        );
     }
 
     #[test]
@@ -739,5 +788,13 @@ mod tests {
 
         assert_eq!(acc.base_fee(0).base_fee(), 111); // seeded from chain
         assert_eq!(acc.base_fee(1).base_fee(), 2000); // untouched
+    }
+
+    #[test]
+    fn fallback_base_fee_is_one_gwei() {
+        // The fail-open fallback in adjust_base_fees must stay a fixed 1 GWEI: it is applied
+        // independently by every committee member, so determinism (and thus consensus) depends on
+        // this exact value.
+        assert_eq!(FALLBACK_BASE_FEE, 1_000_000_000);
     }
 }
