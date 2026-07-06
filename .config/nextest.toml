@@ -24,7 +24,13 @@ filter = "package(e2e-tests)"
 test-group = "e2e"
 slow-timeout = { period = "720s", terminate-after = 3 }
 
+# The cross-process slot allocator (tn_types::helpers) closes the ephemeral-port race,
+# so e2e tests no longer need retries to mask it. Real regressions now surface instead of
+# being silently retried away. The allocator's degraded edges (window exhausted, slot
+# beyond the band's capacity) announce themselves on stderr, so a failure they cause is
+# attributable in the captured output. Other packages keep the profile-wide retries = 2.
 [[profile.ci.overrides]]
 filter = "package(e2e-tests)"
 test-group = "e2e"
+retries = 0
 slow-timeout = { period = "720s", terminate-after = 3 }
