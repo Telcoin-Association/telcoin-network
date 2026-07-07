@@ -19,7 +19,7 @@ mod manager;
 mod metrics;
 pub mod primary;
 pub mod worker;
-pub use manager::catchup_accumulator;
+pub use manager::{catchup_accumulator, sync_num_workers_from_chain};
 
 #[cfg(test)]
 use tempfile as _;
