@@ -57,7 +57,7 @@ impl TxnForwarder for WorkerRpcForwarder {
             for (key, rpc) in &validator_rpcs {
                 match rpc.http.as_str().parse() {
                     Ok(url) => {
-                        providers.insert(key.clone(), ProviderBuilder::new().connect_http(url));
+                        providers.insert(*key, ProviderBuilder::new().connect_http(url));
                     }
                     Err(err) => {
                         debug!(
@@ -89,7 +89,7 @@ impl TxnForwarder for WorkerRpcForwarder {
                 let mut tried = BTreeSet::new();
                 let mut forwarded = false;
                 for key in ordered {
-                    if !tried.insert(key.clone()) {
+                    if !tried.insert(key) {
                         continue;
                     }
                     let Some(provider) = providers.get(&key) else {
