@@ -17,7 +17,7 @@ use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
 use tn_node::{
     catchup_accumulator, derive_base_fees_for_entered_epoch, derive_idle_worker_fee,
-    fill_absent_worker_fees, sync_num_workers_from_chain,
+    sync_num_workers_from_chain,
 };
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
@@ -165,22 +165,16 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
 
-    // Catchup must restore each worker's base fee from the chain. Capture the chain's
-    // finalized base fee, poison the recovered accumulator with a different value, and confirm
-    // catchup overwrites it with the value read from the chain (not left at the stale value).
-    let expected_base_fee = reth_env
-        .finalized_header()?
-        .expect("finalized header exists after producing blocks")
-        .base_fee_per_gas
-        .expect("executed blocks carry a base fee");
-    recovered.base_fee(worker_id).set_base_fee(expected_base_fee + 999);
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
 
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
-
+    // Base fees are owned by the epoch entry seeding, not catchup: the container keeps its MIN
+    // default (which IS the committee value for epoch 0 - fees only move at the first close).
     assert_eq!(
         recovered.base_fee(worker_id).base_fee(),
-        expected_base_fee,
-        "catchup must restore the worker's base fee from the chain, overwriting the stale value",
+        MIN_PROTOCOL_BASE_FEE,
+        "catchup rebuilds gas stats and leader counts only - fees keep the epoch-0 MIN default",
     );
     // assert recovered and active track the same expected values
     //      G48pDy85GhyGMp9afPBvWgaNzgPAnvBtMxjReQTe1NiN: 3,
@@ -432,7 +426,9 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     let worker_id = 0;
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
 
     let expected: BTreeMap<_, _> = rewards
@@ -543,7 +539,9 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
 
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
 
     let worker_id = 0;
     assert_eq!(gas_accumulator.get_values(worker_id), recovered.get_values(worker_id));
@@ -578,27 +576,27 @@ async fn test_sync_num_workers_from_chain_adjusts_to_on_chain_count() -> eyre::R
 
     // the startup default (1 worker) grows to the on-chain count
     let gas_accumulator = GasAccumulator::new(1);
-    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block);
+    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block)?;
     assert_eq!(gas_accumulator.num_workers(), 2, "undersized accumulator grows to on-chain count");
 
     // an oversized accumulator shrinks to the on-chain count
     let gas_accumulator = GasAccumulator::new(3);
-    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block);
+    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block)?;
     assert_eq!(gas_accumulator.num_workers(), 2, "oversized accumulator shrinks to on-chain count");
 
     Ok(())
 }
 
-/// FAIL-OPEN: on a chain without the `WorkerConfigs` contract (older networks), the worker-count
-/// sync must keep the accumulator's current size and return without error.
+/// FAIL-HARD: on a chain without the `WorkerConfigs` contract, the worker-count sync must
+/// error - the caller (startup catchup or the epoch-0 entry arm) cannot proceed on an
+/// unverifiable count.
 ///
-/// The accumulator starts at 3 workers (not 1) so the assertion discriminates the fail-open
-/// branch (failed read => keep current count) from a regression that resizes anyway: a failed
-/// read yielding 0 would clamp to 1 in `set_num_workers`, indistinguishable from fail-open when
-/// starting at 1, but a drop from 3 to 1 fails the assertion.
+/// The accumulator starts at 3 workers (not 1) so the second assertion also discriminates a
+/// clean error from a partial resize: an erroring read that still wrote a clamped count would
+/// drop 3 to 1 and fail it.
 #[tokio::test]
-async fn test_sync_num_workers_fail_open_when_contract_absent() -> eyre::Result<()> {
-    let temp_dir = TempDir::with_prefix("sync_num_workers_fail_open")?;
+async fn test_sync_num_workers_errors_when_contract_absent() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("sync_num_workers_fail_hard")?;
     // strip the WorkerConfigs account from the alloc so the contract read is guaranteed to fail
     let mut genesis = test_genesis_with_consensus_registry(4);
     genesis.alloc.remove(&WORKER_CONFIGS_ADDRESS);
@@ -608,10 +606,10 @@ async fn test_sync_num_workers_fail_open_when_contract_absent() -> eyre::Result<
     let reth_env = execution_node.get_reth_env().await;
     let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
 
-    // 3 sits above the >=1 clamp, so only the Err => keep-current branch preserves it
     let gas_accumulator = GasAccumulator::new(3);
-    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block);
-    assert_eq!(gas_accumulator.num_workers(), 3, "fail-open keeps the current worker count");
+    let result = sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block);
+    assert!(result.is_err(), "a missing WorkerConfigs contract must be a hard error");
+    assert_eq!(gas_accumulator.num_workers(), 3, "a failed sync must not resize the accumulator");
 
     Ok(())
 }
@@ -620,16 +618,17 @@ async fn test_sync_num_workers_fail_open_when_contract_absent() -> eyre::Result<
 /// entry shapes for the idle worker (consensus still only produces worker-0 blocks; worker
 /// spawning is a follow-up):
 ///
-/// 1. MID-EPOCH-0: hold the epoch-closing output back and recover in the startup order —
-///    `sync_num_workers_from_chain` sizes the accumulator, `catchup_accumulator` restores
-///    per-worker state. Worker 0 must match the live accumulator exactly; idle worker 1 holds
-///    `MIN_PROTOCOL_BASE_FEE`, which IS the committee value during epoch 0 (containers hold the MIN
-///    default until the FIRST close, pinned via `derive_idle_worker_fee(_, 0, _)`).
+/// 1. MID-EPOCH-0: hold the epoch-closing output back and recover at startup —
+///    `catchup_accumulator` sizes the accumulator from pinned chain state and restores
+///    per-worker gas stats. Worker 0's totals must match the live accumulator exactly; fees are
+///    owned by the entry seeding and hold `MIN_PROTOCOL_BASE_FEE` for BOTH workers, which IS
+///    the committee value during epoch 0 (containers hold the MIN default until the FIRST
+///    close, pinned via `derive_idle_worker_fee(_, 0, _)`).
 /// 2. Close epoch 0 with the held output.
-/// 3. RESTART-AFTER-CLOSE (the F1 crash-after-close shape on a 2-worker chain): catchup no-ops at a
-///    closing-block tip, so post-catchup worker 1 still holds MIN — the F6 failure state — and the
-///    entry derivation must flip it to the governance-set `Static { fee: 500 }`. That final
-///    assertion was `== MIN_PROTOCOL_BASE_FEE` before the F6 walk-back fix.
+/// 3. RESTART-AFTER-CLOSE (the crash-after-close shape on a 2-worker chain): catchup scans an
+///    empty range at a closing-block tip, so post-catchup worker 1 still holds MIN, and the
+///    entry derivation must flip it to the governance-set `Static { fee: 500 }` — restarting
+///    nodes converge with the fee the live committee computed at the boundary.
 #[tokio::test]
 async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("sync_then_catchup").unwrap();
@@ -743,28 +742,22 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
             .expect("engine update per output");
     }
 
-    // simulate node recovery in the startup order: sync worker count first, then catchup
+    // simulate node recovery at startup: catchup sizes the accumulator from pinned chain state
+    // and rebuilds gas stats (fees are owned by the entry seeding)
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
-    // poison worker 0's fee to prove the resize preserves the slot and catchup then restores it
-    let expected_base_fee = reth_env
-        .finalized_header()?
-        .expect("finalized header exists after producing blocks")
-        .base_fee_per_gas
-        .expect("executed blocks carry a base fee");
-    recovered.base_fee(0).set_base_fee(expected_base_fee + 999);
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
+    assert_eq!(recovered.num_workers(), 2, "catchup sizes the accumulator to the on-chain count");
 
-    let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
-    sync_num_workers_from_chain(&reth_env, &recovered, epoch_first_block);
-    assert_eq!(recovered.num_workers(), 2, "sync sizes the accumulator before catchup");
-
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
-
-    // worker 0: totals and fee restored to match the live accumulator
+    // worker 0: totals restored to match the live accumulator
     let (blocks, gas_used, gas_limit) = recovered.get_values(0);
     assert_eq!((blocks, gas_used, gas_limit), gas_accumulator.get_values(0));
     assert!(gas_used > 0, "worker 0 accumulated gas this epoch");
-    assert_eq!(recovered.base_fee(0).base_fee(), expected_base_fee);
+    // BOTH workers hold the MIN default: catchup does not seed fees, and MIN is the committee
+    // value during epoch 0 anyway (fees only move at the first close)
+    assert_eq!(recovered.base_fee(0).base_fee(), MIN_PROTOCOL_BASE_FEE);
     // worker 1: idle governance-declared slot stays at defaults
     assert_eq!(recovered.get_values(1), (0, 0, 0));
     assert_eq!(recovered.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
@@ -800,19 +793,18 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
 
     let restarted = GasAccumulator::new(1);
     restarted.rewards_counter().set_committee(fixture.committee());
-    sync_num_workers_from_chain(&reth_env, &restarted, entered_state.epoch_info.blockHeight);
-    assert_eq!(restarted.num_workers(), 2);
-    catchup_accumulator(reth_env.clone(), &restarted, &mut consensus_chain).await?;
-    // post-catchup: idle worker 1 still holds MIN — the F6 failure state the fill closes
+    catchup_accumulator(reth_env.clone(), &restarted, &mut consensus_chain, entered_state.epoch)
+        .await?;
+    assert_eq!(restarted.num_workers(), 2, "catchup sizes from the closing block's configs");
+    // post-catchup: fees still hold the MIN default — the entry derivation below owns them
     assert_eq!(restarted.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
 
     let derived = derive_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
     derived.apply(&restarted);
 
     // worker 1 never produced a block, yet its governance-set Static { fee: 500 } is recovered
-    // from the closing block's WorkerConfigs. NOTE: this assertion was
-    // `== MIN_PROTOCOL_BASE_FEE` before the F6 walk-back fix — restarting nodes now converge
-    // with the fee the live committee computed at the boundary.
+    // from the closing block's WorkerConfigs — restarting nodes converge with the fee the live
+    // committee computed at the boundary.
     assert_eq!(derived.fees[1], Some(500), "idle worker's fee derives from chain, not MIN");
     assert_eq!(restarted.base_fee(1).base_fee(), 500);
     // the standalone walk-back seam agrees
@@ -905,20 +897,19 @@ fn extend_canonical_chain(reth_env: &RethEnv, block: ExecutedBlock) -> eyre::Res
     Ok(header)
 }
 
-/// F16 regression (`issues/dual-header-read-robustness.md`): catchup derives the block scan
-/// range AND the epoch classification from the ONE pinned finalized header, so a canonical tip
-/// that advanced past finality across an epoch boundary can no longer produce a silently empty
-/// range that drops per-worker base-fee restoration.
+/// Catchup pins every chain-derived input (scan range, worker-count read block, leader-count
+/// bound) to the ONE finalized header, and guards that header's epoch against the canonical
+/// tip's. A finalized marker lagging the canonical tip WITHIN the epoch is legal (blocks and
+/// the marker commit in separate transactions): the pinned inputs stay internally consistent
+/// and the restore proceeds. A lag that crosses an epoch boundary would pin every input to the
+/// WRONG epoch's state, so catchup refuses with the cross-view guard error instead of silently
+/// rebuilding against it.
 ///
-/// Chain shape: block 1 (epoch 0, worker 0, non-default base fee) is canonical AND finalized;
-/// block 2 closes epoch 0 and is canonical but NOT finalized. The old dual-source read took the
-/// range start from the canonical tip's epoch state (epoch 1's first block, past the tip) and
-/// the range end from the finalized header (block 1), yielding an empty range and silently
-/// skipping the restore. The pinned read derives both ends from the finalized header's own epoch
-/// state and restores worker 0's fee. The epoch-entry seeding in `run_epoch` derives its range
-/// the same pinned way.
+/// Chain shape: block 1 (epoch 0, worker 0, one executed transfer) is canonical AND finalized;
+/// block 2 (epoch 0) is canonical but NOT finalized — the legal mid-epoch lag; block 3 closes
+/// epoch 0 and is canonical but NOT finalized — the boundary-crossing lag.
 #[tokio::test]
-async fn test_catchup_restores_fees_when_finality_lags_canonical_tip() -> eyre::Result<()> {
+async fn catchup_guards_finality_lag_across_epoch_boundary() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("catchup_pinned_finalized")?;
     // committee fixture only backs the consensus-chain handle catchup takes
     let fixture = CommitteeFixture::builder(MemDatabase::default)
@@ -971,17 +962,39 @@ async fn test_catchup_restores_fees_when_finality_lags_canonical_tip() -> eyre::
     let block1_header = extend_canonical_chain(&reth_env, block1)?;
     reth_env.finalize_block(block1_header.clone())?;
 
-    // block 2: closes epoch 0 - canonical but NOT finalized (finality lags the canonical tip)
+    // block 2 (epoch 0): canonical but NOT finalized - the legal mid-epoch finality lag
     let no_txs: Vec<Vec<u8>> = vec![];
-    let output2 = manual_consensus_output(1, 0, 2, true);
+    let output2 = manual_consensus_output(1, 0, 2, false);
     let payload2 = payload_with_base_fee(block1_header.clone(), &output2, chain_fee, worker_id);
     let block2 =
         reth_env.build_block_from_batch_payload(payload2, &no_txs, block1_header.hash(), &[])?;
-    extend_canonical_chain(&reth_env, block2)?;
+    let block2_header = extend_canonical_chain(&reth_env, block2)?;
 
-    // precondition: the OLD code's two sources now genuinely disagree - the canonical tip's
-    // epoch state places the epoch start PAST the finalized header, i.e. the old
-    // (canonical-tip start ..= finalized end) range is empty
+    // negative control: finalized (block 1) and canonical (block 2) agree on the epoch, so the
+    // guard must not fire and the restore scans the range pinned to the finalized header
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+    assert_eq!(canonical_epoch, 0, "mid-epoch canonical tip stays in epoch 0");
+    let recovered = GasAccumulator::new(1);
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
+    let (blocks_counted, gas_used, _gas_limit) = recovered.get_values(worker_id);
+    assert!(blocks_counted > 0, "legal mid-epoch lag must not skip the restore");
+    assert_eq!(
+        gas_used, block1_header.gas_used,
+        "the scan is bounded by the finalized header, not the canonical tip",
+    );
+    // catchup leaves fees to the entry seeding: block 1's non-MIN fee is NOT adopted
+    assert_eq!(recovered.base_fee(worker_id).base_fee(), MIN_PROTOCOL_BASE_FEE);
+
+    // block 3: closes epoch 0 - canonical but NOT finalized (the lag now crosses the boundary)
+    let output3 = manual_consensus_output(2, 0, 3, true);
+    let payload3 = payload_with_base_fee(block2_header.clone(), &output3, chain_fee, worker_id);
+    let block3 =
+        reth_env.build_block_from_batch_payload(payload3, &no_txs, block2_header.hash(), &[])?;
+    extend_canonical_chain(&reth_env, block3)?;
+
+    // precondition: the views genuinely disagree at epoch granularity - the canonical tip's
+    // epoch state places the epoch start PAST the finalized header
     let finalized = reth_env.finalized_header()?.expect("finalized header");
     assert_eq!(finalized.number, block1_header.number, "finality pinned at block 1");
     assert_eq!(finalized.hash(), block1_header.hash(), "pinned header carries its hash");
@@ -989,52 +1002,42 @@ async fn test_catchup_restores_fees_when_finality_lags_canonical_tip() -> eyre::
     assert_eq!(tip_state.epoch, 1, "canonical tip state crossed the epoch boundary");
     assert!(
         tip_state.epoch_info.blockHeight > finalized.number,
-        "old dual-source range start ({}) must exceed the finalized range end ({})",
+        "entered-epoch range start ({}) must exceed the finalized range end ({})",
         tip_state.epoch_info.blockHeight,
         finalized.number,
     );
 
-    // recovery: catchup must restore worker 0's fee from the finalized header's own epoch range
+    // the guard refuses the restore rather than rebuilding against the wrong epoch's state
     let recovered = GasAccumulator::new(1);
-    recovered.base_fee(worker_id).set_base_fee(chain_fee + 999); // poison
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
-
-    assert_eq!(
-        recovered.base_fee(worker_id).base_fee(),
-        chain_fee,
-        "catchup must restore the fee from the range pinned to the finalized header, not \
-         silently skip on an inconsistent (finalized, canonical-tip) pair",
+    let err =
+        catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, tip_state.epoch)
+            .await
+            .expect_err("boundary-crossing finality lag must refuse the restore");
+    assert!(
+        err.to_string().contains("across an epoch boundary"),
+        "error must identify the cross-boundary finalized-marker lag: {err}",
     );
-    // and the pinned range was non-empty: blocks were scanned into the gas stats
-    let (blocks_counted, _gas_used, _gas_limit) = recovered.get_values(worker_id);
-    assert!(blocks_counted > 0, "pinned range must not be empty");
+    // the guard fires before any write: the accumulator is untouched
+    assert_eq!(recovered.num_workers(), 1);
+    assert_eq!(recovered.get_values(worker_id), (0, 0, 0));
 
     Ok(())
 }
 
-/// F5 regression (review gap G12): a FAILED worker-count sync on a multi-worker chain must not
-/// make catchup panic. [`sync_num_workers_from_chain`] is fail-open (any read failure keeps the
-/// current count), so startup can reach [`catchup_accumulator`] holding the hardcoded
-/// `GasAccumulator::new(1)` while the pinned epoch range contains worker-1 blocks. The old code
-/// indexed those block-derived ids unclamped and died on the first worker-1 datum -
-/// `GasAccumulator::base_fee(1)`'s `.expect("valid worker id")` (or `inc_block`'s for a
-/// gas-bearing header) - a crash-loop for as long as the read kept failing. Catchup now grows
-/// the accumulator to the max block-observed worker id (committed blocks are committee-accepted
-/// evidence) and restores ALL observed workers.
+/// A committed block referencing a worker id at or beyond the on-chain `WorkerConfigs` count
+/// means the chain and the contract disagree about the worker set. Catchup fails the restore
+/// with a descriptive error - naming the scanned range, the offending id, and the on-chain
+/// count - instead of writing out-of-range per-worker state or dying on `inc_block`'s panic
+/// (which remains the live-path tripwire for the same condition).
 ///
-/// Chain shape (manual blocks like the F16 finality-lag test, worker ids stamped directly,
-/// because the consensus-driven 2-worker scaffold only ever puts worker-0 blocks on chain):
+/// Chain shape (manual blocks like the finality-lag test, worker ids stamped directly): the
+/// genesis `WorkerConfigs` declares ONE worker;
 /// - block 1 (epoch 0): worker 0, non-MIN fee, one executed transfer (real gas);
-/// - block 2 (epoch 0): worker 1, a different non-MIN fee, one executed transfer - the datum the
-///   old code panicked on. Canonical AND finalized.
-///
-/// The sync step is SKIPPED (simulating the failed read) and catchup runs directly on a fresh
-/// 1-slot accumulator: it must grow to 2 and restore both workers' fees and gas. A control
-/// accumulator then runs the healthy sync-then-catchup order over the same chain and must land
-/// on identical state, pinning growth-recovery == healthy-startup equivalence.
+/// - block 2 (epoch 0): worker 1, a different non-MIN fee, one executed transfer - the
+///   out-of-range datum. Canonical AND finalized.
 #[tokio::test]
-async fn catchup_after_failed_sync_on_multiworker_chain_recovers() -> eyre::Result<()> {
-    let temp_dir = TempDir::with_prefix("catchup_failed_sync_multiworker")?;
+async fn catchup_errors_on_worker_id_beyond_onchain_count() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("catchup_worker_id_bound")?;
     // committee fixture only backs the consensus-chain handle catchup takes
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .with_rng(StdRng::seed_from_u64(8991))
@@ -1042,14 +1045,9 @@ async fn catchup_after_failed_sync_on_multiworker_chain_recovers() -> eyre::Resu
     let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
 
-    // 2-worker WorkerConfigs at genesis (the sync-then-catchup chain shape) with a funded sender
-    // so both blocks carry real gas
+    // ONE-worker WorkerConfigs at genesis, with a funded sender so both blocks carry real gas
     let mut tx_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
-    let genesis = test_genesis_with_consensus_registry_and_workers(
-        4,
-        vec![(0u8, 30_000_000u64), (1u8, 500u64)],
-    )
-    .extend_accounts([(
+    let genesis = test_genesis_with_consensus_registry(4).extend_accounts([(
         tx_factory.address(),
         GenesisAccount::default().with_balance(U256::from(1_000_000_000_000_000_000u64)),
     )]);
@@ -1088,8 +1086,8 @@ async fn catchup_after_failed_sync_on_multiworker_chain_recovers() -> eyre::Resu
     )?;
     let block1_header = extend_canonical_chain(&reth_env, block1)?;
 
-    // block 2 (epoch 0): worker 1 with one executed transfer - the worker-1 datum the old
-    // unclamped catchup panicked on. Canonical AND finalized so the pinned scan covers it.
+    // block 2 (epoch 0): worker 1 with one executed transfer - the out-of-range datum.
+    // Canonical AND finalized so the pinned scan covers it.
     let transfer1 = tx_factory.create_eip1559_encoded(
         chain.clone(),
         None,
@@ -1109,43 +1107,28 @@ async fn catchup_after_failed_sync_on_multiworker_chain_recovers() -> eyre::Resu
     let block2_header = extend_canonical_chain(&reth_env, block2)?;
     reth_env.finalize_block(block2_header.clone())?;
 
-    // the scanned range genuinely carries worker-1 data (the old panic precondition)
+    // the scanned range genuinely carries worker-1 data
     assert!(block2_header.gas_used > 0, "worker 1's block must carry real gas");
 
-    // recovery with the sync step SKIPPED: the fail-open sync kept the startup default, so
-    // catchup starts 1 slot short of the ids on chain and must grow instead of panicking
+    // the on-chain count (1) cannot cover the block-observed worker id (1): the restore must
+    // fail with the descriptive bound error, not grow the accumulator and not panic
+    let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
     let recovered = GasAccumulator::new(1);
-    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
-
-    assert_eq!(
-        recovered.num_workers(),
-        2,
-        "catchup must grow the accumulator to cover the max block-observed worker id",
+    let err =
+        catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+            .await
+            .expect_err("a worker id at/beyond the on-chain count must fail the restore");
+    assert!(
+        err.to_string().contains("reference worker id 1"),
+        "error must name the offending worker id: {err}",
     );
-    assert_eq!(recovered.base_fee(0).base_fee(), worker0_fee);
-    assert_eq!(recovered.base_fee(1).base_fee(), worker1_fee);
-    let (blocks0, gas0, limit0) = recovered.get_values(0);
-    assert_eq!((blocks0, gas0), (1, block1_header.gas_used));
-    assert_eq!(limit0, block1_header.gas_limit);
-    let (blocks1, gas1, limit1) = recovered.get_values(1);
-    assert_eq!((blocks1, gas1), (1, block2_header.gas_used));
-    assert_eq!(limit1, block2_header.gas_limit);
-
-    // control: the healthy startup order (sync succeeds, then catchup) over the same chain must
-    // land on identical state - growth-recovery converges with a working count sync
-    let control = GasAccumulator::new(1);
-    let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
-    sync_num_workers_from_chain(&reth_env, &control, epoch_first_block);
-    assert_eq!(control.num_workers(), 2, "the on-chain WorkerConfigs declares 2 workers");
-    catchup_accumulator(reth_env.clone(), &control, &mut consensus_chain).await?;
-    assert_eq!(recovered.num_workers(), control.num_workers());
-    for worker_id in 0..2u16 {
-        assert_eq!(
-            recovered.base_fee(worker_id).base_fee(),
-            control.base_fee(worker_id).base_fee()
-        );
-        assert_eq!(recovered.get_values(worker_id), control.get_values(worker_id));
-    }
+    assert_eq!(recovered.num_workers(), 1, "the failed restore must not grow the accumulator");
+    assert_eq!(recovered.get_values(0), (0, 0, 0), "the bound check fires before gas accrual");
+    assert_eq!(
+        recovered.base_fee(0).base_fee(),
+        MIN_PROTOCOL_BASE_FEE,
+        "no per-worker state is written on the error path",
+    );
 
     Ok(())
 }
@@ -1160,9 +1143,10 @@ async fn catchup_after_failed_sync_on_multiworker_chain_recovers() -> eyre::Resu
 /// Worker 0 is configured `Static { fee: 12_345 }` in the genesis `WorkerConfigs`. A full epoch
 /// of batches executes and the last output is flagged as the epoch close (so the closing block
 /// runs `concludeEpoch`). A fresh accumulator then follows the production entry order -
-/// `sync_num_workers_from_chain`, `derive_base_fees_for_entered_epoch`, `apply` - and must land
-/// on 12_345. Also pins gas equivalence (header scan ≡ the live accumulator's `inc_block`
-/// totals) and derivation idempotence (the fee is a pure function of the closing block).
+/// `derive_base_fees_for_entered_epoch` at the closing block, then `apply` (which also sizes
+/// the worker count) - and must land on 12_345. Also pins gas equivalence (header scan ≡ the
+/// live accumulator's `inc_block` totals) and derivation idempotence (the fee is a pure
+/// function of the closing block).
 #[tokio::test]
 async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("derive_base_fees_boundary").unwrap();
@@ -1281,14 +1265,12 @@ async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Res
         "entered epoch starts on the block after the closing block",
     );
 
-    // simulate the F1 restart shapes: fresh accumulator recovered in the production entry order
+    // simulate the restart shapes: fresh accumulator recovered in the production entry order
     let recovered = GasAccumulator::new(1);
-    sync_num_workers_from_chain(&reth_env, &recovered, entered_state.epoch_info.blockHeight);
-    assert_eq!(recovered.num_workers(), 1);
     assert_eq!(
         recovered.base_fee(0).base_fee(),
         MIN_PROTOCOL_BASE_FEE,
-        "the F1 failure state: a fresh accumulator holds the MIN default before derivation",
+        "the failure state: a fresh accumulator holds the MIN default before derivation",
     );
 
     let derived = derive_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
@@ -1322,14 +1304,14 @@ async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Res
     Ok(())
 }
 
-/// F17 / P1-13 regression (`report.md` F17, gap G25): pin the closing-block identity that BOTH
-/// base-fee config-read sites silently depend on. The close-time read (`adjust_base_fees`, at the
-/// canonical tip) and the entry-time read (`derive_base_fees_for_entered_epoch`, at the finalized
-/// closing block) resolve to the same closing block ONLY because `concludeEpoch` stamps the entered
-/// epoch's `blockHeight = closing block + 1` (ConsensusRegistry) AND the close system call is
-/// pinned to the LAST batch of the boundary output (`ConsensusOutput::close_epoch_for_last_batch`).
-/// Nothing else asserts it, so a future multi-block-boundary or contract change could break it
-/// silently.
+/// F17 / P1-13 regression (`report.md` F17, gap G25): pin the closing-block identity the
+/// base-fee config reads depend on. The close-time read (`adjust_base_fees`, at the canonical
+/// tip) asserts the identity as its tripwire, and the entry seeding resolves its closing block
+/// directly from the entered epoch's `blockHeight - 1`, so both price fees off the true closing
+/// block ONLY because `concludeEpoch` stamps the entered epoch's `blockHeight = closing block +
+/// 1` (ConsensusRegistry) AND the close system call is pinned to the LAST batch of the boundary
+/// output (`ConsensusOutput::close_epoch_for_last_batch`). A future multi-block-boundary or
+/// contract change would otherwise break that convention silently.
 ///
 /// This drives a REAL epoch close through the ExecutorEngine/`spawn_consensus` scaffold where the
 /// boundary output is MULTI-BLOCK (its committed subdag flattens to more than one batch, so it
@@ -1770,18 +1752,17 @@ async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<
 /// decays once per idle boundary — the exact `compute_next_base_fee_eip1559` chain the live
 /// committee's per-close `adjust_base_fees` ran.
 ///
-/// Manual two-epoch chain (worker ids and fees stamped directly, like the F16 finality-lag
-/// test):
+/// Manual two-epoch chain (worker ids and fees stamped directly, like the finality-lag test):
 /// - block 1 (epoch 0): worker 1's ONLY block, carrying a non-MIN fee — the anchor;
 /// - block 2: closes epoch 0 (worker 0);
 /// - block 3 (epoch 1): worker 0 only — worker 1 is idle;
 /// - block 4: closes epoch 1 (worker 0).
 ///
-/// Pins both entry paths for the idle worker:
-/// - mid-epoch-1 (adopt path): `fill_absent_worker_fees` derives worker 1's fee = ONE boundary
-///   folded from the block-1 anchor;
-/// - entering epoch 2 (boundary path): `derive_idle_worker_fee` and the
-///   `derive_base_fees_for_entered_epoch` fill both equal the TWO-boundary oracle chain.
+/// Pins both entry states for the idle worker:
+/// - mid-epoch-1: the entry derivation (from epoch 0's closing block) prices worker 1 = ONE
+///   boundary folded from the block-1 anchor;
+/// - entering epoch 2: `derive_idle_worker_fee` and the `derive_base_fees_for_entered_epoch`
+///   fill both equal the TWO-boundary oracle chain.
 #[tokio::test]
 async fn test_derive_idle_worker_fee_eip1559_decays_from_last_produced_epoch() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("derive_idle_eip1559").unwrap();
@@ -1835,22 +1816,23 @@ async fn test_derive_idle_worker_fee_eip1559_decays_from_last_produced_epoch() -
         "decay from a non-MIN anchor must stay non-MIN for the oracle to be meaningful",
     );
 
-    // mid-epoch-1 restart (the adopt entry path): worker 1 has no block this epoch, so
-    // seed-from-chain has nothing to adopt; the fill derives its fee from the epoch-0 anchor.
-    // `chain_fees` mirrors what the entry scan reads from epoch 1's only block (worker 0, MIN).
+    // mid-epoch-1 restart: the entry derivation prices EVERY worker from epoch 0's closing
+    // block (block 2). Worker 1 has no epoch-0 gas, so its fee is the anchor folded once;
+    // worker 0's fee is an explicit write of the same MIN its epoch-0 blocks carry (zero gas
+    // folds back to MIN under its 30M-target Eip1559 config).
     let recovered = GasAccumulator::new(1);
-    let chain_fees = HashMap::from([(0u16, MIN_PROTOCOL_BASE_FEE)]);
-    fill_absent_worker_fees(&reth_env, 1, &block3_header, &chain_fees, &recovered)?;
-    assert_eq!(recovered.num_workers(), 2, "fill resizes to the on-chain worker count");
+    let derived_mid = derive_base_fees_for_entered_epoch(&reth_env, 1, &block2_header)?;
+    derived_mid.apply(&recovered);
+    assert_eq!(recovered.num_workers(), 2, "apply resizes to the on-chain worker count");
     assert_eq!(
         recovered.base_fee(1).base_fee(),
         fee_entering_1,
-        "adopt-path fill derives the idle worker's fee from its last produced epoch",
+        "entry derivation prices the idle worker from its last produced epoch",
     );
     assert_eq!(
         recovered.base_fee(0).base_fee(),
         MIN_PROTOCOL_BASE_FEE,
-        "workers present in chain_fees are not touched by the fill",
+        "worker 0's zero-gas epoch folds back to MIN - written explicitly by apply",
     );
     // the standalone seam agrees mid-epoch
     assert_eq!(derive_idle_worker_fee(&reth_env, 1, 1)?, fee_entering_1);
@@ -1883,10 +1865,11 @@ async fn test_derive_idle_worker_fee_eip1559_decays_from_last_produced_epoch() -
     Ok(())
 }
 
-/// One epoch-entry pass over the accumulator exactly as `run_epoch` performs it on the
-/// mid-epoch (adopt) branch: sync the worker count from the previous epoch's closing block,
-/// adopt each worker's latest on-chain fee over the pinned tip's epoch range, then fill
-/// configured-but-absent workers from prior closing-block state.
+/// One epoch-entry pass over the accumulator exactly as `run_epoch` performs it: read the
+/// entered epoch's state from the canonical tip, resolve the previous epoch's closing block
+/// (`blockHeight - 1`, written once at the boundary), and derive+apply the worker count and
+/// every worker's base fee from that pinned state. Epoch 0 has no prior epoch: the count syncs
+/// from genesis `WorkerConfigs` state and fees keep the MIN defaults.
 fn run_epoch_entry_sequence(
     reth_env: &RethEnv,
     gas_accumulator: &GasAccumulator,
@@ -1894,57 +1877,48 @@ fn run_epoch_entry_sequence(
     // run_epoch reads the entered epoch's info from the canonical tip; the values are written
     // once at the boundary, so any mid-epoch tip serves identical ones
     let entered_state = reth_env.epoch_state_from_canonical_tip()?;
-    sync_num_workers_from_chain(reth_env, gas_accumulator, entered_state.epoch_info.blockHeight);
-
-    // the pinned finalized tip classifies the entry; mid-epoch it is the adopt branch
-    let tip = reth_env.finalized_header()?.expect("finalized tip");
-    assert_eq!(
-        RethEnv::extract_epoch_from_header(&tip),
-        entered_state.epoch,
-        "mid-epoch tip -> the adopt entry branch",
-    );
-    let epoch_state = reth_env.epoch_state_at_header(&tip)?;
-    let blocks = reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=tip.number)?;
-    // mirrors `latest_base_fee_per_worker`: worker id from difficulty's low 16 bits, the last
-    // block seen per worker wins
-    let mut chain_fees: HashMap<WorkerId, u64> = HashMap::new();
-    for header in &blocks {
-        let worker_id = (header.difficulty.into_limbs()[0] & 0xffff) as WorkerId;
-        if let Some(fee) = header.base_fee_per_gas {
-            chain_fees.insert(worker_id, fee);
-        }
+    if entered_state.epoch == 0 {
+        sync_num_workers_from_chain(
+            reth_env,
+            gas_accumulator,
+            entered_state.epoch_info.blockHeight,
+        )?;
+    } else {
+        let closing_number = entered_state
+            .epoch_info
+            .blockHeight
+            .checked_sub(1)
+            .ok_or_else(|| eyre::eyre!("entered epoch reports blockHeight 0"))?;
+        let closing = reth_env
+            .sealed_header_by_number(closing_number)?
+            .ok_or_else(|| eyre::eyre!("missing closing block {closing_number}"))?;
+        derive_base_fees_for_entered_epoch(reth_env, entered_state.epoch, &closing)?
+            .apply(gas_accumulator);
     }
-    // adopt (mirrors run_epoch's `seed_base_fees_from_chain`)
-    for worker_id in 0..gas_accumulator.num_workers() as WorkerId {
-        if let Some(&fee) = chain_fees.get(&worker_id) {
-            gas_accumulator.base_fee(worker_id).set_base_fee(fee);
-        }
-    }
-    fill_absent_worker_fees(reth_env, entered_state.epoch, &tip, &chain_fees, gas_accumulator)?;
     Ok(())
 }
 
-/// F18 / G15 regression: a ModeChange re-entry re-runs the epoch-entry sequence mid-epoch while
-/// the engine may still be executing leftover consensus output
-/// (`send_leftover_consensus_output_to_engine` forwards it WITHOUT waiting for execution). What
-/// makes that safe is NOT quiescence but value-stability: every count/config read in the entry
-/// flow is pinned to the previous epoch's closing block (or resolves a value written once at
-/// the boundary), so the re-entry re-reads identical values - the resize no-ops and the fee
-/// writes rewrite the same values - while in-flight `inc_block` calls (ids < count) keep
-/// landing.
+/// A ModeChange re-entry re-runs the epoch-entry sequence mid-epoch while the engine may still
+/// be executing leftover consensus output (`send_leftover_consensus_output_to_engine` forwards
+/// it WITHOUT waiting for execution). What makes that safe is NOT quiescence but
+/// value-stability: the entered epoch's `blockHeight` is written once at the boundary and the
+/// derivation is a pure function of the prior epoch's closing state, so the re-entry
+/// re-derives identical values - the resize no-ops and the fee writes rewrite the same values
+/// - while in-flight `inc_block` calls (ids < count) keep landing.
 ///
-/// Chain shape (2 static workers so both entry sub-paths carry non-MIN fees):
+/// Chain shape (2 static workers so both derive sub-paths carry non-MIN fees):
 /// - block 1 closes epoch 0 (worker 0 at MIN - the live epoch-0 fee; statics activate entering
 ///   epoch 1);
-/// - block 2 (epoch 1): worker 0 at its static fee - the pinned tip for the first entry;
-/// - block 3 (epoch 1): the "leftover" executed between the entries, advancing the pinned tip.
+/// - block 2 (epoch 1): worker 0 at its static fee - chain-consistent with the derived value;
+/// - block 3 (epoch 1): the "leftover" executed between the entries, advancing the tip.
 ///
-/// The first entry seeds count = 2 and fees [700 (adopted), 500 (filled - worker 1 is idle)].
-/// Live gas accumulates, block 3 lands, then the re-entry runs while a hammer thread plays the
-/// engine still executing leftovers - `inc_block`/`base_fee` for both workers (worker 1 =
-/// count - 1 pins the no-shrink-below-in-flight-id bound). Asserts: count unchanged, every fee
-/// unchanged, accumulated gas exactly preserved (sequential + concurrent increments), no panic.
-/// The thread overlap is best-effort; every assertion is timing-independent.
+/// The first entry seeds count = 2 and fees [700, 500] (worker 0 folds through its static
+/// config from its epoch-0 block; idle worker 1 walks back to its static config). Live gas
+/// accumulates, block 3 lands, then the re-entry runs while a hammer thread plays the engine
+/// still executing leftovers - `inc_block`/`base_fee` for both workers (worker 1 = count - 1
+/// pins the no-shrink-below-in-flight-id bound). Asserts: count unchanged, every fee
+/// unchanged, accumulated gas exactly preserved (sequential + concurrent increments), no
+/// panic. The thread overlap is best-effort; every assertion is timing-independent.
 #[tokio::test]
 async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
     const WORKER0_FEE: u64 = 700;
@@ -1953,7 +1927,7 @@ async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
 
     let temp_dir = TempDir::with_prefix("mode_change_reentry").unwrap();
     // 2-worker WorkerConfigs, both Static (strategy 1) so the epoch-1 fees are non-MIN and
-    // self-consistent across every entry seam (adopt, fill, derive)
+    // self-consistent across both derive sub-paths (produced fold and idle walk-back)
     let genesis = test_genesis_with_consensus_registry_and_workers(
         4,
         vec![(1u8, WORKER0_FEE), (1u8, WORKER1_FEE)],
@@ -1986,20 +1960,20 @@ async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
     let block2_header = extend_canonical_chain(&reth_env, block2)?;
     reth_env.finalize_block(block2_header.clone())?;
 
-    // FIRST entry (mid-epoch-1): sync count -> adopt-seed -> fill absent
+    // FIRST entry (mid-epoch-1): derive from epoch 0's closing block, then apply
     let gas_accumulator = GasAccumulator::new(1);
     let block_height_first = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
     run_epoch_entry_sequence(&reth_env, &gas_accumulator)?;
-    assert_eq!(gas_accumulator.num_workers(), 2, "count synced from the closing block's configs");
+    assert_eq!(gas_accumulator.num_workers(), 2, "count derived from the closing block's configs");
     assert_eq!(
         gas_accumulator.base_fee(0).base_fee(),
         WORKER0_FEE,
-        "worker 0 adopted its fee from this epoch's chain blocks",
+        "worker 0's fee folds through its static config from the closing block",
     );
     assert_eq!(
         gas_accumulator.base_fee(1).base_fee(),
         WORKER1_FEE,
-        "idle worker 1 filled from prior closing-block state",
+        "idle worker 1's fee walks back through prior closing-block state",
     );
 
     // live execution before the mode change: deterministic totals the re-entry must preserve

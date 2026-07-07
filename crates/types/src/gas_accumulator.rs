@@ -8,21 +8,23 @@
 //! ## Worker count
 //!
 //! The number of worker slots is not fixed at construction. The on-chain `WorkerConfigs`
-//! contract is the absolute source of truth: `sync_num_workers_from_chain` (in `node::manager`)
-//! reads the count for the entered epoch at the epoch's first block's parent and resizes the
-//! accumulator in place via [`GasAccumulator::set_num_workers`] - at startup (before catchup)
-//! and at every epoch entry - and `adjust_base_fees` resizes at epoch close to the count read
-//! from the closing block (the next epoch's count).
+//! contract is the absolute source of truth, and the count for an epoch is the contract's state
+//! at the previous epoch's closing block: `catchup_accumulator` (in `node::manager`) sizes the
+//! accumulator from that state at startup, the epoch entry seeding re-seeds it on every entry
+//! (`DerivedBaseFees::apply`, or `sync_num_workers_from_chain` for epoch 0), and
+//! `adjust_base_fees` resizes at epoch close to the count read from the closing block (the next
+//! epoch's count). All resizes go through [`GasAccumulator::set_num_workers`].
 //!
 //! ## Startup recovery
 //!
 //! Because the accumulator is purely in-memory, its state must be rebuilt whenever a node restarts
 //! mid-epoch. Three codepaths cooperate to restore it:
 //!
-//! 1. **`catchup_accumulator`** (in `node::manager`) — runs once at startup. It walks the
-//!    already-executed reth blocks for the current epoch to re-accumulate gas stats per worker,
-//!    restores the base fee from the finalized header, and iterates the consensus DB in reverse to
-//!    restore leader counts for rounds that were already executed.
+//! 1. **`catchup_accumulator`** (in `node::manager`) — runs once at startup. It syncs the worker
+//!    count from pinned closing-block chain state, walks the already-executed reth blocks for the
+//!    current epoch to re-accumulate gas stats per worker, and iterates the consensus DB in
+//!    reverse to restore leader counts for rounds that were already executed. Base fees are not
+//!    restored here — the epoch entry seeding owns them.
 //!
 //! 2. **`EpochManager::replay_missed_consensus`** — replays any consensus output that was committed
 //!    to the consensus DB but not yet executed before the previous shutdown. These blocks flow
@@ -36,18 +38,17 @@
 //! ## Base fee on sync and restart (the base-fee-from-chain invariant)
 //!
 //! Base fee is consensus-affecting, so a node must never produce with a fee it cannot verify
-//! against the chain. The entered epoch's fees are therefore always rederivable from chain state
-//! at epoch entry (`run_epoch` in `node::manager`): when the finalized tip is already in the
-//! epoch being entered, each worker's [`BaseFeeContainer`] adopts its most recent on-chain
-//! block's fee (`latest_base_fee_per_worker`); when the tip is the previous epoch's closing
-//! block — a live producer crossing the boundary, or any restart shape that closed the epoch
-//! without adjusting fees — every worker's fee is derived as a pure function of the previous
-//! epoch's chain state (`derive_base_fees_for_entered_epoch`); workers with no block to read
-//! from walk back through earlier closing blocks (`derive_idle_worker_fee`). Any other tip state
-//! is an error: the node halts rather than run on fees it cannot verify. The live producer's
-//! close-time computation (`adjust_base_fees`) folds the same formula over the same inputs, so
-//! the value it carries between close and the next entry is identical to what entry derivation
-//! recomputes.
+//! against the chain. The entered epoch's worker count and per-worker fees are therefore owned
+//! by the epoch entry seeding (`run_epoch` in `node::manager`), which derives them on EVERY
+//! entry — live boundary crossing, restart, mid-epoch re-entry, or sync — as a pure function of
+//! the previous epoch's on-chain state (`derive_base_fees_for_entered_epoch`): the previous
+//! epoch's closing block is resolved from the entered epoch's registry-recorded first block,
+//! worker strategies and count are read at it, and workers with no block to read a fee from walk
+//! back through earlier closing blocks (`derive_idle_worker_fee`). Epoch 0 has no prior epoch,
+//! so every [`BaseFeeContainer`] keeps the MIN default. A node that cannot read or verify that
+//! state halts rather than produce with an unverifiable fee. The live producer's close-time
+//! computation (`adjust_base_fees`) folds the same formula over the same inputs, so the value it
+//! carries between close and the next entry is identical to what entry derivation recomputes.
 
 use crate::{AuthorityIdentifier, Committee, WorkerId};
 
