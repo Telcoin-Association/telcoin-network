@@ -34,9 +34,12 @@ use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, NodeMode, StateSynchronizer,
 };
-use tn_reth::system_calls::{
-    ConsensusRegistry::{self, EpochInfo},
-    EpochState,
+use tn_reth::{
+    system_calls::{
+        ConsensusRegistry::{self, EpochInfo},
+        EpochState,
+    },
+    WorkerRpcForwarder,
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
@@ -434,11 +437,18 @@ where
         )
         .await?;
 
+        // Observer transaction forwarding: a non-committee worker forwards each transaction it
+        // accepts to the JSON-RPC endpoint of the validator that owns it, discovered over
+        // kademlia (issue #804).
+        let forwarder =
+            Arc::new(WorkerRpcForwarder::new(network_handle.get_task_spawner().clone()));
+
         let worker = WorkerNode::new(
             worker_id,
             consensus_config.clone(),
             network_handle.clone(),
             validator,
+            forwarder,
             self.consensus_chain.clone(),
         );
 

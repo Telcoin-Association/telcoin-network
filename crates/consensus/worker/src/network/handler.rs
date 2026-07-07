@@ -28,15 +28,6 @@ use tracing::{debug, warn};
 /// Set for 500MB through emerging market worse-case 20MB/s upload
 const SEND_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
 
-/// Maximum number of transactions accepted in a single [`WorkerRequest::ReportTxns`].
-///
-/// A legitimately built batch is gas-bounded to far fewer transactions than this
-/// (`max_batch_gas` / a transaction's intrinsic gas), so this only rejects abusive
-/// requests that pack the RPC frame with transactions to amplify signature-recovery work
-/// on the recipient. Over-limit requests are rejected and penalized so peer scoring can
-/// throttle a flooder (parity with the gossip mesh's peer scoring).
-const MAX_TXNS_PER_REPORT: usize = 5_000;
-
 /// The type that handles requests from peers.
 ///
 /// An instance is cloned for each request and used in a spawned task.
@@ -137,37 +128,6 @@ where
                             tracing::error!(target: "worker:network", "failed to get gossipped batch {batch_hash}: {e}");
                         }
                     }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Process transactions pushed by a peer for committee inclusion.
-    ///
-    /// This is the RPC replacement for the retired `WorkerGossip::Txn` path (issue #804):
-    /// only committee members act, and each keeps only the transactions that fall in its
-    /// own committee shard via `submit_txn_if_mine`. A non-committee recipient (or a member
-    /// that cannot locate its own slot) simply ignores the request.
-    pub(super) async fn process_report_txns(
-        &self,
-        transactions: Vec<Vec<u8>>,
-    ) -> WorkerNetworkResult<()> {
-        ensure!(
-            transactions.len() <= MAX_TXNS_PER_REPORT,
-            WorkerNetworkError::InvalidRequest(format!(
-                "ReportTxns exceeds max transactions: {} > {MAX_TXNS_PER_REPORT}",
-                transactions.len()
-            ))
-        );
-        if let Some(authority) = self.consensus_config.authority() {
-            let committee = self.consensus_config.committee();
-            let authorities = committee.authorities();
-            let size = authorities.len();
-            if let Some(slot) = authorities.into_iter().position(|auth| &auth == authority) {
-                for tx_bytes in &transactions {
-                    self.validator.submit_txn_if_mine(tx_bytes, size as u64, slot as u64);
                 }
             }
         }
@@ -363,15 +323,6 @@ where
         msg: &GossipMessage,
     ) -> WorkerNetworkResult<()> {
         self.process_gossip(msg).await
-    }
-
-    /// Publicly available for tests.
-    /// See [Self::process_report_txns].
-    pub async fn pub_process_report_txns(
-        &self,
-        transactions: Vec<Vec<u8>>,
-    ) -> WorkerNetworkResult<()> {
-        self.process_report_txns(transactions).await
     }
 
     /// Publicly available for tests.

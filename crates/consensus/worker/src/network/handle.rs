@@ -19,8 +19,8 @@ use tn_network_libp2p::{
     write_frame, Penalty, StreamError, StreamKind, SyncFrame, WorkerSyncRequest,
 };
 use tn_types::{
-    encode, max_batch_size, try_decode, Batch, BlockHash, BlsPublicKey, Epoch, SealedBatch,
-    TaskSpawner, B256,
+    encode, max_batch_size, try_decode, Batch, BlockHash, BlsPublicKey, Epoch, RpcInfo,
+    SealedBatch, TaskSpawner, B256,
 };
 use tracing::{debug, warn};
 
@@ -122,36 +122,16 @@ impl WorkerNetworkHandle {
         Ok(())
     }
 
-    /// Push transactions (as raw bytes) to a committee member via direct RPC.
+    /// Snapshot of every committee validator's advertised JSON-RPC endpoint, discovered over
+    /// kademlia.
     ///
-    /// Use this when not a committee member so a committee validator can include the
-    /// transactions in a batch. This replaces the previous gossip broadcast (issue #804):
-    /// the request is routed to `peer_bls` over the (KAD-discovered) request/response
-    /// protocol instead of flooded on a gossip topic.
-    pub(crate) async fn report_txns(
+    /// A non-committee ("observer") worker uses this to forward the transactions it accepts to
+    /// the validators that own them (issue #804), instead of pushing them over the worker
+    /// protocol. Returns an empty list if no validator has advertised an endpoint.
+    pub(crate) async fn get_all_validator_rpcs(
         &self,
-        peer_bls: BlsPublicKey,
-        transactions: Vec<Vec<u8>>,
-    ) -> NetworkResult<()> {
-        let request = WorkerRequest::ReportTxns { transactions };
-        let res = self.handle.send_request(request, peer_bls).await?;
-        let res = res.await??.result;
-        match res {
-            WorkerResponse::ReportTxns => Ok(()),
-            WorkerResponse::ReportBatch => Err(NetworkError::RPCError(
-                "Got wrong response, not a report txns is report batch!".to_string(),
-            )),
-            WorkerResponse::RequestBatchesStream { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a report txns is stream ack!".to_string(),
-            )),
-            WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a report txns is peer exchange!".to_string(),
-            )),
-            WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
-            WorkerResponse::RecoverableError(WorkerRPCError(s)) => {
-                Err(NetworkError::RPCRetryable(s))
-            }
-        }
+    ) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
+        self.handle.get_all_validator_rpcs().await
     }
 
     /// Report a new batch to a peer.
@@ -165,9 +145,6 @@ impl WorkerNetworkHandle {
         let res = res.await??.result;
         match res {
             WorkerResponse::ReportBatch => Ok(()),
-            WorkerResponse::ReportTxns => Err(NetworkError::RPCError(
-                "Got wrong response, not a report batch is report txns!".to_string(),
-            )),
             WorkerResponse::RequestBatchesStream { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a report batch is stream ack!".to_string(),
             )),
@@ -600,9 +577,6 @@ impl WorkerNetworkHandle {
             }
             WorkerResponse::ReportBatch => Err(NetworkError::RPCError(
                 "Got wrong response: report batch instead of stream ack".to_string(),
-            )),
-            WorkerResponse::ReportTxns => Err(NetworkError::RPCError(
-                "Got wrong response: report txns instead of stream ack".to_string(),
             )),
             WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response: peer exchange instead of stream ack".to_string(),

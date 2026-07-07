@@ -169,9 +169,11 @@ pub use txn_pool::*;
 use worker::WorkerNetwork;
 pub mod error;
 mod evm;
+pub mod forward;
 pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
+
 #[cfg(not(feature = "faucet"))]
 pub use evm::TIMELOCK_DURATION;
 pub use evm::{
@@ -179,6 +181,7 @@ pub use evm::{
     grantMintRoleCall, hasMintRoleCall, mintCall, revokeMintRoleCall, totalSupplyCall,
     BLS_G1_PRECOMPILE_ADDRESS, TELCOIN_PRECOMPILE_ADDRESS,
 };
+pub use forward::WorkerRpcForwarder;
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;

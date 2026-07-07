@@ -4,7 +4,7 @@ use tempfile::TempDir;
 use tn_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use tn_reth::test_utils::transaction;
 use tn_storage::{open_db, tables::NodeBatchesCache};
-use tn_types::{test_chain_spec_arc, Batch, Database, TaskManager};
+use tn_types::{test_chain_spec_arc, Batch, Database, NoopTxnForwarder, TaskManager};
 use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
 
 #[tokio::test]
@@ -29,6 +29,7 @@ async fn make_batch() {
         store.clone(),
         timeout,
         WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        Arc::new(NoopTxnForwarder),
         Vec::new(),
     );
 

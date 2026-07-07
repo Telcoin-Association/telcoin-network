@@ -10,10 +10,8 @@ use crate::{
     quorum_waiter::{QuorumWaiter, QuorumWaiterTrait},
     WorkerNetworkHandle,
 };
-use futures::stream::{futures_unordered::FuturesUnordered, StreamExt as _};
 use std::{sync::Arc, time::Duration};
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::error::NetworkError;
 use tn_network_types::{local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{
     consensus::ConsensusChain,
@@ -21,18 +19,12 @@ use tn_storage::{
 };
 use tn_types::{
     error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, BlsPublicKey, Database,
-    SealedBatch, TaskManager, WorkerId,
+    SealedBatch, TaskManager, TxnForwarder, WorkerId,
 };
 use tracing::{error, info, instrument, warn};
 
 /// The default channel capacity for each channel of the worker.
 pub const CHANNEL_CAPACITY: usize = 1_000;
-
-/// Maximum number of attempts to push transactions to a single committee member.
-const MAX_TXN_PUSH_ATTEMPTS: u32 = 3;
-
-/// Base backoff between transaction-push retries (doubles each attempt).
-const TXN_PUSH_RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
 /// Spawn the worker.
 ///
@@ -42,6 +34,7 @@ pub fn new_worker<DB: Database>(
     validator: Arc<dyn BatchValidation>,
     consensus_config: ConsensusConfig<DB>,
     network_handle: WorkerNetworkHandle,
+    forwarder: Arc<dyn TxnForwarder>,
     consensus_chain: ConsensusChain,
 ) -> Worker<DB, QuorumWaiter> {
     info!(target: "worker::worker", "Boot worker node with id {} key {:?}", id, consensus_config.key_config().primary_public_key());
@@ -65,6 +58,7 @@ pub fn new_worker<DB: Database>(
         &consensus_config,
         consensus_config.local_network().clone(),
         network_handle.clone(),
+        forwarder,
     );
 
     // NOTE: This log entry is used to compute performance.
@@ -83,6 +77,7 @@ fn new_worker_internal<DB: Database>(
     consensus_config: &ConsensusConfig<DB>,
     client: LocalNetwork,
     network_handle: WorkerNetworkHandle,
+    forwarder: Arc<dyn TxnForwarder>,
 ) -> Worker<DB, QuorumWaiter> {
     info!(target: "worker::worker", "Starting handler for transactions");
 
@@ -98,15 +93,16 @@ fn new_worker_internal<DB: Database>(
         )
     });
 
-    // Committee validators to push accepted transactions to when this node is not a CVV.
-    // A non-committee node (`authority()` is `None`) pushes to every committee member; a
-    // committee member excludes itself.
-    let committee_txn_targets = match consensus_config.authority() {
-        Some(authority) => {
-            consensus_config.committee().others_keys_except(authority.protocol_key())
-        }
-        None => consensus_config.committee().bls_keys().into_iter().collect(),
-    };
+    // Committee BLS keys in slot order (index == committee slot). A non-committee ("observer")
+    // worker forwards each transaction it accepts to the JSON-RPC endpoint advertised by the
+    // validator whose slot owns the sender, matching `submit_txn_if_mine` so nonce ordering is
+    // preserved (issue #804).
+    let committee_slots: Vec<BlsPublicKey> = consensus_config
+        .committee()
+        .authorities()
+        .iter()
+        .map(|authority| authority.protocol_key().clone())
+        .collect();
 
     Worker::new(
         id,
@@ -115,7 +111,8 @@ fn new_worker_internal<DB: Database>(
         consensus_config.node_storage().clone(),
         consensus_config.parameters().batch_vote_timeout,
         network_handle,
-        committee_txn_targets,
+        forwarder,
+        committee_slots,
     )
 }
 
@@ -138,12 +135,14 @@ pub struct Worker<DB, QW> {
     timeout: Duration,
     /// Worker network handle.
     network_handle: WorkerNetworkHandle,
-    /// Committee validators to push accepted transactions to when this node is not a
-    /// committee voting validator.
+    /// Forwards transactions this node accepts to committee validators over their advertised
+    /// JSON-RPC endpoints when this node is not a committee voting validator (issue #804).
+    forwarder: Arc<dyn TxnForwarder>,
+    /// Committee BLS keys in slot order (index == committee slot).
     ///
-    /// Populated once per epoch at construction (issue #804): non-CVV workers push the
-    /// transactions they accept to these peers over RPC instead of gossiping them.
-    committee_txn_targets: Vec<BlsPublicKey>,
+    /// Populated once per epoch at construction: a non-CVV worker forwards each transaction it
+    /// accepts to the validator whose slot owns the sender, so nonce ordering is preserved.
+    committee_slots: Vec<BlsPublicKey>,
     /// Prometheus metrics for this worker.
     metrics: WorkerMetrics,
 }
@@ -162,7 +161,8 @@ impl<DB: Clone, QW: Clone> Clone for Worker<DB, QW> {
             rx_batches: None,
             timeout: self.timeout,
             network_handle: self.network_handle.clone(),
-            committee_txn_targets: self.committee_txn_targets.clone(),
+            forwarder: self.forwarder.clone(),
+            committee_slots: self.committee_slots.clone(),
             metrics: self.metrics.clone(),
         }
     }
@@ -183,7 +183,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         store: DB,
         timeout: Duration,
         network_handle: WorkerNetworkHandle,
-        committee_txn_targets: Vec<BlsPublicKey>,
+        forwarder: Arc<dyn TxnForwarder>,
+        committee_slots: Vec<BlsPublicKey>,
     ) -> Self {
         let (tx_batches, rx_batches) = tokio::sync::mpsc::channel(1000);
         Self {
@@ -195,7 +196,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             rx_batches: Some(rx_batches),
             timeout,
             network_handle,
-            committee_txn_targets,
+            forwarder,
+            committee_slots,
             metrics: WorkerMetrics::new_for_worker(id),
         }
     }
@@ -231,87 +233,46 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         self.tx_batches.clone()
     }
 
-    /// Send all the txns in `sealed_batch` to committee validators so they can be included
+    /// Forward all the txns in `sealed_batch` to committee validators so they can be included
     /// in blocks. Use this when not a CVV so that transactions you accept can be included.
     ///
-    /// Replaces the previous gossip broadcast with a direct RPC push to each committee
-    /// validator (issue #804). The push is best-effort and runs on a background task so
-    /// batch production is never stalled by a slow or unreachable committee member; each
-    /// recipient independently keeps only the transactions in its own shard.
+    /// Replaces the previous gossip broadcast (issue #804): each transaction is forwarded to the
+    /// JSON-RPC endpoint the owning validator advertised on its worker record, discovered over
+    /// kademlia. Forwarding is best-effort and runs on a background task so batch production is
+    /// never stalled by a slow or unreachable validator.
     pub async fn disburse_txns(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
         let transactions = sealed_batch.batch.transactions;
-        if transactions.is_empty() || self.committee_txn_targets.is_empty() {
+        if transactions.is_empty() {
             return Ok(());
         }
 
         let network_handle = self.network_handle.clone();
-        let targets = self.committee_txn_targets.clone();
+        let forwarder = self.forwarder.clone();
+        let committee_slots = self.committee_slots.clone();
         self.network_handle.get_task_spawner().spawn_task("disburse-txns", async move {
-            Self::push_txns_to_committee(&network_handle, &targets, transactions).await;
+            match network_handle.get_all_validator_rpcs().await {
+                Ok(validator_rpcs) if !validator_rpcs.is_empty() => {
+                    forwarder.forward_txns(transactions, committee_slots, validator_rpcs);
+                }
+                Ok(_) => {
+                    warn!(
+                        target: "worker::batch_provider",
+                        "no committee validator has advertised a JSON-RPC endpoint; \
+                         cannot forward accepted transactions"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        target: "worker::batch_provider",
+                        ?err,
+                        "failed to discover validator JSON-RPC endpoints for transaction forwarding"
+                    );
+                }
+            }
             Ok(())
         });
 
         Ok(())
-    }
-
-    /// Push `transactions` to every committee validator in `targets` over RPC concurrently.
-    /// Best-effort: a member that cannot be reached (after retries) simply does not receive
-    /// the transactions this round.
-    async fn push_txns_to_committee(
-        network_handle: &WorkerNetworkHandle,
-        targets: &[BlsPublicKey],
-        transactions: Vec<Vec<u8>>,
-    ) {
-        let mut sends: FuturesUnordered<_> = targets
-            .iter()
-            .map(|&peer| {
-                let network_handle = network_handle.clone();
-                let transactions = transactions.clone();
-                async move { Self::push_txns_to_peer(&network_handle, peer, transactions).await }
-            })
-            .collect();
-
-        while sends.next().await.is_some() {}
-    }
-
-    /// Push `transactions` to a single committee member, retrying transient RPC errors with
-    /// exponential backoff (mirroring the batch-report path so a peer that is briefly
-    /// unreachable at an epoch boundary is not skipped). A permanent rejection
-    /// ([`NetworkError::RPCError`]) is not retried. Both give-up outcomes only warn-log,
-    /// since transaction disbursal is best-effort.
-    async fn push_txns_to_peer(
-        network_handle: &WorkerNetworkHandle,
-        peer: BlsPublicKey,
-        transactions: Vec<Vec<u8>>,
-    ) {
-        for attempt in 0..MAX_TXN_PUSH_ATTEMPTS {
-            match network_handle.report_txns(peer, transactions.clone()).await {
-                Ok(()) => return,
-                // permanent rejection - do not retry
-                Err(NetworkError::RPCError(msg)) => {
-                    warn!(
-                        target: "worker::batch_provider",
-                        %peer,
-                        %msg,
-                        "committee member rejected transaction push"
-                    );
-                    return;
-                }
-                // transient error (RPCRetryable / transport) - retry with backoff
-                Err(err) => {
-                    if attempt + 1 < MAX_TXN_PUSH_ATTEMPTS {
-                        tokio::time::sleep(TXN_PUSH_RETRY_BACKOFF * 2u32.pow(attempt)).await;
-                    } else {
-                        warn!(
-                            target: "worker::batch_provider",
-                            %peer,
-                            ?err,
-                            "failed to push transactions to committee member after retries"
-                        );
-                    }
-                }
-            }
-        }
     }
 
     /// Seal and broadcast the current batch.
