@@ -56,8 +56,8 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 ///   and fork off the network;
 /// - confirm the live validator/ConsensusNFT count leaves headroom under the 30M system-call gas
 ///   cap that bounds the one-shot `migrateValidatorSets()` walk;
-/// - consider gating the in-protocol swap on a confirmed expected pre-fork registry code hash so an
-///   unexpected on-chain deployment fails closed rather than migrating over an incompatible layout.
+/// - the swap is gated on [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]: an unexpected on-chain
+///   deployment fails closed (fatal block error) rather than migrating over an incompatible layout.
 pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
 
 #[cfg(test)]

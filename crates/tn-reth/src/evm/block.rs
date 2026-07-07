@@ -297,12 +297,27 @@ where
             .map_err(|e| TnRethError::EVMCustom(format!("registry account read failed: {e}")))?
             .unwrap_or_default();
 
-        // Log the pre-swap code hash so operators can audit at the boundary that the swap ran over
-        // the expected (pre-fork) deployment. The registry is non-upgradeable, so on the live chain
-        // this is the fixed genesis code hash. NOTE: before setting a real
-        // `CONSENSUS_REGISTRY_FORK_EPOCH`, consider gating the swap on a confirmed
-        // expected-old-hash allowlist so an unexpected deployment fails closed rather than
-        // migrating over an incompatible layout.
+        // Fail closed on an unexpected pre-fork deployment. The swap + `migrateValidatorSets()`
+        // assume the exact storage layout of the pinned pre-fork registry code (the registry is
+        // non-upgradeable, so on the live chain this is the fixed genesis code hash); migrating
+        // over anything else risks silent state corruption. Abort the block instead — the check is
+        // a pure function of committed state, so every fork-capable node fails uniformly rather
+        // than diverging.
+        if current.code_hash != tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH {
+            error!(
+                target: "engine",
+                pre_swap_code_hash = %current.code_hash,
+                expected = %tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH,
+                "consensus registry fork failing closed: unexpected pre-fork registry code",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "consensus registry fork failing closed: pre-swap code hash {} does not match \
+                 the pinned pre-fork deployment {}",
+                current.code_hash,
+                tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH,
+            )));
+        }
+
         debug!(
             target: "engine",
             pre_swap_code_hash = %current.code_hash,
