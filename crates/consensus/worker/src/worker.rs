@@ -101,7 +101,7 @@ fn new_worker_internal<DB: Database>(
         .committee()
         .authorities()
         .iter()
-        .map(|authority| authority.protocol_key().clone())
+        .map(|authority| *authority.protocol_key())
         .collect();
 
     Worker::new(
@@ -176,6 +176,7 @@ impl<DB, QW> std::fmt::Debug for Worker<DB, QW> {
 
 impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     /// Create an instance of `Self`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorkerId,
         quorum_waiter: Option<QW>,
