@@ -411,29 +411,7 @@ where
     fn shuffle_new_committee(&mut self, randomness: B256) -> TnRethResult<Vec<Address>> {
         let new_committee_size = self.next_committee_size()?;
 
-        // Read the committee-eligible validator pool from the consensus registry. The registry's
-        // per-status `getValidators`/`getValidatorsInfo` return ONLY the exact status set; the
-        // committee-eligible pool is the union of `{ Active, PendingActivation, PendingExit }` (the
-        // statuses for which `_eligibleForCommitteeNextEpoch` is true). The registry computes the
-        // O(1) eligible *count* on-chain and expects the protocol to assemble the eligible *pool*
-        // by unioning these queries off-chain. We use `getValidatorsInfo` (full structs)
-        // because the pending-exit validators are separated out below by `currentStatus`.
-        let mut all_active_validators: Vec<ConsensusRegistry::ValidatorInfo> = Vec::new();
-        for status in [
-            ValidatorStatus::Active,
-            ValidatorStatus::PendingActivation,
-            ValidatorStatus::PendingExit,
-        ] {
-            let calldata = ConsensusRegistry::getValidatorsInfoCall { status: status.into() }
-                .abi_encode()
-                .into();
-            let state =
-                self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
-            trace!(target: "engine", ?status, "get validators call:\n{:?}", state);
-            let validators: Vec<ConsensusRegistry::ValidatorInfo> =
-                alloy::sol_types::SolValue::abi_decode(&state)?;
-            all_active_validators.extend(validators);
-        }
+        let all_active_validators = self.read_committee_eligible_pool()?;
 
         debug!(target: "engine",  "validators pre-shuffle {:?}", all_active_validators);
 
@@ -483,6 +461,107 @@ where
         trace!(target: "engine",  ?new_committee_size, ?new_committee, "truncated shuffle for new committee");
 
         Ok(new_committee)
+    }
+
+    /// Read the committee-eligible validator pool from the consensus registry.
+    ///
+    /// The registry's per-status `getValidators`/`getValidatorsInfo` return ONLY the exact status
+    /// set; the committee-eligible pool is the union of `{ Active, PendingActivation, PendingExit
+    /// }` (the statuses for which `_eligibleForCommitteeNextEpoch` is true). The registry computes
+    /// the O(1) eligible *count* on-chain and expects the protocol to assemble the eligible *pool*
+    /// by unioning these queries off-chain. We use `getValidatorsInfo` (full structs) because the
+    /// pending-exit validators are separated out by `currentStatus` in `shuffle_new_committee`.
+    fn read_committee_eligible_pool(
+        &mut self,
+    ) -> TnRethResult<Vec<ConsensusRegistry::ValidatorInfo>> {
+        // While the deployed registry still carries the pre-fork adiri code, `getValidatorsInfo`
+        // does not exist on-chain — speak the legacy ABI instead. This keeps every pre-fork epoch
+        // close (fresh-node onboarding, full resync, a fork-capable build deployed before
+        // `CONSENSUS_REGISTRY_FORK_EPOCH`) executing byte-identically to the historical chain. At
+        // the fork boundary `apply_consensus_registry_fork` swaps the code first, so this gate
+        // already sees the upgraded hash and takes the post-fork read below.
+        #[cfg(feature = "adiri")]
+        if self.registry_code_is_pre_fork()? {
+            return self.read_committee_eligible_pool_legacy();
+        }
+
+        let mut all_active_validators: Vec<ConsensusRegistry::ValidatorInfo> = Vec::new();
+        for status in [
+            ValidatorStatus::Active,
+            ValidatorStatus::PendingActivation,
+            ValidatorStatus::PendingExit,
+        ] {
+            let calldata = ConsensusRegistry::getValidatorsInfoCall { status: status.into() }
+                .abi_encode()
+                .into();
+            let state =
+                self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+            trace!(target: "engine", ?status, "get validators call:\n{:?}", state);
+            let validators: Vec<ConsensusRegistry::ValidatorInfo> =
+                alloy::sol_types::SolValue::abi_decode(&state)?;
+            all_active_validators.extend(validators);
+        }
+
+        Ok(all_active_validators)
+    }
+
+    /// Whether the deployed `ConsensusRegistry` still carries the pre-fork adiri runtime code.
+    ///
+    /// Compares the registry account's code hash against the pinned
+    /// [`tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]. A pure `basic()` read: the
+    /// account is neither touched nor committed, so the gate never enters the bundle/state root —
+    /// it is a deterministic function of committed state, identical on the production and replay
+    /// paths.
+    ///
+    /// A DB error propagates as an error; only a genuinely absent account (impossible on any real
+    /// TN chain) falls through to the default (non-pre-fork) hash. An infra failure must never be
+    /// silently read as "not V1".
+    #[cfg(feature = "adiri")]
+    fn registry_code_is_pre_fork(&mut self) -> TnRethResult<bool> {
+        // revm `Database` trait provides `basic`; imported anonymously to avoid clashing with the
+        // `alloy_evm::Database` already in module scope.
+        use reth_revm::Database as _;
+
+        let code_hash = self
+            .evm
+            .db_mut()
+            .basic(CONSENSUS_REGISTRY_ADDRESS)
+            .map_err(|e| TnRethError::EVMCustom(format!("registry account read failed: {e}")))?
+            .unwrap_or_default()
+            .code_hash;
+
+        Ok(code_hash == tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH)
+    }
+
+    /// Read the committee-eligible pool via the PRE-fork registry ABI.
+    ///
+    /// Byte-exact replay of the protocol read every pre-fork epoch close was produced with: the
+    /// pre-fork contract's `getValidators(uint8)` folds the whole committee-eligible union into
+    /// the `Active` query and returns full `ValidatorInfo` structs. One call, one decode — the
+    /// single-call return order feeds the Fisher-Yates shuffle exactly as the historical chain
+    /// computed it, so re-executed pre-fork blocks derive byte-identical committees and state
+    /// roots.
+    ///
+    /// The `getValidators(uint8)` selector is identical pre/post fork (only the declared return
+    /// type changed), so encoding through the current `getValidatorsCall` binding produces the
+    /// same calldata bytes the pre-fork node sent; the pre-fork `ValidatorInfo[]` return payload
+    /// is decoded directly via `SolValue` (the struct layout is byte-identical across the fork),
+    /// bypassing the binding's post-fork `address[]` return type.
+    #[cfg(feature = "adiri")]
+    fn read_committee_eligible_pool_legacy(
+        &mut self,
+    ) -> TnRethResult<Vec<ConsensusRegistry::ValidatorInfo>> {
+        let calldata =
+            ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
+                .abi_encode()
+                .into();
+        let state =
+            self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        trace!(target: "engine", "legacy get validators call:\n{:?}", state);
+        let validators: Vec<ConsensusRegistry::ValidatorInfo> =
+            alloy::sol_types::SolValue::abi_decode(&state)?;
+
+        Ok(validators)
     }
 
     /// Read state on-chain.
