@@ -649,8 +649,8 @@ where
 /// just added get their configured fee (e.g. `Static`) computed here rather than defaulting to
 /// MIN; epoch-entry sync then confirms the same count from the same block.
 ///
-/// Fails on an F17 identity violation (below) or when a node-local provider fault persists
-/// through [`CLOSE_READ_ATTEMPTS`] tries of either chain read (F4: such a fault is NOT
+/// Fails on an identity violation (below) or when a node-local provider fault persists
+/// through [`CLOSE_READ_ATTEMPTS`] tries of either chain read (such a fault is NOT
 /// committee-deterministic, so producing on possibly-stale fees is a safety risk while halting is
 /// only a single-node liveness failure). A CHAIN-GLOBAL read failure instead keeps the current
 /// per-worker base fees and worker count unchanged rather than aborting the epoch close (see the
@@ -663,12 +663,12 @@ async fn adjust_base_fees(
     reth_env: &RethEnv,
     gas_accumulator: &GasAccumulator,
 ) -> eyre::Result<()> {
-    // F16 one-header discipline: pin the canonical tip ONCE. Inside `Self::close_epoch` (after
-    // `wait_for_consensus_execution`) this IS the epoch's closing block; the F17 identity check
+    // One-header discipline: pin the canonical tip ONCE. Inside `Self::close_epoch` (after
+    // `wait_for_consensus_execution`) this IS the epoch's closing block; the identity check
     // and the WorkerConfigs read below both resolve against this single header.
     let tip = reth_env.canonical_tip();
 
-    // F17 CLOSE-TIME IDENTITY: `concludeEpoch` stamps the newly-entered epoch's `blockHeight` as
+    // CLOSE-TIME IDENTITY: `concludeEpoch` stamps the newly-entered epoch's `blockHeight` as
     // `closing block + 1` (ConsensusRegistry), so this read (canonical tip = closing block) prices
     // fees for the epoch whose `blockHeight` is exactly `tip + 1`. That identity is otherwise
     // implicit - it silently depends on the contract's `+1` convention and on no block executing
@@ -676,7 +676,7 @@ async fn adjust_base_fees(
     // pinned tip before touching fees, so a future multi-block-boundary or contract change trips
     // loudly here instead of pricing fees off a non-closing block.
     //
-    // READ-FAILURE POLICY (F4): both this identity read and the config read below are consensus
+    // READ-FAILURE POLICY: both this identity read and the config read below are consensus
     // inputs, so their failures are classified by committee determinism (`StateReadError`):
     // - ChainGlobal (contract absent, revert, decode, arity) is a deterministic product of the
     //   pinned chain state — every committee member hitting it lands on the same kept-current
@@ -740,7 +740,7 @@ async fn adjust_base_fees(
     // block (`derive_base_fees_for_entered_epoch`) and halts if that state is unreadable.
     // A node-local provider fault is NOT committee-deterministic (peers may read fine
     // and move to the new fees), so it must never fail open: retry, then halt. Pinned to the SAME
-    // `tip` the identity check validated (F16 one-header discipline).
+    // `tip` the identity check validated (one-header discipline).
     match retry_provider_faults("close-time worker fee configs", || {
         reth_env.get_worker_fee_configs_at_block(tip.hash())
     })
@@ -897,7 +897,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retry_provider_faults_halts_after_exhausting_attempts() {
-        // F4 retry-then-halt: a persistent node-local provider fault is retried exactly
+        // Retry-then-halt: a persistent node-local provider fault is retried exactly
         // CLOSE_READ_ATTEMPTS times total, then surfaces as the Provider error for the caller
         // to escalate into a halt.
         let calls = Cell::new(0u32);
@@ -948,7 +948,7 @@ mod tests {
     /// Drive ONE epoch-closing block on `reth_env` (parent = genesis) outside the full engine:
     /// build the block from a boundary [`ConsensusOutput`] (its payload runs `concludeEpoch`),
     /// commit it as the canonical head, and finalize it. Afterwards the canonical tip IS an
-    /// epoch-0 closing block, so the F17 close-time identity (`tip + 1 == entered blockHeight`)
+    /// epoch-0 closing block, so the close-time identity (`tip + 1 == entered blockHeight`)
     /// holds for `adjust_base_fees`. Mirrors tn-reth's `execute_payload_and_update_canonical_chain`
     /// test helper via the public [`RethEnv`] surface.
     fn execute_epoch_closing_block(
@@ -987,10 +987,10 @@ mod tests {
         Ok(())
     }
 
-    /// F4 keep-current arm (review G1/P0-1 - first coverage of the close-time fail-open): a
+    /// Keep-current arm (first coverage of the close-time fail-open): a
     /// CHAIN-GLOBAL config-read failure (WorkerConfigs contract absent, the alloc-stripped-genesis
     /// trick) at a REAL closing block returns `Ok` and keeps the per-worker base fees, the worker
-    /// count, and the accumulated gas untouched. The F17 identity read PASSES here (registry
+    /// count, and the accumulated gas untouched. The identity read PASSES here (registry
     /// present, `concludeEpoch` ran in the tip), isolating the failure to the config read's
     /// fail-open arm.
     #[tokio::test]
@@ -1010,7 +1010,7 @@ mod tests {
         let tip = reth_env.canonical_tip();
         let (entered_epoch, epoch_info) = reth_env.get_current_epoch_info_at_header(&tip)?;
         assert_eq!(entered_epoch, 1, "registry state crossed to the entered epoch");
-        assert_eq!(tip.number + 1, epoch_info.blockHeight, "F17 identity holds at the tip");
+        assert_eq!(tip.number + 1, epoch_info.blockHeight, "close-time identity holds at the tip");
 
         // non-default fees, gas, and count on the accumulator
         let acc = GasAccumulator::new(2);

@@ -277,8 +277,8 @@ async fn test_eip1559_fee_rises_at_epoch_boundaries() -> eyre::Result<()> {
 // ---------------------------------------------------------------------------------------------
 
 /// A committee node killed MID-epoch (well away from the boundary) and restarted must resume
-/// accepting blocks at the on-chain static fee, proving recovery re-seeds the base fee from the
-/// chain (`seed_base_fees_from_chain`).
+/// accepting blocks at the on-chain static fee, proving the epoch-entry seeding re-derives the
+/// base fee from the previous epoch's closing-block state on restart.
 ///
 /// Deliberately avoids killing at the exact epoch boundary: there is a known, separately-tracked
 /// recovery gap there (the next-epoch fee computed at close lives only in memory until the first

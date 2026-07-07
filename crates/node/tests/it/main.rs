@@ -779,7 +779,7 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
     let engine_task = timeout(Duration::from_secs(30), &mut rx).await;
     assert!(engine_task.is_ok(), "engine exits at max round after executing the epoch close");
 
-    // PHASE 3 (restart after close — the F1 crash-after-close shape on a 2-worker chain): the
+    // PHASE 3 (restart after close — the crash-after-close shape on a 2-worker chain): the
     // pinned tip IS epoch 0's closing block, so catchup scans an empty range and restores
     // nothing; the entry derivation alone must recover every configured worker's fee.
     let closing = reth_env.finalized_header()?.expect("closing block finalized");
@@ -1133,7 +1133,7 @@ async fn catchup_errors_on_worker_id_beyond_onchain_count() -> eyre::Result<()> 
     Ok(())
 }
 
-/// F1 regression, flipped to RECOVERS: after an epoch closes, a node whose finalized tip is the
+/// Regression, flipped to RECOVERS: after an epoch closes, a node whose finalized tip is the
 /// closing block derives the entered epoch's per-worker base fees purely from the closed epoch's
 /// chain state. This is the entry state shared by all three `close_epoch(None, ..)` shapes -
 /// replay-and-close, crash-after-close, and the live leftover-drain - which previously skipped
@@ -1248,9 +1248,9 @@ async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Res
         }
     }
 
-    // production preconditions shared by every F1 shape: the pinned tip IS the closed epoch's
-    // closing block (nonce still carries epoch 0) while the registry state it holds already
-    // reports the entered epoch
+    // production preconditions shared by every close_epoch(None) recovery shape: the pinned
+    // tip IS the closed epoch's closing block (nonce still carries epoch 0) while the registry
+    // state it holds already reports the entered epoch
     let closing = reth_env.finalized_header()?.expect("closing block finalized");
     assert_eq!(
         RethEnv::extract_epoch_from_header(&closing),
@@ -1304,7 +1304,7 @@ async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Res
     Ok(())
 }
 
-/// F17 / P1-13 regression (`report.md` F17, gap G25): pin the closing-block identity the
+/// Regression: pin the closing-block identity the
 /// base-fee config reads depend on. The close-time read (`adjust_base_fees`, at the canonical
 /// tip) asserts the identity as its tripwire, and the entry seeding resolves its closing block
 /// directly from the entered epoch's `blockHeight - 1`, so both price fees off the true closing
@@ -1322,8 +1322,8 @@ async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Res
 ///   that tripwire's happy path on a real boundary (the check returns `Ok` here);
 /// - the close is pinned to the LAST batch: the boundary output's penultimate block has NOT yet
 ///   advanced the epoch, so the tip IS the boundary output's last (closing) block. This is why the
-///   identity holds even for a multi-block boundary output — the exact fact the F17 refutation
-///   rests on.
+///   identity holds even for a multi-block boundary output — the exact fact the identity's
+///   safety argument rests on.
 #[tokio::test]
 async fn epoch_block_height_is_closing_block_plus_one() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("epoch_block_height_identity").unwrap();
@@ -1459,7 +1459,7 @@ async fn epoch_block_height_is_closing_block_plus_one() -> eyre::Result<()> {
     assert_eq!(
         closing.number + 1,
         entered_state.epoch_info.blockHeight,
-        "F17: canonical tip + 1 must equal the entered epoch's blockHeight",
+        "canonical tip + 1 must equal the entered epoch's blockHeight",
     );
 
     // the close is pinned to the LAST batch of the boundary output: because the output is
@@ -1615,8 +1615,8 @@ async fn test_derive_base_fees_eip1559_variant_matches_oracle() -> eyre::Result<
 /// distinguishable poison: without the genuine-block filter, `derive_base_fees_for_entered_epoch`
 /// would treat the synthetic block as worker 0's latest and fold its `Eip1559` config from the
 /// poison fee (a non-MIN result); with the filter the scanned range holds no genuine block, gas
-/// totals stay empty, and the F6 walk-back prices the worker from the epoch-0 MIN base case —
-/// `Some(MIN_PROTOCOL_BASE_FEE)`, exactly what the live committee held.
+/// totals stay empty, and the idle-worker walk-back prices the worker from the epoch-0 MIN base
+/// case — `Some(MIN_PROTOCOL_BASE_FEE)`, exactly what the live committee held.
 #[tokio::test]
 async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("derive_excludes_synthetic").unwrap();
@@ -1721,8 +1721,8 @@ async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<
     );
 
     // with the filter, the scanned range holds no genuine block, so worker 0's fee comes from
-    // the F6 walk-back: idle all of epoch 0 -> the epoch-0 base case -> MIN (the committee
-    // value; containers hold the MIN default until the first close)
+    // the idle-worker walk-back: idle all of epoch 0 -> the epoch-0 base case -> MIN (the
+    // committee value; containers hold the MIN default until the first close)
     assert_eq!(derived.num_workers, 1);
     assert_eq!(
         derived.fees,
@@ -1733,8 +1733,8 @@ async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<
     // the standalone walk-back seam agrees
     assert_eq!(derive_idle_worker_fee(&reth_env, 1, 0)?, MIN_PROTOCOL_BASE_FEE);
 
-    // the fill guarantees apply() now writes EVERY configured worker: a stale container value
-    // is overwritten with the derived fee (before F6 the None slot left 4242 in place)
+    // the fill guarantees apply() writes EVERY configured worker: a stale container value is
+    // overwritten with the derived fee (a None slot would have left 4242 in place)
     let recovered = GasAccumulator::new(1);
     recovered.base_fee(0).set_base_fee(4242);
     derived.apply(&recovered);

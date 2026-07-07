@@ -3313,7 +3313,7 @@ mod tests {
         Ok(())
     }
 
-    /// F4 classification pin: the pinned-block read paths distinguish node-local provider faults
+    /// Classification pin: the pinned-block read paths distinguish node-local provider faults
     /// (the pinned hash/header not resolving on THIS node - peers may read fine) from
     /// chain-global failures (contract absent at the block - identical on every node). The
     /// close-time base-fee compute keys retry-then-halt vs keep-current off this split.
@@ -3373,7 +3373,7 @@ mod tests {
         Ok(())
     }
 
-    /// F7 regression: a `WorkerConfigs` constructor revert must FAIL genesis creation.
+    /// Regression: a `WorkerConfigs` constructor revert must FAIL genesis creation.
     ///
     /// Strategy 2 exceeds the contract's `MAX_STRATEGY` (= 1), so the constructor reverts
     /// `InvalidStrategy`. Before the fix the reverted state was committed anyway, shipping
@@ -3392,7 +3392,7 @@ mod tests {
         );
     }
 
-    /// F7 regression: an EMPTY worker config set must FAIL genesis creation (the
+    /// Regression: an EMPTY worker config set must FAIL genesis creation (the
     /// `WorkerConfigs` constructor reverts `NumWorkersBelowMinimum`). See
     /// [`genesis_ceremony_rejects_invalid_worker_config_strategy`] for the pre-fix failure mode.
     #[tokio::test]
@@ -3406,7 +3406,7 @@ mod tests {
         );
     }
 
-    /// F7 regression (verifier note): the `ConsensusRegistry` pre-genesis create is guarded by
+    /// Regression: the `ConsensusRegistry` pre-genesis create is guarded by
     /// the same success check. A proof of possession generated for the WRONG address fails the
     /// constructor's BLS precompile verification (`InvalidProofOfPossession`), which must fail
     /// genesis creation instead of committing a half-initialized registry.

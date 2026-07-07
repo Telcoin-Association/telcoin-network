@@ -386,7 +386,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// F7 regression: strategies above `WorkerConfigs.sol`'s `MAX_STRATEGY` (= 1) must fail at
+    /// Regression: strategies above `WorkerConfigs.sol`'s `MAX_STRATEGY` (= 1) must fail at
     /// parse time with a message naming the offending entry, instead of reverting the
     /// pre-genesis constructor.
     #[test]
@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(result, vec![(0, u64::MAX)]);
     }
 
-    /// F7 regression: an empty config list (only reachable programmatically — clap's default
+    /// Regression: an empty config list (only reachable programmatically — clap's default
     /// guarantees one entry) must fail at parse time; the contract constructor would revert
     /// `NumWorkersBelowMinimum`.
     #[test]
