@@ -144,7 +144,7 @@ where
 
         let reth_env = engine.get_reth_env().await;
 
-        // ENTRY-READ INVARIANT (F18): the previous epoch's closing state rules the entire epoch,
+        // ENTRY-READ INVARIANT: the previous epoch's closing state rules the entire epoch,
         // so every worker-count/config read in this entry flow is pinned to the previous epoch's
         // closing block (or an earlier epoch's closing block via the walk-back) - never the live
         // mid-epoch tip - and the epoch-info/committee reads resolve values written once at the
@@ -217,7 +217,7 @@ where
                     // so producing with an unverifiable fee is a safety failure while halting is
                     // only a single-node liveness failure.
                     //
-                    // F17 ENTRY-TIME IDENTITY: the derivation trusts `tip` to be E-1's closing
+                    // ENTRY-TIME IDENTITY: the derivation trusts `tip` to be E-1's closing
                     // block, which holds only because `concludeEpoch` stamps the entered epoch's
                     // `blockHeight = closing block + 1` (ConsensusRegistry) - i.e. `tip` is the
                     // block right before the entered epoch's first block. That identity is

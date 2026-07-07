@@ -612,7 +612,7 @@ pub(crate) fn derive_idle_worker_fee_at(
     worker_id: WorkerId,
     entry_header: &SealedHeader,
 ) -> eyre::Result<u64> {
-    // Epoch-0 base case: every container holds MIN until the first close (rule 5). Do NOT price
+    // Epoch-0 base case: every container holds MIN until the first close. Do NOT price
     // the genesis configuration here — it activates entering epoch 1.
     if epoch == 0 {
         return Ok(MIN_PROTOCOL_BASE_FEE);
