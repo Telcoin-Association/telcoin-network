@@ -493,20 +493,16 @@ async fn test_fetch_cancellation_on_success() {
     // Poll under a generous deadline so a slow CI runner simply waits longer rather than
     // failing. Reaching this point also proves the fetch task returned, which is when the
     // fan-out is cancelled.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let all_stored = round1_certs
+    timeout(Duration::from_secs(10), async {
+        while !round1_certs
             .iter()
-            .all(|cert| certificate_store.read(cert.digest()).unwrap().is_some());
-        if all_stored {
-            break;
+            .all(|cert| certificate_store.read(cert.digest()).unwrap().is_some())
+        {
+            sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Round 1 certificates should be stored after a successful fetch"
-        );
-        sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await
+    .expect("Round 1 certificates should be stored after a successful fetch");
 
     // No further peer is queried after success. With the fallback spawn interval pushed
     // beyond the test's lifetime, the only request ever emitted was the one answered
@@ -755,10 +751,10 @@ async fn test_network_failure_keeps_trying() {
     assert!(result.is_err(), "should fail due to missing parents");
 
     let num_peers = fixture.committee().authorities().len() - 1;
-    let mut response_count = 0;
 
-    // all peers return network errors
-    loop {
+    // all peers return network errors: respond to at most `num_peers` requests, stopping
+    // early if the channel goes quiet (a per-recv timeout or a closed channel).
+    for _ in 0..num_peers {
         let Some((_, _, reply)) =
             timeout(Duration::from_secs(5), fake_receiver.recv()).await.ok().flatten()
         else {
@@ -766,11 +762,6 @@ async fn test_network_failure_keeps_trying() {
         };
         // simulate network failure
         reply.send(Err(NetworkError::Timeout)).unwrap();
-        response_count += 1;
-
-        if response_count >= num_peers {
-            break;
-        }
     }
 
     // certificates are missing
