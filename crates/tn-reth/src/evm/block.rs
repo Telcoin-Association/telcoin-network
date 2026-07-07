@@ -371,10 +371,14 @@ where
         // Read back the rebuilt eligible count for an operational confirmation log. Best-effort and
         // deliberately non-fatal: the migration is already committed above, so a hiccup on this
         // cosmetic read must not abort the block (which would discard a valid, deterministic
-        // migration). Pure read — state is not committed.
+        // migration) — and must not alarm at `error!` either, hence the `try_` variant + `debug!`.
+        // Pure read — state is not committed.
         let calldata = ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into();
         let eligible = self
-            .read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)
+            .try_read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)
+            .inspect_err(|e| {
+                debug!(target: "engine", "non-fatal eligible-count readback after migration failed: {e}");
+            })
             .ok()
             .and_then(|data| <U256 as alloy::sol_types::SolValue>::abi_decode(&data).ok());
 
@@ -579,34 +583,44 @@ where
         Ok(validators)
     }
 
-    /// Read state on-chain.
+    /// Read state on-chain, logging any failure at `error!` level.
+    ///
+    /// Thin wrapper over [`Self::try_read_state_on_chain`] for consensus-critical reads, where a
+    /// failure aborts the block and warrants an operator-facing error log.
     fn read_state_on_chain(
         &mut self,
         caller: Address,
         contract: Address,
         calldata: Bytes,
     ) -> TnRethResult<Bytes> {
+        self.try_read_state_on_chain(caller, contract, calldata).inspect_err(|e| {
+            error!(target: "engine", ?caller, ?contract, "failed to read state on chain: {e}");
+        })
+    }
+
+    /// Read state on-chain without logging failures.
+    ///
+    /// The two failure cases (the system call itself erroring vs an unsuccessful execution
+    /// result) stay distinguishable through the error strings. Callers pick the log level their
+    /// context warrants: consensus-critical reads go through [`Self::read_state_on_chain`]
+    /// (`error!`), best-effort reads log at `debug!`.
+    fn try_read_state_on_chain(
+        &mut self,
+        caller: Address,
+        contract: Address,
+        calldata: Bytes,
+    ) -> TnRethResult<Bytes> {
         // read from state
-        let res = match self.evm.transact_system_call(caller, contract, calldata) {
-            Ok(res) => res,
-            Err(e) => {
-                // fatal error
-                error!(target: "engine", ?caller, ?contract, "failed to read state on chain: {}", e);
-                return Err(TnRethError::EVMCustom(format!("failed to read state on chain: {e}")));
-            }
-        };
+        let res = self
+            .evm
+            .transact_system_call(caller, contract, calldata)
+            .map_err(|e| TnRethError::EVMCustom(format!("failed to read state on chain: {e}")))?;
 
         // retrieve data from execution result
-        let data = match res.result {
-            ExecutionResult::Success { output, .. } => output.into_data(),
-            e => {
-                // fatal error
-                error!(target: "engine", "error reading state on chain: {:?}", e);
-                return Err(TnRethError::EVMCustom(format!("error reading state on chain: {e:?}")));
-            }
-        };
-
-        Ok(data)
+        match res.result {
+            ExecutionResult::Success { output, .. } => Ok(output.into_data()),
+            e => Err(TnRethError::EVMCustom(format!("error reading state on chain: {e:?}"))),
+        }
     }
 
     /// Return the next committee size.
