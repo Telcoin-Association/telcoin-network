@@ -2559,6 +2559,13 @@ mod tests {
     /// pubkey survives the swap as 96-byte compressed; and the fork block's `state_root` is
     /// identical across two independent executions (determinism — every node re-derives the
     /// same root).
+    ///
+    /// NOTE: the fixture is the LIVE pre-fork deployment, pinned by
+    /// `tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH` and its tn-types pin test. If
+    /// `chain-configs/testnet/genesis.yaml` is ever regenerated from the current (post-fork)
+    /// artifact, the `pre.is_err()` probe below fails first — that means the fixture no longer
+    /// mirrors the chain this fork targets; reassess the fork plan rather than updating the
+    /// probes.
     #[cfg(feature = "adiri")]
     #[tokio::test]
     async fn test_consensus_registry_fork_swaps_code_and_migrates() -> eyre::Result<()> {

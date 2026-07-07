@@ -800,13 +800,15 @@ where
             // the remainder of this very block.
             //
             // This MUST run BEFORE the rewards/conclude calls below. `shuffle_new_committee`
-            // (inside `apply_closing_epoch_contract_call`) reads the committee-eligible
-            // pool via `getValidatorsInfo` — the post-refactor ABI absent from the
-            // pre-fork testnet code — and the new `concludeEpoch` guards the committee
-            // size against the cached `eligibleValidatorCount`. Both only work once the
-            // code is swapped and `migrateValidatorSets` has populated the sets, so the
-            // fork leads. Reward math and the epoch transition then run on the new code
-            // over the byte-identical preserved storage.
+            // (inside `apply_closing_epoch_contract_call`) routes its committee-pool read
+            // by the registry's code hash (`read_committee_eligible_pool`): swapping first
+            // flips that gate to the post-fork `getValidatorsInfo` union for the remainder
+            // of this very block, and the new `concludeEpoch` guards the committee size
+            // against the cached `eligibleValidatorCount` that only `migrateValidatorSets`
+            // populates — so the fork leads. Reward math and the epoch transition then run
+            // on the new code over the byte-identical preserved storage. (Every epoch close
+            // BEFORE this boundary sees the pre-fork code hash and takes the gate's legacy
+            // branch instead, keeping pre-fork history re-executable on this same binary.)
             //
             // Both the production and replay paths reach this with an identical `ctx`, so the
             // resulting `state_root` is byte-identical across the fleet.

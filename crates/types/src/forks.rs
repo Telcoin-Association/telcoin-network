@@ -50,14 +50,35 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 ///
 /// PLACEHOLDER: `u32::MAX` practically never fires (the trigger would need epoch `u32::MAX - 1`,
 /// ~4.29e9 epochs away). Set to a concrete future epoch with ample lead time in a dedicated
-/// one-line PR before deploy (mirror the `ADIRI_DUP_BATCH_EPOCH` rollout). Pre-deploy checklist:
-/// - every node must run a **fork-capable build** (compiled with the `adiri` feature — verify the
-///   deploy image is built `--features adiri`) before this epoch, or it will reject the fork block
-///   and fork off the network;
+/// epoch-setting PR before deploy.
+///
+/// Rollout sequence (standard hard-fork rule): every validator must run a fork-capable build
+/// (compiled `--features adiri` — verify the deploy image — and including the epoch-setting PR)
+/// **before** the epoch-closing block of `CONSENSUS_REGISTRY_FORK_EPOCH - 1` executes. Nodes
+/// still on older builds never apply the swap at that boundary, reject the fork block, and
+/// diverge from the canonical chain.
+///
+/// Deploying the fork-capable build EARLY is safe for the registry-read path: the
+/// committee-pool read is gated on the deployed registry's code hash
+/// ([`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]), so every pre-fork epoch close speaks the legacy
+/// registry ABI and derives byte-identical committees (the legacy single-call pool order feeds
+/// the shuffle exactly as the historical chain computed it). The same gate keeps pre-fork
+/// history re-executable, so fresh-node onboarding and full resync from genesis work across the
+/// fork on one binary. Scope: this covers the registry reads only — full old-binary ↔
+/// fork-build live mixed-fleet compatibility depends on everything else shipped since and is
+/// confirmed by the operator dry-run below, not promised here.
+///
+/// Pre-deploy checklist for the epoch-setting PR:
+/// - pin the swapped-in (post-fork) runtime code hash the same way
+///   [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`] pins the pre-fork code, with a pin test against the
+///   embedded `ConsensusRegistry.json` artifact: after the fork runs live, a tn-contracts artifact
+///   bump would otherwise change the bytes re-execution swaps in and break historical state roots;
 /// - confirm the live validator/ConsensusNFT count leaves headroom under the 30M system-call gas
 ///   cap that bounds the one-shot `migrateValidatorSets()` walk;
-/// - the swap is gated on [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]: an unexpected on-chain
-///   deployment fails closed (fatal block error) rather than migrating over an incompatible layout.
+/// - operator dry-run: resync a fork-build node against a live adiri archive across the fork
+///   boundary and confirm matching state roots (also measures the live migration gas);
+/// - the swap fails closed on [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]: an unexpected on-chain
+///   deployment aborts the block (fatal error) rather than migrating over an incompatible layout.
 pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
 
 #[cfg(test)]
