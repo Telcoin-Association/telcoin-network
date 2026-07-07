@@ -1,6 +1,6 @@
 //! Handle specific request types received from the network.
 
-use super::{message::MissingCertificatesRequest, PrimaryResponse};
+use super::PrimaryResponse;
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::{message::PrimaryGossip, PendingStreamRequest, StreamRequestKind},
@@ -23,9 +23,9 @@ use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlsPublicKey, Certificate,
-    ConsensusHeader, ConsensusHeaderDigest, ConsensusResult, ConsensusResultDigest, Database,
-    Epoch, EpochCertificate, EpochDigest, EpochRecord, Hash as _, Header, HeaderDigest,
-    ProtocolSignature, ReadStream, Round, SignatureVerificationState, TnSender as _, Vote, B256,
+    ConsensusResult, ConsensusResultDigest, Database, Epoch, EpochCertificate, EpochDigest,
+    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, ReadStream, Round,
+    SignatureVerificationState, TnSender as _, Vote, B256,
 };
 use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
@@ -41,6 +41,14 @@ const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 /// drip-reads just fast enough to keep resetting the per-frame timer cannot pin
 /// the responder task (and the admission slot it holds) indefinitely.
 const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
+
+/// Total timeout for serving a missing-certificates response over the sync protocol.
+///
+/// The streaming collector is already bounded by its DB-read time limit, but the
+/// number of frames and a slow reader are not, so this backstops the whole serve
+/// (and the admission slot it holds) the same way [`SEND_SYNC_PACK_TIMEOUT`] does
+/// for an epoch pack.
+const SEND_SYNC_CERTS_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
 /// rerequests.
@@ -100,6 +108,12 @@ where
             consensus_certs: Default::default(),
             consensus_chain,
         }
+    }
+
+    /// Expose the handlers consensus chain- useful for testing.
+    #[cfg(test)]
+    pub(super) fn consensus_chain(&self) -> &ConsensusChain {
+        &self.consensus_chain
     }
 
     /// Detect if we are too far behind the given epoch, round and switch to CVV inactive if we are
@@ -401,7 +415,7 @@ where
             if vote_info.vote_digest == header.digest().into() {
                 let vote = Vote::new(
                     &header,
-                    self.consensus_config.authority_id().expect("only validators can vote"),
+                    self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?,
                     self.consensus_config.key_config(),
                 );
 
@@ -707,7 +721,9 @@ where
                     // Make sure we don't vote twice for the same authority in the same epoch/round.
                     let vote = Vote::new(
                         &header,
-                        self.consensus_config.authority_id().expect("only validators can vote"),
+                        self.consensus_config
+                            .authority_id()
+                            .ok_or(HeaderError::NotCommitteeMember)?,
                         self.consensus_config.key_config(),
                     );
                     if vote.digest() != vote_info.vote_digest() {
@@ -757,7 +773,7 @@ where
         // this node hasn't voted yet
         let vote = Vote::new(
             &header,
-            self.consensus_config.authority_id().expect("only validators can vote"),
+            self.consensus_config.authority_id().ok_or(HeaderError::NotCommitteeMember)?,
             self.consensus_config.key_config(),
         );
 
@@ -848,68 +864,6 @@ where
         Ok(())
     }
 
-    /// Process a request from a peer for missing certificates.
-    ///
-    /// This method efficiently retrieves certificates that the requesting peer is missing while
-    /// protecting against malicious requests through:
-    /// - limiting total processing time
-    /// - processing certificates in chunks
-    /// - validating request parameters
-    pub(crate) async fn retrieve_missing_certs(
-        &self,
-        request: MissingCertificatesRequest,
-    ) -> PrimaryNetworkResult<PrimaryResponse> {
-        // validates request is within limits
-        let mut collector = CertificateCollector::new(request, self.consensus_config.clone())?;
-
-        // Create a time-bounded iter for collecting certificates
-        let mut missing = Vec::new();
-
-        // Collect certificates from the stream
-        for cert in collector.by_ref() {
-            missing.push(cert?);
-
-            // yield occassionally to allow the request handler shutdown during network timeout
-            if missing.len() % 10 == 0 {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        debug!(
-            target: "cert-collector",
-            "Collected {} certificates in {}ms",
-            missing.len(),
-            collector.start_time().elapsed().as_millis(),
-        );
-
-        Ok(PrimaryResponse::RequestedCertificates(missing))
-    }
-
-    /// Retrieve a consensus header from local storage.
-    pub(super) async fn retrieve_consensus_header(
-        &self,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-    ) -> PrimaryNetworkResult<PrimaryResponse> {
-        let mut my_number = self.consensus_chain.latest_consensus_number();
-        // If we are behind then wait up to two seconds to catch up.
-        let mut count = 0;
-        if number.saturating_sub(my_number) < 4 {
-            // Only wait if we are close.
-            while my_number < number {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                my_number = self.consensus_chain.latest_consensus_number();
-                if count >= 20 {
-                    // Don't wait more than 2 seconds for this to show up.
-                    return Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash));
-                }
-                count += 1;
-            }
-        }
-        let header = self.get_header_by_hash(number, hash).await?;
-        Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
-    }
-
     /// Retrieve the raw (serialized) consensus output bytes from local storage.
     ///
     /// Returns the full pack-file encoded output for `number` so a peer can reconstruct the
@@ -958,19 +912,6 @@ where
         Ok(PrimaryResponse::EpochRecord { record, certificate })
     }
 
-    /// Retrieve the consensus header by hash
-    async fn get_header_by_hash(
-        &self,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-    ) -> PrimaryNetworkResult<ConsensusHeader> {
-        let epoch = self.consensus_chain.epochs().number_to_epoch(number);
-        match self.consensus_chain.consensus_header_by_digest(epoch, hash).await {
-            Ok(Some(header)) => Ok(header),
-            _ => Err(PrimaryNetworkError::UnknownConsensusHeaderDigest(hash)),
-        }
-    }
-
     /// Retrieve the consensus header by number.
     async fn get_epoch_by_number(
         &self,
@@ -1015,11 +956,6 @@ where
             }
             None => Err(PrimaryNetworkError::UnavailableEpochDigest(hash)),
         }
-    }
-
-    /// Return a reference to the `ConsensusChain`.
-    pub(super) fn consensus_chain(&self) -> &ConsensusChain {
-        &self.consensus_chain
     }
 
     /// Number of tracked consensus-result digests. Test-only accessor used to assert the
@@ -1271,6 +1207,98 @@ where
             // bound the best-effort error write: a peer that read the `Ack` then
             // stopped reading would otherwise pin this responder task.
             let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+            let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
+                let _ = write_frame(
+                    &mut stream,
+                    &SyncFrame::<PrimarySyncRequest>::Err(SyncFrameError::Internal),
+                    &mut encode_buffer,
+                    &mut compressed_buffer,
+                    max_frame,
+                )
+                .await;
+            })
+            .await;
+        }
+
+        // attempt to close the stream gracefully, bounded so a peer that stops
+        // reading cannot pin this responder task on the FIN flush
+        let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
+
+        Ok(())
+    }
+
+    /// Serve an inbound missing-certificates sync exchange.
+    ///
+    /// The exchange has already been admitted against the concurrency caps and its
+    /// opening `Req(MissingCertificates { .. })` frame read by the caller. A streaming
+    /// [`CertificateCollector`] (no aggregate response-size cap, only its DB-read time
+    /// limit) drives [`send_sync_certificates_over_stream`], which writes [`SyncFrame::Ack`]
+    /// then the matching certificates as batched `Data` frames terminated by
+    /// [`SyncFrame::End`]. This is the streamed replacement for the legacy
+    /// request-response `RequestedCertificates` reply, without its `max_response_size`
+    /// coupling.
+    ///
+    /// A request whose `skip_rounds` is out of bounds fails the collector build and is
+    /// declined with [`SyncFrame::Err`]`(`[`SyncFrameError::Malformed`]`)` before any
+    /// `Ack`; any later serve failure is logged and best-effort signalled with
+    /// `SyncFrame::Err`. Errors are metrics-only during the rollout (no penalty),
+    /// matching the legacy responder and the epoch-pack sync path.
+    ///
+    /// [`send_sync_certificates_over_stream`]: crate::network::sync_codec::send_sync_certificates_over_stream
+    pub(super) async fn process_sync_missing_certs_stream(
+        &self,
+        peer: BlsPublicKey,
+        mut stream: Stream,
+        exclusive_lower_bound: Round,
+        skip_rounds: Vec<(AuthorityIdentifier, Vec<u8>)>,
+    ) -> PrimaryNetworkResult<()> {
+        debug!(target: "primary::network", %peer, exclusive_lower_bound, "serving inbound sync missing certificates stream");
+        let max_frame = crate::network::sync_codec::MAX_SYNC_CERT_FRAME_SIZE;
+        let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+
+        // build the streaming collector. An out-of-bounds `skip_rounds` (or an
+        // undecodable bitmap) is a malformed request: decline with `Err(Malformed)`
+        // before any `Ack` and drop (metrics-only, no penalty during rollout).
+        let Ok(collector) = CertificateCollector::new(
+            exclusive_lower_bound,
+            skip_rounds,
+            self.consensus_config.clone(),
+        ) else {
+            warn!(target: "primary::network", %peer, "rejecting malformed sync missing certificates request");
+            let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
+                let _ = write_frame(
+                    &mut stream,
+                    &SyncFrame::<PrimarySyncRequest>::Err(SyncFrameError::Malformed),
+                    &mut encode_buffer,
+                    &mut compressed_buffer,
+                    max_frame,
+                )
+                .await;
+                stream.close().await
+            })
+            .await;
+            return Ok(());
+        };
+
+        // bound the whole serve; flatten the timeout's outer Result into the send's
+        let served = timeout(
+            SEND_SYNC_CERTS_TIMEOUT,
+            crate::network::sync_codec::send_sync_certificates_over_stream(
+                &mut stream,
+                collector,
+                SEND_STREAM_BUFFER_TIMEOUT,
+            ),
+        )
+        .await
+        .map_err(PrimaryNetworkError::from)
+        .and_then(|served| served);
+
+        // a serve failure or timeout is logged and best-effort signalled so the
+        // requester stops waiting; it is not a peer fault, so no penalty
+        if let Err(e) = served {
+            warn!(target: "primary::network", %peer, ?e, "failed to serve sync missing certificates stream");
+            // bound the best-effort error write: a peer that read the `Ack` then
+            // stopped reading would otherwise pin this responder task.
             let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
                 let _ = write_frame(
                     &mut stream,

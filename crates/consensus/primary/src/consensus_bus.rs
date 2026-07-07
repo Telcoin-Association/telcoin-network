@@ -217,9 +217,10 @@ pub struct ConsensusBusAppInner {
     /// Watch tracking the last gossipped consensus block number and hash.
     tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, ConsensusHeaderDigest)>,
 
-    /// Consensus header.  Note this can be used to create consensus output to execute for non
-    /// validators.
-    consensus_header: broadcast::Sender<ConsensusHeader>,
+    /// Verified consensus OUTPUTs (header + batches) delivered to a following/catching-up
+    /// subscriber for execution. Filled by the state-sync forward drain; used only by
+    /// non-active nodes.
+    sync_output: broadcast::Sender<ConsensusOutput>,
     /// Broadcast the latest output from consensus after committing to the subdag.
     /// Engine consumes and executes to extend canonical chain.
     consensus_output: broadcast::Sender<ConsensusOutput>,
@@ -293,7 +294,7 @@ impl ConsensusBusApp {
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
 
-        let (consensus_header, _rx_consensus_header) = broadcast::channel(CHANNEL_CAPACITY);
+        let (sync_output, _rx_sync_output) = broadcast::channel(CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
         let (exex_certificates, _) = broadcast::channel(CHANNEL_CAPACITY);
@@ -312,7 +313,7 @@ impl ConsensusBusApp {
                 tx_recent_blocks,
                 tx_last_consensus_header,
                 tx_last_published_consensus_num_hash,
-                consensus_header,
+                sync_output,
                 consensus_output,
                 exex_certificates,
                 exex_consensus_output,
@@ -462,10 +463,10 @@ impl ConsensusBusApp {
         &self.inner.consensus_output
     }
 
-    /// Broadcast channel with consensus header.
-    /// This is useful pre-consensus output when not participating in consensus.
-    pub fn consensus_header(&self) -> &impl TnSender<ConsensusHeader> {
-        &self.inner.consensus_header
+    /// Broadcast channel delivering verified consensus OUTPUTs (header + batches) to a
+    /// following/catching-up subscriber for execution. Used when not participating in consensus.
+    pub fn sync_output(&self) -> &impl TnSender<ConsensusOutput> {
+        &self.inner.sync_output
     }
 
     /// Status of initial sync operation.
@@ -544,9 +545,9 @@ impl ConsensusBusApp {
         self.inner.consensus_output.subscribe()
     }
 
-    /// Provide a subscription(Receiver) to consensus_headers.
-    pub fn subscribe_consensus_header(&self) -> impl TnReceiver<ConsensusHeader> {
-        self.inner.consensus_header.subscribe()
+    /// Provide a subscription(Receiver) to verified sync consensus outputs.
+    pub fn subscribe_sync_output(&self) -> impl TnReceiver<ConsensusOutput> {
+        self.inner.sync_output.subscribe()
     }
 
     /// Broadcast sender for verified certificates (ExEx).

@@ -17,9 +17,9 @@ use tn_reth::{
 };
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusHeaderDigest,
-    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
+    gas_accumulator::GasAccumulator, Address, BatchSender, BatchValidation, BlockHeader,
+    BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer,
+    SealedHeader, TaskSpawner, WorkerId,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -74,7 +74,7 @@ impl ExecutionNodeInner {
         // spawn tn engine
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
             info!("Engine stated from block {block_num}/{block_hash}, consensus output {consensus_header:?}");
-            let res = tn_engine.await;
+            let res = tn_engine.run().await;
             match &res {
                 Ok(_) => {
                     info!(target: "engine", "TN Engine exited gracefully");
@@ -120,7 +120,7 @@ impl ExecutionNodeInner {
 
         // spawn batch builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
-            let res = batch_builder.await;
+            let res = batch_builder.run().await;
             info!(target: "tn::execution", ?res, "batch builder task exited");
             Ok(res?)
         });
@@ -204,7 +204,7 @@ impl ExecutionNodeInner {
     pub(super) fn new_batch_validator(
         &self,
         worker_id: &WorkerId,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> Arc<dyn BatchValidation> {
         // retrieve handle to transaction pool to submit gossip transactions to validators

@@ -16,10 +16,9 @@ use tn_reth::{
 };
 use tn_storage::{open_db, tables::NodeBatchesCache};
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    test_genesis, Address, Batch, BatchValidation, Bytes, Certificate, CertifiedBatch,
-    CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Database, Encodable2718,
-    GenesisAccount, NoopTxnForwarder, ReputationScores, SealedBatch, TaskManager,
+    gas_accumulator::GasAccumulator, test_genesis, Address, Batch, BatchValidation, Bytes,
+    Certificate, CertifiedBatch, CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Database,
+    Encodable2718, GenesisAccount, NoopTxnForwarder, ReputationScores, SealedBatch, TaskManager,
     MIN_PROTOCOL_BASE_FEE, U160, U256,
 };
 use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
@@ -135,7 +134,7 @@ async fn test_make_batch_el_to_cl() {
     assert_eq!(pending_pool_len, 3);
 
     // spawn batch_builder once worker is ready
-    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+    let _batch_builder = tokio::spawn(batch_builder.run());
 
     //
     //=== Test batch flow
@@ -154,13 +153,8 @@ async fn test_make_batch_el_to_cl() {
     let sealed_batch = sealed_batch.unwrap();
 
     // ensure batch validator succeeds
-    let batch_validator = BatchValidator::new(
-        reth_env.clone(),
-        Some(txpool.clone()),
-        0,
-        BaseFeeContainer::default(),
-        0,
-    );
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
 
     let valid_batch_result = batch_validator.validate_batch(sealed_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -297,7 +291,7 @@ async fn test_batch_builder_produces_valid_batches() {
     assert_eq!(pool_size.blob, 0);
 
     // spawn batch_builder once worker is ready
-    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+    let _batch_builder = tokio::spawn(batch_builder.run());
 
     //
     //=== Test batch flow
@@ -332,13 +326,8 @@ async fn test_batch_builder_produces_valid_batches() {
     let _ = ack.send(Ok(()));
 
     // validate first batch
-    let batch_validator = BatchValidator::new(
-        reth_env.clone(),
-        Some(txpool.clone()),
-        0,
-        BaseFeeContainer::default(),
-        0,
-    );
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
 
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());
@@ -459,7 +448,7 @@ async fn test_canonical_notification_updates_pool() {
     assert_eq!(pending_pool_len, 0);
 
     // spawn batch_builder once worker is ready
-    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+    let _batch_builder = tokio::spawn(batch_builder.run());
 
     //
     //=== Test block flow
@@ -537,13 +526,8 @@ async fn test_canonical_notification_updates_pool() {
     let _ = ack.send(Ok(()));
 
     // validate batch
-    let batch_validator = BatchValidator::new(
-        reth_env.clone(),
-        Some(txpool.clone()),
-        0,
-        BaseFeeContainer::default(),
-        0,
-    );
+    let batch_validator =
+        BatchValidator::new(reth_env.clone(), Some(txpool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
 
     let valid_batch_result = batch_validator.validate_batch(first_batch.clone());
     assert!(valid_batch_result.is_ok());

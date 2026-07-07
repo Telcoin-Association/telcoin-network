@@ -21,7 +21,7 @@ use crate::{
 };
 use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
@@ -30,8 +30,8 @@ use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce, gas_accumulator::GasAccumulator, BlsPublicKey, BootstrapServer, Committee,
     ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
-    Database as TNDatabase, EngineUpdate, Epoch, Notifier, TaskError, TaskManager, TaskSpawner,
-    TimestampSec, DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
+    Database as TNDatabase, EngineUpdate, Epoch, Notifier, SealedHeader, TaskError, TaskManager,
+    TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
@@ -140,8 +140,8 @@ pub(crate) struct EpochManager<P, DB> {
 /// [`tn_types::gas_accumulator`] for the full picture). It runs once at startup, before
 /// execution resumes, and performs the following:
 ///
-/// 1. **Base fee** — sets worker 0's base fee from the finalized reth header. In a multi-worker
-///    configuration this will need per-worker restoration.
+/// 1. **Base fee** — restores each worker's base fee from its latest on-chain block this epoch (via
+///    [`latest_base_fee_per_worker`]), preserving the base-fee-from-chain invariant.
 /// 2. **Gas stats** — iterates every reth block from the epoch's start height through the finalized
 ///    tip, extracting the worker id from each block's `difficulty` field and calling
 ///    [`GasAccumulator::inc_block`] to rebuild per-worker gas totals.
@@ -160,27 +160,25 @@ pub async fn catchup_accumulator(
     if let Some(block) = reth_env.finalized_header()? {
         let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
 
-        // Note WORKER: In a single worker world this should be suffecient to set the base fee.
-        // In a multi-worker world (future) this will NOT work and needs updating.
-        gas_accumulator
-            .base_fee(0)
-            .set_base_fee(block.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE));
-
         let nonce: u64 = block.nonce.into();
         let (last_executed_epoch, last_executed_round) = deconstruct_nonce(nonce);
 
         let blocks =
             reth_env.blocks_for_range(epoch_state.epoch_info.blockHeight..=block.number)?;
 
+        // Restore each worker's base fee from its latest on-chain block this epoch (the
+        // base-fee-from-chain invariant). Workers that produced no block keep the default (MIN).
+        // Generalizes the previous worker-0-only restore now that there can be multiple workers.
+        for (worker_id, base_fee) in latest_base_fee_per_worker(&blocks) {
+            gas_accumulator.base_fee(worker_id).set_base_fee(base_fee);
+        }
+
         // loop through blocks to accumulate gas stats
         for current in blocks {
             let gas = current.gas_used;
             let limit = current.gas_limit;
 
-            // difficulty contains the worker id and batch index:
-            // `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
-            let lower64 = current.difficulty.into_limbs()[0];
-            let worker_id = (lower64 & 0xffff) as u16;
+            let worker_id = worker_id_from_header(&current);
             gas_accumulator.inc_block(worker_id, gas, limit);
         }
 
@@ -194,6 +192,102 @@ pub async fn catchup_accumulator(
     };
 
     Ok(())
+}
+
+/// Resize the [`GasAccumulator`] to the on-chain worker count for the epoch whose first block is
+/// `epoch_first_block`.
+///
+/// The `WorkerConfigs` contract is the absolute source of truth for the worker count, and the
+/// count for epoch E is its state at block `epoch_first_block - 1` - E's first block's parent,
+/// i.e. the previous epoch's closing block (`saturating_sub` makes epoch 0 read genesis state).
+/// That block is identical for a live producer at the boundary, a restarting node, and a
+/// mid-epoch syncing node, and it is immune to mid-epoch `setNumWorkers` writes, which by design
+/// only take effect at the next boundary.
+///
+/// FAIL-OPEN: any read failure (contract absent on older chains, state unavailable) logs a
+/// warning and keeps the accumulator's current size, so the node behaves exactly as it did
+/// before worker counts were chain-derived.
+///
+/// Callers must only invoke this while no consensus output is executing (startup before
+/// [`catchup_accumulator`], epoch entry before replay) - see
+/// [`GasAccumulator::set_num_workers`].
+pub fn sync_num_workers_from_chain(
+    reth_env: &RethEnv,
+    gas_accumulator: &GasAccumulator,
+    epoch_first_block: u64,
+) {
+    let read_block = epoch_first_block.saturating_sub(1);
+    let header = match reth_env.sealed_header_by_number(read_block) {
+        Ok(Some(header)) => header,
+        Ok(None) => {
+            warn!(
+                target: "epoch-manager",
+                read_block,
+                "no header at epoch start parent while syncing worker count - keeping current count"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                target: "epoch-manager",
+                ?e,
+                read_block,
+                "failed to read header while syncing worker count - keeping current count"
+            );
+            return;
+        }
+    };
+
+    match reth_env.get_worker_fee_configs_at_block(header.hash()) {
+        Ok((num_workers, _configs)) => {
+            let current = gas_accumulator.num_workers();
+            if current != num_workers {
+                info!(
+                    target: "epoch-manager",
+                    current,
+                    on_chain = num_workers,
+                    read_block,
+                    "syncing GasAccumulator worker count to on-chain WorkerConfigs"
+                );
+            }
+            gas_accumulator.set_num_workers(num_workers);
+        }
+        Err(e) => {
+            warn!(
+                target: "epoch-manager",
+                ?e,
+                read_block,
+                "failed to read WorkerConfigs while syncing worker count - keeping current count"
+            );
+        }
+    }
+}
+
+/// Worker id encoded in a header's `difficulty` (low 16 bits of `batch_index << 16 | worker_id`).
+pub(crate) fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
+    (header.difficulty.into_limbs()[0] & 0xffff) as u16
+}
+
+/// Return the most recent on-chain `base_fee_per_gas` for each worker that produced a block in
+/// `headers`.
+///
+/// `headers` are the executed reth blocks for the current epoch (epoch-start height..=tip), in
+/// ascending block-number order, so the last header seen for a worker is its latest block. The
+/// worker id is read from each header's `difficulty` field (lower 16 bits, matching how
+/// [`GasAccumulator::inc_block`] callers encode it). Workers that produced no block in the range
+/// are absent from the returned map.
+///
+/// Used to seed per-worker base fees from the chain on sync and restart, preserving the
+/// base-fee-from-chain invariant (see the [`tn_types::gas_accumulator`] module docs).
+pub(crate) fn latest_base_fee_per_worker(headers: &[SealedHeader]) -> HashMap<WorkerId, u64> {
+    let mut fees = HashMap::new();
+    for header in headers {
+        let worker_id = worker_id_from_header(header);
+        if let Some(base_fee) = header.base_fee_per_gas {
+            fees.insert(worker_id, base_fee);
+        }
+    }
+    fees
 }
 
 /// Open the process-lifetime consensus DB, creating its directory if absent.
@@ -321,8 +415,10 @@ where
         // create channels for engine that survive the lifetime of the node
         let (to_engine, for_engine) = mpsc::channel(1000);
 
-        // Create our epoch gas accumulator, we currently have one worker.
-        // All nodes have to agree on the worker count, do not change this for an existing chain.
+        // Create the epoch gas accumulator with a single worker slot. The on-chain WorkerConfigs
+        // contract is the absolute source of truth for the worker count:
+        // sync_num_workers_from_chain resizes the accumulator to match it below (before catchup)
+        // and again at every epoch entry, so all nodes converge on the governance-set count.
         let gas_accumulator = GasAccumulator::new(1);
         // create channel for engine updates to consensus
         let (engine_update_tx, engine_update_rx) = mpsc::channel(64);
@@ -339,14 +435,13 @@ where
             .await?;
 
         // retrieve epoch information from canonical tip on startup
-        let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
+        let EpochState { epoch, epoch_info, .. } = engine.epoch_state_from_canonical_tip().await?;
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
-        catchup_accumulator(
-            engine.get_reth_env().await,
-            &gas_accumulator,
-            &mut self.consensus_chain,
-        )
-        .await?;
+        // Size the accumulator from on-chain state first so catchup's per-worker restore writes
+        // (keyed by each block header's worker id) land in a correctly sized accumulator.
+        let reth_env = engine.get_reth_env().await;
+        sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_info.blockHeight);
+        catchup_accumulator(reth_env, &gas_accumulator, &mut self.consensus_chain).await?;
 
         // read the network config or use the default, then stamp the genesis chain id
         // onto it so every wire protocol and gossip topic is chain-namespaced (issue
@@ -456,7 +551,7 @@ where
             if exex_critical {
                 node_task_manager.get_spawner().spawn_critical_task(
                     "exex-manager",
-                    run_critical_exex_future("exex-manager".to_string(), manager),
+                    run_critical_exex_future("exex-manager".to_string(), manager.run()),
                 );
                 info!(target: "epoch-manager", "ExEx manager and tasks spawned (critical)");
             } else {
@@ -464,7 +559,7 @@ where
                 // loudly) but the node — host to an optional subsystem — stays up.
                 node_task_manager.get_spawner().spawn_task(
                     "exex-manager",
-                    run_isolated_exex_future("exex-manager".to_string(), manager),
+                    run_isolated_exex_future("exex-manager".to_string(), manager.run()),
                 );
                 info!(target: "epoch-manager", "ExEx manager and tasks spawned (isolated, non-critical)");
             }

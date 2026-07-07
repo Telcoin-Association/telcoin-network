@@ -1,0 +1,54 @@
+[package]
+name = "tn-worker-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Stateless reverse proxy in front of Telcoin Network worker JSON-RPC."
+
+[[bin]]
+name = "worker-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# cli + runtime
+clap = { workspace = true, features = ["derive", "env"] }
+eyre = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "sync",
+    "signal",
+    "macros",
+    "io-util",
+] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi", "std"] }
+
+# http server + client
+axum = { workspace = true, features = ["json", "tokio", "http1"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+tower-http = { workspace = true }
+
+# config + serde
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+humantime = { workspace = true }
+
+# telcoin
+tn-config = { workspace = true }
+tn-types = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

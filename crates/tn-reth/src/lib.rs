@@ -30,7 +30,7 @@ use crate::{
     traits::{DefaultEthPayloadTypes, TNExecution},
 };
 use alloy::{
-    hex::{self, ToHexExt},
+    hex,
     primitives::{Bytes, ChainId},
     sol_types::{SolCall, SolConstructor},
 };
@@ -1170,13 +1170,12 @@ impl RethEnv {
             .with_bundle_update()
             .build();
 
-        // The BlsG1 proof-of-possession library is a native precompile registered by the EVM
-        // factory at `BLS_G1_PRECOMPILE_ADDRESS`, so there is nothing to deploy at genesis:
-        // the registry is linked directly against the precompile address. The registry
-        // constructor's PoP verification `delegatecall`s this address and is served
-        // natively by the precompile, which shares the exact `blst` verification the
-        // consensus layer uses to produce the proofs (so the on-chain check cannot drift
-        // from the off-chain encoding).
+        // The BLS proof-of-possession precompile is registered by the EVM factory at
+        // `BLS_G1_PRECOMPILE_ADDRESS`, so there is nothing to deploy at genesis. The registry
+        // constructor's PoP verification staticcalls this address and is served natively by the
+        // precompile, which shares the exact `blst` verification the consensus layer uses to
+        // produce the proofs (so the on-chain check cannot drift from the off-chain
+        // encoding).
         let blsg1_address = BLS_G1_PRECOMPILE_ADDRESS;
 
         // prepare registry deployment
@@ -1194,8 +1193,7 @@ impl RethEnv {
                 };
                 let bls_pubkey: tn_types::Bytes = v.bls_public_key.to_bytes().into();
                 let proof = ConsensusRegistry::ProofOfPossession {
-                    uncompressedPubkey: v.bls_public_key.serialize().into(),
-                    uncompressedSignature: v.proof_of_possession.serialize().into(),
+                    signature: v.proof_of_possession.to_bytes().into(),
                 };
 
                 (validator, (bls_pubkey, proof))
@@ -1222,11 +1220,15 @@ impl RethEnv {
             Self::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
         let registry_initcode_str =
             registry_initcode_binding.as_str().ok_or_eyre("invalid registry json")?;
-        // link the BlsG1 library address into the registry bytecode
-        let linked_registry_initcode =
-            Self::link_solidity_library(registry_initcode_str, &blsg1_address.encode_hex())?;
-
-        let mut create_registry = linked_registry_initcode;
+        // The registry calls the BLS precompile directly at `BLS_G1_ADDRESS` (no linked library),
+        // so its bytecode carries no link placeholder; deploy it as-is. Guard against a
+        // stale artifact that still contains an unresolved `__$..$__` placeholder.
+        if registry_initcode_str.contains("__$") {
+            eyre::bail!(
+                "ConsensusRegistry initcode has an unresolved library link placeholder; regenerate tn-contracts artifacts"
+            );
+        }
+        let mut create_registry = hex::decode(registry_initcode_str)?;
         create_registry.extend(constructor_args);
 
         // after adding bls proof of possession, registry precompile exceeds size limit so disable
@@ -1299,8 +1301,7 @@ impl RethEnv {
         )?;
         let registry_runtimecode_str =
             registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?;
-        let registry_runtimecode =
-            Self::link_solidity_library(registry_runtimecode_str, &blsg1_address.encode_hex())?;
+        let registry_runtimecode = hex::decode(registry_runtimecode_str)?;
 
         let tmp_worker_configs_storage = state.get(&tmp_worker_configs_address).map(|account| {
             account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
@@ -1318,7 +1319,7 @@ impl RethEnv {
         let issuance_runtimecode =
             hex::decode(issuance_json_binding.as_str().ok_or_eyre("invalid issuance json")?)?;
         let genesis = genesis.extend_accounts([
-            // The BLS proof-of-possession library is a precompile at `blsg1_address`
+            // The BLS proof-of-possession precompile lives at `blsg1_address`
             // (`BLS_G1_PRECOMPILE_ADDRESS`). Mirror the TEL precompile and give it a single `0xfe`
             // (INVALID) byte of code so the account is non-empty (never state-pruned) and any call
             // that bypasses precompile dispatch reverts instead of succeeding against an EOA.
@@ -1346,54 +1347,6 @@ impl RethEnv {
         ]);
 
         Ok(genesis)
-    }
-
-    /// Links a library address into contract bytecode
-    ///
-    /// Replaces Solidity's `__$<34 chars of library hash>$__` placeholder
-    pub fn link_solidity_library(
-        bytecode_hex: &str,
-        library_address: &str,
-    ) -> eyre::Result<Vec<u8>> {
-        const PLACEHOLDER_PREFIX: &str = "__$";
-        const PLACEHOLDER_SUFFIX: &str = "$__";
-        const PLACEHOLDER_LEN: usize = 40; // __$ + 34 chars + $__
-        let library_address_unprefixed =
-            library_address.strip_prefix("0x").unwrap_or(library_address);
-        let mut result = String::with_capacity(bytecode_hex.len());
-        let mut chars = bytecode_hex.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            // check if we're at the start of a placeholder
-            if ch == '_' && chars.peek() == Some(&'_') {
-                let mut potential_placeholder = String::from("_");
-
-                // collect the next 39 characters (we already have the first _)
-                for _ in 1..PLACEHOLDER_LEN {
-                    if let Some(next_ch) = chars.next() {
-                        potential_placeholder.push(next_ch);
-                    } else {
-                        break;
-                    }
-                }
-
-                // check it matches the placeholder pattern
-                if potential_placeholder.starts_with(PLACEHOLDER_PREFIX)
-                    && potential_placeholder.ends_with(PLACEHOLDER_SUFFIX)
-                    && potential_placeholder.len() == PLACEHOLDER_LEN
-                {
-                    // it's a valid placeholder, replace with address
-                    result.push_str(library_address_unprefixed);
-                } else {
-                    // not a placeholder, add the characters back
-                    result.push_str(&potential_placeholder);
-                }
-            } else {
-                result.push(ch);
-            }
-        }
-
-        hex::decode(result).map_err(Into::into)
     }
 
     /// Fetches json info from the given string
@@ -1685,19 +1638,13 @@ impl RethEnv {
 
     /// Read worker fee configs from the [`WorkerConfigs`] contract at the canonical tip.
     ///
-    /// `num_workers` is the caller's view of the on-chain worker count. It is compared against
-    /// the value returned by `numWorkers()` at canonical tip; a mismatch indicates governance
-    /// grew/shrank the worker set mid-node-lifetime and the in-memory `GasAccumulator` no longer
-    /// matches the contract. Caller must restart or re-resolve the worker count.
-    pub fn get_worker_fee_configs(&self, num_workers: usize) -> eyre::Result<Vec<WorkerFeeConfig>> {
+    /// The returned `Vec`'s length is the on-chain `numWorkers()` at the canonical tip (the
+    /// arity between the count and the per-worker arrays is validated in
+    /// [`Self::worker_fee_configs_inner`]). Callers size their in-memory worker state (e.g. the
+    /// `GasAccumulator`) to match, rather than asserting a preconceived count.
+    pub fn get_worker_fee_configs(&self) -> eyre::Result<Vec<WorkerFeeConfig>> {
         let canonical_tip = self.canonical_tip();
-        let (num_workers_on_chain, configs) = self.worker_fee_configs_inner(&canonical_tip)?;
-        if num_workers != num_workers_on_chain {
-            return Err(eyre::eyre!(
-                "worker count drift: caller={num_workers}, on-chain numWorkers()={num_workers_on_chain}; \
-                 GasAccumulator sized at startup no longer matches WorkerConfigs; node restart required"
-            ));
-        }
+        let (_num_workers, configs) = self.worker_fee_configs_inner(&canonical_tip)?;
         Ok(configs)
     }
 
@@ -1941,8 +1888,7 @@ mod tests {
             calldata,
         );
         let proof = ConsensusRegistry::ProofOfPossession {
-            uncompressedPubkey: new_validator.bls_public_key.serialize().into(),
-            uncompressedSignature: new_validator.proof_of_possession.serialize().into(),
+            signature: new_validator.proof_of_possession.to_bytes().into(),
         };
         let calldata = ConsensusRegistry::stakeCall {
             blsPubkey: new_validator.bls_public_key.to_bytes().into(),
@@ -2519,11 +2465,151 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
                 .unwrap();
 
-        // read back worker configs from chain state
-        let configs = reth_env.get_worker_fee_configs(2)?;
+        // read back worker configs from chain state - the returned length IS the on-chain
+        // numWorkers()
+        let configs = reth_env.get_worker_fee_configs()?;
         assert_eq!(configs.len(), 2);
         assert_eq!(configs[0], WorkerFeeConfig::Eip1559 { target_gas: 30_000_000 });
         assert_eq!(configs[1], WorkerFeeConfig::Static { fee: 500 });
+
+        // the block-pinned read primitive reports the same count at genesis
+        let (num_workers, configs_at_block) =
+            reth_env.get_worker_fee_configs_at_block(chain.sealed_genesis_header().hash())?;
+        assert_eq!(num_workers, 2);
+        assert_eq!(configs_at_block, configs);
+
+        Ok(())
+    }
+
+    /// Pins the per-epoch worker-count read rule: the count for epoch E is the `WorkerConfigs`
+    /// state at E's first block's parent (= E-1's closing block). Governance submits
+    /// `setWorkerConfig` + `setNumWorkers` during epoch 0; the count read at epoch 1's
+    /// start-parent block reflects the change, while the count read at epoch 0's start-parent
+    /// (genesis) still reports the original single worker.
+    #[tokio::test]
+    async fn test_worker_count_read_at_epoch_start_parent() -> eyre::Result<()> {
+        // minimal validator set (5 validators)
+        let all_validators: Vec<Address> =
+            (1..=5).map(|i| Address::from_slice(&[i * 0x11; 20])).collect();
+
+        let validators: Vec<_> = all_validators
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                let mut rng = StdRng::seed_from_u64(i as u64);
+                let bls = BlsKeypair::generate(&mut rng);
+                let bls_pubkey = bls.public();
+                let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                    .expect("pop generation failed");
+                NodeInfo {
+                    name: format!("validator-{i}"),
+                    bls_public_key: *bls_pubkey,
+                    p2p_info: NodeP2pInfo::default(),
+                    execution_address: *addr,
+                    proof_of_possession: pop,
+                }
+            })
+            .collect();
+
+        let initial_stake_config = ConsensusRegistry::StakeConfig {
+            stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+            minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+            epochIssuance: U256::from(parse_ether("20_000_000").unwrap())
+                .checked_div(U256::from(28))
+                .expect("u256 div checked"),
+            epochDuration: 28800,
+        };
+
+        // governance owns the WorkerConfigs contract and signs the config txs
+        let mut governance_multisig =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+        let governance = governance_multisig.address();
+        let tmp_genesis = tn_types::test_genesis().extend_accounts([(
+            governance,
+            GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)),
+        )]);
+
+        // deploy with a single worker (the canonical existing-chain shape)
+        let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+            validators.clone(),
+            tmp_genesis,
+            initial_stake_config.clone(),
+            governance,
+            vec![(0u8, 30_000_000u64)],
+        )?;
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Worker Count Epoch Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+
+        // sanity: epoch 0 starts at blockHeight 0, so its start-parent (saturating) is genesis
+        let EpochState { epoch, epoch_info, .. } = reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 0);
+        let epoch_zero_read_block = epoch_info.blockHeight.saturating_sub(1);
+        assert_eq!(epoch_zero_read_block, 0);
+
+        // governance grows the worker set mid-epoch: config worker 1 (Static 500), then grow
+        // the count (setWorkerConfig must precede setNumWorkers per the contract)
+        let set_config_tx = governance_multisig.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setWorkerConfigCall { workerId: 1, strategy: 1, value: 500, data: 0 }
+                .abi_encode()
+                .into(),
+        );
+        let set_num_workers_tx = governance_multisig.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setNumWorkersCall { numWorkers_: 2 }.abi_encode().into(),
+        );
+
+        // block 1 (mid-epoch-0): the governance txs land
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(
+            &reth_env,
+            payload,
+            vec![set_config_tx, set_num_workers_tx],
+        )?;
+        let canonical_header = block1.recovered_block.clone_sealed_header();
+
+        // block 2 closes epoch 0 -> epoch 1's first block will be 3, start-parent = block 2
+        let consensus_output = consensus_output_for_tests(2, 1, 2, true);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let close_block_hash = block2.recovered_block.clone_sealed_header().hash();
+
+        // the new epoch's info points its start-parent at the closing block
+        let EpochState { epoch, epoch_info, .. } = reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 1);
+        let epoch_one_read_block = epoch_info.blockHeight.saturating_sub(1);
+        let epoch_one_read_header = reth_env
+            .sealed_header_by_number(epoch_one_read_block)?
+            .expect("epoch 1 start-parent header");
+        assert_eq!(epoch_one_read_header.hash(), close_block_hash);
+
+        // epoch 1's count (read at its start-parent) reflects the governance change...
+        let (num_workers, configs) =
+            reth_env.get_worker_fee_configs_at_block(epoch_one_read_header.hash())?;
+        assert_eq!(num_workers, 2);
+        assert_eq!(configs[1], WorkerFeeConfig::Static { fee: 500 });
+
+        // ...while epoch 0's count (read at genesis) still reports the original single worker
+        let genesis_hash = reth_env
+            .sealed_header_by_number(epoch_zero_read_block)?
+            .expect("genesis header")
+            .hash();
+        let (num_workers, _configs) = reth_env.get_worker_fee_configs_at_block(genesis_hash)?;
+        assert_eq!(num_workers, 1);
 
         Ok(())
     }

@@ -11,6 +11,8 @@ use crate::{
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
+use rand::{rngs::StdRng, SeedableRng};
+use roaring::RoaringBitmap;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -18,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use tn_config::Parameters;
+use tn_config::{ConsensusConfig, KeyConfig, Parameters};
 use tn_network_libp2p::{GossipMessage, TopicHash};
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
@@ -29,10 +31,10 @@ use tn_storage::{
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
     encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
-    BlockHeader, BlockNumHash, BlsPublicKey, BlsSigner as _, Certificate, CommittedSubDag,
-    ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch, EpochVote,
-    ExecHeader, Hash as _, HeaderDigest, ReputationScores, Round, SealedHeader, TaskManager,
-    VoteDigest, VoteInfo, B256,
+    BlockHeader, BlockNumHash, BlsKeypair, BlsPublicKey, BlsSigner as _, Certificate,
+    CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch,
+    EpochVote, ExecHeader, Hash as _, HeaderDigest, ReputationScores, Round, SealedHeader,
+    TaskManager, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -55,6 +57,25 @@ fn test_missing_certs_request() {
         missing_req.get_bounds().expect("decode missing bounds");
     assert_eq!(expected_gc_round, decoded_gc_round);
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
+}
+
+#[test]
+// for primary::network::message
+fn test_missing_certs_request_skip_round_overflow() {
+    let mut serialized = Vec::new();
+    [1u32, 2]
+        .into_iter()
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    // `exclusive_lower_bound + 2` exceeds u32::MAX and must surface as an invalid request
+    // instead of wrapping (release) or panicking (debug) on peer-supplied input
+    let missing_req = MissingCertificatesRequest {
+        exclusive_lower_bound: Round::MAX - 1,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 10,
+    };
+    assert_matches!(missing_req.get_bounds(), Err(PrimaryNetworkError::InvalidRequest(_)));
 }
 
 /// The type for holding testng components.
@@ -271,6 +292,74 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert!(res.is_ok());
+    Ok(())
+}
+
+/// Regression test for issue #803: a node that is **not** a member of the current committee must
+/// reject an inbound vote request with a graceful error instead of panicking. The vote path
+/// previously called `authority_id().expect("only validators can vote")`, which aborts the whole
+/// process for any non-validator that reaches it (e.g. an observer served a misrouted request).
+#[tokio::test]
+async fn test_vote_non_committee_member_returns_error() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+
+    // Build a ConsensusConfig keyed by an identity that is NOT in the committee, so that
+    // `authority_id()` is `None` (a non-validator / observer node). Reuse the fixture's
+    // genesis-aligned `Config` and `NetworkConfig`, swapping only the signing key.
+    let base = committee.first_authority().consensus_config();
+    let outsider_key =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let config = ConsensusConfig::new_with_committee_for_test(
+        base.config().clone(),
+        MemDatabase::default(),
+        outsider_key,
+        committee.committee(),
+        base.network_config().clone(),
+    )?;
+    assert!(config.authority_id().is_none(), "outsider key must not be a committee member");
+
+    // Build the handler against the outsider config, mirroring `create_test_types_with_params`.
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    // Seed the latest execution result to genesis so a round-1 header passes execution checks.
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.committee())
+            .await
+            .unwrap();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+
+    // A valid round-1 header proposed by a real committee member (identical to test_vote_succeeds),
+    // so the request passes the peer/author and header validation and reaches the former panic
+    // site.
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // The non-validator must return a graceful error rather than panicking.
+    let res = handler.vote(peer, header, vec![]).await;
+    debug!(target: "primary::handler_tests", ?res);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotCommitteeMember)));
+
+    // keep the synchronizer's task alive until the vote has been processed
+    drop(task_manager);
     Ok(())
 }
 
@@ -494,6 +583,87 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(wrong))) if wrong == wrong_authority.to_string());
     Ok(())
+}
+
+/// Regression for #802: the Byzantine errors the vote RPC returns must be penalizable.
+///
+/// `process_vote_request` now reports `(&err).into()` before collapsing the result into a
+/// response, exactly like every sibling request handler. That wiring only penalizes a
+/// misbehaving peer if the vote handler's error variants map to `Some(Penalty)` in the
+/// central `From<&PrimaryNetworkError>` table. Pin that contract here so a future error
+/// reshuffle that silently downgrades a vote error to `None` (re-opening #802 from the
+/// other side) is caught.
+#[tokio::test]
+async fn test_vote_byzantine_errors_are_penalizable() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // A vote request whose peer is not the header's author -> PeerNotAuthor.
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let not_author = BlsPublicKey::default();
+    let err = handler
+        .vote(not_author, header, Vec::new())
+        .await
+        .expect_err("a vote whose peer is not the header author must fail");
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor));
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert_matches!(
+        penalty,
+        Some(tn_network_libp2p::Penalty::Fatal),
+        "a non-author vote must penalize the peer so process_vote_request can report it"
+    );
+
+    // A vote request authored by an authority outside the committee -> UnknownAuthority.
+    let wrong_authority = AuthorityIdentifier::dummy_for_test(100);
+    let header = committee
+        .header_builder_last_authority()
+        .author(wrong_authority.clone())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let err = handler
+        .vote(peer, header, Vec::new())
+        .await
+        .expect_err("a vote authored by an unknown authority must fail");
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(ref a))
+            if *a == wrong_authority.to_string()
+    );
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert_matches!(
+        penalty,
+        Some(tn_network_libp2p::Penalty::Fatal),
+        "an unknown-authority vote must penalize the peer"
+    );
+
+    Ok(())
+}
+
+/// #802 follow-through: header errors that reflect a LOCAL or transient condition (our own
+/// storage failure, or our execution lagging behind a peer that is merely ahead) must NOT
+/// penalize the peer now that the vote RPC is wired into the penalty pipeline. Pin the
+/// central table so these stay `None`, consistent with the sibling
+/// `PrimaryNetworkError::Storage` and `*::Timeout` arms.
+#[test]
+fn test_local_header_errors_are_not_penalized() {
+    let storage: PrimaryNetworkError = HeaderError::Storage(eyre::eyre!("local db failure")).into();
+    let penalty: Option<tn_network_libp2p::Penalty> = (&storage).into();
+    assert!(penalty.is_none(), "a local storage failure must not penalize the peer");
+
+    let exec_lag: PrimaryNetworkError =
+        HeaderError::UnknownExecutionResult(BlockNumHash::new(0, BlockHash::default())).into();
+    let penalty: Option<tn_network_libp2p::Penalty> = (&exec_lag).into();
+    assert!(
+        penalty.is_none(),
+        "a peer that is merely ahead of our execution must not be penalized"
+    );
 }
 
 /// Test that primary pub/sub is enforcing topics.

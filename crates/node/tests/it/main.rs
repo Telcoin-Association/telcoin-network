@@ -10,18 +10,24 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, WORKER_CONFIGS_ADDRESS};
 use tn_engine::ExecutorEngine;
 use tn_executor::subscriber::spawn_subscriber;
 use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
-use tn_node::catchup_accumulator;
+use tn_node::{catchup_accumulator, sync_num_workers_from_chain};
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
     network::PrimaryNetworkHandle,
     ConsensusBus,
 };
-use tn_reth::{test_utils::seeded_genesis_from_random_batches, RethChainSpec};
+use tn_reth::{
+    test_utils::{
+        seeded_genesis_from_random_batches, test_genesis_with_consensus_registry,
+        test_genesis_with_consensus_registry_and_workers,
+    },
+    RethChainSpec,
+};
 use tn_rpc::{EngineToPrimary, RpcNodeInfo};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
 use tn_test_utils::{
@@ -97,7 +103,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
         Ok(())
@@ -150,7 +156,24 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     // initialize a new gas accumulator to simulate node recovery
     let recovered = GasAccumulator::new(1);
     recovered.rewards_counter().set_committee(fixture.committee());
+
+    // Catchup must restore each worker's base fee from the chain. Capture the chain's
+    // finalized base fee, poison the recovered accumulator with a different value, and confirm
+    // catchup overwrites it with the value read from the chain (not left at the stale value).
+    let expected_base_fee = reth_env
+        .finalized_header()?
+        .expect("finalized header exists after producing blocks")
+        .base_fee_per_gas
+        .expect("executed blocks carry a base fee");
+    recovered.base_fee(worker_id).set_base_fee(expected_base_fee + 999);
+
     catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+
+    assert_eq!(
+        recovered.base_fee(worker_id).base_fee(),
+        expected_base_fee,
+        "catchup must restore the worker's base fee from the chain, overwriting the stale value",
+    );
     // assert recovered and active track the same expected values
     //      G48pDy85GhyGMp9afPBvWgaNzgPAnvBtMxjReQTe1NiN: 3,
     //      Agv7rsffEbxoa7ybTJj57TiAHchf27ia7ziB5CVrHNTk: 3,
@@ -301,7 +324,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         debug!(target: "gas-test", ?res, "res:");
         let _ = tx.send(res);
         Ok(())
@@ -469,7 +492,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         debug!(target: "gas-test", ?res, "partial res:");
         let _ = tx.send(res);
         Ok(())
@@ -525,6 +548,194 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         .collect();
     assert_eq!(expected, recovered.rewards_counter().get_address_counts());
     assert_eq!(expected, gas_accumulator.rewards_counter().get_address_counts());
+
+    Ok(())
+}
+
+/// `sync_num_workers_from_chain` sizes the accumulator to the on-chain `WorkerConfigs` count,
+/// growing an undersized accumulator and shrinking an oversized one.
+#[tokio::test]
+async fn test_sync_num_workers_from_chain_adjusts_to_on_chain_count() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("sync_num_workers")?;
+    // genesis deploys WorkerConfigs with 2 workers (worker 0 EIP-1559, worker 1 static)
+    let genesis = test_genesis_with_consensus_registry_and_workers(
+        4,
+        vec![(0u8, 30_000_000u64), (1u8, 500u64)],
+    );
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node =
+        default_test_execution_node(Some(chain), None, &temp_dir.path().join("reth"), None)?;
+    let reth_env = execution_node.get_reth_env().await;
+    let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
+
+    // the startup default (1 worker) grows to the on-chain count
+    let gas_accumulator = GasAccumulator::new(1);
+    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block);
+    assert_eq!(gas_accumulator.num_workers(), 2, "undersized accumulator grows to on-chain count");
+
+    // an oversized accumulator shrinks to the on-chain count
+    let gas_accumulator = GasAccumulator::new(3);
+    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block);
+    assert_eq!(gas_accumulator.num_workers(), 2, "oversized accumulator shrinks to on-chain count");
+
+    Ok(())
+}
+
+/// FAIL-OPEN: on a chain without the `WorkerConfigs` contract (older networks), the worker-count
+/// sync must keep the accumulator's current size and return without error.
+#[tokio::test]
+async fn test_sync_num_workers_fail_open_when_contract_absent() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("sync_num_workers_fail_open")?;
+    // strip the WorkerConfigs account from the alloc so the contract read is guaranteed to fail
+    let mut genesis = test_genesis_with_consensus_registry(4);
+    genesis.alloc.remove(&WORKER_CONFIGS_ADDRESS);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let execution_node =
+        default_test_execution_node(Some(chain), None, &temp_dir.path().join("reth"), None)?;
+    let reth_env = execution_node.get_reth_env().await;
+    let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
+
+    let gas_accumulator = GasAccumulator::new(1);
+    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block);
+    assert_eq!(gas_accumulator.num_workers(), 1, "fail-open keeps the current worker count");
+
+    Ok(())
+}
+
+/// Mid-epoch recovery on a chain whose `WorkerConfigs` declares 2 workers, mirroring the startup
+/// order: `sync_num_workers_from_chain` sizes the accumulator first, then `catchup_accumulator`
+/// restores per-worker state into the correctly sized slots.
+///
+/// Consensus still only produces worker-0 blocks (worker spawning is a follow-up), so worker 0
+/// must match the live accumulator exactly while worker 1 carries an idle default slot.
+#[tokio::test]
+async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("sync_then_catchup").unwrap();
+    // create deterministic committee fixture and use first authority's components
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config().clone();
+    let consensus_bus = ConsensusBus::new();
+    let committee = config.committee().clone();
+    let mut consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).await.unwrap();
+
+    // make certificates with batches of txs (all worker 0)
+    let max_round = 21;
+    let (certificates, _next_parents, batches) =
+        create_signed_certificates_for_rounds(1..=max_round, &fixture, &[]);
+
+    // 2-worker WorkerConfigs at genesis; fund the batch senders so txs execute
+    let genesis = test_genesis_with_consensus_registry_and_workers(
+        4,
+        vec![(0u8, 30_000_000u64), (1u8, 500u64)],
+    );
+    let all_batches: Vec<_> = batches.values().cloned().collect();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // live accumulator sized 2, as the startup sync would have left it
+    let gas_accumulator = GasAccumulator::new(2);
+    gas_accumulator.rewards_counter().set_committee(fixture.committee());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+
+    // manually create engine
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
+    let max = Some(max_round as u64 - 1); // consensus needs 1 extra round to commit
+    let parent = chain.sealed_genesis_header();
+
+    // start engine
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+    let (tx, mut rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        debug!(target: "gas-test", ?res, "res:");
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    // subscribe to output early
+    let mut consensus_output = consensus_bus.app().subscribe_consensus_output();
+
+    // spawn consensus to send output to engine for full execution
+    spawn_consensus(
+        &fixture,
+        &consensus_bus,
+        batches,
+        config,
+        &task_manager,
+        consensus_chain.clone(),
+    )
+    .await;
+
+    // send certificates to trigger subdag commit
+    for certificate in certificates.iter() {
+        consensus_bus.new_certificates().send(certificate.clone()).await.unwrap();
+    }
+
+    // forward consensus output to engine until `max_round`
+    loop {
+        tokio::select! {
+            Some(output) = consensus_output.recv() => {
+                to_engine.send(output).await?;
+            }
+            engine_task = timeout(Duration::from_secs(30), &mut rx) => {
+                assert!(engine_task.is_ok());
+                break;
+            }
+        }
+    }
+
+    // simulate node recovery in the startup order: sync worker count first, then catchup
+    let recovered = GasAccumulator::new(1);
+    recovered.rewards_counter().set_committee(fixture.committee());
+    // poison worker 0's fee to prove the resize preserves the slot and catchup then restores it
+    let expected_base_fee = reth_env
+        .finalized_header()?
+        .expect("finalized header exists after producing blocks")
+        .base_fee_per_gas
+        .expect("executed blocks carry a base fee");
+    recovered.base_fee(0).set_base_fee(expected_base_fee + 999);
+
+    let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
+    sync_num_workers_from_chain(&reth_env, &recovered, epoch_first_block);
+    assert_eq!(recovered.num_workers(), 2, "sync sizes the accumulator before catchup");
+
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain).await?;
+
+    // worker 0: totals and fee restored to match the live accumulator
+    let (blocks, gas_used, gas_limit) = recovered.get_values(0);
+    assert_eq!((blocks, gas_used, gas_limit), gas_accumulator.get_values(0));
+    assert!(gas_used > 0, "worker 0 accumulated gas this epoch");
+    assert_eq!(recovered.base_fee(0).base_fee(), expected_base_fee);
+    // worker 1: idle governance-declared slot stays at defaults
+    assert_eq!(recovered.get_values(1), (0, 0, 0));
+    assert_eq!(recovered.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
+    // rewards restored identically
+    assert_eq!(
+        gas_accumulator.rewards_counter().get_address_counts(),
+        recovered.rewards_counter().get_address_counts()
+    );
 
     Ok(())
 }

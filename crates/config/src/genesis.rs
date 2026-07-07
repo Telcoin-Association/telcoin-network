@@ -16,9 +16,12 @@ use tracing::{info, warn};
 
 /// The validators directory used to create genesis
 pub const GENESIS_VALIDATORS_DIR: &str = "validators";
-/// Precompile info for genesis, read from current submodule commit
+/// Precompile info for genesis, read from current submodule commit.
+/// tn-contracts split its single deployments.json into per-network files (#123); the
+/// genesis-assigned addresses live in deployments-mainnet.json, which is the genesis
+/// source of truth that also generates the precompile-config.yaml read below.
 pub const DEPLOYMENTS_JSON: &str =
-    include_str!("../../../tn-contracts/deployments/deployments.json");
+    include_str!("../../../tn-contracts/deployments/deployments-mainnet.json");
 /// The path to consensus registry json (tn-contracts submodule).
 pub const CONSENSUS_REGISTRY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ConsensusRegistry.json");

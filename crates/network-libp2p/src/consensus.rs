@@ -861,7 +861,6 @@ where
                 self.metrics.record_gossip_received();
                 // verify message was published by authorized node
                 let msg_acceptance = self.verify_gossip(&message);
-                let valid = msg_acceptance.is_accepted();
                 trace!(target: "network", ?msg_acceptance, "gossip message verification status");
 
                 // report message validation results to propagate valid messages
@@ -874,50 +873,102 @@ where
                 }
 
                 // process gossip in application layer
-                if valid {
-                    // A peer is `Connected` before its `NodeRecord` resolves its BLS
-                    // identity, so a live mesh neighbor can relay a message before
-                    // `peer_to_bls` can resolve it. Deliver the accepted payload
-                    // regardless and carry the relayer as `Option`: the author is
-                    // already authenticated by `verify_gossip`, the relayer identity
-                    // is only used for penalty attribution, and dropping here would
-                    // lose the message for good because gossipsub has already cached
-                    // `message_id` and will not re-deliver it once the identity
-                    // resolves. The consumer skips the (unattributable) penalty while
-                    // the relayer is unresolved.
-                    let relayer =
-                        self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source);
-                    if relayer.is_none() {
-                        debug!(
-                            target: "network",
-                            ?propagation_source,
-                            ?message_id,
-                            "delivering accepted gossip with unresolved relayer identity; consensus-layer penalty skipped"
-                        );
+                match msg_acceptance {
+                    GossipAcceptance::Accept => {
+                        // A peer is `Connected` before its `NodeRecord` resolves its BLS
+                        // identity, so a live mesh neighbor can relay a message before
+                        // `peer_to_bls` can resolve it. Deliver the accepted payload
+                        // regardless and carry the relayer as `Option`: the author is
+                        // already authenticated by `verify_gossip`, the relayer identity
+                        // is only used for penalty attribution, and dropping here would
+                        // lose the message for good because gossipsub has already cached
+                        // `message_id` and will not re-deliver it once the identity
+                        // resolves. The consumer skips the (unattributable) penalty while
+                        // the relayer is unresolved.
+                        let relayer =
+                            self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source);
+                        if relayer.is_none() {
+                            debug!(
+                                target: "network",
+                                ?propagation_source,
+                                ?message_id,
+                                "delivering accepted gossip with unresolved relayer identity; consensus-layer penalty skipped"
+                            );
+                        }
+                        // Resolve the author's BLS identity too. The message is already
+                        // authenticated, but deep validation in the application layer (the
+                        // worker's batch checks) runs after this `Accept`, and an
+                        // author-content fault it surfaces must be charged to the author,
+                        // not the forwarder (see issue #819). On a restricted topic
+                        // acceptance guarantees the author resolved; on an open topic it may
+                        // be `None`, in which case the consumer skips the author penalty.
+                        let author = message
+                            .source
+                            .as_ref()
+                            .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
+                        // forward gossip to handler
+                        if let Err(e) = self
+                            .event_stream
+                            .try_send(accepted_gossip_event(message, relayer, author))
+                        {
+                            error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                            // ignore failures at the epoch boundary
+                            // During epoch change the event_stream reciever can be closed.
+                            return Ok(());
+                        }
                     }
-                    // forward gossip to handler
-                    if let Err(e) =
-                        self.event_stream.try_send(accepted_gossip_event(message, relayer))
-                    {
-                        error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
-                        // ignore failures at the epoch boundary
-                        // During epoch change the event_stream reciever can be closed.
-                        return Ok(());
+                    GossipAcceptance::Reject(reason) => {
+                        self.metrics.record_gossip_rejected();
+                        // Resolve both candidate culprits, then let `reason` decide accountability
+                        // (see `RejectReason::penalty`): an oversized payload is charged to the
+                        // relaying peer, an unauthorized author to the author, each only once its
+                        // identity has resolved. The relaying peer is never penalized for an
+                        // author fault (#801/#785).
+                        let relayer =
+                            self.swarm.behaviour().peer_manager.peer_to_bls(&propagation_source);
+                        let author_id = message.source;
+                        let author = author_id
+                            .as_ref()
+                            .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
+                        let topic = &message.topic;
+                        match reason.penalty(relayer.is_some(), author.is_some()) {
+                            RejectPenalty::FatalRelayer => {
+                                warn!(
+                                    target: "network",
+                                    ?topic,
+                                    "oversized gossip - applying fatal penalty to propagation source: {propagation_source:?}"
+                                );
+                                self.swarm
+                                    .behaviour_mut()
+                                    .peer_manager
+                                    .process_penalty(propagation_source, Penalty::Fatal);
+                            }
+                            RejectPenalty::FatalAuthor => {
+                                // `author.is_some()` guarantees `author_id` is `Some`.
+                                if let Some(author_id) = author_id {
+                                    warn!(
+                                        target: "network",
+                                        ?author_id,
+                                        ?topic,
+                                        "unauthorized-author gossip - applying fatal penalty to the author, not the forwarding relayer: {propagation_source:?}"
+                                    );
+                                    self.swarm
+                                        .behaviour_mut()
+                                        .peer_manager
+                                        .process_penalty(author_id, Penalty::Fatal);
+                                }
+                            }
+                            RejectPenalty::Skip => {
+                                debug!(
+                                    target: "network",
+                                    ?reason,
+                                    ?topic,
+                                    ?propagation_source,
+                                    "rejecting gossip without an attributable penalty (unresolved relayer/author, or this node's committee-view lag)"
+                                );
+                            }
+                        }
                     }
-                } else {
-                    self.metrics.record_gossip_rejected();
-                    let GossipMessage { source, topic, .. } = message;
-                    warn!(
-                        target: "network",
-                        author = ?source,
-                        ?topic,
-                        "received invalid gossip - applying fatal penalty to propagation source: {:?}",
-                        propagation_source
-                    );
-                    self.swarm
-                        .behaviour_mut()
-                        .peer_manager
-                        .process_penalty(propagation_source, Penalty::Fatal);
                 }
             }
             GossipEvent::Subscribed { peer_id, topic } => {
@@ -1155,7 +1206,7 @@ where
     fn verify_gossip(&self, gossip: &GossipMessage) -> GossipAcceptance {
         // verify message size
         if gossip.data.len() > self.config.max_gossip_message_size {
-            return GossipAcceptance::Reject;
+            return GossipAcceptance::Reject(RejectReason::TooLarge);
         }
 
         let GossipMessage { topic, .. } = gossip;
@@ -1171,7 +1222,7 @@ where
         }) {
             GossipAcceptance::Accept
         } else {
-            GossipAcceptance::Reject
+            GossipAcceptance::Reject(RejectReason::UnauthorizedAuthor)
         }
     }
 
@@ -1693,18 +1744,68 @@ where
 ///
 /// This is necessary because libp2p does not impl `PartialEq` on [MessageAcceptance].
 /// This impl does not map to `MessageAcceptance::Ignore`.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GossipAcceptance {
     /// The message is considered valid, and it should be delivered and forwarded to the network.
     Accept,
-    /// The message is considered invalid, and it should be rejected and trigger the P₄ penalty.
-    Reject,
+    /// The message is considered invalid, and it should be rejected. The [`RejectReason`]
+    /// records who is accountable for the rejection.
+    Reject(RejectReason),
 }
 
-impl GossipAcceptance {
-    /// Helper method indicating if the gossip message was accepted.
-    fn is_accepted(&self) -> bool {
-        *self == GossipAcceptance::Accept
+/// Why `verify_gossip` rejected a message.
+///
+/// The variant records *who* the fault is attributable to, which the reject path uses to decide
+/// whether the relaying peer may be penalized. Rejecting a message never propagates it, regardless
+/// of the reason; the distinction only governs peer scoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RejectReason {
+    /// The payload exceeds `max_gossip_message_size`. The bound is a shared constant, so under
+    /// gossipsub `Strict` validation an honest peer computes the same verdict and never forwards
+    /// the message: a peer that forwards an oversized payload is itself misbehaving, so the
+    /// relaying peer is accountable.
+    TooLarge,
+    /// The message author is absent, has no resolved BLS identity, or is not an authorized
+    /// publisher for the topic. The fault is the author's, not the forwarder's: an honest relayer
+    /// merely forwarded content the author is responsible for, so the relaying peer is never
+    /// penalized (the reject-path analogue of #801/#785). The resolved author is charged instead;
+    /// an honest author authorized under a neighbouring committee view is spared by the committee
+    /// exemption in the peer manager.
+    UnauthorizedAuthor,
+}
+
+/// The peer-scoring outcome for a rejected gossip message. Rejecting never propagates the message;
+/// this only decides which peer, if any, is penalized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RejectPenalty {
+    /// Fatally penalize the relaying peer (`propagation_source`).
+    FatalRelayer,
+    /// Fatally penalize the message author (`GossipMessage::source`).
+    FatalAuthor,
+    /// Do not penalize any peer.
+    Skip,
+}
+
+impl RejectReason {
+    /// Decide the peer-scoring outcome for this reject, given whether the relaying peer's and the
+    /// message author's BLS identities have resolved.
+    ///
+    /// An oversized payload is charged to the relaying peer: the size bound is a shared constant,
+    /// so under gossipsub `Strict` validation an honest peer computes the same verdict and never
+    /// forwards one, making a forwarded oversized payload relayer misbehavior. An unauthorized
+    /// author is charged to the *author*, never the forwarder — an honest relayer merely forwarded
+    /// content the author is responsible for (the reject-path analogue of #801/#785), and an honest
+    /// author authorized under a neighbouring committee view is spared downstream by the committee
+    /// exemption in the peer manager. Either penalty is skipped until the accountable peer's
+    /// identity resolves: unattributable otherwise (the same join-window race the Accept path
+    /// documents), which for the author also covers the anonymous-message and view-lag cases.
+    fn penalty(self, relayer_resolved: bool, author_resolved: bool) -> RejectPenalty {
+        match self {
+            RejectReason::TooLarge if relayer_resolved => RejectPenalty::FatalRelayer,
+            RejectReason::TooLarge => RejectPenalty::Skip,
+            RejectReason::UnauthorizedAuthor if author_resolved => RejectPenalty::FatalAuthor,
+            RejectReason::UnauthorizedAuthor => RejectPenalty::Skip,
+        }
     }
 }
 
@@ -1712,7 +1813,7 @@ impl From<GossipAcceptance> for MessageAcceptance {
     fn from(value: GossipAcceptance) -> Self {
         match value {
             GossipAcceptance::Accept => MessageAcceptance::Accept,
-            GossipAcceptance::Reject => MessageAcceptance::Reject,
+            GossipAcceptance::Reject(_) => MessageAcceptance::Reject,
         }
     }
 }
@@ -1777,6 +1878,7 @@ fn resolve_response<Res: TNMessage>(
 fn accepted_gossip_event<Req, Res>(
     message: GossipMessage,
     relayer: Option<BlsPublicKey>,
+    author: Option<BlsPublicKey>,
 ) -> NetworkEvent<Req, Res> {
-    NetworkEvent::Gossip(message, relayer)
+    NetworkEvent::Gossip { message, relayer, author }
 }

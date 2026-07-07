@@ -62,6 +62,11 @@ impl BannedPeers {
     /// This method is a precaution to ensure a committee member's IP address won't become
     /// blocked during initial connection. It's possible the IP address becomes banned again,
     /// but the validator won't be disconnected because it is a trusted peer.
+    ///
+    /// This only mutates `banned_peers_by_ip`. The peer-level `total` is owned by
+    /// [`Self::remove_banned_peer`] and is deliberately left untouched here: removing an IP-map
+    /// entry unbans no peer, so decrementing `total` per entry over-counts the unban and, across
+    /// committee rotations, floors `total` at 0 and silently disables ban-set pruning (issue #809).
     pub(super) fn remove_validator_ip(
         &mut self,
         peer_id: &PeerId,
@@ -70,9 +75,8 @@ impl BannedPeers {
         debug!(target: "peer-manager", ips=?self.banned_peers_by_ip, "filtering banned ips for validators");
         for ip in ip_addresses {
             debug!(target: "peer-manager", ?ip, "removing banned ip for validator");
-            if let Some((_, _)) = self.banned_peers_by_ip.remove_entry(&ip) {
+            if self.banned_peers_by_ip.remove(&ip).is_some() {
                 warn!(target: "peer-manager", ?peer_id, "removed banned ip address associated with validator");
-                self.total = self.total.saturating_sub(1);
             }
         }
     }
