@@ -70,6 +70,7 @@ use std::{
         Arc,
     },
 };
+use tracing::warn;
 
 /// Tracks how many blocks each leader committed during an epoch for reward distribution.
 ///
@@ -334,7 +335,10 @@ impl GasAccumulator {
     /// catchup, epoch entry before replay, epoch close after final execution): a resize that
     /// races `inc_block` for a removed worker id panics there by design.
     pub fn set_num_workers(&self, num_workers: usize) {
-        // A chain always has at least worker 0.
+        // a chain always has at least worker 0.
+        if num_workers == 0 {
+            warn!(target: "epoch-manager", "attempt to set num workers to {num_workers}");
+        }
         let num_workers = num_workers.max(1);
         let mut inner = self.inner.write();
         if inner.len() == num_workers {
