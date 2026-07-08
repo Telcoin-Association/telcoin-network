@@ -3,7 +3,7 @@
 //! This network is used by workers and primaries to reliably send consensus messages.
 
 use crate::{
-    codec::{TNCodec, TNMessage},
+    codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
     kad::KadStore,
     metrics::{PeerManagerMetrics, SwarmMetrics},
@@ -57,6 +57,7 @@ mod network_tests;
 /// - `peer_manager`: Connection management and peer scoring
 /// - `gossipsub`: Flood publishing for certificates and batches
 /// - `req_res`: Point-to-point request-response messages
+/// - `peer_exchange`: Dedicated request-response protocol for the goodbye exchange
 /// - `kademlia`: Distributed hash table for peer discovery
 /// - `stream`: Stream-based bulk data transfer for state sync
 ///
@@ -76,6 +77,13 @@ where
     pub(crate) gossipsub: gossipsub::Behaviour,
     /// The request-response network behavior.
     pub(crate) req_res: request_response::Behaviour<C>,
+    /// Dedicated request-response behavior for the peer-exchange goodbye.
+    ///
+    /// Preferred over the [`PeerExchangeMap`] variants embedded in the consensus
+    /// request enums; goodbyes fall back to the embedded variant when the peer
+    /// has not upgraded yet. The embedded variants stay on the wire until the
+    /// coordinated `/0.0.2` protocol bump.
+    pub(crate) peer_exchange: request_response::Behaviour<PeerExchangeCodec>,
     /// Used for peer discovery.
     pub(crate) kademlia: kad::Behaviour<KadStore<DB>>,
     /// Stream-based sync behavior for bulk data transfer.
@@ -88,20 +96,50 @@ where
     DB: Database,
 {
     /// Create a new instance of Self.
+    ///
+    /// The request-response behaviours arrive as a `(consensus, peer_exchange)`
+    /// pair: the main consensus RPC behaviour and the dedicated goodbye behaviour.
     pub(crate) fn new(
         local_peer_id: PeerId,
         gossipsub: gossipsub::Behaviour,
-        req_res: request_response::Behaviour<C>,
+        req_res: (request_response::Behaviour<C>, request_response::Behaviour<PeerExchangeCodec>),
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         metrics: PeerManagerMetrics,
         stream_protocols: (StreamProtocol, StreamProtocol),
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
+        let (req_res, peer_exchange) = req_res;
         let (stream_legacy, stream_sync) = stream_protocols;
         let stream = StreamBehavior::new(stream_legacy, stream_sync);
-        Self { peer_manager, gossipsub, req_res, kademlia, stream }
+        Self { peer_manager, gossipsub, req_res, peer_exchange, kademlia, stream }
     }
+}
+
+/// A goodbye dispatched on the dedicated peer-exchange protocol, awaiting the ack.
+///
+/// Holds everything needed to fall back to the legacy embedded exchange if the
+/// peer turns out not to support the dedicated protocol.
+#[derive(Debug)]
+struct PendingGoodbye {
+    /// The exchange map, retained so an `UnsupportedProtocols` failure can resend
+    /// it as the embedded legacy variant.
+    exchange: PeerExchangeMap,
+    /// Notifies the disconnect-deadline task how the goodbye resolved.
+    ///
+    /// Dropping the sender wakes the task, which disconnects: the correct default
+    /// for every resolution except a legacy fallback.
+    notify: oneshot::Sender<GoodbyeOutcome>,
+}
+
+/// How a goodbye on the dedicated peer-exchange protocol resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoodbyeOutcome {
+    /// The peer acked the exchange: safe to disconnect immediately.
+    Acked,
+    /// The peer does not support the dedicated protocol; the goodbye was re-sent
+    /// on the legacy embedded path, which owns the disconnect from here.
+    FellBack,
 }
 
 /// The network type for consensus messages.
@@ -138,6 +176,14 @@ where
     /// before disconnecting. This keeps track of the number of disconnects to ensure resources
     /// aren't starved while waiting for the peer's ack.
     pending_px_disconnects: HashMap<OutboundRequestId, PeerId>,
+    /// The collection of pending goodbyes on the dedicated peer-exchange protocol.
+    ///
+    /// Tracked separately from `pending_px_disconnects`: request ids are scoped to
+    /// the behaviour that issued them, so ids from the dedicated protocol could
+    /// collide with the legacy req-res ids. Each entry retains the exchange map so
+    /// a goodbye that fails with `UnsupportedProtocols` can fall back to the
+    /// legacy variant embedded in the consensus request enum.
+    pending_goodbyes: HashMap<OutboundRequestId, PendingGoodbye>,
     /// The collection of pending outbound requests.
     ///
     /// Callers include a oneshot channel for the network to return response. The caller is
@@ -290,6 +336,17 @@ where
             vec![(network_type.req_res_protocol(chain_id)?, ProtocolSupport::Full)],
             request_response::Config::default(),
         );
+
+        // Dedicated goodbye protocol: the same hardened codec under its own wire
+        // name, so the peer-exchange map no longer has to ride inside the consensus
+        // request enums. The embedded variants remain as the fallback for
+        // not-yet-upgraded peers until the coordinated `/0.0.2` bump.
+        let px_codec = PeerExchangeCodec::new(network_config.libp2p_config().max_rpc_message_size);
+        let peer_exchange = request_response::Behaviour::with_codec(
+            px_codec,
+            vec![(network_type.peer_exchange_protocol(chain_id)?, ProtocolSupport::Full)],
+            request_response::Config::default(),
+        );
         let peer_id: PeerId = keypair.public().into();
         let mut kad_config = libp2p::kad::Config::new(network_type.kad_protocol(chain_id)?);
         // manually add peers
@@ -337,7 +394,7 @@ where
         let mut behavior = TNBehavior::new(
             peer_id,
             gossipsub,
-            req_res,
+            (req_res, peer_exchange),
             kademlia,
             network_config.peer_config(),
             PeerManagerMetrics::new_for(&network_type),
@@ -379,6 +436,7 @@ where
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let config = network_config.libp2p_config().clone();
         let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
+        let pending_goodbyes = HashMap::with_capacity(config.max_px_disconnects);
         let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey, rpc);
 
         Ok(Self {
@@ -393,6 +451,7 @@ where
             config,
             connected_peers: VecDeque::new(),
             pending_px_disconnects,
+            pending_goodbyes,
             key_config,
             task_spawner,
             node_record,
@@ -519,8 +578,7 @@ where
             }
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
-            self.metrics
-                .set_pending(self.pending_px_disconnects.len(), self.outbound_requests.len());
+            self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
         }
     }
 
@@ -534,6 +592,7 @@ where
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
+                TNBehaviorEvent::PeerExchange(event) => self.process_peer_exchange_event(event)?,
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
                 TNBehaviorEvent::Stream(event) => self.process_stream_event(event)?,
@@ -1200,6 +1259,162 @@ where
         Ok(())
     }
 
+    /// Process events from the dedicated peer-exchange goodbye protocol.
+    ///
+    /// Mirrors the legacy embedded peer-exchange handling in
+    /// [`Self::process_reqres_event`]: an inbound exchange updates the peer manager,
+    /// receives an empty ack, and triggers a reciprocal disconnect. Failures are
+    /// never penalized: a goodbye precedes a disconnect, so there is no
+    /// relationship left to protect. The one failure that changes course is
+    /// outbound `UnsupportedProtocols` (honest version skew, penalty-exempt): the
+    /// exchange is re-sent as the legacy variant embedded in the consensus request
+    /// enum so not-yet-upgraded peers still receive it.
+    fn process_peer_exchange_event(
+        &mut self,
+        event: ReqResEvent<PeerExchangeMap, PeerExchangeMap>,
+    ) -> NetworkResult<()> {
+        match event {
+            ReqResEvent::Message { peer, message, connection_id: _ } => match message {
+                request_response::Message::Request { request_id: _, request, channel } => {
+                    debug!(target: "network", ?peer, ?request, "processing peer exchange (dedicated protocol)");
+                    self.swarm.behaviour_mut().peer_manager.process_peer_exchange(request);
+                    // send empty ack and ignore errors
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .peer_exchange
+                        .send_response(channel, PeerExchangeMap::default());
+
+                    // initiate disconnect from this peer to prevent redial attempts
+                    debug!(target: "peer-manager", ?peer, "initiating reciprocal disconnect after px");
+                    self.swarm.behaviour_mut().peer_manager.disconnect_peer(peer, false);
+                }
+                request_response::Message::Response { request_id, response: _ } => {
+                    // goodbye acked: disconnect immediately (the ack payload is
+                    // reserved for a future reciprocal exchange and ignored today)
+                    if let Some(pending) = self.pending_goodbyes.remove(&request_id) {
+                        let _ = pending.notify.send(GoodbyeOutcome::Acked);
+                        let _ = self.swarm.disconnect_peer_id(peer);
+                    }
+                }
+            },
+            ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
+                debug!(target: "network", ?peer, ?error, "Outbound failure for peer exchange");
+                if let Some(pending) = self.pending_goodbyes.remove(&request_id) {
+                    match &error {
+                        // Not penalized: honest version skew, the same class the main
+                        // req-res handler exempts. The peer predates the dedicated
+                        // protocol, so re-send the exchange as the embedded legacy
+                        // variant, which owns the disconnect from here.
+                        ReqResOutboundFailure::UnsupportedProtocols => {
+                            debug!(
+                                target: "peer-manager",
+                                ?peer,
+                                "peer exchange protocol unsupported - falling back to embedded exchange"
+                            );
+                            self.send_legacy_goodbye(peer, pending.exchange);
+                            let _ = pending.notify.send(GoodbyeOutcome::FellBack);
+                        }
+                        // Any other failure means no ack is coming: dropping the
+                        // notify sender wakes the deadline task, which disconnects.
+                        // No penalty: px supports discovery and failures are okay.
+                        ReqResOutboundFailure::DialFailure
+                        | ReqResOutboundFailure::ConnectionClosed
+                        | ReqResOutboundFailure::Io(_)
+                        | ReqResOutboundFailure::Timeout => {}
+                    }
+                }
+            }
+            ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
+                // never penalized: the exchange is best-effort and both sides
+                // disconnect afterwards regardless
+                debug!(target: "network", ?peer, ?request_id, ?error, "Inbound failure for peer exchange");
+            }
+            ReqResEvent::ResponseSent { peer, .. } => {
+                trace!(target: "network", ?peer, "peer exchange ack sent");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The number of graceful goodbyes currently awaiting resolution, across the
+    /// dedicated peer-exchange protocol and the embedded legacy path.
+    ///
+    /// Both paths share the `max_px_disconnects` budget so the combined pending
+    /// count keeps the original bound.
+    fn goodbyes_in_flight(&self) -> usize {
+        self.pending_goodbyes.len() + self.pending_px_disconnects.len()
+    }
+
+    /// Send a goodbye on the dedicated peer-exchange protocol and schedule the
+    /// disconnect.
+    ///
+    /// The spawned task disconnects once the goodbye resolves or after
+    /// `px_disconnect_timeout`, whichever comes first, unless the goodbye fell
+    /// back to the embedded legacy path, which schedules its own disconnect.
+    fn send_goodbye(&mut self, peer_id: PeerId, exchange: PeerExchangeMap) {
+        let (notify, done) = oneshot::channel();
+        let request_id =
+            self.swarm.behaviour_mut().peer_exchange.send_request(&peer_id, exchange.clone());
+        self.pending_goodbyes.insert(request_id, PendingGoodbye { exchange, notify });
+
+        let timeout = self.config.px_disconnect_timeout;
+        let handle = self.network_handle();
+
+        // spawn task
+        let task_name = format!("goodbye-{peer_id}");
+        self.task_spawner.spawn_task(task_name, async move {
+            // disconnect after the goodbye resolves (ack / failure / deadline)
+            // unless the legacy fallback took over the disconnect
+            let fell_back = tokio::time::timeout(timeout, done)
+                .await
+                .ok()
+                .and_then(|resolved| resolved.ok())
+                .is_some_and(|outcome| outcome == GoodbyeOutcome::FellBack);
+            if !fell_back {
+                let _ = handle.disconnect_peer(peer_id).await;
+            }
+            Ok(())
+        });
+    }
+
+    /// Send a goodbye as the [`PeerExchangeMap`] variant embedded in the legacy
+    /// consensus request enum.
+    ///
+    /// The fallback for peers that do not support the dedicated peer-exchange
+    /// protocol yet; removal is coordinated with the `/0.0.2` protocol bump.
+    fn send_legacy_goodbye(&mut self, peer_id: PeerId, peer_exchange: PeerExchangeMap) {
+        // guard: skip PX if peer already disconnected
+        if !self.swarm.is_connected(&peer_id) {
+            debug!(target: "peer-manager", ?peer_id, "peer already disconnected, skipping PX");
+        } else if self.goodbyes_in_flight() < self.config.max_px_disconnects {
+            // attempt to exchange peer information if limits allow
+            let (reply, done) = oneshot::channel();
+            let request_id =
+                self.swarm.behaviour_mut().req_res.send_request(&peer_id, peer_exchange.into());
+            self.outbound_requests.insert((peer_id, request_id), reply);
+
+            let timeout = self.config.px_disconnect_timeout;
+            let handle = self.network_handle();
+
+            // spawn task
+            let task_name = format!("peer-exchange-{peer_id}");
+            self.task_spawner.spawn_task(task_name, async move {
+                // ignore errors and disconnect after px attempt
+                let _res = tokio::time::timeout(timeout, done).await;
+                let _ = handle.disconnect_peer(peer_id).await;
+                Ok(())
+            });
+
+            // insert to pending px disconnects
+            self.pending_px_disconnects.insert(request_id, peer_id);
+        } else {
+            // too many px disconnects pending so disconnect without px
+            let _ = self.swarm.disconnect_peer_id(peer_id);
+        }
+    }
+
     /// Specific logic to accept gossip messages.
     ///
     /// Messages are only published by current committee nodes and must be within max size.
@@ -1281,30 +1496,11 @@ where
                 // guard: skip PX if peer already disconnected
                 if !self.swarm.is_connected(&peer_id) {
                     debug!(target: "peer-manager", ?peer_id, "peer already disconnected, skipping PX");
-                } else if self.pending_px_disconnects.len() < self.config.max_px_disconnects {
-                    // attempt to exchange peer information if limits allow
-                    let (reply, done) = oneshot::channel();
-                    let request_id = self
-                        .swarm
-                        .behaviour_mut()
-                        .req_res
-                        .send_request(&peer_id, peer_exchange.into());
-                    self.outbound_requests.insert((peer_id, request_id), reply);
-
-                    let timeout = self.config.px_disconnect_timeout;
-                    let handle = self.network_handle();
-
-                    // spawn task
-                    let task_name = format!("peer-exchange-{peer_id}");
-                    self.task_spawner.spawn_task(task_name, async move {
-                        // ignore errors and disconnect after px attempt
-                        let _res = tokio::time::timeout(timeout, done).await;
-                        let _ = handle.disconnect_peer(peer_id).await;
-                        Ok(())
-                    });
-
-                    // insert to pending px disconnects
-                    self.pending_px_disconnects.insert(request_id, peer_id);
+                } else if self.goodbyes_in_flight() < self.config.max_px_disconnects {
+                    // attempt to exchange peer information if limits allow,
+                    // preferring the dedicated protocol (falls back to the
+                    // embedded legacy variant on `UnsupportedProtocols`)
+                    self.send_goodbye(peer_id, peer_exchange);
                 } else {
                     // too many px disconnects pending so disconnect without px
                     let _ = self.swarm.disconnect_peer_id(peer_id);
@@ -1829,6 +2025,7 @@ where
         f.debug_struct("ConsensusNetwork")
             .field("authorized_publishers", &self.authorized_publishers)
             .field("pending_px_disconnects", &self.pending_px_disconnects)
+            .field("pending_goodbyes", &self.pending_goodbyes)
             .field("outbound_requests", &self.outbound_requests.len())
             .field("inbound_requests", &self.inbound_requests.len())
             .field("config", &self.config)

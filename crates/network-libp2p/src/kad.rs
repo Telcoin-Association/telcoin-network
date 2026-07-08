@@ -940,6 +940,15 @@ mod test {
             "/tn-primary-sync-2017/0.0.1"
         );
         assert_eq!(NetworkType::Worker(3).sync_protocol(7)?.as_ref(), "/tn-worker-3-sync-7/0.0.1");
+        // the per-role peer-exchange goodbye protocol is chain-namespaced as well
+        assert_eq!(
+            NetworkType::Primary.peer_exchange_protocol(2017)?.as_ref(),
+            "/tn-primary-peer-exchange-2017/0.0.1"
+        );
+        assert_eq!(
+            NetworkType::Worker(3).peer_exchange_protocol(7)?.as_ref(),
+            "/tn-worker-3-peer-exchange-7/0.0.1"
+        );
         // a stream node advertises the bulk-transfer protocol first, then the
         // per-role sync protocol; both carry the chain id, and the order is the
         // negotiation-preference contract (existing opens keep using the bulk one)
