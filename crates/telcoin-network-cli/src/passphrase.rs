@@ -67,15 +67,25 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
         &self,
         preloaded: Option<String>,
     ) -> eyre::Result<Option<String>> {
+        self.resolve_bls_passphrase_with_reader(preloaded, std::io::stdin().lock())
+    }
+
+    /// Same as [`Self::resolve_bls_passphrase`], but reads stdin from an injectable
+    /// reader so tests can supply synthetic input without touching real process stdin.
+    fn resolve_bls_passphrase_with_reader<R: std::io::BufRead>(
+        &self,
+        preloaded: Option<String>,
+        mut reader: R,
+    ) -> eyre::Result<Option<String>> {
         let mut passphrase = preloaded;
         match self.bls_passphrase_source {
             PassSource::Env => {} // Already have the env var if provided.
             PassSource::Stdin => {
                 let mut buffer = String::new();
-                if let Err(err) = std::io::stdin().read_line(&mut buffer) {
+                if let Err(err) = reader.read_line(&mut buffer) {
                     bail!("Error reading BLS passphrase from stdin: {err:?}");
                 }
-                passphrase = Some(buffer.trim_end().to_string());
+                passphrase = Some(buffer.trim_end().to_string()).filter(|s| !s.is_empty());
             }
             PassSource::Ask => match self.command {
                 Commands::Keytool(_) => {
@@ -117,13 +127,13 @@ mod tests {
     }
 
     #[test]
-    fn no_passphrase_source_resolves_none() {
+    fn test_no_passphrase_source_resolves_none() {
         let cli = cli(&["tn", "node", "--bls-passphrase-source", "no-passphrase"]);
         assert_eq!(cli.resolve_bls_passphrase(Some("preload".into())).unwrap(), None);
     }
 
     #[test]
-    fn env_source_keeps_preloaded_value() {
+    fn test_env_source_keeps_preloaded_value() {
         let cli = cli(&["tn", "node"]); // default source is env
         assert_eq!(
             cli.resolve_bls_passphrase(Some("preload".into())).unwrap(),
@@ -132,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_passphrase_errors_with_exact_message() {
+    fn test_missing_required_passphrase_errors_with_exact_message() {
         let cli = cli(&["tn", "node"]);
         let err = cli.resolve_bls_passphrase(None).unwrap_err();
         assert_eq!(
@@ -142,15 +152,40 @@ mod tests {
     }
 
     #[test]
-    fn db_subcommand_is_exempt() {
-        let cli = cli(&["tn", "db", "stats"]);
+    fn test_db_subcommand_is_exempt() {
+        let cli = cli(&["tn", "node", "--bls-passphrase-source", "no-passphrase"]);
         assert_eq!(cli.resolve_bls_passphrase(None).unwrap(), None);
+    }
+
+    #[test]
+    fn test_stdin_empty_line_errors_when_passphrase_required() {
+        let cli = cli(&["tn", "node", "--bls-passphrase-source", "stdin"]);
+        let err = cli
+            .resolve_bls_passphrase_with_reader(None, std::io::Cursor::new(b"\n".as_ref()))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Error passphrase is required, see the option --bls-passphrase-source for options"
+        );
+    }
+
+    #[test]
+    fn test_stdin_reads_provided_passphrase() {
+        let cli = cli(&["tn", "node", "--bls-passphrase-source", "stdin"]);
+        assert_eq!(
+            cli.resolve_bls_passphrase_with_reader(
+                None,
+                std::io::Cursor::new(b"sekrit\n".as_ref())
+            )
+            .unwrap(),
+            Some("sekrit".into())
+        );
     }
 
     /// The ONLY test allowed to touch the environment: `cargo test` runs tests
     /// concurrently in one process, and the env is process-global.
     #[test]
-    fn env_preload_reads_and_clears_var() {
+    fn test_env_preload_reads_and_clears_var() {
         std::env::set_var(BLS_PASSPHRASE_ENVVAR, "sekrit");
         assert_eq!(get_bls_passphrase_from_env(), Some("sekrit".into()));
         assert!(std::env::var(BLS_PASSPHRASE_ENVVAR).is_err());
