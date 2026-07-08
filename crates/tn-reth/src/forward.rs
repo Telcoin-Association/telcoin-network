@@ -187,11 +187,7 @@ mod tests {
     }
 
     fn cached_urls(forwarder: &WorkerRpcForwarder) -> Vec<String> {
-        forwarder
-            .providers
-            .lock()
-            .map(|cache| cache.keys().cloned().collect())
-            .unwrap_or_default()
+        forwarder.providers.lock().map(|cache| cache.keys().cloned().collect()).unwrap_or_default()
     }
 
     #[test]
