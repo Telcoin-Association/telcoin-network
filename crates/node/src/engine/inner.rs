@@ -236,13 +236,13 @@ impl ExecutionNodeInner {
     /// This returns the hash of the last executed ConsensusHeader on the consensus chain.
     /// since the execution layer is confirming the last executing block.
     pub(super) fn last_executed_output(&self) -> eyre::Result<ConsensusHeaderDigest> {
-        // NOTE: The payload_builder only extends canonical tip and sets finalized after
-        // entire output is successfully executed. This ensures consistent recovery state.
-        //
-        // For example: consensus round 8 sends an output with 5 blocks, but only 2 blocks are
-        // executed before the node restarts. The provider never finalized the round, so the
-        // `finalized_block_number` would point to the last block of round 7. The primary
-        // would then re-send consensus output for round 8.
+        // The payload builder commits an output's blocks and the finalized marker in separate
+        // transactions; a crash between them leaves the marker lagging the persisted tip.
+        // Startup heals that lag (`RethEnv::heal_finalized_to_persisted_tip`) before anything
+        // reads the marker, so the finalized block read here is the last block of the last
+        // consensus output whose execution was fully committed — the digest recovered below
+        // names exactly the last executed output, and the primary re-requests everything after
+        // it.
         //
         // recover finalized block's nonce: this is the last subdag index from consensus (round)
         let finalized_block_num = self.reth_env.last_finalized_block_number()?;
