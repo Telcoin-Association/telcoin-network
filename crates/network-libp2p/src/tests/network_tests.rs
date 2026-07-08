@@ -7,6 +7,7 @@ use crate::common::{
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
+use futures::StreamExt as _;
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::num::NonZeroUsize;
 use tn_config::{ConsensusConfig, NetworkConfig};
@@ -228,6 +229,44 @@ async fn wait_for_peer_discovery<Req: TNMessage, Res: TNMessage>(
     }
 }
 
+/// Poll an async `condition` until it returns `true`, or fail once `timeout_duration` elapses.
+///
+/// A bounded, self-synchronizing replacement for a fixed `sleep` that only guesses
+/// at how long an asynchronous swarm event (gossip mesh grafting, subscription
+/// propagation, connection teardown plus pending-request cleanup) takes. It folds
+/// over a bounded sequence of ~10ms poll attempts, carrying the first resolved
+/// verdict forward: `Some(Ok(()))` once the condition holds, `Some(Err(_))` if a
+/// poll itself errors, and `None` while still waiting. An exhausted fold (still
+/// `None`) means the deadline passed. Mirrors the poll shape of
+/// [`wait_for_peer_discovery`] but is generic over the polled condition.
+async fn wait_until<F, Fut>(
+    timeout_duration: Duration,
+    description: &str,
+    condition: F,
+) -> eyre::Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = eyre::Result<bool>>,
+{
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    let attempts = (timeout_duration.as_millis() / POLL_INTERVAL.as_millis()).max(1);
+    let condition = &condition;
+
+    futures::stream::iter(0..attempts)
+        .fold(None, move |resolved: Option<eyre::Result<()>>, attempt| async move {
+            if resolved.is_some() {
+                resolved
+            } else {
+                if attempt > 0 {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                condition().await.map(|met| met.then_some(())).transpose()
+            }
+        })
+        .await
+        .unwrap_or_else(|| Err(eyre!("timed out waiting for condition: {description}")))
+}
+
 #[tokio::test]
 async fn test_valid_req_restt() -> eyre::Result<()> {
     // start honest peer1 network
@@ -359,8 +398,15 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
     peer2_network_task.abort();
     assert!(peer2_network_task.await.unwrap_err().is_cancelled());
 
-    // allow peer1 to process disconnect
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // wait for peer1 to observe the disconnect and drain its pending request,
+    // instead of guessing at how long the teardown plus outbound-failure delivery takes
+    let handle = &peer1;
+    wait_until(
+        Duration::from_secs(5),
+        "peer1 clears its pending request after peer2 disconnects",
+        move || async move { Ok(handle.get_pending_request_count().await? == 0) },
+    )
+    .await?;
 
     // peer1 removes pending requests
     let count = peer1.get_pending_request_count().await?;
@@ -921,8 +967,21 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
     let sealed_block = random_block.seal_slow();
     let expected_result = Vec::from(&sealed_block);
 
-    // sleep for gossip connection time lapse
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // wait until the publisher has observed a TEST_TOPIC subscriber before publishing.
+    // cvv is not subscribed itself, so `publish` fans out only to peers whose
+    // subscription has already propagated here; poll for that instead of guessing.
+    let topic_hash = TopicHash::from_raw(TEST_TOPIC);
+    let topic_ref = &topic_hash;
+    let handle = &cvv;
+    wait_until(
+        Duration::from_secs(5),
+        "publisher observes a TEST_TOPIC subscriber",
+        move || async move {
+            let peers = handle.all_peers().await?;
+            Ok(peers.values().any(|topics| topics.contains(topic_ref)))
+        },
+    )
+    .await?;
 
     // publish on wrong topic - no peers
     let expected_failure = cvv.publish("WRONG_TOPIC".into(), expected_result.clone()).await;
@@ -984,8 +1043,21 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     let sealed_block = random_block.seal_slow();
     let expected_result = Vec::from(&sealed_block);
 
-    // sleep for gossip connection time lapse
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // wait until the publisher has observed a TEST_TOPIC subscriber before publishing.
+    // cvv is not subscribed itself, so `publish` fans out only to peers whose
+    // subscription has already propagated here; poll for that instead of guessing.
+    let topic_hash = TopicHash::from_raw(TEST_TOPIC);
+    let topic_ref = &topic_hash;
+    let handle = &cvv;
+    wait_until(
+        Duration::from_secs(5),
+        "publisher observes a TEST_TOPIC subscriber",
+        move || async move {
+            let peers = handle.all_peers().await?;
+            Ok(peers.values().any(|topics| topics.contains(topic_ref)))
+        },
+    )
+    .await?;
 
     // publish correct message and wait to receive
     let _message_id = cvv.publish(TEST_TOPIC.into(), expected_result.clone()).await?;
@@ -1646,8 +1718,14 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
             .await?;
     }
 
-    // Wait for connections to stabilize
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 2)).await;
+    // Wait for every peer to connect to the target, instead of assuming a fixed
+    // number of heartbeats is enough
+    let handle = &target_peer.network_handle;
+    let expected = other_peers.len();
+    wait_until(Duration::from_secs(10), "all peers connected to target", move || async move {
+        Ok(handle.connected_peer_ids().await?.len() == expected)
+    })
+    .await?;
 
     // Verify all peers are connected to target
     let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
