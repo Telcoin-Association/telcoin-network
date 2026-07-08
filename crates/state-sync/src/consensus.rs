@@ -365,7 +365,7 @@ pub async fn spawn_fetch_consensus(
 
 /// Retrieve a consensus headers from a peer.
 /// Start at number/hash and work backwards to end number.
-async fn get_consensus_header_range<DB: TNDatabase>(
+pub(crate) async fn get_consensus_header_range<DB: TNDatabase>(
     number: u64,
     hash: ConsensusHeaderDigest,
     db: &DB,

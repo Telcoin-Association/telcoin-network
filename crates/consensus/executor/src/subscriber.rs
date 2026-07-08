@@ -190,6 +190,7 @@ impl<DB: Database> Subscriber<DB> {
             self.consensus_bus.clone(),
             tasks,
             self.inner.consensus_chain.clone(),
+            self.network_handle.clone(),
         );
         while let Some(output) = rx_sync_output.recv().await {
             let consensus_header_number = output.number();
@@ -224,6 +225,7 @@ impl<DB: Database> Subscriber<DB> {
             self.consensus_bus.clone(),
             tasks,
             self.inner.consensus_chain.clone(),
+            self.network_handle.clone(),
         );
         let mut processed_count: u64 = 0;
         while let Some(output) = rx_sync_output.recv().await {
