@@ -846,6 +846,71 @@ impl RethEnv {
         Ok(())
     }
 
+    /// Advance a lagging finalized marker to the persisted canonical tip.
+    ///
+    /// Blocks commit in [`Self::finish_executing_output`] and the finalized/safe markers commit
+    /// in [`Self::finalize_block`] — two separate database transactions. A crash between them
+    /// restarts the node with `finalized marker < persisted canonical tip`, hiding the gap
+    /// blocks from every marker reader (accumulator catchup, the tx-pool's last-seen seed, the
+    /// RPC `finalized`/`safe` tags).
+    ///
+    /// Advancing the marker is sound because every persisted canonical block is consensus-final
+    /// by construction: blocks only enter the canonical database from committed consensus
+    /// output, so there is no speculative or reorgable segment the marker could overrun. The
+    /// lag is purely a two-transaction persistence artifact.
+    ///
+    /// The heal MUST route through [`Self::finalize_block`] rather than a bare
+    /// `save_finalized_block_number` write: the in-memory finalized/safe watches are seeded
+    /// from the (stale) database at provider construction, and startup marker readers like the
+    /// accumulator catchup consult the watch — a DB-only write would leave them reading the
+    /// stale value.
+    ///
+    /// Replay is unaffected: the missed-consensus watermark derives from the persisted
+    /// execution tip (which this method never moves), not the finalized marker, so healing
+    /// cannot cause `replay_missed_consensus` to re-forward committed output — no
+    /// double-execution is possible.
+    ///
+    /// Call once at startup, before anything reads the marker and before any consensus output
+    /// executes. A marker ahead of the tip fails with
+    /// [`TnRethError::FinalizedMarkerAheadOfTip`]: the execution database lost blocks this node
+    /// already attested as final.
+    ///
+    /// Like every startup tip reader, this trusts the persisted tip itself; a torn write
+    /// between MDBX and static files below the provider is a pre-existing exposure this method
+    /// neither adds to nor guards against.
+    pub fn heal_finalized_to_persisted_tip(&self) -> TnRethResult<()> {
+        // One RO provider = one consistent MDBX snapshot for all three reads. Read errors
+        // PROPAGATE: the public last_block_number()/last_finalized_block_number() wrappers
+        // unwrap_or(0) and would misdiagnose a failed read as tip=0 here.
+        let provider = self.inner.blockchain_provider.database_provider_ro()?;
+        let tip = provider.last_block_number()?;
+        // None = never finalized (fresh genesis). Some(0) is unreachable in production (the
+        // first finalize_block call is for block >= 1), so collapsing None to 0 is safe.
+        let finalized = provider.last_finalized_block_number()?.unwrap_or(0);
+
+        if finalized > tip {
+            return Err(TnRethError::FinalizedMarkerAheadOfTip { finalized, tip });
+        }
+        if finalized == tip {
+            // Normal restart (marker caught up), or fresh genesis (marker never written and
+            // tip = 0): genesis intentionally stays unfinalized so
+            // finalized_block_hash_number_for_startup keeps its genesis fallback.
+            return Ok(());
+        }
+
+        let header =
+            provider.sealed_header(tip)?.ok_or(ProviderError::HeaderNotFound(tip.into()))?;
+        drop(provider);
+        warn!(
+            target: "tn::reth",
+            finalized,
+            tip,
+            "finalized marker lags the persisted canonical tip (crash between the \
+             blocks-commit and finalize-commit transactions); healing marker to tip"
+        );
+        self.finalize_block(header)
+    }
+
     /// This makes all blocks canonical, commits them to the database,
     /// broadcasts new chain on `canon_state_notification_sender`
     /// and set last executed header as the tracked header.
