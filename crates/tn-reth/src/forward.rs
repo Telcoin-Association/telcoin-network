@@ -12,8 +12,11 @@
 //! [`submit_txn_if_mine`]: tn_types::BatchValidation::submit_txn_if_mine
 
 use crate::recover_raw_transaction;
-use alloy::providers::{Provider as _, ProviderBuilder};
-use std::collections::{BTreeMap, BTreeSet};
+use alloy::providers::{Provider as _, RootProvider};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+};
 use tn_types::{BlsPublicKey, RpcInfo, TaskSpawner, TxnForwarder};
 use tracing::{debug, warn};
 
@@ -22,6 +25,11 @@ use tracing::{debug, warn};
 pub struct WorkerRpcForwarder {
     /// Spawner used to run the (best-effort, non-blocking) forward on a background task.
     task_spawner: TaskSpawner,
+    /// HTTP providers cached per advertised endpoint so consecutive batch seals reuse the
+    /// underlying connection pool instead of paying a fresh TCP+TLS handshake per validator
+    /// per seal. Entries for endpoints that are no longer advertised are evicted on each
+    /// forward, so the cache stays bounded by the current committee's advertisement set.
+    providers: Arc<Mutex<BTreeMap<String, RootProvider>>>,
 }
 
 impl std::fmt::Debug for WorkerRpcForwarder {
@@ -33,7 +41,48 @@ impl std::fmt::Debug for WorkerRpcForwarder {
 impl WorkerRpcForwarder {
     /// Create a new forwarder that runs forwards on `task_spawner`.
     pub fn new(task_spawner: TaskSpawner) -> Self {
-        Self { task_spawner }
+        Self { task_spawner, providers: Arc::new(Mutex::new(BTreeMap::new())) }
+    }
+
+    /// Resolve the advertised endpoints to providers, reusing cached ones where the endpoint
+    /// is unchanged. A malformed URL is dropped here so the per-transaction loop only sees
+    /// usable endpoints. The endpoint string is reparsed into the exact URL type the provider
+    /// expects. `RootProvider` needs no fillers: the transactions are already signed raw
+    /// bytes, and `send_raw_transaction` submits them as-is.
+    fn cached_providers(
+        &self,
+        validator_rpcs: &[(BlsPublicKey, RpcInfo)],
+    ) -> BTreeMap<BlsPublicKey, RootProvider> {
+        let mut cache = self.providers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let advertised: BTreeSet<String> =
+            validator_rpcs.iter().map(|(_, rpc)| rpc.http.to_string()).collect();
+        cache.retain(|url, _| advertised.contains(url));
+        validator_rpcs
+            .iter()
+            .filter_map(|(key, rpc)| {
+                let url = rpc.http.to_string();
+                cache
+                    .get(&url)
+                    .cloned()
+                    .or_else(|| match url.parse() {
+                        Ok(parsed) => {
+                            let provider = RootProvider::new_http(parsed);
+                            cache.insert(url, provider.clone());
+                            Some(provider)
+                        }
+                        Err(err) => {
+                            debug!(
+                                target: "worker::forward",
+                                endpoint = %rpc.http,
+                                %err,
+                                "skipping validator with an unparseable RPC endpoint"
+                            );
+                            None
+                        }
+                    })
+                    .map(|provider| (*key, provider))
+            })
+            .collect()
     }
 }
 
@@ -49,37 +98,19 @@ impl TxnForwarder for WorkerRpcForwarder {
             return;
         }
 
-        self.task_spawner.spawn_task("forward-txns", async move {
-            // Build one HTTP provider per advertised validator, keyed by BLS key. A malformed
-            // URL is dropped here so the per-transaction loop only sees usable endpoints. The
-            // endpoint string is reparsed into the exact URL type the provider expects.
-            let mut providers = BTreeMap::new();
-            for (key, rpc) in &validator_rpcs {
-                match rpc.http.as_str().parse() {
-                    Ok(url) => {
-                        providers.insert(*key, ProviderBuilder::new().connect_http(url));
-                    }
-                    Err(err) => {
-                        debug!(
-                            target: "worker::forward",
-                            endpoint = %rpc.http,
-                            %err,
-                            "skipping validator with an unparseable RPC endpoint"
-                        );
-                    }
-                }
-            }
-            if providers.is_empty() {
-                warn!(
-                    target: "worker::forward",
-                    "no usable validator RPC endpoints; dropping forwarded transactions"
-                );
-                return Ok(());
-            }
-            // Fallback order: every usable endpoint, so a transaction whose owning validator has
-            // not advertised (or is unreachable) can still reach the committee.
-            let fallbacks: Vec<BlsPublicKey> = providers.keys().cloned().collect();
+        let providers = self.cached_providers(&validator_rpcs);
+        if providers.is_empty() {
+            warn!(
+                target: "worker::forward",
+                "no usable validator RPC endpoints; dropping forwarded transactions"
+            );
+            return;
+        }
+        // Fallback order: every usable endpoint, so a transaction whose owning validator has
+        // not advertised (or is unreachable) can still reach the committee.
+        let fallbacks: Vec<BlsPublicKey> = providers.keys().cloned().collect();
 
+        self.task_spawner.spawn_task("forward-txns", async move {
             for tx in &transactions {
                 // Route by sender so all transactions from one account land on the same
                 // validator (matches `submit_txn_if_mine`), then fall back to any endpoint.
@@ -135,4 +166,63 @@ fn owning_validator(
     bytes.copy_from_slice(&sender.as_slice()[0..8]);
     let slot = (u64::from_le_bytes(bytes) % committee_size) as usize;
     committee_slots.get(slot).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+    use tn_types::{BlsKeypair, TaskManager};
+
+    fn test_forwarder() -> WorkerRpcForwarder {
+        WorkerRpcForwarder::new(TaskManager::default().get_spawner())
+    }
+
+    fn test_key(seed: u8) -> BlsPublicKey {
+        *BlsKeypair::generate(&mut StdRng::from_seed([seed; 32])).public()
+    }
+
+    fn test_rpc(url: &str) -> eyre::Result<RpcInfo> {
+        Ok(RpcInfo { http: url.parse()?, ws: None })
+    }
+
+    fn cached_urls(forwarder: &WorkerRpcForwarder) -> Vec<String> {
+        forwarder
+            .providers
+            .lock()
+            .map(|cache| cache.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn cached_providers_resolves_every_advertised_endpoint() -> eyre::Result<()> {
+        let forwarder = test_forwarder();
+        let rpcs = vec![
+            (test_key(1), test_rpc("http://127.0.0.1:8545")?),
+            (test_key(2), test_rpc("http://127.0.0.1:8546")?),
+        ];
+
+        let resolved = forwarder.cached_providers(&rpcs);
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(cached_urls(&forwarder).len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_providers_reuses_cache_and_evicts_stale_endpoints() -> eyre::Result<()> {
+        let forwarder = test_forwarder();
+        let live = (test_key(1), test_rpc("http://127.0.0.1:8545")?);
+        let stale = (test_key(2), test_rpc("http://127.0.0.1:8546")?);
+        let first = forwarder.cached_providers(&[live.clone(), stale]);
+        assert_eq!(first.len(), 2);
+
+        // A repeat advertisement resolves from the cache without growing it; the endpoint
+        // that is no longer advertised is evicted.
+        let second = forwarder.cached_providers(&[live]);
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(cached_urls(&forwarder), vec!["http://127.0.0.1:8545/".to_string()]);
+        Ok(())
+    }
 }
