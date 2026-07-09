@@ -204,6 +204,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::UnknownNetworkKey(_)
         | HeaderError::PeerNotAuthor
         | HeaderError::InvalidGenesisParent(_)
+        | HeaderError::InvalidRound(_)
         | HeaderError::ParentMissingSignature
         | HeaderError::InvalidParentTimestamp { .. }
         | HeaderError::UnkownWorkerId
