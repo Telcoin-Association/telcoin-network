@@ -238,6 +238,27 @@ enum EpochPackAttempt {
     Failed(NetworkError),
 }
 
+/// One epoch-pack fetch over the typed sync protocol, as threaded unchanged
+/// through every per-peer probe (`request_epoch_pack_sync` down to the stream
+/// exchange). Bundles what the exchange needs so each probe hop takes the peer
+/// plus this instead of six loose parameters.
+#[derive(Clone, Copy)]
+struct EpochPackSyncRequest<'a> {
+    /// The epoch whose pack is requested.
+    epoch: Epoch,
+    /// `None` requests the full pack; `Some(n)` requests a verifiable prefix
+    /// stopping after consensus number `n`.
+    last_consensus_number: Option<u64>,
+    /// Record of the epoch being fetched; the streamed pack verifies against it.
+    epoch_record: &'a EpochRecord,
+    /// The preceding epoch's record, anchoring verification.
+    previous_epoch: &'a EpochRecord,
+    /// Destination chain the served pack imports into.
+    consensus_chain: &'a ConsensusChain,
+    /// Timeout applied when importing the streamed records.
+    record_timeout: Duration,
+}
+
 /// RAII guard for an admitted inbound sync epoch-pack stream.
 ///
 /// Holds a global concurrency permit and counts toward the peer's per-peer
@@ -772,14 +793,14 @@ impl PrimaryNetworkHandle {
         // peers to upgrade.
         let Some(last_consensus_number) = last_consensus_number else {
             return self
-                .request_epoch_pack_sync(
+                .request_epoch_pack_sync(EpochPackSyncRequest {
                     epoch,
-                    None,
+                    last_consensus_number: None,
                     epoch_record,
                     previous_epoch,
                     consensus_chain,
                     record_timeout,
-                )
+                })
                 .await;
         };
 
@@ -788,14 +809,14 @@ impl PrimaryNetworkHandle {
         // below for peers that do not yet serve the `EpochPackPartial` sync variant.
         // The sync probe is penalty-exempt; `is_ok` avoids matching the `Result`.
         if self
-            .request_epoch_pack_sync(
+            .request_epoch_pack_sync(EpochPackSyncRequest {
                 epoch,
-                Some(last_consensus_number),
+                last_consensus_number: Some(last_consensus_number),
                 epoch_record,
                 previous_epoch,
                 consensus_chain,
                 record_timeout,
-            )
+            })
             .await
             .is_ok()
         {
@@ -913,15 +934,8 @@ impl PrimaryNetworkHandle {
     /// that imports; otherwise `Err` (full-pack fetch has no legacy fallback, so the
     /// caller retries). A peer that does not answer is cached unsyncable (skipping
     /// its probe next time); the probe is penalty-exempt either way.
-    async fn request_epoch_pack_sync(
-        &self,
-        epoch: Epoch,
-        last_consensus_number: Option<u64>,
-        epoch_record: &EpochRecord,
-        previous_epoch: &EpochRecord,
-        consensus_chain: &ConsensusChain,
-        record_timeout: Duration,
-    ) -> NetworkResult<()> {
+    async fn request_epoch_pack_sync(&self, sync: EpochPackSyncRequest<'_>) -> NetworkResult<()> {
+        let EpochPackSyncRequest { epoch, last_consensus_number, .. } = sync;
         let peers = self.handle.connected_peers().await?;
 
         // Probe candidate peers one at a time (the async analog of a short-circuiting
@@ -936,18 +950,7 @@ impl PrimaryNetworkHandle {
             })
             .take(MAX_EPOCH_SYNC_PROBES)
             .then(move |peer| async move {
-                match self
-                    .sync_epoch_pack_from_peer(
-                        peer,
-                        epoch,
-                        last_consensus_number,
-                        epoch_record,
-                        previous_epoch,
-                        consensus_chain,
-                        record_timeout,
-                    )
-                    .await
-                {
+                match self.sync_epoch_pack_from_peer(peer, sync).await {
                     EpochPackAttempt::Imported => {
                         self.sync_capability.lock().insert(peer, true);
                         info!(
@@ -1007,24 +1010,11 @@ impl PrimaryNetworkHandle {
     async fn sync_epoch_pack_from_peer(
         &self,
         peer: BlsPublicKey,
-        epoch: Epoch,
-        last_consensus_number: Option<u64>,
-        epoch_record: &EpochRecord,
-        previous_epoch: &EpochRecord,
-        consensus_chain: &ConsensusChain,
-        record_timeout: Duration,
+        sync: EpochPackSyncRequest<'_>,
     ) -> EpochPackAttempt {
-        self.try_sync_epoch_pack_exchange(
-            peer,
-            epoch,
-            last_consensus_number,
-            epoch_record,
-            previous_epoch,
-            consensus_chain,
-            record_timeout,
-        )
-        .await
-        .map_or_else(|attempt| attempt, |()| EpochPackAttempt::Imported)
+        self.try_sync_epoch_pack_exchange(peer, sync)
+            .await
+            .map_or_else(|attempt| attempt, |()| EpochPackAttempt::Imported)
     }
 
     /// Open a `/tn-primary-sync` stream, write the epoch-pack request in the opening
@@ -1045,13 +1035,16 @@ impl PrimaryNetworkHandle {
     async fn try_sync_epoch_pack_exchange(
         &self,
         peer: BlsPublicKey,
-        epoch: Epoch,
-        last_consensus_number: Option<u64>,
-        epoch_record: &EpochRecord,
-        previous_epoch: &EpochRecord,
-        consensus_chain: &ConsensusChain,
-        record_timeout: Duration,
+        sync: EpochPackSyncRequest<'_>,
     ) -> Result<(), EpochPackAttempt> {
+        let EpochPackSyncRequest {
+            epoch,
+            last_consensus_number,
+            epoch_record,
+            previous_epoch,
+            consensus_chain,
+            record_timeout,
+        } = sync;
         // open the sync stream, flattening the command-channel and stream-open
         // results. Only a genuine negotiation failure (`UpgradeFailed`) is a
         // pre-cutover peer that does not advertise the protocol -> Unsupported
