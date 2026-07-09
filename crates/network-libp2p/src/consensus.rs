@@ -19,8 +19,8 @@ use crate::{
 use futures::StreamExt as _;
 use libp2p::{
     gossipsub::{
-        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance, Topic,
-        TopicHash,
+        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
+        PublishError, Topic, TopicHash,
     },
     kad::{self, store::RecordStore, Mode, QueryId},
     request_response::{
@@ -36,7 +36,7 @@ use std::{
     io::ErrorKind,
     time::Duration,
 };
-use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
+use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, MAX_GOSSIP_MESSAGE_SIZE};
 use tn_types::{
     encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
     TnSender, WorkerId,
@@ -720,8 +720,18 @@ where
                 send_or_log_error!(reply, peer_id, "LocalPeerId");
             }
             NetworkCommand::Publish { topic, msg, reply } => {
-                let res =
-                    self.swarm.behaviour_mut().gossipsub.publish(TopicHash::from_raw(topic), msg);
+                // Enforce `MAX_GOSSIP_MESSAGE_SIZE` at origination, symmetrically with the
+                // receive-side check in `verify_gossip`. Honest peers reject an oversized payload
+                // as `RejectReason::TooLarge` and Fatal-attribute it to the
+                // relaying peer; on the first hop that relayer is the originator,
+                // so a node that published an oversized message would be banned by
+                // its own neighbours. Refuse locally with a clear error instead, so
+                // origination and forwarding apply the identical bound.
+                let res = if msg.len() > MAX_GOSSIP_MESSAGE_SIZE {
+                    Err(PublishError::MessageTooLarge)
+                } else {
+                    self.swarm.behaviour_mut().gossipsub.publish(TopicHash::from_raw(topic), msg)
+                };
                 if res.is_ok() {
                     self.metrics.record_gossip_published();
                 }
@@ -1419,8 +1429,10 @@ where
     ///
     /// Messages are only published by current committee nodes and must be within max size.
     fn verify_gossip(&self, gossip: &GossipMessage) -> GossipAcceptance {
-        // verify message size
-        if gossip.data.len() > self.config.max_gossip_message_size {
+        // verify message size against the network-wide protocol constant (not per-node config):
+        // the reject path attributes an oversized payload to the relaying peer, which is sound only
+        // if every honest node applies the identical bound. See `MAX_GOSSIP_MESSAGE_SIZE`.
+        if gossip.data.len() > MAX_GOSSIP_MESSAGE_SIZE {
             return GossipAcceptance::Reject(RejectReason::TooLarge);
         }
 
@@ -1956,10 +1968,12 @@ enum GossipAcceptance {
 /// of the reason; the distinction only governs peer scoring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RejectReason {
-    /// The payload exceeds `max_gossip_message_size`. The bound is a shared constant, so under
-    /// gossipsub `Strict` validation an honest peer computes the same verdict and never forwards
-    /// the message: a peer that forwards an oversized payload is itself misbehaving, so the
-    /// relaying peer is accountable.
+    /// The payload exceeds [`MAX_GOSSIP_MESSAGE_SIZE`]. That bound is a compile-time protocol
+    /// constant, identical on every honest node, and enforced on both the publish path (the size
+    /// guard in the `NetworkCommand::Publish` handler) and the receive path here. An honest node
+    /// therefore never originates an oversized payload, and under gossipsub `Strict` validation
+    /// never forwards one either: a peer that delivers an oversized payload is itself misbehaving,
+    /// so the relaying peer is accountable.
     TooLarge,
     /// The message author is absent, has no resolved BLS identity, or is not an authorized
     /// publisher for the topic. The fault is the author's, not the forwarder's: an honest relayer
@@ -1986,9 +2000,11 @@ impl RejectReason {
     /// Decide the peer-scoring outcome for this reject, given whether the relaying peer's and the
     /// message author's BLS identities have resolved.
     ///
-    /// An oversized payload is charged to the relaying peer: the size bound is a shared constant,
-    /// so under gossipsub `Strict` validation an honest peer computes the same verdict and never
-    /// forwards one, making a forwarded oversized payload relayer misbehavior. An unauthorized
+    /// An oversized payload is charged to the relaying peer: the size bound is a compile-time
+    /// protocol constant ([`MAX_GOSSIP_MESSAGE_SIZE`]), identical on every honest node and enforced
+    /// on both the publish and receive paths, so an honest peer never originates one and (under
+    /// gossipsub `Strict` validation) never forwards one, making a delivered oversized payload
+    /// relayer misbehavior. An unauthorized
     /// author is charged to the *author*, never the forwarder — an honest relayer merely forwarded
     /// content the author is responsible for (the reject-path analogue of #801/#785), and an honest
     /// author authorized under a neighbouring committee view is spared downstream by the committee
