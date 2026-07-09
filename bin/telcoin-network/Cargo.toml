@@ -11,8 +11,6 @@ description.workspace = true
 exclude.workspace = true
 
 [dependencies]
-rpassword = { workspace = true }
-clap = { workspace = true }
 telcoin-network-cli = { workspace = true }
 tn-node = { workspace = true }
 

@@ -57,6 +57,11 @@ type AuthEquivocationMap = HashMap<
     TokioMutex<Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>>,
 >;
 
+/// A pending consensus-result signature tally: a monotonic recency sequence (bumped every time a
+/// new distinct signer is added, used for LRU eviction) paired with the set of committee members
+/// that have signed this result. See the `consensus_certs` field and GHSA-2r5c-c4h7-gp5h.
+type ConsensusCertTally = (u64, HashSet<BlsPublicKey>);
+
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
 pub(crate) struct RequestHandler<DB> {
@@ -77,7 +82,7 @@ pub(crate) struct RequestHandler<DB> {
     /// Used to stop validator equivocation early.
     auth_last_vote: Arc<AuthEquivocationMap>,
     /// Track consensus headers until we hit a simple quorum then send on.
-    consensus_certs: Arc<Mutex<HashMap<ConsensusResultDigest, HashSet<BlsPublicKey>>>>,
+    consensus_certs: Arc<Mutex<HashMap<ConsensusResultDigest, ConsensusCertTally>>>,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
 }
@@ -305,7 +310,10 @@ where
                         // skip it.  So this seems like the place.  And of course
                         // close any windows to double counting a signature.
                         let guard = self.consensus_certs.lock();
-                        if guard.get(&consensus_result_hash).and_then(|set| set.get(&key)).is_some()
+                        if guard
+                            .get(&consensus_result_hash)
+                            .and_then(|(_, signers)| signers.get(&key))
+                            .is_some()
                         {
                             // We have already counted this signature so ignore.
                             return Ok(());
@@ -322,17 +330,35 @@ where
                         // valid.
                         enough_sigs = (committee.len() / 3) + 1;
                         let mut guard = self.consensus_certs.lock();
-                        if guard.len() > 20 {
-                            // Small sanity check to make it more difficult for a malicious
-                            // committee member to fill up
-                            // consensus_certs.  Attempt to evict any records that don't appear
-                            // relavent when more that 20 entries
-                            // (should not have this many under normal conditions).
-                            // We would expect a malicious validator to flood a lot of singleton
-                            // results.
-                            guard.retain(|k, s| *k == consensus_result_hash || s.len() > 1);
+                        // Hard-cap the tally map so a flood of validly-signed but non-quorum
+                        // results cannot grow it without bound. `consensus_certs` is cleared
+                        // wholesale on every quorum (below), so under honest operation only a few
+                        // entries are ever live (typically one, for the next consensus number).
+                        //
+                        // Eviction is by least-recently-updated (LRU), NOT by signer count. A real
+                        // consensus result is signed once by each honest validator in a burst as
+                        // the network commits it, so its tally is bumped to most-recently-used on
+                        // every distinct signer and is never the eviction victim while it climbs to
+                        // quorum. Evicting by fewest-signers instead would be steerable: colluding
+                        // members can co-sign fakes that carry more signers than an honest tally
+                        // still gathering its first signatures, and so evict genuine progress.
+                        // Honest validators gossip each result only once, so an evicted honest
+                        // signature is lost for good; LRU keeps the actively-updated honest tally
+                        // and evicts the stale, frozen fakes instead. See GHSA-2r5c-c4h7-gp5h.
+                        let next_seq = guard.values().map(|(seq, _)| *seq).max().unwrap_or(0) + 1;
+                        if guard.len() >= super::MAX_CONSENSUS_CERTS
+                            && !guard.contains_key(&consensus_result_hash)
+                        {
+                            let evict = guard
+                                .iter()
+                                .min_by_key(|(_, (seq, _))| *seq)
+                                .map(|(digest, _)| *digest);
+                            if let Some(evict) = evict {
+                                guard.remove(&evict);
+                            }
                         }
-                        let set = guard.entry(consensus_result_hash).or_default();
+                        let (seq, set) = guard.entry(consensus_result_hash).or_default();
+                        *seq = next_seq;
                         set.insert(key);
                         sigs = set.len();
                     }
