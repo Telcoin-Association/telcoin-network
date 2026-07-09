@@ -69,6 +69,18 @@ pub const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// so this bounds the true concurrent count—not just the pending map size.
 pub const MAX_CONCURRENT_EPOCH_STREAMS: usize = 5;
 
+/// Hard cap on the number of distinct pending consensus results tracked in the
+/// handler's `consensus_certs` signature-tally map at any time.
+///
+/// `consensus_certs` is a transient tally that is wiped wholesale the moment any
+/// consensus result reaches quorum, so under honest operation only a handful of
+/// entries (typically one, for the next consensus number) are ever live at once.
+/// Capping the map bounds its memory against a gossip flood of validly-signed but
+/// non-quorum `ConsensusResult`s from Byzantine committee members: no matter how
+/// many members collude, they cannot grow the map past this cap. See the
+/// `PrimaryGossip::Consensus` handler and GHSA-2r5c-c4h7-gp5h.
+pub(crate) const MAX_CONSENSUS_CERTS: usize = 20;
+
 /// Maximum number of concurrent pending batch requests from a single peer.
 ///
 /// Prevents a single malicious peer from filling all global slots.
