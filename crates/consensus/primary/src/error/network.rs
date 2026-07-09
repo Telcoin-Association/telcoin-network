@@ -71,36 +71,60 @@ pub(crate) enum PrimaryNetworkError {
 }
 
 impl PrimaryNetworkError {
-    /// Whether this fault is determined purely by the *content* of a gossip message — its BCS
-    /// encoding or its declared topic — and is therefore attributable to the message author
-    /// (`GossipMessage::source`) rather than the peer that relayed it.
+    /// Whether this gossip fault is determined by the *content* of the message and is therefore
+    /// charged to its authenticated publisher (the gossip source `GossipMessage::source`, resolved
+    /// to `author`), rather than to the peer that relayed it.
     ///
-    /// Mirrors `WorkerNetworkError::is_author_content_fault` (tn-worker) and is consulted only on
-    /// the gossip path (`PrimaryNetwork::process_gossip`): the network layer accepted and forwarded
-    /// the message after a shallow check, so an honest relayer could not have screened a
-    /// content-determined fault, and charging the relayer for it lets a Byzantine author ban honest
-    /// forwarders (see issues #801/#819). The request/response paths penalize the peer
-    /// unconditionally because there the peer *is* the originator.
+    /// Consulted only on the gossip path (`PrimaryNetwork::process_gossip`), whose deep validation
+    /// of a signed payload runs *after* gossipsub has already accepted and forwarded the message.
+    /// An honest relayer therefore cannot screen a content-determined fault before relaying it, and
+    /// charging the relayer for one lets a Byzantine author ban honest forwarders (#801/#785/#819).
+    /// The request/response paths never consult this classifier: there the peer *is* the originator
+    /// and is penalized unconditionally.
     ///
-    /// Restricted to the two `Fatal` faults authored by the gossip source and reachable from the
-    /// gossip handler: [`Self::Decode`] (`try_decode` of the payload) and [`Self::InvalidTopic`]
-    /// (the payload variant was published to the wrong topic). Every other variant is either
-    /// benign on the gossip path or concerns embedded certificate/consensus content whose signer
-    /// is carried inside the payload and is not necessarily the gossip source, so its existing
-    /// relayer/no-penalty attribution is left unchanged.
+    /// The publisher is the accountable party (not the relayer, and not a signer embedded in the
+    /// payload) for two reasons:
+    ///
+    /// 1. The source is authenticated. Gossipsub runs with `MessageAuthenticity::Signed` and
+    ///    `ValidationMode::Strict` (`crates/network-libp2p/src/consensus.rs`), so an accepted
+    ///    message carries a source signed by that peer's key; an attacker cannot publish under a
+    ///    victim's identity. Honest nodes only gossip content they produced and (for consensus
+    ///    results / epoch votes) self-signed (`publish_certificate` / `publish_consensus` /
+    ///    `publish_epoch_vote`), so a content-determined fault is the publisher's own.
+    ///
+    /// 2. Charging the *embedded* signer would be unsafe. A certificate is a multi-party aggregate,
+    ///    and the vote / consensus-result faults here are exactly signature-verification failures,
+    ///    so the key named in the payload is unauthenticated at the point of fault. An attacker
+    ///    could gossip a `ConsensusResult { validator: <victim>, .. }`, or an `EpochVote` naming
+    ///    any committee key, with a bad signature and have the innocent victim penalized: a framing
+    ///    vector the authenticated publisher carries no risk of.
+    ///
+    /// Parallels `WorkerNetworkError::is_author_content_fault` (tn-worker) at the mechanism level,
+    /// though the primary additionally covers the deep embedded-signature faults its signed
+    /// payloads carry, which the worker has no equivalent for.
+    ///
+    /// True for the envelope faults [`Self::Decode`] / [`Self::InvalidTopic`] and for the embedded
+    /// signed-payload content faults reachable from the gossip handler: [`Self::Certificate`] (a
+    /// malformed / unsigned / inquorate / bad-signature certificate), [`Self::InvalidHeader`] (an
+    /// `EpochVote` failing its signature or committee-membership check), and
+    /// [`Self::UnknownConsensusHeaderCert`] (a `ConsensusResult` with a bad signature). The
+    /// remaining arms are transport/local/benign and keep their relayer / no-penalty attribution;
+    /// [`Self::PeerNotInCommittee`] is content-determined but already maps to no penalty, so the
+    /// relayer was never charged for it.
     pub(crate) fn is_author_content_fault(&self) -> bool {
         //
         // explicitly match every variant so the classification is revisited with changes
         //
         match self {
-            PrimaryNetworkError::Decode(_) | PrimaryNetworkError::InvalidTopic => true,
-            PrimaryNetworkError::InvalidHeader(_)
+            PrimaryNetworkError::Decode(_)
+            | PrimaryNetworkError::InvalidTopic
+            | PrimaryNetworkError::InvalidHeader(_)
             | PrimaryNetworkError::Certificate(_)
-            | PrimaryNetworkError::StdIo(_)
+            | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => true,
+            PrimaryNetworkError::StdIo(_)
             | PrimaryNetworkError::Storage(_)
             | PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::Internal(_)
-            | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
             | PrimaryNetworkError::UnknownConsensusOutput(_)
             | PrimaryNetworkError::PeerNotInCommittee(_)
             | PrimaryNetworkError::UnavailableEpoch(_)
@@ -238,14 +262,44 @@ mod tests {
         assert!(PrimaryNetworkError::InvalidTopic.is_author_content_fault());
     }
 
-    /// Every other fault keeps its relayer / no-penalty attribution: transport and local faults
-    /// are not the author's, and embedded certificate/consensus content is signed by a party
-    /// carried inside the payload, not by the gossip source.
+    /// Transport and local faults keep their relayer / no-penalty attribution: they are not
+    /// determined by the gossip payload's content, so the authenticated publisher is not the
+    /// accountable party. (The embedded signed-payload content faults, by contrast, *are*
+    /// author-charged: see `embedded_signed_payload_faults_are_author_content`.)
     #[test]
-    fn non_envelope_faults_are_not_author_content() {
+    fn non_content_faults_are_not_author_charged() {
         assert!(!PrimaryNetworkError::InvalidEpochRequest.is_author_content_fault());
         assert!(!PrimaryNetworkError::UnknownConsensusOutput(0).is_author_content_fault());
         assert!(!PrimaryNetworkError::InvalidRequest("bad".to_string()).is_author_content_fault());
         assert!(!PrimaryNetworkError::Internal("boom".to_string()).is_author_content_fault());
+    }
+
+    /// Finding #871: the primary's signed gossip payloads carry content faults that deep validation
+    /// only surfaces after gossipsub has forwarded the message. Each is charged to the
+    /// authenticated author, not the honest relayer: a malformed certificate (`Certificate`),
+    /// an `EpochVote` that fails its signature (`PeerNotAuthor`) or committee-membership
+    /// (`UnknownAuthority`) check, and a `ConsensusResult` with a bad signature
+    /// (`UnknownConsensusHeaderCert`).
+    #[test]
+    fn embedded_signed_payload_faults_are_author_content() {
+        // gossiped Certificate faults (validate_received / process_peer_certificate)
+        assert!(PrimaryNetworkError::Certificate(CertManagerError::Certificate(
+            CertificateError::Unsigned
+        ))
+        .is_author_content_fault());
+        assert!(PrimaryNetworkError::Certificate(CertManagerError::Certificate(
+            CertificateError::InvalidSignature
+        ))
+        .is_author_content_fault());
+        // gossiped EpochVote: bad signature -> PeerNotAuthor; non-committee key -> UnknownAuthority
+        assert!(PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+            .is_author_content_fault());
+        assert!(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(
+            "key not in committee".to_string()
+        ))
+        .is_author_content_fault());
+        // gossiped ConsensusResult with a bad signature
+        assert!(PrimaryNetworkError::UnknownConsensusHeaderCert(ConsensusHeaderDigest::default())
+            .is_author_content_fault());
     }
 }
