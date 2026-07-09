@@ -8,21 +8,23 @@
 //! ## Worker count
 //!
 //! The number of worker slots is not fixed at construction. The on-chain `WorkerConfigs`
-//! contract is the absolute source of truth: `sync_num_workers_from_chain` (in `node::manager`)
-//! reads the count for the entered epoch at the epoch's first block's parent and resizes the
-//! accumulator in place via [`GasAccumulator::set_num_workers`] - at startup (before catchup)
-//! and at every epoch entry - and `adjust_base_fees` resizes at epoch close to the count read
-//! from the closing block (the next epoch's count).
+//! contract is the absolute source of truth, and the count for an epoch is the contract's state
+//! at the previous epoch's closing block: `catchup_accumulator` (in `node::manager`) sizes the
+//! accumulator from that state at startup, the epoch entry seeding re-seeds it on every entry
+//! (`DerivedBaseFees::apply`, or `sync_num_workers_from_chain` for epoch 0), and
+//! `adjust_base_fees` resizes at epoch close to the count read from the closing block (the next
+//! epoch's count). All resizes go through [`GasAccumulator::set_num_workers`].
 //!
 //! ## Startup recovery
 //!
 //! Because the accumulator is purely in-memory, its state must be rebuilt whenever a node restarts
 //! mid-epoch. Three codepaths cooperate to restore it:
 //!
-//! 1. **`catchup_accumulator`** (in `node::manager`) — runs once at startup. It walks the
-//!    already-executed reth blocks for the current epoch to re-accumulate gas stats per worker,
-//!    restores the base fee from the finalized header, and iterates the consensus DB in reverse to
-//!    restore leader counts for rounds that were already executed.
+//! 1. **`catchup_accumulator`** (in `node::manager`) — runs once at startup. It syncs the worker
+//!    count from pinned closing-block chain state, walks the already-executed reth blocks for the
+//!    current epoch to re-accumulate gas stats per worker, and iterates the consensus DB in reverse
+//!    to restore leader counts for rounds that were already executed. Base fees are not restored
+//!    here — the epoch entry seeding owns them.
 //!
 //! 2. **`EpochManager::replay_missed_consensus`** — replays any consensus output that was committed
 //!    to the consensus DB but not yet executed before the previous shutdown. These blocks flow
@@ -35,12 +37,18 @@
 //!
 //! ## Base fee on sync and restart (the base-fee-from-chain invariant)
 //!
-//! Base fee is consensus-affecting, so a node that is merely catching up must never recompute it
-//! and risk diverging from the value already baked into the chain. At epoch entry, if the
-//! canonical tip is already in the epoch being entered, each worker's [`BaseFeeContainer`] is
-//! seeded from its most recent on-chain block (`latest_base_fee_per_worker`); otherwise the
-//! container keeps the value the live producer just computed at the boundary. Only the live
-//! producer crossing the boundary computes the next fee forward; everyone else reads the chain.
+//! Base fee is consensus-affecting, so a node must never produce with a fee it cannot verify
+//! against the chain. The entered epoch's worker count and per-worker fees are therefore owned
+//! by the epoch entry seeding (`run_epoch` in `node::manager`), which derives them on EVERY
+//! entry — live boundary crossing, restart, mid-epoch re-entry, or sync — as a pure function of
+//! the previous epoch's on-chain state (`derive_base_fees_for_entered_epoch`): the previous
+//! epoch's closing block is resolved from the entered epoch's registry-recorded first block,
+//! worker strategies and count are read at it, and workers with no block to read a fee from walk
+//! back through earlier closing blocks (`derive_idle_worker_fee`). Epoch 0 has no prior epoch,
+//! so every [`BaseFeeContainer`] keeps the MIN default. A node that cannot read or verify that
+//! state halts rather than produce with an unverifiable fee. The live producer's close-time
+//! computation (`adjust_base_fees`) folds the same formula over the same inputs, so the value it
+//! carries between close and the next entry is identical to what entry derivation recomputes.
 
 use crate::{AuthorityIdentifier, Committee, WorkerId};
 
@@ -284,7 +292,15 @@ impl GasAccumulator {
             return;
         }
         let inner = self.inner.read();
-        let mut guard = inner.get(worker_id as usize).expect("valid worker id").gas.lock();
+        let accumulated = inner.get(worker_id as usize).unwrap_or_else(|| {
+            panic!(
+                "inc_block: worker id {worker_id} out of range for accumulator with {} workers - \
+                 the on-chain worker-count sync may have failed or lagged (check epoch-manager \
+                 warnings at epoch entry)",
+                inner.len()
+            )
+        });
+        let mut guard = accumulated.gas.lock();
         guard.blocks += 1;
         guard.gas_used += gas_used;
         guard.gas_limit += gas_limit;
@@ -315,7 +331,19 @@ impl GasAccumulator {
     /// Return the shared [`BaseFeeContainer`] for `worker_id`. Mutations are visible to all
     /// holders of the returned clone.
     pub fn base_fee(&self, worker_id: WorkerId) -> BaseFeeContainer {
-        self.inner.read().get(worker_id as usize).expect("valid worker id").base_fee.clone()
+        let inner = self.inner.read();
+        inner
+            .get(worker_id as usize)
+            .unwrap_or_else(|| {
+                panic!(
+                    "base_fee: worker id {worker_id} out of range for accumulator with {} workers \
+                     - the on-chain worker-count sync may have failed or lagged (check \
+                     epoch-manager warnings at epoch entry)",
+                    inner.len()
+                )
+            })
+            .base_fee
+            .clone()
     }
 
     /// Return the number of workers in the accumulator.
@@ -331,9 +359,19 @@ impl GasAccumulator {
     /// (`MIN_PROTOCOL_BASE_FEE` fee, zero gas); shrinking truncates, discarding the removed
     /// workers' totals and fees. Existing slots and the [`RewardsCounter`] are untouched.
     ///
-    /// Callers must only invoke this while no consensus output is executing (startup before
-    /// catchup, epoch entry before replay, epoch close after final execution): a resize that
-    /// races `inc_block` for a removed worker id panics there by design.
+    /// # Concurrency
+    ///
+    /// The write lock makes the resize atomic with respect to concurrent
+    /// [`GasAccumulator::inc_block`] / [`GasAccumulator::base_fee`] calls (read lock), and a
+    /// call with the current size returns without resizing. Callers need not quiesce execution;
+    /// the one safety bound is that the count must never shrink to or below a worker id still
+    /// present in in-flight consensus output - `inc_block` panics on the truncated id by
+    /// design. Grows are index-stable (existing slots keep their index and state), so they are
+    /// always safe. The epoch-entry callers uphold the bound through value-stability rather
+    /// than quiescence: they pin the count read to the previous epoch's closing block, so a
+    /// mid-epoch (ModeChange) re-entry re-reads the identical count and no-ops here while the
+    /// engine may still be executing leftover output - whose worker ids are all below that
+    /// count.
     pub fn set_num_workers(&self, num_workers: usize) {
         // a chain always has at least worker 0.
         if num_workers == 0 {
@@ -526,6 +564,17 @@ mod tests {
         let acc = GasAccumulator::new(2);
         acc.set_num_workers(0);
         assert_eq!(acc.num_workers(), 1);
+    }
+
+    /// LIVE-execution tripwire: a batch carrying a worker id the accumulator no longer covers
+    /// must halt (see `inc_block`'s Panics doc - halting beats silently diverging gas totals).
+    /// Pins a fragment of the panic message so a refactor cannot silently soften the tripwire.
+    #[test]
+    #[should_panic(expected = "worker id 1 out of range")]
+    fn inc_block_after_shrink_panics() {
+        let acc = GasAccumulator::new(2);
+        acc.set_num_workers(1);
+        acc.inc_block(1, 10, 20);
     }
 
     #[test]

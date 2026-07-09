@@ -37,7 +37,9 @@ use alloy::{
 use alloy_evm::Evm;
 use clap::Parser;
 use dirs::path_to_datadir;
-use error::{EvmReadError, EvmReadResult, TnRethError, TnRethResult};
+use error::{
+    EvmReadError, EvmReadResult, StateReadError, StateReadResult, TnRethError, TnRethResult,
+};
 use evm::TnEvmConfig;
 use eyre::OptionExt;
 use jsonrpsee::Methods;
@@ -91,7 +93,7 @@ use reth_provider::{
 };
 use reth_revm::{
     cached::CachedReads,
-    context::result::{ExecutionResult, ResultAndState},
+    context::result::{EVMError, ExecutionResult, ResultAndState},
     database::StateProviderDatabase,
     db::{states::bundle_state::BundleRetention, BundleState},
     DatabaseCommit, State,
@@ -1038,15 +1040,18 @@ impl RethEnv {
         Ok(self.inner.blockchain_provider.database_provider_ro()?.header_by_number(block_num)?)
     }
 
-    /// Return the finalalized execution header if available.
-    pub fn finalized_header(&self) -> TnRethResult<Option<ExecHeader>> {
-        let finalized_block_num_hash =
-            self.inner.blockchain_provider.finalized_block_num_hash().unwrap_or_default();
-        if let Some(finalized_block_num_hash) = finalized_block_num_hash {
-            Ok(self.inner.blockchain_provider.header(finalized_block_num_hash.hash)?)
-        } else {
-            Ok(None)
-        }
+    /// Return the finalized header, sealed with its hash, if available.
+    ///
+    /// Number and hash come from one logical read (the finalized num/hash pair, then the header
+    /// looked up by that hash), so callers can pin block ranges, epoch classification, and state
+    /// reads to this single header without consulting a second source (see `catchup_accumulator`
+    /// and the epoch-entry base-fee seeding in the epoch manager, which pair this with
+    /// [`Self::epoch_state_at_header`]).
+    pub fn finalized_header(&self) -> TnRethResult<Option<SealedHeader>> {
+        let Some(finalized_num_hash) = self.finalized_block_num_hash()? else {
+            return Ok(None);
+        };
+        self.sealed_header_by_hash(finalized_num_hash.hash)
     }
 
     /// Return the latest canonical block number.
@@ -1448,6 +1453,7 @@ impl RethEnv {
             let ResultAndState { result, state } =
                 tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
             debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
+            Self::ensure_pre_genesis_create_success("ConsensusRegistry", &result)?;
 
             tn_evm.db_mut().commit(state);
 
@@ -1479,6 +1485,7 @@ impl RethEnv {
             let ResultAndState { result, state } =
                 tn_evm.transact_pre_genesis_create(owner_address, create_worker_configs.into())?;
             debug!(target: "engine", "create worker configs result:\n{:#?}", result);
+            Self::ensure_pre_genesis_create_success("WorkerConfigs", &result)?;
 
             tn_evm.db_mut().commit(state);
 
@@ -1553,6 +1560,31 @@ impl RethEnv {
         Ok(genesis)
     }
 
+    /// Bail unless a pre-genesis constructor transaction succeeded.
+    ///
+    /// Pre-genesis creates are committed straight into genesis storage. An unchecked
+    /// Revert/Halt would still ship the contract's runtime code but with EMPTY storage
+    /// (e.g. an ownerless, zero-worker `WorkerConfigs`), which downstream fail-open reads
+    /// mask as defaults — so the ceremony must fail loudly here instead.
+    fn ensure_pre_genesis_create_success(
+        contract: &str,
+        result: &ExecutionResult,
+    ) -> eyre::Result<()> {
+        match result {
+            ExecutionResult::Success { .. } => Ok(()),
+            ExecutionResult::Revert { output, .. } => {
+                let reason = alloy::sol_types::decode_revert_reason(output)
+                    .unwrap_or_else(|| "<undecodable revert reason>".to_string());
+                eyre::bail!(
+                    "{contract} constructor reverted during pre-genesis create: {reason} (revert output: {output})"
+                )
+            }
+            ExecutionResult::Halt { reason, gas_used } => eyre::bail!(
+                "{contract} constructor halted during pre-genesis create: {reason:?} (gas used: {gas_used})"
+            ),
+        }
+    }
+
     /// Fetches json info from the given string
     ///
     /// If a key is specified, return the corresponding nested object.
@@ -1583,26 +1615,36 @@ impl RethEnv {
     /// - getValidator token id by address
     /// - getValidator info by token id
     pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
-        // create EVM with latest state
         let canonical_tip = self.canonical_tip();
         debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(canonical_tip.hash())?;
+        self.epoch_state_at_header(&canonical_tip)
+    }
+
+    /// Read the committee and epoch information from the [ConsensusRegistry] at `header`.
+    ///
+    /// The registry state, the EVM environment, and therefore the returned epoch, epoch info,
+    /// and committee all derive from this ONE header. Recovery paths that scan
+    /// `epoch_info.blockHeight..=header.number` (catchup and epoch-entry base-fee seeding) rely
+    /// on this pin: reading the range start from a different header (e.g. the canonical tip)
+    /// could yield a silently empty range if finality ever lags the canonical tip.
+    pub fn epoch_state_at_header(&self, header: &SealedHeader) -> eyre::Result<EpochState> {
+        // create EVM with the state at the pinned header
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
-        debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
+        debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state at header");
         let mut tn_evm = self
             .inner
             .evm_config
             .evm_factory()
-            .create_evm(&mut db, self.inner.evm_config.evm_env(&canonical_tip)?);
+            .create_evm(&mut db, self.inner.evm_config.evm_env(header)?);
 
         // current epoch number
         let epoch = self.get_current_epoch_number(&mut tn_evm)?;
 
         // current epoch info
         let epoch_info = self.get_current_epoch_info(&mut tn_evm)?;
-        debug!(target: "engine", ?epoch, ?epoch_info, "retrieved epoch info from canonical tip for next epoch");
+        debug!(target: "engine", ?epoch, ?epoch_info, "retrieved epoch info at header");
 
         // retrieve closing timestamp for previous epoch
         let epoch_start = self
@@ -1614,7 +1656,7 @@ impl RethEnv {
         let validators = self.get_committee_validators_by_epoch(epoch, &mut tn_evm)?;
         let bls_pubkeys = self.get_committee_bls_pubkeys_by_epoch(epoch, &mut tn_evm)?;
         let epoch_state = EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start };
-        debug!(target: "engine", ?epoch_state, "returning epoch state from canonical tip");
+        debug!(target: "engine", ?epoch_state, "returning epoch state at header");
 
         Ok(epoch_state)
     }
@@ -1822,21 +1864,31 @@ impl RethEnv {
     ///
     /// Builds an EVM against `header`'s state and issues a single `getAllWorkerConfigs()` call.
     /// Returns the on-chain worker count alongside the decoded [`WorkerFeeConfig`]s.
+    ///
+    /// Failures are classified per [`StateReadError`]. The classification boundary: the state
+    /// provider construction and any database fault the EVM hits while lazily reading state are
+    /// [`StateReadError::Provider`] (node-local — peers reading the same block may succeed);
+    /// everything downstream of a successfully-executing EVM — contract absent (empty return
+    /// data), revert, halt, ABI decode, arity mismatch — plus EVM environment construction is
+    /// [`StateReadError::ChainGlobal`] (a deterministic product of the pinned block, identical on
+    /// every node).
     fn worker_fee_configs_inner(
         &self,
         header: &SealedHeader,
-    ) -> eyre::Result<(usize, Vec<WorkerFeeConfig>)> {
-        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
+    ) -> StateReadResult<(usize, Vec<WorkerFeeConfig>)> {
+        let state_provider =
+            self.inner.blockchain_provider.state_by_block_hash(header.hash()).map_err(|e| {
+                StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
+            })?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
-        let mut tn_evm = self
-            .inner
-            .evm_config
-            .evm_factory()
-            .create_evm(&mut db, self.inner.evm_config.evm_env(header)?);
+        let evm_env = self.inner.evm_config.evm_env(header).map_err(|e| {
+            StateReadError::ChainGlobal(format!("evm env for {}: {e}", header.hash()))
+        })?;
+        let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
         let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
-        let result = self.read_state_on_chain(
+        let result = Self::classified_system_call(
             &mut tn_evm,
             SYSTEM_ADDRESS,
             WORKER_CONFIGS_ADDRESS,
@@ -1844,24 +1896,33 @@ impl RethEnv {
         )?;
         let data = match result.result {
             ExecutionResult::Success { output, .. } => output.into_data(),
-            e => eyre::bail!("failed to read worker configs: {e:?}"),
+            e => {
+                return Err(StateReadError::ChainGlobal(format!(
+                    "failed to read worker configs: {e:?}"
+                )))
+            }
         };
         let ret =
             <WorkerConfigs::getAllWorkerConfigsCall as alloy::sol_types::SolCall>::abi_decode_returns(
                 &data,
-            )?;
+            )
+            .map_err(|e| {
+                StateReadError::ChainGlobal(format!(
+                    "worker configs return decode failed (contract absent at this block?): {e}"
+                ))
+            })?;
 
         let num_workers = ret.count as usize;
         if ret.strategies.len() != num_workers
             || ret.values.len() != num_workers
             || ret.datas.len() != num_workers
         {
-            eyre::bail!(
+            return Err(StateReadError::ChainGlobal(format!(
                 "worker config arity mismatch: count={num_workers}, strategies={}, values={}, datas={}",
                 ret.strategies.len(),
                 ret.values.len(),
                 ret.datas.len(),
-            );
+            )));
         }
 
         let mut configs = Vec::with_capacity(num_workers);
@@ -1894,16 +1955,59 @@ impl RethEnv {
     /// Read worker fee configs from the [`WorkerConfigs`] contract at the block identified by
     /// `block_hash`.
     ///
-    /// Returns the on-chain worker count and one [`WorkerFeeConfig`] per worker. Fails with a
-    /// descriptive error if `block_hash` does not resolve to a sealed header.
+    /// Returns the on-chain worker count and one [`WorkerFeeConfig`] per worker. Failures are
+    /// classified per [`StateReadError`] (see [`Self::worker_fee_configs_inner`]); `block_hash`
+    /// failing to resolve to a sealed header is [`StateReadError::Provider`] — the pinned block
+    /// exists on the committee by construction, so a miss reflects this node's local view, not a
+    /// chain-global fact.
     pub fn get_worker_fee_configs_at_block(
         &self,
         block_hash: B256,
-    ) -> eyre::Result<(usize, Vec<WorkerFeeConfig>)> {
+    ) -> StateReadResult<(usize, Vec<WorkerFeeConfig>)> {
+        let header = self
+            .sealed_header_by_hash(block_hash)
+            .map_err(|e| {
+                StateReadError::Provider(format!("header lookup for {block_hash:?}: {e}"))
+            })?
+            .ok_or_else(|| {
+                StateReadError::Provider(format!(
+                    "sealed header not found for block hash {block_hash:?}"
+                ))
+            })?;
+        self.worker_fee_configs_inner(&header)
+    }
+
+    /// Read the [`ConsensusRegistry`] [`EpochInfo`](ConsensusRegistry::EpochInfo) for `epoch` at
+    /// the block identified by `block_hash`.
+    ///
+    /// Builds an EVM pinned to `block_hash`'s state and issues a single `getEpochInfo(uint32)`
+    /// call. The registry keeps a ring buffer of the four most recent epochs and reverts
+    /// (`InvalidEpoch`) for anything outside it, so a successful return is guaranteed to be the
+    /// requested epoch's record. Used by the epoch manager to recover the previous epoch's block
+    /// range from its closing block when deriving next-epoch base fees.
+    ///
+    /// Fails with a descriptive error if `block_hash` does not resolve to a sealed header or the
+    /// registry call does not succeed.
+    pub fn get_epoch_info_at_block(
+        &self,
+        epoch: Epoch,
+        block_hash: B256,
+    ) -> eyre::Result<ConsensusRegistry::EpochInfo> {
         let header = self
             .sealed_header_by_hash(block_hash)?
             .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
-        self.worker_fee_configs_inner(&header)
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut tn_evm = self
+            .inner
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, self.inner.evm_config.evm_env(&header)?);
+
+        let calldata = ConsensusRegistry::getEpochInfoCall { epoch }.abi_encode().into();
+        self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)
+            .map_err(Into::into)
     }
 
     /// Read worker fee configs from the [`WorkerConfigs`] contract at the canonical tip.
@@ -1912,10 +2016,114 @@ impl RethEnv {
     /// arity between the count and the per-worker arrays is validated in
     /// [`Self::worker_fee_configs_inner`]). Callers size their in-memory worker state (e.g. the
     /// `GasAccumulator`) to match, rather than asserting a preconceived count.
-    pub fn get_worker_fee_configs(&self) -> eyre::Result<Vec<WorkerFeeConfig>> {
+    pub fn get_worker_fee_configs(&self) -> StateReadResult<Vec<WorkerFeeConfig>> {
         let canonical_tip = self.canonical_tip();
         let (_num_workers, configs) = self.worker_fee_configs_inner(&canonical_tip)?;
         Ok(configs)
+    }
+
+    /// Read the CURRENT epoch number and [`EpochInfo`](ConsensusRegistry::EpochInfo) from the
+    /// [`ConsensusRegistry`] at `header`, with failures classified per [`StateReadError`].
+    ///
+    /// This is the close-time identity read for the epoch manager's `adjust_base_fees`: at an
+    /// epoch's closing block the registry state has already crossed to the entered epoch
+    /// (`concludeEpoch` ran inside that block), so the returned info is the entered epoch's record
+    /// and its `blockHeight` must equal `header.number + 1`. It reads exactly what
+    /// [`Self::epoch_state_at_header`] reads for the same check but skips the committee/BLS/
+    /// epoch-start lookups (a gating check needs only the epoch identity) and — unlike that
+    /// method, whose failures collapse into `eyre` strings — keeps node-local provider faults
+    /// (NOT committee-deterministic: retry or halt) distinguishable from chain-global failures
+    /// (committee-deterministic: fail-open stays consistent).
+    pub fn get_current_epoch_info_at_header(
+        &self,
+        header: &SealedHeader,
+    ) -> StateReadResult<(Epoch, ConsensusRegistry::EpochInfo)> {
+        let state_provider =
+            self.inner.blockchain_provider.state_by_block_hash(header.hash()).map_err(|e| {
+                StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
+            })?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let evm_env = self.inner.evm_config.evm_env(header).map_err(|e| {
+            StateReadError::ChainGlobal(format!("evm env for {}: {e}", header.hash()))
+        })?;
+        let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
+
+        // both reads observe the ONE pinned EVM state
+        let epoch: Epoch = Self::classified_registry_read(
+            &mut tn_evm,
+            ConsensusRegistry::getCurrentEpochCall {}.abi_encode().into(),
+        )?;
+        let epoch_info: ConsensusRegistry::EpochInfo = Self::classified_registry_read(
+            &mut tn_evm,
+            ConsensusRegistry::getCurrentEpochInfoCall {}.abi_encode().into(),
+        )?;
+        Ok((epoch, epoch_info))
+    }
+
+    /// Execute a read-only [`ConsensusRegistry`] call on `evm` and decode the result, classifying
+    /// failures per [`StateReadError`].
+    ///
+    /// The [`StateReadError`]-typed sibling of [`Self::call_consensus_registry`]: revert, halt,
+    /// and decode failures are all deterministic products of the pinned chain state
+    /// ([`StateReadError::ChainGlobal`]); only a database fault inside the EVM (via
+    /// [`Self::classified_system_call`]) is node-local ([`StateReadError::Provider`]).
+    fn classified_registry_read<DB, T>(evm: &mut TNEvm<DB>, calldata: Bytes) -> StateReadResult<T>
+    where
+        DB: alloy_evm::Database,
+        T: alloy::sol_types::SolValue,
+        T: From<
+            <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
+        >,
+    {
+        let state = Self::classified_system_call(
+            evm,
+            SYSTEM_ADDRESS,
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+        )?;
+        match state.result {
+            ExecutionResult::Success { output, .. } => {
+                alloy::sol_types::SolValue::abi_decode(&output.into_data()).map_err(|e| {
+                    StateReadError::ChainGlobal(format!(
+                        "registry return decode failed (contract absent at this block?): {e}"
+                    ))
+                })
+            }
+            ExecutionResult::Revert { output, .. } => Err(StateReadError::ChainGlobal(format!(
+                "registry call reverted: {:?}",
+                alloy::sol_types::decode_revert_reason(&output)
+            ))),
+            ExecutionResult::Halt { reason, gas_used } => Err(StateReadError::ChainGlobal(
+                format!("registry call halted: {reason:?} (gas {gas_used})"),
+            )),
+        }
+    }
+
+    /// Execute a read-only system call on `evm`, classifying failures per [`StateReadError`].
+    ///
+    /// An [`EVMError::Database`] is a node-local provider fault surfaced by the EVM's lazy state
+    /// reads (the state provider is only CONSTRUCTED up front; account/storage/bytecode loads
+    /// happen during execution, so an MDBX/provider I/O fault lands here) — classified
+    /// [`StateReadError::Provider`]. Every other transact failure derives deterministically from
+    /// the pinned block and calldata, so it is [`StateReadError::ChainGlobal`].
+    fn classified_system_call<DB>(
+        evm: &mut TNEvm<DB>,
+        caller: Address,
+        contract: Address,
+        calldata: Bytes,
+    ) -> StateReadResult<ResultAndState>
+    where
+        DB: alloy_evm::Database,
+    {
+        evm.transact_system_call(caller, contract, calldata).map_err(|e| match e {
+            EVMError::Database(db_err) => {
+                StateReadError::Provider(format!("system call state read failed: {db_err}"))
+            }
+            other => {
+                StateReadError::ChainGlobal(format!("system call failed reading state: {other}"))
+            }
+        })
     }
 
     /// Helper function to call `ConsensusRegistry` state on-chain.
@@ -3103,5 +3311,140 @@ mod tests {
         assert_eq!(num_workers, 1);
 
         Ok(())
+    }
+
+    /// Classification pin: the pinned-block read paths distinguish node-local provider faults
+    /// (the pinned hash/header not resolving on THIS node - peers may read fine) from
+    /// chain-global failures (contract absent at the block - identical on every node). The
+    /// close-time base-fee compute keys retry-then-halt vs keep-current off this split.
+    #[tokio::test]
+    async fn test_state_read_classifies_provider_vs_chain_global() -> eyre::Result<()> {
+        // healthy provider/database, but with the system contracts stripped from the alloc so
+        // the contract reads fail deterministically at every block
+        let mut genesis = tn_types::test_genesis();
+        genesis.alloc.remove(&WORKER_CONFIGS_ADDRESS);
+        genesis.alloc.remove(&CONSENSUS_REGISTRY_ADDRESS);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("State Read Classification Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // PROVIDER: an unknown/random block hash on a healthy env is a node-local resolution
+        // failure (the fault never reaches the contract)
+        let err = reth_env
+            .get_worker_fee_configs_at_block(B256::random())
+            .expect_err("unknown block hash must fail");
+        assert!(
+            matches!(err, StateReadError::Provider(_)),
+            "unknown block hash must classify as Provider, got: {err}"
+        );
+
+        // CHAIN-GLOBAL: the hash resolves (genesis) but the WorkerConfigs contract is absent -
+        // the call succeeds with empty return data and the decode fails deterministically
+        let err = reth_env
+            .get_worker_fee_configs_at_block(chain.sealed_genesis_header().hash())
+            .expect_err("absent contract must fail");
+        assert!(
+            matches!(err, StateReadError::ChainGlobal(_)),
+            "absent contract must classify as ChainGlobal, got: {err}"
+        );
+
+        // the close-time identity read classifies the same way: a header this node cannot
+        // resolve state for is Provider...
+        let phantom = SealedHeader::new(ExecHeader::default(), B256::random());
+        let err = reth_env
+            .get_current_epoch_info_at_header(&phantom)
+            .expect_err("phantom header must fail");
+        assert!(
+            matches!(err, StateReadError::Provider(_)),
+            "unresolvable header state must classify as Provider, got: {err}"
+        );
+
+        // ...while an absent ConsensusRegistry at a resolvable block is ChainGlobal
+        let err = reth_env
+            .get_current_epoch_info_at_header(&chain.sealed_genesis_header())
+            .expect_err("absent registry must fail");
+        assert!(
+            matches!(err, StateReadError::ChainGlobal(_)),
+            "absent registry must classify as ChainGlobal, got: {err}"
+        );
+
+        Ok(())
+    }
+
+    /// Regression: a `WorkerConfigs` constructor revert must FAIL genesis creation.
+    ///
+    /// Strategy 2 exceeds the contract's `MAX_STRATEGY` (= 1), so the constructor reverts
+    /// `InvalidStrategy`. Before the fix the reverted state was committed anyway, shipping
+    /// runtime code with empty storage: `numWorkers() = 0` and `owner() = address(0)` —
+    /// permanently unownable and masked downstream by fail-open defaults.
+    #[tokio::test]
+    async fn genesis_ceremony_rejects_invalid_worker_config_strategy() {
+        let err = crate::test_utils::try_test_genesis_with_consensus_registry_and_workers(
+            4,
+            vec![(2u8, 30_000_000u64)],
+        )
+        .expect_err("strategy 2 exceeds the contract's MAX_STRATEGY and must fail genesis");
+        assert!(
+            format!("{err:#}").contains("WorkerConfigs constructor reverted"),
+            "error must name the WorkerConfigs revert, got: {err:#}"
+        );
+    }
+
+    /// Regression: an EMPTY worker config set must FAIL genesis creation (the
+    /// `WorkerConfigs` constructor reverts `NumWorkersBelowMinimum`). See
+    /// [`genesis_ceremony_rejects_invalid_worker_config_strategy`] for the pre-fix failure mode.
+    #[tokio::test]
+    async fn genesis_ceremony_rejects_empty_worker_configs() {
+        let err =
+            crate::test_utils::try_test_genesis_with_consensus_registry_and_workers(4, vec![])
+                .expect_err("empty worker configs must fail genesis");
+        assert!(
+            format!("{err:#}").contains("WorkerConfigs constructor reverted"),
+            "error must name the WorkerConfigs revert, got: {err:#}"
+        );
+    }
+
+    /// Regression: the `ConsensusRegistry` pre-genesis create is guarded by
+    /// the same success check. A proof of possession generated for the WRONG address fails the
+    /// constructor's BLS precompile verification (`InvalidProofOfPossession`), which must fail
+    /// genesis creation instead of committing a half-initialized registry.
+    #[tokio::test]
+    async fn genesis_ceremony_rejects_invalid_consensus_registry_pop() {
+        let validator_address = Address::from_slice(&[0x11; 20]);
+        let wrong_address = Address::from_slice(&[0x22; 20]);
+        let mut rng = StdRng::seed_from_u64(0);
+        let bls = BlsKeypair::generate(&mut rng);
+        // sign the proof of possession over the wrong address
+        let pop = generate_proof_of_possession_bls_for_test(&bls, &wrong_address)
+            .expect("pop generation failed");
+        let validator = NodeInfo {
+            name: "validator-0".to_string(),
+            bls_public_key: *bls.public(),
+            p2p_info: NodeP2pInfo::default(),
+            execution_address: validator_address,
+            proof_of_possession: pop,
+        };
+
+        let initial_stake_config = ConsensusRegistry::StakeConfig {
+            stakeAmount: U256::from(parse_ether("1_000_000").expect("parse stake amount")),
+            minWithdrawAmount: U256::from(parse_ether("1_000").expect("parse min withdraw")),
+            epochIssuance: U256::from(parse_ether("25_806").expect("parse epoch issuance")),
+            epochDuration: 60 * 60 * 8,
+        };
+
+        let err = RethEnv::create_consensus_registry_genesis_accounts(
+            vec![validator],
+            tn_types::test_genesis(),
+            initial_stake_config,
+            Address::from_slice(&[0x99; 20]),
+            vec![(0u8, 30_000_000u64)],
+        )
+        .expect_err("invalid proof of possession must fail genesis");
+        assert!(
+            format!("{err:#}").contains("ConsensusRegistry constructor reverted"),
+            "error must name the ConsensusRegistry revert, got: {err:#}"
+        );
     }
 }
