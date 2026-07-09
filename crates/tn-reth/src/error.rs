@@ -48,6 +48,9 @@ pub enum TnRethError {
     /// it is treated as an error instead.
     #[error("receipts not found for existing block {0} during replay")]
     ReplayReceiptsMissing(u64),
+    /// Failed to recover a transaction's signer from its signature.
+    #[error(transparent)]
+    SignerRecovery(#[from] alloy::consensus::crypto::RecoveryError),
 }
 
 impl From<TnRethError> for EthApiError {
@@ -66,12 +69,12 @@ impl<T> From<std::sync::mpsc::SendError<T>> for TnRethError {
     }
 }
 
-/// Failure reading the on-chain `ConsensusRegistry`.
+/// Failure executing a read-only on-chain EVM call.
 ///
 /// Distinguishes a user-triggerable on-chain revert (revert bytes surfaced to RPC
 /// clients eth_call-style) from internal node failures (never leaked to clients).
 #[derive(Debug, thiserror::Error)]
-pub enum RegistryReadError {
+pub enum EvmReadError {
     /// The EVM call reverted on-chain.
     #[error("execution reverted{}", .reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
     Revert {
@@ -85,9 +88,9 @@ pub enum RegistryReadError {
     Internal(String),
 }
 
-/// Result of an on-chain `ConsensusRegistry` read.
+/// Result of a read-only on-chain EVM call.
 ///
-/// The error is always a [`RegistryReadError`], so consumers (e.g. the RPC layer) can match
+/// The error is always an [`EvmReadError`], so consumers (e.g. the RPC layer) can match
 /// revert-vs-internal directly instead of recovering it via a runtime downcast. Every non-revert
-/// failure — state provider/EVM setup, `Halt`, ABI decode — is a [`RegistryReadError::Internal`].
-pub type RegistryReadResult<T> = Result<T, RegistryReadError>;
+/// failure — state provider/EVM setup, `Halt`, ABI decode — is an [`EvmReadError::Internal`].
+pub type EvmReadResult<T> = Result<T, EvmReadError>;
