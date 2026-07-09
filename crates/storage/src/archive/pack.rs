@@ -19,7 +19,7 @@ use std::{
     fmt::Debug,
     fs::{self, File},
     hash::Hasher as _,
-    io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::Path,
 };
@@ -448,8 +448,7 @@ where
     W: ?Sized + std::io::Write,
 {
     value_buffer.clear();
-    encode_into_buffer(value_buffer, value)
-        .map_err(|e| std::io::Error::new(ErrorKind::Other, e.to_string()))?;
+    encode_into_buffer(value_buffer, value).map_err(|e| std::io::Error::other(e.to_string()))?;
     let buffer = match compression {
         PackCompression::None => value_buffer,
         PackCompression::ZStd => {

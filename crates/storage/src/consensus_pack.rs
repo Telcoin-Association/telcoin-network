@@ -630,11 +630,7 @@ impl Inner {
                 Ok(p) => p.output_end,
                 Err(_) => return false,
             };
-            if pack_len == last_record_end {
-                true
-            } else {
-                false
-            }
+            pack_len == last_record_end
         } else {
             true
         }
@@ -967,7 +963,7 @@ impl Inner {
         &mut self,
         consensus: &ConsensusOutput,
     ) -> Result<Option<u64>, PackError> {
-        let batches = collect_batches(&consensus);
+        let batches = collect_batches(consensus);
         let mut first_batch_pos = None;
         // Save all the required batches into the pack file.
         for (batch_digest, batch) in batches.into_iter() {
@@ -1269,7 +1265,7 @@ impl Inner {
 }
 
 /// Gathers all the batches from consensus into an ordered Map by digest.
-fn collect_batches<'a>(consensus: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
+fn collect_batches(consensus: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
     let mut batches = BTreeMap::new();
     // We want to make sure batches are saved to the pack in a deterministic order, so
     // collect them in a BTreeMap.
