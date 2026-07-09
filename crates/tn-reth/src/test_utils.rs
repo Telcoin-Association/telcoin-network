@@ -113,7 +113,7 @@ impl RethEnv {
         &self,
         txs: Vec<Vec<u8>>,
         parent: &SealedHeader,
-    ) -> BundleState {
+    ) -> eyre::Result<BundleState> {
         // create "empty" header with default values
         let mut header = ExecHeader {
             parent_hash: parent.hash(),
@@ -139,16 +139,21 @@ impl RethEnv {
             requests_hash: None,
         };
 
-        // decode transactions
-        let mut decoded_txs = Vec::with_capacity(txs.len());
-        let mut signers = Vec::with_capacity(txs.len());
-        for tx_bytes in &txs {
-            let tx = recover_raw_transaction(tx_bytes)
-                .expect("raw transaction recovered for test")
-                .into_inner();
-            signers.push(tx.recover_signer().expect("recover signer for test tx"));
-            decoded_txs.push(tx);
-        }
+        // decode transactions and recover their signers
+        let (decoded_txs, signers): (Vec<_>, Vec<_>) = txs
+            .iter()
+            .map(|tx_bytes| {
+                let tx = recover_raw_transaction(tx_bytes)
+                    .map_err(|e| eyre::eyre!("recover raw test transaction: {e:?}"))?
+                    .into_inner();
+                let signer = tx
+                    .recover_signer()
+                    .map_err(|e| eyre::eyre!("recover signer for test tx: {e:?}"))?;
+                Ok::<_, eyre::Report>((tx, signer))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
 
         // update header's transactions root
         header.transactions_root = if txs.is_empty() {
@@ -169,14 +174,22 @@ impl RethEnv {
 
         // create execution db
         let mut db = StateProviderDatabase::new(
-            self.latest().expect("provider retrieves latest during test batch execution"),
+            self.latest()
+                .map_err(|e| eyre::eyre!("provider retrieves latest for test batch: {e:?}"))?,
         );
         let executor = self.inner.evm_config.executor(&mut db);
         let res = executor
             .execute(&RecoveredBlock::new_unhashed(block, signers))
-            .expect("execute one block");
+            .map_err(|e| eyre::eyre!("execute one block for test: {e:?}"))?;
 
-        res.state
+        // a reverted tx still commits (with a failed receipt), silently yielding bundle
+        // state that is missing the tx's intended effects; fail loudly with the receipts
+        // so the offending tx is identifiable instead of surfacing later as missing
+        // genesis state (see #863)
+        let all_succeeded = res.result.receipts.iter().all(|receipt| receipt.success);
+        all_succeeded.then_some(res.state).ok_or_else(|| {
+            eyre::eyre!("setup tx reverted during simulated execution: {:?}", res.result.receipts)
+        })
     }
 
     /// Retrieve validator rewards.

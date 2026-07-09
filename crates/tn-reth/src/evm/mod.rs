@@ -33,6 +33,8 @@ pub use bls_precompile::{add_bls_precompile, BLS_G1_PRECOMPILE_ADDRESS};
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
+#[cfg(feature = "faucet")]
+pub use tel_precompile::faucet_mint_role_slot;
 #[cfg(not(feature = "faucet"))]
 pub use tel_precompile::TIMELOCK_DURATION;
 pub use tel_precompile::{
