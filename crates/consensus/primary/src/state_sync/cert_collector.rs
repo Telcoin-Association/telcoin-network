@@ -58,8 +58,18 @@ where
         config: ConsensusConfig<DB>,
     ) -> PrimaryNetworkResult<Self> {
         let start_time = Instant::now();
-        let request =
-            MissingCertificatesRequest { exclusive_lower_bound, skip_rounds, max_response_size: 0 };
+        // `max_response_size` is unused on the sync fetch path: the reply is streamed and ended
+        // explicitly, so the legacy request-response size cap no longer applies. The field is kept
+        // only for BCS wire compatibility of the retained `/0.0.1`
+        // `PrimaryRequest::MissingCertificates` variant (removed at the coordinated `/0.0.2` bump,
+        // item 9 of #739); this local rebuild exists solely to reuse `get_bounds()`, which ignores
+        // it, so a fixed dummy is correct.
+        const SYNC_PATH_UNUSED_RESPONSE_CAP: usize = 0;
+        let request = MissingCertificatesRequest {
+            exclusive_lower_bound,
+            skip_rounds,
+            max_response_size: SYNC_PATH_UNUSED_RESPONSE_CAP,
+        };
         let (lower_bound, skip_rounds) = request.get_bounds()?;
 
         // initialize the fetch queue with the first round for each authority

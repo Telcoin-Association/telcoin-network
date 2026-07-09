@@ -70,6 +70,16 @@ pub fn encode<T: Serialize>(obj: &T) -> Vec<u8> {
     bcs::to_bytes(obj).unwrap_or_else(|_| panic!("Serialization should not fail"))
 }
 
+/// Return the BCS-encoded byte length of `obj` without allocating the bytes.
+///
+/// Runs the same serializer as [`encode`] over a byte counter, so `encoded_size(x)`
+/// equals `encode(x).len()` for any value that serializes, and surfaces the serializer
+/// error instead of panicking. Use it where only the size is needed (e.g. streaming
+/// byte-cap accounting) to avoid the throwaway allocation of encoding just to read `.len()`.
+pub fn encoded_size<T: ?Sized + Serialize>(obj: &T) -> bcs::Result<usize> {
+    bcs::serialized_size(obj)
+}
+
 /// Encode into a provided buffer.
 pub fn encode_into_buffer<W, T>(write: &mut W, value: &T) -> bcs::Result<()>
 where

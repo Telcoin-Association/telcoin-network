@@ -23,7 +23,7 @@ use futures::{
 use std::time::Duration;
 use tn_network_libp2p::{read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame};
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{encode, try_decode, BlsPublicKey, Certificate, Epoch};
+use tn_types::{encode, encoded_size, try_decode, BlsPublicKey, Certificate, Epoch};
 use tokio::io::AsyncRead as TokioAsyncRead;
 use tracing::debug;
 
@@ -74,6 +74,11 @@ const MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// responder cap so the batch that carries an honest responder past
 /// [`MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES`] is still accepted, while a responder
 /// that ignores `End` and streams unboundedly is cut off.
+///
+/// This bounds a *single* exchange. The requester (`fetch_from_peers`) staggers several
+/// fetches and cancels only on the first success, so a catch-up round can hold multiple
+/// exchanges open at once; the process-wide requester peak is that concurrency times this
+/// cap. See `fetch_from_peers` for the aggregate envelope (issue #822, finding 2).
 const MAX_SYNC_MISSING_CERTS_ACCEPT_BYTES: usize =
     MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES + MAX_SYNC_CERT_FRAME_SIZE;
 
@@ -324,7 +329,9 @@ where
     // A storage error yielded by `certs` short-circuits the fold and propagates so the
     // caller signals `SyncFrame::Err`.
     futures::stream::iter(certs)
-        .map(|cert| cert.map(|cert| (encode(&cert).len(), cert)))
+        .map(|cert| {
+            cert.and_then(|cert| encoded_size(&cert).map(|size| (size, cert)).map_err(Into::into))
+        })
         .scan(0usize, |sent, sized| {
             let within_cap = *sent < MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES;
             futures::future::ready(within_cap.then(|| sized.inspect(|(size, _)| *sent += *size)))
