@@ -11398,8 +11398,6 @@ dependencies = [
 name = "telcoin-network"
 version = "0.1.0"
 dependencies = [
- "clap",
- "rpassword",
  "telcoin-network-cli",
  "tn-node",
 ]
@@ -11422,6 +11420,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "rayon",
+ "rpassword",
  "secp256k1 0.31.1",
  "serde_json",
  "serde_yaml",

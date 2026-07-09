@@ -23,7 +23,7 @@ use tn_types::{
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Inner type for holding execution layer types.
 #[derive(Debug)]
@@ -179,14 +179,28 @@ impl ExecutionNodeInner {
     ///
     /// Called every epoch so the pool charges the base fee the accumulator currently holds for
     /// the worker. This covers the respawn path, where `initialize_worker_components` is skipped
-    /// but the base fee for the new epoch must still take effect. No-op if the worker's components
-    /// have not been initialized yet.
+    /// but the base fee for the new epoch must still take effect. If the worker's components have
+    /// not been initialized, the update is dropped with a warning (and a debug assertion): the
+    /// worker's pool would keep charging the previous epoch's base fee, admitting underpriced
+    /// transactions into batches.
     pub(super) fn set_worker_base_fee(&self, worker_id: WorkerId, base_fee: u64) {
         if let Some(worker) = self.workers.get(worker_id as usize) {
             let pool = worker.pool();
             let mut block_info = pool.block_info();
             block_info.pending_basefee = base_fee;
             pool.set_block_info(block_info);
+        } else {
+            warn!(
+                target: "tn::execution",
+                worker_id,
+                initialized_workers = self.workers.len(),
+                "set_worker_base_fee: dropping base-fee update for uninitialized worker"
+            );
+            debug_assert!(
+                false,
+                "set_worker_base_fee: worker {worker_id} uninitialized ({} workers initialized)",
+                self.workers.len()
+            );
         }
     }
 

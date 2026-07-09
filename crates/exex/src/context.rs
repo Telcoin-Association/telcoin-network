@@ -74,6 +74,16 @@ impl TnExExContext {
     ///   empty `BundleState`); this is what [`replay_from`](Self::replay_from) uses.
     /// - `latest()` — a state provider for account/storage queries against the latest committed
     ///   state.
+    /// - `transaction_by_hash_with_meta(hash)` — a transaction with its recovered sender and block
+    ///   metadata (block number/hash, index, timestamp).
+    /// - `receipt_by_hash(hash)` / `receipts_by_block(..)` — transaction receipts.
+    /// - `total_transactions()` + `transactions_by_tx_range_with_meta(range)` — the chain-wide
+    ///   sequential transaction feed (serve "latest N transactions" pages without visiting empty
+    ///   blocks).
+    /// - `retrieve_account(&addr)` / `account_code(&addr)` — account nonce/balance/code-hash and
+    ///   deployed bytecode at the latest state.
+    /// - `read_contract(contract, calldata)` — an `eth_call`-style read-only contract call at the
+    ///   canonical tip (`read_contract_at_block` pins it to a block hash).
     pub fn reth_env(&self) -> &RethEnv {
         &self.reth_env
     }
