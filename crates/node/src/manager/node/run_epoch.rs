@@ -89,9 +89,9 @@ where
     /// 1. Build an epoch-scoped [`ConsensusBus`] over the application channels and read the
     ///    committee plus epoch timing from chain (the epoch's primary does not exist yet). Derive
     ///    `self.epoch_boundary`, seed the [`GasAccumulator`]'s worker count and per-worker base
-    ///    fees from the previous epoch's closing block (`derive_base_fees_for_entered_epoch`;
-    ///    epoch 0 sizes from genesis state and keeps the MIN defaults), and backfill a dummy
-    ///    epoch-0 [`EpochRecord`] if missing so later lookups can treat epoch 0 like any other.
+    ///    fees from the previous epoch's closing block (`derive_base_fees_for_entered_epoch`; epoch
+    ///    0 sizes from genesis state and keeps the MIN defaults), and backfill a dummy epoch-0
+    ///    [`EpochRecord`] if missing so later lookups can treat epoch 0 like any other.
     /// 2. Create the per-epoch [`TaskManager`] and open the epoch pack files via `open_epoch_pack`.
     /// 3. If the mode calls for replay, re-forward any missed consensus output. If that replay
     ///    crosses the epoch boundary, close the epoch immediately, clear the consensus DB, and

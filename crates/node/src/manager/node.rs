@@ -145,8 +145,8 @@ pub(crate) struct EpochManager<P, DB> {
 /// 1. **Worker count** — sizes the accumulator via [`sync_num_workers_from_chain`], reading the
 ///    on-chain `WorkerConfigs` count at the epoch's first block's parent (the previous epoch's
 ///    closing block), with the epoch's first block resolved from the pinned epoch state.
-/// 2. **Gas stats** — iterates every reth block from the epoch's start height through the
-///    finalized tip, extracting the worker id from each block's `difficulty` field and calling
+/// 2. **Gas stats** — iterates every reth block from the epoch's start height through the finalized
+///    tip, extracting the worker id from each block's `difficulty` field and calling
 ///    [`GasAccumulator::inc_block`] to rebuild per-worker gas totals.
 /// 3. **Leader counts** — walks the consensus DB in reverse, counting each leader's committed
 ///    blocks for rounds that have already been executed (i.e. `leader_round <=

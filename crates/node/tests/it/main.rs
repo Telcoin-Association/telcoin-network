@@ -619,16 +619,16 @@ async fn test_sync_num_workers_errors_when_contract_absent() -> eyre::Result<()>
 /// spawning is a follow-up):
 ///
 /// 1. MID-EPOCH-0: hold the epoch-closing output back and recover at startup —
-///    `catchup_accumulator` sizes the accumulator from pinned chain state and restores
-///    per-worker gas stats. Worker 0's totals must match the live accumulator exactly; fees are
-///    owned by the entry seeding and hold `MIN_PROTOCOL_BASE_FEE` for BOTH workers, which IS
-///    the committee value during epoch 0 (containers hold the MIN default until the FIRST
-///    close, pinned via `derive_idle_worker_fee(_, 0, _)`).
+///    `catchup_accumulator` sizes the accumulator from pinned chain state and restores per-worker
+///    gas stats. Worker 0's totals must match the live accumulator exactly; fees are owned by the
+///    entry seeding and hold `MIN_PROTOCOL_BASE_FEE` for BOTH workers, which IS the committee value
+///    during epoch 0 (containers hold the MIN default until the FIRST close, pinned via
+///    `derive_idle_worker_fee(_, 0, _)`).
 /// 2. Close epoch 0 with the held output.
-/// 3. RESTART-AFTER-CLOSE (the crash-after-close shape on a 2-worker chain): catchup scans an
-///    empty range at a closing-block tip, so post-catchup worker 1 still holds MIN, and the
-///    entry derivation must flip it to the governance-set `Static { fee: 500 }` — restarting
-///    nodes converge with the fee the live committee computed at the boundary.
+/// 3. RESTART-AFTER-CLOSE (the crash-after-close shape on a 2-worker chain): catchup scans an empty
+///    range at a closing-block tip, so post-catchup worker 1 still holds MIN, and the entry
+///    derivation must flip it to the governance-set `Static { fee: 500 }` — restarting nodes
+///    converge with the fee the live committee computed at the boundary.
 #[tokio::test]
 async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("sync_then_catchup").unwrap();
@@ -1033,8 +1033,8 @@ async fn catchup_guards_finality_lag_across_epoch_boundary() -> eyre::Result<()>
 /// Chain shape (manual blocks like the finality-lag test, worker ids stamped directly): the
 /// genesis `WorkerConfigs` declares ONE worker;
 /// - block 1 (epoch 0): worker 0, non-MIN fee, one executed transfer (real gas);
-/// - block 2 (epoch 0): worker 1, a different non-MIN fee, one executed transfer - the
-///   out-of-range datum. Canonical AND finalized.
+/// - block 2 (epoch 0): worker 1, a different non-MIN fee, one executed transfer - the out-of-range
+///   datum. Canonical AND finalized.
 #[tokio::test]
 async fn catchup_errors_on_worker_id_beyond_onchain_count() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("catchup_worker_id_bound")?;
@@ -1322,8 +1322,8 @@ async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Res
 ///   that tripwire's happy path on a real boundary (the check returns `Ok` here);
 /// - the close is pinned to the LAST batch: the boundary output's penultimate block has NOT yet
 ///   advanced the epoch, so the tip IS the boundary output's last (closing) block. This is why the
-///   identity holds even for a multi-block boundary output — the exact fact the identity's
-///   safety argument rests on.
+///   identity holds even for a multi-block boundary output — the exact fact the identity's safety
+///   argument rests on.
 #[tokio::test]
 async fn epoch_block_height_is_closing_block_plus_one() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("epoch_block_height_identity").unwrap();
@@ -1761,8 +1761,8 @@ async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<
 /// Pins both entry states for the idle worker:
 /// - mid-epoch-1: the entry derivation (from epoch 0's closing block) prices worker 1 = ONE
 ///   boundary folded from the block-1 anchor;
-/// - entering epoch 2: `derive_idle_worker_fee` and the `derive_base_fees_for_entered_epoch`
-///   fill both equal the TWO-boundary oracle chain.
+/// - entering epoch 2: `derive_idle_worker_fee` and the `derive_base_fees_for_entered_epoch` fill
+///   both equal the TWO-boundary oracle chain.
 #[tokio::test]
 async fn test_derive_idle_worker_fee_eip1559_decays_from_last_produced_epoch() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("derive_idle_eip1559").unwrap();

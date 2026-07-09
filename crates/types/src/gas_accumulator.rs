@@ -22,9 +22,9 @@
 //!
 //! 1. **`catchup_accumulator`** (in `node::manager`) — runs once at startup. It syncs the worker
 //!    count from pinned closing-block chain state, walks the already-executed reth blocks for the
-//!    current epoch to re-accumulate gas stats per worker, and iterates the consensus DB in
-//!    reverse to restore leader counts for rounds that were already executed. Base fees are not
-//!    restored here — the epoch entry seeding owns them.
+//!    current epoch to re-accumulate gas stats per worker, and iterates the consensus DB in reverse
+//!    to restore leader counts for rounds that were already executed. Base fees are not restored
+//!    here — the epoch entry seeding owns them.
 //!
 //! 2. **`EpochManager::replay_missed_consensus`** — replays any consensus output that was committed
 //!    to the consensus DB but not yet executed before the previous shutdown. These blocks flow
