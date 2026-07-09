@@ -142,12 +142,19 @@ where
         self.metrics.current.set(committee.epoch() as f64);
         self.metrics.boundary_timestamp_seconds.set(self.epoch_boundary as f64);
 
+        let reth_env = engine.get_reth_env().await;
+
+        // Size the accumulator to the on-chain worker count for the epoch being entered (read at
+        // the epoch's first block's parent - the previous epoch's closing block). Runs on every
+        // entry mode, before fee seeding (which loops 0..num_workers) and before replay drives
+        // inc_block, so both operate on a correctly sized accumulator.
+        super::sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_info.blockHeight);
+
         // Base-fee-from-chain seeding: if the canonical tip is already in the epoch we are
         // entering, adopt each worker's latest on-chain base fee rather than recomputing. This
         // covers syncing and restarting nodes: they execute the fee already baked into the chain.
         // A live producer crossing N->N+1 still has its tip in N here, so seeding is skipped and
         // the value adjust_base_fees computed at the boundary is kept. (See gas_accumulator docs.)
-        let reth_env = engine.get_reth_env().await;
         {
             if let Some(tip) = reth_env.finalized_header()? {
                 let tip_epoch = RethEnv::extract_epoch_from_header(&tip);
@@ -619,23 +626,28 @@ where
 /// each worker's base-fee container. This is the deterministic seam every committee member runs
 /// identically at the boundary.
 ///
-/// Infallible: if the contract read fails, worker 0's fee is pinned to [`FALLBACK_BASE_FEE`]
-/// instead of aborting the epoch close (see the FAIL-OPEN note in the body).
+/// The read's config count is the on-chain `numWorkers()` at the closing block, i.e. the worker
+/// count for the NEXT epoch (a mid-epoch `setNumWorkers` only takes effect at the boundary by
+/// design). The accumulator is resized to it before the per-worker loop so workers governance
+/// just added get their configured fee (e.g. `Static`) computed here rather than defaulting to
+/// MIN; epoch-entry sync then confirms the same count from the same block.
+///
+/// Infallible: if the contract read fails, the current per-worker base fees and worker count are
+/// kept unchanged instead of aborting the epoch close (see the FAIL-OPEN note in the body).
 ///
 /// Inert on existing chains: the genesis fee strategy is `Eip1559 { target_gas: u64::MAX }`, which
 /// floors every worker at `MIN_PROTOCOL_BASE_FEE`. Fees only move once governance sets a real
 /// per-worker target.
 fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) {
-    let num_workers = gas_accumulator.num_workers();
-    // num_workers is the count the GasAccumulator was sized to at startup; get_worker_fee_configs
-    // validates it against the on-chain numWorkers() and errors on drift.
-    //
-    // FAIL-OPEN: a contract-read revert or a numWorkers() drift must not abort the epoch close
-    // The fallback is deterministic (a fixed 1 GWEI for worker 0), so
-    // every committee member that hits the same on-chain condition lands on the same fee and
-    // consensus should not diverge.
-    match reth_env.get_worker_fee_configs(num_workers) {
+    // FAIL-OPEN: a contract-read failure must not abort the epoch close. Keep the current
+    // per-worker base fees and worker count untouched -- both are already consensus-consistent
+    // (seeded from the same chain at epoch entry, then held deterministic within the epoch), so
+    // every committee member that hits the same read failure lands on the same state. The count
+    // self-heals at the next epoch entry via `sync_num_workers_from_chain`, which fails open the
+    // same way.
+    match reth_env.get_worker_fee_configs() {
         Ok(configs) => {
+            gas_accumulator.set_num_workers(configs.len());
             for (worker_id, config) in configs.into_iter().enumerate() {
                 let worker_id = worker_id as u16;
                 let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
@@ -648,16 +660,11 @@ fn adjust_base_fees(reth_env: &RethEnv, gas_accumulator: &GasAccumulator) {
             warn!(
                 target: "epoch-manager",
                 ?e,
-                "failed to read worker fee configs at epoch close - falling back to {FALLBACK_BASE_FEE} wei for worker 0"
+                "failed to read worker fee configs at epoch close - keeping current per-worker base fees and worker count"
             );
-            gas_accumulator.base_fee(0).set_base_fee(FALLBACK_BASE_FEE);
         }
     }
 }
-
-/// Deterministic base fee (1 GWEI) applied to worker 0 when the `WorkerConfigs` contract read
-/// fails at epoch close.
-const FALLBACK_BASE_FEE: u64 = 1_000_000_000;
 
 /// Apply a worker's [`WorkerFeeConfig`] to compute its next-epoch base fee.
 ///
@@ -788,13 +795,5 @@ mod tests {
 
         assert_eq!(acc.base_fee(0).base_fee(), 111); // seeded from chain
         assert_eq!(acc.base_fee(1).base_fee(), 2000); // untouched
-    }
-
-    #[test]
-    fn fallback_base_fee_is_one_gwei() {
-        // The fail-open fallback in adjust_base_fees must stay a fixed 1 GWEI: it is applied
-        // independently by every committee member, so determinism (and thus consensus) depends on
-        // this exact value.
-        assert_eq!(FALLBACK_BASE_FEE, 1_000_000_000);
     }
 }

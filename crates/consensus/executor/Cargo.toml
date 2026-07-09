@@ -38,4 +38,4 @@ workspace = true
 
 [features]
 default = []
-adiri = []
+adiri = ["tn-types/adiri"]

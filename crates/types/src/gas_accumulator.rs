@@ -5,6 +5,15 @@
 //! block. At epoch boundaries these totals drive base-fee adjustments and validator reward
 //! withdrawals.
 //!
+//! ## Worker count
+//!
+//! The number of worker slots is not fixed at construction. The on-chain `WorkerConfigs`
+//! contract is the absolute source of truth: `sync_num_workers_from_chain` (in `node::manager`)
+//! reads the count for the entered epoch at the epoch's first block's parent and resizes the
+//! accumulator in place via [`GasAccumulator::set_num_workers`] - at startup (before catchup)
+//! and at every epoch entry - and `adjust_base_fees` resizes at epoch close to the count read
+//! from the closing block (the next epoch's count).
+//!
 //! ## Startup recovery
 //!
 //! Because the accumulator is purely in-memory, its state must be rebuilt whenever a node restarts
@@ -61,6 +70,7 @@ use std::{
         Arc,
     },
 };
+use tracing::warn;
 
 /// Tracks how many blocks each leader committed during an epoch for reward distribution.
 ///
@@ -225,13 +235,21 @@ impl Default for Accumulated {
 /// [`EpochManager::adjust_base_fees`] reads the totals at the epoch boundary to update each
 /// worker's base fee for the next epoch.
 ///
+/// The worker count is not fixed at construction: the on-chain `WorkerConfigs` contract is the
+/// source of truth, and [`GasAccumulator::set_num_workers`] resizes the slot list in place to
+/// match it at each epoch boundary. Resizing in place (rather than replacing the accumulator)
+/// keeps the node-lifetime clones held by the engine and the [`RewardsCounter`] held by the EVM
+/// config live across epochs.
+///
 /// If the engine is moved to a separate process in the future, this shared-memory design will
 /// need to be replaced with an IPC mechanism (or something similar).
 #[derive(Clone, Debug)]
 pub struct GasAccumulator {
     /// One [`Accumulated`] entry per worker, indexed by worker id. Wrapped in `Arc` for
-    /// cheap cloning across the engine and consensus tasks.
-    inner: Arc<Vec<Accumulated>>,
+    /// cheap cloning across the engine and consensus tasks; the `RwLock` exists solely so
+    /// [`GasAccumulator::set_num_workers`] can resize the slot list in place - per-slot state
+    /// stays interior-mutable behind its own lock.
+    inner: Arc<RwLock<Vec<Accumulated>>>,
     /// Leader block counts used to compute validator rewards at epoch boundaries.
     rewards_counter: RewardsCounter,
 }
@@ -248,7 +266,7 @@ impl GasAccumulator {
         for _ in 0..workers {
             inner.push(Accumulated::default());
         }
-        Self { inner: Arc::new(inner), rewards_counter: rewards }
+        Self { inner: Arc::new(RwLock::new(inner)), rewards_counter: rewards }
     }
 
     /// Increment the block count, gas used, and gas limit for `worker_id`.
@@ -257,13 +275,16 @@ impl GasAccumulator {
     ///
     /// # Panics
     ///
-    /// Panics if `worker_id` is out of range. Any batch that reaches execution has a valid id.
+    /// Panics if `worker_id` is out of range. Any batch that reaches execution has a valid id;
+    /// an out-of-range id here means the accumulator disagrees with the chain on the worker
+    /// count, and halting beats silently diverging gas totals.
     pub fn inc_block(&self, worker_id: WorkerId, gas_used: u64, gas_limit: u64) {
         // Don't bother accumulating empty blocks- helps with restarts.
         if gas_used == 0 {
             return;
         }
-        let mut guard = self.inner.get(worker_id as usize).expect("valid worker id").gas.lock();
+        let inner = self.inner.read();
+        let mut guard = inner.get(worker_id as usize).expect("valid worker id").gas.lock();
         guard.blocks += 1;
         guard.gas_used += gas_used;
         guard.gas_limit += gas_limit;
@@ -271,7 +292,7 @@ impl GasAccumulator {
 
     /// Reset all gas totals and leader counts to zero. Called at epoch boundaries.
     pub fn clear(&self) {
-        for acc in self.inner.iter() {
+        for acc in self.inner.read().iter() {
             let mut guard = acc.gas.lock();
             guard.blocks = 0;
             guard.gas_used = 0;
@@ -286,20 +307,44 @@ impl GasAccumulator {
     ///
     /// Panics if `worker_id` is out of range.
     pub fn get_values(&self, worker_id: WorkerId) -> (u64, u64, u64) {
-        let guard = self.inner.get(worker_id as usize).expect("valid worker id").gas.lock();
+        let inner = self.inner.read();
+        let guard = inner.get(worker_id as usize).expect("valid worker id").gas.lock();
         (guard.blocks, guard.gas_used, guard.gas_limit)
     }
 
     /// Return the shared [`BaseFeeContainer`] for `worker_id`. Mutations are visible to all
     /// holders of the returned clone.
     pub fn base_fee(&self, worker_id: WorkerId) -> BaseFeeContainer {
-        self.inner.get(worker_id as usize).expect("valid worker id").base_fee.clone()
+        self.inner.read().get(worker_id as usize).expect("valid worker id").base_fee.clone()
     }
 
     /// Return the number of workers in the accumulator.
     /// Worker ids will be 0 to one less that this value.
     pub fn num_workers(&self) -> usize {
-        self.inner.len()
+        self.inner.read().len()
+    }
+
+    /// Resize the slot list in place to `num_workers` (clamped to at least 1).
+    ///
+    /// The change is visible to every clone of this accumulator, so node-lifetime handles (the
+    /// engine's, the EVM config's rewards counter) stay live. Growing appends default slots
+    /// (`MIN_PROTOCOL_BASE_FEE` fee, zero gas); shrinking truncates, discarding the removed
+    /// workers' totals and fees. Existing slots and the [`RewardsCounter`] are untouched.
+    ///
+    /// Callers must only invoke this while no consensus output is executing (startup before
+    /// catchup, epoch entry before replay, epoch close after final execution): a resize that
+    /// races `inc_block` for a removed worker id panics there by design.
+    pub fn set_num_workers(&self, num_workers: usize) {
+        // a chain always has at least worker 0.
+        if num_workers == 0 {
+            warn!(target: "epoch-manager", "attempt to set num workers to {num_workers}");
+        }
+        let num_workers = num_workers.max(1);
+        let mut inner = self.inner.write();
+        if inner.len() == num_workers {
+            return;
+        }
+        inner.resize_with(num_workers, Accumulated::default);
     }
 
     /// Return a copy of the rewards counter object.
@@ -438,5 +483,90 @@ mod tests {
             compute_next_base_fee_eip1559(MIN_PROTOCOL_BASE_FEE, 200, 100),
             MIN_PROTOCOL_BASE_FEE + 1
         );
+    }
+
+    #[test]
+    fn set_num_workers_grow_preserves_existing_and_defaults_new_slots() {
+        let acc = GasAccumulator::new(1);
+        acc.inc_block(0, 100, 200);
+        acc.base_fee(0).set_base_fee(999);
+
+        acc.set_num_workers(3);
+
+        assert_eq!(acc.num_workers(), 3);
+        // existing slot keeps its gas totals and fee
+        assert_eq!(acc.get_values(0), (1, 100, 200));
+        assert_eq!(acc.base_fee(0).base_fee(), 999);
+        // new slots start at (MIN fee, zero gas)
+        for worker_id in 1..3u16 {
+            assert_eq!(acc.get_values(worker_id), (0, 0, 0));
+            assert_eq!(acc.base_fee(worker_id).base_fee(), MIN_PROTOCOL_BASE_FEE);
+        }
+    }
+
+    #[test]
+    fn set_num_workers_shrink_truncates_high_slots() {
+        let acc = GasAccumulator::new(3);
+        acc.inc_block(0, 100, 200);
+        acc.inc_block(2, 300, 400);
+        acc.base_fee(2).set_base_fee(777);
+
+        acc.set_num_workers(2);
+        assert_eq!(acc.num_workers(), 2);
+        assert_eq!(acc.get_values(0), (1, 100, 200));
+
+        // re-growing yields a fresh default slot, not the truncated one
+        acc.set_num_workers(3);
+        assert_eq!(acc.get_values(2), (0, 0, 0));
+        assert_eq!(acc.base_fee(2).base_fee(), MIN_PROTOCOL_BASE_FEE);
+    }
+
+    #[test]
+    fn set_num_workers_clamps_zero_to_one() {
+        let acc = GasAccumulator::new(2);
+        acc.set_num_workers(0);
+        assert_eq!(acc.num_workers(), 1);
+    }
+
+    #[test]
+    fn set_num_workers_same_size_is_noop() {
+        let acc = GasAccumulator::new(2);
+        acc.inc_block(1, 50, 60);
+        acc.base_fee(1).set_base_fee(123);
+
+        acc.set_num_workers(2);
+
+        assert_eq!(acc.num_workers(), 2);
+        assert_eq!(acc.get_values(1), (1, 50, 60));
+        assert_eq!(acc.base_fee(1).base_fee(), 123);
+    }
+
+    #[test]
+    fn clones_observe_resize() {
+        // The engine holds a node-lifetime clone taken before any resize; a resize through the
+        // manager's handle must be visible through it (the resize-in-place requirement).
+        let acc = GasAccumulator::new(1);
+        let engine_handle = acc.clone();
+
+        acc.set_num_workers(2);
+
+        assert_eq!(engine_handle.num_workers(), 2);
+        // writes through the pre-resize clone land in the new slot
+        engine_handle.inc_block(1, 10, 20);
+        assert_eq!(acc.get_values(1), (1, 10, 20));
+    }
+
+    #[test]
+    fn resize_preserves_rewards_counter_identity() {
+        // RethEnv/TnEvmConfig hold a RewardsCounter clone taken at startup; resizing the worker
+        // slots must not detach it.
+        let acc = GasAccumulator::new(1);
+        let evm_handle = acc.rewards_counter();
+
+        acc.set_num_workers(3);
+
+        let leader = AuthorityIdentifier::default();
+        evm_handle.inc_leader_count(&leader);
+        assert_eq!(acc.rewards_counter().leader_counts.lock().get(&leader), Some(&1));
     }
 }

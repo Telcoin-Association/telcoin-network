@@ -251,6 +251,15 @@ mod test {
             start.elapsed().as_secs_f64()
         );
 
+        // `commit()` on a non-full-memory layered DB only queues the commit to the
+        // background writer, so wait for that write path to drain before iterating.
+        // Without this barrier the chained disk+mem iterator below can briefly observe
+        // a key in both layers and fail the ordering assertions.  A single barrier
+        // covers all the reads below since no writes occur until the clear_table.
+        // Deliberately untimed: the commit number above measures the (async) commit
+        // call itself, not durability.
+        db.sync_persist();
+
         let start = std::time::Instant::now();
         let mut i = 0;
         #[allow(clippy::explicit_counter_loop)]

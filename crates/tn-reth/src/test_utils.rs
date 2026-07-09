@@ -728,6 +728,19 @@ pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Resul
 /// NOTE: this is sync but must be called from within a tokio runtime (e.g. a `#[tokio::test]`),
 /// because deploying the registry spins up a temporary `RethEnv`.
 pub fn test_genesis_with_consensus_registry(num_validators: usize) -> Genesis {
+    test_genesis_with_consensus_registry_and_workers(num_validators, vec![(0u8, 30_000_000u64)])
+}
+
+/// [`test_genesis_with_consensus_registry`] with explicit `WorkerConfigs` deployment parameters.
+///
+/// `worker_configs` is one `(strategy, value)` pair per worker (strategy 0 = EIP-1559 with
+/// `value` as the gas target, strategy 1 = static with `value` as the fee), so its length is the
+/// genesis `numWorkers()`. Use this for tests that need a multi-worker `WorkerConfigs` contract;
+/// the single-worker default above matches the canonical testnet genesis.
+pub fn test_genesis_with_consensus_registry_and_workers(
+    num_validators: usize,
+    worker_configs: Vec<(u8, u64)>,
+) -> Genesis {
     // deterministic committee-eligible validator addresses (0x11.., 0x22.., ...)
     let all_validators: Vec<Address> = (1..=num_validators)
         .map(|i| Address::from_slice(&[(i as u8).wrapping_mul(0x11); 20]))
@@ -781,7 +794,7 @@ pub fn test_genesis_with_consensus_registry(num_validators: usize) -> Genesis {
         base_genesis,
         initial_stake_config,
         governance,
-        vec![(0u8, 30_000_000u64)],
+        worker_configs,
     )
     .expect("create consensus registry genesis accounts")
 }
