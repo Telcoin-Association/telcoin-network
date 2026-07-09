@@ -287,7 +287,7 @@ async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()
 
     // the every-epoch setter updates the pool (covers the respawn path where init is skipped).
     let new_fee = base_fee + 50;
-    execution_node.set_worker_base_fee(worker_id, new_fee).await;
+    execution_node.set_worker_base_fee(worker_id, new_fee).await?;
     let pool = execution_node.get_worker_transaction_pool(&worker_id).await?;
     assert_eq!(
         pool.block_info().pending_basefee,
