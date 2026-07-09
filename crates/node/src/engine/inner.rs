@@ -3,7 +3,7 @@
 //! This module contains the logic for execution.
 
 use crate::error::ExecutionError;
-use eyre::OptionExt;
+use eyre::{eyre, OptionExt};
 use jsonrpsee::http_client::HttpClient;
 use std::{net::SocketAddr, sync::Arc};
 use tn_batch_builder::BatchBuilder;
@@ -180,10 +180,14 @@ impl ExecutionNodeInner {
     /// Called every epoch so the pool charges the base fee the accumulator currently holds for
     /// the worker. This covers the respawn path, where `initialize_worker_components` is skipped
     /// but the base fee for the new epoch must still take effect. If the worker's components have
-    /// not been initialized, the update is dropped with a warning (and a debug assertion): the
+    /// not been initialized, the update is dropped with a warning and forces node shutdown: the
     /// worker's pool would keep charging the previous epoch's base fee, admitting underpriced
-    /// transactions into batches.
-    pub(super) fn set_worker_base_fee(&self, worker_id: WorkerId, base_fee: u64) {
+    /// transactions into batches that are rejected by peers.
+    pub(super) fn set_worker_base_fee(
+        &self,
+        worker_id: WorkerId,
+        base_fee: u64,
+    ) -> eyre::Result<()> {
         if let Some(worker) = self.workers.get(worker_id as usize) {
             let pool = worker.pool();
             let mut block_info = pool.block_info();
@@ -196,12 +200,12 @@ impl ExecutionNodeInner {
                 initialized_workers = self.workers.len(),
                 "set_worker_base_fee: dropping base-fee update for uninitialized worker"
             );
-            debug_assert!(
-                false,
+            return Err(eyre!(
                 "set_worker_base_fee: worker {worker_id} uninitialized ({} workers initialized)",
                 self.workers.len()
-            );
+            ));
         }
+        Ok(())
     }
 
     /// Respawn any tasks on the worker network when we get a new epoch task manager.
