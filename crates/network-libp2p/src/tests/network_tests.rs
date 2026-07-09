@@ -7,7 +7,6 @@ use crate::common::{
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
-use futures::StreamExt as _;
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::num::NonZeroUsize;
 use tn_config::{ConsensusConfig, NetworkConfig};
