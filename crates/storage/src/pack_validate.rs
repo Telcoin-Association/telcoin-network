@@ -37,7 +37,7 @@ use tn_types::{BlockHash, ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochRe
 
 use crate::{
     archive::pack::{Pack, PackCompression},
-    consensus_pack::{verify_epoch_meta, PackError, PackRecord},
+    consensus_pack::{verify_epoch_meta, PackError, PackRecord, PACK_VERSION},
 };
 
 /// Classification of a referenced-but-missing batch digest.
@@ -175,7 +175,8 @@ pub fn validate_pack_file(
 ) -> Result<PackValidationReport, PackError> {
     // Read-only open of just the data file — `Pack::open` loads/cross-checks the header (the wrong
     // epoch fails here with an open error) and needs no sidecar index files.
-    let pack = Pack::<PackRecord>::open(path, epoch as u64, true, PackCompression::ZStd)?;
+    let pack =
+        Pack::<PackRecord>::open(path, epoch as u64, true, PackCompression::ZStd, PACK_VERSION)?;
 
     // ---- Single pass: mirror `Inner::stream_import`, but collect every issue instead of bailing.
     let mut issues = Vec::new();
@@ -430,7 +431,7 @@ mod test {
     use super::{validate_pack_file, BatchClass, PackIssue, Verdict};
     use crate::{
         archive::pack::{Pack, PackCompression},
-        consensus_pack::{test::make_test_output, EpochMeta, PackRecord},
+        consensus_pack::{test::make_test_output, EpochMeta, PackRecord, PACK_VERSION},
         mem_db::MemDatabase,
     };
 
@@ -488,7 +489,8 @@ mod test {
     /// Write a record stream to a bare epoch-0 `data` pack file.
     fn write_records(path: &Path, records: &[PackRecord]) {
         let mut pack =
-            Pack::<PackRecord>::open(path, 0, false, PackCompression::ZStd).expect("open pack");
+            Pack::<PackRecord>::open(path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                .expect("open pack");
         for record in records {
             pack.append(record).expect("append record");
         }

@@ -1127,6 +1127,7 @@ impl PrimaryNetworkHandle {
                 | PackError::InvalidConsensusNumber(_, _)
                 | PackError::ConsensusNumberAlreadyAdded
                 | PackError::ConsensusNumberTooLow
+                | PackError::InvalidVersion(_, _)
                 | PackError::ConsensusNumberTooHigh => None,
             },
             ConsensusChainError::EpochMismatch
