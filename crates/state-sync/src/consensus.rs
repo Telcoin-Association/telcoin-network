@@ -2,7 +2,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
         Arc,
     },
     time::Duration,
@@ -29,6 +29,31 @@ enum ConsensusHeaderResult {
     Done,
     Continue(u64, ConsensusHeaderDigest),
     Retry,
+}
+
+/// RAII accounting for a single in-flight gap-fill walk.
+///
+/// Constructing one marks the gap walk active (single-flight) and adds it to the shared `tasks`
+/// throttle so the gossip-driven backfill sees the load. `Drop` releases both, so the slot is
+/// freed even if the walk task panics or is cancelled — otherwise a lost walk would wedge gap
+/// recovery permanently.
+struct GapWalkGuard {
+    active: Arc<AtomicBool>,
+    tasks: Arc<AtomicI32>,
+}
+
+impl GapWalkGuard {
+    fn new(active: Arc<AtomicBool>, tasks: Arc<AtomicI32>) -> Self {
+        tasks.fetch_add(1, Ordering::Relaxed);
+        Self { active, tasks }
+    }
+}
+
+impl Drop for GapWalkGuard {
+    fn drop(&mut self) {
+        self.tasks.fetch_sub(1, Ordering::Relaxed);
+        self.active.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Retrieve a verified consensus OUTPUT (header + batches) for `number` and cache it.
@@ -530,6 +555,10 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     let mut first_gossipped_epoch = None; // Track the first epoch we see via gossip.
     let mut last_number = None;
     let tasks = Arc::new(AtomicI32::new(0));
+    // At most one gap-fill walk runs at a time (single-flight); further requests coalesce onto the
+    // watch until it clears. Independent of the gossip watermark, so it can reach a gap below it.
+    let gap_walk_active = Arc::new(AtomicBool::new(false));
+    let mut rx_consensus_gap = consensus_bus.consensus_gap_request().subscribe();
     // This loop will track current consensus as well as try to backfill from current.
     // This task backfills the current epoch records as well as requesting entire pack files
     // be downloaded for missing historic epochs.
@@ -552,6 +581,46 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
                     &mut last_number,
                     &mut current_fetch_epoch,
                 ).await;
+            }
+
+            // The observer catch-up loop stalled on a bottom gap the gossip-driven walk cannot
+            // reach (its floor only ever rises). Fill exactly that range here, in the task that
+            // owns the fetch accounting, walking back from the verified tip down to `floor`.
+            gap = rx_consensus_gap.changed() => {
+                if gap.is_err() {
+                    // Bus dropped: the node is shutting down and this critical task ends with it.
+                    return;
+                }
+                let request = *rx_consensus_gap.borrow_and_update();
+                if let Some((epoch, number, hash, floor)) = request {
+                    // Single-flight: skip if a gap walk is already in flight (it will re-signal).
+                    if number >= floor && !gap_walk_active.swap(true, Ordering::Relaxed) {
+                        let guard = GapWalkGuard::new(gap_walk_active.clone(), tasks.clone());
+                        let db = db.clone();
+                        let consensus_bus = consensus_bus.clone();
+                        let network = network.clone();
+                        let consensus_chain = consensus_chain.clone();
+                        task_spawner.spawn_task(
+                            format!("gap-fill epoch {epoch} consensus {floor}..={number}"),
+                            async move {
+                                // Held for the walk's lifetime; Drop frees the single-flight slot
+                                // and the task count even on panic/cancellation.
+                                let _guard = guard;
+                                get_consensus_header_range(
+                                    number,
+                                    hash,
+                                    &db,
+                                    &consensus_bus,
+                                    &network,
+                                    &consensus_chain,
+                                    floor,
+                                )
+                                .await;
+                                Ok(())
+                            },
+                        );
+                    }
+                }
             }
 
             _ = &rx_shutdown => {
