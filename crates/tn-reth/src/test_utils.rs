@@ -27,7 +27,7 @@ use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
-    Secp256k1,
+    SECP256K1,
 };
 use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
 use tn_config::NodeInfo;
@@ -219,25 +219,22 @@ impl TransactionFactory {
     /// Secret: 9bf49a6a0755f953811fce125f2683d50429c3bb49e074147e0089a52eae155f
     pub fn new() -> Self {
         let mut rng = StdRng::from_seed([0; 32]);
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(&mut rng);
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
+        let (secret_key, _public_key) = SECP256K1.generate_keypair(&mut rng);
+        let keypair = ExecutionKeypair::from_secret_key(SECP256K1, &secret_key);
         Self { keypair, nonce: 0 }
     }
 
     /// create a new instance of self from a provided seed.
     pub fn new_random_from_seed<R: Rng + ?Sized>(rand: &mut R) -> Self {
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(rand);
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
+        let (secret_key, _public_key) = SECP256K1.generate_keypair(rand);
+        let keypair = ExecutionKeypair::from_secret_key(SECP256K1, &secret_key);
         Self { keypair, nonce: 0 }
     }
 
     /// create a new instance of self from a random seed.
     pub fn new_random() -> Self {
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(&mut StdRng::from_os_rng());
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
+        let (secret_key, _public_key) = SECP256K1.generate_keypair(&mut StdRng::from_os_rng());
+        let keypair = ExecutionKeypair::from_secret_key(SECP256K1, &secret_key);
         Self { keypair, nonce: 0 }
     }
 

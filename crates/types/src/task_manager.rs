@@ -768,7 +768,26 @@ mod test {
 
         drop(task_manager);
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Dropping the manager notifies local_shutdown; each killed task drops its
+        // Ping on exit, closing the ping channel. Poll for that instead of a fixed
+        // 1s sleep, bounded so a shutdown regression still fails loudly.
+        let killed = [
+            &pong_crit.ping_tx,
+            &pong_norm.ping_tx,
+            &spong_crit.ping_tx,
+            &spong_norm.ping_tx,
+            &rspong_crit.ping_tx,
+            &rspong_norm.ping_tx,
+            &rspong_block.ping_tx,
+            &rspong_crit_block.ping_tx,
+        ];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while killed.iter().any(|tx| !tx.is_closed()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("spawned tasks still alive 5s after TaskManager drop");
         assert!(pong_crit.ping(2).await.is_err());
         assert!(pong_norm.ping(2).await.is_err());
 

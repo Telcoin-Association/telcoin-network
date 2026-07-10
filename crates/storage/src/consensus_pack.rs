@@ -1819,6 +1819,18 @@ pub(crate) mod test {
         }
     }
 
+    /// Poll `condition` every 25ms until it holds, panicking with a clear message if it
+    /// does not become true within 10s. Bounded, event-driven replacement for fixed sleeps.
+    async fn wait_for(mut condition: impl AsyncFnMut() -> bool, msg: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !condition().await {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out after 10s waiting for {msg}"));
+    }
+
     #[tokio::test]
     async fn test_pack_save_wrong_epoch_rejected() {
         let temp_dir = TempDir::with_prefix("test_pack_wrong_epoch").expect("temp dir");
@@ -1949,7 +1961,14 @@ pub(crate) mod test {
             )
             .await
             .expect("open pack");
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // stream_import fully drains the stream before returning, so the data already
+            // lives in the pack thread; wait (bounded) for the last output to be readable
+            // instead of sleeping a fixed 2s.
+            wait_for(
+                async || pack.get_consensus_output(num_outputs as u64 * 2).await.is_ok(),
+                "last stream-imported consensus output to be readable",
+            )
+            .await;
             for i in 0..num_outputs {
                 let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();
                 let output = outputs.get(i as usize).unwrap();
