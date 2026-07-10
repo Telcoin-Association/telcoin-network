@@ -1138,6 +1138,12 @@ impl AllPeers {
         self.apply_committee_membership(committee)
     }
 
+    /// The current committee slot, as set from authoritative epoch state by
+    /// [`Self::update_committees`].
+    pub(super) fn current_committee(&self) -> &HashSet<BlsPublicKey> {
+        &self.current_committee
+    }
+
     /// Whether `bls_key` sits in any tracked committee slot (previous, current, or next).
     ///
     /// Committee membership is set every epoch from authoritative consensus state, so this is the
