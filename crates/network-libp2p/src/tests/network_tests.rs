@@ -1543,6 +1543,14 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
 
     let malicious_addr = config_2.primary_address();
 
+    // honest must resolve malicious_bls -> peer id to penalize it. the committee gate added in
+    // #827 drops kad-discovered records for non-committee keys, so register the malicious peer
+    // explicitly (an operator-provisioned, pinned path) instead. unlike committee membership this
+    // does not make honest re-dial the peer, so the Fatal ban disconnects and stays disconnected.
+    honest_peer
+        .add_explicit_peer(malicious_bls, config_2.primary_networkkey(), malicious_addr.clone())
+        .await?;
+
     // Connect malicious to honest
     malicious_peer
         .add_explicit_peer(
@@ -2608,6 +2616,14 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
         network.run().await.expect("nvv network run failed!");
     });
     nvv.start_listening(nvv_config.primary_address()).await?;
+    // seed the nvv's committee (target + the rest) BEFORE it connects so target's rpc-bearing
+    // record is retained the moment it arrives via kad; the committee gate added in #827 drops
+    // records for non-committee keys, and a late seed misses the record's first delivery. an nvv
+    // following the chain learns the committee from epoch state.
+    let committee_keys = std::iter::once(target_peer_bls)
+        .chain(committee.iter().map(|p| p.config.key_config().primary_public_key()))
+        .collect();
+    nvv.update_committees(Default::default(), committee_keys, Default::default()).await?;
     nvv.add_trusted_peer_and_dial(
         target_peer_bls,
         target_peer_net.clone(),
@@ -2696,6 +2712,14 @@ async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()>
     assert!(node_record.info.rpc.is_none());
     assert_eq!(node_record.info.multiaddrs, vec![peer2.config.primary_address()]);
 
+    // owner is a committee member so the gated discovery path (#827) retains its record;
+    // production applies committee membership from epoch state before processing records.
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        std::iter::once(owner_bls).collect(),
+        Default::default(),
+    );
+
     // an inbound put request stores the record and promotes it into `known_peers`
     network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
     assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&kad_record.key).is_some());
@@ -2748,6 +2772,14 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
         publisher: Some(owner_peer_id),
         expires: None,
     };
+
+    // owner is a committee member so the gated discovery path (#827) retains its record;
+    // production applies committee membership from epoch state before processing records.
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        std::iter::once(owner_bls).collect(),
+        Default::default(),
+    );
 
     network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
 
