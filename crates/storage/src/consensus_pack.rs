@@ -216,11 +216,33 @@ impl ConsensusPack {
         previous_epoch: EpochRecord,
         committee: Committee,
     ) -> Result<ConsensusPack, PackError> {
+        Self::open_append_inner(path, previous_epoch, committee, PACK_VERSION)
+    }
+
+    /// Test-only: open an append pack forcing a specific on-disk data version so tests can
+    /// construct genuine v0 (legacy, batches-first) pack files.
+    #[cfg(test)]
+    pub(crate) fn open_append_version<P: Into<PathBuf>>(
+        path: P,
+        previous_epoch: EpochRecord,
+        committee: Committee,
+        version: u16,
+    ) -> Result<ConsensusPack, PackError> {
+        Self::open_append_inner(path, previous_epoch, committee, version)
+    }
+
+    /// Shared body for [`Self::open_append`] stamping the given on-disk data `version`.
+    fn open_append_inner<P: Into<PathBuf>>(
+        path: P,
+        previous_epoch: EpochRecord,
+        committee: Committee,
+        version: u16,
+    ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
         let epoch = committee.epoch();
-        let inner = Inner::open_append(path.clone(), &previous_epoch, committee.clone())?;
+        let inner = Inner::open_append(path.clone(), &previous_epoch, committee.clone(), version)?;
         let version = inner.version();
         let compression = inner.data.header().compression();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
@@ -415,8 +437,11 @@ impl ConsensusPack {
                 bytes.clear();
                 let mut value_buffer = Vec::new();
                 let mut compress_buffer = Vec::new();
+                // Re-encode as PackRecord-wrapped records (header first) to match the on-disk v1
+                // format the consumer decodes; the raw v1 serve path (below) returns these same
+                // PackRecord records straight from the pack file.
                 write_value(
-                    &header,
+                    &PackRecord::Consensus(Box::new(header)),
                     &mut bytes,
                     &mut value_buffer,
                     &mut compress_buffer,
@@ -424,7 +449,7 @@ impl ConsensusPack {
                 )?;
                 for (_, batch) in batches.into_iter() {
                     write_value(
-                        &batch,
+                        &PackRecord::Batch(batch),
                         &mut bytes,
                         &mut value_buffer,
                         &mut compress_buffer,
@@ -726,6 +751,7 @@ impl Inner {
         path: P,
         previous_epoch: &EpochRecord,
         committee: Committee,
+        version: u16,
     ) -> Result<Self, PackError> {
         let epoch = committee.epoch();
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
@@ -733,7 +759,7 @@ impl Inner {
         let pack_file = base_dir.join(Self::DATA_NAME);
         let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
         let mut data: Pack<PackRecord> =
-            Pack::open(&pack_file, epoch as u64, false, PackCompression::ZStd, PACK_VERSION)?;
+            Pack::open(&pack_file, epoch as u64, false, PackCompression::ZStd, version)?;
         let start_consensus_number =
             if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
         let epoch_meta = EpochMeta {
@@ -2424,6 +2450,92 @@ pub(crate) mod test {
         )
         .await;
         assert!(matches!(res, Err(PackError::TooManyBatches(_))), "expected TooManyBatches");
+    }
+
+    /// A v0 (legacy, batches-first) pack must serve its outputs as v1 (header-first) bytes via
+    /// `get_consensus_output_bytes`, so all peer-facing bytes are v1 regardless of on-disk format.
+    #[tokio::test]
+    async fn test_v0_output_served_as_v1_bytes() {
+        use crate::{
+            archive::pack_iter::AsyncPackIter,
+            consensus_pack::{bytes_to_output, bytes_to_output_legacy, PackRecord},
+        };
+        use std::io::Cursor;
+        use tokio::io::BufReader;
+
+        let temp_dir = TempDir::with_prefix("test_v0_served_v1").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Force a genuine v0 pack file (header stamped version 0 -> batches-first on disk).
+        let pack = ConsensusPack::open_append_version(
+            temp_dir.path(),
+            previous_epoch,
+            committee.clone(),
+            0,
+        )
+        .expect("open v0 pack");
+        assert_eq!(pack.version, 0, "constructor must produce a v0 pack file");
+
+        let num_outputs = 5;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output = make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+            parent = output.digest();
+            outputs.push(output.clone());
+            pack.save_consensus_output(output).await.unwrap();
+        }
+        pack.persist().await.expect("persist");
+
+        for (i, original) in outputs.iter().enumerate() {
+            let number = i as u64 + 1;
+            let bytes = pack.get_consensus_output_bytes(number).await.expect("bytes");
+
+            // 1. Header-first: the first record must be a Consensus header (v1 ordering). A v0 file
+            //    would have yielded a Batch first.
+            let mut iter = AsyncPackIter::<PackRecord, _>::open_partial(
+                BufReader::new(Cursor::new(bytes.clone())),
+                PackCompression::ZStd,
+                PACK_VERSION,
+            )
+            .await
+            .expect("open partial");
+            match iter.next().await {
+                Some(Ok(PackRecord::Consensus(_))) => {}
+                other => panic!("expected first record to be a Consensus header, got {other:?}"),
+            }
+
+            // 2. Decodes with the v1 decoder and matches the original output.
+            let decoded = bytes_to_output(
+                BufReader::new(Cursor::new(bytes.clone())),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+            )
+            .await
+            .expect("v1 decode");
+            compare_outputs(&decoded, original);
+
+            // 3. The bytes are truly re-ordered: the legacy (batches-first) decoder rejects them.
+            let legacy = bytes_to_output_legacy(
+                BufReader::new(Cursor::new(bytes)),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+            )
+            .await;
+            assert!(legacy.is_err(), "legacy decode of v1 bytes must fail, got {legacy:?}");
+
+            // The local read path still honors the on-disk v0 format (legacy decode).
+            compare_outputs(
+                &pack.get_consensus_output(number).await.expect("local read"),
+                original,
+            );
+        }
+        drop(pack);
     }
 
     /// CP2: get_consensus_output with a number below start_consensus_number must error rather
