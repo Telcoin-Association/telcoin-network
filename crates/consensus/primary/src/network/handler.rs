@@ -894,8 +894,9 @@ where
     ///
     /// Returns the full pack-file encoded output for `number` so a peer can reconstruct the
     /// [`tn_types::ConsensusOutput`] (batches + consensus header) without a separate batch fetch.
-    /// The bytes are streamed to the requesting peer (see `send_consensus_output_over_stream`),
-    /// because a single output can exceed the request/response message-size limit.
+    /// The bytes are streamed to the requesting peer over the typed sync protocol (see
+    /// `process_sync_consensus_output_stream`), because a single output can exceed the
+    /// request/response message-size limit.
     pub(super) async fn consensus_output_bytes(
         &self,
         number: u64,
@@ -1056,49 +1057,7 @@ where
         Ok(())
     }
 
-    /// Send a single consensus output's raw bytes over a stream.
-    ///
-    /// If the output is unavailable locally, the stream is simply closed with no bytes; the
-    /// requesting peer observes EOF and retries another peer.
-    pub(super) async fn send_consensus_output_over_stream<S>(
-        &self,
-        mut stream: S,
-        number: u64,
-        buffer_timeout: Duration,
-        peer: BlsPublicKey,
-    ) -> PrimaryNetworkResult<()>
-    where
-        S: AsyncWrite + Unpin + Send,
-    {
-        match self.consensus_output_bytes(number).await {
-            Ok(bytes) => {
-                // write in chunks so a single timeout bounds a slow reader
-                for chunk in bytes.chunks(16 * 1024) {
-                    timeout(buffer_timeout, stream.write_all(chunk)).await??;
-                }
-            }
-            Err(e) => {
-                // Benign miss (e.g. not-yet-served during catch-up): close with no bytes so the
-                // peer retries elsewhere. Closing below also handles the unavailable case.
-                debug!(
-                    target: "primary::network",
-                    %peer,
-                    ?number,
-                    ?e,
-                    "consensus output unavailable for stream; closing with no bytes"
-                );
-            }
-        }
-
-        // attempt to close the stream gracefully
-        if let Err(e) = stream.close().await {
-            tracing::warn!(target: "primary::network", %peer, ?number, ?e, "stream close failed");
-        }
-
-        Ok(())
-    }
-
-    /// Process request to open a stream for an epoch pack or a single consensus output.
+    /// Process request to open a stream for an epoch pack (full or partial prefix).
     pub(super) async fn process_request_epoch_stream(
         &self,
         peer: BlsPublicKey,
@@ -1165,27 +1124,6 @@ where
                 .await
                 .inspect_err(|e| {
                     warn!(target: "primary::network", %peer, ?e, "failed to send partial epoch over stream")
-                })
-            }
-            StreamRequestKind::ConsensusOutput(number) => {
-                debug!(
-                    target: "primary::network",
-                    %peer,
-                    ?request_digest,
-                    number,
-                    "processing inbound consensus output stream"
-                );
-
-                // set timeout to prevent slow-read attack
-                self.send_consensus_output_over_stream(
-                    stream,
-                    number,
-                    SEND_STREAM_BUFFER_TIMEOUT,
-                    peer,
-                )
-                .await
-                .inspect_err(|e| {
-                    warn!(target: "primary::network", %peer, ?e, "failed to send consensus output over stream")
                 })
             }
         }
@@ -1325,6 +1263,75 @@ where
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync missing certificates stream");
             // bound the best-effort error write: a peer that read the `Ack` then
             // stopped reading would otherwise pin this responder task.
+            let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
+                let _ = write_frame(
+                    &mut stream,
+                    &SyncFrame::<PrimarySyncRequest>::Err(SyncFrameError::Internal),
+                    &mut encode_buffer,
+                    &mut compressed_buffer,
+                    max_frame,
+                )
+                .await;
+            })
+            .await;
+        }
+
+        // attempt to close the stream gracefully, bounded so a peer that stops
+        // reading cannot pin this responder task on the FIN flush
+        let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
+
+        Ok(())
+    }
+
+    /// Serve an inbound single-consensus-output sync exchange.
+    ///
+    /// The exchange has already been admitted against the concurrency caps and its
+    /// opening `Req(ConsensusOutput { number })` frame read by the caller. This
+    /// resolves the output bytes (with the same brief catch-up wait as before, via
+    /// [`Self::consensus_output_bytes`]) and streams them with
+    /// [`send_sync_consensus_output_over_stream`]: an available output is sent as
+    /// `Ack` + `Data`* + `End`; a benign miss (unknown number, or one not yet built
+    /// during catch-up) sheds with a [`SyncFrame::Deny`]`(Unavailable)` frame so the
+    /// requester retries elsewhere. A send failure is logged and best-effort signalled
+    /// with [`SyncFrame::Err`]; it is not a peer fault, so no penalty is returned
+    /// (metrics-only during the item-9b rollout, like the epoch-pack sync path).
+    ///
+    /// [`send_sync_consensus_output_over_stream`]: crate::network::sync_codec::send_sync_consensus_output_over_stream
+    pub(super) async fn process_sync_consensus_output_stream(
+        &self,
+        peer: BlsPublicKey,
+        mut stream: Stream,
+        number: u64,
+    ) -> PrimaryNetworkResult<()> {
+        debug!(target: "primary::network", %peer, number, "serving inbound sync consensus output stream");
+        let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
+
+        // resolve the output bytes; a benign miss is shed with `Deny(Unavailable)`
+        // inside the serve helper (not a peer fault), so drop the error into `None`.
+        let bytes = self.consensus_output_bytes(number).await.ok();
+
+        // bound the whole serve; flatten the timeout's outer Result into the send's
+        let served = timeout(
+            SEND_SYNC_PACK_TIMEOUT,
+            crate::network::sync_codec::send_sync_consensus_output_over_stream(
+                &mut stream,
+                bytes,
+                SEND_STREAM_BUFFER_TIMEOUT,
+                peer,
+                number,
+            ),
+        )
+        .await
+        .map_err(PrimaryNetworkError::from)
+        .and_then(|served| served);
+
+        // a send failure or timeout is logged and best-effort signalled so the
+        // requester stops waiting; it is not a peer fault, so no penalty
+        if let Err(e) = served {
+            warn!(target: "primary::network", %peer, ?e, "failed to serve sync consensus output stream");
+            // bound the best-effort error write: a peer that read the `Ack` then
+            // stopped reading would otherwise pin this responder task.
+            let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
             let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
                 let _ = write_frame(
                     &mut stream,

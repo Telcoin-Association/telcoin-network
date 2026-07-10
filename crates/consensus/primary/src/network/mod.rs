@@ -91,9 +91,6 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 /// TODO- replace with a size from consensus.  See Issue 782.
 const MAX_CONSENSUS_OUTPUT_STREAM_BYTES: usize = 512 * 1024 * 1024;
 
-/// Per-read timeout while draining a consensus-output stream (slow-peer guard).
-const CONSENSUS_OUTPUT_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the epoch-pack
 /// request frame is written. A peer that negotiated the sync protocol but does not
 /// answer (a pre-cutover node that registered the protocol but reads the stream on
@@ -152,18 +149,15 @@ pub enum StreamRequestKind {
         /// The final (inclusive) consensus header number to stream up to.
         last_consensus_number: u64,
     },
-    /// Stream the raw bytes for a single consensus output (by consensus chain number).
-    ConsensusOutput(u64),
 }
 
-/// Correlation digest for a single consensus-output stream request.
+/// Correlation digest for an epoch-pack stream request.
 ///
 /// Each kind is domain-separated so distinct requests never collide in the pending map:
 /// - `EpochPack(epoch)` hashes only the epoch — byte-for-byte the original full-stream scheme, so
 ///   existing full-stream clients are unaffected.
 /// - `EpochPackPartial { epoch, n }` additionally mixes in the stop number, giving it a distinct
 ///   digest from the full-epoch request.
-/// - `ConsensusOutput(n)` is tagged so output `N` never collides with epoch `N`.
 fn stream_request_digest(kind: &StreamRequestKind) -> B256 {
     let mut hasher = tn_types::DefaultHashFunction::new();
     match kind {
@@ -175,10 +169,6 @@ fn stream_request_digest(kind: &StreamRequestKind) -> B256 {
             hasher.update(b"epoch-pack-partial");
             hasher.update(&epoch.to_le_bytes());
             hasher.update(&last_consensus_number.to_le_bytes());
-        }
-        StreamRequestKind::ConsensusOutput(number) => {
-            hasher.update(b"consensus-output");
-            hasher.update(&number.to_le_bytes());
         }
     }
     B256::from_slice(hasher.finalize().as_bytes())
@@ -231,6 +221,24 @@ enum EpochPackAttempt {
     Imported,
     /// The peer did not answer the sync exchange; cache it unsyncable this epoch
     /// and skip it on later probes (it must upgrade to be syncable again).
+    Unsupported,
+    /// The peer answered but the exchange failed; try the next peer.
+    Failed(NetworkError),
+}
+
+/// The outcome of a single-consensus-output fetch attempt over the typed sync
+/// protocol.
+///
+/// Mirrors [`EpochPackAttempt`] but carries the fetched bytes on success (an output
+/// is reassembled into a `Vec<u8>` for the caller to decode and verify, not imported
+/// into the chain).
+enum ConsensusOutputAttempt {
+    /// The peer served the output's bytes.
+    Fetched(Vec<u8>),
+    /// The peer did not answer the sync exchange. Unlike a full-pack `Unsupported`
+    /// this is NOT cached unsyncable, because a peer that speaks `/tn-primary-sync`
+    /// but cannot decode this newer `ConsensusOutput` variant still serves full epoch
+    /// packs and must not be hidden from the full-pack path.
     Unsupported,
     /// The peer answered but the exchange failed; try the next peer.
     Failed(NetworkError),
@@ -529,139 +537,209 @@ impl PrimaryNetworkHandle {
         }
     }
 
-    /// Request the raw (serialized) consensus output bytes for `number` from a specific peer.
+    /// Request the raw (serialized) consensus output bytes for `number` from any
+    /// connected peer over the typed `/tn-primary-sync` protocol.
     ///
-    /// Returns the pack-file encoded output (batches + consensus header). A single output can
-    /// exceed the request/response message-size limit, so the bytes are streamed: this negotiates
-    /// the stream via RPC, then opens a stream and reads the bytes. The caller is responsible for
-    /// deserializing the result (with the epoch's committee) and verifying it; the bytes cannot be
-    /// cheaply validated at the network layer.
-    pub async fn request_consensus_output_from_peer(
+    /// Item 9b (#739) cut this path fully over to sync: there is no legacy `/tn-stream`
+    /// fallback. Probes up to `MAX_EPOCH_SYNC_PROBES` connected peers that are not
+    /// cached unsyncable, opening a stream whose opening frame carries
+    /// [`PrimarySyncRequest::ConsensusOutput`]; returns the reassembled bytes from the
+    /// first peer that serves, otherwise `Err` (the caller retries). Returns the
+    /// pack-file encoded output (batches + consensus header); the caller deserializes it
+    /// with the epoch committee and verifies the decoded header digest. A peer that
+    /// serves proves it speaks the sync protocol (cached `true`); a peer that does not
+    /// answer is NOT cached (an ambiguous `Unsupported`; see `ConsensusOutputAttempt`).
+    /// The probe is penalty-exempt.
+    pub async fn request_consensus_output(&self, number: u64) -> NetworkResult<Vec<u8>> {
+        let peers = self.handle.connected_peers().await?;
+
+        // Probe candidate peers one at a time (the async analog of a short-circuiting
+        // fold): `filter` drops peers cached unsyncable for free, `take` bounds the
+        // network probes, `then` runs each exchange and records its verdict, and
+        // `filter_map` + `next` stop at the first peer that serves (so no peer past the
+        // first success is probed).
+        let probes = futures::stream::iter(peers)
+            .filter(move |peer| {
+                let known_unsyncable = self.sync_capability.lock().get(peer) == Some(&false);
+                futures::future::ready(!known_unsyncable)
+            })
+            .take(MAX_EPOCH_SYNC_PROBES)
+            .then(move |peer| async move {
+                match self.sync_consensus_output_from_peer(peer, number).await {
+                    ConsensusOutputAttempt::Fetched(bytes) => {
+                        self.sync_capability.lock().insert(peer, true);
+                        debug!(
+                            target: "primary::network",
+                            %peer,
+                            number,
+                            "fetched consensus output over sync protocol"
+                        );
+                        Some(bytes)
+                    }
+                    ConsensusOutputAttempt::Unsupported => {
+                        // Ambiguous: the peer may serve full epoch packs but not decode
+                        // this newer `ConsensusOutput` variant, so do NOT cache `false`
+                        // and hide it from the full-pack path.
+                        debug!(
+                            target: "primary::network",
+                            %peer,
+                            number,
+                            "peer did not answer consensus output sync; skipping this probe"
+                        );
+                        None
+                    }
+                    ConsensusOutputAttempt::Failed(e) => {
+                        // the peer speaks sync but this exchange failed; keep it
+                        // sync-capable and try the next peer
+                        self.sync_capability.lock().insert(peer, true);
+                        warn!(
+                            target: "primary::network",
+                            %peer,
+                            number,
+                            ?e,
+                            "consensus output sync exchange failed; trying next peer"
+                        );
+                        None
+                    }
+                }
+            })
+            .filter_map(futures::future::ready);
+
+        // `next` needs the stream `Unpin`, which the `then(async move { .. })`
+        // combinator is not, so pin the probe chain on the stack before pulling the
+        // first success.
+        let mut probes = std::pin::pin!(probes);
+        probes.next().await.ok_or_else(|| {
+            NetworkError::RPCError(
+                "no peer served the consensus output over the sync protocol".to_string(),
+            )
+        })
+    }
+
+    /// Run one consensus-output sync exchange against `peer`, flattening the classified
+    /// outcome into a single [`ConsensusOutputAttempt`].
+    async fn sync_consensus_output_from_peer(
         &self,
         peer: BlsPublicKey,
         number: u64,
-    ) -> NetworkResult<Vec<u8>> {
-        let request = PrimaryRequest::StreamConsensusOutput { number };
-        let request_digest = stream_request_digest(&StreamRequestKind::ConsensusOutput(number));
-        let resp = self.handle.send_request(request, peer).await?.await??;
-        let PrimaryResponse::StreamRequestAck { ack } = resp.result else {
-            return Err(NetworkError::RPCError(
-                "Got wrong response, not a stream ack!".to_string(),
-            ));
-        };
-        if !ack {
-            return Err(NetworkError::RPCError(
-                "peer declined consensus output stream request".to_string(),
-            ));
-        }
-        let bytes = self.stream_consensus_output(peer, request_digest).await?;
-        if bytes.is_empty() {
-            return Err(NetworkError::RPCError(
-                "peer streamed an empty consensus output".to_string(),
-            ));
-        }
-        Ok(bytes)
+    ) -> ConsensusOutputAttempt {
+        self.try_sync_consensus_output_exchange(peer, number)
+            .await
+            .map_or_else(|attempt| attempt, ConsensusOutputAttempt::Fetched)
     }
 
-    /// Request the raw (serialized) consensus output bytes for `number` from a random peer,
-    /// trying up to three times from three different peers.
+    /// Open a `/tn-primary-sync` stream, write the consensus-output request in the
+    /// opening frame, read the `Ack`, and reassemble the streamed output bytes.
     ///
-    /// Returns the pack-file encoded output (batches + consensus header). A single output can
-    /// exceed the request/response message-size limit, so the bytes are streamed (see
-    /// [`Self::request_consensus_output_from_peer`]). The caller is responsible for deserializing
-    /// the result (with the epoch's committee) and verifying it; the bytes cannot be cheaply
-    /// validated at the network layer.
-    pub async fn request_consensus_output(&self, number: u64) -> NetworkResult<Vec<u8>> {
-        const TIMEOUT: Duration = Duration::from_secs(10);
-        let request = PrimaryRequest::StreamConsensusOutput { number };
-        let request_digest = stream_request_digest(&StreamRequestKind::ConsensusOutput(number));
-        // Try up to three times (from three peers) to get the output.
-        // This could be a lot more complicated but this KISS method should work fine.
-        for _ in 0..3 {
-            let dispatch = match self.handle.send_request_any(request.clone()).await {
-                Ok(rx) => rx,
-                Err(e) => {
-                    warn!(target: "primary::network", ?e, ?number, "send_request_any failed; retrying");
-                    continue;
-                }
-            };
-            let resp = match tokio::time::timeout(TIMEOUT, dispatch).await {
-                Ok(Ok(Ok(r))) => r,
-                Ok(Ok(Err(e))) => {
-                    warn!(target: "primary::network", ?e, ?number, "peer responded with error; retrying");
-                    continue;
-                }
-                Ok(Err(e)) => {
-                    warn!(target: "primary::network", ?e, ?number, "peer dropped response channel; retrying");
-                    continue;
-                }
-                Err(_) => {
-                    warn!(target: "primary::network", ?number, "request_consensus_output timed out waiting for peer response");
-                    continue;
-                }
-            };
-            let PrimaryResponse::StreamRequestAck { ack } = resp.result else {
-                continue;
-            };
-            if !ack {
-                continue;
-            }
-            match self.stream_consensus_output(resp.peer, request_digest).await {
-                Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
-                Ok(_) => {
-                    warn!(target: "primary::network", ?number, peer = %resp.peer, "peer streamed an empty consensus output; retrying");
-                }
-                Err(e) => {
-                    warn!(target: "primary::network", ?e, ?number, peer = %resp.peer, "failed to stream consensus output; retrying");
-                }
-            }
-        }
-        Err(NetworkError::RPCError("Could not get the consensus output!".to_string()))
-    }
-
-    /// Open a stream to `peer`, write the correlation digest, and read the streamed consensus
-    /// output bytes to EOF.
-    async fn stream_consensus_output(
+    /// `Err(ConsensusOutputAttempt::Unsupported)` means the peer did not answer the
+    /// protocol (negotiation failed, or it negotiated but never `Ack`ed - e.g. a peer
+    /// that speaks `/tn-primary-sync` but cannot decode the newer `ConsensusOutput`
+    /// variant and shut the stream). `Err(ConsensusOutputAttempt::Failed(_))` means a
+    /// transient or exchange-level error once the peer has proved sync-capable. A
+    /// transport I/O error during the open (`UpgradeIo`) is transient rather than a
+    /// protocol mismatch, so it maps to `Failed`.
+    async fn try_sync_consensus_output_exchange(
         &self,
         peer: BlsPublicKey,
-        request_digest: B256,
-    ) -> NetworkResult<Vec<u8>> {
-        let mut stream = self.handle.open_stream(peer, StreamKind::Legacy).await??;
-        stream
-            .write_all(request_digest.as_slice())
-            .await
-            .map_err(|e| NetworkError::RPCError(format!("failed to write request digest: {e}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| NetworkError::RPCError(format!("failed to flush request digest: {e}")))?;
-
-        let mut out = Vec::new();
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            let n = match tokio::time::timeout(
-                CONSENSUS_OUTPUT_STREAM_READ_TIMEOUT,
-                stream.read(&mut buf[..]),
-            )
-            .await
-            {
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => {
-                    return Err(NetworkError::RPCError(format!("stream read failed: {e}")))
+        number: u64,
+    ) -> Result<Vec<u8>, ConsensusOutputAttempt> {
+        // open the sync stream, flattening the command-channel and stream-open results.
+        // Only a genuine negotiation failure (`UpgradeFailed`) is a peer that does not
+        // advertise the protocol -> Unsupported; a transient upgrade I/O error or any
+        // other open error is not proof the peer lacks sync -> try next.
+        let mut stream =
+            self.handle.open_stream(peer, StreamKind::Sync).await.and_then(|s| s).map_err(|e| {
+                match () {
+                    () if matches!(e, NetworkError::Stream(StreamError::UpgradeFailed)) => {
+                        ConsensusOutputAttempt::Unsupported
+                    }
+                    () => ConsensusOutputAttempt::Failed(e),
                 }
-                Err(_) => return Err(NetworkError::RPCError("stream read timed out".to_string())),
-            };
-            if n == 0 {
-                break;
+            })?;
+
+        // write the request in the opening frame. Negotiation already succeeded, so a
+        // write failure is transient -> try next.
+        let max_frame = sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
+        let request = SyncFrame::Req(PrimarySyncRequest::ConsensusOutput { number });
+        let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+        write_frame(&mut stream, &request, &mut encode_buffer, &mut compressed_buffer, max_frame)
+            .await
+            .and(stream.flush().await)
+            .map_err(|e| {
+                ConsensusOutputAttempt::Failed(NetworkError::RPCRetryable(format!(
+                    "failed to write consensus output sync request frame: {e}"
+                )))
+            })?;
+
+        // read the responder's first frame. A timeout (outer `Err`) means no `Ack` -> a
+        // peer that negotiated sync but does not serve this variant, so try the next
+        // peer. A clean close on the read (inner `Err`) is the same Unsupported signal;
+        // any other read error after negotiation is transient -> Failed.
+        let (mut decode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+        let first = tokio::time::timeout(
+            SYNC_ACK_TIMEOUT,
+            read_frame::<_, PrimarySyncRequest>(
+                &mut stream,
+                &mut decode_buffer,
+                &mut compressed_buffer,
+                max_frame,
+            ),
+        )
+        .await
+        .map_err(|_elapsed| ConsensusOutputAttempt::Unsupported)?
+        .map_err(|e| {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            ) {
+                ConsensusOutputAttempt::Unsupported
+            } else {
+                ConsensusOutputAttempt::Failed(NetworkError::RPCRetryable(format!(
+                    "failed to read consensus output sync ack frame: {e}"
+                )))
             }
-            if out.len() + n > MAX_CONSENSUS_OUTPUT_STREAM_BYTES {
-                return Err(NetworkError::RPCError(
-                    "consensus output stream exceeded maximum size".to_string(),
-                ));
+        })?;
+
+        match first {
+            // accepted: reassemble the `Data`/`End` frames into the output bytes, bounded
+            // by the legacy size cap and the per-frame timeout inside the reader. An empty
+            // output is a miss (the responder `Ack`ed but holds nothing): try the next
+            // peer.
+            SyncFrame::Ack => {
+                let bytes = sync_codec::read_sync_consensus_output(
+                    stream,
+                    MAX_CONSENSUS_OUTPUT_STREAM_BYTES,
+                )
+                .await
+                .map_err(|e| {
+                    ConsensusOutputAttempt::Failed(NetworkError::RPCError(format!(
+                        "failed to read consensus output over sync stream: {e}"
+                    )))
+                })?;
+                (!bytes.is_empty()).then_some(bytes).ok_or_else(|| {
+                    ConsensusOutputAttempt::Failed(NetworkError::RPCError(
+                        "peer streamed an empty consensus output".to_string(),
+                    ))
+                })
             }
-            out.extend_from_slice(&buf[..n]);
+            // sync-capable, but shedding load or lacking the output: try next peer
+            SyncFrame::Deny(reason) => {
+                Err(ConsensusOutputAttempt::Failed(NetworkError::RPCRetryable(format!(
+                    "peer denied consensus output sync request: {reason:?}"
+                ))))
+            }
+            SyncFrame::Err(err) => Err(ConsensusOutputAttempt::Failed(NetworkError::RPCError(
+                format!("peer aborted consensus output sync exchange: {err:?}"),
+            ))),
+            // a well-behaved responder never opens with these
+            SyncFrame::Req(_) | SyncFrame::Data(_) | SyncFrame::End => {
+                Err(ConsensusOutputAttempt::Failed(NetworkError::ProtocolError(
+                    "unexpected opening sync frame from peer".to_string(),
+                )))
+            }
         }
-        Ok(out)
     }
 
     /// Request consensus header from a random peer up to three times from three different peers.
@@ -1531,18 +1609,34 @@ where
         self.send_stream_ack(ack, channel, cancel, format!("process-request-epoch-{peer}"));
     }
 
-    /// Process a request to stream a single consensus output's raw bytes.
+    /// Answer a legacy request-response `StreamConsensusOutput` request.
+    ///
+    /// Item 9b (#739) cut the consensus-output fetch fully over to the
+    /// `/tn-primary-sync` protocol, so this request-response path is no longer served:
+    /// peers fetch a single consensus output over sync. The request variant is retained
+    /// for wire compatibility (BCS variant indices stay until the coordinated `/0.0.2`
+    /// bump, item 9c); a legacy requester is answered with a typed error rather than
+    /// served.
     fn process_consensus_output_stream(
         &self,
         peer: BlsPublicKey,
-        number: u64,
+        _number: u64,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        let kind = StreamRequestKind::ConsensusOutput(number);
-        let request_digest = stream_request_digest(&kind);
-        let ack = self.accept_stream_request(peer, request_digest, kind);
-        self.send_stream_ack(ack, channel, cancel, format!("process-request-output-{peer}"));
+        let network_handle = self.network_handle.clone();
+        let task_name = format!("ConsensusOutputDeprecated-{peer}");
+        let response = PrimaryResponse::Error(PrimaryRPCError(
+            "consensus output is served over the sync protocol only".to_string(),
+        ));
+        self.task_spawner.spawn_task(task_name, async move {
+            tokio::select! {
+                _ = network_handle.handle.send_response(response, channel) => (),
+                // cancel notification from network layer
+                _ = cancel => (),
+            }
+            Ok(())
+        });
     }
 
     /// Process gossip from committee.
@@ -1720,6 +1814,14 @@ where
                             exclusive_lower_bound,
                             skip_rounds,
                         )
+                        .await?;
+                }
+                // `ConsensusOutput` over sync (item 9b): serve one output's raw bytes
+                // as a streamed `Ack` + `Data`* + `End`, replacing the legacy
+                // `StreamConsensusOutput` ack-plus-digest path.
+                SyncFrame::Req(PrimarySyncRequest::ConsensusOutput { number }) => {
+                    request_handler
+                        .process_sync_consensus_output_stream(peer, stream, number)
                         .await?;
                 }
                 // a well-behaved requester always opens with `Req`; anything else is

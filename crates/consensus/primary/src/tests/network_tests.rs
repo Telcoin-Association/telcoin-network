@@ -267,52 +267,6 @@ async fn test_retrieve_consensus_output() {
     assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
 }
 
-/// The server-side stream send writes exactly the stored output bytes and closes the stream.
-/// An unknown number closes the stream with no bytes (the client observes EOF and retries).
-#[tokio::test]
-async fn test_send_consensus_output_over_stream() {
-    let temp_dir = TempDir::new().unwrap();
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path()).await;
-    let committee_obj = committee.committee();
-    let peer = BlsPublicKey::default();
-
-    for number in 1..=3u64 {
-        let cert = Certificate::default();
-        let sub_dag = CommittedSubDag::new(
-            vec![cert.clone()],
-            cert,
-            number,
-            ReputationScores::new(&committee_obj),
-            None,
-        );
-        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
-    }
-
-    // streamed bytes for a stored output must match the bytes returned by the lookup
-    for number in 1..=3u64 {
-        let expected = handler
-            .consensus_output_bytes(number)
-            .await
-            .expect("stored consensus output should be served");
-        let mut streamed: Vec<u8> = Vec::new();
-        handler
-            .send_consensus_output_over_stream(&mut streamed, number, Duration::from_secs(5), peer)
-            .await
-            .expect("streaming a stored output should succeed");
-        assert_eq!(streamed, expected, "streamed bytes must match stored output {number}");
-        assert!(!streamed.is_empty(), "streamed output {number} must not be empty");
-    }
-
-    // an unknown number streams nothing (graceful EOF) rather than erroring the send
-    let mut streamed: Vec<u8> = Vec::new();
-    handler
-        .send_consensus_output_over_stream(&mut streamed, 999, Duration::from_secs(5), peer)
-        .await
-        .expect("streaming an unknown output closes gracefully");
-    assert!(streamed.is_empty(), "unknown output must stream zero bytes");
-}
-
 #[tokio::test]
 async fn test_vote_succeeds() -> eyre::Result<()> {
     // common types
