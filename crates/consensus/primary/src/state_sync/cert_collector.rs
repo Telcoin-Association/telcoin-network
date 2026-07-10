@@ -60,7 +60,8 @@ where
         let start_time = Instant::now();
         let request =
             MissingCertificatesRequest { exclusive_lower_bound, skip_rounds, max_response_size: 0 };
-        let (lower_bound, skip_rounds) = request.get_bounds()?;
+        let (lower_bound, skip_rounds) = request
+            .get_bounds(config.network_config().sync_config().max_skip_rounds_for_missing_certs)?;
 
         // initialize the fetch queue with the first round for each authority
         let mut fetch_queue = BinaryHeap::new();

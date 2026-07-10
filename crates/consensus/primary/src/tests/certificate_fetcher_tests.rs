@@ -208,7 +208,7 @@ async fn test_fetch_certificates_basic() {
     let mut first_batch_len = 0;
     let mut first_batch_resp = vec![];
     if let Some((_, inner, reply)) = fake_receiver.recv().await {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(1_000).unwrap();
         assert_eq!(lower_bound, 0);
         assert_eq!(skip_rounds.len(), fixture.authorities().count());
         for rounds in skip_rounds.values() {
@@ -242,14 +242,14 @@ async fn test_fetch_certificates_basic() {
     loop {
         match fake_receiver.recv().await {
             Some((_, inner, reply)) => {
-                let (_, skip_rounds) = inner.get_bounds().unwrap();
+                let (_, skip_rounds) = inner.get_bounds(1_000).unwrap();
                 if skip_rounds.values().next().unwrap().len() == 1 {
                     // Drain the fetch requests sent out before the last reply, when only 1 round in
                     // skip_rounds.
                     reply.send(Ok(first_batch_resp.clone())).unwrap();
                     continue;
                 }
-                let (_, skip_rounds) = inner.get_bounds().unwrap();
+                let (_, skip_rounds) = inner.get_bounds(1_000).unwrap();
                 assert_eq!(skip_rounds.len(), fixture.authorities().count());
                 for (_, rounds) in skip_rounds {
                     let rounds = rounds.into_iter().collect::<Vec<_>>();
@@ -289,7 +289,7 @@ async fn test_fetch_certificates_basic() {
     loop {
         match fake_receiver.try_recv() {
             Ok((_, inner, reply)) => {
-                let (_, skip_rounds) = inner.get_bounds().unwrap();
+                let (_, skip_rounds) = inner.get_bounds(1_000).unwrap();
                 let first_num_skip_rounds = skip_rounds.values().next().unwrap().len();
                 if first_num_skip_rounds == 16 || first_num_skip_rounds == 17 {
                     // Drain the fetch requests sent out before the last reply.
@@ -311,7 +311,7 @@ async fn test_fetch_certificates_basic() {
 
     // Verify the fetch request.
     if let Some((_, inner, reply)) = fake_receiver.recv().await {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(1_000).unwrap();
         assert_eq!(lower_bound, 0);
         assert_eq!(skip_rounds.len(), fixture.authorities().count());
         for rounds in skip_rounds.values() {
@@ -351,7 +351,7 @@ async fn test_fetch_certificates_basic() {
 
     // Verify the fetch request.
     if let Some((_, inner, reply)) = fake_receiver.recv().await {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(1_000).unwrap();
         assert_eq!(lower_bound, 0);
         assert_eq!(skip_rounds.len(), fixture.authorities().count());
         for rounds in skip_rounds.values() {
@@ -383,7 +383,7 @@ async fn test_fetch_certificates_basic() {
 
     // Verify the fetch request.
     if let Some((_, inner, reply)) = fake_receiver.recv().await {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(1_000).unwrap();
         assert_eq!(lower_bound, 0);
         assert_eq!(skip_rounds.len(), fixture.authorities().count());
         for rounds in skip_rounds.values() {
@@ -677,7 +677,7 @@ async fn test_gc_round_update_during_fetch() {
 
     // first fetch request
     if let Some((_, inner, reply)) = fake_receiver.recv().await {
-        let (lower_bound, _) = inner.get_bounds().unwrap();
+        let (lower_bound, _) = inner.get_bounds(1_000).unwrap();
         assert_eq!(lower_bound, 0, "initial GC round should be 0");
 
         // don't respond yet
@@ -696,7 +696,7 @@ async fn test_gc_round_update_during_fetch() {
         panic!("Should receive fetch request with updated GC round but timedout");
     };
 
-    let (_lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+    let (_lower_bound, skip_rounds) = inner.get_bounds(1_000).unwrap();
     // verify skip_rounds don't include rounds <= 5
     for rounds in skip_rounds.values() {
         assert!(rounds.iter().all(|&r| r > 5), "should not fetch rounds <= GC round");

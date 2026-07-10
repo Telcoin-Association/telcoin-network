@@ -55,7 +55,7 @@ fn test_missing_certs_request() {
         .expect("boundary set")
         .set_max_response_size(max);
     let (decoded_gc_round, decoded_skip_rounds) =
-        missing_req.get_bounds().expect("decode missing bounds");
+        missing_req.get_bounds(1_000).expect("decode missing bounds");
     assert_eq!(expected_gc_round, decoded_gc_round);
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
 }
@@ -76,7 +76,111 @@ fn test_missing_certs_request_skip_round_overflow() {
         skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
         max_response_size: 10,
     };
-    assert_matches!(missing_req.get_bounds(), Err(PrimaryNetworkError::InvalidRequest(_)));
+    assert_matches!(missing_req.get_bounds(1_000), Err(PrimaryNetworkError::InvalidRequest(_)));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_rejects_decompression_bomb() {
+    // A serialized RoaringBitmap header declaring 65_536 run containers is only 4 bytes on the
+    // wire, yet `deserialize_from` would expand it to ~512 MiB of heap (roaring 0.10 has no run
+    // store, so each run container becomes an ~8 KiB array/bitmap store). The container count is
+    // read straight from the header and rejected before a single container is allocated.
+    // See GHSA-4ggp-fcpj-g9f3.
+    const RUN_COOKIE: u32 = 12347;
+    let container_count: u32 = 65_536;
+    let cookie = ((container_count - 1) << 16) | RUN_COOKIE;
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), cookie.to_le_bytes().to_vec())],
+        max_response_size: 10,
+    };
+    assert_matches!(request.get_bounds(1_000), Err(PrimaryNetworkError::InvalidRequest(_)));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_rejects_oversized_cardinality() {
+    // A well-formed bitmap whose cardinality exceeds the limit is rejected before the
+    // `O(cardinality)` collect, even though it occupies a single cheap container.
+    let mut serialized = Vec::new();
+    (0..=1_000u32)
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 10,
+    };
+    // 1_001 rounds against a limit of 1_000
+    assert_matches!(request.get_bounds(1_000), Err(PrimaryNetworkError::InvalidRequest(_)));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_accepts_cardinality_at_limit() {
+    // The bound is inclusive: a bitmap with exactly the maximum number of rounds is accepted.
+    let expected: BTreeSet<Round> = (1..=1_000).collect();
+    let mut serialized = Vec::new();
+    expected
+        .iter()
+        .copied()
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    let origin = AuthorityIdentifier::dummy_for_test(0);
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(origin.clone(), serialized)],
+        max_response_size: 10,
+    };
+    let (lower_bound, skip_rounds) =
+        request.get_bounds(1_000).expect("bitmap at the limit is accepted");
+    assert_eq!(lower_bound, 0);
+    assert_eq!(skip_rounds.get(&origin), Some(&expected));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_accepts_container_count_at_limit() {
+    // Pin the pre-deserialize container-count gate's inclusive boundary: a legitimate bitmap of
+    // `cap` rounds, each in a distinct 65_536-round block, occupies exactly `cap` containers and
+    // must be accepted. A `<` instead of `<=` on the container check would wrongly reject it, and
+    // the single-container fixtures above would not catch that. See GHSA-4ggp-fcpj-g9f3.
+    let expected: BTreeSet<Round> = (0..1_000u32).map(|block| block * 65_536).collect();
+    let mut serialized = Vec::new();
+    expected
+        .iter()
+        .copied()
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    let origin = AuthorityIdentifier::dummy_for_test(0);
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(origin.clone(), serialized)],
+        max_response_size: 10,
+    };
+    let (_, skip_rounds) =
+        request.get_bounds(1_000).expect("max-container bitmap at the limit is accepted");
+    assert_eq!(skip_rounds.get(&origin), Some(&expected));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_rejects_malformed_bitmap_header() {
+    // An unrecognized cookie and a truncated header are both rejected without deserializing.
+    let unknown_cookie = vec![0xFF, 0xFF, 0xFF, 0xFF];
+    let truncated = vec![0x3A, 0x30]; // first two bytes of the NO_RUNCONTAINER cookie (12346)
+    for serialized in [unknown_cookie, truncated] {
+        let request = MissingCertificatesRequest {
+            exclusive_lower_bound: 0,
+            skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+            max_response_size: 10,
+        };
+        assert_matches!(request.get_bounds(1_000), Err(PrimaryNetworkError::InvalidRequest(_)));
+    }
 }
 
 /// The type for holding testng components.
