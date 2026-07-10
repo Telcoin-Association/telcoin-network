@@ -28,6 +28,15 @@ use tracing::{debug, error, info, warn};
 /// `SealedHeader`.
 type PendingExecutionTask = oneshot::Receiver<EngineResult<SealedHeader>>;
 
+/// Maximum number of consensus outputs buffered for execution.
+///
+/// Each queued output holds a full `CommittedSubDag` plus batches, so an unbounded queue lets a
+/// lagging engine consume all memory while consensus keeps committing. Once the queue is full
+/// the engine stops polling the consensus stream, pushing backpressure into the `to_engine`
+/// channel (and ultimately the EpochManager forwarder) instead of buffering here. The
+/// `tn_engine_queued_outputs` gauge tracks occupancy.
+pub const MAX_QUEUED_OUTPUTS: usize = 8;
+
 /// The TN consensus engine is responsible executing state that has reached consensus.
 ///
 /// The engine makes no attempt to track consensus. It's only purpose is to receive output from
@@ -229,7 +238,11 @@ impl ExecutorEngine {
                 _ = &self.rx_shutdown, if !self.rx_shutdown.noticed() => {}
 
                 // check if output is available from consensus to keep broadcast stream from "lagging"
-                output = self.consensus_output_stream.next(), if !consensus_closed => {
+                //
+                // gated on the queue bound: while the backlog is full there is always a
+                // pending execution task to wake the loop, and each completion re-opens the
+                // gate, so consensus backpressures instead of growing the queue unbounded
+                output = self.consensus_output_stream.next(), if !consensus_closed && self.queued.len() < MAX_QUEUED_OUTPUTS => {
                     output
                         .map(|output| {
                             // queue the output for local execution
