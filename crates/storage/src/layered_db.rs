@@ -81,6 +81,13 @@ impl<DB: Database> DbTxMut for LayeredDbTxMut<DB> {
         Ok(())
     }
 
+    /// Queue the commit to the background writer thread and return.
+    ///
+    /// For a non-full-memory layer the commit is therefore asynchronous: when this
+    /// returns, the data may not be committed on-disk yet and may still be in the mem
+    /// layer, so an immediate `iter()` can observe a key in both layers.  Callers that
+    /// need a read-your-writes guarantee for iteration must call
+    /// [`Database::sync_persist`] (or await [`Database::persist`]) after committing.
     fn commit(self) -> eyre::Result<()> {
         self.tx.send(DBMessage::CommitTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
         Ok(())

@@ -277,8 +277,8 @@ where
                     warn!(target: "worker::network", "worker application received unexpected peer exchange message");
                 }
             },
-            NetworkEvent::Gossip(msg, relayer) => {
-                self.process_gossip(msg, relayer);
+            NetworkEvent::Gossip { message, relayer, author } => {
+                self.process_gossip(message, relayer, author);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = WorkerResponse::Error(message::WorkerRPCError(msg));
@@ -338,7 +338,12 @@ where
     }
 
     /// Process gossip from a worker.
-    fn process_gossip(&self, msg: GossipMessage, relayer: Option<BlsPublicKey>) {
+    fn process_gossip(
+        &self,
+        msg: GossipMessage,
+        relayer: Option<BlsPublicKey>,
+        author: Option<BlsPublicKey>,
+    ) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
@@ -348,19 +353,14 @@ where
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
-                // A gossip fault is charged to the *relaying* peer, not the message
-                // author. Faults determined purely by message content (malformed
-                // encoding, mis-topic, ...) are the author's: the network layer
-                // accepted and forwarded this message after a shallow check, so an
-                // honest relayer could not have screened it. Banning the relayer for an
-                // author-content fault lets a Byzantine author ban honest validators and
-                // partition the gossip mesh (see issue #801). Penalize only when the
-                // fault is attributable to the relaying peer and its BLS identity has
-                // resolved.
-                let attributable =
-                    relayer.zip(e.penalty()).filter(|_| !e.is_author_content_fault());
-                if let Some((relayer, penalty)) = attributable {
-                    network_handle.report_penalty(relayer, penalty).await;
+                // Charge the accountable peer, and only once its BLS identity has resolved: the
+                // author for a content-determined fault (#819, guaranteed resolved on the
+                // restricted batch topic), the relaying peer for every other fault (#801).
+                // `is_author_content_fault` is the shared classifier; `zip` skips the penalty when
+                // that peer is unresolved or the error carries no penalty.
+                let charged = if e.is_author_content_fault() { author } else { relayer };
+                if let Some((peer, penalty)) = charged.zip(e.penalty()) {
+                    network_handle.report_penalty(peer, penalty).await;
                 }
                 Err(e.into())
             } else {

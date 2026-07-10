@@ -79,6 +79,50 @@ pub fn config_local_testnet_with_epoch_duration(
     accounts: Option<Vec<(Address, GenesisAccount)>>,
     epoch_duration_secs: Option<u32>,
 ) -> eyre::Result<()> {
+    config_local_testnet_inner(temp_path, passphrase, accounts, epoch_duration_secs, &[])
+}
+
+/// Like [`config_local_testnet_with_epoch_duration`], but also lets the caller set per-worker
+/// fee strategies at genesis via `--worker-fee-config`.
+///
+/// Each entry is a `"WORKER_ID:STRATEGY:VALUE"` string, where `STRATEGY` is `0` for EIP-1559
+/// (`VALUE` = target gas) or `1` for a static fee (`VALUE` = fee in wei). Entries must cover
+/// contiguous worker ids starting at 0 (the genesis ceremony validates this).
+///
+/// When `worker_fee_configs` is empty this is identical to
+/// [`config_local_testnet_with_epoch_duration`]: the genesis CLI default
+/// `Eip1559 { target_gas: u64::MAX }` applies, which keeps every worker pinned at
+/// `MIN_PROTOCOL_BASE_FEE`. When it is non-empty, the provided configs *replace* that default —
+/// do not also pass the default value.
+pub fn config_local_testnet_with_worker_fee_configs(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    epoch_duration_secs: Option<u32>,
+    worker_fee_configs: &[&str],
+) -> eyre::Result<()> {
+    config_local_testnet_inner(
+        temp_path,
+        passphrase,
+        accounts,
+        epoch_duration_secs,
+        worker_fee_configs,
+    )
+}
+
+/// Shared implementation for the `config_local_testnet*` helpers.
+///
+/// Builds the genesis CLI argument vector, optionally appending `--epoch-duration-in-secs` and one
+/// `--worker-fee-config` flag per entry in `worker_fee_configs`, runs the genesis ceremony, and
+/// distributes the resulting genesis/committee/parameters files to every validator and the
+/// observer.
+fn config_local_testnet_inner(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    epoch_duration_secs: Option<u32>,
+    worker_fee_configs: &[&str],
+) -> eyre::Result<()> {
     let validators = [
         ("validator-1", "0x1111111111111111111111111111111111111111"),
         ("validator-2", "0x2222222222222222222222222222222222222222"),
@@ -122,6 +166,13 @@ pub fn config_local_testnet_with_epoch_duration(
     if let Some(duration) = epoch_duration_secs {
         genesis_args.push("--epoch-duration-in-secs".into());
         genesis_args.push(duration.to_string());
+    }
+    // Append one `--worker-fee-config` flag per provided entry. When empty, clap falls back to the
+    // genesis default (`0:0:u64::MAX`, an inert EIP-1559 strategy). Any provided configs replace
+    // that default, so callers must supply contiguous worker ids starting at 0.
+    for cfg in worker_fee_configs {
+        genesis_args.push("--worker-fee-config".into());
+        genesis_args.push((*cfg).to_string());
     }
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from(genesis_args);
     create_committee_command.args.execute(shared_genesis_dir.clone())?;

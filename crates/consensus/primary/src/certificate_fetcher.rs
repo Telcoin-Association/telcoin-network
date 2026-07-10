@@ -476,7 +476,7 @@ async fn fetch_from_peers<F: MissingCertFetcher>(
 
     loop {
         tokio::select! {
-            Some(result) = rx_results.recv() => {
+            Some((peer, result)) = rx_results.recv() => {
                 if let Ok(certificates) = result {
                     if !certificates.is_empty() {
                         debug!(target: "primary::cert_fetcher",
@@ -488,7 +488,7 @@ async fn fetch_from_peers<F: MissingCertFetcher>(
                             validate_fetched_certificate(cert).map_err(|e| {
                                 error!(
                                     target: "primary::cert_fetcher",
-                                    peer=?peers[peer_index],
+                                    peer=?peer,
                                     "cert fetch received invalid genesis cert from peer"
                                 );
                                 e.into()
@@ -554,13 +554,16 @@ fn spawn_peer_fetch<F: MissingCertFetcher>(
     peer: BlsPublicKey,
     request: MissingCertificatesRequest,
     network: F,
-    tx_results: tokio::sync::mpsc::UnboundedSender<CertManagerResult<Vec<Certificate>>>,
+    tx_results: tokio::sync::mpsc::UnboundedSender<(
+        BlsPublicKey,
+        CertManagerResult<Vec<Certificate>>,
+    )>,
     cancel_signal: Noticer,
 ) {
     task_spawner.spawn_task(format!("fetch-cert-{peer}"), async move {
         tokio::select! {
             result = network.fetch_missing_certificates(peer, request) => {
-                let _ = tx_results.send(result.map_err(Into::into));
+                let _ = tx_results.send((peer, result.map_err(Into::into)));
             }
             _ = cancel_signal => {
                 // cancelled - another peer succeeded
