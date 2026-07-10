@@ -129,18 +129,33 @@ impl MissingCertificatesRequest {
     /// Deserialize the [RoaringBitmap] representing the difference between the requesting peer's
     /// lower boundary and their GC round.
     ///
-    /// Every bitmap is attacker-controlled, so its expansion is bounded twice against
-    /// `max_skip_rounds_per_authority` (the committee's `max_skip_rounds_for_missing_certs`): once
-    /// on the container count read straight from the serialized header *before*
-    /// [`RoaringBitmap::deserialize_from`] allocates anything, and once on the decoded cardinality
-    /// *before* the `O(cardinality)` collect below. Without the first bound a few hundred KiB of
-    /// run-encoded bitmap decompresses to hundreds of MiB of heap during deserialization (roaring
-    /// 0.10 has no run store, so every run container is expanded into an array/bitmap store); see
-    /// GHSA-4ggp-fcpj-g9f3.
+    /// Every skip-round entry is attacker-controlled, so three request-shaped allocations are
+    /// bounded here, each rejected before it happens:
+    /// - `max_authorities` (the caller passes the committee size) bounds the number of
+    ///   `skip_rounds` entries (GHSA-wwqq-q2xx-4jf9). One bitmap per committee authority is the
+    ///   invariant; nothing else limits how many entries a peer can name in a single request, and
+    ///   each accepted entry costs a decode plus a retained `BTreeSet`.
+    /// - `max_skip_rounds_per_authority` (the committee's `max_skip_rounds_for_missing_certs`)
+    ///   bounds each bitmap twice (GHSA-4ggp-fcpj-g9f3): once on the container count read straight
+    ///   from the serialized header *before* [`RoaringBitmap::deserialize_from`] allocates anything
+    ///   (a few hundred KiB of run-encoded bitmap would otherwise decompress to hundreds of MiB of
+    ///   heap during deserialization -- roaring 0.10 has no run store, so every run container is
+    ///   expanded into an array/bitmap store), and once on the decoded cardinality *before* the
+    ///   `O(cardinality)` collect below.
     pub(crate) fn get_bounds(
         &self,
         max_skip_rounds_per_authority: usize,
+        max_authorities: usize,
     ) -> PrimaryNetworkResult<(Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>)> {
+        // One skip-round bitmap per committee authority is the documented invariant; reject a
+        // request naming more authorities than the committee has before decoding anything.
+        (self.skip_rounds.len() <= max_authorities).then_some(()).ok_or_else(|| {
+            PrimaryNetworkError::InvalidRequest(format!(
+                "skip_rounds authority count exceeds committee size: {} > {max_authorities}",
+                self.skip_rounds.len()
+            ))
+        })?;
+
         let max_cardinality = u64::try_from(max_skip_rounds_per_authority).unwrap_or(u64::MAX);
         let skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>> = self
             .skip_rounds

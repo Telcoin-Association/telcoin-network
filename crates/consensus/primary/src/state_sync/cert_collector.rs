@@ -60,8 +60,16 @@ where
         let start_time = Instant::now();
         let request =
             MissingCertificatesRequest { exclusive_lower_bound, skip_rounds, max_response_size: 0 };
-        let (lower_bound, skip_rounds) = request
-            .get_bounds(config.network_config().sync_config().max_skip_rounds_for_missing_certs)?;
+        // Bound the request *before* anything is materialized (see
+        // `MissingCertificatesRequest::get_bounds`): the committee size caps how many
+        // per-authority entries a peer can name, and the per-authority container/cardinality gates
+        // keep a compressed bitmap under the RPC size cap from decoding to billions of rounds and
+        // OOM-ing the node. The per-authority loop below re-checks the cardinality limit as a
+        // defense-in-depth secondary guard.
+        let max_skip_rounds =
+            config.network_config().sync_config().max_skip_rounds_for_missing_certs;
+        let max_authorities = config.committee().size();
+        let (lower_bound, skip_rounds) = request.get_bounds(max_skip_rounds, max_authorities)?;
 
         // initialize the fetch queue with the first round for each authority
         let mut fetch_queue = BinaryHeap::new();

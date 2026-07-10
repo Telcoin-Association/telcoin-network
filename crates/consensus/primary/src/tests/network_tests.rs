@@ -55,9 +55,108 @@ fn test_missing_certs_request() {
         .expect("boundary set")
         .set_max_response_size(max);
     let (decoded_gc_round, decoded_skip_rounds) =
-        missing_req.get_bounds(1_000).expect("decode missing bounds");
+        missing_req.get_bounds(1_000, 4).expect("decode missing bounds");
     assert_eq!(expected_gc_round, decoded_gc_round);
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
+}
+
+/// A `RoaringBitmap` is a *compressed* set, so a `MissingCertificates` request that stays under the
+/// 1 MiB RPC size cap can still decode to millions of skip rounds (and, via run containers -- which
+/// the deserializer accepts -- to the full ~4.29e9 `u32` range; see GHSA-wwqq-q2xx-4jf9 /
+/// GHSA-4ggp-fcpj-g9f3). `get_bounds` must reject such a request by cardinality *before*
+/// materializing the set into a `BTreeSet`, otherwise `.collect()` allocates tens of GB and
+/// OOM-kills the validator.
+#[test]
+fn test_get_bounds_rejects_oversized_skip_rounds() {
+    use roaring::RoaringBitmap;
+
+    let max_skip_rounds = 1_000;
+
+    // 5M set bits serialize to ~0.6 MiB: comfortably under the 1 MiB RPC cap, yet 5000x the
+    // per-authority skip-round limit. The bound is checked on cardinality (not serialized size), so
+    // a regression here fails by returning `Ok` rather than by OOM-ing the test runner.
+    let mut bomb = RoaringBitmap::new();
+    assert_eq!(bomb.insert_range(0..=5_000_000), 5_000_001);
+    let mut serialized = Vec::new();
+    bomb.serialize_into(&mut serialized).expect("serialize skip-round bitmap");
+    assert!(
+        serialized.len() < 1024 * 1024,
+        "bomb stays under the RPC cap: {} bytes",
+        serialized.len()
+    );
+
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 0,
+    };
+
+    // Rejected on cardinality, before the ~5M-element `BTreeSet` is materialized (the ~77 dense
+    // containers clear the container-count gate, so the cardinality gate is what fires).
+    assert_matches!(
+        request.get_bounds(max_skip_rounds, 4),
+        Err(PrimaryNetworkError::InvalidRequest(msg)) if msg.contains("too large:")
+    );
+}
+
+/// Nothing but the committee size bounds how many `skip_rounds` entries a request can name:
+/// each accepted entry costs a bitmap decode plus a retained `BTreeSet`, so tens of thousands
+/// of entries (each individually under the per-authority limit) would still materialize a
+/// multi-hundred-MiB map. `get_bounds` must reject on entry count before decoding anything.
+#[test]
+fn test_get_bounds_rejects_too_many_authorities() {
+    use roaring::RoaringBitmap;
+
+    let max_skip_rounds = 1_000;
+    let max_authorities = 4;
+
+    // One more entry than the committee has authorities; every entry is individually tiny and
+    // well-formed, so the rejection can only come from the entry-count gate.
+    let skip_rounds: Vec<_> = (0..=4u8)
+        .map(|i| {
+            let mut serialized = Vec::new();
+            [1u32, 2, 3]
+                .into_iter()
+                .collect::<RoaringBitmap>()
+                .serialize_into(&mut serialized)
+                .expect("serialize skip-round bitmap");
+            (AuthorityIdentifier::dummy_for_test(i), serialized)
+        })
+        .collect();
+    assert_eq!(skip_rounds.len(), max_authorities + 1);
+
+    let request =
+        MissingCertificatesRequest { exclusive_lower_bound: 0, skip_rounds, max_response_size: 0 };
+
+    assert_matches!(
+        request.get_bounds(max_skip_rounds, max_authorities),
+        Err(PrimaryNetworkError::InvalidRequest(msg)) if msg.contains("exceeds committee size")
+    );
+}
+
+/// A skip-round count at or below the limit still decodes normally: the cardinality gate must not
+/// reject legitimate `MissingCertificates` requests.
+#[test]
+fn test_get_bounds_accepts_within_limit_skip_rounds() {
+    use roaring::RoaringBitmap;
+
+    let max_skip_rounds = 1_000;
+
+    let mut bitmap = RoaringBitmap::new();
+    assert_eq!(bitmap.insert_range(0..=(max_skip_rounds as u32 - 1)), max_skip_rounds as u64);
+    let mut serialized = Vec::new();
+    bitmap.serialize_into(&mut serialized).expect("serialize skip-round bitmap");
+
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 10,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 0,
+    };
+
+    let (lower_bound, skip_rounds) =
+        request.get_bounds(max_skip_rounds, 4).expect("within-limit ok");
+    assert_eq!(lower_bound, 10);
+    assert_eq!(skip_rounds[&AuthorityIdentifier::dummy_for_test(0)].len(), max_skip_rounds);
 }
 
 #[test]
@@ -76,7 +175,7 @@ fn test_missing_certs_request_skip_round_overflow() {
         skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
         max_response_size: 10,
     };
-    assert_matches!(missing_req.get_bounds(1_000), Err(PrimaryNetworkError::InvalidRequest(_)));
+    assert_matches!(missing_req.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
 }
 
 #[test]
@@ -95,7 +194,7 @@ fn test_get_bounds_rejects_decompression_bomb() {
         skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), cookie.to_le_bytes().to_vec())],
         max_response_size: 10,
     };
-    assert_matches!(request.get_bounds(1_000), Err(PrimaryNetworkError::InvalidRequest(_)));
+    assert_matches!(request.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
 }
 
 #[test]
@@ -114,7 +213,7 @@ fn test_get_bounds_rejects_oversized_cardinality() {
         max_response_size: 10,
     };
     // 1_001 rounds against a limit of 1_000
-    assert_matches!(request.get_bounds(1_000), Err(PrimaryNetworkError::InvalidRequest(_)));
+    assert_matches!(request.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
 }
 
 #[test]
@@ -136,7 +235,7 @@ fn test_get_bounds_accepts_cardinality_at_limit() {
         max_response_size: 10,
     };
     let (lower_bound, skip_rounds) =
-        request.get_bounds(1_000).expect("bitmap at the limit is accepted");
+        request.get_bounds(1_000, 4).expect("bitmap at the limit is accepted");
     assert_eq!(lower_bound, 0);
     assert_eq!(skip_rounds.get(&origin), Some(&expected));
 }
@@ -163,7 +262,7 @@ fn test_get_bounds_accepts_container_count_at_limit() {
         max_response_size: 10,
     };
     let (_, skip_rounds) =
-        request.get_bounds(1_000).expect("max-container bitmap at the limit is accepted");
+        request.get_bounds(1_000, 4).expect("max-container bitmap at the limit is accepted");
     assert_eq!(skip_rounds.get(&origin), Some(&expected));
 }
 
@@ -179,7 +278,7 @@ fn test_get_bounds_rejects_malformed_bitmap_header() {
             skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
             max_response_size: 10,
         };
-        assert_matches!(request.get_bounds(1_000), Err(PrimaryNetworkError::InvalidRequest(_)));
+        assert_matches!(request.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
     }
 }
 
