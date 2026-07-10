@@ -19,7 +19,7 @@ use tn_types::{encode, max_batch_size, Batch, Database, Epoch, B256};
 /// Batch db reads are chunked to limit the amount of batches in memory.
 ///
 /// SAFETY: current max batch size is 1MB.
-const BATCH_DIGESTS_READ_CHUNK_SIZE: usize = 200;
+pub(crate) const BATCH_DIGESTS_READ_CHUNK_SIZE: usize = 200;
 
 /// Read a single length-prefixed, snappy-compressed batch from a stream.
 ///
@@ -498,6 +498,38 @@ mod tests {
         assert_eq!(result.len(), batch_count);
         let received_digests: BTreeSet<B256> = result.iter().map(|(d, _)| *d).collect();
         assert_eq!(received_digests, digests);
+    }
+
+    /// A peer that answers with a run of zero-count chunk headers exceeding the
+    /// request's chunk span must be rejected, not spun on (regression for the
+    /// zero-count spin, GHSA-cq2q-p534-cmmg). `read_and_validate_batches_with_timeout`
+    /// caps the number of chunk headers at `ceil(requested / 200)`.
+    ///
+    /// The input is a FINITE buffer of zero-count headers so the test terminates
+    /// deterministically under either behaviour: with the cap it errors at the
+    /// first header past the span; if the cap were ever removed the reader would
+    /// instead drain the buffer, hit EOF, and return `Ok` — failing this assertion
+    /// cleanly rather than hanging. (An infinite reader could not test this: a
+    /// no-progress busy-loop never yields, so no `tokio::time::timeout` guard could
+    /// fire to catch a regression — it would hang the test instead.)
+    #[tokio::test]
+    async fn test_read_and_validate_rejects_zero_count_flood() {
+        // one digest -> chunk span of 1, so the second zero-count header is already
+        // one past the cap. Send several so a removed cap would still terminate (EOF).
+        let digests: BTreeSet<B256> = create_test_batches(1).iter().map(|b| b.digest()).collect();
+        assert!(!digests.is_empty());
+        let zero_count_headers = vec![0u8; 8 * std::mem::size_of::<u32>()];
+        let mut cursor = Cursor::new(zero_count_headers);
+
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+        let outcome = handle.read_and_validate_batches_with_timeout(&mut cursor, &digests).await;
+
+        assert!(
+            outcome.is_err(),
+            "a run of zero-count headers past the chunk-span cap must error, got {outcome:?}"
+        );
     }
 
     /// The sync responder's `Ack`+`Data`+`End` framing round-trips through the
