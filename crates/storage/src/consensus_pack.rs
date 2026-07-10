@@ -685,6 +685,10 @@ impl Inner {
                 }
                 idx -= 1;
             }
+            // Only ever shrink: `truncate` is `set_len`, so a `new_pack_len` above the current
+            // length (an index entry claiming an `output_end` past the data we actually have)
+            // would zero-extend the pack.  Clamp defensively.
+            let new_pack_len = new_pack_len.min(pack_len);
             if new_pack_len != pack_len {
                 data.truncate(new_pack_len)?;
             }
@@ -1427,10 +1431,22 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
         }
     }
     let expected_digest_count = expected_batch_digests.len();
+    // Bound how many batch records we will read for one output before the terminating
+    // condition.  The header is read first, so a hostile stream cannot flood batches ahead of
+    // it, but the header's sub-dag (attacker-controlled, bounded only by MAX_RECORD_SIZE) can
+    // still declare a huge number of payload digests.  Reject early — before reading/buffering
+    // any batches — like the legacy path does.  A legitimate ConsensusOutput references far
+    // fewer batches than this.
+    if expected_digest_count > MAX_BATCHES_PER_OUTPUT {
+        return Err(PackError::TooManyBatches(MAX_BATCHES_PER_OUTPUT));
+    }
     let mut expected_batch_digests = expected_batch_digests.into_iter();
 
     let mut available_batches = HashMap::new();
-    // Load and verify batches.
+    // Load and verify batches.  Batches are matched positionally against `expected_batch_digests`
+    // (sorted digest order): producers write them in `BTreeMap`/`BTreeSet` digest order (see
+    // `collect_batches` / `save_consensus_batches`), so the stream MUST arrive in that same order.
+    // Out-of-order input is rejected below rather than silently reordered.
     let mut digest_count = 0;
     while let Some(record) = next_output_record(stream_iter, timeout).await? {
         match record {
@@ -2093,7 +2109,7 @@ pub(crate) mod test {
             let output_db = pack
                 .get_consensus_output(i as u64 + 1)
                 .await
-                .expect(&format!("failed output on {i}"));
+                .unwrap_or_else(|e| panic!("failed output on {i}: {e}"));
             let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
         }
@@ -2335,6 +2351,79 @@ pub(crate) mod test {
         .await;
         // New format will fail by starting with a batch.  This would be TooManyBatches with v0.
         assert!(matches!(res, Err(PackError::BatchLoad(_))), "expected BatchLoad");
+    }
+
+    /// CP1b: in the v1 (header-first) format a hostile header whose sub-dag declares more than
+    /// `MAX_BATCHES_PER_OUTPUT` payload digests must be rejected up front — before any batch is
+    /// read — rather than allocating/reading a batch per declared digest.
+    #[tokio::test]
+    async fn test_iter_to_output_caps_expected_batches() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output, PackError, PackRecord, MAX_BATCHES_PER_OUTPUT},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_expected_cap").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // Craft a single consensus header whose leader references more distinct batch digests
+        // than the cap.
+        let batches = tn_reth::test_utils::batches(chain, MAX_BATCHES_PER_OUTPUT + 5);
+        let authority = committee.authorities().first().expect("authority").id();
+        let mut leader = Certificate::default();
+        leader.update_header_author_for_test(authority);
+        for batch in &batches {
+            let mut builder = HeaderBuilder::from_header(leader.header());
+            builder = builder.with_payload_batch(batch, 0_u16);
+            leader.update_header_for_test(builder.build());
+        }
+        leader.update_header_round_for_test(1);
+        leader.update_header_epoch_for_test(committee.epoch());
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            None,
+        );
+        let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let output = ConsensusOutput::new(
+            sub_dag,
+            ConsensusHeader::default().digest(),
+            1,
+            false,
+            batch_digests,
+            vec![],
+        );
+        assert!(
+            output.sub_dag().num_primary_batches() > MAX_BATCHES_PER_OUTPUT,
+            "test must exceed the cap"
+        );
+
+        // Write just the header record (v1: header first) with no batch records to follow.
+        let path = temp_dir.path().join("header_only");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Consensus(Box::new(output.consensus_header())))
+                .expect("append header");
+            pack.commit().expect("commit");
+        }
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        assert!(matches!(res, Err(PackError::TooManyBatches(_))), "expected TooManyBatches");
     }
 
     /// CP2: get_consensus_output with a number below start_consensus_number must error rather
