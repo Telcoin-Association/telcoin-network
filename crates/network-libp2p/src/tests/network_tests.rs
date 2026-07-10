@@ -2975,6 +2975,77 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
     Ok(())
 }
 
+/// Regression test for issue #828: `published_to_peers` is a per-process-lifetime de-dup gate that
+/// is never cleaned on disconnect, so as an unbounded set it grew once per distinct `PeerId` ever
+/// seen and would eventually OOM a RAM-capped node. It is now a capacity-bounded LRU: a flood of
+/// fresh peer identities must pin it at [`MAX_PUBLISHED_TO_PEERS`] and never grow past it.
+#[tokio::test]
+async fn test_published_to_peers_is_bounded() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // The field is initialized at the intended cap and starts empty.
+    assert_eq!(network.published_to_peers.cap(), MAX_PUBLISHED_TO_PEERS);
+    assert_eq!(network.published_to_peers.len(), 0);
+
+    // Each fresh, never-before-seen peer is a first-time push (this is exactly what the
+    // `PeerEvent::PeerConnected` arm does when it sees a new `PeerId`). Overrun the cap and
+    // assert the set never grows past it.
+    let cap = MAX_PUBLISHED_TO_PEERS.get();
+    for _ in 0..(cap + 100) {
+        let peer_id = PeerId::random();
+        assert!(
+            network.mark_published_to_peer(peer_id),
+            "a never-before-seen peer must register as a first-time push"
+        );
+        assert!(
+            network.published_to_peers.len() <= cap,
+            "published_to_peers must never exceed its LRU capacity"
+        );
+    }
+
+    // The flood pinned the set at capacity rather than growing without bound.
+    assert_eq!(
+        network.published_to_peers.len(),
+        cap,
+        "a flood of distinct peers fills the LRU to exactly its capacity and stays there"
+    );
+}
+
+/// Regression test for issue #828: bounding `published_to_peers` must not reintroduce the kad
+/// re-push amplification the gate exists to prevent. An actively (re)connecting peer must stay
+/// resident in the LRU - so it keeps de-duping and is never re-pushed to - even while a flood of
+/// fresh peers churns the rest of the set.
+#[tokio::test]
+async fn test_published_to_peers_keeps_active_peer_resident() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // First sight of our sticky peer warrants a one-time push.
+    let sticky = PeerId::random();
+    assert!(
+        network.mark_published_to_peer(sticky),
+        "first sight of a peer must register as a first-time push"
+    );
+
+    // The sticky peer keeps reconnecting while enough fresh identities connect to overrun the
+    // cap. Because every reconnect promotes it to most-recently-used, it is never the eviction
+    // victim - unlike a plain insertion-order set, which would drop it after `cap` fresh inserts.
+    for _ in 0..(MAX_PUBLISHED_TO_PEERS.get() + 100) {
+        assert!(
+            !network.mark_published_to_peer(sticky),
+            "a reconnecting peer we have already pushed to must not be re-pushed"
+        );
+        network.mark_published_to_peer(PeerId::random());
+    }
+
+    // Despite the flood, the continually-active peer survived eviction and still de-dups.
+    assert!(
+        !network.mark_published_to_peer(sticky),
+        "an actively reconnecting peer must survive LRU eviction (no re-push storm)"
+    );
+}
+
 /// Regression for issue #819: a resolved author identity is carried on the delivered gossip
 /// event so the application layer can charge an author-content fault to the author rather than
 /// the forwarding relayer.
