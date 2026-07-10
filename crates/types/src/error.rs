@@ -217,6 +217,9 @@ pub enum HeaderError {
     /// Vote request includes too many parents.
     #[error("Too many parents in vote request: {0} > {1}")]
     TooManyParents(usize, usize),
+    /// Header references more batch digests than the protocol permits.
+    #[error("Header references too many batches: {0} > {1}")]
+    TooManyBatches(usize, usize),
     /// Vote request includes parent(s) that were not requested.
     #[error("Got parents we did not request")]
     InvalidParents,

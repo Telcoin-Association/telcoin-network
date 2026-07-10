@@ -31,6 +31,25 @@ pub const DEFAULT_PRIMARY_PORT: u16 = 44894;
 /// same list (good or bad) not unfairly be punished while another node is rewarded.
 pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 33;
 
+/// Maximum garbage-collection depth, in consensus rounds, that the protocol supports.
+///
+/// A single `CommittedSubDag` is the causal history of one leader certificate down to
+/// `gc_round + 1`, so it spans at most this many rounds (see `order_dag`). A node's configured
+/// `gc_depth` is validated against this ceiling by `Parameters::validate`, and the consensus-pack
+/// reconstruction bound (`max_batches_per_output`) is derived from it, so raising this value
+/// requires re-deriving that bound.
+pub const MAX_GC_DEPTH: Round = 50;
+
+/// Maximum number of batch digests a single primary `Header` may reference.
+///
+/// The proposer caps its own headers at the configured `max_header_num_of_batches`, and
+/// `Header::validate` rejects any inbound header that exceeds this protocol ceiling, so the
+/// per-header batch count is a genuine consensus invariant rather than a proposer-only convention.
+/// Together with [`MAX_GC_DEPTH`] and the committee size it bounds the number of unique batches a
+/// committed `ConsensusOutput` can contain, which the consensus-pack reader relies on to
+/// reconstruct every executed output.
+pub const MAX_HEADER_NUM_OF_BATCHES: usize = 10;
+
 /// The round number.
 /// Becomes the lower 32 bits of a nonce (with epoch the high bits).
 pub type Round = u32;

@@ -198,6 +198,7 @@ Source: `crates/consensus/primary/src/error/network.rs:137-171`.
 | `AlreadyVoted(_, _)`               | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
 | `DuplicateParents`                 | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
 | `TooManyParents(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `TooManyBatches(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
 | `UnknownNetworkKey(_)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
 | `PeerNotAuthor`                    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
 | `InvalidGenesisParent(_)`          | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |

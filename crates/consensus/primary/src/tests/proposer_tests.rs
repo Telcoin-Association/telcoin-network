@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use std::collections::BTreeSet;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
-use tn_types::{now, HeaderBuilder, B256};
+use tn_types::{error::HeaderError, now, HeaderBuilder, B256, MAX_HEADER_NUM_OF_BATCHES};
 
 #[tokio::test]
 async fn test_empty_proposal() {
@@ -34,6 +34,31 @@ async fn test_empty_proposal() {
     assert!(header.validate(&committee).is_ok());
 
     // TODO: assert header el state present
+}
+
+/// A header at the protocol batch ceiling validates, but one batch over is rejected.  This keeps
+/// the per-header batch count a genuine consensus invariant (not just a proposer convention), which
+/// is what lets the consensus-pack reader bound the batches per output and always reconstruct a
+/// committed sub-DAG (#896).
+#[tokio::test]
+async fn test_header_rejects_too_many_batches() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+
+    // Random, distinct batch digests keyed to worker 0; only the payload length differs.
+    let at_ceiling: IndexMap<B256, u16> =
+        (0..MAX_HEADER_NUM_OF_BATCHES).map(|_| (B256::random(), 0)).collect();
+    let ok = primary.header_builder(&committee).payload(at_ceiling).build();
+    assert!(ok.validate(&committee).is_ok(), "header at the ceiling must validate");
+
+    let over_ceiling: IndexMap<B256, u16> =
+        (0..MAX_HEADER_NUM_OF_BATCHES + 1).map(|_| (B256::random(), 0)).collect();
+    let too_many = primary.header_builder(&committee).payload(over_ceiling).build();
+    assert!(
+        matches!(too_many.validate(&committee), Err(HeaderError::TooManyBatches(_, _))),
+        "header over the ceiling must be rejected"
+    );
 }
 
 #[tokio::test]

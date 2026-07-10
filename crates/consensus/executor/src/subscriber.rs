@@ -463,8 +463,11 @@ impl<DB: Database> Subscriber<DB> {
             }
         }
 
-        // SAFETY: 10-node committees * 6-round commit max * 5 batch max = 300 max batch digests
-        // possible 32bytes * 300 = 9.6 kb => well within 1MB max message size
+        // A committed sub-DAG spans at most `MAX_GC_DEPTH` rounds, with at most one certificate per
+        // authority per round and at most `MAX_HEADER_NUM_OF_BATCHES` batches per header, so
+        // `batch_set` holds at most `committee.size() * MAX_GC_DEPTH * MAX_HEADER_NUM_OF_BATCHES`
+        // unique digests.  The consensus-pack reader (`max_batches_per_output`) uses that same
+        // bound, so every output built here can later be reconstructed from pack storage.
         let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
 
         let mut batches = Vec::with_capacity(num_certs);
