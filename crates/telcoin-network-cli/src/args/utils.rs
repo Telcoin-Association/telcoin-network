@@ -4,6 +4,7 @@ use eyre::OptionExt;
 use std::str::FromStr;
 use tn_reth::{dirs::DataDirPath, MaybePlatformPath};
 use tn_types::{Address, U256};
+use url::Url;
 
 /// Create a default path for the node.
 pub fn tn_platform_path(value: &str) -> eyre::Result<MaybePlatformPath<DataDirPath>> {
@@ -22,6 +23,16 @@ pub fn clap_address_parser(value: &str) -> eyre::Result<Address> {
     };
 
     Ok(address)
+}
+
+/// Parse a JSON-RPC endpoint URL from a string.
+///
+/// Used by `keytool set-rpc` for the `--http`/`--ws` endpoints advertised in
+/// `node-info.yaml`. Scheme validation (http/https, ws/wss) is left to
+/// [`tn_types::RpcInfo::validate`] so the CLI applies the exact check node
+/// startup runs.
+pub fn clap_url_parser(value: &str) -> eyre::Result<Url> {
+    Ok(Url::parse(value)?)
 }
 
 /// Parse 18 decimal U256 from string for ConsensusRegistry.
