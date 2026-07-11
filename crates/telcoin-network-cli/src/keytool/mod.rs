@@ -61,6 +61,26 @@ impl KeyArgs {
         Ok(())
     }
 
+    /// Test-only twin of [`Self::execute`]: `generate validator|observer` wrap the fresh BLS
+    /// key with an intentionally weak PBKDF2 round count; every other subcommand never writes
+    /// keys and behaves exactly like [`Self::execute`]. NEVER call this outside tests.
+    #[cfg(feature = "test-utils")]
+    pub fn execute_insecure(
+        &self,
+        datadir: PathBuf,
+        passphrase: Option<String>,
+        rounds: u32,
+    ) -> eyre::Result<()> {
+        if let KeySubcommand::Generate(args) = &self.command {
+            if let NodeType::ValidatorKeys(a) | NodeType::ObserverKeys(a) = &args.node_type {
+                // initialize path and warn users if overwriting keys
+                self.init_path(datadir.node_keys_path(), a.force)?;
+                return a.execute_insecure(&datadir, passphrase, rounds);
+            }
+        }
+        self.execute(datadir, passphrase)
+    }
+
     /// Ensure the path exists, and if not, create it.
     fn init_path<P: AsRef<Path>>(&self, path: P, force: bool) -> eyre::Result<()> {
         let rpath = path.as_ref();

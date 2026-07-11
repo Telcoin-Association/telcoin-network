@@ -11,10 +11,10 @@ description.workspace = true
 exclude.workspace = true
 
 [dependencies]
-telcoin-network-cli = { workspace = true }
+telcoin-network-cli = { workspace = true, features = ["test-utils"] }
 clap = { workspace = true, features = ["derive", "env"] }
 eyre = { workspace = true }
-tn-config = { workspace = true, features = ["test-utils"]}
+tn-config = { workspace = true }
 tn-node = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 tracing = { workspace = true }

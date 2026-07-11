@@ -21,6 +21,14 @@ use tracing::{error, info};
 /// Only compile main bin once for all tests.
 pub static TELCOIN_BINARY: OnceLock<CargoRun> = OnceLock::new();
 
+/// PBKDF2 round count for test-generated BLS keyfiles.
+///
+/// Tests intentionally wrap keys with a trivially weak KDF so suites don't spend CPU on
+/// 1,000,000-round PBKDF2 per node. The round count is not stored on disk; the spawned node
+/// binary - built without any test features - recovers these keys by trying the weak round
+/// count when reading (and warns that they are weakly wrapped).
+const INSECURE_TEST_KDF_ROUNDS: u32 = 1;
+
 /// RPC endpoints for a single node across all transports.
 #[derive(Debug)]
 pub struct NodeEndpoints {
@@ -43,7 +51,7 @@ pub fn create_validator_info(
     // keytool
     let keys_command =
         CommandParser::<KeyArgs>::parse_from(["tn", "generate", "validator", "--address", address]);
-    keys_command.args.execute(datadir, passphrase)?;
+    keys_command.args.execute_insecure(datadir, passphrase, INSECURE_TEST_KDF_ROUNDS)?;
 
     Ok(())
 }
@@ -58,7 +66,7 @@ fn create_observer_info(datadir: PathBuf, passphrase: Option<String>) -> eyre::R
         "--address",
         "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
     ]);
-    keys_command.args.execute(datadir, passphrase)
+    keys_command.args.execute_insecure(datadir, passphrase, INSECURE_TEST_KDF_ROUNDS)
 }
 
 /// Create validator info, genesis ceremony, and configure local testnet.

@@ -73,3 +73,6 @@ workspace = true
 
 [features]
 adiri = []
+# Enables the insecure key-generation twins (weak PBKDF2 rounds) for tests.
+# Purely additive: it must never change how the secure paths behave.
+test-utils = ["tn-config/test-utils"]

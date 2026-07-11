@@ -145,14 +145,8 @@ pub struct KeygenArgs {
 }
 
 impl KeygenArgs {
-    fn update_keys<TND: TelcoinDirs>(
-        &self,
-        node_info: &mut NodeInfo,
-        tn_datadir: &TND,
-        passphrase: Option<String>,
-    ) -> eyre::Result<()> {
-        let key_config = KeyConfig::generate_and_save(tn_datadir, passphrase)?;
-        set_proof_of_possession(node_info, &key_config, self.address)?;
+    fn update_keys(&self, node_info: &mut NodeInfo, key_config: &KeyConfig) -> eyre::Result<()> {
+        set_proof_of_possession(node_info, key_config, self.address)?;
 
         // Fresh keys: use the operator-supplied name, else derive from the new BLS key.
         // (`generate pop` never reaches here, so it preserves the existing name.)
@@ -207,17 +201,22 @@ impl KeygenArgs {
         Ok(())
     }
 
-    /// Create all necessary information needed for validator and save to file.
-    pub fn execute<TND: TelcoinDirs>(
-        &self,
-        tn_datadir: &TND,
-        passphrase: Option<String>,
-    ) -> eyre::Result<()> {
-        info!(target: "tn::generate_keys", "generating keys for full validator node");
-        let mut node_info = NodeInfo::default();
+    /// Validate the CLI arguments before any keys are generated or written.
+    fn validate(&self) -> eyre::Result<()> {
         if self.workers != 1 {
             return Err(eyre::eyre!("Only supports a single worker at this time!"));
         }
+        Ok(())
+    }
+
+    /// Shared tail of key generation: derive node info from the freshly generated keys and
+    /// write node-info.yaml.
+    fn finish_execute<TND: TelcoinDirs>(
+        &self,
+        tn_datadir: &TND,
+        key_config: &KeyConfig,
+    ) -> eyre::Result<()> {
+        let mut node_info = NodeInfo::default();
         /* Uncomment when multi-worker support is enabled
         if self.workers > 1 {
             node_info.p2p_info.worker_index.0 = Vec::with_capacity(self.workers as usize);
@@ -227,11 +226,38 @@ impl KeygenArgs {
         }
         */
 
-        self.update_keys(&mut node_info, tn_datadir, passphrase)?;
+        self.update_keys(&mut node_info, key_config)?;
 
         // execution address is set inside `set_proof_of_possession` (called by `update_keys`)
         Config::write_to_path(tn_datadir.node_info_path(), &node_info, ConfigFmt::YAML)?;
 
         Ok(())
+    }
+
+    /// Create all necessary information needed for validator and save to file.
+    pub fn execute<TND: TelcoinDirs>(
+        &self,
+        tn_datadir: &TND,
+        passphrase: Option<String>,
+    ) -> eyre::Result<()> {
+        info!(target: "tn::generate_keys", "generating keys for full validator node");
+        self.validate()?;
+        let key_config = KeyConfig::generate_and_save(tn_datadir, passphrase)?;
+        self.finish_execute(tn_datadir, &key_config)
+    }
+
+    /// Test-only twin of [`Self::execute`] that wraps the generated BLS key with an
+    /// intentionally weak PBKDF2 round count. NEVER call this outside tests.
+    #[cfg(feature = "test-utils")]
+    pub fn execute_insecure<TND: TelcoinDirs>(
+        &self,
+        tn_datadir: &TND,
+        passphrase: Option<String>,
+        rounds: u32,
+    ) -> eyre::Result<()> {
+        info!(target: "tn::generate_keys", "generating keys for node with INSECURE test KDF");
+        self.validate()?;
+        let key_config = KeyConfig::generate_and_save_insecure(tn_datadir, passphrase, rounds)?;
+        self.finish_execute(tn_datadir, &key_config)
     }
 }

@@ -29,7 +29,7 @@ Software:
 Build from source:
 
 ```bash
-cargo build --bin telcoin-network --release
+cargo build -p telcoin-network --bin telcoin-network --release
 ```
 
 The binary lands at `target/release/telcoin-network`.
