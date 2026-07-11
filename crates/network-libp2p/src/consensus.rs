@@ -2025,6 +2025,16 @@ where
     }
 
     /// Cleanup kad record queries (called on last step).
+    ///
+    /// The winning record is promoted ONLY into the peer manager's `known_peers` cache (via
+    /// `add_discovered_peer`) and deliberately NOT written to the kad store: `known_peers` is
+    /// the read model of discovery, and the node needs the resolution, not the record.
+    /// Persisting merely-queried third-party records would enlist libp2p's `PutRecordJob` to
+    /// republish them on every replication run (hourly by libp2p default), making this node an
+    /// hourly replicator of records it never needed to serve, and would erode the store's
+    /// max-records cap — the node's DHT storage-duty budget — with query traffic. Nothing is
+    /// lost: peers push their own records on first connect (an inbound kad put handled by
+    /// [`Self::process_kad_put_request`]), which is the path that legitimately feeds the store.
     fn close_kad_query(&mut self, query_id: &QueryId) {
         if let Some(query) = self.kad_record_queries.remove(query_id) {
             if let Some(node_record) = query.result {

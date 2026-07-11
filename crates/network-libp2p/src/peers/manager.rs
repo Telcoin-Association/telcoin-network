@@ -47,10 +47,29 @@ pub(crate) struct PeerManager {
     heartbeat: tokio::time::Interval,
     /// All peers for the manager.
     peers: AllPeers,
-    /// The collection of bls public keys to known peers.
-    /// This should incude the current and next couple of committee members network info.
-    /// This is used for bootstrapping and to make sure we know the network settings of committee
-    /// members.
+    /// The validated read-model of kad discovery: resolves a committee member's
+    /// [`BlsPublicKey`] to its [`NetworkInfo`] on the hot send path. [`Self::auth_to_peer`] is
+    /// a synchronous map probe on the swarm loop for every outbound BLS-addressed request;
+    /// resolving through the kad store instead would cost a key hash, a db get, and a decode
+    /// per call.
+    ///
+    /// The kad store is NOT a superset of this map: `get_record` query results are promoted
+    /// straight into this cache (`close_kad_query` in consensus.rs) and are deliberately never
+    /// written back to the store, so replacing this map with store reads would lose data.
+    ///
+    /// The lifecycles also differ. Store records lazily expire (the configured kad record TTL)
+    /// and can be evicted (max-records cap, ban-triggered removal); entries here have NO TTL by
+    /// design, because a committee member must stay resolvable for its whole committee window —
+    /// an expiry-driven resolution failure would be a consensus liveness bug.
+    ///
+    /// Values are post-validation — BLS signature verified and publisher-checked
+    /// (`peer_record_valid` in consensus.rs), committee-gated per issue #827, malformed
+    /// advertised RPC info stripped in [`Self::cache_known_peer`] — while the store holds raw
+    /// signed record bytes.
+    ///
+    /// Bounded to pinned operator peers plus the tracked committee slots
+    /// ([`Self::prune_known_peers`]); kad-sourced updates are timestamp-monotonic
+    /// ([`Self::kad_record_is_stale`]), mirroring the store-side `is_newer_record` rule.
     known_peers: HashMap<BlsPublicKey, NetworkInfo>,
     /// BLS keys whose `known_peers` entry is pinned and never evicted by committee rotation.
     ///
