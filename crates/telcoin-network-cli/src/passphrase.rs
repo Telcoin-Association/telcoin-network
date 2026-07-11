@@ -103,15 +103,16 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                         rpassword::prompt_password("Enter the BLS key passphrase to decrypt: ")
                             .ok();
                 }
+                Commands::Snapshot(_) => {} // Snapshot import/export never signs, so no key needed.
             },
             PassSource::NoPassphrase => {
                 passphrase = None;
             }
         }
-        // The `db` subcommand is a read-only inspection tool and `keytool set-rpc`
-        // only edits public config; neither needs the BLS key passphrase.
+        // The `db` and `snapshot` subcommands are offline tools, and `keytool set-rpc` only edits
+        // public config; none of them need the BLS key passphrase.
         let command_needs_passphrase = match &self.command {
-            Commands::Db(_) => false,
+            Commands::Db(_) | Commands::Snapshot(_) => false,
             Commands::Keytool(keytool) => keytool.needs_passphrase(),
             Commands::Genesis(_) | Commands::Node(_) => true,
         };

@@ -11611,6 +11611,7 @@ dependencies = [
  "tn-metrics",
  "tn-node",
  "tn-reth",
+ "tn-snapshot",
  "tn-storage",
  "tn-types",
  "tokio",

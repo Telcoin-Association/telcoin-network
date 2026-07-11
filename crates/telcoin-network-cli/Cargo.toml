@@ -52,6 +52,7 @@ tn-node = { workspace = true }
 tn-reth = { workspace = true }
 tn-config = { workspace = true }
 tn-storage = { workspace = true }
+tn-snapshot = { workspace = true }
 rayon = { workspace = true }
 rpassword = { workspace = true }
 dirs-next = { workspace = true }
