@@ -175,6 +175,7 @@ pub mod error;
 mod evm;
 pub mod forward;
 pub mod rpc_server_args;
+mod snapshot;
 pub mod system_calls;
 pub mod worker;
 #[cfg(feature = "faucet")]
@@ -187,6 +188,7 @@ pub use evm::{
     BLS_G1_PRECOMPILE_ADDRESS, TELCOIN_PRECOMPILE_ADDRESS,
 };
 pub use forward::WorkerRpcForwarder;
+pub use snapshot::{PinnedStateView, StateExportStats};
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
