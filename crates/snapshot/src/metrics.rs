@@ -41,6 +41,9 @@ pub(crate) enum JobOutcome {
     /// Skipped because the epoch's EIP-1559 base fees are not derivable from the captured state,
     /// so a restored node could not resume fee calculation.
     SkippedFeeUnderivable,
+    /// Skipped because the closing epoch is epoch 0, which verify/restore reject; publishing it
+    /// would waste an upload and leave a `latest.json` a restore must skip.
+    SkippedEpochZero,
     /// The job failed with an error.
     Failed,
 }
@@ -53,6 +56,7 @@ impl JobOutcome {
             Self::SkippedOverlap => "skipped_overlap",
             Self::SkippedCertTimeout => "skipped_cert_timeout",
             Self::SkippedFeeUnderivable => "skipped_fee_underivable",
+            Self::SkippedEpochZero => "skipped_epoch_zero",
             Self::Failed => "failed",
         }
     }
@@ -78,6 +82,7 @@ mod tests {
             metrics.record_job(JobOutcome::SkippedOverlap);
             metrics.record_job(JobOutcome::SkippedCertTimeout);
             metrics.record_job(JobOutcome::SkippedFeeUnderivable);
+            metrics.record_job(JobOutcome::SkippedEpochZero);
             metrics.record_job(JobOutcome::Failed);
         });
 

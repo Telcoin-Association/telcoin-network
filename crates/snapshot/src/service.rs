@@ -166,6 +166,15 @@ impl SnapshotUploader {
     pub async fn on_epoch_closed(&self, reth_env: &RethEnv, record: EpochRecord) {
         let epoch = record.epoch;
 
+        // epoch-0 snapshots are unsupported: verify/restore reject them ("epoch-0 snapshots are
+        // unsupported"), so publishing one only wastes an upload and leaves a latest.json a restore
+        // must skip. bail before claiming the gate so an epoch-0 boundary is a no-op.
+        if epoch == 0 {
+            info!(target: "tn::snapshot", "skipping snapshot publish for epoch 0 (unsupported by restore)");
+            self.metrics.record_job(JobOutcome::SkippedEpochZero);
+            return;
+        }
+
         // single-flight: skip rather than queue behind an in-flight job
         let Some(gate) = self.claim_gate(epoch) else { return };
 
@@ -875,6 +884,30 @@ mod tests {
             assert!(uploader.store.list_epochs().await.unwrap().is_empty(), "nothing uploaded");
         });
         assert_eq!(counter(&rows, JOBS_TOTAL, "skipped_overlap"), 1);
+    }
+
+    #[test]
+    fn epoch_zero_skips_before_gate_and_uploads_nothing() {
+        let dir = tempdir().unwrap();
+        let reth_tmp = tempdir().unwrap();
+        let rows = with_recorded_metrics(|metrics| async {
+            let (uploader, reth_tm) = test_uploader(&dir, metrics);
+            // reth_env is required by the signature but never touched on the epoch-0 path
+            let chain: Arc<tn_reth::RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+            let reth_env =
+                RethEnv::new_for_temp_chain(chain, reth_tmp.path(), &reth_tm, None).unwrap();
+
+            uploader.on_epoch_closed(&reth_env, epoch_record(0)).await;
+
+            // the gate was never claimed, so it stays free for the next boundary
+            assert!(
+                Arc::clone(&uploader.gate).try_lock_owned().is_ok(),
+                "epoch-0 skip must leave the gate released"
+            );
+            assert!(uploader.store.list_epochs().await.unwrap().is_empty(), "nothing uploaded");
+        });
+        assert_eq!(counter(&rows, JOBS_TOTAL, "skipped_epoch_zero"), 1);
+        assert_eq!(counter(&rows, JOBS_TOTAL, "failed"), 0, "epoch-0 skip is not a failure");
     }
 
     #[tokio::test]

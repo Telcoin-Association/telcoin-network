@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, CommittedSubDag,
     Committee, ConsensusChainReader, ConsensusChainWriter, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusOutput, Epoch, EpochRecord, ReadStream, Round,
+    ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, ReadStream, Round,
 };
 use tokio::{
     fs::File as AsyncFile,
@@ -26,7 +26,7 @@ use tokio::{
         oneshot,
     },
 };
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     archive::data_file::fsync_directory,
@@ -785,6 +785,41 @@ impl ConsensusChain {
         }
     }
 
+    /// Resolve the `(number, hash)` position of the consensus header identified by `digest` in
+    /// `epoch`, consulting the epoch-record chain when the local pack is a snapshot-restore
+    /// placeholder.
+    ///
+    /// A normal node hits the pack and returns the header's real position, never touching the
+    /// record. A snapshot-restored node's `epoch-{epoch}` pack is an empty placeholder until the
+    /// real pack streams in from a peer, so the pack lookup misses; when `digest` is exactly
+    /// `epoch`'s recorded `final_consensus` output, that record pins the authoritative
+    /// `(number, hash)`. The returned hash is always the requested `digest` (or the record's
+    /// matching final), never a synthesized one, so callers can chain-link against it safely.
+    ///
+    /// Any other miss returns `None`: a random digest never triggers a fallback, and the zero
+    /// digest (the `recent_blocks` genesis/empty sentinel) is excluded so the genesis parent
+    /// resolution is unchanged.
+    pub async fn consensus_position_by_digest(
+        &self,
+        epoch: Epoch,
+        digest: ConsensusHeaderDigest,
+    ) -> Result<Option<ConsensusNumHash>, ConsensusChainError> {
+        if let Some(header) = self.consensus_header_by_digest(epoch, digest).await? {
+            // the pack verifies `header.digest() == digest` on lookup, so `digest` is truthful.
+            return Ok(Some(ConsensusNumHash::new(header.number, digest)));
+        }
+        // pack miss. the zero digest is never a real header id (it is the default carried by an
+        // un-seeded `recent_blocks`), so it must not resolve to any record.
+        if digest != ConsensusHeaderDigest::default() {
+            if let Some(record) = self.epochs().record_by_epoch(epoch).await {
+                if record.final_consensus.hash == digest {
+                    return Ok(Some(record.final_consensus));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Retrieve a consensus header by number.
     pub async fn consensus_header_by_number(
         &self,
@@ -934,6 +969,13 @@ impl ConsensusChain {
     pub async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
         match self.consensus_header_by_number(epoch_record.final_consensus.number).await {
             Ok(result) => result.is_some(),
+            // probing a snapshot-restore placeholder pack (0 entries) errors with
+            // `ConsensusNumberTooHigh`: the real pack streams in from peers later, so this is an
+            // expected "not yet complete" answer, not a DB fault. keep other errors at error level.
+            Err(ConsensusChainError::PackError(PackError::ConsensusNumberTooHigh)) => {
+                debug!(target: "consensus-chain", epoch=?epoch_record.epoch, "epoch pack not yet complete (placeholder or catching up)");
+                false
+            }
             Err(e) => {
                 error!(target: "consensus-chain", epoch=?epoch_record.epoch, "DB error checking epoch completeness: {e}");
                 false
@@ -946,6 +988,32 @@ impl ConsensusChain {
         &self,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         self.latest_consensus_header_from_pack(self.latest_consensus.epoch()).await
+    }
+
+    /// Resolve the `(number, hash)` position of the latest consensus header, consulting the
+    /// epoch-record chain when the latest epoch's pack is a snapshot-restore placeholder.
+    ///
+    /// A normal node reads the latest header straight from its pack. A snapshot restore seeds the
+    /// `latest_consensus` slots to `(epoch N, final_N number)` but stages an empty `epoch-N` pack,
+    /// so the pack read misses; the seeded slot points at epoch `N`'s final consensus, which that
+    /// epoch's record pins as `(number, hash)`. Number `0` is the genesis/empty slot (never a
+    /// restore boundary), so it never falls back.
+    pub async fn consensus_position_latest(
+        &self,
+    ) -> Result<Option<ConsensusNumHash>, ConsensusChainError> {
+        if let Some(header) = self.consensus_header_latest().await? {
+            return Ok(Some(ConsensusNumHash::new(header.number, header.digest())));
+        }
+        let number = self.latest_consensus.number();
+        if number != 0 {
+            let epoch = self.latest_consensus.epoch();
+            if let Some(record) = self.epochs().record_by_epoch(epoch).await {
+                if record.final_consensus.number == number {
+                    return Ok(Some(record.final_consensus));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Return the last consensus number that was processed.
@@ -1588,6 +1656,139 @@ mod test {
                 .expect("pack read must not error")
                 .is_none(),
             "freshly-staged epoch-{n} pack must contain no consensus headers"
+        );
+    }
+
+    /// A snapshot-restored node holds the full epoch-record chain but only an EMPTY placeholder
+    /// pack for the boundary epoch (the real pack streams in later). The position resolvers
+    /// must fall back to the record when the pack misses, returning the record's REAL `(number,
+    /// hash)` — never a fabricated digest — and must NOT fall back for a digest the record does
+    /// not pin.
+    #[tokio::test]
+    async fn test_consensus_position_falls_back_to_record_on_placeholder_pack() {
+        let temp_dir = TempDir::with_prefix("test_position_fallback").unwrap();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee_zero = fixture.committee();
+
+        // restore point: boundary of epoch N, whose record pins the final consensus (number, hash).
+        let n: Epoch = 2;
+        let final_n_number = 300u64;
+        let final_n_hash = ConsensusHeaderDigest::from([7u8; 32]);
+        let committee_n = committee_zero.advance_epoch_for_test(n);
+
+        // epoch-record chain 0..=N with strictly increasing final numbers (so number_to_epoch's
+        // binary search is well ordered); epoch N is pinned to the real hash a peer reproduces.
+        let final_numbers = [100u64, 200, final_n_number];
+        let records: Vec<EpochRecord> = (0..=n)
+            .map(|e| EpochRecord {
+                epoch: e,
+                final_consensus: ConsensusNumHash {
+                    number: final_numbers[e as usize],
+                    hash: if e == n {
+                        final_n_hash
+                    } else {
+                        ConsensusHeaderDigest::from([e as u8; 32])
+                    },
+                },
+                ..Default::default()
+            })
+            .collect();
+
+        // exactly what a restore stages before the node opens the chain.
+        seed_latest_consensus(temp_dir.path(), n, final_n_number).await.unwrap();
+        create_empty_epoch_pack(temp_dir.path(), records[(n - 1) as usize].clone(), committee_n)
+            .await
+            .unwrap();
+
+        let chain = ConsensusChain::new(temp_dir.path().to_owned(), committee_zero).unwrap();
+        for record in &records {
+            chain.epochs().save_record(record.clone()).await.unwrap();
+        }
+
+        // sanity: the boundary pack really is an empty placeholder.
+        assert!(chain.latest_consensus_header_from_pack(n).await.unwrap().is_none());
+
+        // digest-of-final_N resolves to the record's REAL (number, hash) via the record fallback.
+        assert_eq!(
+            chain.consensus_position_by_digest(n, final_n_hash).await.unwrap(),
+            Some(ConsensusNumHash::new(final_n_number, final_n_hash)),
+            "final_N digest must resolve to the record's pinned position"
+        );
+
+        // a digest the record does not pin must miss — no false fallback.
+        let unknown = ConsensusHeaderDigest::from([9u8; 32]);
+        assert_eq!(
+            chain.consensus_position_by_digest(n, unknown).await.unwrap(),
+            None,
+            "an unrecorded digest must not fall back"
+        );
+
+        // the latest-position resolver resolves the seeded slot to the same recorded final.
+        assert_eq!(
+            chain.consensus_position_latest().await.unwrap(),
+            Some(ConsensusNumHash::new(final_n_number, final_n_hash)),
+            "latest position must resolve the seeded slot to the record's pinned final"
+        );
+    }
+
+    /// A normal node's pack contains the header, so the position resolvers short-circuit on the
+    /// pack hit and never consult the epoch-record chain (behavior-neutral for non-restored
+    /// nodes). A deliberately-wrong record for the same epoch must be ignored.
+    #[tokio::test]
+    async fn test_consensus_position_short_circuits_complete_pack() {
+        let temp_dir = TempDir::with_prefix("test_position_short_circuit").unwrap();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain_spec: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
+
+        // save a handful of real outputs into the epoch-0 pack.
+        let mut parent = ConsensusHeaderDigest::default();
+        let mut headers = Vec::new();
+        for i in 0..5u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain_spec.clone(), i + 1, parent);
+            parent = output.digest();
+            headers.push(output.consensus_header());
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+
+        // a bogus record for epoch 0 that a pack hit must ignore.
+        consensus_chain
+            .epochs()
+            .save_record(EpochRecord {
+                epoch: 0,
+                final_consensus: ConsensusNumHash {
+                    number: 999,
+                    hash: ConsensusHeaderDigest::from([0xabu8; 32]),
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // by-digest resolves to the PACK header's real position, not the bogus record.
+        let mid = &headers[2];
+        assert_eq!(
+            consensus_chain.consensus_position_by_digest(0, mid.digest()).await.unwrap(),
+            Some(ConsensusNumHash::new(mid.number, mid.digest())),
+            "a complete pack must resolve from the pack, ignoring the record"
+        );
+
+        // latest resolves to the pack's last header, not the bogus record.
+        let last = headers.last().unwrap();
+        assert_eq!(
+            consensus_chain.consensus_position_latest().await.unwrap(),
+            Some(ConsensusNumHash::new(last.number, last.digest())),
+            "latest must come from the pack when it has headers"
         );
     }
 
