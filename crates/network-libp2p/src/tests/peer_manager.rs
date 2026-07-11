@@ -982,6 +982,151 @@ async fn test_bootstrap_peer_pins_existing_entry_without_overwrite() {
     assert_eq!(multiaddrs, restored_addrs, "pinned entry keeps the restored record");
 }
 
+#[tokio::test]
+async fn test_discovered_peer_stale_record_ignored() {
+    // Timestamp monotonicity (defect D2): `get_record` query results bypass the store-side
+    // `is_newer_record` check entirely (close_kad_query -> add_discovered_peer), so without a
+    // cache-side guard a stale-but-valid record served as the only query response would regress
+    // a fresher `known_peers` entry.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([31; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // cache the committee member's record at timestamp T
+    let mut fresh = random_network_info();
+    fresh.timestamp = 1_000;
+    let fresh_addrs = fresh.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, fresh);
+
+    // an older record arriving via the same discovery path is dropped
+    let mut stale = random_network_info();
+    stale.timestamp = 999;
+    assert_ne!(stale.multiaddrs, fresh_addrs, "addresses must differ for this test");
+    peer_manager.add_discovered_peer(bls, stale);
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, fresh_addrs, "stale record must not regress the cached entry");
+    assert_eq!(cached.timestamp, 1_000, "cached timestamp unchanged");
+
+    // a strictly newer record applies
+    let mut newer = random_network_info();
+    newer.timestamp = 1_001;
+    let newer_addrs = newer.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, newer);
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, newer_addrs, "newer record must replace the cached entry");
+    assert_eq!(cached.timestamp, 1_001, "cached timestamp advanced");
+}
+
+#[tokio::test]
+async fn test_discovered_peer_equal_timestamp_keeps_existing() {
+    // EQUAL timestamps keep the existing entry (benign replay churn) — the same rule as the
+    // store-side `is_newer_record` check.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([37; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    let mut original = random_network_info();
+    original.timestamp = 1_000;
+    let original_addrs = original.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, original);
+
+    // a same-timestamp record with different addresses must not displace the cached entry
+    let mut replay = random_network_info();
+    replay.timestamp = 1_000;
+    assert_ne!(replay.multiaddrs, original_addrs, "addresses must differ for this test");
+    peer_manager.add_discovered_peer(bls, replay);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(
+        cached.multiaddrs, original_addrs,
+        "equal-timestamp record must keep the existing entry"
+    );
+}
+
+#[tokio::test]
+async fn test_self_advertised_stale_record_ignored() {
+    // A pushed record can pass the store-side `is_newer_record` check yet still be older than the
+    // cached entry (the cache learned a fresher record via a query result the store never saw).
+    // The committee branch of `add_self_advertised_peer` must not regress the cache.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([41; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // cache the committee member's record at timestamp T via kad discovery
+    let mut fresh = random_network_info();
+    fresh.timestamp = 1_000;
+    let fresh_addrs = fresh.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, fresh);
+
+    // a stale record pushed over the peer's own authenticated connection (source == advertised)
+    let mut stale = random_network_info();
+    stale.timestamp = 999;
+    let source: PeerId = stale.pubkey.clone().into();
+    assert_ne!(stale.multiaddrs, fresh_addrs, "addresses must differ for this test");
+    peer_manager.add_self_advertised_peer(source, bls, stale);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(
+        cached.multiaddrs, fresh_addrs,
+        "stale self-advertised record must not regress the cache"
+    );
+    assert_eq!(cached.timestamp, 1_000, "cached timestamp unchanged");
+}
+
+#[tokio::test]
+async fn test_operator_add_overwrites_newer_kad_record() {
+    // Operator-provisioned paths deliberately bypass the staleness guard: `add_known_peer`
+    // (the AddExplicitPeer handler) inserts unconditionally, so an operator can always repair a
+    // bad cached record regardless of its timestamp. In production these handlers stamp now().
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([43; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // a kad-discovered record with a high timestamp
+    let mut discovered = random_network_info();
+    discovered.timestamp = 10_000;
+    let discovered_addrs = discovered.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, discovered);
+
+    // the operator provisions the peer with a LOWER timestamp and different addresses: it wins
+    let mut operator = random_network_info();
+    operator.timestamp = 5_000;
+    let operator_addrs = operator.multiaddrs.clone();
+    assert_ne!(operator_addrs, discovered_addrs, "addresses must differ for this test");
+    peer_manager.add_known_peer(bls, operator);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, operator_addrs, "operator record must overwrite the kad record");
+    assert_eq!(cached.timestamp, 5_000, "operator record timestamp wins");
+}
+
+#[tokio::test]
+async fn test_pinned_peer_kad_record_bypasses_staleness_guard() {
+    // An operator-provisioned (pinned) entry's timestamp is a local now() provisioning stamp,
+    // not a peer-signed record timestamp, and node records are signed once at peer startup. The
+    // staleness guard must therefore not apply to pinned entries: the peer's real signed record
+    // (older stamp, but carrying rpc info and real multiaddrs) must still replace the operator
+    // stub — the flow exercised end-to-end by `test_advertise_rpc_via_kad`.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([47; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // the operator stub: pinned, rpc-less, stamped AFTER the peer signed its own record
+    let mut stub = random_network_info();
+    stub.timestamp = 10_000;
+    peer_manager.add_known_peer(bls, stub);
+
+    // the peer's real record arrives via kad with its startup-signed (older) timestamp
+    let (mut real, rpc) = random_network_info_with_rpc();
+    real.timestamp = 5_000;
+    let real_addrs = real.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, real);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, real_addrs, "signed record must refresh the pinned stub");
+    assert_eq!(cached.rpc, Some(rpc), "advertised rpc must reach the cache despite older stamp");
+}
+
 /// Build a [`NetworkInfo`] like [`random_network_info`], but advertising a valid [`RpcInfo`].
 fn random_network_info_with_rpc() -> (NetworkInfo, RpcInfo) {
     let rpc = RpcInfo {

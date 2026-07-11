@@ -827,6 +827,14 @@ impl PeerManager {
             );
             return;
         }
+        if self.kad_record_is_stale(&bls_key, &info) {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                "dropping stale discovered peer record"
+            );
+            return;
+        }
         self.cache_known_peer(bls_key, info);
     }
 
@@ -852,6 +860,15 @@ impl PeerManager {
     ) {
         let advertised: PeerId = info.pubkey.clone().into();
         if self.peers.is_committee_member(&bls_key) {
+            if self.kad_record_is_stale(&bls_key, &info) {
+                trace!(
+                    target: "peer-manager",
+                    ?bls_key,
+                    ?source,
+                    "dropping stale self-advertised record for committee member"
+                );
+                return;
+            }
             self.cache_known_peer(bls_key, info);
         } else if source == advertised {
             trace!(
@@ -875,6 +892,31 @@ impl PeerManager {
     #[cfg(test)]
     pub(crate) fn peer_multiaddr_count(&self, peer_id: &PeerId) -> Option<usize> {
         self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
+    }
+
+    /// Check whether a kad-sourced record's timestamp fails to advance the cached entry.
+    ///
+    /// Mirrors the store-side `is_newer_record` monotonicity check (consensus.rs) so kad-sourced
+    /// updates can never regress a fresher `known_peers` entry — `get_record` query results reach
+    /// the cache without passing through the store, so the store-side check alone cannot protect
+    /// it. EQUAL timestamps keep the existing entry (benign replay churn — the same rule as the
+    /// store side). Operator-provisioned paths bypass this guard structurally: they all stamp
+    /// `timestamp: now()` when building the [`NetworkInfo`] (the `AddTrustedPeerAndDial` /
+    /// `AddExplicitPeer` / `AddBootstrapPeers` handlers in consensus.rs), and
+    /// [`Self::add_bootstrap_peer`] never overwrites an existing entry at all.
+    ///
+    /// Pinned (operator-provisioned) entries are exempt from the comparison in the other
+    /// direction too: their timestamp is a local provisioning stamp, not a peer-signed record
+    /// timestamp, and node records are signed once at peer startup — so an operator stub stamped
+    /// after the peer started would otherwise block the peer's real record (fresh multiaddrs,
+    /// advertised rpc) forever. A signed record may therefore always refresh a pinned entry,
+    /// which is the pre-existing upgrade flow for trusted/explicit peers.
+    fn kad_record_is_stale(&self, bls_key: &BlsPublicKey, info: &NetworkInfo) -> bool {
+        !self.pinned_peers.contains(bls_key)
+            && self
+                .known_peers
+                .get(bls_key)
+                .is_some_and(|existing| existing.timestamp >= info.timestamp)
     }
 
     /// Validate the advertised endpoint, register the peer's network identity, cache its info, and
