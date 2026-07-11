@@ -264,7 +264,7 @@ pub struct NodeSnapshotArgs {
     ///
     /// Supported schemes: `s3://`, `gs://`, `az://`, `http(s)://`, and `file://`. Cloud backends
     /// read credentials from the standard per-scheme environment variables (for example `AWS_*`
-    /// for S3, `GOOGLE_*`/`GCS_*` for GCS, and `AZURE_*` for Azure).
+    /// for S3, `GOOGLE_*` for GCS, and `AZURE_*` for Azure).
     #[arg(long, value_name = "URL", env = "TN_SNAPSHOT_UPLOAD")]
     pub snapshot_upload: Option<String>,
 

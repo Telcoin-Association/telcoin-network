@@ -144,6 +144,61 @@ The following `.env` variables are useful but not required:
   https://github.com/multiformats/rust-multiaddr
   These are used with libp2p2 so also see the Rust libp2p docs.
 
+## Snapshots
+
+Cloud snapshots let a fresh node start at the last epoch boundary instead of replaying consensus from genesis. An observer node publishes a signed, state-only snapshot to object storage at each epoch boundary; a new node downloads one and verifies it against its LOCAL `genesis`/`committee.yaml` before installing a single byte. Verification is always full and trustless — the bucket is never a trust root, so the only thing an operator must protect is the local committee file.
+
+### Publishing (observer nodes only)
+
+Run an observer with an upload target and it publishes one snapshot per epoch boundary:
+
+```bash
+telcoin-network node --observer --snapshot-upload <URL> --chain adiri --datadir DATADIR
+```
+
+- `--snapshot-upload` (env `TN_SNAPSHOT_UPLOAD`) is **observer-only**. A validator started with it refuses to boot: the uploader must never spend the epoch-boundary quiet window publishing.
+- `--snapshot-keep-last N` (env `TN_SNAPSHOT_KEEP_LAST`, default `3`) retains the N most-recent snapshots and prunes older ones.
+
+Supported URL schemes and the credentials each reads from the process environment:
+
+| Scheme | Example | Credentials |
+| --- | --- | --- |
+| `s3://` (`s3a://`) | `s3://bucket/prefix` | `AWS_*` (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, …) |
+| `gs://` | `gs://bucket/prefix` | `GOOGLE_*` (service-account key or path) |
+| `az://` (`azure://`, `abfs://`, …) | `az://container/prefix` | `AZURE_*` (`AZURE_STORAGE_ACCOUNT_NAME` plus an access or SAS key) |
+| `http(s)://` | `https://host/path` | none (public, pre-signed, or reverse-proxied; a `user:pass@` in the URL is honored) |
+| `file://` | `file:///abs/path` | none (a local directory; for tests and local runs) |
+
+Operational notes:
+
+- Run **one uploader per bucket prefix**. Publishing is last-writer-wins on `latest.json`, so two uploaders pointed at the same prefix will race the pointer.
+- Set a bucket **lifecycle rule to abort/expire incomplete multipart uploads**. A cancelled upload can leave orphaned parts that snapshot pruning does not clean up.
+
+### Restoring
+
+Restore into a datadir that already holds `genesis`/`committee.yaml` but **no chain data**:
+
+```bash
+telcoin-network snapshot restore --source <URL> [--epoch N] --datadir DATADIR
+```
+
+Or auto-restore on a fresh start — the node downloads, verifies, and installs the newest snapshot before opening its databases, and skips silently if the datadir already holds chain data:
+
+```bash
+telcoin-network node --observer --snapshot-source <URL> --chain adiri --datadir DATADIR
+```
+
+- Verification is **always full**; the trust root is the LOCAL `committee.yaml`, never the bucket. Without a local genesis/committee, restore refuses with a missing-trust-root error.
+- The restored epoch is **logged prominently**. A malicious bucket cannot forge a snapshot for the wrong committee, but it can withhold the newest one and serve an older, still-valid snapshot. Passing `--epoch N` pins the choice, bypasses the `latest.json` pointer, and defeats withholding.
+- `telcoin-network snapshot verify --source <URL> [--epoch N]` runs the same download-and-verify path but installs nothing, so a bucket can be vetted before committing to a restore.
+- `telcoin-network snapshot create --out <URL>` exports and uploads a snapshot from a **stopped** node whose tip sits exactly on an epoch boundary — an out-of-band alternative to the background uploader.
+
+### Caveats
+
+- **State-only, by design.** A restored node does not serve pre-snapshot history: it holds the final EVM state and a bounded header window, not the full chain.
+- **Fee-derivability skips.** The uploader skips any epoch whose EIP-1559 base fees are not derivable from the captured state (a fee-configured worker that produced no block that epoch). Such an epoch is never published, because a restored node could not resume fee calculation from it.
+- **Quarantine after a failed restore.** A failed restore leaves a `.restore-incomplete` marker in the datadir's `snapshots/` directory. While it is present, a manual `snapshot restore` refuses (`restore did not complete`) and a node started with `--snapshot-source` refuses to boot rather than run on partial state. Recovery is manual: clear the datadir before retrying.
+
 ## Example RPC request
 
 ### get chain id

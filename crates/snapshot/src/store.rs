@@ -64,7 +64,7 @@ const ZSTD_LEVEL: i32 = 3;
 ///
 /// A `SnapshotStore` pairs an [`ObjectStore`] backend with a key `prefix` parsed from the snapshot
 /// URL. Every method takes keys **relative** to that prefix and resolves them through
-/// [`SnapshotStore::location`], so callers never deal with bucket names or the base path directly.
+/// `SnapshotStore::location`, so callers never deal with bucket names or the base path directly.
 ///
 /// Construct one from a URL with [`SnapshotStore::open`]; tests and advanced callers may inject a
 /// preconfigured backend with [`SnapshotStore::with_store`].

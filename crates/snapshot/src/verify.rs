@@ -5,7 +5,7 @@
 //! the one thing the node already has: its local genesis committee (`committee.yaml`, loaded by the
 //! caller) and genesis hash.
 //!
-//! The trust anchor is the signed [`EpochRecord`](tn_types::EpochRecord) chain. Epoch `0`'s record
+//! The trust anchor is the signed [`EpochRecord`] chain. Epoch `0`'s record
 //! must commit to the local genesis committee; every later record must chain to its predecessor by
 //! `parent_hash` and inherit the predecessor's `next_committee`; and every record must carry an
 //! aggregate-BLS certificate signed by a super-quorum (`2/3 + 1`) of *its own* committee. Once the
@@ -20,7 +20,7 @@
 //!
 //! # Header artifact codec
 //!
-//! The execution-header window is transported through [`decode_headers`], the single place that
+//! The execution-header window is transported through `decode_headers`, the single place that
 //! knows the header wire codec. See that function for why the codec is JSON — the encoding the
 //! exporter (`export::stage_zstd_artifact` on `serde_json::to_vec(&Vec<ExecHeader>)`) also uses.
 

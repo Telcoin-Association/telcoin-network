@@ -1,20 +1,124 @@
 //! Cloud snapshot support for telcoin-network.
 //!
-//! This crate produces, uploads, verifies, and restores signed chain snapshots so a node
-//! can bootstrap from remote object storage instead of replaying consensus from genesis. It
-//! is organized into focused modules:
+//! A fresh node normally reaches the chain tip by replaying consensus from genesis. This crate is
+//! an opt-in shortcut: an observer node publishes a signed, self-describing snapshot of the chain
+//! state at each epoch boundary, and a new node downloads, cryptographically verifies, and installs
+//! one so it starts at the last epoch boundary instead of from genesis. Snapshots are state-only —
+//! the restored node holds the final EVM state and the checkpoints needed to resume consensus, not
+//! the full pre-snapshot history. The trust model below is what makes accepting state from an
+//! untrusted bucket safe; the limitations at the end are what it costs.
 //!
-//! - [`manifest`]: the snapshot manifest format and its (de)serialization.
-//! - [`store`]: object-store construction and access from a snapshot URL (S3, GCS, Azure, HTTP, or
-//!   local file).
-//! - [`export`]: packaging local chain data into an uploadable snapshot.
-//! - [`verify`]: trustless verification of a downloaded snapshot against a local trust root.
-//! - [`restore`]: laying a verified snapshot down onto an empty datadir.
-//! - [`service`]: the long-running task that periodically exports and uploads snapshots.
+//! # Trust model
 //!
-//! The crate's entire error surface is [`SnapshotError`] (aliased as [`SnapshotResult`]), and
-//! [`has_chain_data`] is the shared precondition guarding restore against clobbering a datadir
-//! that already holds chain data.
+//! The sole trust root is the node's LOCAL configuration — the genesis committee in
+//! `committee.yaml` and the genesis block hash — never anything fetched from the bucket. Restore
+//! and verify refuse to run without it ([`SnapshotError::MissingTrustRoot`]). Verification then
+//! re-establishes trust outward from that root as one unbroken chain of bindings:
+//!
+//! 1. **Signed epoch-record chain.** The bucket ships the full
+//!    [`EpochRecord`](tn_types::EpochRecord)/[`EpochCertificate`](tn_types::EpochCertificate) chain
+//!    for epochs `0..=N`. Epoch `0`'s record must commit to the local genesis committee with a zero
+//!    `parent_hash`; every later record must chain to its predecessor by `parent_hash` and inherit
+//!    the predecessor's `next_committee`; and every record must carry an aggregate-BLS certificate
+//!    signed by a super-quorum (`2/3 + 1` of voting power) of *its own* committee. Committee `N`
+//!    thereby certifies who committee `N+1` is, so trust walks from genesis to the snapshot epoch
+//!    without ever trusting the bucket.
+//! 2. **Manifest binding.** Record `N`'s digest, `final_state` (the closing execution block number
+//!    and hash), and `final_consensus` must equal the [`Manifest`](manifest::Manifest)'s. The
+//!    certified chain now pins the exact boundary block the snapshot claims.
+//! 3. **Header window.** The shipped execution headers must be non-empty, consecutively numbered,
+//!    internally hash-linked, and end exactly at `final_state`, tying the certified boundary block
+//!    back through a verifiable header chain.
+//! 4. **From-scratch state-root recompute.** On import, `tn-reth` scaffolds the boundary header
+//!    from the verified window, re-imports the plain-state dump, and recomputes the state root FROM
+//!    SCRATCH, hard-failing on any mismatch with the header's `state_root` (then re-checking that
+//!    the reconstructed tip hash equals `final_state`). Because the BLS-certified block hash
+//!    already commits to that state root, tampered state cannot survive the recompute.
+//!
+//! Every check compares typed values, never serialized strings: a digest and a hash have more than
+//! one textual encoding, so string comparison would be both wrong and fragile.
+//!
+//! What this leaves an adversary: a malicious bucket can NEVER forge a snapshot for a different
+//! committee or serve tampered state — each attempt fails a signature, chain, header, or
+//! state-root check. It CAN only withhold the newest snapshot and serve an OLDER, still-valid one,
+//! because freshness is unauthenticated: nothing signs "this is the latest epoch". Pinning the
+//! epoch (the CLI's `--epoch`) bypasses the `latest.json` pointer and defeats withholding.
+//!
+//! # Module map
+//!
+//! - [`manifest`] — the two JSON documents that describe a bucket ([`Manifest`](manifest::Manifest)
+//!   per epoch, [`Pointer`](manifest::Pointer) at the root) plus the validation gates every
+//!   consumer parses through.
+//! - [`store`] — [`SnapshotStore`](store::SnapshotStore): object-store construction from a URL (S3,
+//!   GCS, Azure, HTTP, or local file) with per-scheme credentials read from the environment, the
+//!   canonical bucket key layout, streaming integrity-checked transfers, and zstd helpers with an
+//!   anti-bomb decompression cap.
+//! - [`export`] — [`export_epoch`](export::export_epoch): stage the artifact set (chunked state,
+//!   header window, epoch-record chain) and the manifest for one closed epoch, and compute the
+//!   `fee_derivable` precheck. It stages to a local directory but never uploads.
+//! - [`verify`] — [`verify_snapshot`](verify::verify_snapshot): the full trust gate above,
+//!   returning a [`VerifiedSnapshot`](verify::VerifiedSnapshot) as proof the checks passed.
+//! - [`restore`] — [`restore_from_snapshot`](restore::restore_from_snapshot): orchestrate download
+//!   → verify → install onto an empty datadir, with strict preconditions and crash-atomic failure
+//!   handling.
+//! - [`service`] — the observer-only [`SnapshotUploader`](service::SnapshotUploader): an
+//!   epoch-boundary state machine that pins, exports, uploads, and prunes, writing the pointer LAST
+//!   so a crash never publishes a half-uploaded epoch.
+//! - `metrics` (crate-internal) — Prometheus series under the `tn_snapshot` scope.
+//!
+//! # Bucket layout
+//!
+//! ```text
+//! <bucket>/<prefix>/
+//!   latest.json                 # Pointer to the newest epoch; written LAST
+//!   epoch-0000000042/           # one directory per snapshot, epoch zero-padded to 10 digits
+//!     manifest.json             # Manifest: chain/genesis binding, checkpoints, artifact digests
+//!     state-000.jsonl.zst       # reth init-state JSONL, split at line boundaries, zstd-compressed
+//!     state-001.jsonl.zst       # ...one or more chunks, concatenating back to the state dump
+//!     headers.json.zst          # the header window as a JSON array of headers, zstd-compressed
+//!     epoch-records.bcs.zst     # Vec<(EpochRecord, EpochCertificate)> for epochs 0..=N, BCS + zstd
+//! ```
+//!
+//! # Flows
+//!
+//! **Upload** (observer, once per boundary).
+//! [`on_epoch_closed`](service::SnapshotUploader::on_epoch_closed) fires inside the boundary quiet
+//! window. Synchronously it claims a single-flight gate and pins the closing epoch's state view,
+//! then spawns the heavy work off the consensus path: await epoch `N`'s certificate, call
+//! [`export_epoch`](export::export_epoch) to stage the artifacts and manifest, upload every
+//! artifact, upload the manifest, and write `latest.json` LAST, then prune to `keep_last`. Any
+//! failure, skip, or shutdown before the pointer write leaves the pointer naming the previous
+//! epoch. An epoch whose `fee_derivable` precheck fails is skipped rather than published.
+//!
+//! **Restore** (fresh node, manual or on startup).
+//! [`restore_from_snapshot`](restore::restore_from_snapshot) checks its preconditions (local trust
+//! root present, no existing chain data, no leftover marker), resolves the target epoch (pinned or
+//! via `latest.json`), and downloads into a staging directory. It runs
+//! [`verify_snapshot`](verify::verify_snapshot); then, under a [`RESTORE_INCOMPLETE_MARKER`] that
+//! guards failure atomicity, it imports the verified state into reth, installs the epoch-record
+//! chain, seeds the consensus stores to the boundary, writes a receipt, and clears the marker. A
+//! failure before install wipes staging only and leaves the datadir untouched; a failure during
+//! install deletes the partial chain data this run created but KEEPS the marker, quarantining the
+//! datadir until an operator clears it.
+//!
+//! # Limitations
+//!
+//! - A restored node serves no pre-snapshot history: it holds the final state and a bounded header
+//!   window by design, not the full chain.
+//! - The uploader skips an epoch whose EIP-1559 base fees are not derivable from the captured state
+//!   — a fee-configured worker that produced no block that epoch leaves a restored node with no
+//!   chain-observable anchor to resume fee calculation from.
+//! - Freshness is unauthenticated (see the trust model's withholding caveat); pin `--epoch` to
+//!   defeat a withholding bucket.
+//! - After a failed restore the datadir stays quarantined by the [`RESTORE_INCOMPLETE_MARKER`];
+//!   clearing it is a deliberate manual step.
+//!
+//! # Errors and shared preconditions
+//!
+//! The crate's entire error surface is [`SnapshotError`] (aliased as [`SnapshotResult`]);
+//! [`SnapshotError::Other`] is the escape hatch for anything without a specific variant.
+//! [`has_chain_data`] is the shared precondition guarding both manual restore and startup
+//! auto-restore against clobbering a datadir that already holds chain data.
 
 // Used only by the standalone integration-test binaries under `tests/`.
 #[cfg(test)]

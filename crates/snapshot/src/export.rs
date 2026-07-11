@@ -20,7 +20,7 @@
 //!    produced by [`PinnedStateView::export_state_jsonl`], split at LINE boundaries into chunks of
 //!    ~[`STATE_CHUNK_TARGET_UNCOMPRESSED`] uncompressed bytes each, every chunk zstd-compressed.
 //!    The state-root line is the first line of chunk 0 only; concatenating the decompressed chunks
-//!    reproduces the dump byte stream exactly. Streamed through [`StateChunkWriter`] so no whole
+//!    reproduces the dump byte stream exactly. Streamed through `StateChunkWriter` so no whole
 //!    chunk is ever buffered in memory.
 //! 2. **Headers** — `headers.json.zst`. The window headers as one `serde_json` array of
 //!    [`ExecHeader`] (plain headers, no hashes — the verifier recomputes each hash via
@@ -77,7 +77,7 @@ use tracing::info;
 
 /// Target uncompressed size of a single state chunk, in bytes (~256 MiB).
 ///
-/// [`StateChunkWriter`] rotates to a new chunk once the active chunk crosses this many uncompressed
+/// `StateChunkWriter` rotates to a new chunk once the active chunk crosses this many uncompressed
 /// bytes AND reaches a line boundary, so a chunk may run slightly over when a single line straddles
 /// the threshold. The value trades chunk count against per-chunk memory during download/verify.
 pub const STATE_CHUNK_TARGET_UNCOMPRESSED: u64 = 256 * 1024 * 1024;

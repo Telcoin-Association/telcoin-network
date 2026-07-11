@@ -13,7 +13,7 @@
 //! genesis committee (`committee.yaml`). Both must be present or restore refuses with
 //! [`SnapshotError::MissingTrustRoot`] — a restore never fabricates a trust root from the untrusted
 //! bucket. Everything downloaded is checked against that anchor by
-//! [`verify_snapshot`](crate::verify::verify_snapshot) before a single byte reaches the datadir.
+//! [`verify_snapshot`] before a single byte reaches the datadir.
 //!
 //! # Withholding caveat
 //!

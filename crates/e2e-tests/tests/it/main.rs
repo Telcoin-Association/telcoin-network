@@ -12,6 +12,7 @@ mod faucet;
 mod genesis_tests;
 mod metrics;
 mod restarts;
+mod snapshots;
 mod staking;
 mod sync;
 
