@@ -141,7 +141,7 @@ mod tests {
     use crate::{cli::Cli, NoArgs};
     use clap::Parser;
     use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo};
-    use tn_types::{hex, verify_proof_of_possession_bls, Address, RpcInfo};
+    use tn_types::{hex, verify_proof_of_possession_bls, Address, BlsPublicKey, RpcInfo};
     use url::Url;
 
     /// Test that generate keys command works.
@@ -300,6 +300,8 @@ mod tests {
             name,
             external_primary_addr: None,
             external_worker_addrs: None,
+            rpc_http: None,
+            rpc_ws: None,
         }
     }
 
@@ -439,6 +441,167 @@ mod tests {
             derived.name.starts_with("node-"),
             "without --name the node name should derive from the BLS key, got: {}",
             derived.name
+        );
+    }
+
+    /// `generate validator --rpc-http .. --rpc-ws ..` writes the worker RPC
+    /// descriptor into `node-info.yaml` alongside the freshly minted identity:
+    /// the primary RPC stays unset and the BLS key, name, and execution address
+    /// are all populated (the late `worker.rpc` assignment does not clobber them).
+    #[tokio::test]
+    async fn test_generate_sets_worker_rpc() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+
+        let http = Url::parse("https://validator.example.com:8545/").expect("http url");
+        let ws = Url::parse("wss://validator.example.com:8546/").expect("ws url");
+        KeygenArgs {
+            address: new_test_address(),
+            rpc_http: Some(http.clone()),
+            rpc_ws: Some(ws.clone()),
+            ..keygen_args(None)
+        }
+        .execute(&datadir, None)
+        .expect("generate keys with rpc");
+
+        let node_info = Config::load_from_path::<NodeInfo>(
+            datadir.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("node info loaded");
+
+        // worker rpc is exactly what we passed in.
+        assert_eq!(
+            node_info.p2p_info.worker.rpc,
+            Some(RpcInfo { http, ws: Some(ws) }),
+            "worker rpc should match the provided endpoints"
+        );
+        // the primary's rpc is never touched (the runtime never reads it).
+        assert!(node_info.p2p_info.primary.rpc.is_none(), "primary rpc must stay unset");
+        // identity fields are populated by fresh generation and survive the rpc assignment.
+        assert_ne!(
+            node_info.bls_public_key,
+            BlsPublicKey::default(),
+            "BLS public key must be populated"
+        );
+        assert!(
+            node_info.name.starts_with("node-"),
+            "node name must be derived from the BLS key, got: {}",
+            node_info.name
+        );
+        assert_eq!(
+            node_info.execution_address,
+            new_test_address(),
+            "execution address must be the one passed to generate"
+        );
+    }
+
+    /// `generate validator` without the RPC flags leaves the worker RPC descriptor
+    /// unset - the pre-flag default, so existing generation flows are unchanged.
+    #[tokio::test]
+    async fn test_generate_without_rpc_leaves_unset() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        keygen_args(None).execute(&datadir, None).expect("generate keys without rpc");
+
+        let node_info = Config::load_from_path::<NodeInfo>(
+            datadir.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("node info loaded");
+        assert!(
+            node_info.p2p_info.worker.rpc.is_none(),
+            "worker rpc should stay unset without --rpc-http"
+        );
+    }
+
+    /// `generate validator` validates the worker RPC endpoint *before* minting
+    /// keys: a non-http(s) scheme is rejected and no `node-info.yaml` is written,
+    /// proving the fail-fast ordering (a typo does not leave keys on disk).
+    #[tokio::test]
+    async fn test_generate_rejects_bad_rpc_scheme() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+
+        // a non-http(s) scheme parses as a URL but fails RpcInfo::validate.
+        let http = Url::parse("ftp://validator.example.com:8545/").expect("ftp url parses");
+        let err = KeygenArgs { rpc_http: Some(http), rpc_ws: None, ..keygen_args(None) }
+            .execute(&datadir, None)
+            .expect_err("generate must reject a non-http(s) scheme");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid worker rpc endpoint"),
+            "error should wrap the validation failure, got: {msg}"
+        );
+
+        // fail-fast: validation runs before any keys / node-info are written.
+        assert!(
+            !datadir.join("node-info.yaml").exists(),
+            "no node-info.yaml should be written when the rpc endpoint is rejected"
+        );
+    }
+
+    /// The `generate validator` RPC flags are wired into clap under the namespaced
+    /// `--rpc-http` / `--rpc-ws` names: both parse together, `--rpc-ws` requires
+    /// `--rpc-http`, and the un-namespaced `--http` (set-rpc's name) is rejected
+    /// here - confirming the deliberate per-command rename.
+    #[test]
+    fn test_generate_rpc_cli_parses() {
+        // both rpc endpoints parse together.
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+                "--rpc-http",
+                "https://validator.example.com:8545/",
+                "--rpc-ws",
+                "wss://validator.example.com:8546/",
+            ])
+            .is_ok(),
+            "`generate validator --rpc-http .. --rpc-ws ..` should parse"
+        );
+
+        // `--rpc-ws` without `--rpc-http` errors (requires), so a ws endpoint is
+        // never silently dropped for lack of an http endpoint.
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+                "--rpc-ws",
+                "wss://validator.example.com:8546/",
+            ])
+            .is_err(),
+            "`--rpc-ws` without `--rpc-http` should error"
+        );
+
+        // the un-namespaced set-rpc name is not accepted by `generate` (confirms the rename).
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+                "--http",
+                "https://validator.example.com:8545/",
+            ])
+            .is_err(),
+            "bare `--http` should be rejected by `generate` (it uses `--rpc-http`)"
         );
     }
 

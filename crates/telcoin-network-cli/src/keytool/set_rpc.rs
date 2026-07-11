@@ -11,6 +11,10 @@
 //! unsigned config edit: it loads `node-info.yaml`, mutates the worker RPC
 //! descriptor, and writes it back. No keys are read and the BLS passphrase is
 //! ignored - the kademlia node record is signed at node startup, not here.
+//!
+//! The [`build_worker_rpc`] helper is the single source of truth for building
+//! and validating a worker RPC endpoint; it is shared with
+//! `generate validator|observer` so both commands apply identical validation.
 
 use crate::args::clap_url_parser;
 use clap::Args;
@@ -19,6 +23,25 @@ use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo, TelcoinDirs};
 use tn_types::RpcInfo;
 use tracing::{info, warn};
 use url::Url;
+
+/// Build a validated worker `RpcInfo` from the `--http`/`--ws` (or `--rpc-http`/`--rpc-ws`) flags.
+///
+/// Returns `Ok(None)` when no HTTP endpoint was provided (nothing to advertise). Applies the same
+/// validation node startup runs (`node.rs:624`), so a bad scheme/length fails at CLI time. Shared by
+/// `set-rpc` and `generate validator|observer`.
+pub(crate) fn build_worker_rpc(
+    http: Option<Url>,
+    ws: Option<Url>,
+) -> eyre::Result<Option<RpcInfo>> {
+    match http {
+        Some(http) => {
+            let rpc = RpcInfo { http, ws };
+            rpc.validate().wrap_err("invalid worker rpc endpoint")?;
+            Ok(Some(rpc))
+        }
+        None => Ok(None),
+    }
+}
 
 /// Set or clear the worker JSON-RPC endpoint advertised in `node-info.yaml`.
 ///
@@ -71,11 +94,9 @@ impl SetRpcArgs {
                 info!(target: "tn::keytool", "no worker RPC endpoint set; nothing to clear");
             }
         } else {
-            // clap guarantees `http` is `Some` whenever `--clear` is absent.
-            let http = self.http.clone().expect("clap requires --http unless --clear");
-            let rpc = RpcInfo { http, ws: self.ws.clone() };
-            // same validation node startup applies (node.rs:624) - fail fast.
-            rpc.validate().wrap_err("invalid worker rpc endpoint")?;
+            // clap guarantees --http is present unless --clear.
+            let rpc = build_worker_rpc(self.http.clone(), self.ws.clone())?
+                .expect("clap requires --http unless --clear");
             if node_info.p2p_info.worker.rpc.is_some() {
                 warn!(target: "tn::keytool", "overwriting existing worker RPC endpoint");
             }

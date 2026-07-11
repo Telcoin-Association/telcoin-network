@@ -27,7 +27,8 @@ pub fn clap_address_parser(value: &str) -> eyre::Result<Address> {
 
 /// Parse a JSON-RPC endpoint URL from a string.
 ///
-/// Used by `keytool set-rpc` for the `--http`/`--ws` endpoints advertised in
+/// Used by `keytool set-rpc` (`--http`/`--ws`) and `keytool generate
+/// validator|observer` (`--rpc-http`/`--rpc-ws`) for the endpoints advertised in
 /// `node-info.yaml`. Scheme validation (http/https, ws/wss) is left to
 /// [`tn_types::RpcInfo::validate`] so the CLI applies the exact check node
 /// startup runs.
