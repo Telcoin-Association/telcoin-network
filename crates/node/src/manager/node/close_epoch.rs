@@ -165,7 +165,8 @@ where
 
     /// Persist the finalized [`EpochRecord`] for the just-completed epoch and
     /// publish it on `epoch_record_watch` for downstream signing or signature
-    /// collection.
+    /// collection. The persisted record is returned so the epoch-boundary teardown
+    /// can hand it to the snapshot uploader.
     ///
     /// Epoch 0 is a special case: it starts with an unsigned "dummy" record so
     /// the initial committee is available before any certificate exists. Once a
@@ -181,7 +182,7 @@ where
         &mut self,
         primary: &PrimaryNode<DB>,
         engine: &ExecutionNode,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<EpochRecord> {
         let committee = primary.current_committee().await;
         let epoch = committee.epoch();
         if epoch == 0 {
@@ -195,15 +196,15 @@ where
                 self.consensus_chain.epochs().get_epoch_by_number(epoch).await
             {
                 // We already have this record...
-                self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
-                return Ok(());
+                self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+                return Ok(epoch_rec);
             }
         } else if let Some((epoch_rec, _)) =
             self.consensus_chain.epochs().get_epoch_by_number(epoch).await
         {
             // We already have this record...
-            self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
-            return Ok(());
+            self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+            return Ok(epoch_rec);
         }
 
         let committee_keys = engine.validators_for_epoch(epoch).await?;
@@ -230,8 +231,8 @@ where
         )?;
 
         self.consensus_chain.epochs().save_record(epoch_rec.clone()).await?;
-        self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
-        Ok(())
+        self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+        Ok(epoch_rec)
     }
 
     /// Clear the epoch-scoped consensus tables so the next epoch starts clean.

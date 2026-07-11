@@ -5,9 +5,6 @@
 //! `tn_snapshot.last_restored_epoch` gauges track the most recent successful upload and
 //! restore.
 
-// TODO(snapshot): remove once service/export/restore wire these handles (C6/C7)
-#![allow(dead_code)]
-
 use reth_metrics::{metrics::Gauge, Metrics};
 
 /// Metrics for the snapshot subsystem, owned by the snapshot service.
@@ -41,6 +38,9 @@ pub(crate) enum JobOutcome {
     SkippedOverlap,
     /// Skipped because the upload-and-certify deadline elapsed.
     SkippedCertTimeout,
+    /// Skipped because the epoch's EIP-1559 base fees are not derivable from the captured state,
+    /// so a restored node could not resume fee calculation.
+    SkippedFeeUnderivable,
     /// The job failed with an error.
     Failed,
 }
@@ -52,6 +52,7 @@ impl JobOutcome {
             Self::Uploaded => "uploaded",
             Self::SkippedOverlap => "skipped_overlap",
             Self::SkippedCertTimeout => "skipped_cert_timeout",
+            Self::SkippedFeeUnderivable => "skipped_fee_underivable",
             Self::Failed => "failed",
         }
     }
@@ -76,6 +77,7 @@ mod tests {
             metrics.record_job(JobOutcome::Uploaded);
             metrics.record_job(JobOutcome::SkippedOverlap);
             metrics.record_job(JobOutcome::SkippedCertTimeout);
+            metrics.record_job(JobOutcome::SkippedFeeUnderivable);
             metrics.record_job(JobOutcome::Failed);
         });
 

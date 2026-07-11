@@ -16,8 +16,11 @@
 //! [`has_chain_data`] is the shared precondition guarding restore against clobbering a datadir
 //! that already holds chain data.
 
-// TODO(snapshot): remove once all modules land (C6/C7)
-#![allow(unused_crate_dependencies)]
+// Used only by the standalone integration-test binaries under `tests/`.
+#[cfg(test)]
+mod clippy {
+    use proptest as _;
+}
 
 use std::{path::Path, time::Duration};
 use tn_config::TelcoinDirs;

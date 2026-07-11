@@ -14,7 +14,6 @@ tn-types = { workspace = true }
 tn-config = { workspace = true }
 tn-storage = { workspace = true }
 tn-reth = { workspace = true }
-tn-metrics = { workspace = true }
 
 # remote object storage (rustls only; see native-tls guard in root Cargo.toml notes)
 object_store = { workspace = true }
@@ -51,7 +50,6 @@ reth-metrics = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 proptest = { workspace = true }
-tn-test-utils-committee = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 rand = { workspace = true }
 metrics-util = { workspace = true }
