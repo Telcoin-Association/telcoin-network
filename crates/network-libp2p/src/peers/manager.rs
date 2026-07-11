@@ -54,11 +54,14 @@ pub(crate) struct PeerManager {
     known_peers: HashMap<BlsPublicKey, NetworkInfo>,
     /// BLS keys whose `known_peers` entry is pinned and never evicted by committee rotation.
     ///
-    /// Populated by the locally provisioned insertion paths — trusted/bootstrap/explicit peers and
-    /// records restored from persistence at startup — whose count is bounded by node
-    /// configuration. Every other `known_peers` entry is a kad-discovered committee record kept
-    /// only while its key sits in a tracked committee slot, so [`Self::prune_known_peers`] can
-    /// drop rotated-out members without touching operator-provisioned peers.
+    /// Populated only by the operator-provisioned insertion paths — trusted/bootstrap/explicit
+    /// peers — whose count is bounded by node configuration. Records restored from persistence
+    /// at startup are NOT pinned: the persisted kad store holds peer-fillable third-party records
+    /// (stored as the node's DHT storage duty), so restored entries stay subject to
+    /// committee-rotation pruning. Every other `known_peers` entry is a kad-discovered committee
+    /// record kept only while its key sits in a tracked committee slot, so
+    /// [`Self::prune_known_peers`] can drop rotated-out members without touching
+    /// operator-provisioned peers.
     pinned_peers: HashSet<BlsPublicKey>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
@@ -763,14 +766,45 @@ impl PeerManager {
 
     /// Add a locally provisioned known peer and pin it against eviction.
     ///
-    /// Used for operator-driven entries — bootstrap and explicit peers, and records restored from
-    /// local persistence at startup — whose count is bounded by node configuration. Pinned entries
-    /// survive committee rotation (see [`Self::prune_known_peers`]). The attacker-reachable kad
-    /// discovery path must instead use [`Self::add_discovered_peer`], which is bounded to committee
+    /// Used for operator-driven entries only — trusted/explicit peers (bootstrap peers go through
+    /// [`Self::add_bootstrap_peer`]) — whose count is bounded by node configuration. Pinned
+    /// entries survive committee rotation (see [`Self::prune_known_peers`]). Records restored
+    /// from local persistence at startup do NOT use this method precisely because they must not
+    /// pin — they go through [`Self::add_restored_peer`]. The attacker-reachable kad discovery
+    /// path must instead use [`Self::add_discovered_peer`], which is bounded to committee
     /// membership.
     pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.pinned_peers.insert(bls_key);
         self.cache_known_peer(bls_key, info);
+    }
+
+    /// Add a peer record restored from the persisted kad store at startup, WITHOUT pinning it.
+    ///
+    /// Restored records are kad-discovered cache, not operator-provisioned peers: the persisted
+    /// store's contents are peer-fillable because the node stores arbitrary signature-valid
+    /// third-party records as its DHT storage duty. Pinning them would let a restart convert
+    /// attacker-fillable store entries into permanently pinned `known_peers` entries, so restored
+    /// entries are deliberately NOT pinned — they survive only until the first
+    /// [`Self::update_committees`] prunes non-members, restoring the issue #827 committee bound.
+    pub(crate) fn add_restored_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.cache_known_peer(bls_key, info);
+    }
+
+    /// Add an operator-configured bootstrap peer: always pin it, but never overwrite an existing
+    /// `known_peers` record.
+    ///
+    /// Bootstrap peers are operator-provisioned and bounded by node configuration, so they must
+    /// always be pinned — under unpinned restore, skipping keys that already resolve (the old
+    /// handler pattern) would leave a bootstrap peer with a restored record unpinned, and it
+    /// would be pruned at the first committee rotation. An existing `known_peers` entry (e.g. a
+    /// richer record restored from persistence, which may carry fresher multiaddrs/rpc info) is
+    /// not overwritten by the config-derived stub, preserving the don't-overwrite contract of
+    /// the [`AddBootstrapPeers`](crate::types::NetworkCommand) command.
+    pub(crate) fn add_bootstrap_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.pinned_peers.insert(bls_key);
+        if !self.known_peers.contains_key(&bls_key) {
+            self.cache_known_peer(bls_key, info);
+        }
     }
 
     /// Add a peer learned from the kad discovery DHT, but only if it is a tracked committee member.
@@ -846,8 +880,8 @@ impl PeerManager {
     /// Validate the advertised endpoint, register the peer's network identity, cache its info, and
     /// close the committee trust window if it belongs to a tracked slot.
     ///
-    /// Shared body of [`Self::add_known_peer`] and [`Self::add_discovered_peer`]; the caller
-    /// decides whether the entry is pinned or admitted at all.
+    /// Shared body of the known-peer insertion paths; the caller decides whether the entry is
+    /// pinned or admitted at all.
     fn cache_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
         // signature verification proves authenticity but not scheme correctness; drop a
         // malformed advertised endpoint so only well-formed RPC info is ever cached in

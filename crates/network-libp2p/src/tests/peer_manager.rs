@@ -923,6 +923,65 @@ async fn test_known_peers_pruned_on_rotation_but_pinned_survive() {
     );
 }
 
+#[tokio::test]
+async fn test_restored_records_not_pinned_and_pruned_at_rotation() {
+    // Records restored from the persisted kad store at startup are peer-fillable third-party
+    // records (DHT storage duty), so they must NOT be pinned: the first committee rotation prunes
+    // every restored key that does not sit in a tracked slot, restoring the issue #827 bound that
+    // a pinning restore would bypass.
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([17; 32]);
+
+    let restored_a = *BlsKeypair::generate(&mut rng).public();
+    let restored_b = *BlsKeypair::generate(&mut rng).public();
+    peer_manager.add_restored_peer(restored_a, random_network_info());
+    peer_manager.add_restored_peer(restored_b, random_network_info());
+    assert!(peer_manager.auth_to_peer(restored_a).is_some(), "restored record a resolvable");
+    assert!(peer_manager.auth_to_peer(restored_b).is_some(), "restored record b resolvable");
+
+    // first rotation: only `restored_b` occupies a tracked committee slot
+    peer_manager.update_committees(HashSet::new(), HashSet::from([restored_b]), HashSet::new());
+
+    assert!(
+        peer_manager.auth_to_peer(restored_a).is_none(),
+        "restored non-member must be pruned at the first rotation"
+    );
+    assert!(
+        peer_manager.auth_to_peer(restored_b).is_some(),
+        "restored committee member must be retained"
+    );
+}
+
+#[tokio::test]
+async fn test_bootstrap_peer_pins_existing_entry_without_overwrite() {
+    // A bootstrap peer whose record was already restored (unpinned) from persistence must still
+    // be pinned — otherwise the first rotation would prune it — while the existing, possibly
+    // richer record is not overwritten by the config-derived stub.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([23; 32])).public();
+
+    // restored (unpinned) record with distinctive multiaddrs
+    let restored_info = random_network_info();
+    let restored_addrs = restored_info.multiaddrs.clone();
+    peer_manager.add_restored_peer(bls, restored_info);
+
+    // the operator's bootstrap config carries a different (stub) address for the same key
+    let bootstrap_info = random_network_info();
+    assert_ne!(restored_addrs, bootstrap_info.multiaddrs, "addresses must differ for this test");
+    peer_manager.add_bootstrap_peer(bls, bootstrap_info);
+
+    // the restored record won: no overwrite
+    let (_, multiaddrs) = peer_manager.auth_to_peer(bls).expect("bootstrap peer resolvable");
+    assert_eq!(multiaddrs, restored_addrs, "existing record must not be overwritten");
+
+    // rotate to a committee that does NOT include the bootstrap peer: it survives, pinned
+    let new_member = *BlsKeypair::generate(&mut StdRng::from_seed([99; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([new_member]), HashSet::new());
+    let (_, multiaddrs) =
+        peer_manager.auth_to_peer(bls).expect("bootstrap peer must survive rotation");
+    assert_eq!(multiaddrs, restored_addrs, "pinned entry keeps the restored record");
+}
+
 /// Build a [`NetworkInfo`] like [`random_network_info`], but advertising a valid [`RpcInfo`].
 fn random_network_info_with_rpc() -> (NetworkInfo, RpcInfo) {
     let rpc = RpcInfo {

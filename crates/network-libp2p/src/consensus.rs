@@ -434,9 +434,22 @@ where
             stream_protocols,
         );
 
-        // Promote the surviving records into the local peer cache.
+        // Promote the surviving records into the local peer cache. The store's contents are
+        // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
+        // duty), so entries are restored UNPINNED and stay prunable at the first committee
+        // rotation. Our own record is skipped: both primary and worker key their record by
+        // the primary BLS key, and there is no point caching ourselves as a known peer.
+        let own_key = key_config.primary_public_key();
+        let mut restored: usize = 0;
         for (key, info) in known {
-            behavior.peer_manager.add_known_peer(key, info);
+            if key == own_key {
+                continue;
+            }
+            behavior.peer_manager.add_restored_peer(key, info);
+            restored += 1;
+        }
+        if restored > 0 {
+            info!(target: "network-kad", restored, "restored persisted kad records into the local peer cache");
         }
 
         let network_pubkey = keypair.public().into();
@@ -737,20 +750,20 @@ where
                 let _ = reply.send(Ok(()));
             }
             NetworkCommand::AddBootstrapPeers { peers, reply } => {
-                // update peer manager
+                // update peer manager: always pin bootstrap peers (even when a record already
+                // exists, e.g. restored unpinned from persistence), but never overwrite an
+                // existing record with the config-derived stub
                 let peer = &mut self.swarm.behaviour_mut().peer_manager;
                 for (bls, info) in peers {
-                    if peer.auth_to_peer(bls).is_none() {
-                        peer.add_known_peer(
-                            bls,
-                            NetworkInfo {
-                                pubkey: info.network_key,
-                                multiaddrs: vec![info.network_address],
-                                timestamp: now(),
-                                rpc: None,
-                            },
-                        );
-                    }
+                    peer.add_bootstrap_peer(
+                        bls,
+                        NetworkInfo {
+                            pubkey: info.network_key,
+                            multiaddrs: vec![info.network_address],
+                            timestamp: now(),
+                            rpc: None,
+                        },
+                    );
                 }
                 let _ = reply.send(Ok(()));
             }

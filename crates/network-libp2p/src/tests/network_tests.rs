@@ -2982,6 +2982,181 @@ async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result
     Ok(())
 }
 
+/// Records restored from the persisted kad store at startup are UNPINNED: the store legitimately
+/// holds arbitrary signature-valid third-party records (DHT storage duty), so a restart must not
+/// convert them into permanently pinned `known_peers` entries. Restored records resolve until the
+/// first committee rotation, which prunes every key outside a tracked slot — restoring the issue
+/// #827 bound.
+#[tokio::test]
+async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result<()> {
+    use libp2p::kad;
+    use tn_types::Signer as _;
+
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default)
+        .with_network_config(NetworkConfig::default())
+        .build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let authority_2 = authorities.next().expect("second authority");
+    let config_1 = authority_1.consensus_config();
+    let config_2 = authority_2.consensus_config();
+    let task_manager = TaskManager::default();
+
+    let authority_bls = config_2.key_config().primary_public_key();
+
+    // a third party whose signature-valid record the node stored as its DHT storage duty
+    let outsider_keypair = BlsKeypair::generate(&mut StdRng::from_seed([5; 32]));
+    let outsider_bls = *outsider_keypair.public();
+
+    let db = MemDatabase::default();
+
+    // seed the DB before the network starts with two VALID records: one for a committee
+    // authority and one for the non-committee outsider
+    {
+        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), NetworkType::Primary);
+
+        let key_config_2 = config_2.key_config();
+        let authority_record = NodeRecord::build(
+            key_config_2.primary_network_public_key(),
+            config_2.primary_address(),
+            None,
+            |data| key_config_2.request_signature_direct(data),
+        );
+        kad_store.put(kad::Record {
+            key: kad::RecordKey::new(&authority_bls),
+            value: encode(&authority_record),
+            publisher: None,
+            expires: None,
+        })?;
+
+        let outsider_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+        let outsider_record =
+            NodeRecord::build(outsider_netkey, create_multiaddr(None), None, |data| {
+                outsider_keypair.sign(data)
+            });
+        kad_store.put(kad::Record {
+            key: kad::RecordKey::new(&outsider_bls),
+            value: encode(&outsider_record),
+            publisher: None,
+            expires: None,
+        })?;
+    }
+
+    // construct the network over the seeded DB — the startup restore path
+    let (tx, _network_events) = mpsc::channel(10);
+    let network_key = config_1.key_config().primary_network_keypair().clone();
+    let mut network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        config_1.network_config(),
+        tx,
+        config_1.key_config().clone(),
+        network_key,
+        db,
+        task_manager.get_spawner(),
+        NetworkType::Primary,
+        config_1.primary_address(),
+        None,
+    )?;
+
+    // both restored records resolve after startup
+    assert!(
+        network.swarm.behaviour().peer_manager.auth_to_peer(authority_bls).is_some(),
+        "restored authority record resolvable at startup"
+    );
+    assert!(
+        network.swarm.behaviour().peer_manager.auth_to_peer(outsider_bls).is_some(),
+        "restored outsider record resolvable at startup"
+    );
+
+    // the first committee rotation tracks only the authority; production applies committee
+    // membership from epoch state the same way
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        std::iter::once(authority_bls).collect(),
+        Default::default(),
+    );
+
+    assert!(
+        network.swarm.behaviour().peer_manager.auth_to_peer(authority_bls).is_some(),
+        "restored committee authority must survive rotation"
+    );
+    assert!(
+        network.swarm.behaviour().peer_manager.auth_to_peer(outsider_bls).is_none(),
+        "restored non-committee record must be pruned at the first rotation"
+    );
+
+    Ok(())
+}
+
+/// Startup restore skips the node's own persisted kad record: both primary and worker key their
+/// record by the primary BLS key, and there is no point caching ourselves as a known peer.
+#[tokio::test]
+async fn test_restore_skips_own_record() -> eyre::Result<()> {
+    use libp2p::kad;
+
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default)
+        .with_network_config(NetworkConfig::default())
+        .build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let config_1 = authority_1.consensus_config();
+    let task_manager = TaskManager::default();
+
+    let own_bls = config_1.key_config().primary_public_key();
+    let db = MemDatabase::default();
+
+    // seed the DB with a valid record for the node's OWN primary BLS key, built the same way
+    // the node builds its own record
+    {
+        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), NetworkType::Primary);
+        let key_config = config_1.key_config();
+        let own_record = NodeRecord::build(
+            key_config.primary_network_public_key(),
+            config_1.primary_address(),
+            None,
+            |data| key_config.request_signature_direct(data),
+        );
+        kad_store.put(kad::Record {
+            key: kad::RecordKey::new(&own_bls),
+            value: encode(&own_record),
+            publisher: None,
+            expires: None,
+        })?;
+    }
+
+    // construct the network over the seeded DB — the startup restore path
+    let (tx, _network_events) = mpsc::channel(10);
+    let network_key = config_1.key_config().primary_network_keypair().clone();
+    let network = ConsensusNetwork::<
+        TestWorkerRequest,
+        TestWorkerResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+    >::new(
+        config_1.network_config(),
+        tx,
+        config_1.key_config().clone(),
+        network_key,
+        db,
+        task_manager.get_spawner(),
+        NetworkType::Primary,
+        config_1.primary_address(),
+        None,
+    )?;
+
+    // the restore loop skipped our own record
+    assert!(
+        network.swarm.behaviour().peer_manager.auth_to_peer(own_bls).is_none(),
+        "own record must be skipped by the startup restore"
+    );
+
+    Ok(())
+}
+
 /// Regression for issue #743: a response from a peer whose BLS identity is not
 /// yet resolved must surface as the transient `PeerUnresolved`, never the
 /// misleading `PeerMissing`, because the response payload itself is genuine.
