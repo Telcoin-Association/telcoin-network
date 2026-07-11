@@ -692,8 +692,10 @@ impl SnapshotRestorer {
 /// The worker id encoded in a header's `difficulty` (low 16 bits).
 ///
 /// Mirrors the canonical `worker_id_from_header` in `tn_node::manager::node`; kept in sync with the
-/// encoding used by the gas accumulator's block attribution.
-fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
+/// encoding used by the gas accumulator's block attribution. Public so the snapshot uploader's
+/// fee-derivability precheck attributes headers with the exact same rule the restore-side
+/// [`SnapshotRestorer::derive_fee_precondition`] uses — one implementation, no drift.
+pub fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
     (header.difficulty.into_limbs()[0] & 0xffff) as u16
 }
 
@@ -701,8 +703,10 @@ fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
 ///
 /// Mirrors the canonical `is_worker_batch_block` in `tn_node::manager::node`: excludes genesis
 /// (`number == 0`) and the synthetic empty-close block, whose `ommers_hash` (the batch-digest slot)
-/// is zero. Only genuine batch blocks carry a non-zero batch digest.
-fn is_worker_batch_block(header: &SealedHeader) -> bool {
+/// is zero. Only genuine batch blocks carry a non-zero batch digest. Public so the snapshot
+/// uploader's fee-derivability precheck shares the exact attribution rule the restore-side
+/// [`SnapshotRestorer::derive_fee_precondition`] applies.
+pub fn is_worker_batch_block(header: &SealedHeader) -> bool {
     header.number != 0 && header.ommers_hash != B256::ZERO
 }
 

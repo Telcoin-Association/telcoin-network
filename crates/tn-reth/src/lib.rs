@@ -188,7 +188,10 @@ pub use evm::{
     BLS_G1_PRECOMPILE_ADDRESS, TELCOIN_PRECOMPILE_ADDRESS,
 };
 pub use forward::WorkerRpcForwarder;
-pub use snapshot::{PinnedStateView, SnapshotRestorer, StateExportStats};
+pub use snapshot::{
+    is_worker_batch_block, worker_id_from_header, PinnedStateView, SnapshotRestorer,
+    StateExportStats,
+};
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
