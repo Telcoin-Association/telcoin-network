@@ -8,6 +8,7 @@ members = [
     "crates/exex",
     "crates/node",
     "crates/storage",
+    "crates/snapshot",
     "crates/test-utils",
     "crates/test-utils-committee",
     "crates/tn-utils",
@@ -84,6 +85,7 @@ serde_json = "1.0.94"
 humantime-serde = "1.1"
 fdlimit = "0.3.0"
 snap = "1.1.1"
+zstd = "0.13.3"
 rayon = "1.7"
 
 # crypto
@@ -92,6 +94,7 @@ secp256k1 = { version = "0.31", default-features = false, features = [
     "rand",
     "recovery",
 ] }
+sha2 = "0.10.8"
 
 rpassword = "7.4.0"
 
@@ -163,6 +166,7 @@ tn-network-types = { path = "./crates/network-types" }
 tn-rpc = { path = "./crates/execution/tn-rpc" }
 state-sync = { path = "./crates/state-sync" }
 tn-utils = { path = "./crates/tn-utils" }
+tn-snapshot = { path = "./crates/snapshot" }
 telcoin-network-cli = { path = "./crates/telcoin-network-cli" }
 
 # consensus
@@ -218,6 +222,8 @@ reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",
 ] }
+# remote object storage for snapshots; keep native-tls out of the lockfile (rustls only)
+object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"] }
 # worker-gateway http server (bin/worker-gateway)
 axum = { version = "0.8.6", default-features = false }
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }

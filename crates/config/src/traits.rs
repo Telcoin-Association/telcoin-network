@@ -147,6 +147,17 @@ pub trait TelcoinDirs: std::fmt::Debug + Send + Sync + 'static {
     fn epochs_db_path(&self) -> PathBuf {
         self.consensus_db_path().join("epochs")
     }
+
+    /// Return the path to the directory holding snapshot working files and the restore marker.
+    ///
+    /// Resolves to `<datadir>/snapshots`, a sibling of the reth and consensus databases.
+    fn snapshots_path(&self) -> PathBuf {
+        // sibling of consensus-db/db; the parent of consensus_db_path is the datadir root
+        self.consensus_db_path()
+            .parent()
+            .map(|datadir| datadir.join("snapshots"))
+            .unwrap_or_else(|| PathBuf::from("snapshots"))
+    }
 }
 
 impl<P> TelcoinDirs for P
