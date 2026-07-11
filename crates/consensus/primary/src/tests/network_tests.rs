@@ -1339,6 +1339,96 @@ async fn test_send_partial_epoch_over_stream() {
     assert_eq!(&sent_more[..sent.len()], &sent[..], "smaller prefix must prefix the larger one");
 }
 
+/// Serving a partial prefix over the sync protocol (`EpochPackPartial`, item 9)
+/// writes `Ack` then streams exactly the verifiable prefix bytes as `Data` frames:
+/// the bytes reassembled from the frames must equal the data file truncated at
+/// `output_end(k)`, and a later cutoff must stream strictly more (with the smaller
+/// prefix a true prefix of it): the sync mirror of `test_send_partial_epoch_over_stream`.
+#[tokio::test]
+async fn test_sync_partial_epoch_pack_over_stream() {
+    use tokio::io::AsyncReadExt as _;
+
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let peer = *committee.first_authority().authority().protocol_key();
+
+    // Populate the in-progress (never finalized) epoch-0 pack with some outputs.
+    let num_outputs = 15u64;
+    for number in 1..=num_outputs {
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+        );
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
+    }
+
+    // Reassemble the pack bytes streamed by the sync serve for a stop point `k`: read
+    // the leading `Ack`, then feed the remaining `Data`/`End` frames through
+    // `sync_pack_reader` (the reader the real requester uses).
+    async fn reassemble_partial(
+        consensus_chain: &tn_storage::consensus::ConsensusChain,
+        stop_number: u64,
+        peer: BlsPublicKey,
+    ) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        crate::network::sync_codec::send_sync_epoch_pack_over_stream(
+            &mut out,
+            consensus_chain,
+            0,
+            Some(stop_number),
+            Duration::from_secs(10),
+            peer,
+        )
+        .await
+        .expect("serve partial epoch pack over sync");
+
+        let mut cursor = futures::io::Cursor::new(out);
+        let (mut dec, mut comp) = (Vec::new(), Vec::new());
+        let ack = tn_network_libp2p::read_frame::<_, tn_network_libp2p::PrimarySyncRequest>(
+            &mut cursor,
+            &mut dec,
+            &mut comp,
+            crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await
+        .expect("read ack frame");
+        assert_matches!(ack, tn_network_libp2p::SyncFrame::Ack);
+
+        let mut reassembled = Vec::new();
+        crate::network::sync_codec::sync_pack_reader(cursor)
+            .read_to_end(&mut reassembled)
+            .await
+            .expect("reassemble partial pack data frames");
+        reassembled
+    }
+
+    // The reassembled bytes must equal the verifiable prefix the chain exposes, i.e.
+    // the data file truncated at `output_end(k)`.
+    let k = 9u64;
+    let reassembled = reassemble_partial(handler.consensus_chain(), k, peer).await;
+    let (stream, len) =
+        handler.consensus_chain().get_partial_epoch_stream(0, k).await.expect("partial stream");
+    let mut expected = Vec::new();
+    stream.take(len).read_to_end(&mut expected).await.unwrap();
+    assert_eq!(reassembled.len() as u64, len, "streamed byte count must equal the partial cutoff");
+    assert_eq!(reassembled, expected, "reassembled bytes must equal the verifiable prefix");
+
+    // A later cutoff streams strictly more, and the smaller prefix is a true prefix of it.
+    let reassembled_more = reassemble_partial(handler.consensus_chain(), num_outputs, peer).await;
+    assert!(reassembled_more.len() > reassembled.len(), "a later cutoff must stream more bytes");
+    assert_eq!(
+        &reassembled_more[..reassembled.len()],
+        &reassembled[..],
+        "smaller prefix must prefix the larger one"
+    );
+}
+
 /// A full epoch pack the responder does not hold is shed with
 /// `Deny(Unavailable)`, so a sync requester retries another peer immediately
 /// instead of waiting out its ack timeout. (The `Ack`+`Data`+`End` happy path is
@@ -1357,6 +1447,7 @@ async fn test_sync_epoch_pack_unavailable_denies() {
         &mut out,
         handler.consensus_chain(),
         0,
+        None,
         Duration::from_secs(5),
         peer,
     )

@@ -1206,9 +1206,10 @@ where
         peer: BlsPublicKey,
         mut stream: Stream,
         epoch: Epoch,
+        stop_number: Option<u64>,
         consensus_chain: &ConsensusChain,
     ) -> PrimaryNetworkResult<()> {
-        debug!(target: "primary::network", %peer, epoch, "serving inbound sync epoch pack stream");
+        debug!(target: "primary::network", %peer, epoch, ?stop_number, "serving inbound sync epoch pack stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
         // bound the whole serve; flatten the timeout's outer Result into the send's
@@ -1218,6 +1219,7 @@ where
                 &mut stream,
                 consensus_chain,
                 epoch,
+                stop_number,
                 SEND_STREAM_BUFFER_TIMEOUT,
                 peer,
             ),
