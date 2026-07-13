@@ -176,6 +176,8 @@ mod evm;
 pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
+#[cfg(feature = "faucet")]
+pub use evm::faucet_mint_role_slot;
 #[cfg(not(feature = "faucet"))]
 pub use evm::TIMELOCK_DURATION;
 pub use evm::{
@@ -1405,6 +1407,16 @@ impl RethEnv {
         task_manager: &TaskManager,
         rewards: Option<RewardsCounter>,
     ) -> eyre::Result<Self> {
+        /// MDBX map-size ceiling for throwaway temp-chain envs. reth defaults to 8 TB per
+        /// environment; `cargo test` runs a test binary as threads in ONE process, so N
+        /// concurrent 8 TB virtual reservations exhaust the address space and MDBX aborts
+        /// env-open with ENOMEM ("Cannot allocate memory (12)"). A temp chain never holds a
+        /// full node's history, so a small ceiling is safe and lets many envs coexist.
+        const TEMP_CHAIN_DB_MAX_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+        /// Grow the temp DB file in small increments so throwaway DBs stay tiny on disk
+        /// (reth pairs its 8 TB default with a 4 GiB step; mirror reth's `test()` 4 MiB step).
+        const TEMP_CHAIN_DB_GROWTH_STEP: usize = 4 * 1024 * 1024; // 4 MiB
+
         let node_config = NodeConfig {
             datadir: DatadirArgs {
                 datadir: MaybePlatformPath::from(db_path.as_ref().to_path_buf()),
@@ -1414,6 +1426,12 @@ impl RethEnv {
                 pprof_dumps_path: None,
             },
             chain,
+            // Bound the MDBX geometry for throwaway temp chains (see const docs).
+            db: DatabaseArgs {
+                max_size: Some(TEMP_CHAIN_DB_MAX_SIZE),
+                growth_step: Some(TEMP_CHAIN_DB_GROWTH_STEP),
+                ..Default::default()
+            },
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config);

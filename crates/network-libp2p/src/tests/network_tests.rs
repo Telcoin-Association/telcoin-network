@@ -3077,9 +3077,10 @@ fn author_attributable_reject_charges_the_author_never_the_relayer() {
     }
 }
 
-/// An oversized payload is the only relayer-attributable reject — the size bound is deterministic
-/// network-wide, so under `Strict` validation an honest peer never forwards one — and it is
-/// charged to the forwarder only once its BLS identity has resolved (the author's resolution is
+/// An oversized payload is the only relayer-attributable reject — the size bound is a compile-time
+/// protocol constant (`MAX_GOSSIP_MESSAGE_SIZE`), identical on every honest node and enforced on
+/// both the publish and receive paths, so an honest peer never originates or forwards one — and it
+/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution is
 /// irrelevant), mirroring the Accept path's unresolved-relayer skip.
 #[test]
 fn oversized_reject_penalizes_only_a_resolved_relayer() {
@@ -3090,4 +3091,25 @@ fn oversized_reject_penalizes_only_a_resolved_relayer() {
         );
         assert_eq!(RejectReason::TooLarge.penalty(false, author_resolved), RejectPenalty::Skip);
     }
+}
+
+/// #872: a node must never originate a gossip payload larger than `MAX_GOSSIP_MESSAGE_SIZE`. Honest
+/// peers reject an oversized payload as `RejectReason::TooLarge` and Fatal-attribute it to the
+/// relaying peer, which on the first hop is the originator — so the publish path enforces the same
+/// bound as `verify_gossip`, refusing an oversized message locally with
+/// `PublishError::MessageTooLarge` instead of letting the originator be banned by its peers.
+#[tokio::test]
+async fn oversized_publish_is_refused_locally() -> eyre::Result<()> {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { network_handle: cvv, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // one byte over the bound is refused at origination, before it can reach any peer
+    let too_big = vec![0u8; MAX_GOSSIP_MESSAGE_SIZE + 1];
+    let err = cvv.publish(TEST_TOPIC.into(), too_big).await.expect_err("oversized publish refused");
+    assert_matches!(err, NetworkError::Publish(PublishError::MessageTooLarge));
+
+    Ok(())
 }
