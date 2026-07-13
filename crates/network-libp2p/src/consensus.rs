@@ -1863,8 +1863,17 @@ where
         // reject record
         if publisher_is_banned || source_is_banned {
             error!(target: "network-kad", ?publisher_is_banned, ?source_is_banned, ?source, publisher=?record.publisher, "rejecting put request for record");
-            // handle race condition with PM
-            self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
+            // Do NOT `remove_record(&record.key)` on the reject path. Kademlia runs
+            // with `StoreInserts::FilterBoth`, so this inbound record was never
+            // written to the store; the only record `remove_record` can delete is one
+            // the local node itself published (libp2p removes a key only when the
+            // stored record's publisher is our own peer id; see libp2p-kad
+            // behaviour.rs). The sole locally-published record is our own discovery
+            // record, keyed on our BLS public key with `expires: None`, so an
+            // unauthenticated PUT carrying `publisher = None` and `key = our own key`
+            // would delete it. Because we only re-provide at startup, that deletion
+            // then persists until restart. Reject with a penalty only; never mutate
+            // the store on a key supplied by the sender.
 
             // assess penalty for pushing record without publisher
             if record.publisher.is_none() {

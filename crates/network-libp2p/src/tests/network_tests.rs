@@ -2743,6 +2743,61 @@ async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()>
     Ok(())
 }
 
+/// Regression (GHSA-j24g-gqj4-9vj8): an inbound `PUT_VALUE` with `publisher =
+/// None` and a `key` equal to the node's own discovery-record key must NOT
+/// delete the node's own record from the local store.
+///
+/// `publisher = None` short-circuits to the reject path before any signature
+/// check, and the pre-fix reject path called `remove_record(&record.key)` with
+/// the sender-supplied key. Because the node's own record is the only
+/// locally-published record, that call deleted it, and since we only re-provide
+/// our record at startup, the deletion persisted until restart. The reject path
+/// must perform no store mutation keyed on attacker-supplied input.
+#[tokio::test]
+async fn test_publisherless_put_cannot_delete_own_record() -> eyre::Result<()> {
+    use libp2p::kad;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // Seed our own discovery record into the local store with the same record
+    // `provide_our_data` publishes at startup: keyed on our BLS public key with
+    // `publisher = Some(local_peer_id)`, the only record `remove_record` can touch.
+    let own_record = network.get_peer_record();
+    network.swarm.behaviour_mut().kademlia.store_mut().put(own_record.clone())?;
+    assert!(
+        network.swarm.behaviour_mut().kademlia.store_mut().get(&own_record.key).is_some(),
+        "own discovery record present before the attack",
+    );
+
+    // An arbitrary connected peer sends a PUT keyed on our own record key with no
+    // publisher. No signature and no committee membership are required.
+    let attacker = *peer2.network.swarm.local_peer_id();
+    let malicious = kad::Record {
+        key: own_record.key.clone(),
+        value: vec![0xde, 0xad, 0xbe, 0xef],
+        publisher: None,
+        expires: None,
+    };
+    network.process_kad_put_request(attacker, malicious)?;
+
+    // The node's own authoritative record must survive intact: it is only
+    // re-provided at startup, so a deletion here would persist until restart.
+    // Assert it is still present AND unchanged, covering both the "delete" and
+    // "mutate" halves of the advisory's acceptance criterion. (Compare the stable
+    // fields; `expires` loses precision across the store's SystemTime<->Instant
+    // round-trip, as noted in `test_newer_kad_record_replaced`.)
+    let survived = network.swarm.behaviour_mut().kademlia.store_mut().get(&own_record.key).expect(
+        "own discovery record must survive a publisher=None reject-path put (GHSA-j24g-gqj4-9vj8)",
+    );
+    assert_eq!(survived.key, own_record.key);
+    assert_eq!(survived.value, own_record.value);
+    assert_eq!(survived.publisher, own_record.publisher);
+
+    Ok(())
+}
+
 /// A signed record advertising an RPC endpoint with a well-formed URL but the
 /// wrong scheme is accepted (the signature is authentic) and promoted with the
 /// malformed endpoint stripped, without penalizing the sender.
