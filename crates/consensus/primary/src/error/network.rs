@@ -35,9 +35,6 @@ pub(crate) enum PrimaryNetworkError {
     /// Internal error occurred.
     #[error("Internal error: {0}")]
     Internal(String),
-    /// Unknown consensus header.
-    #[error("Unknown consensus header: {0}")]
-    UnknownConsensusHeaderDigest(ConsensusHeaderDigest),
     /// Unknown consensus header certificate.
     #[error("Unknown consensus header certificate for: {0}")]
     UnknownConsensusHeaderCert(ConsensusHeaderDigest),
@@ -71,6 +68,50 @@ pub(crate) enum PrimaryNetworkError {
     /// Pass through from the consesus chain.
     #[error("ConsensusChainError {0}")]
     ConsensusChainError(ConsensusChainError),
+}
+
+impl PrimaryNetworkError {
+    /// Whether this fault is determined purely by the *content* of a gossip message — its BCS
+    /// encoding or its declared topic — and is therefore attributable to the message author
+    /// (`GossipMessage::source`) rather than the peer that relayed it.
+    ///
+    /// Mirrors `WorkerNetworkError::is_author_content_fault` (tn-worker) and is consulted only on
+    /// the gossip path (`PrimaryNetwork::process_gossip`): the network layer accepted and forwarded
+    /// the message after a shallow check, so an honest relayer could not have screened a
+    /// content-determined fault, and charging the relayer for it lets a Byzantine author ban honest
+    /// forwarders (see issues #801/#819). The request/response paths penalize the peer
+    /// unconditionally because there the peer *is* the originator.
+    ///
+    /// Restricted to the two `Fatal` faults authored by the gossip source and reachable from the
+    /// gossip handler: [`Self::Decode`] (`try_decode` of the payload) and [`Self::InvalidTopic`]
+    /// (the payload variant was published to the wrong topic). Every other variant is either
+    /// benign on the gossip path or concerns embedded certificate/consensus content whose signer
+    /// is carried inside the payload and is not necessarily the gossip source, so its existing
+    /// relayer/no-penalty attribution is left unchanged.
+    pub(crate) fn is_author_content_fault(&self) -> bool {
+        //
+        // explicitly match every variant so the classification is revisited with changes
+        //
+        match self {
+            PrimaryNetworkError::Decode(_) | PrimaryNetworkError::InvalidTopic => true,
+            PrimaryNetworkError::InvalidHeader(_)
+            | PrimaryNetworkError::Certificate(_)
+            | PrimaryNetworkError::StdIo(_)
+            | PrimaryNetworkError::Storage(_)
+            | PrimaryNetworkError::InvalidRequest(_)
+            | PrimaryNetworkError::Internal(_)
+            | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
+            | PrimaryNetworkError::UnknownConsensusOutput(_)
+            | PrimaryNetworkError::PeerNotInCommittee(_)
+            | PrimaryNetworkError::UnavailableEpoch(_)
+            | PrimaryNetworkError::UnavailableEpochDigest(_)
+            | PrimaryNetworkError::InvalidEpochRequest
+            | PrimaryNetworkError::Timeout(_)
+            | PrimaryNetworkError::UnknownStreamRequest(_)
+            | PrimaryNetworkError::StreamUnavailable(_)
+            | PrimaryNetworkError::ConsensusChainError(_) => false,
+        }
+    }
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -120,8 +161,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             },
             // Benign "miss": observers legitimately request not-yet-served headers/outputs.
             // No penalty so honest sync flows are not banned during catch-up.
-            PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
-            | PrimaryNetworkError::UnknownConsensusOutput(_) => None,
+            PrimaryNetworkError::UnknownConsensusOutput(_) => None,
             PrimaryNetworkError::InvalidRequest(_)
             | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
@@ -147,10 +187,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
 fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
     match error {
         // mild
-        HeaderError::SyncBatches(_)
-        | HeaderError::TooNew { .. }
-        | HeaderError::Storage(_)
-        | HeaderError::UnknownExecutionResult(_) => Some(Penalty::Mild),
+        HeaderError::SyncBatches(_) | HeaderError::TooNew { .. } => Some(Penalty::Mild),
         // medium
         HeaderError::InvalidParents
         | HeaderError::WrongNumberOfParents(_, _)
@@ -167,14 +204,49 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::UnknownNetworkKey(_)
         | HeaderError::PeerNotAuthor
         | HeaderError::InvalidGenesisParent(_)
+        | HeaderError::InvalidRound(_)
         | HeaderError::ParentMissingSignature
         | HeaderError::InvalidParentTimestamp { .. }
         | HeaderError::UnkownWorkerId
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
-        // ignore
+        // ignore (local/transient, not the peer's fault)
+        //
+        // Storage is our own DB error, and UnknownExecutionResult means a peer is merely
+        // ahead of our execution while we catch up (the vote handler notes "this doesn't
+        // hurt"). Penalizing either would punish an honest peer for a local condition, and
+        // contradicts the sibling PrimaryNetworkError::Storage and *::Timeout arms that
+        // already map to None.
         HeaderError::PendingCertificateOneshot
+        | HeaderError::Storage(_)
+        | HeaderError::UnknownExecutionResult(_)
         | HeaderError::TNSend(_)
         | HeaderError::InvalidEpoch { .. }
+        | HeaderError::NotCommitteeMember
         | HeaderError::ClosedWatchChannel => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Finding 2 (#819): faults determined by the gossip envelope's content — a malformed payload
+    /// (`Decode`) or a wrong declared topic (`InvalidTopic`) — are the message author's, so the
+    /// gossip path charges the author rather than Fatal-banning the honest relaying peer (#801).
+    #[test]
+    fn author_content_faults_are_decode_and_invalid_topic() {
+        assert!(PrimaryNetworkError::Decode(BcsError::Eof).is_author_content_fault());
+        assert!(PrimaryNetworkError::InvalidTopic.is_author_content_fault());
+    }
+
+    /// Every other fault keeps its relayer / no-penalty attribution: transport and local faults
+    /// are not the author's, and embedded certificate/consensus content is signed by a party
+    /// carried inside the payload, not by the gossip source.
+    #[test]
+    fn non_envelope_faults_are_not_author_content() {
+        assert!(!PrimaryNetworkError::InvalidEpochRequest.is_author_content_fault());
+        assert!(!PrimaryNetworkError::UnknownConsensusOutput(0).is_author_content_fault());
+        assert!(!PrimaryNetworkError::InvalidRequest("bad".to_string()).is_author_content_fault());
+        assert!(!PrimaryNetworkError::Internal("boom".to_string()).is_author_content_fault());
     }
 }

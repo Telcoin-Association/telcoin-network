@@ -29,7 +29,7 @@ Software:
 Build from source:
 
 ```bash
-cargo build --bin telcoin-network --release
+cargo build -p telcoin-network --bin telcoin-network --release
 ```
 
 The binary lands at `target/release/telcoin-network`.
@@ -138,6 +138,29 @@ After rotating, re-export the staking arguments for the new address (see [Stakin
 telcoin-network keytool export-staking-args \
     --node-info /var/lib/telcoin/node-info.yaml
 ```
+
+### Advertising a JSON-RPC endpoint
+
+A node can advertise an optional JSON-RPC endpoint to peers over Kademlia so wallets and dapps can discover where to submit transactions. The endpoint is stored in `node-info.yaml` under `p2p_info.worker.rpc` and advertised by the worker network when the node runs.
+
+`keytool set-rpc` sets or clears that endpoint. It is a config-only edit — no keys are read and the BLS passphrase is ignored — so it requires an existing `node-info.yaml` under `--datadir`; run `keytool generate validator|observer` first (it errors with that hint otherwise).
+
+```bash
+telcoin-network keytool set-rpc \
+    --datadir /var/lib/telcoin \
+    --http https://validator.example.com:8545/ \
+    --ws wss://validator.example.com:8546/
+```
+
+`--http` is the required HTTP/HTTPS endpoint; `--ws` is the optional WebSocket endpoint. Both are validated with the same check node startup applies — `--http` must use the `http` or `https` scheme and `--ws` must use `ws` or `wss` — so a bad scheme fails immediately instead of being advertised and rejected by peers.
+
+Remove a previously-advertised endpoint with `--clear`:
+
+```bash
+telcoin-network keytool set-rpc --datadir /var/lib/telcoin --clear
+```
+
+`--clear` conflicts with `--http`/`--ws`, and omitting all flags is an error (`--http` is required unless `--clear`).
 
 ## Genesis ceremony
 
@@ -620,8 +643,7 @@ JSON (`--json`):
 ```json
 {
 	"blsPubkey": "0x...",
-	"uncompressedPubkey": "0x...",
-	"uncompressedSignature": "0x..."
+	"signature": "0x..."
 }
 ```
 
@@ -638,12 +660,11 @@ function stake(
 ) public
 
 struct ProofOfPossession {
-    bytes uncompressedPubkey;    // 192 bytes
-    bytes uncompressedSignature; // 96 bytes
+    bytes signature; // 48 bytes (compressed G1)
 }
 ```
 
-The compressed BLS public key is 96 bytes. The proof of possession binds the BLS key to the validator's execution address.
+The compressed BLS public key is 96 bytes and the proof-of-possession signature is 48 bytes. The proof of possession binds the BLS key to the validator's execution address; the native precompile verifies the signature directly against the compressed `blsPubkey`.
 
 ## Observer mode
 

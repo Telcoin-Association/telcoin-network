@@ -3,7 +3,8 @@
 mod export_staking_args;
 mod generate;
 mod pop;
-use self::{export_staking_args::ExportStakingArgs, generate::NodeType};
+mod set_rpc;
+use self::{export_staking_args::ExportStakingArgs, generate::NodeType, set_rpc::SetRpcArgs};
 use clap::{Args, Subcommand};
 use eyre::{eyre, Context};
 
@@ -34,6 +35,10 @@ pub enum KeySubcommand {
     /// Export hex-encoded staking arguments from node-info.yaml.
     #[command(name = "export-staking-args")]
     ExportStakingArgs(ExportStakingArgs),
+
+    /// Set or clear the worker JSON-RPC endpoint advertised in node-info.yaml.
+    #[command(name = "set-rpc")]
+    SetRpc(SetRpcArgs),
 }
 
 impl KeyArgs {
@@ -56,9 +61,43 @@ impl KeyArgs {
             KeySubcommand::ExportStakingArgs(args) => {
                 args.execute()?;
             }
+            // set or clear the worker rpc endpoint in node-info.yaml (config-only
+            // edit; does not use the BLS passphrase)
+            KeySubcommand::SetRpc(args) => args.execute(&datadir)?,
         }
 
         Ok(())
+    }
+
+    /// Test-only twin of [`Self::execute`]: `generate validator|observer` wrap the fresh BLS
+    /// key with an intentionally weak PBKDF2 round count; every other subcommand never writes
+    /// keys and behaves exactly like [`Self::execute`]. NEVER call this outside tests.
+    #[cfg(feature = "test-utils")]
+    pub fn execute_insecure(
+        &self,
+        datadir: PathBuf,
+        passphrase: Option<String>,
+        rounds: u32,
+    ) -> eyre::Result<()> {
+        if let KeySubcommand::Generate(args) = &self.command {
+            if let NodeType::ValidatorKeys(a) | NodeType::ObserverKeys(a) = &args.node_type {
+                // initialize path and warn users if overwriting keys
+                self.init_path(datadir.node_keys_path(), a.force)?;
+                return a.execute_insecure(&datadir, passphrase, rounds);
+            }
+        }
+        self.execute(datadir, passphrase)
+    }
+
+    /// Whether this keytool invocation needs the BLS key passphrase up front.
+    ///
+    /// `generate validator|observer` encrypts a freshly minted BLS key and
+    /// `generate pop` decrypts the existing key to re-sign, so the binary must
+    /// have the passphrase available before dispatching them. `set-rpc` only
+    /// edits public config in `node-info.yaml` and never touches the BLS key, so
+    /// it must not be gated on a passphrase.
+    pub fn needs_passphrase(&self) -> bool {
+        !matches!(self.command, KeySubcommand::SetRpc(_))
     }
 
     /// Ensure the path exists, and if not, create it.
@@ -95,11 +134,15 @@ impl KeyArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{export_staking_args::ExportStakingArgs, generate::KeygenArgs, pop::PopArgs};
+    use super::{
+        export_staking_args::ExportStakingArgs, generate::KeygenArgs, pop::PopArgs,
+        set_rpc::SetRpcArgs,
+    };
     use crate::{cli::Cli, NoArgs};
     use clap::Parser;
     use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo};
-    use tn_types::{hex, verify_proof_of_possession_bls, Address};
+    use tn_types::{hex, verify_proof_of_possession_bls, Address, BlsPublicKey, RpcInfo};
+    use url::Url;
 
     /// Test that generate keys command works.
     /// This test also ensures that confy is able to
@@ -163,23 +206,19 @@ mod tests {
         )
         .expect("node info loaded");
 
-        let compressed = node_info.bls_public_key.to_bytes();
-        let uncompressed_pk = node_info.bls_public_key.serialize();
-        let uncompressed_sig = node_info.proof_of_possession.serialize();
+        let compressed_pubkey = node_info.bls_public_key.to_bytes();
+        let compressed_sig = node_info.proof_of_possession.to_bytes();
 
-        assert_eq!(compressed.len(), 96, "compressed BLS pubkey should be 96 bytes");
-        assert_eq!(uncompressed_pk.len(), 192, "uncompressed BLS pubkey should be 192 bytes");
-        assert_eq!(uncompressed_sig.len(), 96, "uncompressed PoP signature should be 96 bytes");
+        assert_eq!(compressed_pubkey.len(), 96, "compressed BLS pubkey should be 96 bytes");
+        assert_eq!(compressed_sig.len(), 48, "compressed PoP signature should be 48 bytes");
 
         // verify hex encoding produces valid 0x-prefixed strings
-        let compressed_hex = format!("0x{}", hex::encode(compressed));
-        let uncompressed_pk_hex = format!("0x{}", hex::encode(uncompressed_pk));
-        let uncompressed_sig_hex = format!("0x{}", hex::encode(uncompressed_sig));
+        let compressed_pubkey_hex = format!("0x{}", hex::encode(compressed_pubkey));
+        let compressed_sig_hex = format!("0x{}", hex::encode(compressed_sig));
 
-        assert!(compressed_hex.starts_with("0x"));
-        assert_eq!(compressed_hex.len(), 2 + 96 * 2); // 0x + 96 bytes hex
-        assert_eq!(uncompressed_pk_hex.len(), 2 + 192 * 2); // 0x + 192 bytes hex
-        assert_eq!(uncompressed_sig_hex.len(), 2 + 96 * 2); // 0x + 96 bytes hex
+        assert!(compressed_pubkey_hex.starts_with("0x"));
+        assert_eq!(compressed_pubkey_hex.len(), 2 + 96 * 2); // 0x + 96 bytes hex
+        assert_eq!(compressed_sig_hex.len(), 2 + 48 * 2); // 0x + 48 bytes hex
 
         // also test that ExportStakingArgs::execute works with directory path
         let args =
@@ -261,6 +300,8 @@ mod tests {
             name,
             external_primary_addr: None,
             external_worker_addrs: None,
+            rpc_http: None,
+            rpc_ws: None,
         }
     }
 
@@ -403,6 +444,167 @@ mod tests {
         );
     }
 
+    /// `generate validator --rpc-http .. --rpc-ws ..` writes the worker RPC
+    /// descriptor into `node-info.yaml` alongside the freshly minted identity:
+    /// the primary RPC stays unset and the BLS key, name, and execution address
+    /// are all populated (the late `worker.rpc` assignment does not clobber them).
+    #[tokio::test]
+    async fn test_generate_sets_worker_rpc() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+
+        let http = Url::parse("https://validator.example.com:8545/").expect("http url");
+        let ws = Url::parse("wss://validator.example.com:8546/").expect("ws url");
+        KeygenArgs {
+            address: new_test_address(),
+            rpc_http: Some(http.clone()),
+            rpc_ws: Some(ws.clone()),
+            ..keygen_args(None)
+        }
+        .execute(&datadir, None)
+        .expect("generate keys with rpc");
+
+        let node_info = Config::load_from_path::<NodeInfo>(
+            datadir.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("node info loaded");
+
+        // worker rpc is exactly what we passed in.
+        assert_eq!(
+            node_info.p2p_info.worker.rpc,
+            Some(RpcInfo { http, ws: Some(ws) }),
+            "worker rpc should match the provided endpoints"
+        );
+        // the primary's rpc is never touched (the runtime never reads it).
+        assert!(node_info.p2p_info.primary.rpc.is_none(), "primary rpc must stay unset");
+        // identity fields are populated by fresh generation and survive the rpc assignment.
+        assert_ne!(
+            node_info.bls_public_key,
+            BlsPublicKey::default(),
+            "BLS public key must be populated"
+        );
+        assert!(
+            node_info.name.starts_with("node-"),
+            "node name must be derived from the BLS key, got: {}",
+            node_info.name
+        );
+        assert_eq!(
+            node_info.execution_address,
+            new_test_address(),
+            "execution address must be the one passed to generate"
+        );
+    }
+
+    /// `generate validator` without the RPC flags leaves the worker RPC descriptor
+    /// unset - the pre-flag default, so existing generation flows are unchanged.
+    #[tokio::test]
+    async fn test_generate_without_rpc_leaves_unset() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        keygen_args(None).execute(&datadir, None).expect("generate keys without rpc");
+
+        let node_info = Config::load_from_path::<NodeInfo>(
+            datadir.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("node info loaded");
+        assert!(
+            node_info.p2p_info.worker.rpc.is_none(),
+            "worker rpc should stay unset without --rpc-http"
+        );
+    }
+
+    /// `generate validator` validates the worker RPC endpoint *before* minting
+    /// keys: a non-http(s) scheme is rejected and no `node-info.yaml` is written,
+    /// proving the fail-fast ordering (a typo does not leave keys on disk).
+    #[tokio::test]
+    async fn test_generate_rejects_bad_rpc_scheme() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+
+        // a non-http(s) scheme parses as a URL but fails RpcInfo::validate.
+        let http = Url::parse("ftp://validator.example.com:8545/").expect("ftp url parses");
+        let err = KeygenArgs { rpc_http: Some(http), rpc_ws: None, ..keygen_args(None) }
+            .execute(&datadir, None)
+            .expect_err("generate must reject a non-http(s) scheme");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid worker rpc endpoint"),
+            "error should wrap the validation failure, got: {msg}"
+        );
+
+        // fail-fast: validation runs before any keys / node-info are written.
+        assert!(
+            !datadir.join("node-info.yaml").exists(),
+            "no node-info.yaml should be written when the rpc endpoint is rejected"
+        );
+    }
+
+    /// The `generate validator` RPC flags are wired into clap under the namespaced
+    /// `--rpc-http` / `--rpc-ws` names: both parse together, `--rpc-ws` requires
+    /// `--rpc-http`, and the un-namespaced `--http` (set-rpc's name) is rejected
+    /// here - confirming the deliberate per-command rename.
+    #[test]
+    fn test_generate_rpc_cli_parses() {
+        // both rpc endpoints parse together.
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+                "--rpc-http",
+                "https://validator.example.com:8545/",
+                "--rpc-ws",
+                "wss://validator.example.com:8546/",
+            ])
+            .is_ok(),
+            "`generate validator --rpc-http .. --rpc-ws ..` should parse"
+        );
+
+        // `--rpc-ws` without `--rpc-http` errors (requires), so a ws endpoint is
+        // never silently dropped for lack of an http endpoint.
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+                "--rpc-ws",
+                "wss://validator.example.com:8546/",
+            ])
+            .is_err(),
+            "`--rpc-ws` without `--rpc-http` should error"
+        );
+
+        // the un-namespaced set-rpc name is not accepted by `generate` (confirms the rename).
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "generate",
+                "validator",
+                "--datadir",
+                "/tmp/does-not-matter",
+                "--address",
+                "0",
+                "--http",
+                "https://validator.example.com:8545/",
+            ])
+            .is_err(),
+            "bare `--http` should be rejected by `generate` (it uses `--rpc-http`)"
+        );
+    }
+
     /// `generate pop` refuses to run when node-info.yaml records a BLS public key
     /// that does not match the keys on disk (wrong datadir / mixed-up files),
     /// rather than silently rewriting the recorded identity.
@@ -482,6 +684,200 @@ mod tests {
                 "0",
             ]);
             assert!(parsed.is_ok(), "`generate {name}` should parse");
+        }
+    }
+
+    /// `set-rpc --http .. --ws ..` writes the worker RPC descriptor into
+    /// `node-info.yaml` and touches nothing else: the primary RPC stays unset and
+    /// the node identity (BLS key, name, execution address) is unchanged.
+    #[tokio::test]
+    async fn test_set_rpc_sets_worker_rpc() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        keygen_args(None).execute(&datadir, None).expect("generate keys");
+
+        let node_info_path = datadir.join("node-info.yaml");
+        let before = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded before set-rpc");
+        // the worker starts with no advertised rpc.
+        assert!(before.p2p_info.worker.rpc.is_none(), "worker rpc should start unset");
+
+        let http = Url::parse("https://validator.example.com:8545/").expect("http url");
+        let ws = Url::parse("wss://validator.example.com:8546/").expect("ws url");
+        SetRpcArgs { http: Some(http.clone()), ws: Some(ws.clone()), clear: false }
+            .execute(&datadir)
+            .expect("set-rpc sets worker rpc");
+
+        let after = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded after set-rpc");
+
+        // worker rpc is exactly what we passed in.
+        assert_eq!(
+            after.p2p_info.worker.rpc,
+            Some(RpcInfo { http, ws: Some(ws) }),
+            "worker rpc should match the provided endpoints"
+        );
+        // the primary's rpc is never touched (the runtime never reads it).
+        assert!(after.p2p_info.primary.rpc.is_none(), "primary rpc must stay unset");
+        // identity fields are untouched - this is a config-only edit.
+        assert_eq!(before.bls_public_key, after.bls_public_key, "BLS public key must not change");
+        assert_eq!(before.name, after.name, "node name must not change");
+        assert_eq!(
+            before.execution_address, after.execution_address,
+            "execution address must not change"
+        );
+    }
+
+    /// `set-rpc --clear` removes a previously-set worker RPC descriptor.
+    #[tokio::test]
+    async fn test_set_rpc_clear() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        keygen_args(None).execute(&datadir, None).expect("generate keys");
+        let node_info_path = datadir.join("node-info.yaml");
+
+        // set, then clear.
+        let http = Url::parse("https://validator.example.com:8545/").expect("http url");
+        SetRpcArgs { http: Some(http), ws: None, clear: false }
+            .execute(&datadir)
+            .expect("set-rpc sets worker rpc");
+        let set = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded after set");
+        assert!(set.p2p_info.worker.rpc.is_some(), "worker rpc should be set before clearing");
+
+        SetRpcArgs { http: None, ws: None, clear: true }
+            .execute(&datadir)
+            .expect("set-rpc clears worker rpc");
+        let cleared = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
+            .expect("node info loaded after clear");
+        assert!(cleared.p2p_info.worker.rpc.is_none(), "worker rpc should be cleared");
+    }
+
+    /// `set-rpc` errors with a "generate keys first" hint when `node-info.yaml`
+    /// is missing, rather than creating a fresh node-info with default identity.
+    #[tokio::test]
+    async fn test_set_rpc_missing_node_info_errors() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        let http = Url::parse("https://validator.example.com:8545/").expect("http url");
+        let err = SetRpcArgs { http: Some(http), ws: None, clear: false }
+            .execute(&datadir)
+            .expect_err("set-rpc must error when node-info.yaml is missing");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("generate keys first"),
+            "missing node-info hint should tell the operator to generate keys first, got: {msg}"
+        );
+    }
+
+    /// `set-rpc` applies the same scheme validation node startup runs: a non-http
+    /// scheme parses as a URL but is rejected, and nothing is persisted.
+    #[tokio::test]
+    async fn test_set_rpc_rejects_bad_scheme() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir created");
+        let datadir = tempdir.path().to_path_buf();
+        keygen_args(None).execute(&datadir, None).expect("generate keys");
+
+        // a non-http(s) scheme parses as a URL but fails RpcInfo::validate.
+        let http = Url::parse("ftp://validator.example.com:8545/").expect("ftp url parses");
+        let err = SetRpcArgs { http: Some(http), ws: None, clear: false }
+            .execute(&datadir)
+            .expect_err("set-rpc must reject a non-http(s) scheme");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid worker rpc endpoint"),
+            "error should wrap the validation failure, got: {msg}"
+        );
+
+        // the rejected endpoint must not have been written.
+        let after = Config::load_from_path::<NodeInfo>(
+            datadir.join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )
+        .expect("node info still loads");
+        assert!(after.p2p_info.worker.rpc.is_none(), "rejected endpoint must not be persisted");
+    }
+
+    /// The `set-rpc` clap relations: `--http` is required unless `--clear`, and
+    /// `--http`/`--ws` conflict with `--clear`.
+    #[test]
+    fn test_set_rpc_parse() {
+        // set with both endpoints parses.
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "set-rpc",
+                "--http",
+                "https://validator.example.com:8545/",
+                "--ws",
+                "wss://validator.example.com:8546/",
+            ])
+            .is_ok(),
+            "`set-rpc --http .. --ws ..` should parse"
+        );
+
+        // clear parses on its own.
+        assert!(
+            Cli::<NoArgs>::try_parse_from(["telcoin-network", "keytool", "set-rpc", "--clear"])
+                .is_ok(),
+            "`set-rpc --clear` should parse"
+        );
+
+        // bare set-rpc errors: --http is required unless --clear.
+        assert!(
+            Cli::<NoArgs>::try_parse_from(["telcoin-network", "keytool", "set-rpc"]).is_err(),
+            "`set-rpc` with no flags should error (http required)"
+        );
+
+        // --clear and --http conflict.
+        assert!(
+            Cli::<NoArgs>::try_parse_from([
+                "telcoin-network",
+                "keytool",
+                "set-rpc",
+                "--clear",
+                "--http",
+                "https://validator.example.com:8545/",
+            ])
+            .is_err(),
+            "`set-rpc --clear --http ..` should error (conflict)"
+        );
+    }
+
+    /// The binary's passphrase gate keys off `KeyArgs::needs_passphrase`. A
+    /// config-only edit (`set-rpc`) must not require the BLS passphrase, while a
+    /// key-touching subcommand (`generate pop`) must.
+    #[test]
+    fn test_set_rpc_needs_no_passphrase() {
+        use crate::cli::Commands;
+
+        // set-rpc only edits public config: no passphrase required.
+        let cli =
+            Cli::<NoArgs>::try_parse_from(["telcoin-network", "keytool", "set-rpc", "--clear"])
+                .expect("set-rpc --clear parses");
+        match cli.command {
+            Commands::Keytool(keytool) => {
+                assert!(!keytool.needs_passphrase(), "set-rpc must not require the BLS passphrase")
+            }
+            _ => panic!("expected a keytool command"),
+        }
+
+        // generate pop decrypts the existing BLS key: passphrase required.
+        let cli = Cli::<NoArgs>::try_parse_from([
+            "telcoin-network",
+            "keytool",
+            "generate",
+            "pop",
+            "--address",
+            "0",
+        ])
+        .expect("generate pop parses");
+        match cli.command {
+            Commands::Keytool(keytool) => {
+                assert!(keytool.needs_passphrase(), "generate pop must require the BLS passphrase")
+            }
+            _ => panic!("expected a keytool command"),
         }
     }
 }

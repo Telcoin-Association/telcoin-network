@@ -47,7 +47,8 @@ redb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
 default = ["reth-libmdbx"]
 test-utils = []
-adiri = []
+# Adiri testnet fork logic gated on `tn_types::forks` — pull in the constants.
+adiri = ["tn-types/adiri"]
 
 [lints]
 workspace = true

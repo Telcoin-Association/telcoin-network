@@ -12,7 +12,9 @@ use std::{
 use crate::{
     proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus, ConsensusBusApp,
 };
-use futures::{AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _};
+use futures::{
+    AsyncReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _, TryFutureExt as _,
+};
 use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
@@ -35,9 +37,9 @@ use tn_storage::{
     PayloadStore,
 };
 use tn_types::{
-    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
-    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
+    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest, ConsensusResult,
+    Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest,
+    Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, B256,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -67,6 +69,18 @@ pub const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// so this bounds the true concurrent count—not just the pending map size.
 pub const MAX_CONCURRENT_EPOCH_STREAMS: usize = 5;
 
+/// Hard cap on the number of distinct pending consensus results tracked in the
+/// handler's `consensus_certs` signature-tally map at any time.
+///
+/// `consensus_certs` is a transient tally that is wiped wholesale the moment any
+/// consensus result reaches quorum, so under honest operation only a handful of
+/// entries (typically one, for the next consensus number) are ever live at once.
+/// Capping the map bounds its memory against a gossip flood of validly-signed but
+/// non-quorum `ConsensusResult`s from Byzantine committee members: no matter how
+/// many members collude, they cannot grow the map past this cap. See the
+/// `PrimaryGossip::Consensus` handler and GHSA-2r5c-c4h7-gp5h.
+pub(crate) const MAX_CONSENSUS_CERTS: usize = 20;
+
 /// Maximum number of concurrent pending batch requests from a single peer.
 ///
 /// Prevents a single malicious peer from filling all global slots.
@@ -85,8 +99,20 @@ const CONSENSUS_OUTPUT_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the epoch-pack
 /// request frame is written. A peer that negotiated the sync protocol but does not
 /// answer (a pre-cutover node that registered the protocol but reads the stream on
-/// the legacy digest path) trips this and the requester falls back to legacy.
+/// the legacy digest path) trips this and is cached unsyncable this epoch, so the
+/// probe moves on to the next peer.
 const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Overall bound on reading a streamed missing-certificates response, on top of the
+/// per-frame timeout. Without it a Byzantine peer that `Ack`s and then drips a tiny
+/// valid `Data` frame just inside the per-frame timeout could keep the requester's
+/// read loop (and its open substream) alive far longer than any honest transfer;
+/// this caps the whole post-`Ack` read so such a peer is dropped and the fan-out
+/// moves on. Comfortably covers a realistic catch-up response (a few MiB) while
+/// keeping an abandoned per-peer fetch task's lifetime in the same ballpark as the
+/// legacy request-response path's network timeout; a peer too slow to finish in this
+/// window is treated as failed and another peer (or the legacy path) is tried.
+const MISSING_CERTS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for reading the opening request frame of an inbound sync stream, and the
 /// bound on every best-effort trailing write (shed `Deny`, malformed `Err`). A peer
@@ -95,16 +121,25 @@ const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of network sync probe attempts per [`request_epoch_pack`] call
-/// before falling back to the legacy path.
+/// before the full-pack fetch gives up (returns `Err`) for this call.
 ///
 /// This caps probe *attempts* (stream opens), not peers examined: a peer cached
-/// legacy-only this epoch is skipped with only a cache lookup (no network I/O) and
+/// unsyncable this epoch is skipped with only a cache lookup (no network I/O) and
 /// does not count against the budget, so successive calls keep discovering newly
-/// upgraded peers without an all-legacy fleet ever spending more than this many
+/// upgraded peers without an all-unsupported fleet ever spending more than this many
 /// sync opens per call.
 ///
 /// [`request_epoch_pack`]: PrimaryNetworkHandle::request_epoch_pack
 const MAX_EPOCH_SYNC_PROBES: usize = 3;
+
+/// Bound on the opening `Req` frame of an inbound sync stream (and on the tiny
+/// best-effort control writes that follow). The `EpochPack` request is a few bytes,
+/// but a `MissingCertificates` request carries one skip-round bitmap per committee
+/// authority, so this is sized well above the per-pack-chunk bound to admit a large
+/// (but still bounded) request. An oversized request is rejected at read, after
+/// which the requester simply falls back to the legacy path, so this is a safety
+/// bound rather than a hard compatibility limit.
+const MAX_SYNC_REQUEST_FRAME_SIZE: usize = 4 * 1024 * 1024;
 
 /// What a [`PendingStreamRequest`] should stream once the peer opens the stream.
 #[derive(Debug, Clone, Copy)]
@@ -196,10 +231,32 @@ impl PendingStreamRequest {
 enum EpochPackAttempt {
     /// The peer served and the pack was imported into the consensus chain.
     Imported,
-    /// The peer did not answer the sync exchange; fall back to legacy.
+    /// The peer did not answer the sync exchange; cache it unsyncable this epoch
+    /// and skip it on later probes (it must upgrade to be syncable again).
     Unsupported,
     /// The peer answered but the exchange failed; try the next peer.
     Failed(NetworkError),
+}
+
+/// One epoch-pack fetch over the typed sync protocol, as threaded unchanged
+/// through every per-peer probe (`request_epoch_pack_sync` down to the stream
+/// exchange). Bundles what the exchange needs so each probe hop takes the peer
+/// plus this instead of six loose parameters.
+#[derive(Clone, Copy)]
+struct EpochPackSyncRequest<'a> {
+    /// The epoch whose pack is requested.
+    epoch: Epoch,
+    /// `None` requests the full pack; `Some(n)` requests a verifiable prefix
+    /// stopping after consensus number `n`.
+    last_consensus_number: Option<u64>,
+    /// Record of the epoch being fetched; the streamed pack verifies against it.
+    epoch_record: &'a EpochRecord,
+    /// The preceding epoch's record, anchoring verification.
+    previous_epoch: &'a EpochRecord,
+    /// Destination chain the served pack imports into.
+    consensus_chain: &'a ConsensusChain,
+    /// Timeout applied when importing the streamed records.
+    record_timeout: Duration,
 }
 
 /// RAII guard for an admitted inbound sync epoch-pack stream.
@@ -266,8 +323,9 @@ pub struct PrimaryNetworkHandle {
     ///
     /// Absent means not yet probed (try the sync protocol); `false` means the peer
     /// did not answer a sync open (a pre-cutover peer that fails negotiation, or one
-    /// that negotiated but never `Ack`ed), so go straight to legacy; `true` means the
-    /// peer served (or is serving) the sync protocol. Cleared each epoch via
+    /// that negotiated but never `Ack`ed), so it is skipped on later probes this epoch
+    /// (full-pack fetch has no legacy fallback); `true` means the peer served (or is
+    /// serving) the sync protocol. Cleared each epoch via
     /// [`Self::clear_sync_capability`] so a peer upgraded over the rotation boundary
     /// is re-probed.
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
@@ -302,8 +360,8 @@ impl PrimaryNetworkHandle {
     /// Clear the per-peer epoch-pack sync-capability cache.
     ///
     /// Called at each epoch boundary: committees rotate and binaries are upgraded
-    /// there, so a peer that could only speak legacy last epoch is re-probed for
-    /// the sync protocol this epoch.
+    /// there, so a peer that did not answer the sync protocol last epoch is
+    /// re-probed for it this epoch.
     pub fn clear_sync_capability(&self) {
         self.sync_capability.lock().clear();
     }
@@ -388,9 +446,6 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::MissingParents(parents) => {
                 Ok(RequestVoteResult::MissingParents(parents))
             }
-            PrimaryResponse::ConsensusHeader(_consensus_header) => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is consensus header!".to_string(),
-            )),
             PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is epoch record!".to_string(),
             )),
@@ -403,90 +458,101 @@ impl PrimaryNetworkHandle {
         }
     }
 
+    /// Fetch missing certificates from `peer` over the typed sync protocol.
+    ///
+    /// Item 7 (#739) cut the certificate fetch fully over to `/tn-primary-sync`: there is
+    /// no legacy request-response fallback. The exchange opens a stream, writes the
+    /// request in the opening frame, reads the `Ack`, and reassembles the streamed
+    /// certificate `Data` frames; any failure (negotiation, shed, transport, or protocol)
+    /// returns an error so the staggered fan-out tries the next peer. The exchange is
+    /// penalty-exempt, and cancelling this future (the fan-out's cancel-on-first-success)
+    /// drops the in-flight substream, resetting it. The returned certificates are
+    /// unverified; the caller validates them.
     pub async fn fetch_certificates(
         &self,
         peer: BlsPublicKey,
         request: MissingCertificatesRequest,
     ) -> NetworkResult<Vec<Certificate>> {
-        let request = PrimaryRequest::MissingCertificates { inner: request };
-        let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??.result;
-        match res {
-            PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
-            PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
-            _ => Err(NetworkError::RPCError("Got wrong response, not a certificate!".to_string())),
-        }
-    }
+        // open the sync stream, flattening the command-channel and stream-open results. A
+        // peer that does not advertise the protocol surfaces an error here; with no
+        // fallback it is simply a failed peer and the fan-out moves on.
+        let mut stream = self.handle.open_stream(peer, StreamKind::Sync).await.and_then(|s| s)?;
 
-    /// Request consensus header from specific peer.
-    /// Will verify the returned header matches hash if provided (strong) or number if not (weak).
-    pub async fn request_consensus_from_peer(
-        &self,
-        peer: BlsPublicKey,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-    ) -> NetworkResult<ConsensusHeader> {
-        let request = PrimaryRequest::ConsensusHeader { number, hash };
-        let res = self.handle.send_request(request, peer).await?;
-        let res = res.await??.result;
-        match res {
-            PrimaryResponse::ConsensusHeader(header) => {
-                if header.digest() == hash && header.number == number {
-                    Ok(Arc::unwrap_or_clone(header))
-                } else {
-                    Err(NetworkError::RPCError(format!(
-                        "Returned header does not match number {number}/{} or hash {hash}/{}!",
-                        header.number,
-                        header.digest()
-                    )))
-                }
-            }
-            PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
-            _ => Err(NetworkError::RPCError(
-                "Got wrong response, not a consensus header!".to_string(),
-            )),
-        }
-    }
+        // write the request in the opening frame
+        let request_frame = SyncFrame::Req(PrimarySyncRequest::MissingCertificates {
+            exclusive_lower_bound: request.exclusive_lower_bound,
+            skip_rounds: request.skip_rounds.clone(),
+        });
+        let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+        write_frame(
+            &mut stream,
+            &request_frame,
+            &mut encode_buffer,
+            &mut compressed_buffer,
+            MAX_SYNC_REQUEST_FRAME_SIZE,
+        )
+        .await
+        .and(stream.flush().await)
+        .map_err(|e| {
+            NetworkError::RPCRetryable(format!(
+                "failed to write missing certificates sync request frame: {e}"
+            ))
+        })?;
 
-    /// Request consensus header from a random peer up to three times from three different peers.
-    /// Will verify the returned header matches hash if provided (strong) or number if not (weak).
-    pub async fn request_consensus(
-        &self,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-    ) -> NetworkResult<ConsensusHeader> {
-        const TIMEOUT: Duration = Duration::from_secs(10);
-        let request = PrimaryRequest::ConsensusHeader { number, hash };
-        // Try up to three times (from three peers) to get consensus.
-        // This could be a lot more complicated but this KISS method should work fine.
-        for _ in 0..3 {
-            let res = self.handle.send_request_any(request.clone()).await?;
-            let res = match tokio::time::timeout(TIMEOUT, res).await {
-                Ok(r) => r,
-                Err(_) => {
-                    tracing::warn!(target: "primary::network", ?number, "request_consensus timed out waiting for peer response");
-                    continue;
-                }
-            };
-            let res = res?;
-            if let Ok(NetworkResponseMessage {
-                peer,
-                result: PrimaryResponse::ConsensusHeader(header),
-            }) = res
-            {
-                if header.digest() == hash && header.number == number {
-                    return Ok(Arc::unwrap_or_clone(header));
-                } else {
-                    tracing::warn!(target: "primary::network", "Returned header does not match number {number}/{} or hash {hash}/{}, try again!",
-                        header.number,
-                        header.digest()
-                    );
-                    // Give the naughty peer a penalty.
-                    self.report_penalty(peer, Penalty::Medium).await;
-                }
-            }
+        // read the responder's first frame, bounded by the ack timeout
+        let (mut decode_buffer, mut decompress_buffer) = (Vec::new(), Vec::new());
+        let first = tokio::time::timeout(
+            SYNC_ACK_TIMEOUT,
+            read_frame::<_, PrimarySyncRequest>(
+                &mut stream,
+                &mut decode_buffer,
+                &mut decompress_buffer,
+                sync_codec::MAX_SYNC_CERT_FRAME_SIZE,
+            ),
+        )
+        .await
+        .map_err(|_elapsed| {
+            NetworkError::RPCRetryable(
+                "timed out awaiting missing certificates sync ack".to_string(),
+            )
+        })?
+        .map_err(|e| {
+            NetworkError::RPCRetryable(format!(
+                "failed to read missing certificates sync ack frame: {e}"
+            ))
+        })?;
+
+        match first {
+            // accepted: reassemble the streamed certificate `Data` frames under an overall
+            // read timeout (on top of the per-frame timeout) so a peer that `Ack`s then
+            // drips frames cannot pin the read loop and its substream
+            SyncFrame::Ack => tokio::time::timeout(
+                MISSING_CERTS_RESPONSE_TIMEOUT,
+                sync_codec::read_sync_certificates(&mut stream),
+            )
+            .await
+            .map_err(|_elapsed| {
+                NetworkError::RPCRetryable(
+                    "timed out reading missing certificates over sync stream".to_string(),
+                )
+            })?
+            .map_err(|e| {
+                NetworkError::RPCError(format!(
+                    "failed to read missing certificates over sync stream: {e}"
+                ))
+            }),
+            // the responder is shedding load or declines the request: try another peer
+            SyncFrame::Deny(reason) => Err(NetworkError::RPCRetryable(format!(
+                "peer denied missing certificates sync request: {reason:?}"
+            ))),
+            SyncFrame::Err(err) => Err(NetworkError::RPCError(format!(
+                "peer aborted missing certificates sync exchange: {err:?}"
+            ))),
+            // a well-behaved responder never opens with these
+            SyncFrame::Req(_) | SyncFrame::Data(_) | SyncFrame::End => Err(
+                NetworkError::ProtocolError("unexpected opening sync frame from peer".to_string()),
+            ),
         }
-        Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
     }
 
     /// Request the raw (serialized) consensus output bytes for `number` from a specific peer.
@@ -656,12 +722,15 @@ impl PrimaryNetworkHandle {
         self.handle.connected_peer_count().await
     }
 
-    /// Attempt to get a complete epoch pack file from any peer via stream.
+    /// Attempt to get a complete epoch pack file from any peer over the typed
+    /// `/tn-primary-sync` protocol.
     ///
-    /// This method:
-    /// 1. Sends a `StreamEpoch` request to negotiate
-    /// 2. If accepted, opens a stream with the request digest for correlation
-    /// 3. Reads and validates batches from the stream in real-time
+    /// Full-pack fetch is typed-only (no legacy fallback): this returns `Err`, and
+    /// the caller retries, when no connected peer successfully serves a pack over
+    /// the sync protocol (no peers, all unsupported, or all failed to import). See
+    /// [`Self::request_epoch_pack_sync`] for the per-peer probe behavior. The partial
+    /// prefix ([`Self::request_partial_epoch_pack`]) reuses the same probe over the
+    /// sync protocol but keeps a legacy fallback.
     pub async fn request_epoch_pack(
         &self,
         epoch_record: &EpochRecord,
@@ -705,8 +774,11 @@ impl PrimaryNetworkHandle {
     }
 
     /// Shared implementation for full ([`Self::request_epoch_pack`]) and partial
-    /// ([`Self::request_partial_epoch_pack`]) epoch pack streaming. `last_consensus_number` selects
-    /// the request variant and correlation digest; everything else is identical.
+    /// ([`Self::request_partial_epoch_pack`]) epoch pack streaming. A full pack
+    /// (`last_consensus_number` is `None`) is fetched over the typed sync protocol
+    /// only; a partial prefix (`Some`) is fetched over the sync protocol first and
+    /// falls back to the legacy stream path for peers that do not yet serve the
+    /// `EpochPackPartial` sync variant.
     async fn request_epoch_pack_inner(
         &self,
         epoch_record: &EpochRecord,
@@ -717,36 +789,50 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<()> {
         let epoch = epoch_record.epoch;
 
-        // Step 6 (#739): a full epoch pack prefers the typed sync protocol, folding
-        // the legacy ack-plus-digest handshake into a single stream open. On failure
-        // it falls back to the legacy path below (per peer, penalty-exempt). The
-        // partial-prefix transfer has no sync request variant yet, so it stays on
-        // legacy.
-        if last_consensus_number.is_none()
-            && self
-                .request_epoch_pack_sync(
+        // Full epoch pack is typed-only (#739, step 6): the legacy `StreamEpoch`
+        // fallback was removed so that a full-pack fetch hard-fails (and the caller
+        // retries) when no connected peer serves the `/tn-primary-sync` protocol,
+        // rather than silently syncing over the legacy stream path. This forces
+        // peers to upgrade.
+        let Some(last_consensus_number) = last_consensus_number else {
+            return self
+                .request_epoch_pack_sync(EpochPackSyncRequest {
                     epoch,
+                    last_consensus_number: None,
                     epoch_record,
                     previous_epoch,
                     consensus_chain,
                     record_timeout,
-                )
-                .await
-                .is_ok()
+                })
+                .await;
+        };
+
+        // Partial prefix (#739, step 9): try the typed sync protocol first (the same
+        // per-peer probe as the full pack), then fall back to the legacy stream path
+        // below for peers that do not yet serve the `EpochPackPartial` sync variant.
+        // The sync probe is penalty-exempt; `is_ok` avoids matching the `Result`.
+        if self
+            .request_epoch_pack_sync(EpochPackSyncRequest {
+                epoch,
+                last_consensus_number: Some(last_consensus_number),
+                epoch_record,
+                previous_epoch,
+                consensus_chain,
+                record_timeout,
+            })
+            .await
+            .is_ok()
         {
             return Ok(());
         }
 
-        // Try up to three times (from three peers) to get consensus.
-        // This could be a lot more complicated but this KISS method should work fine.
-        // send request to negotiate stream
-        let (request, kind) = match last_consensus_number {
-            None => (PrimaryRequest::StreamEpoch { epoch }, StreamRequestKind::EpochPack(epoch)),
-            Some(last_consensus_number) => (
-                PrimaryRequest::StreamEpochPartial { epoch, last_consensus_number },
-                StreamRequestKind::EpochPackPartial { epoch, last_consensus_number },
-            ),
-        };
+        // Legacy fallback: negotiate the stream over the legacy path. Try up to three
+        // times (from three peers) to get consensus. This could be a lot more
+        // complicated but this KISS method should work fine.
+        let (request, kind) = (
+            PrimaryRequest::StreamEpochPartial { epoch, last_consensus_number },
+            StreamRequestKind::EpochPackPartial { epoch, last_consensus_number },
+        );
         let request_digest = stream_request_digest(&kind);
 
         for _ in 0..3 {
@@ -789,7 +875,8 @@ impl PrimaryNetworkHandle {
                 );
 
                 // open raw stream then write request_digest for correlation. The
-                // primary still uses the legacy path; its sync cutover is item 6.
+                // partial-prefix transfer still uses the legacy path (no typed sync
+                // request variant yet).
                 let mut stream = self.handle.open_stream(peer, StreamKind::Legacy).await??;
                 stream.write_all(request_digest.as_slice()).await.map_err(|e| {
                     NetworkError::RPCError(format!("failed to write request digest: {e}"))
@@ -805,28 +892,17 @@ impl PrimaryNetworkHandle {
                     "stream opened - reading and validating epoch pack file..."
                 );
 
-                // A full request imports into the live epoch dir (completed epochs); a partial
-                // request imports into a side "staging" dir so it cannot race the in-order build of
-                // the current epoch's main pack.
-                let import_result = if last_consensus_number.is_some() {
-                    consensus_chain
-                        .import_partial_to_staging(
-                            stream.compat(),
-                            epoch_record,
-                            previous_epoch,
-                            record_timeout,
-                        )
-                        .await
-                } else {
-                    consensus_chain
-                        .stream_import(
-                            stream.compat(),
-                            epoch_record,
-                            previous_epoch,
-                            record_timeout,
-                        )
-                        .await
-                };
+                // This is the partial-prefix path (the full-request path returned early above), so
+                // import into a side "staging" dir where it cannot race the in-order build of the
+                // current epoch's main pack.
+                let import_result = consensus_chain
+                    .import_partial_to_staging(
+                        stream.compat(),
+                        epoch_record,
+                        previous_epoch,
+                        record_timeout,
+                    )
+                    .await;
                 if let Err(err) = import_result {
                     if let Some(penalty) = Self::consensus_chain_error_to_penalty(&err) {
                         self.report_penalty(peer, penalty).await;
@@ -856,44 +932,28 @@ impl PrimaryNetworkHandle {
     /// Attempt to fetch and import a full epoch pack over the typed sync protocol.
     ///
     /// Probes up to [`MAX_EPOCH_SYNC_PROBES`] connected peers that are not cached
-    /// legacy-only this epoch, opening a `/tn-primary-sync` stream whose opening
+    /// unsyncable this epoch, opening a `/tn-primary-sync` stream whose opening
     /// frame carries the request. Returns `Ok(())` as soon as one peer serves a pack
-    /// that imports; otherwise `Err` so the caller falls back to the legacy path. A
-    /// peer that does not answer is cached legacy-only (skipping its probe next
-    /// time); the probe is penalty-exempt either way.
-    async fn request_epoch_pack_sync(
-        &self,
-        epoch: Epoch,
-        epoch_record: &EpochRecord,
-        previous_epoch: &EpochRecord,
-        consensus_chain: &ConsensusChain,
-        record_timeout: Duration,
-    ) -> NetworkResult<()> {
+    /// that imports; otherwise `Err` (full-pack fetch has no legacy fallback, so the
+    /// caller retries). A peer that does not answer is cached unsyncable (skipping
+    /// its probe next time); the probe is penalty-exempt either way.
+    async fn request_epoch_pack_sync(&self, sync: EpochPackSyncRequest<'_>) -> NetworkResult<()> {
+        let EpochPackSyncRequest { epoch, last_consensus_number, .. } = sync;
         let peers = self.handle.connected_peers().await?;
 
         // Probe candidate peers one at a time (the async analog of a short-circuiting
-        // fold): `filter` drops peers cached legacy-only this epoch for free, `take`
+        // fold): `filter` drops peers cached unsyncable this epoch for free, `take`
         // bounds the network probe attempts, `then` runs each exchange and records its
         // verdict in the capability cache, and `any` stops at the first peer whose pack
         // imports (so no peer past the first success is probed).
         let imported = futures::stream::iter(peers)
             .filter(move |peer| {
-                let known_legacy = self.sync_capability.lock().get(peer) == Some(&false);
-                futures::future::ready(!known_legacy)
+                let known_unsyncable = self.sync_capability.lock().get(peer) == Some(&false);
+                futures::future::ready(!known_unsyncable)
             })
             .take(MAX_EPOCH_SYNC_PROBES)
             .then(move |peer| async move {
-                match self
-                    .sync_epoch_pack_from_peer(
-                        peer,
-                        epoch,
-                        epoch_record,
-                        previous_epoch,
-                        consensus_chain,
-                        record_timeout,
-                    )
-                    .await
-                {
+                match self.sync_epoch_pack_from_peer(peer, sync).await {
                     EpochPackAttempt::Imported => {
                         self.sync_capability.lock().insert(peer, true);
                         info!(
@@ -905,11 +965,21 @@ impl PrimaryNetworkHandle {
                         true
                     }
                     EpochPackAttempt::Unsupported => {
-                        self.sync_capability.lock().insert(peer, false);
+                        // Only a FULL-pack `Unsupported` authoritatively proves the peer
+                        // does not speak `/tn-primary-sync`. A PARTIAL `Unsupported` is
+                        // ambiguous: the peer may be on an earlier item that serves full
+                        // packs but cannot decode the newer `EpochPackPartial` variant, so
+                        // it must not cache `false` and hide that peer from full-pack sync.
+                        // (Partial still honors a `false` a full probe wrote and caches
+                        // `true` on success, so it dedups without poisoning.)
+                        if last_consensus_number.is_none() {
+                            self.sync_capability.lock().insert(peer, false);
+                        }
                         debug!(
                             target: "primary::network",
                             %peer,
-                            "peer did not answer epoch pack sync; will fall back to legacy"
+                            partial = last_consensus_number.is_some(),
+                            "peer did not answer epoch pack sync; skipping this probe"
                         );
                         false
                     }
@@ -943,49 +1013,47 @@ impl PrimaryNetworkHandle {
     async fn sync_epoch_pack_from_peer(
         &self,
         peer: BlsPublicKey,
-        epoch: Epoch,
-        epoch_record: &EpochRecord,
-        previous_epoch: &EpochRecord,
-        consensus_chain: &ConsensusChain,
-        record_timeout: Duration,
+        sync: EpochPackSyncRequest<'_>,
     ) -> EpochPackAttempt {
-        self.try_sync_epoch_pack_exchange(
-            peer,
-            epoch,
-            epoch_record,
-            previous_epoch,
-            consensus_chain,
-            record_timeout,
-        )
-        .await
-        .map_or_else(|attempt| attempt, |()| EpochPackAttempt::Imported)
+        self.try_sync_epoch_pack_exchange(peer, sync)
+            .await
+            .map_or_else(|attempt| attempt, |()| EpochPackAttempt::Imported)
     }
 
-    /// Open a `/tn-primary-sync` stream, write the [`PrimarySyncRequest::EpochPack`]
-    /// request in the opening frame, and stream the pack through
-    /// [`ConsensusChain::stream_import`].
+    /// Open a `/tn-primary-sync` stream, write the epoch-pack request in the opening
+    /// frame, and stream the pack into the consensus chain. `last_consensus_number`
+    /// selects the transfer: `None` requests the full pack ([`PrimarySyncRequest::EpochPack`])
+    /// and imports it in place via [`ConsensusChain::stream_import`]; `Some(number)`
+    /// requests a verifiable prefix ([`PrimarySyncRequest::EpochPackPartial`]) and imports
+    /// it into a side staging dir via [`ConsensusChain::import_partial_to_staging`].
     ///
     /// `Err(EpochPackAttempt::Unsupported)` means the peer did not answer the
-    /// protocol (negotiation failed, or it negotiated but never `Ack`ed), so the
-    /// caller falls back to legacy. `Err(EpochPackAttempt::Failed(_))` means a
-    /// transient or exchange-level error once the peer has proved sync-capable, so
-    /// the caller keeps it sync-capable and tries the next peer. A transport I/O
+    /// protocol (negotiation failed, or it negotiated but never `Ack`ed), so it is
+    /// cached unsyncable and skipped on later probes this epoch.
+    /// `Err(EpochPackAttempt::Failed(_))` means a transient or exchange-level error
+    /// once the peer has proved sync-capable, so the caller keeps it sync-capable and
+    /// tries the next peer. A transport I/O
     /// error during the open (`UpgradeIo`) is transient rather than a protocol
     /// mismatch, so it maps to `Failed` instead of poisoning the capability cache.
     async fn try_sync_epoch_pack_exchange(
         &self,
         peer: BlsPublicKey,
-        epoch: Epoch,
-        epoch_record: &EpochRecord,
-        previous_epoch: &EpochRecord,
-        consensus_chain: &ConsensusChain,
-        record_timeout: Duration,
+        sync: EpochPackSyncRequest<'_>,
     ) -> Result<(), EpochPackAttempt> {
+        let EpochPackSyncRequest {
+            epoch,
+            last_consensus_number,
+            epoch_record,
+            previous_epoch,
+            consensus_chain,
+            record_timeout,
+        } = sync;
         // open the sync stream, flattening the command-channel and stream-open
         // results. Only a genuine negotiation failure (`UpgradeFailed`) is a
         // pre-cutover peer that does not advertise the protocol -> Unsupported
-        // (penalty-exempt, cached legacy-only). A transient upgrade I/O error or any
-        // other open error is not proof the peer lacks sync -> try next peer.
+        // (penalty-exempt, cached unsyncable this epoch). A transient upgrade I/O
+        // error or any other open error is not proof the peer lacks sync -> try next
+        // peer.
         let mut stream =
             self.handle.open_stream(peer, StreamKind::Sync).await.and_then(|s| s).map_err(|e| {
                 match () {
@@ -999,7 +1067,13 @@ impl PrimaryNetworkHandle {
         // write the request in the opening frame. Negotiation already succeeded, so
         // the peer is sync-capable; a write failure is transient -> try next.
         let max_frame = sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
-        let request = SyncFrame::Req(PrimarySyncRequest::EpochPack { epoch });
+        // full pack vs a verifiable partial prefix: select the request variant through
+        // the `Option`'s combinator (no Some/None branch).
+        let request = SyncFrame::Req(
+            last_consensus_number.map_or(PrimarySyncRequest::EpochPack { epoch }, |number| {
+                PrimarySyncRequest::EpochPackPartial { epoch, last_consensus_number: number }
+            }),
+        );
         let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
         write_frame(&mut stream, &request, &mut encode_buffer, &mut compressed_buffer, max_frame)
             .await
@@ -1011,10 +1085,11 @@ impl PrimaryNetworkHandle {
             })?;
 
         // read the responder's first frame. A timeout (outer `Err`) means no `Ack`
-        // -> a peer that negotiated sync but does not serve it, so fall back to
-        // legacy. A read I/O error (inner `Err`) after negotiation is transient ->
-        // try the next peer, unless it is a clean close (a pre-cutover peer that shut
-        // the misread stream), which is also a fall-back-to-legacy signal.
+        // -> a peer that negotiated sync but does not serve it, so cache it
+        // unsyncable and try the next peer. A read I/O error (inner `Err`) after
+        // negotiation is transient -> try the next peer, unless it is a clean close
+        // (a pre-cutover peer that shut the misread stream), which is also an
+        // Unsupported signal.
         let (mut decode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
         let first = tokio::time::timeout(
             SYNC_ACK_TIMEOUT,
@@ -1044,22 +1119,43 @@ impl PrimaryNetworkHandle {
 
         match first {
             // accepted: reassemble the `Data`/`End` frames into a contiguous reader
-            // and import it. A bad pack is the peer's fault on the legacy path, but
-            // the sync path is metrics-only during rollout: classify it `Failed`
-            // (try next peer) without a penalty.
-            SyncFrame::Ack => consensus_chain
-                .stream_import(
-                    sync_codec::sync_pack_reader(stream),
-                    epoch_record,
-                    previous_epoch,
-                    record_timeout,
-                )
-                .await
-                .map_err(|e| {
-                    EpochPackAttempt::Failed(NetworkError::RPCError(format!(
-                        "failed to import epoch pack over sync stream: {e}"
-                    )))
-                }),
+            // and import it. A full pack imports in place; a partial prefix imports to
+            // a side staging dir so it cannot race the in-order build of the current
+            // epoch's main pack (matching the legacy responder split). A bad pack is
+            // the peer's fault on the legacy path, but the sync path is metrics-only
+            // during rollout: classify it `Failed` (try next peer) without a penalty.
+            SyncFrame::Ack => {
+                let reader = sync_codec::sync_pack_reader(stream);
+                // pick the import target on `last_consensus_number.is_some()` (a bool,
+                // not an `Option` pattern-match); each branch normalizes to
+                // `Result<(), EpochPackAttempt>` then boxes so the `if` unifies their
+                // distinct future types.
+                let import = if last_consensus_number.is_some() {
+                    consensus_chain
+                        .import_partial_to_staging(
+                            reader,
+                            epoch_record,
+                            previous_epoch,
+                            record_timeout,
+                        )
+                        .map_err(|e| {
+                            EpochPackAttempt::Failed(NetworkError::RPCError(format!(
+                                "failed to import partial epoch pack over sync stream: {e}"
+                            )))
+                        })
+                        .boxed()
+                } else {
+                    consensus_chain
+                        .stream_import(reader, epoch_record, previous_epoch, record_timeout)
+                        .map_err(|e| {
+                            EpochPackAttempt::Failed(NetworkError::RPCError(format!(
+                                "failed to import epoch pack over sync stream: {e}"
+                            )))
+                        })
+                        .boxed()
+                };
+                import.await
+            }
             // sync-capable, but shedding load or lacking the pack: try next peer
             SyncFrame::Deny(reason) => Err(EpochPackAttempt::Failed(NetworkError::RPCRetryable(
                 format!("peer denied epoch pack sync request: {reason:?}"),
@@ -1249,9 +1345,6 @@ where
                 PrimaryRequest::MissingCertificates { inner } => {
                     self.process_request_for_missing_certs(peer, inner, channel, cancel)
                 }
-                PrimaryRequest::ConsensusHeader { number, hash } => {
-                    self.process_consensus_output_request(peer, number, hash, channel, cancel)
-                }
                 PrimaryRequest::PeerExchange { .. } => {
                     warn!(target: "primary::network", "primary application received unexpected peer exchange message");
                 }
@@ -1273,8 +1366,8 @@ where
                     self.process_consensus_output_stream(peer, number, channel, cancel)
                 }
             },
-            NetworkEvent::Gossip(msg, relayer) => {
-                self.process_gossip(msg, relayer);
+            NetworkEvent::Gossip { message, relayer, author } => {
+                self.process_gossip(message, relayer, author);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
@@ -1310,6 +1403,19 @@ where
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
                 vote = request_handler.vote(peer, header, parents) => {
+                    // report penalty if any
+                    //
+                    // votes are consensus-critical, so a peer that returns a penalizable
+                    // error must pay the same reputational cost as on every other request
+                    // handler. Route the error through the central PrimaryNetworkError →
+                    // Penalty table before collapsing it into a response, instead of
+                    // silently dropping it.
+                    if let Err(ref e) = vote {
+                        if let Some(penalty) = e.into() {
+                            network_handle.report_penalty(peer, penalty).await;
+                        }
+                    }
+
                     let response = vote.into_response();
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }
@@ -1320,74 +1426,28 @@ where
         });
     }
 
-    /// Attempt to retrieve certificates for a peer that's missing them.
+    /// Answer a legacy request-response `MissingCertificates` request.
+    ///
+    /// Item 7 (#739) cut the certificate fetch fully over to the `/tn-primary-sync`
+    /// protocol, so this request-response path is no longer served: peers fetch
+    /// certificates over sync. The request variant is retained for wire compatibility
+    /// (BCS variant indices stay until the coordinated `/0.0.2` bump, item 9); a legacy
+    /// requester is answered with a typed error rather than served.
     fn process_request_for_missing_certs(
         &self,
         peer: BlsPublicKey,
-        request: MissingCertificatesRequest,
+        _request: MissingCertificatesRequest,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("MissingCertsReq-{peer}");
+        let task_name = format!("MissingCertsDeprecated-{peer}");
+        let response = PrimaryResponse::Error(PrimaryRPCError(
+            "missing certificates are served over the sync protocol only".to_string(),
+        ));
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                result = request_handler.retrieve_missing_certs(request) => {
-                    // report penalty if any
-                    if let Err(ref e) = result {
-                        if let Some(penalty) = e.into() {
-                            network_handle.report_penalty(peer, penalty).await;
-                        }
-                    }
-
-                    let response = result.into_response();
-                    let _ = network_handle.handle.send_response(response, channel).await;
-                }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
-        });
-    }
-
-    /// Attempt to retrieve consensus chain header from the database.
-    fn process_consensus_output_request(
-        &self,
-        peer: BlsPublicKey,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-        channel: ResponseChannel<PrimaryResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("ConsensusOutputReq-{peer}");
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                header =
-                    request_handler.retrieve_consensus_header(number, hash) => {
-                        // Route through the central PrimaryNetworkError → Penalty mapping
-                        // so every handler in this file applies penalties consistently.
-                        // The only reachable variant from this path is
-                        // UnknownConsensusHeaderDigest, which the central table now maps
-                        // to None — observers legitimately request not-yet-served headers.
-                        if let Err(ref e) = header {
-                            if let Some(penalty) = e.into() {
-                                network_handle.report_penalty(peer, penalty).await;
-                            }
-                            let my_number = request_handler.consensus_chain().latest_consensus_number();
-                            tracing::debug!(
-                                target: "primary::network",
-                                ?e, ?my_number, ?number, ?hash, ?peer,
-                                "consensus header request could not be served"
-                            );
-                        }
-                        let response = header.into_response();
-                        let _ = network_handle.handle.send_response(response, channel).await;
-                    }
+                _ = network_handle.handle.send_response(response, channel) => (),
                 // cancel notification from network layer
                 _ = cancel => (),
             }
@@ -1551,7 +1611,12 @@ where
     }
 
     /// Process gossip from committee.
-    fn process_gossip(&self, msg: GossipMessage, relayer: Option<BlsPublicKey>) {
+    fn process_gossip(
+        &self,
+        msg: GossipMessage,
+        relayer: Option<BlsPublicKey>,
+        author: Option<BlsPublicKey>,
+    ) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
@@ -1562,10 +1627,16 @@ where
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "primary::network", ?e, "process_gossip");
-                // convert error into penalty to lower peer score; only attributable
-                // when the relaying peer's BLS identity has resolved
-                if let Some((relayer, penalty)) = relayer.zip((&e).into()) {
-                    network_handle.report_penalty(relayer, penalty).await;
+                // Charge the accountable peer, and only once its BLS identity has resolved. A
+                // content-determined fault (malformed payload / mis-topic) is the message
+                // author's: the network layer forwarded it after a shallow check, so an honest
+                // relayer could not have screened it, and banning the relayer lets a Byzantine
+                // author partition the mesh (issues #801/#819). Every other fault is the relaying
+                // peer's, as before. `zip` skips the penalty when that peer is unresolved or the
+                // error carries no penalty.
+                let charged = if e.is_author_content_fault() { author } else { relayer };
+                if let Some((peer, penalty)) = charged.zip((&e).into()) {
+                    network_handle.report_penalty(peer, penalty).await;
                 }
                 Err(e.into())
             } else {
@@ -1647,7 +1718,9 @@ where
         let task_name = format!("sync-epoch-pack-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             let mut stream = stream;
-            let max_frame = sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
+            // bounds the opening `Req` read and the tiny control writes below; the
+            // per-request-type data bounds live in each serve function.
+            let max_frame = MAX_SYNC_REQUEST_FRAME_SIZE;
             let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
 
             // shed load: deny without reading so the requester retries elsewhere
@@ -1695,25 +1768,42 @@ where
             match request {
                 SyncFrame::Req(PrimarySyncRequest::EpochPack { epoch }) => {
                     request_handler
-                        .process_sync_epoch_pack_stream(peer, stream, epoch, &consensus_chain)
+                        .process_sync_epoch_pack_stream(peer, stream, epoch, None, &consensus_chain)
                         .await?;
                 }
-                // `MissingCertificates` over sync is item 7; the primary registers
-                // the request type but does not serve it yet. Decline cleanly.
-                SyncFrame::Req(PrimarySyncRequest::MissingCertificates { .. }) => {
-                    debug!(target: "primary::network", %peer, "declining unimplemented sync request: missing certificates (item 7)");
-                    let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
-                        let _ = write_frame(
-                            &mut stream,
-                            &SyncFrame::<PrimarySyncRequest>::Deny(DenyReason::Unavailable),
-                            &mut encode_buffer,
-                            &mut compressed_buffer,
-                            max_frame,
+                // `EpochPackPartial` over sync (item 9): serve the verifiable prefix of
+                // an in-progress epoch, replacing the legacy `StreamEpochPartial`
+                // ack-plus-digest path. Same serve as the full pack, bounded to the
+                // prefix length by `Some(last_consensus_number)`.
+                SyncFrame::Req(PrimarySyncRequest::EpochPackPartial {
+                    epoch,
+                    last_consensus_number,
+                }) => {
+                    request_handler
+                        .process_sync_epoch_pack_stream(
+                            peer,
+                            stream,
+                            epoch,
+                            Some(last_consensus_number),
+                            &consensus_chain,
                         )
-                        .await;
-                        let _ = stream.close().await;
-                    })
-                    .await;
+                        .await?;
+                }
+                // `MissingCertificates` over sync (item 7): serve the matching
+                // certificates as a streamed `Ack` + `Data`* + `End`, replacing the
+                // legacy request-response `RequestedCertificates` reply.
+                SyncFrame::Req(PrimarySyncRequest::MissingCertificates {
+                    exclusive_lower_bound,
+                    skip_rounds,
+                }) => {
+                    request_handler
+                        .process_sync_missing_certs_stream(
+                            peer,
+                            stream,
+                            exclusive_lower_bound,
+                            skip_rounds,
+                        )
+                        .await?;
                 }
                 // a well-behaved requester always opens with `Req`; anything else is
                 // malformed. Signal it and drop (metrics-only, no penalty).

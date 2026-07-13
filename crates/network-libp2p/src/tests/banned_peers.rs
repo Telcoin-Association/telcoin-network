@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::common::{ensure_score_config, random_ip_addr};
-use libp2p::{multiaddr::Protocol, Multiaddr};
+use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use std::net::Ipv4Addr;
 
 /// Helper function to create a peer with specific IP addresses.
@@ -249,4 +249,115 @@ fn test_saturating_operations() {
     assert_eq!(banned_peers.total(), 0);
     // assert ip unbanned
     assert!(!banned_peers.ip_banned(&ip));
+}
+
+/// Regression for #809: `remove_validator_ip` is an IP-map cleanup and must not change the
+/// peer-level `total`. This mirrors the committee-rotation path: a banned validator is first
+/// unbanned by `remove_banned_peer` (the single, correct `-1`), then its lingering count-0 IP
+/// entries are swept by `remove_validator_ip`. Previously that sweep decremented `total` once
+/// per removed entry, over-counting the unban by the validator's IP count.
+#[test]
+fn test_remove_validator_ip_does_not_decrement_total() {
+    let mut banned_peers = BannedPeers::default();
+
+    // three unrelated background bans so a spurious decrement is visible rather than floored to
+    // 0 by saturating_sub
+    for _ in 0..3 {
+        let background = create_peer_with_ips(vec![random_ip_addr()]);
+        banned_peers.add_banned_peer(&background);
+    }
+    assert_eq!(banned_peers.total(), 3);
+
+    // a validator whose two IPs are present in the banned-ip map
+    let ip_a = random_ip_addr();
+    let ip_b = random_ip_addr();
+    let validator = create_peer_with_ips(vec![ip_a, ip_b]);
+    banned_peers.add_banned_peer(&validator);
+    assert_eq!(banned_peers.total(), 4);
+
+    // the rotation path unbans the peer first; this owns the single, correct decrement and leaves
+    // the two IP keys behind at count 0
+    banned_peers.remove_banned_peer(vec![ip_a, ip_b].into_iter());
+    assert_eq!(banned_peers.total(), 3, "remove_banned_peer owns the single -1");
+
+    // then the validator-IP cleanup sweeps those count-0 entries. it must not touch `total`.
+    // before the fix this decremented once per entry, driving total to 1.
+    banned_peers.remove_validator_ip(&PeerId::random(), vec![ip_a, ip_b].into_iter());
+
+    assert_eq!(banned_peers.total(), 3, "remove_validator_ip must not change the banned total");
+    // and it still does its real job: the validator's IP entries are gone from the map (asserted
+    // directly because a count-0 entry is indistinguishable from an absent one via ip_banned)
+    assert!(!banned_peers.banned_peers_by_ip.contains_key(&ip_a));
+    assert!(!banned_peers.banned_peers_by_ip.contains_key(&ip_b));
+}
+
+/// Regression for #809 (co-located variant): clearing a never-banned committee member's IP must
+/// not decrement `total` even when that IP entry exists because a different, still-banned peer
+/// shares it. This is why guarding only the call site is insufficient: the spurious decrement
+/// also fires for members that were never banned.
+#[test]
+fn test_remove_validator_ip_for_never_banned_member_preserves_total() {
+    let mut banned_peers = BannedPeers::default();
+    let shared_ip = random_ip_addr();
+
+    // a still-banned peer occupying the shared IP (below the per-IP block threshold)
+    let attacker = create_peer_with_ips(vec![shared_ip]);
+    banned_peers.add_banned_peer(&attacker);
+    assert_eq!(banned_peers.total(), 1);
+
+    // a never-banned committee member co-located on the same IP gets its validator IP cleared
+    banned_peers.remove_validator_ip(&PeerId::random(), vec![shared_ip].into_iter());
+
+    assert_eq!(
+        banned_peers.total(),
+        1,
+        "clearing a never-banned validator IP must not change the banned total"
+    );
+}
+
+#[test]
+fn test_remove_banned_peer_prunes_zero_count_keys() {
+    let mut banned_peers = BannedPeers::default();
+
+    // ban a single peer on each of many distinct IPs
+    let ips: Vec<IpAddr> = (0..64).map(|_| random_ip_addr()).collect();
+    for ip in &ips {
+        banned_peers.add_banned_peer(&create_peer_with_ips(vec![*ip]));
+    }
+
+    // every distinct IP now holds an entry
+    assert_eq!(banned_peers.banned_peers_by_ip.len(), ips.len());
+
+    // unban every peer again
+    for ip in &ips {
+        assert_eq!(banned_peers.remove_banned_peer(std::iter::once(*ip)), vec![*ip]);
+    }
+
+    // the map must shrink back to empty rather than leaking a permanent
+    // zero-count entry per distinct banned IP
+    assert!(
+        banned_peers.banned_peers_by_ip.is_empty(),
+        "zero-count keys should be pruned, found {} lingering entries",
+        banned_peers.banned_peers_by_ip.len()
+    );
+}
+
+#[test]
+fn test_remove_banned_peer_keeps_entry_until_zero() {
+    let mut banned_peers = BannedPeers::default();
+    let ip = random_ip_addr();
+
+    // two banned peers share the same IP
+    for _ in 0..2 {
+        banned_peers.add_banned_peer(&create_peer_with_ips(vec![ip]));
+    }
+    assert_eq!(banned_peers.banned_peers_by_ip.get(&ip), Some(&2));
+
+    // first removal decrements but must keep the entry (count still above zero)
+    banned_peers.remove_banned_peer(std::iter::once(ip));
+    assert_eq!(banned_peers.banned_peers_by_ip.get(&ip), Some(&1));
+
+    // second removal drives the count to zero and must prune the entry
+    banned_peers.remove_banned_peer(std::iter::once(ip));
+    assert!(!banned_peers.banned_peers_by_ip.contains_key(&ip));
 }

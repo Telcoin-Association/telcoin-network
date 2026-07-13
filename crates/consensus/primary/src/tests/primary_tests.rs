@@ -2,7 +2,7 @@
 
 use crate::{
     error::PrimaryNetworkError,
-    network::{handler::RequestHandler, MissingCertificatesRequest, PrimaryResponse},
+    network::{handler::RequestHandler, PrimaryResponse},
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
@@ -19,9 +19,8 @@ use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee,
-    ConsensusHeaderDigest, ConsensusNumHash, ExecHeader, Hash as _, SealedHeader,
-    SignatureVerificationState, TaskManager,
+    error::HeaderError, now, BlockNumHash, Certificate, Committee, ConsensusHeaderDigest,
+    ConsensusNumHash, ExecHeader, Hash as _, SealedHeader, TaskManager,
 };
 use tokio::time::timeout;
 
@@ -89,6 +88,79 @@ async fn test_request_vote_too_new() {
     let result = result.unwrap();
     assert!(
         matches!(result, Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooNew { .. }))),
+        "{result:?}"
+    );
+}
+
+/// Regression for #789: a committee member can craft its own round-0 header (the Vote path is
+/// committee-gated). Before the fix, `check_for_missing_parents` evaluated `header.round() - 1`
+/// at round 0, wrapping to `u32::MAX` on the release binary and leaving a stale
+/// `(u32::MAX, digest)` requested-parent entry. The header is now rejected before parent tracking,
+/// so no underflow occurs and no stale state is left behind.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_round_zero_rejected() {
+    const NUM_PARENTS: usize = 10;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(NUM_PARENTS).unwrap())
+        .build();
+    let target = fixture.authorities().next().unwrap();
+    let author = fixture.authorities().nth(2).unwrap();
+    let author_id = author.id();
+    let author_peer = *author.authority().protocol_key();
+
+    let cb = ConsensusBus::new();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
+    // Need a dummy parent so we can request a vote.
+    let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
+    cb.app().recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
+    });
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+    let handler = RequestHandler::new(
+        target.consensus_config(),
+        cb.app().clone(),
+        synchronizer.clone(),
+        consensus_chain,
+    );
+
+    // Mock certificates to use as (bogus) parent digests on the crafted header.
+    let committee: Committee = fixture.committee();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let ids: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
+    let (certificates, _next_parents) =
+        make_optimal_signed_certificates(1..=3, &genesis, &committee, ids.as_slice());
+    let all_certificates = certificates.into_iter().collect::<Vec<_>>();
+    let round_2_certs = all_certificates[NUM_PARENTS..(NUM_PARENTS * 2)].to_vec();
+
+    // Craft a self-consistent round-0 header with non-empty parents, mirroring the attack shape.
+    let test_header = author
+        .header_builder(&fixture.committee())
+        .author(author_id)
+        .round(0)
+        .latest_execution_block(BlockNumHash::default())
+        .parents(round_2_certs.iter().map(|c| c.digest()).collect())
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
+        .build();
+
+    // The round-0 header is rejected before parent tracking: no underflow, no stale entry.
+    let result =
+        timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new())).await;
+    let result = result.unwrap();
+    assert!(
+        matches!(result, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidRound(_)))),
         "{result:?}"
     );
 }
@@ -686,146 +758,6 @@ async fn test_request_vote_already_voted() {
 
     let response = handler.vote(author_peer, test_header, Vec::new()).await;
     assert!(response.is_err());
-}
-
-// NOTE: this is unit tested in primary::state_sync
-#[tokio::test]
-async fn test_fetch_certificates_handler() {
-    let fixture = CommitteeFixture::builder(MemDatabase::default)
-        .randomize_ports(true)
-        .committee_size(NonZeroUsize::new(4).unwrap())
-        .build();
-    let primary = fixture.authorities().next().unwrap();
-    let consensus_config = primary.consensus_config();
-    let certificate_store = consensus_config.node_storage().clone();
-
-    let cb = ConsensusBus::new();
-    let temp_dir = TempDir::new().unwrap();
-    let consensus_chain =
-        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
-            .await
-            .unwrap();
-    let task_manager = TaskManager::default();
-    let synchronizer =
-        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
-    synchronizer.spawn(&task_manager);
-    let handler = RequestHandler::new(
-        primary.consensus_config(),
-        cb.app().clone(),
-        synchronizer.clone(),
-        consensus_chain,
-    );
-
-    let mut current_round: Vec<_> = Certificate::genesis(&fixture.committee())
-        .into_iter()
-        .map(|cert| cert.header().clone())
-        .collect();
-    let mut headers = vec![];
-    let total_rounds = 4;
-    for i in 0..total_rounds {
-        let parents: BTreeSet<_> =
-            current_round.into_iter().map(|header| fixture.certificate(&header).digest()).collect();
-        (_, current_round) = fixture.headers_round(i, &parents);
-        headers.extend(current_round.clone());
-    }
-
-    let total_authorities = fixture.authorities().count();
-    let total_certificates = total_authorities * total_rounds as usize;
-    // Create certificates test data.
-    let mut certificates = vec![];
-    for header in headers.into_iter() {
-        certificates.push(fixture.certificate(&header));
-    }
-    assert_eq!(certificates.len(), total_certificates);
-    assert_eq!(16, total_certificates);
-
-    // Populate certificate store such that each authority has the following rounds:
-    // Authority 0: 1
-    // Authority 1: 1 2
-    // Authority 2: 1 2 3
-    // Authority 3: 1 2 3 4
-    // This is unrealistic because in practice a certificate can only be stored with 2f+1 parents
-    // already in store. But this does not matter for testing here.
-    let mut authorities = Vec::<AuthorityIdentifier>::new();
-    for i in 0..total_authorities {
-        authorities.push(certificates[i].header().author().clone());
-        for j in 0..=i {
-            let mut cert = certificates[i + j * total_authorities].clone();
-            assert_eq!(&cert.header().author(), &authorities.last().unwrap());
-            if i == 3 && j == 3 {
-                // Simulating only 1 directly verified certificate (Auth 3 Round 4) being stored.
-                cert.set_signature_verification_state(
-                    SignatureVerificationState::VerifiedDirectly(
-                        cert.aggregated_signature().expect("Invalid Signature"),
-                    ),
-                );
-            } else {
-                // Simulating some indirectly verified certificates being stored.
-                cert.set_signature_verification_state(
-                    SignatureVerificationState::VerifiedIndirectly(
-                        cert.aggregated_signature().expect("Invalid Signature"),
-                    ),
-                );
-            }
-            certificate_store.write(cert).expect("Writing certificate to store failed");
-        }
-    }
-
-    // Each test case contains (lower bound round, skip rounds, max items, expected output).
-    let test_cases = vec![
-        (0, vec![vec![], vec![], vec![], vec![]], 20, vec![1, 1, 1, 1, 2, 2, 2, 3, 3, 4]),
-        (0, vec![vec![1u32], vec![1], vec![], vec![]], 20, vec![1, 1, 2, 2, 2, 3, 3, 4]),
-        (0, vec![vec![], vec![], vec![1], vec![1]], 20, vec![1, 1, 2, 2, 2, 3, 3, 4]),
-        (1, vec![vec![], vec![], vec![2], vec![2]], 4, vec![2, 3, 3, 4]),
-        (1, vec![vec![], vec![], vec![2], vec![2]], 2, vec![2, 3]),
-        (0, vec![vec![1], vec![1], vec![1, 2, 3], vec![1, 2, 3]], 2, vec![2, 4]),
-        (2, vec![vec![], vec![], vec![], vec![]], 3, vec![3, 3, 4]),
-        (2, vec![vec![], vec![], vec![], vec![]], 2, vec![3, 3]),
-        // Check that round 2 and 4 are fetched for the last authority, skipping round 3.
-        (1, vec![vec![], vec![], vec![3], vec![3]], 5, vec![2, 2, 2, 4]),
-    ];
-
-    let sample_cert = &certificates[0];
-    let single_cert_size = tn_types::encode(sample_cert).len();
-    let message_overhead = tn_types::encode(&MissingCertificatesRequest::default()).len();
-    for (lower_bound_round, skip_rounds_vec, max_items, expected_rounds) in &test_cases {
-        // estimate response size based on max_items returned
-        let response_size = single_cert_size * max_items + message_overhead;
-        let missing_req = MissingCertificatesRequest::default()
-            .set_bounds(
-                *lower_bound_round,
-                authorities
-                    .clone()
-                    .into_iter()
-                    .zip(skip_rounds_vec.iter().map(|rounds| rounds.iter().copied().collect()))
-                    .collect(),
-            )
-            .expect("boundary set")
-            .set_max_response_size(response_size);
-        let resp = handler.retrieve_missing_certs(missing_req).await.unwrap();
-        if let PrimaryResponse::RequestedCertificates(certs) = resp {
-            assert_eq!(certs.iter().map(|cert| cert.round()).collect::<Vec<_>>(), *expected_rounds);
-        } else {
-            panic!("did not get certs response!");
-        }
-    }
-
-    // assert error for invalid requests with min too low
-    for (lower_bound_round, skip_rounds_vec, _max_items, _expected_rounds) in test_cases {
-        let too_big = MissingCertificatesRequest::default()
-            .set_bounds(
-                lower_bound_round,
-                authorities
-                    .clone()
-                    .into_iter()
-                    .zip(skip_rounds_vec.into_iter().map(|rounds| rounds.into_iter().collect()))
-                    .collect(),
-            )
-            .expect("boundary set")
-            .set_max_response_size(0);
-        let resp = handler.retrieve_missing_certs(too_big).await;
-        assert!(resp.is_err());
-    }
 }
 
 #[tokio::test]

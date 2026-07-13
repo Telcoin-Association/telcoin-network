@@ -332,6 +332,16 @@ impl ConsensusPack {
         bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee).await
     }
 
+    /// Decode pack-file `bytes` (as produced by [`Self::get_consensus_output_bytes`] / streamed via
+    /// `request_consensus_output`) into a [`ConsensusOutput`] using this pack's committee and
+    /// compression. The committee resolves each certificate author to an execution address, so the
+    /// pack must be for the same epoch as the bytes.
+    pub async fn decode_output(&self, bytes: Vec<u8>) -> Result<ConsensusOutput, PackError> {
+        let cursor = Cursor::new(bytes);
+        let reader = BufReader::new(cursor);
+        bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee).await
+    }
+
     /// Load and return the pack file bytes for consensus output form this epoch.
     pub async fn get_consensus_output_bytes(&self, number: u64) -> Result<Vec<u8>, PackError> {
         let (tx, rx) = oneshot::channel();

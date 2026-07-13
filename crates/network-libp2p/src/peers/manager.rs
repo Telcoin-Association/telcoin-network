@@ -52,6 +52,14 @@ pub(crate) struct PeerManager {
     /// This is used for bootstrapping and to make sure we know the network settings of committee
     /// members.
     known_peers: HashMap<BlsPublicKey, NetworkInfo>,
+    /// BLS keys whose `known_peers` entry is pinned and never evicted by committee rotation.
+    ///
+    /// Populated by the locally provisioned insertion paths — trusted/bootstrap/explicit peers and
+    /// records restored from persistence at startup — whose count is bounded by node
+    /// configuration. Every other `known_peers` entry is a kad-discovered committee record kept
+    /// only while its key sits in a tracked committee slot, so [`Self::prune_known_peers`] can
+    /// drop rotated-out members without touching operator-provisioned peers.
+    pinned_peers: HashSet<BlsPublicKey>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
     /// A queue of peers to dial.
@@ -110,6 +118,7 @@ impl PeerManager {
             heartbeat,
             peers,
             known_peers: Default::default(),
+            pinned_peers: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
             temporarily_banned,
@@ -136,6 +145,8 @@ impl PeerManager {
         if self.temporarily_banned.remove(&peer_id) {
             warn!(target: "peer-manager", ?peer_id, "removed trusted peer from temporarily banned list");
         }
+        // trusted peers are operator-provisioned; pin so committee rotation never evicts them
+        self.pinned_peers.insert(bls_key);
         self.known_peers.insert(bls_key, info);
 
         self.dial_peer(peer_id, multiaddr, Some(reply));
@@ -685,6 +696,10 @@ impl PeerManager {
         self.forgive_temporarily_banned(&next);
         let unban_actions = self.peers.update_committees(previous, current, next);
         self.apply_unban_actions(unban_actions);
+        // bound `known_peers`: with the new committee slots in place, drop every entry that is
+        // neither pinned nor a current committee member so rotated-out members and stale discovered
+        // records cannot accumulate across epochs (issue #827).
+        self.prune_known_peers();
     }
 
     /// Pre-dial recovery: forgive bans for a committee so a subsequent dial loop can connect,
@@ -696,6 +711,21 @@ impl PeerManager {
         self.forgive_temporarily_banned(&committee);
         let unban_actions = self.peers.mark_committee_for_dial(committee);
         self.apply_unban_actions(unban_actions);
+    }
+
+    /// Drop cached network info for peers no longer worth tracking, bounding `known_peers`.
+    ///
+    /// Run after every committee rotation. An entry survives only if it is pinned (an
+    /// operator-provisioned trusted/bootstrap/explicit peer) or its key still sits in a tracked
+    /// committee slot, so members that rotated out — and any stale kad-discovered records — cannot
+    /// accumulate across epochs. `known_peers` is thereby bounded by the operator-configured set
+    /// plus the three committee slots. Evicting a still-relevant peer only forces a fresh kad
+    /// lookup if it becomes a committee member again, which is the intended discovery flow.
+    fn prune_known_peers(&mut self) {
+        let pinned = &self.pinned_peers;
+        let peers = &self.peers;
+        self.known_peers
+            .retain(|bls_key, _| pinned.contains(bls_key) || peers.is_committee_member(bls_key));
     }
 
     /// Lift any already-known committee members out of the manager's temporary-ban cache.
@@ -731,9 +761,88 @@ impl PeerManager {
         }
     }
 
-    /// Add a known peer to the known list.
-    /// Used for bootstrap servers or possibly committee members.
-    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
+    /// Add a locally provisioned known peer and pin it against eviction.
+    ///
+    /// Used for operator-driven entries — bootstrap and explicit peers, and records restored from
+    /// local persistence at startup — whose count is bounded by node configuration. Pinned entries
+    /// survive committee rotation (see [`Self::prune_known_peers`]). The attacker-reachable kad
+    /// discovery path must instead use [`Self::add_discovered_peer`], which is bounded to committee
+    /// membership.
+    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.pinned_peers.insert(bls_key);
+        self.cache_known_peer(bls_key, info);
+    }
+
+    /// Add a peer learned from the kad discovery DHT, but only if it is a tracked committee member.
+    ///
+    /// Unlike [`Self::add_known_peer`], this path is reachable by any remote peer: a
+    /// signature-valid kad record only proves the publisher owns the network key it advertises,
+    /// not that the advertised [`BlsPublicKey`] belongs to any committee. Caching every such
+    /// record would let a peer grow `known_peers` without bound by publishing records for endless
+    /// fresh keys (issue #827). `known_peers` exists solely to resolve committee members' network
+    /// info, so a record whose key is in no tracked committee slot is dropped: it is either stale
+    /// (a member that already rotated out) or forged, and is never read. Legitimate discovery is
+    /// unaffected because kad lookups are only ever triggered for current/next committee members
+    /// whose info is missing (see [`Self::trigger_missing_authorities`]).
+    pub(crate) fn add_discovered_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        if !self.peers.is_committee_member(&bls_key) {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                "dropping discovered peer record for non-committee key"
+            );
+            return;
+        }
+        self.cache_known_peer(bls_key, info);
+    }
+
+    /// Admit a peer record pushed to us over the peer's own authenticated connection (a kad PUT
+    /// whose `source` is the sending peer).
+    ///
+    /// A committee member is cached in `known_peers` exactly as via [`Self::add_discovered_peer`].
+    /// A non-committee peer that advertises its OWN record - the authenticated kad-put `source`
+    /// equals the record's advertised network identity, so libp2p has already proven the sender
+    /// owns that transport key - has only its `bls_key <-> peer_id` identity confirmed in the peer
+    /// store, so a live connection (for example an nvv joining the gossip mesh) is retained. It is
+    /// deliberately NOT inserted into the committee-only `known_peers` cache. Because
+    /// [`AllPeers::upsert_peer`] re-keys by peer id, a peer can only ever hold ONE confirmed
+    /// identity for its own connection, so this is bounded by the live connection count and keeps
+    /// the issue #827 bound against unbounded record injection intact. A relayed record (`source`
+    /// != the advertised identity) cannot confirm an identity the sender does not control and is
+    /// dropped, so this never lets a peer displace another peer's identity.
+    pub(crate) fn add_self_advertised_peer(
+        &mut self,
+        source: PeerId,
+        bls_key: BlsPublicKey,
+        info: NetworkInfo,
+    ) {
+        let advertised: PeerId = info.pubkey.clone().into();
+        if self.peers.is_committee_member(&bls_key) {
+            self.cache_known_peer(bls_key, info);
+        } else if source == advertised {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                ?source,
+                "confirming self-advertised connected peer identity"
+            );
+            self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);
+        } else {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                ?source,
+                "dropping non-committee relayed peer record"
+            );
+        }
+    }
+
+    /// Validate the advertised endpoint, register the peer's network identity, cache its info, and
+    /// close the committee trust window if it belongs to a tracked slot.
+    ///
+    /// Shared body of [`Self::add_known_peer`] and [`Self::add_discovered_peer`]; the caller
+    /// decides whether the entry is pinned or admitted at all.
+    fn cache_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
         // signature verification proves authenticity but not scheme correctness; drop a
         // malformed advertised endpoint so only well-formed RPC info is ever cached in
         // `known_peers`. the rest of the (signed, authentic) record is still usable.

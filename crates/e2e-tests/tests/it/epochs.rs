@@ -32,8 +32,12 @@ const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
 const MIN_EPOCHS_TO_TEST: usize = 6;
 // Epoch init creates HDX index files per epoch (open_epoch_pack → new_epoch →
 // ConsensusPack::open_append). With test-utils, these are ~1.3MB each (vs ~130MB in prod).
-// 10s provides margin for parallel test execution and CI load variance.
-const EPOCH_DURATION: u64 = 10;
+// 5s is the consensus minimum epoch duration; halving it from 10s roughly halves the
+// wall time of each epoch test. The two `tn_epochRecord` certificate-availability polls
+// below are floored to an absolute minimum (`.max(..)`) rather than scaling with this
+// constant, because certificate production is a fixed async quorum-voting cost that does
+// not shrink with the epoch cadence.
+const EPOCH_DURATION: u64 = 5;
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
@@ -147,7 +151,9 @@ async fn test_epoch_boundary_inner(
         for ep in endpoints {
             let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
             for epoch in 0..=latest_epoch {
-                let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 3);
+                // Certificate availability is a fixed async quorum-voting cost, so floor
+                // this deadline at 30s instead of letting it shrink with EPOCH_DURATION.
+                let deadline = Instant::now() + Duration::from_secs((EPOCH_DURATION * 3).max(30));
                 let (epoch_rec, cert) = loop {
                     match provider
                         .raw_request::<_, (EpochRecord, EpochCertificate)>(
@@ -406,11 +412,12 @@ async fn test_epoch_sync_inner(
                 .join("data");
             let pack_file_exists = std::fs::exists(file_test).unwrap_or_default();
             assert!(pack_file_exists, "Missing an epoch pack file for {val_name} on epoch {epoch}");
-            // Use 6× epoch duration: when a new validator joins the committee mid-test,
-            // its epoch vote quorum collection can time out (25 × 2.5s = ~62s) before the
-            // failed-quorum P2P fallback runs. The spawn_epoch_record_collector retries
-            // every 5s independently, so 60s gives enough time for it to succeed.
-            let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 6);
+            // When a new validator joins the committee mid-test, its epoch vote quorum
+            // collection can time out (25 × 2.5s = ~62s) before the failed-quorum P2P
+            // fallback runs. The spawn_epoch_record_collector retries every 5s
+            // independently, so 60s gives enough time for it to succeed. This is a fixed
+            // cost, so floor the deadline at 60s rather than scaling it with EPOCH_DURATION.
+            let deadline = Instant::now() + Duration::from_secs((EPOCH_DURATION * 6).max(60));
             let (epoch_rec, cert) = loop {
                 match provider
                     .raw_request::<_, (EpochRecord, EpochCertificate)>(
@@ -756,8 +763,7 @@ fn generate_new_validator_txs(
 
     // stake tx
     let proof = ConsensusRegistry::ProofOfPossession {
-        uncompressedPubkey: new_validator_info.bls_public_key.serialize().into(),
-        uncompressedSignature: new_validator_info.proof_of_possession.serialize().into(),
+        signature: new_validator_info.proof_of_possession.to_bytes().into(),
     };
     let calldata = ConsensusRegistry::stakeCall {
         blsPubkey: new_validator_info.bls_public_key.compress().into(),

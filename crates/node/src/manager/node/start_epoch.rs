@@ -370,10 +370,10 @@ where
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now (with id 0) - otherwise, loop here
         let worker_id = DEFAULT_WORKER_ID;
-        let base_fee_container = gas_accumulator.base_fee(worker_id);
-        // u64 snapshot of the worker's base fee for the transaction pool. Base fee is constant
-        // within an epoch, so a snapshot taken at epoch start is valid for the whole epoch.
-        let base_fee = base_fee_container.base_fee();
+        // u64 snapshot of the worker's base fee, used by both the transaction pool and the batch
+        // validator. Base fee is constant within an epoch, so a snapshot taken at epoch start is
+        // valid for the whole epoch.
+        let base_fee = gas_accumulator.base_fee(worker_id).base_fee();
 
         // update the network handle's task spawner for reporting batches in the epoch
         {
@@ -408,7 +408,7 @@ where
         // Ensure the worker's transaction pool charges the accumulator's base fee for this epoch.
         // On the init path above the pool was created with this value; this call additionally
         // covers the respawn path, where initialization is skipped.
-        engine.set_worker_base_fee(worker_id, base_fee).await;
+        engine.set_worker_base_fee(worker_id, base_fee).await?;
 
         let network_handle = self
             .worker_network_handle
@@ -417,11 +417,7 @@ where
             .clone();
 
         let validator = engine
-            .new_batch_validator(
-                &worker_id,
-                base_fee_container,
-                consensus_config.committee().epoch(),
-            )
+            .new_batch_validator(&worker_id, base_fee, consensus_config.committee().epoch())
             .await;
         self.spawn_worker_network_for_epoch(
             consensus_config,

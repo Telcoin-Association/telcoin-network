@@ -132,12 +132,12 @@ sol!(
             uint32 epochDuration;
         }
 
-        /// Represents a proof of possession for a validator's BLS public key
-        /// Uses a 192-byte uncompressed public key and 96-byte uncompressed PoP
+        /// Represents a validator's BLS12-381 proof of possession: a 48-byte compressed G1
+        /// signature, verified by the native precompile against the separately-supplied 96-byte
+        /// compressed `blsPubkey`.
         #[derive(Debug)]
         struct ProofOfPossession {
-            bytes uncompressedPubkey;
-            bytes uncompressedSignature;
+            bytes signature;
         }
 
         /// Initialize the contract.
@@ -149,7 +149,7 @@ sol!(
             ValidatorInfo[] memory initialValidators_,
             /// The initial validators' BLS12-381 public keys.
             bytes[] memory blsPubkeys_,
-            /// The initial validators' uncompressed proofs of possession
+            /// The initial validators' proofs of possession
             ProofOfPossession[] memory proofsOfPossession,
             /// The address of the owner.
             address owner_
@@ -161,6 +161,13 @@ sol!(
         function applyIncentives(RewardInfo[] calldata rewardInfos) external;
         /// Apply negative incentives for the epoch. This must be called before `concludeEpoch`.
         function applySlashes(Slash[] calldata slashes) external;
+        /// One-time in-protocol fork migration: back-fills the appended per-status `validatorSets`
+        /// and the cached `eligibleValidatorCount` from the preserved `currentStatus` source of
+        /// truth after the registry bytecode is swapped in place. System-gated and idempotent.
+        function migrateValidatorSets() external;
+        /// Number of committee-eligible validators (union of `PendingActivation`, `Active`,
+        /// `PendingExit`). Single cached SLOAD; read back to confirm a successful migration.
+        function getEligibleValidatorCount() external view returns (uint256);
         /// Return the current epoch.
         function getCurrentEpoch() public view returns (uint32) ;
         /// Helper function to get the epoch info from the current epoch.
@@ -181,11 +188,6 @@ sol!(
         function getCommitteeBlsPubkeys(uint32 epoch) external view returns (bytes[] memory);
         /// Fetch the `ValidatorInfo` for a give address.
         function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
-        /// Returns the BLS12-381 proof of possession message: `blsPubkey || validatorAddress`
-        function proofOfPossessionMessage(
-            bytes memory blsPubkey,
-            address validatorAddress
-        ) external view returns (bytes memory);
         /// Mint an NFT for validator to stake.
         function mint(address validatorAddress) external override onlyOwner;
         /// Stake to the consensus registry.
@@ -202,6 +204,13 @@ sol!(
         /// Returns the current stake config version.
         function getCurrentStakeVersion() external view returns (uint8);
         /// Returns true if the BLS pubkey belongs to a known validator.
+        ///
+        /// NOTE (post-`CONSENSUS_REGISTRY_FORK_EPOCH`): the upgraded contract keys its internal
+        /// dedup map by a masked-x `_blsKeyId` rather than `keccak(full key)`, and the fork's
+        /// `migrateValidatorSets()` does not re-key legacy entries. As an accepted, documented gap,
+        /// `isValidator(legacyKey)` returns `false` for validators that staked before the fork. This
+        /// is RPC-only and not consensus-critical (the protocol reads stored `blsPubkeys` via
+        /// `getCommitteeBlsPubkeys`, never this map). See `tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH`.
         function isValidator(bytes calldata blsPubkey) external view returns (bool);
         /// Returns true if the validator's stake originates from a delegator.
         function isDelegated(address validatorAddress) external view returns (bool);

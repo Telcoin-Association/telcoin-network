@@ -243,8 +243,13 @@ where
             }
         }
 
-        // attempt to close the stream gracefully
-        let _ = stream.close().await;
+        // attempt to close the stream gracefully, bounded so a peer that stops
+        // reading cannot pin this legacy responder task (and the admission permit
+        // it holds via `PendingBatchStream`) on the FIN flush. Mirrors the bounded
+        // close in `process_sync_batches_stream` and the trailing writes in `mod.rs`;
+        // every best-effort trailing op on this task is time-bounded.
+        let _ =
+            tokio::time::timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
         Ok(())
     }

@@ -9,13 +9,13 @@ use jsonrpsee::proc_macros::rpc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tn_reth::{
-    error::{RegistryReadError, RegistryReadResult},
+    error::{EvmReadError, EvmReadResult},
     system_calls::ConsensusRegistry,
     RethEnv,
 };
 use tn_types::{
-    Address, Bytes, ConsensusHeader, Epoch, EpochCertificate, EpochDigest, EpochRecord, Genesis,
-    SolCall, SolType, SolValue, B256, U256,
+    construct_proof_of_possession_message, Address, BlsPublicKey, Bytes, ConsensusHeader, Epoch,
+    EpochCertificate, EpochDigest, EpochRecord, Genesis, SolCall, SolType, SolValue, B256, U256,
 };
 use tokio::sync::{oneshot, Semaphore};
 
@@ -139,13 +139,14 @@ pub trait TelcoinNetworkRpcExtApi {
         validator_address: Address,
         delegator: Address,
     ) -> TelcoinNetworkRpcResult<B256>;
-    /// Return the BLS12-381 proof of possession message: `blsPubkey || validatorAddress`.
+    /// Return the BLS12-381 proof-of-possession message a validator signs:
+    /// `intentPrefix(3) || compressedBlsPubkey(96) || validatorAddress(20)`.
     ///
-    /// Expects the 192-byte uncompressed BLS public key.
+    /// Expects the 96-byte compressed BLS public key.
     #[method(name = "proofOfPossessionMessage")]
     async fn proof_of_possession_message(
         &self,
-        bls_pubkey_uncompressed: Bytes,
+        bls_pubkey: Bytes,
         validator_address: Address,
     ) -> TelcoinNetworkRpcResult<Bytes>;
     /// Return the committee size for the next epoch.
@@ -372,16 +373,17 @@ where
 
     async fn proof_of_possession_message(
         &self,
-        bls_pubkey_uncompressed: Bytes,
+        bls_pubkey: Bytes,
         validator_address: Address,
     ) -> TelcoinNetworkRpcResult<Bytes> {
-        let calldata = ConsensusRegistry::proofOfPossessionMessageCall {
-            blsPubkey: bls_pubkey_uncompressed,
-            validatorAddress: validator_address,
-        }
-        .abi_encode()
-        .into();
-        self.registry_read(calldata).await
+        // As of the compressed-bytes pivot the registry's `proofOfPossessionMessage` is an internal
+        // helper (not externally callable), so build the message natively from the same `tn_types`
+        // routine the validator signs and the registry reproduces on-chain byte-for-byte:
+        // `intent || compressed pubkey || address`.
+        let pubkey = BlsPublicKey::from_literal_bytes(&bls_pubkey).map_err(|e| {
+            TNRpcError::InvalidParams(format!("invalid 96-byte compressed BLS pubkey: {e:?}"))
+        })?;
+        Ok(construct_proof_of_possession_message(&pubkey, &validator_address).into())
     }
 
     async fn get_next_committee_size(&self) -> TelcoinNetworkRpcResult<u16> {
@@ -442,7 +444,7 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
     async fn spawn_registry_read<R, F>(&self, read: F) -> TelcoinNetworkRpcResult<R>
     where
         R: Send + 'static,
-        F: FnOnce(RethEnv) -> RegistryReadResult<R> + Send + 'static,
+        F: FnOnce(RethEnv) -> EvmReadResult<R> + Send + 'static,
     {
         // bound concurrent blocking reads; queues (does not reject) at capacity, mirroring
         // reth's eth_call guard. acquire only fails if the semaphore is closed, which never
@@ -469,10 +471,10 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
                 TNRpcError::Internal
             })?
             .map_err(|err| match &err {
-                RegistryReadError::Revert { output, .. } => {
+                EvmReadError::Revert { output, .. } => {
                     TNRpcError::Revert { message: err.to_string(), output: output.clone() }
                 }
-                RegistryReadError::Internal(_) => {
+                EvmReadError::Internal(_) => {
                     tracing::debug!(
                         target: "tn::rpc",
                         error = ?err,

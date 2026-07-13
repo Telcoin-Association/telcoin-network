@@ -17,7 +17,7 @@ futures-util = { workspace = true }
 thiserror = { workspace = true }
 tn-types = { workspace = true }
 tn-reth = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 eyre = { workspace = true, optional = true }
@@ -39,7 +39,8 @@ assert_matches = { workspace = true }
 [features]
 default = []
 test-utils = ["dep:eyre"]
-adiri = []
+# Adiri testnet fork logic gated on `tn_types::forks` — pull in the constants.
+adiri = ["tn-types/adiri"]
 
 [lints]
 workspace = true

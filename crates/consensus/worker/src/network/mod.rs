@@ -277,8 +277,8 @@ where
                     warn!(target: "worker::network", "worker application received unexpected peer exchange message");
                 }
             },
-            NetworkEvent::Gossip(msg, relayer) => {
-                self.process_gossip(msg, relayer);
+            NetworkEvent::Gossip { message, relayer, author } => {
+                self.process_gossip(message, relayer, author);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = WorkerResponse::Error(message::WorkerRPCError(msg));
@@ -338,7 +338,12 @@ where
     }
 
     /// Process gossip from a worker.
-    fn process_gossip(&self, msg: GossipMessage, relayer: Option<BlsPublicKey>) {
+    fn process_gossip(
+        &self,
+        msg: GossipMessage,
+        relayer: Option<BlsPublicKey>,
+        author: Option<BlsPublicKey>,
+    ) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
@@ -348,10 +353,14 @@ where
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
-                // convert error into penalty to lower peer score; only attributable
-                // when the relaying peer's BLS identity has resolved
-                if let Some((relayer, penalty)) = relayer.zip(e.penalty()) {
-                    network_handle.report_penalty(relayer, penalty).await;
+                // Charge the accountable peer, and only once its BLS identity has resolved: the
+                // author for a content-determined fault (#819, guaranteed resolved on the
+                // restricted batch topic), the relaying peer for every other fault (#801).
+                // `is_author_content_fault` is the shared classifier; `zip` skips the penalty when
+                // that peer is unresolved or the error carries no penalty.
+                let charged = if e.is_author_content_fault() { author } else { relayer };
+                if let Some((peer, penalty)) = charged.zip(e.penalty()) {
+                    network_handle.report_penalty(peer, penalty).await;
                 }
                 Err(e.into())
             } else {
@@ -600,7 +609,10 @@ where
             .and_then(Result::ok);
             let Some(request) = request else {
                 warn!(target: "worker::network", %peer, "no readable sync request frame");
-                let _ = stream.close().await;
+                // bound the best-effort close so a peer that sent no readable frame
+                // and then stops reading cannot pin the held admission permit on the
+                // FIN flush; mirrors the shed/malformed bounded closes above.
+                let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
                 return Ok(());
             };
 

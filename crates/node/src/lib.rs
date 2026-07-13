@@ -19,7 +19,10 @@ mod manager;
 mod metrics;
 pub mod primary;
 pub mod worker;
-pub use manager::catchup_accumulator;
+pub use manager::{
+    catchup_accumulator, derive_base_fees_for_entered_epoch, derive_idle_worker_fee,
+    fold_next_epoch_base_fees, sync_num_workers_from_chain, DerivedBaseFees,
+};
 
 #[cfg(test)]
 use tempfile as _;

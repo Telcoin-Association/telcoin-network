@@ -5,20 +5,23 @@ use crate::{
     network::{
         message::{PrimaryGossip, PrimaryResponse},
         MissingCertificatesRequest, PendingStreamRequest, RequestHandler, StreamRequestKind,
-        MAX_CONCURRENT_EPOCH_STREAMS, PENDING_REQUEST_TIMEOUT,
+        MAX_CONCURRENT_EPOCH_STREAMS, MAX_CONSENSUS_CERTS, PENDING_REQUEST_TIMEOUT,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
 };
 use assert_matches::assert_matches;
+use rand::{rngs::StdRng, SeedableRng};
+use roaring::RoaringBitmap;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    num::NonZeroUsize,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use tn_config::Parameters;
+use tn_config::{ConsensusConfig, KeyConfig, Parameters};
 use tn_network_libp2p::{GossipMessage, TopicHash};
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
@@ -29,10 +32,10 @@ use tn_storage::{
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
     encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
-    BlockHeader, BlockNumHash, BlsPublicKey, BlsSigner as _, Certificate, CommittedSubDag,
-    ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch, EpochVote,
-    ExecHeader, Hash as _, HeaderDigest, ReputationScores, Round, SealedHeader, TaskManager,
-    VoteDigest, VoteInfo, B256,
+    BlockHeader, BlockNumHash, BlsKeypair, BlsPublicKey, BlsSigner as _, Certificate,
+    CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch,
+    EpochVote, ExecHeader, Hash as _, HeaderDigest, ReputationScores, Round, SealedHeader,
+    TaskManager, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -52,9 +55,231 @@ fn test_missing_certs_request() {
         .expect("boundary set")
         .set_max_response_size(max);
     let (decoded_gc_round, decoded_skip_rounds) =
-        missing_req.get_bounds().expect("decode missing bounds");
+        missing_req.get_bounds(1_000, 4).expect("decode missing bounds");
     assert_eq!(expected_gc_round, decoded_gc_round);
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
+}
+
+/// A `RoaringBitmap` is a *compressed* set, so a `MissingCertificates` request that stays under the
+/// 1 MiB RPC size cap can still decode to millions of skip rounds (and, via run containers -- which
+/// the deserializer accepts -- to the full ~4.29e9 `u32` range; see GHSA-wwqq-q2xx-4jf9 /
+/// GHSA-4ggp-fcpj-g9f3). `get_bounds` must reject such a request by cardinality *before*
+/// materializing the set into a `BTreeSet`, otherwise `.collect()` allocates tens of GB and
+/// OOM-kills the validator.
+#[test]
+fn test_get_bounds_rejects_oversized_skip_rounds() {
+    use roaring::RoaringBitmap;
+
+    let max_skip_rounds = 1_000;
+
+    // 5M set bits serialize to ~0.6 MiB: comfortably under the 1 MiB RPC cap, yet 5000x the
+    // per-authority skip-round limit. The bound is checked on cardinality (not serialized size), so
+    // a regression here fails by returning `Ok` rather than by OOM-ing the test runner.
+    let mut bomb = RoaringBitmap::new();
+    assert_eq!(bomb.insert_range(0..=5_000_000), 5_000_001);
+    let mut serialized = Vec::new();
+    bomb.serialize_into(&mut serialized).expect("serialize skip-round bitmap");
+    assert!(
+        serialized.len() < 1024 * 1024,
+        "bomb stays under the RPC cap: {} bytes",
+        serialized.len()
+    );
+
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 0,
+    };
+
+    // Rejected on cardinality, before the ~5M-element `BTreeSet` is materialized (the ~77 dense
+    // containers clear the container-count gate, so the cardinality gate is what fires).
+    assert_matches!(
+        request.get_bounds(max_skip_rounds, 4),
+        Err(PrimaryNetworkError::InvalidRequest(msg)) if msg.contains("too large:")
+    );
+}
+
+/// Nothing but the committee size bounds how many `skip_rounds` entries a request can name:
+/// each accepted entry costs a bitmap decode plus a retained `BTreeSet`, so tens of thousands
+/// of entries (each individually under the per-authority limit) would still materialize a
+/// multi-hundred-MiB map. `get_bounds` must reject on entry count before decoding anything.
+#[test]
+fn test_get_bounds_rejects_too_many_authorities() {
+    use roaring::RoaringBitmap;
+
+    let max_skip_rounds = 1_000;
+    let max_authorities = 4;
+
+    // One more entry than the committee has authorities; every entry is individually tiny and
+    // well-formed, so the rejection can only come from the entry-count gate.
+    let skip_rounds: Vec<_> = (0..=4u8)
+        .map(|i| {
+            let mut serialized = Vec::new();
+            [1u32, 2, 3]
+                .into_iter()
+                .collect::<RoaringBitmap>()
+                .serialize_into(&mut serialized)
+                .expect("serialize skip-round bitmap");
+            (AuthorityIdentifier::dummy_for_test(i), serialized)
+        })
+        .collect();
+    assert_eq!(skip_rounds.len(), max_authorities + 1);
+
+    let request =
+        MissingCertificatesRequest { exclusive_lower_bound: 0, skip_rounds, max_response_size: 0 };
+
+    assert_matches!(
+        request.get_bounds(max_skip_rounds, max_authorities),
+        Err(PrimaryNetworkError::InvalidRequest(msg)) if msg.contains("exceeds committee size")
+    );
+}
+
+/// A skip-round count at or below the limit still decodes normally: the cardinality gate must not
+/// reject legitimate `MissingCertificates` requests.
+#[test]
+fn test_get_bounds_accepts_within_limit_skip_rounds() {
+    use roaring::RoaringBitmap;
+
+    let max_skip_rounds = 1_000;
+
+    let mut bitmap = RoaringBitmap::new();
+    assert_eq!(bitmap.insert_range(0..=(max_skip_rounds as u32 - 1)), max_skip_rounds as u64);
+    let mut serialized = Vec::new();
+    bitmap.serialize_into(&mut serialized).expect("serialize skip-round bitmap");
+
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 10,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 0,
+    };
+
+    let (lower_bound, skip_rounds) =
+        request.get_bounds(max_skip_rounds, 4).expect("within-limit ok");
+    assert_eq!(lower_bound, 10);
+    assert_eq!(skip_rounds[&AuthorityIdentifier::dummy_for_test(0)].len(), max_skip_rounds);
+}
+
+#[test]
+// for primary::network::message
+fn test_missing_certs_request_skip_round_overflow() {
+    let mut serialized = Vec::new();
+    [1u32, 2]
+        .into_iter()
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    // `exclusive_lower_bound + 2` exceeds u32::MAX and must surface as an invalid request
+    // instead of wrapping (release) or panicking (debug) on peer-supplied input
+    let missing_req = MissingCertificatesRequest {
+        exclusive_lower_bound: Round::MAX - 1,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 10,
+    };
+    assert_matches!(missing_req.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_rejects_decompression_bomb() {
+    // A serialized RoaringBitmap header declaring 65_536 run containers is only 4 bytes on the
+    // wire, yet `deserialize_from` would expand it to ~512 MiB of heap (roaring 0.10 has no run
+    // store, so each run container becomes an ~8 KiB array/bitmap store). The container count is
+    // read straight from the header and rejected before a single container is allocated.
+    // See GHSA-4ggp-fcpj-g9f3.
+    const RUN_COOKIE: u32 = 12347;
+    let container_count: u32 = 65_536;
+    let cookie = ((container_count - 1) << 16) | RUN_COOKIE;
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), cookie.to_le_bytes().to_vec())],
+        max_response_size: 10,
+    };
+    assert_matches!(request.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_rejects_oversized_cardinality() {
+    // A well-formed bitmap whose cardinality exceeds the limit is rejected before the
+    // `O(cardinality)` collect, even though it occupies a single cheap container.
+    let mut serialized = Vec::new();
+    (0..=1_000u32)
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 10,
+    };
+    // 1_001 rounds against a limit of 1_000
+    assert_matches!(request.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_accepts_cardinality_at_limit() {
+    // The bound is inclusive: a bitmap with exactly the maximum number of rounds is accepted.
+    let expected: BTreeSet<Round> = (1..=1_000).collect();
+    let mut serialized = Vec::new();
+    expected
+        .iter()
+        .copied()
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    let origin = AuthorityIdentifier::dummy_for_test(0);
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(origin.clone(), serialized)],
+        max_response_size: 10,
+    };
+    let (lower_bound, skip_rounds) =
+        request.get_bounds(1_000, 4).expect("bitmap at the limit is accepted");
+    assert_eq!(lower_bound, 0);
+    assert_eq!(skip_rounds.get(&origin), Some(&expected));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_accepts_container_count_at_limit() {
+    // Pin the pre-deserialize container-count gate's inclusive boundary: a legitimate bitmap of
+    // `cap` rounds, each in a distinct 65_536-round block, occupies exactly `cap` containers and
+    // must be accepted. A `<` instead of `<=` on the container check would wrongly reject it, and
+    // the single-container fixtures above would not catch that. See GHSA-4ggp-fcpj-g9f3.
+    let expected: BTreeSet<Round> = (0..1_000u32).map(|block| block * 65_536).collect();
+    let mut serialized = Vec::new();
+    expected
+        .iter()
+        .copied()
+        .collect::<RoaringBitmap>()
+        .serialize_into(&mut serialized)
+        .expect("serialize skip rounds");
+    let origin = AuthorityIdentifier::dummy_for_test(0);
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: 0,
+        skip_rounds: vec![(origin.clone(), serialized)],
+        max_response_size: 10,
+    };
+    let (_, skip_rounds) =
+        request.get_bounds(1_000, 4).expect("max-container bitmap at the limit is accepted");
+    assert_eq!(skip_rounds.get(&origin), Some(&expected));
+}
+
+#[test]
+// for primary::network::message
+fn test_get_bounds_rejects_malformed_bitmap_header() {
+    // An unrecognized cookie and a truncated header are both rejected without deserializing.
+    let unknown_cookie = vec![0xFF, 0xFF, 0xFF, 0xFF];
+    let truncated = vec![0x3A, 0x30]; // first two bytes of the NO_RUNCONTAINER cookie (12346)
+    for serialized in [unknown_cookie, truncated] {
+        let request = MissingCertificatesRequest {
+            exclusive_lower_bound: 0,
+            skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+            max_response_size: 10,
+        };
+        assert_matches!(request.get_bounds(1_000, 4), Err(PrimaryNetworkError::InvalidRequest(_)));
+    }
 }
 
 /// The type for holding testng components.
@@ -131,6 +356,47 @@ async fn create_test_types(path: &Path) -> TestTypes {
 async fn create_test_types_at_epoch(path: &Path, epoch: Epoch) -> TestTypes {
     let committee =
         CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).epoch(epoch).build();
+    let authority = committee.first_authority();
+    let config = authority.consensus_config();
+    let cb = ConsensusBus::new();
+
+    // spawn the synchronizer
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    // last execution result
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+
+    // set the latest execution result to genesis - test headers are proposed for round 1
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(path.to_owned(), committee.committee()).await.unwrap();
+    let consensus_bus = cb.app().clone();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+    TestTypes { committee, handler, parent, consensus_bus, task_manager }
+}
+
+/// Like [`create_test_types`] but with an explicit committee size, so a test can exercise a
+/// quorum threshold larger than the default four-node committee (e.g. to keep a set of colluding
+/// co-signers strictly below quorum).
+async fn create_test_types_with_committee_size(
+    path: &Path,
+    committee_size: NonZeroUsize,
+) -> TestTypes {
+    let committee = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(committee_size)
+        .build();
     let authority = committee.first_authority();
     let config = authority.consensus_config();
     let cb = ConsensusBus::new();
@@ -271,6 +537,74 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert!(res.is_ok());
+    Ok(())
+}
+
+/// Regression test for issue #803: a node that is **not** a member of the current committee must
+/// reject an inbound vote request with a graceful error instead of panicking. The vote path
+/// previously called `authority_id().expect("only validators can vote")`, which aborts the whole
+/// process for any non-validator that reaches it (e.g. an observer served a misrouted request).
+#[tokio::test]
+async fn test_vote_non_committee_member_returns_error() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+
+    // Build a ConsensusConfig keyed by an identity that is NOT in the committee, so that
+    // `authority_id()` is `None` (a non-validator / observer node). Reuse the fixture's
+    // genesis-aligned `Config` and `NetworkConfig`, swapping only the signing key.
+    let base = committee.first_authority().consensus_config();
+    let outsider_key =
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+    let config = ConsensusConfig::new_with_committee_for_test(
+        base.config().clone(),
+        MemDatabase::default(),
+        outsider_key,
+        committee.committee(),
+        base.network_config().clone(),
+    )?;
+    assert!(config.authority_id().is_none(), "outsider key must not be a committee member");
+
+    // Build the handler against the outsider config, mirroring `create_test_types_with_params`.
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+
+    // Seed the latest execution result to genesis so a round-1 header passes execution checks.
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(
+        0,
+        ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+        Some(parent.clone()),
+    );
+    cb.app().recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.committee())
+            .await
+            .unwrap();
+    let handler =
+        RequestHandler::new(config.clone(), cb.app().clone(), synchronizer, consensus_chain);
+
+    // A valid round-1 header proposed by a real committee member (identical to test_vote_succeeds),
+    // so the request passes the peer/author and header validation and reaches the former panic
+    // site.
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // The non-validator must return a graceful error rather than panicking.
+    let res = handler.vote(peer, header, vec![]).await;
+    debug!(target: "primary::handler_tests", ?res);
+    assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::NotCommitteeMember)));
+
+    // keep the synchronizer's task alive until the vote has been processed
+    drop(task_manager);
     Ok(())
 }
 
@@ -494,6 +828,87 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(wrong))) if wrong == wrong_authority.to_string());
     Ok(())
+}
+
+/// Regression for #802: the Byzantine errors the vote RPC returns must be penalizable.
+///
+/// `process_vote_request` now reports `(&err).into()` before collapsing the result into a
+/// response, exactly like every sibling request handler. That wiring only penalizes a
+/// misbehaving peer if the vote handler's error variants map to `Some(Penalty)` in the
+/// central `From<&PrimaryNetworkError>` table. Pin that contract here so a future error
+/// reshuffle that silently downgrades a vote error to `None` (re-opening #802 from the
+/// other side) is caught.
+#[tokio::test]
+async fn test_vote_byzantine_errors_are_penalizable() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // A vote request whose peer is not the header's author -> PeerNotAuthor.
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let not_author = BlsPublicKey::default();
+    let err = handler
+        .vote(not_author, header, Vec::new())
+        .await
+        .expect_err("a vote whose peer is not the header author must fail");
+    assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor));
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert_matches!(
+        penalty,
+        Some(tn_network_libp2p::Penalty::Fatal),
+        "a non-author vote must penalize the peer so process_vote_request can report it"
+    );
+
+    // A vote request authored by an authority outside the committee -> UnknownAuthority.
+    let wrong_authority = AuthorityIdentifier::dummy_for_test(100);
+    let header = committee
+        .header_builder_last_authority()
+        .author(wrong_authority.clone())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+    let err = handler
+        .vote(peer, header, Vec::new())
+        .await
+        .expect_err("a vote authored by an unknown authority must fail");
+    assert_matches!(
+        err,
+        PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(ref a))
+            if *a == wrong_authority.to_string()
+    );
+    let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+    assert_matches!(
+        penalty,
+        Some(tn_network_libp2p::Penalty::Fatal),
+        "an unknown-authority vote must penalize the peer"
+    );
+
+    Ok(())
+}
+
+/// #802 follow-through: header errors that reflect a LOCAL or transient condition (our own
+/// storage failure, or our execution lagging behind a peer that is merely ahead) must NOT
+/// penalize the peer now that the vote RPC is wired into the penalty pipeline. Pin the
+/// central table so these stay `None`, consistent with the sibling
+/// `PrimaryNetworkError::Storage` and `*::Timeout` arms.
+#[test]
+fn test_local_header_errors_are_not_penalized() {
+    let storage: PrimaryNetworkError = HeaderError::Storage(eyre::eyre!("local db failure")).into();
+    let penalty: Option<tn_network_libp2p::Penalty> = (&storage).into();
+    assert!(penalty.is_none(), "a local storage failure must not penalize the peer");
+
+    let exec_lag: PrimaryNetworkError =
+        HeaderError::UnknownExecutionResult(BlockNumHash::new(0, BlockHash::default())).into();
+    let penalty: Option<tn_network_libp2p::Penalty> = (&exec_lag).into();
+    assert!(
+        penalty.is_none(),
+        "a peer that is merely ahead of our execution must not be penalized"
+    );
 }
 
 /// Test that primary pub/sub is enforcing topics.
@@ -924,6 +1339,96 @@ async fn test_send_partial_epoch_over_stream() {
     assert_eq!(&sent_more[..sent.len()], &sent[..], "smaller prefix must prefix the larger one");
 }
 
+/// Serving a partial prefix over the sync protocol (`EpochPackPartial`, item 9)
+/// writes `Ack` then streams exactly the verifiable prefix bytes as `Data` frames:
+/// the bytes reassembled from the frames must equal the data file truncated at
+/// `output_end(k)`, and a later cutoff must stream strictly more (with the smaller
+/// prefix a true prefix of it): the sync mirror of `test_send_partial_epoch_over_stream`.
+#[tokio::test]
+async fn test_sync_partial_epoch_pack_over_stream() {
+    use tokio::io::AsyncReadExt as _;
+
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let peer = *committee.first_authority().authority().protocol_key();
+
+    // Populate the in-progress (never finalized) epoch-0 pack with some outputs.
+    let num_outputs = 15u64;
+    for number in 1..=num_outputs {
+        let cert = Certificate::default();
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+        );
+        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
+    }
+
+    // Reassemble the pack bytes streamed by the sync serve for a stop point `k`: read
+    // the leading `Ack`, then feed the remaining `Data`/`End` frames through
+    // `sync_pack_reader` (the reader the real requester uses).
+    async fn reassemble_partial(
+        consensus_chain: &tn_storage::consensus::ConsensusChain,
+        stop_number: u64,
+        peer: BlsPublicKey,
+    ) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        crate::network::sync_codec::send_sync_epoch_pack_over_stream(
+            &mut out,
+            consensus_chain,
+            0,
+            Some(stop_number),
+            Duration::from_secs(10),
+            peer,
+        )
+        .await
+        .expect("serve partial epoch pack over sync");
+
+        let mut cursor = futures::io::Cursor::new(out);
+        let (mut dec, mut comp) = (Vec::new(), Vec::new());
+        let ack = tn_network_libp2p::read_frame::<_, tn_network_libp2p::PrimarySyncRequest>(
+            &mut cursor,
+            &mut dec,
+            &mut comp,
+            crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await
+        .expect("read ack frame");
+        assert_matches!(ack, tn_network_libp2p::SyncFrame::Ack);
+
+        let mut reassembled = Vec::new();
+        crate::network::sync_codec::sync_pack_reader(cursor)
+            .read_to_end(&mut reassembled)
+            .await
+            .expect("reassemble partial pack data frames");
+        reassembled
+    }
+
+    // The reassembled bytes must equal the verifiable prefix the chain exposes, i.e.
+    // the data file truncated at `output_end(k)`.
+    let k = 9u64;
+    let reassembled = reassemble_partial(handler.consensus_chain(), k, peer).await;
+    let (stream, len) =
+        handler.consensus_chain().get_partial_epoch_stream(0, k).await.expect("partial stream");
+    let mut expected = Vec::new();
+    stream.take(len).read_to_end(&mut expected).await.unwrap();
+    assert_eq!(reassembled.len() as u64, len, "streamed byte count must equal the partial cutoff");
+    assert_eq!(reassembled, expected, "reassembled bytes must equal the verifiable prefix");
+
+    // A later cutoff streams strictly more, and the smaller prefix is a true prefix of it.
+    let reassembled_more = reassemble_partial(handler.consensus_chain(), num_outputs, peer).await;
+    assert!(reassembled_more.len() > reassembled.len(), "a later cutoff must stream more bytes");
+    assert_eq!(
+        &reassembled_more[..reassembled.len()],
+        &reassembled[..],
+        "smaller prefix must prefix the larger one"
+    );
+}
+
 /// A full epoch pack the responder does not hold is shed with
 /// `Deny(Unavailable)`, so a sync requester retries another peer immediately
 /// instead of waiting out its ack timeout. (The `Ack`+`Data`+`End` happy path is
@@ -942,6 +1447,7 @@ async fn test_sync_epoch_pack_unavailable_denies() {
         &mut out,
         handler.consensus_chain(),
         0,
+        None,
         Duration::from_secs(5),
         peer,
     )
@@ -1133,9 +1639,9 @@ async fn test_consensus_result_duplicate_signature_counted_once() -> eyre::Resul
 }
 
 /// A single committee member flooding distinct singleton results must not grow `consensus_certs`
-/// without bound: once the map exceeds the 20-entry threshold the handler evicts singleton
-/// entries that are not the result currently being processed. The eviction must also not break
-/// legitimate aggregation — a real quorum still publishes afterward.
+/// without bound: once the map reaches `MAX_CONSENSUS_CERTS` the handler evicts the
+/// least-recently-updated entry before inserting a new one. The eviction must also not break
+/// legitimate aggregation: a real quorum still publishes afterward.
 #[tokio::test]
 async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
@@ -1156,10 +1662,10 @@ async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
         handler.process_gossip(&msg).await?;
     }
 
-    // The eviction bound must cap the map well below the 50 distinct inputs (≤ 21: the
-    // threshold of 20 plus the in-flight entry inserted after the retain).
+    // The hard cap must hold the map at or below MAX_CONSENSUS_CERTS despite the 50 distinct
+    // inputs: each new digest seen while the map is full evicts the least-recently-updated entry.
     assert!(
-        handler.consensus_certs_len() <= 21,
+        handler.consensus_certs_len() <= MAX_CONSENSUS_CERTS,
         "consensus_certs must stay bounded under a singleton flood, got {}",
         handler.consensus_certs_len(),
     );
@@ -1176,6 +1682,119 @@ async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
         "a legitimate quorum must publish even after singleton eviction",
     );
     // Publishing clears the map.
+    assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
+
+    Ok(())
+}
+
+/// Two (or more) colluding committee members can co-sign an unbounded stream of distinct
+/// `(number, hash)` tuples. Each tuple then carries two valid signatures, so a heuristic that
+/// only evicts *singleton* entries would keep every one of them and let `consensus_certs` grow
+/// without bound. That is the residual of GHSA-2r5c-c4h7-gp5h that a singleton-only guard leaves
+/// open. The hard cap must bound the map regardless of how many members collude, while still
+/// letting a genuine quorum publish afterward.
+#[tokio::test]
+async fn test_consensus_certs_bounded_under_collusion() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    // A committee of seven has a quorum of three, so two co-signers stay strictly below quorum:
+    // their entries never publish and therefore never clear the map during the flood.
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_with_committee_size(temp_dir.path(), NonZeroUsize::new(7).unwrap()).await;
+
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    assert!(quorum > 2, "collusion test needs quorum > 2 so two co-signers stay sub-quorum");
+    let authorities: Vec<_> = committee.authorities().collect();
+
+    // Flood: 50 distinct tuples, each co-signed by the SAME two validators. Every resulting entry
+    // has two signers, so a "keep any entry with more than one signer" guard would retain all 50.
+    // None reaches the quorum of three, so no publish clears the map mid-flood.
+    for _ in 0..50 {
+        let hash = ConsensusHeaderDigest::from(B256::random());
+        for auth in authorities.iter().take(2) {
+            let msg = signed_consensus_gossip(auth, epoch, round, 1, hash);
+            handler.process_gossip(&msg).await?;
+        }
+    }
+
+    assert!(
+        handler.consensus_certs_len() <= MAX_CONSENSUS_CERTS,
+        "consensus_certs must stay bounded even when every entry has multiple signers, got {}",
+        handler.consensus_certs_len(),
+    );
+
+    // A legitimate quorum must still publish after the collusion flood and eviction.
+    let hash_l = ConsensusHeaderDigest::from(B256::random());
+    for auth in authorities.iter().take(quorum) {
+        let msg = signed_consensus_gossip(auth, epoch, round, 2, hash_l);
+        handler.process_gossip(&msg).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 2, hash_l),
+        "a legitimate quorum must publish even after a collusion flood",
+    );
+    assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
+
+    Ok(())
+}
+
+/// The eviction policy must not let an ongoing flood evict a result that is actively accumulating
+/// honest signatures. Honest validators gossip each consensus result only once, so if an
+/// in-progress tally is evicted between honest signatures those signatures are lost for good and
+/// the result can never reach quorum. This test fills the map, then interleaves a fresh flood
+/// digest between each honest signature so an eviction fires every round while the map is full.
+/// Least-recently-updated eviction keeps the honest tally (bumped on every honest signer) and
+/// evicts the stale fakes, so the quorum still publishes. A fewest-signers policy would instead
+/// evict the honest tally here (it sits at one signer, below the co-signed 2-signer fakes) and
+/// this test would fail: it is the regression guard for that liveness trap (GHSA-2r5c-c4h7-gp5h).
+#[tokio::test]
+async fn test_consensus_certs_honest_quorum_survives_interleaved_flood() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_with_committee_size(temp_dir.path(), NonZeroUsize::new(7).unwrap()).await;
+
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= quorum + 2, "need two colluders plus a distinct honest quorum");
+
+    // Fill the map to the cap with co-signed (2-signer) fake tallies from two colluding members,
+    // so any further new digest forces an eviction and every fake out-signers a fresh honest tally.
+    for _ in 0..MAX_CONSENSUS_CERTS {
+        let hash = ConsensusHeaderDigest::from(B256::random());
+        for auth in authorities.iter().take(2) {
+            handler.process_gossip(&signed_consensus_gossip(auth, epoch, round, 1, hash)).await?;
+        }
+    }
+    assert_eq!(
+        handler.consensus_certs_len(),
+        MAX_CONSENSUS_CERTS,
+        "map should be full of fake tallies before the interleaved quorum",
+    );
+
+    // Deliver the honest quorum for the real result (number 2). Before each honest signature inject
+    // a fresh singleton flood digest from a colluder, so the map stays full and an eviction fires
+    // every round. LRU must keep the accumulating honest tally through all of it.
+    let hash_real = ConsensusHeaderDigest::from(B256::random());
+    for auth in authorities.iter().skip(2).take(quorum) {
+        let flood = ConsensusHeaderDigest::from(B256::random());
+        handler
+            .process_gossip(&signed_consensus_gossip(authorities[0], epoch, round, 1, flood))
+            .await?;
+        handler.process_gossip(&signed_consensus_gossip(auth, epoch, round, 2, hash_real)).await?;
+        assert!(
+            handler.consensus_certs_len() <= MAX_CONSENSUS_CERTS,
+            "map must stay bounded during the interleaved flood, got {}",
+            handler.consensus_certs_len(),
+        );
+    }
+
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 2, hash_real),
+        "the honest tally must survive the interleaved flood and publish at quorum",
+    );
     assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
 
     Ok(())

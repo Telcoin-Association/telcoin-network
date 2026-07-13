@@ -1,4 +1,13 @@
 //! Cryptographic keys used by the node.
+//!
+//! # Wrapped BLS keyfile format (`bls.kw`)
+//!
+//! The file is the Base58 encoding of `salt[12] | nonce[12] | AES-256-GCM-SIV ciphertext`.
+//! The AES wrapping key is derived from the passphrase with PBKDF2-HMAC-SHA256. The round
+//! count is not stored on disk; [`KeyConfig::read_config`] tries `{1, 1_000_000}` in turn and
+//! authenticates each guess with the AEAD tag, so a wrong round count (or passphrase) can
+//! never decrypt a key. A key that only opens at 1 round was written by an insecure or
+//! poisoned build and is warned about loudly.
 
 use crate::{
     TelcoinDirs, BLS_KEYFILE, BLS_WRAPPED_KEYFILE, PRIMARY_NETWORK_SEED_FILE,
@@ -11,18 +20,39 @@ use sha2::Sha256;
 use std::sync::Arc;
 use tn_types::{
     construct_proof_of_possession_message, Address, BlsKeypair, BlsPublicKey, BlsSignature,
-    BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey, ProtocolSignature as _,
-    Signer,
+    BlsSigner, DefaultHashFunction, NetworkKeypair, NetworkPublicKey, Signer,
 };
 
 /// The work factor for PBKDF2 is implemented through an iteration count, which is based on the
 /// internal hashing algorithm used. HMAC-SHA-256 is widely supported and is recommended by NIST.
 /// OWASP recommends 600,000 iterations for PBKDF2-HMAC-SHA256.
-#[cfg(not(feature = "test-utils"))]
+///
+/// This constant must NEVER be feature-gated: cargo features unify across the whole workspace,
+/// so a cfg'd weak value here would silently poison release binaries that happen to be built
+/// alongside test crates. Tests that need a fast KDF must use
+/// [`KeyConfig::generate_and_save_insecure`], whose weakness stays contained to the single
+/// file it writes.
 const PBKDF2_HMAC_ROUNDS: u32 = 1_000_000;
-// prevent excessive delays during testing
-#[cfg(feature = "test-utils")]
-const PBKDF2_HMAC_ROUNDS: u32 = 1;
+
+/// The round count written by builds poisoned by the old `test-utils` feature unification bug
+/// (and by the insecure test writer). Tried first when reading - it costs microseconds and
+/// precisely identifies weakly wrapped keys so they can be loudly warned about.
+const TEST_ONLY_INSECURE_ROUNDS: u32 = 1;
+
+/// PBKDF2 salt length (bytes).
+const SALT_LEN: usize = 12;
+/// AES-256-GCM-SIV nonce length (96 bits).
+const NONCE_LEN: usize = 12;
+
+/// Emit `msg` as a warning on both `tracing` and stderr.
+///
+/// Node startup reads the BLS key *before* tracing is initialized (see the CLI's
+/// `read_config` call site), so a tracing-only warning would vanish exactly where it matters
+/// most; `eprintln!` still reaches the operator's console and container logs.
+fn warn_weak_kdf(msg: &str) {
+    tracing::warn!(target: "tn::config", "{msg}");
+    eprintln!("WARNING: {msg}");
+}
 
 #[derive(Debug)]
 struct KeyConfigInner {
@@ -52,50 +82,81 @@ pub struct KeyConfig {
 }
 
 impl KeyConfig {
-    /// Wrap (encrypt) a BLS key with passphrase.
-    /// Returns a String that is the Base58 encoding of the encrypted bytes.
-    /// bytes 0-11 are the pbkdf2 salt, 12-23 are the aes-gcm-siv nonce and 24.. are the encrypted
-    /// key.
-    fn wrap_bls_key(primary_keypair: &BlsKeypair, passphrase: &str) -> eyre::Result<String> {
-        let mut salt = [0_u8; 12];
+    /// Derive the 32-byte AES wrapping key from `passphrase` via PBKDF2-HMAC-SHA256.
+    fn derive_wrapping_key(passphrase: &str, salt: &[u8], rounds: u32) -> [u8; 32] {
+        let mut wrapping_key = [0_u8; 32];
+        pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, rounds, &mut wrapping_key);
+        wrapping_key
+    }
+
+    /// Wrap (encrypt) a BLS key with a passphrase using `rounds` PBKDF2-HMAC-SHA256 iterations.
+    /// Returns the Base58 encoding of `salt[12] | nonce[12] | ciphertext` (see the module docs).
+    fn wrap_bls_key(
+        primary_keypair: &BlsKeypair,
+        passphrase: &str,
+        rounds: u32,
+    ) -> eyre::Result<String> {
+        let mut salt = [0_u8; SALT_LEN];
         rand::rng().fill(&mut salt);
-        let mut nonce_bytes = [0_u8; 12];
+        let mut nonce_bytes = [0_u8; NONCE_LEN];
         rand::rng().fill(&mut nonce_bytes);
-        let mut passphrase_bytes = [0_u8; 32];
-        pbkdf2_hmac::<Sha256>(
-            passphrase.as_bytes(),
-            &salt,
-            PBKDF2_HMAC_ROUNDS,
-            &mut passphrase_bytes,
-        );
-        let key = Key::<Aes256GcmSiv>::from_slice(&passphrase_bytes);
+        let wrapping_key = Self::derive_wrapping_key(passphrase, &salt, rounds);
+        let key = Key::<Aes256GcmSiv>::from_slice(&wrapping_key);
         let cipher = Aes256GcmSiv::new(key);
         let nonce = Nonce::from_slice(&nonce_bytes); // 96-bits
         let ciphertext = cipher
             .encrypt(nonce, &primary_keypair.to_bytes()[..])
             .map_err(|e| eyre::eyre!("Could not encrypt BLS key: {e}"))?;
-        let encrypted_data = [&salt[..], &nonce_bytes[..], &ciphertext[..]].concat();
-        Ok(bs58::encode(&encrypted_data).into_string())
+        Ok(bs58::encode([&salt[..], &nonce_bytes[..], &ciphertext[..]].concat()).into_string())
+    }
+
+    /// One AEAD decryption attempt at a specific salt/nonce/rounds interpretation.
+    ///
+    /// `None` means authentication failed, i.e. this interpretation (or the passphrase) is
+    /// wrong; callers may safely try another interpretation of the same bytes.
+    fn try_decrypt(
+        passphrase: &str,
+        salt: &[u8],
+        nonce: &[u8],
+        ciphertext: &[u8],
+        rounds: u32,
+    ) -> Option<BlsKeypair> {
+        let wrapping_key = Self::derive_wrapping_key(passphrase, salt, rounds);
+        let key = Key::<Aes256GcmSiv>::from_slice(&wrapping_key);
+        let cipher = Aes256GcmSiv::new(key);
+        let plaintext = cipher.decrypt(Nonce::from_slice(nonce), ciphertext).ok()?;
+        BlsKeypair::from_bytes(&plaintext).ok()
     }
 
     /// Accepts bytes that are a wrapped BLS key and unwraps with the passphrase.
-    /// bytes 0-11 are the pbkdf2 salt, 12-23 are the aes-gcm-siv nonce and 24.. are the encrypted
-    /// key.
+    ///
+    /// The round count is not stored in the file, so each historical value is tried in turn.
+    /// Every failed attempt is an AEAD authentication failure, so falling through to the next
+    /// round count can never decrypt a key wrongly.
     fn unwrap_bls_key(bytes: &[u8], passphrase: &str) -> eyre::Result<BlsKeypair> {
-        let mut passphrase_bytes = [0_u8; 32];
-        pbkdf2_hmac::<Sha256>(
-            passphrase.as_bytes(),
-            &bytes[0..12],
-            PBKDF2_HMAC_ROUNDS,
-            &mut passphrase_bytes,
-        );
-        let nonce = Nonce::from_slice(&bytes[12..24]); // 96-bits
-        let key = Key::<Aes256GcmSiv>::from_slice(&passphrase_bytes);
-        let cipher = Aes256GcmSiv::new(key);
-        let plaintext = cipher
-            .decrypt(nonce, &bytes[24..])
-            .map_err(|e| eyre::eyre!("Could not decrypt BLS key: {e}"))?;
-        BlsKeypair::from_bytes(&plaintext)
+        if bytes.len() <= SALT_LEN + NONCE_LEN {
+            return Err(eyre::eyre!("Could not decrypt BLS key: keyfile is truncated or corrupt"));
+        }
+        let salt = &bytes[..SALT_LEN];
+        let (nonce, ciphertext) = bytes[SALT_LEN..].split_at(NONCE_LEN);
+        // Weak first: it costs microseconds and precisely flags weakly-wrapped keys. AEAD
+        // authentication rejects wrong guesses, so falling through can never decrypt a key
+        // wrongly.
+        for &rounds in &[TEST_ONLY_INSECURE_ROUNDS, PBKDF2_HMAC_ROUNDS] {
+            if let Some(keypair) = Self::try_decrypt(passphrase, salt, nonce, ciphertext, rounds) {
+                if rounds < PBKDF2_HMAC_ROUNDS {
+                    warn_weak_kdf(&format!(
+                        "BLS keyfile is protected by a weak KDF ({rounds} PBKDF2 round(s) instead \
+                         of {PBKDF2_HMAC_ROUNDS}); it was written by an insecure or poisoned \
+                         build. Re-wrap it with a production binary."
+                    ));
+                }
+                return Ok(keypair);
+            }
+        }
+        Err(eyre::eyre!(
+            "Could not decrypt BLS key: wrong passphrase, or corrupted/unsupported keyfile"
+        ))
     }
 
     /// Read a key config file that contains the primary BLS key in Base 58 format.
@@ -159,6 +220,39 @@ impl KeyConfig {
         tn_datadir: &TND,
         passphrase: Option<String>,
     ) -> eyre::Result<Self> {
+        Self::generate_and_save_with_rounds(tn_datadir, passphrase, PBKDF2_HMAC_ROUNDS)
+    }
+
+    /// Generate a new random primary BLS key and save it wrapped with a caller-chosen,
+    /// intentionally weak PBKDF2 round count. NEVER call this outside tests.
+    ///
+    /// The reader tries the weak round count when opening any wrapped key (with a loud
+    /// warning), so the file this writes still loads on a production binary - the weakness
+    /// stays contained to this one file and can never change how other keys are wrapped.
+    #[cfg(feature = "test-utils")]
+    pub fn generate_and_save_insecure<TND: TelcoinDirs>(
+        tn_datadir: &TND,
+        passphrase: Option<String>,
+        rounds: u32,
+    ) -> eyre::Result<Self> {
+        if rounds == 0 {
+            return Err(eyre::eyre!("invalid PBKDF2 round count: must be >= 1"));
+        }
+        tracing::warn!(
+            target: "tn::config",
+            "generating BLS key with INSECURE PBKDF2 rounds = {rounds} - test use only"
+        );
+        Self::generate_and_save_with_rounds(tn_datadir, passphrase, rounds)
+    }
+
+    /// Shared implementation for [`Self::generate_and_save`] and
+    /// [`Self::generate_and_save_insecure`]: generate the key material and persist it, wrapped
+    /// at `rounds` when a passphrase is given.
+    fn generate_and_save_with_rounds<TND: TelcoinDirs>(
+        tn_datadir: &TND,
+        passphrase: Option<String>,
+        rounds: u32,
+    ) -> eyre::Result<Self> {
         // note: StdRng uses ChaCha12
         let primary_keypair = BlsKeypair::generate(&mut StdRng::from_os_rng());
         let primary_seed = "primary network keypair";
@@ -170,7 +264,7 @@ impl KeyConfig {
         // Don't error out if path exists.
         let _ = std::fs::create_dir(tn_datadir.node_keys_path());
         if let Some(passphrase) = passphrase {
-            let contents = Self::wrap_bls_key(&primary_keypair, &passphrase)?;
+            let contents = Self::wrap_bls_key(&primary_keypair, &passphrase, rounds)?;
             std::fs::write(tn_datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE), contents)?;
         } else {
             let contents = bs58::encode(primary_keypair.to_bytes()).into_string();
@@ -233,18 +327,16 @@ impl KeyConfig {
     /// holder of authority protocol key, and also ensures that the authority
     /// protocol public key exists.
     ///
-    /// The proof of possession is a [BlsSignature] committed over the intent message
-    /// `intent || message` (See more at [IntentMessage] and [Intent]).
-    /// The message is constructed as: EIP2537([BlsPublicKey]) || [Address].
-    /// Where the public key is uncompressed with G2 point coordinates padded to 64-byte EVM words
+    /// The proof of possession is a [BlsSignature] over [`construct_proof_of_possession_message`]:
+    /// `intentPrefix || compressedBlsPubkey || address`. Using the compressed key keeps the message
+    /// cheaply reconstructable by the on-chain `ConsensusRegistry`, which verifies it via the
+    /// native BLS precompile.
     pub fn generate_proof_of_possession_bls(
         &self,
         address: &Address,
     ) -> eyre::Result<BlsSignature> {
-        let msg = construct_proof_of_possession_message(&self.primary_public_key(), address)?;
-        let sig = BlsSignature::new_secure(&msg.clone(), &self.inner.primary_keypair);
-
-        Ok(sig)
+        let msg = construct_proof_of_possession_message(&self.primary_public_key(), address);
+        Ok(self.inner.primary_keypair.sign(&msg))
     }
 
     /// Derive a NetworkKeypair from a BLS signature, seed string and [DefaultHashFunction].
@@ -270,25 +362,138 @@ impl BlsSigner for KeyConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
-    use super::KeyConfig;
+    /// Re-implement the on-disk format independently of the production writer, so the reader
+    /// tests pin the format contract rather than merely echoing the writer's output:
+    /// `salt[12] | nonce[12] | ciphertext`, with `rounds` implied rather than stored.
+    fn wrap_test_only(keypair: &BlsKeypair, passphrase: &str, rounds: u32) -> String {
+        let mut salt = [0_u8; SALT_LEN];
+        rand::rng().fill(&mut salt);
+        let mut nonce_bytes = [0_u8; NONCE_LEN];
+        rand::rng().fill(&mut nonce_bytes);
+        let wrapping_key = KeyConfig::derive_wrapping_key(passphrase, &salt, rounds);
+        let cipher = Aes256GcmSiv::new(Key::<Aes256GcmSiv>::from_slice(&wrapping_key));
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), &keypair.to_bytes()[..])
+            .expect("test_only encrypt");
+        bs58::encode([&salt[..], &nonce_bytes[..], &ciphertext[..]].concat()).into_string()
+    }
+
+    /// Write `wrapped` as `bls.kw` under a fresh datadir so `read_config` exercises the
+    /// normal read path.
+    fn install_wrapped(tmp_dir: &TempDir, wrapped: &str) -> PathBuf {
+        let datadir = tmp_dir.path().to_path_buf();
+        std::fs::create_dir_all(datadir.node_keys_path()).expect("keys dir");
+        std::fs::write(datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE), wrapped)
+            .expect("write bls.kw");
+        datadir
+    }
+
+    fn random_keypair() -> BlsKeypair {
+        BlsKeypair::generate(&mut StdRng::from_os_rng())
+    }
 
     #[test]
     fn test_bls_passphrase() {
         let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = tmp_dir.path().to_path_buf();
         let pp = Some("test_bls_passphrase".to_string());
-        let kc = KeyConfig::generate_and_save(&tmp_dir.path().to_path_buf(), pp.clone())
+        // fast rounds: this test covers the wrap/unwrap plumbing, not the work factor
+        // (the production round count is pinned by `test_bls_passphrase_production_rounds`)
+        let kc = KeyConfig::generate_and_save_with_rounds(&datadir, pp.clone(), 1)
             .expect("BLS key config");
-        let kc2 =
-            KeyConfig::read_config(&tmp_dir.path().to_path_buf(), pp.clone()).expect("load config");
+        let kc2 = KeyConfig::read_config(&datadir, pp).expect("load config");
         assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
-        assert!(KeyConfig::read_config(&tmp_dir.path().to_path_buf(), None).is_err());
-        assert!(KeyConfig::read_config(
-            &tmp_dir.path().to_path_buf(),
-            Some("not_passphrase".to_string())
-        )
-        .is_err());
+        assert!(KeyConfig::read_config(&datadir, None).is_err());
+        assert!(KeyConfig::read_config(&datadir, Some("not_passphrase".to_string())).is_err());
+    }
+
+    /// The true production write path: `generate_and_save` must emit the headerless layout,
+    /// wrap at `PBKDF2_HMAC_ROUNDS`, and read back correctly.
+    #[test]
+    fn test_bls_passphrase_production_rounds() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = tmp_dir.path().to_path_buf();
+        let pp = "production_rounds";
+        let kc = KeyConfig::generate_and_save(&datadir, Some(pp.to_string())).expect("key config");
+
+        // decode the on-disk file and pin the headerless layout: salt | nonce | ct (+16-byte tag)
+        let contents = std::fs::read_to_string(datadir.node_keys_path().join(BLS_WRAPPED_KEYFILE))
+            .expect("read bls.kw");
+        let bytes = bs58::decode(contents.trim()).into_vec().expect("base58");
+        let sk_len = kc.inner.primary_keypair.to_bytes().len();
+        assert_eq!(bytes.len(), SALT_LEN + NONCE_LEN + sk_len + 16);
+
+        // The round count is not stored on disk, so pin the production work factor directly:
+        // the file must open at PBKDF2_HMAC_ROUNDS and NOT at the insecure round count. This is
+        // what would catch a cfg-gated weak constant sneaking back in via feature unification.
+        let salt = &bytes[..SALT_LEN];
+        let (nonce, ct) = bytes[SALT_LEN..].split_at(NONCE_LEN);
+        assert!(
+            KeyConfig::try_decrypt(pp, salt, nonce, ct, TEST_ONLY_INSECURE_ROUNDS).is_none(),
+            "production keyfile must not open at the insecure round count"
+        );
+        assert!(
+            KeyConfig::try_decrypt(pp, salt, nonce, ct, PBKDF2_HMAC_ROUNDS).is_some(),
+            "production keyfile must open at PBKDF2_HMAC_ROUNDS"
+        );
+
+        let kc2 = KeyConfig::read_config(&datadir, Some(pp.to_string())).expect("load config");
+        assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
+    }
+
+    /// Weak keyfile written by a build poisoned by the old feature-unification bug
+    /// (rounds = 1): the in-place upgrade path for weakly provisioned datadirs - must read
+    /// OK (with a loud warning).
+    #[test]
+    fn test_test_only_weak_file_read() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let keypair = random_keypair();
+        let expected = keypair.to_bytes();
+        let wrapped = wrap_test_only(&keypair, "test_only_weak", TEST_ONLY_INSECURE_ROUNDS);
+        let datadir = install_wrapped(&tmp_dir, &wrapped);
+        let kc = KeyConfig::read_config(&datadir, Some("test_only_weak".to_string()))
+            .expect("read test_only weak file");
+        assert_eq!(kc.inner.primary_keypair.to_bytes(), expected);
+    }
+
+    /// Keyfile written by a healthy build (rounds = 1,000,000) must read OK.
+    #[test]
+    fn test_test_only_strong_file_read() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let keypair = random_keypair();
+        let expected = keypair.to_bytes();
+        let wrapped = wrap_test_only(&keypair, "test_only_strong", PBKDF2_HMAC_ROUNDS);
+        let datadir = install_wrapped(&tmp_dir, &wrapped);
+        let kc = KeyConfig::read_config(&datadir, Some("test_only_strong".to_string()))
+            .expect("read test_only strong file");
+        assert_eq!(kc.inner.primary_keypair.to_bytes(), expected);
+    }
+
+    /// Truncated / garbage keyfiles must error, not panic (regression test: the old reader
+    /// sliced fixed byte ranges without length guards).
+    #[test]
+    fn test_truncated_wrapped_file_errors() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = install_wrapped(&tmp_dir, &bs58::encode([0_u8; 10]).into_string());
+        assert!(KeyConfig::read_config(&datadir, Some("any".to_string())).is_err());
+    }
+
+    /// The test-utils-gated insecure writer rejects a zero round count and round-trips.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn test_generate_and_save_insecure() {
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = tmp_dir.path().to_path_buf();
+        let pp = Some("insecure".to_string());
+        assert!(KeyConfig::generate_and_save_insecure(&datadir, pp.clone(), 0).is_err());
+        let kc = KeyConfig::generate_and_save_insecure(&datadir, pp.clone(), 1)
+            .expect("insecure BLS key config");
+        let kc2 = KeyConfig::read_config(&datadir, pp).expect("load config");
+        assert_eq!(kc.inner.primary_keypair.to_bytes(), kc2.inner.primary_keypair.to_bytes());
     }
 
     #[test]

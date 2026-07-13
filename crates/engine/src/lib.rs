@@ -12,14 +12,9 @@ mod payload_builder;
 use crate::metrics::ENGINE_METRICS;
 use error::EngineResult;
 pub use error::TnEngineError;
-use futures::{Future, StreamExt};
-use futures_util::FutureExt;
+use futures::{future::OptionFuture, StreamExt};
 pub use payload_builder::execute_consensus_output;
-use std::{
-    collections::VecDeque,
-    pin::{pin, Pin},
-    task::{Context, Poll},
-};
+use std::collections::VecDeque;
 use tn_reth::{payload::BuildArguments, RethEnv};
 use tn_types::{
     gas_accumulator::GasAccumulator, ConsensusOutput, EngineUpdate, Noticer, SealedHeader,
@@ -32,6 +27,15 @@ use tracing::{debug, error, info, warn};
 /// Type alias for the blocking task that executes consensus output and returns the finalized
 /// `SealedHeader`.
 type PendingExecutionTask = oneshot::Receiver<EngineResult<SealedHeader>>;
+
+/// Maximum number of consensus outputs buffered for execution.
+///
+/// Each queued output holds a full `CommittedSubDag` plus batches, so an unbounded queue lets a
+/// lagging engine consume all memory while consensus keeps committing. Once the queue is full
+/// the engine stops polling the consensus stream, pushing backpressure into the `to_engine`
+/// channel (and ultimately the EpochManager forwarder) instead of buffering here. The
+/// `tn_engine_queued_outputs` gauge tracks occupancy.
+pub const MAX_QUEUED_OUTPUTS: usize = 8;
 
 /// The TN consensus engine is responsible executing state that has reached consensus.
 ///
@@ -189,97 +193,96 @@ impl ExecutorEngine {
 ///
 /// If the broadcast stream is closed, the engine will attempt to execute all remaining tasks and
 /// any output that is queued.
-impl Future for ExecutorEngine {
-    type Output = EngineResult<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        // check for shutdown signal
-        if pin!(&this.rx_shutdown).poll(cx).is_ready() {
-            info!(target: "engine", "received shutdown signal...");
-            // only return if there are no current tasks and the queue is empty
-            // otherwise, let the loop continue so any remaining tasks and queued output is
-            // executed
-            // rx_shutdown should continue to poll ready so once the queue is clear should shutdown.
-            if this.pending_task.is_none() && this.queued.is_empty() {
-                return Poll::Ready(Ok(()));
-            }
-        }
+impl ExecutorEngine {
+    /// Run the engine event loop until shutdown or the consensus stream closes.
+    pub async fn run(mut self) -> EngineResult<()> {
+        // tracks the consensus stream returning `None`; the engine keeps draining queued and
+        // in-flight work before finally shutting down.
+        let mut consensus_closed = false;
 
         loop {
-            // check if output is available from consensus to keep broadcast stream from "lagging"
-            match this.consensus_output_stream.poll_next_unpin(cx) {
-                Poll::Ready(Some(output)) => {
-                    // queue the output for local execution
-                    this.queued.push_back(output);
-                    // backlog growth means execution is falling behind consensus
-                    ENGINE_METRICS.queued_outputs.set(this.queued.len() as f64);
+            // check for shutdown signal
+            if self.rx_shutdown.noticed() {
+                info!(target: "engine", "received shutdown signal...");
+                // only return if there are no current tasks and the queue is empty
+                // otherwise, let the loop continue so any remaining tasks and queued output is
+                // executed
+                // rx_shutdown should continue to poll ready so once the queue is clear should
+                // shutdown.
+                if self.pending_task.is_none() && self.queued.is_empty() {
+                    return Ok(());
                 }
-                Poll::Ready(None) => {
-                    // the stream has ended
-                    error!(target: "engine", "ConsensusOutput channel closed. Shutting down...");
+            }
 
-                    // only return if there are no current tasks and the queue is empty
-                    // otherwise, let the loop continue so any remaining tasks and queued output is
-                    // executed
-                    if this.pending_task.is_none() && this.queued.is_empty() {
-                        return Poll::Ready(Err(TnEngineError::ConsensusOutputStreamClosed));
-                    }
-                }
-
-                Poll::Pending => { /* nothing to do */ }
+            // the consensus stream closed: once the queue and in-flight task drain, shut down
+            // (the original re-checked this on every poll after observing the closed stream)
+            if consensus_closed && self.pending_task.is_none() && self.queued.is_empty() {
+                return Err(TnEngineError::ConsensusOutputStreamClosed);
             }
 
             // only insert task if there is none
             //
             // note: it's important that the previous consensus output finishes executing before
             // inserting the next task to ensure the parent sealed header is finalized
-            if this.pending_task.is_none() {
-                if this.queued.is_empty() {
-                    // nothing to insert
-                    break;
-                }
-
+            if self.pending_task.is_none() && !self.queued.is_empty() {
                 // ready to begin executing next round of consensus
-                this.pending_task = Some(this.spawn_execution_task());
+                self.pending_task = Some(self.spawn_execution_task());
             }
 
-            // poll receiver that returns output execution result
-            if let Some(mut receiver) = this.pending_task.take() {
-                match receiver.poll_unpin(cx) {
-                    Poll::Ready(res) => {
-                        debug!(target: "engine", ?res, "reciever for execution result polled ready");
-                        let finalized_header = res.map_err(Into::into).and_then(|res| res)?;
-                        // store last executed header in memory
-                        this.parent_header = finalized_header;
-                        ENGINE_METRICS.outputs_executed_total.increment(1);
-                        ENGINE_METRICS.canonical_height.set(this.parent_header.number as f64);
-                        ENGINE_METRICS.queued_outputs.set(this.queued.len() as f64);
+            tokio::select! {
+                // poll consensus first to keep the broadcast stream from "lagging"
+                biased;
 
-                        // check max_round to auto shutdown
-                        #[cfg(any(test, feature = "test-utils"))]
-                        if this.max_round.is_some()
-                            && this.has_reached_max_round(this.parent_header.nonce.into())
-                        {
-                            // immediately terminate if the specified max consensus round is reached
-                            return Poll::Ready(Ok(()));
-                        }
+                // wake on shutdown while otherwise idle; disabled once noticed (from then on the
+                // top-of-loop check owns the drain-and-return path).
+                _ = &self.rx_shutdown, if !self.rx_shutdown.noticed() => {}
 
-                        // allow loop to continue: poll broadcast stream for next output
+                // check if output is available from consensus to keep broadcast stream from "lagging"
+                //
+                // gated on the queue bound: while the backlog is full there is always a
+                // pending execution task to wake the loop, and each completion re-opens the
+                // gate, so consensus backpressures instead of growing the queue unbounded
+                output = self.consensus_output_stream.next(), if !consensus_closed && self.queued.len() < MAX_QUEUED_OUTPUTS => {
+                    output
+                        .map(|output| {
+                            // queue the output for local execution
+                            self.queued.push_back(output);
+                            // backlog growth means execution is falling behind consensus
+                            ENGINE_METRICS.queued_outputs.set(self.queued.len() as f64);
+                        })
+                        .unwrap_or_else(|| {
+                            // the stream has ended; the top-of-loop check returns the error once
+                            // the queue and in-flight task have drained.
+                            error!(target: "engine", "ConsensusOutput channel closed. Shutting down...");
+                            consensus_closed = true;
+                        });
+                }
+
+                // poll receiver that returns output execution result
+                Some(res) = OptionFuture::from(self.pending_task.as_mut()), if self.pending_task.is_some() => {
+                    debug!(target: "engine", ?res, "reciever for execution result polled ready");
+                    let finalized_header = res.map_err(Into::into).and_then(|res| res)?;
+                    // the in-flight task resolved; clear the slot so the next round can be spawned
+                    self.pending_task = None;
+                    // store last executed header in memory
+                    self.parent_header = finalized_header;
+                    ENGINE_METRICS.outputs_executed_total.increment(1);
+                    ENGINE_METRICS.canonical_height.set(self.parent_header.number as f64);
+                    ENGINE_METRICS.queued_outputs.set(self.queued.len() as f64);
+
+                    // check max_round to auto shutdown
+                    #[cfg(any(test, feature = "test-utils"))]
+                    if self.max_round.is_some()
+                        && self.has_reached_max_round(self.parent_header.nonce.into())
+                    {
+                        // immediately terminate if the specified max consensus round is reached
+                        return Ok(());
                     }
-                    Poll::Pending => {
-                        this.pending_task = Some(receiver);
 
-                        // break loop and return Poll::Pending
-                        break;
-                    }
+                    // allow loop to continue: poll broadcast stream for next output
                 }
             }
         }
-
-        // all output executed, yield back to runtime
-        Poll::Pending
     }
 }
 

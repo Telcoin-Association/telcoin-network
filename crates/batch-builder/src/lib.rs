@@ -18,13 +18,8 @@
 
 pub use batch::{build_batch, BatchBuilderOutput};
 use error::{BatchBuilderError, BatchBuilderResult};
-use futures_util::{FutureExt, StreamExt};
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-    time::{Duration, Instant},
-};
+use futures_util::{future::OptionFuture, StreamExt};
+use std::time::{Duration, Instant};
 use tn_reth::{CanonStateNotificationStream, ChangedAccount, RethEnv, TxPool as _, WorkerTxPool};
 use tn_types::{
     error::BlockSealError, Address, BatchBuilderArgs, BatchSender, Epoch, SealedBlock, TaskSpawner,
@@ -255,103 +250,104 @@ impl BatchBuilder {
 ///
 /// If the broadcast stream is closed, the engine will attempt to execute all remaining tasks and
 /// any output that is queued.
-impl Future for BatchBuilder {
-    type Output = BatchBuilderResult<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
+impl BatchBuilder {
+    /// Run the batch builder event loop. Runs for the lifetime of the worker.
+    pub async fn run(mut self) -> BatchBuilderResult<()> {
+        // reproduces the original future's post-quorum-failure `break`: skip starting a build for
+        // exactly one iteration so the loop backs off (parks) before retrying, instead of
+        // immediately rebuilding the same (still-unmined) transactions.
+        let mut defer_build = false;
 
         // loop when a successful block is built
         loop {
-            // This is used as a "wake up" when canonical state updates.
-            while let Poll::Ready(Some(latest)) = this.state_changed.poll_next_unpin(cx) {
-                // NOTE: separate background task applies these changes to the pool
-                // regardless of pending_task
-                this.last_canonical_update = latest.tip().sealed_block().clone()
-            }
-
             // only propose one block at a time
-            if this.pending_task.is_none() {
+            if self.pending_task.is_none() && !defer_build {
                 // check for pending transactions
-                this.metrics.pending_pool_transactions.set(this.pool.pool_size().pending as f64);
-                if this.pool.pending_transactions().is_empty() {
+                self.metrics.pending_pool_transactions.set(self.pool.pool_size().pending as f64);
+                if self.pool.pending_transactions().is_empty() {
                     // reset interval to wake up after some time
                     //
                     // only need to reset here if there is no pending block being built
-                    this.max_delay_interval.reset();
-
-                    // tick interval to ensure it advances
-                    let _ = this.max_delay_interval.poll_tick(cx);
+                    self.max_delay_interval.reset();
 
                     // nothing pending
-                    break;
+                } else {
+                    // start building the next batch
+                    self.pending_task = Some(self.spawn_execution_task());
+
+                    // don't break so pending_task receiver gets polled
                 }
-
-                // start building the next batch
-                this.pending_task = Some(this.spawn_execution_task());
-
-                // don't break so pending_task receiver gets polled
             }
 
-            // poll receiver that returns mined transactions once the batch reaches quorum
-            if let Some(mut receiver) = this.pending_task.take() {
+            // consume the one-shot defer now that this build attempt has been skipped
+            defer_build = false;
+
+            tokio::select! {
+                // drain canonical updates first, then the in-flight build, then the periodic tick
+                biased;
+
+                // This is used as a "wake up" when canonical state updates.
+                Some(latest) = self.state_changed.next() => {
+                    // NOTE: separate background task applies these changes to the pool
+                    // regardless of pending_task
+                    self.last_canonical_update = latest.tip().sealed_block().clone()
+                }
+
+                // poll receiver that returns mined transactions once the batch reaches quorum
+                //
                 // poll here so waker is notified when ack received
-                match receiver.poll_unpin(cx) {
-                    Poll::Ready(res) => {
-                        debug!(target: "block-builder", ?res, "pending task complete");
-                        // ensure no fatal errors
-                        let MinedBatchResult { mined_transactions, changed_accounts } = res??;
+                Some(res) = OptionFuture::from(self.pending_task.as_mut()), if self.pending_task.is_some() => {
+                    // the build resolved; the original `take`s the receiver and only restores it
+                    // while it is still pending, so clear the slot here
+                    self.pending_task = None;
 
-                        // NOTE: empty vec returned for non-fatal error during block proposal
-                        if mined_transactions.is_empty() {
-                            // reset interval to prevent immediate re-wake from stale tick
-                            this.max_delay_interval.reset();
-                            let _ = this.max_delay_interval.poll_tick(cx);
+                    debug!(target: "block-builder", ?res, "pending task complete");
+                    // ensure no fatal errors
+                    let MinedBatchResult { mined_transactions, changed_accounts } = res??;
 
-                            // return pending and wait for canonical update to wake up again
-                            break;
-                        }
+                    // NOTE: empty vec returned for non-fatal error during block proposal
+                    if mined_transactions.is_empty() {
+                        // reset interval to prevent immediate re-wake from stale tick
+                        self.max_delay_interval.reset();
 
-                        debug!(target: "block-builder", "applying block builder's update");
-
-                        let base_fee_per_gas = this
-                            .last_canonical_update
-                            .base_fee_per_gas
-                            .unwrap_or_else(|| this.pool.get_pending_base_fee());
-
-                        // update pool to remove mined transactions
-                        this.pool.update_canonical_state(
-                            &this.last_canonical_update,
-                            base_fee_per_gas,
-                            Some(u128::MAX), // set max fee for blobs
-                            mined_transactions,
-                            changed_accounts,
-                        );
-
-                        // loop again to check for any other pending transactions
-                        // and possibly start building the next block
-                        //
-                        // NOTE: continuing here is important.
-                        // To prevent the following scenario, do not wait for task's waker:
-                        // - there were more transactions in the pool than could fit in the first
-                        //   block
-                        // - pending transaction notifications already drained
-                        // - have to wait for engine's next canonical update to wake up
+                        // return pending and wait for canonical update to wake up again
+                        defer_build = true;
                         continue;
                     }
 
-                    Poll::Pending => {
-                        this.pending_task = Some(receiver);
+                    debug!(target: "block-builder", "applying block builder's update");
 
-                        // break loop and return Poll::Pending
-                        break;
-                    }
+                    let base_fee_per_gas = self
+                        .last_canonical_update
+                        .base_fee_per_gas
+                        .unwrap_or_else(|| self.pool.get_pending_base_fee());
+
+                    // update pool to remove mined transactions
+                    self.pool.update_canonical_state(
+                        &self.last_canonical_update,
+                        base_fee_per_gas,
+                        Some(u128::MAX), // set max fee for blobs
+                        mined_transactions,
+                        changed_accounts,
+                    );
+
+                    // loop again to check for any other pending transactions
+                    // and possibly start building the next block
+                    //
+                    // NOTE: continuing here is important.
+                    // To prevent the following scenario, do not wait for task's waker:
+                    // - there were more transactions in the pool than could fit in the first
+                    //   block
+                    // - pending transaction notifications already drained
+                    // - have to wait for engine's next canonical update to wake up
+                    continue;
                 }
+
+                // periodic wake to check the pending pool; gated to no-build-in-flight to match the
+                // original, which only polled the interval while `pending_task` was `None`.
+                _ = self.max_delay_interval.tick(), if self.pending_task.is_none() => {}
             }
         }
-
-        // all output executed, yield back to runtime
-        Poll::Pending
     }
 }
 
@@ -478,7 +474,7 @@ mod tests {
         assert_eq!(pending_pool_len, 3);
 
         // spawn batch_builder once worker is ready
-        let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+        let _batch_builder = tokio::spawn(batch_builder.run());
 
         // wait for new batch
         let mut new_batch = None;
@@ -633,7 +629,7 @@ mod tests {
         assert_eq!(pending_pool_len, 3);
 
         // spawn batch_builder once worker is ready
-        let batch_builder_task = tokio::spawn(Box::pin(batch_builder));
+        let batch_builder_task = tokio::spawn(batch_builder.run());
 
         // plenty of time for block production
         let duration = std::time::Duration::from_secs(5);
@@ -676,10 +672,9 @@ mod tests {
             // all 3 transactions present
             assert_eq!(sealed_batch.batch().transactions().len(), 3 + subdag_index);
 
-            // send non-fatal error
-            let _ = ack.send(Err(error));
-
-            // submit another tx to pool
+            // submit another tx to pool before acking so the builder's next rebuild
+            // (whenever it wakes) is guaranteed to see the new tx - the builder can't
+            // rebuild while it still awaits this ack
             tx_factory
                 .create_and_submit_eip1559_pool_tx(
                     chain.clone(),
@@ -701,8 +696,8 @@ mod tests {
             // update values for next loop
             parent = final_header;
 
-            // sleep to ensure canonical update received before ack
-            let _ = tokio::time::sleep(Duration::from_secs(1)).await;
+            // send non-fatal error
+            let _ = ack.send(Err(error));
         }
 
         // wait for next block
@@ -798,7 +793,7 @@ mod tests {
         assert_eq!(pending_pool_len, 3);
 
         // spawn batch_builder once worker is ready
-        let _batch_builder_task = tokio::spawn(Box::pin(batch_builder));
+        let _batch_builder_task = tokio::spawn(batch_builder.run());
 
         // plenty of time for block production
         let duration = std::time::Duration::from_secs(5);

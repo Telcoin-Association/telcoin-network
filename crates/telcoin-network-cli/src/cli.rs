@@ -101,23 +101,28 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     ///
     /// ```no_run
     /// use clap::Parser;
-    /// use telcoin_network_cli::cli::Cli;
+    /// use telcoin_network_cli::{cli::Cli, passphrase::get_bls_passphrase_from_env};
     /// use tn_node::launch_node;
     ///
-    /// #[derive(Debug, Parser)]
+    /// /// Extra CLI args flattened into the `node` subcommand.
+    /// #[derive(Debug, clap::Args)]
     /// pub struct MyArgs {
+    ///     /// Example flag consumed by your ExEx.
+    ///     #[arg(long)]
     ///     pub enable: bool,
     /// }
     ///
-    /// if let Err(err) = telcoin_network_cli::cli::Cli::<MyArgs>::parse().run(
-    ///     None,
-    ///     |builder, _, tn_datadir, passphrase, version| {
-    ///         launch_node(builder, tn_datadir, passphrase, version)
-    ///     },
-    /// ) {
-    ///     eprintln!("Error: {err:?}");
-    ///     std::process::exit(1);
-    /// }
+    /// // 1. Read (and clear) TN_BLS_PASSPHRASE before any threads exist.
+    /// let preloaded = get_bls_passphrase_from_env();
+    /// let cli = Cli::<MyArgs>::parse();
+    /// // 2. Resolve the passphrase for the parsed subcommand.
+    /// let passphrase = cli.resolve_bls_passphrase(preloaded)?;
+    /// // 3. Run, installing ExExes on the builder before launching the node.
+    /// cli.run(passphrase, |mut builder, _args, tn_datadir, key_config, version| {
+    ///     builder.install_exex("my-exex", |_ctx| async move { Ok(()) });
+    ///     launch_node(builder, tn_datadir, key_config, version)
+    /// })?;
+    /// # Ok::<(), eyre::Report>(())
     /// ```
     pub fn run<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
     where
@@ -204,7 +209,7 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Key management.
     /// Generate or read keys for node management.
     #[command(name = "keytool")]
-    Keytool(keytool::KeyArgs),
+    Keytool(Box<keytool::KeyArgs>),
 
     /// Start the node
     #[command(name = "node")]

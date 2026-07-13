@@ -108,6 +108,22 @@ impl NetworkType {
             Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-sync-{chain_id}/0.0.1")),
         }
     }
+
+    /// Peer-exchange goodbye wire protocol, isolated per role (and per worker) and
+    /// namespaced by `chain_id` so nodes on different chains never negotiate it.
+    ///
+    /// A dedicated request-response protocol for the [`PeerExchangeMap`](crate::PeerExchangeMap)
+    /// a node shares when it gracefully disconnects. Goodbyes prefer this protocol and fall
+    /// back to the variant embedded in the consensus request enums when the peer has not
+    /// upgraded yet (`UnsupportedProtocols` is penalty-exempt).
+    pub(crate) fn peer_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        match self {
+            Self::Primary => owned_protocol(format!("/tn-primary-peer-exchange-{chain_id}/0.0.1")),
+            Self::Worker(id) => {
+                owned_protocol(format!("/tn-worker-{id}-peer-exchange-{chain_id}/0.0.1"))
+            }
+        }
+    }
 }
 
 /// Bulk-transfer stream protocol, namespaced by `chain_id`.
@@ -202,6 +218,12 @@ impl<Res> ResponseChannel<Res> {
 }
 
 /// Events created from network activity.
+// The `Gossip` variant carries the payload plus two resolved BLS identities (relayer + author)
+// for penalty attribution, making it the largest variant. `NetworkEvent` is a short-lived message
+// moved across a small-capacity channel, so the per-slot size is immaterial, whereas boxing a
+// field would add a heap allocation to the hot gossip-delivery path; the peer-manager event enum
+// takes the same allowance (see `peers/types.rs`).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum NetworkEvent<Req, Res> {
     /// Direct request from peer.
@@ -215,16 +237,27 @@ pub enum NetworkEvent<Req, Res> {
         /// The oneshot channel if the request gets cancelled at the network level.
         cancel: oneshot::Receiver<()>,
     },
-    /// Gossip message received, with the relaying peer's BLS identity when it
-    /// has resolved.
+    /// Gossip message received, with the relaying peer's and the author's BLS identities
+    /// when they have resolved.
     ///
-    /// The identity is `None` during the brief window after a peer joins the
-    /// gossipsub mesh and relays a message before its signed `NodeRecord`
-    /// (which carries the BLS key) has been resolved. The payload is delivered
-    /// regardless, because the message author is already authenticated during
-    /// gossip verification; the relayer identity is used only for penalty
-    /// attribution and a log label, never for the payload itself.
-    Gossip(GossipMessage, Option<BlsPublicKey>),
+    /// Both identities are `Option` because a peer is `Connected` — and can relay or author
+    /// gossip — before its signed `NodeRecord` (which carries the BLS key) has been resolved.
+    /// The payload is delivered regardless, because the message author is already authenticated
+    /// during gossip verification; the identities are used only for penalty attribution and a
+    /// log label, never for the payload itself.
+    ///
+    /// `relayer` (the forwarding `propagation_source`) and `author` (the publishing
+    /// `GossipMessage::source`) are distinct peers, and charging a content fault to the wrong
+    /// one bans honest peers (see issues #801/#819); they are named rather than positional so
+    /// the two cannot be transposed.
+    Gossip {
+        /// The gossip message payload.
+        message: GossipMessage,
+        /// BLS identity of the relaying peer (`propagation_source`), when resolved.
+        relayer: Option<BlsPublicKey>,
+        /// BLS identity of the message author (`GossipMessage::source`), when resolved.
+        author: Option<BlsPublicKey>,
+    },
     /// Send an error back the requester.
     Error(String, ResponseChannel<Res>),
     /// An inbound stream was established by a peer.

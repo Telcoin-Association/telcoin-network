@@ -13,7 +13,7 @@ use std::{
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_engine::{ExecutorEngine, TnEngineError};
+use tn_engine::{ExecutorEngine, TnEngineError, MAX_QUEUED_OUTPUTS};
 use tn_reth::{
     calculate_gas_penalty, recover_signed_transaction,
     system_calls::EpochState,
@@ -187,7 +187,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -211,6 +211,117 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     assert_eq!(last_block_num, 0);
     // canonical tip is still genesis
     assert_eq!(canonical_tip.hash(), genesis_header.hash());
+
+    Ok(())
+}
+
+/// The engine must stop draining the consensus stream once its execution backlog reaches
+/// [`MAX_QUEUED_OUTPUTS`], then drain to completion (executing every output exactly once, in
+/// order) as completed executions re-open the gate.
+#[tokio::test]
+async fn test_queued_outputs_bounded_with_backpressure() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus
+    //
+    // build a chain of empty outputs. Pre-fill one more than the bound: the loop immediately
+    // pops one output into the in-flight execution slot, so MAX_QUEUED_OUTPUTS + 1 leaves the
+    // queue exactly at the bound (gate closed) when the stream is first polled.
+    const STREAMED: usize = 2;
+    let prefill = MAX_QUEUED_OUTPUTS + 1;
+    let total = prefill + STREAMED;
+    let timestamp = now();
+    let mut outputs = Vec::with_capacity(total);
+    let mut parent_hash = ConsensusHeaderDigest::default();
+    let mut previous_sub_dag: Option<CommittedSubDag> = None;
+    for i in 0..total {
+        let round = i as u32 + 1;
+        let mut leader = Certificate::default();
+        leader.update_header_round_for_test(round);
+        leader.update_header_created_at_for_test(timestamp);
+        leader.update_header_author_for_test(leader_id.clone());
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            round as u64,
+            ReputationScores::default(),
+            previous_sub_dag.clone(),
+        );
+        let output = ConsensusOutput::new_with_subdag(sub_dag.clone(), parent_hash, i as u64 + 1);
+        parent_hash = output.consensus_header_hash();
+        previous_sub_dag = Some(sub_dag);
+        outputs.push(output);
+    }
+
+    //=== Execution
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(STREAMED);
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(total + 1);
+    let mut engine = ExecutorEngine::new(
+        reth_env.clone(),
+        None,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        engine_update_tx,
+    );
+
+    // pre-fill the queue past the bound and fill the channel behind it
+    let mut outputs_iter = outputs.iter();
+    for output in outputs_iter.by_ref().take(prefill) {
+        engine.push_back_queued_for_test(output.clone());
+    }
+    for output in outputs_iter {
+        to_engine.send(output.clone()).await?;
+    }
+    assert_eq!(to_engine.capacity(), 0, "test setup: channel must start full");
+
+    // first poll: the queue is at the bound, so the engine must leave the stream untouched
+    // (an unbounded engine drains the whole channel on this poll)
+    let mut engine_fut = Box::pin(engine.run());
+    assert!(futures::poll!(&mut engine_fut).is_pending());
+    assert_eq!(
+        to_engine.capacity(),
+        0,
+        "engine drained the consensus stream past MAX_QUEUED_OUTPUTS"
+    );
+
+    // as executions complete the gate re-opens: everything drains and the engine shuts
+    // down once the (dropped) stream is exhausted
+    drop(to_engine);
+    let res = timeout(Duration::from_secs(30), engine_fut).await?;
+    assert_matches!(res, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // every output was executed exactly once, in order
+    for (i, output) in outputs.iter().enumerate() {
+        let (leader_round, consensus_num_hash, _tip) =
+            engine_update_rx.try_recv().unwrap_or_else(|e| {
+                panic!("missing engine update for output {}: {e}", i + 1);
+            });
+        assert_eq!(leader_round, i as u32 + 1, "output executed out of order");
+        assert_eq!(consensus_num_hash, output.num_hash());
+    }
+    assert!(engine_update_rx.try_recv().is_err(), "extra engine update: output executed twice");
 
     Ok(())
 }
@@ -300,7 +411,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -480,7 +591,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -816,7 +927,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1325,7 +1436,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1692,7 +1803,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1910,7 +2021,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -2202,7 +2313,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
 
     let (tx, rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });

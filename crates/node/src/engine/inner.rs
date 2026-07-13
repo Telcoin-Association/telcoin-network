@@ -3,7 +3,7 @@
 //! This module contains the logic for execution.
 
 use crate::error::ExecutionError;
-use eyre::OptionExt;
+use eyre::{eyre, OptionExt};
 use jsonrpsee::http_client::HttpClient;
 use std::{net::SocketAddr, sync::Arc};
 use tn_batch_builder::BatchBuilder;
@@ -17,13 +17,13 @@ use tn_reth::{
 };
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusHeaderDigest,
-    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
+    gas_accumulator::GasAccumulator, Address, BatchSender, BatchValidation, BlockHeader,
+    BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer,
+    SealedHeader, TaskSpawner, WorkerId,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Inner type for holding execution layer types.
 #[derive(Debug)]
@@ -74,7 +74,7 @@ impl ExecutionNodeInner {
         // spawn tn engine
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
             info!("Engine stated from block {block_num}/{block_hash}, consensus output {consensus_header:?}");
-            let res = tn_engine.await;
+            let res = tn_engine.run().await;
             match &res {
                 Ok(_) => {
                     info!(target: "engine", "TN Engine exited gracefully");
@@ -120,7 +120,7 @@ impl ExecutionNodeInner {
 
         // spawn batch builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
-            let res = batch_builder.await;
+            let res = batch_builder.run().await;
             info!(target: "tn::execution", ?res, "batch builder task exited");
             Ok(res?)
         });
@@ -179,15 +179,33 @@ impl ExecutionNodeInner {
     ///
     /// Called every epoch so the pool charges the base fee the accumulator currently holds for
     /// the worker. This covers the respawn path, where `initialize_worker_components` is skipped
-    /// but the base fee for the new epoch must still take effect. No-op if the worker's components
-    /// have not been initialized yet.
-    pub(super) fn set_worker_base_fee(&self, worker_id: WorkerId, base_fee: u64) {
+    /// but the base fee for the new epoch must still take effect. If the worker's components have
+    /// not been initialized, the update is dropped with a warning and forces node shutdown: the
+    /// worker's pool would keep charging the previous epoch's base fee, admitting underpriced
+    /// transactions into batches that are rejected by peers.
+    pub(super) fn set_worker_base_fee(
+        &self,
+        worker_id: WorkerId,
+        base_fee: u64,
+    ) -> eyre::Result<()> {
         if let Some(worker) = self.workers.get(worker_id as usize) {
             let pool = worker.pool();
             let mut block_info = pool.block_info();
             block_info.pending_basefee = base_fee;
             pool.set_block_info(block_info);
+        } else {
+            warn!(
+                target: "tn::execution",
+                worker_id,
+                initialized_workers = self.workers.len(),
+                "set_worker_base_fee: dropping base-fee update for uninitialized worker"
+            );
+            return Err(eyre!(
+                "set_worker_base_fee: worker {worker_id} uninitialized ({} workers initialized)",
+                self.workers.len()
+            ));
         }
+        Ok(())
     }
 
     /// Respawn any tasks on the worker network when we get a new epoch task manager.
@@ -204,7 +222,7 @@ impl ExecutionNodeInner {
     pub(super) fn new_batch_validator(
         &self,
         worker_id: &WorkerId,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> Arc<dyn BatchValidation> {
         // retrieve handle to transaction pool to submit gossip transactions to validators
@@ -222,13 +240,13 @@ impl ExecutionNodeInner {
     /// This returns the hash of the last executed ConsensusHeader on the consensus chain.
     /// since the execution layer is confirming the last executing block.
     pub(super) fn last_executed_output(&self) -> eyre::Result<ConsensusHeaderDigest> {
-        // NOTE: The payload_builder only extends canonical tip and sets finalized after
-        // entire output is successfully executed. This ensures consistent recovery state.
-        //
-        // For example: consensus round 8 sends an output with 5 blocks, but only 2 blocks are
-        // executed before the node restarts. The provider never finalized the round, so the
-        // `finalized_block_number` would point to the last block of round 7. The primary
-        // would then re-send consensus output for round 8.
+        // The payload builder commits an output's blocks and the finalized marker in separate
+        // transactions; a crash between them leaves the marker lagging the persisted tip.
+        // Startup heals that lag (`RethEnv::heal_finalized_to_persisted_tip`) before anything
+        // reads the marker, so the finalized block read here is the last block of the last
+        // consensus output whose execution was fully committed — the digest recovered below
+        // names exactly the last executed output, and the primary re-requests everything after
+        // it.
         //
         // recover finalized block's nonce: this is the last subdag index from consensus (round)
         let finalized_block_num = self.reth_env.last_finalized_block_number()?;
