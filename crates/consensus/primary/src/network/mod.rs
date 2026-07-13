@@ -1375,8 +1375,8 @@ where
                         channel,
                         cancel,
                     ),
-                PrimaryRequest::StreamConsensusOutput { number } => {
-                    self.process_consensus_output_stream(peer, number, channel, cancel)
+                PrimaryRequest::StreamConsensusOutput { .. } => {
+                    self.process_consensus_output_stream(peer, channel, cancel)
                 }
             },
             NetworkEvent::Gossip { message, relayer, author } => {
@@ -1620,7 +1620,6 @@ where
     fn process_consensus_output_stream(
         &self,
         peer: BlsPublicKey,
-        _number: u64,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
