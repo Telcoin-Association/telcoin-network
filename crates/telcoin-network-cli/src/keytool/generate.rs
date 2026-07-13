@@ -1,10 +1,14 @@
 //! Generate subcommand
 
-use crate::{args::clap_address_parser, keytool::pop::PopArgs};
+use crate::{
+    args::{clap_address_parser, clap_url_parser},
+    keytool::{pop::PopArgs, set_rpc::build_worker_rpc},
+};
 use clap::{value_parser, Args, Subcommand};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NodeInfo, TelcoinDirs};
-use tn_types::{get_available_udp_port, Address, BlsPublicKey, Multiaddr, Protocol};
+use tn_types::{get_available_udp_port, Address, BlsPublicKey, Multiaddr, Protocol, RpcInfo};
 use tracing::info;
+use url::Url;
 
 /// Sign the proof of possession for `address` from `key_config` and write the
 /// PoP-derived fields (`bls_public_key`, `proof_of_possession`, `execution_address`)
@@ -142,6 +146,18 @@ pub struct KeygenArgs {
         value_delimiter = ','
     )]
     pub external_worker_addrs: Option<Vec<Multiaddr>>,
+
+    /// Optional HTTP(S) JSON-RPC endpoint to advertise to peers (e.g. https://validator.example.com:8545/).
+    ///
+    /// Recorded in node-info.yaml so wallets/dapps can discover where to submit transactions -
+    /// equivalent to running `keytool set-rpc` after generation. Omit to advertise no endpoint.
+    #[arg(long = "rpc-http", value_name = "URL", value_parser = clap_url_parser)]
+    pub rpc_http: Option<Url>,
+
+    /// Optional WebSocket JSON-RPC endpoint (e.g. wss://validator.example.com:8546/). Requires
+    /// `--rpc-http`.
+    #[arg(long = "rpc-ws", value_name = "URL", value_parser = clap_url_parser, requires = "rpc_http")]
+    pub rpc_ws: Option<Url>,
 }
 
 impl KeygenArgs {
@@ -215,6 +231,7 @@ impl KeygenArgs {
         &self,
         tn_datadir: &TND,
         key_config: &KeyConfig,
+        worker_rpc: Option<RpcInfo>,
     ) -> eyre::Result<()> {
         let mut node_info = NodeInfo::default();
         /* Uncomment when multi-worker support is enabled
@@ -228,7 +245,9 @@ impl KeygenArgs {
 
         self.update_keys(&mut node_info, key_config)?;
 
-        // execution address is set inside `set_proof_of_possession` (called by `update_keys`)
+        // execution address is set inside `set_proof_of_possession` (called by `update_keys`);
+        // only `worker.rpc` is set here (update_keys owns the worker network key/address).
+        node_info.p2p_info.worker.rpc = worker_rpc;
         Config::write_to_path(tn_datadir.node_info_path(), &node_info, ConfigFmt::YAML)?;
 
         Ok(())
@@ -242,8 +261,12 @@ impl KeygenArgs {
     ) -> eyre::Result<()> {
         info!(target: "tn::generate_keys", "generating keys for full validator node");
         self.validate()?;
+        // validate the optional worker RPC endpoint up front (same check as `set-rpc` / node
+        // startup) so a bad scheme fails before any keys are written; None when `--rpc-http`
+        // is omitted.
+        let worker_rpc = build_worker_rpc(self.rpc_http.clone(), self.rpc_ws.clone())?;
         let key_config = KeyConfig::generate_and_save(tn_datadir, passphrase)?;
-        self.finish_execute(tn_datadir, &key_config)
+        self.finish_execute(tn_datadir, &key_config, worker_rpc)
     }
 
     /// Test-only twin of [`Self::execute`] that wraps the generated BLS key with an
@@ -257,7 +280,10 @@ impl KeygenArgs {
     ) -> eyre::Result<()> {
         info!(target: "tn::generate_keys", "generating keys for node with INSECURE test KDF");
         self.validate()?;
+        // validate the optional worker RPC endpoint up front, before any keys are written -
+        // mirrors `execute`'s fail-fast ordering.
+        let worker_rpc = build_worker_rpc(self.rpc_http.clone(), self.rpc_ws.clone())?;
         let key_config = KeyConfig::generate_and_save_insecure(tn_datadir, passphrase, rounds)?;
-        self.finish_execute(tn_datadir, &key_config)
+        self.finish_execute(tn_datadir, &key_config, worker_rpc)
     }
 }
