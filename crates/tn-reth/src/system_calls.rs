@@ -198,7 +198,7 @@ sol!(
         /// Returns the validator's (outstandingBalance, initialStake, rewards).
         function getBalanceBreakdown(address validatorAddress) external view returns (uint256, uint256, uint256);
         /// Returns the EIP-712 digest a validator signs to accept a delegation.
-        function delegationDigest(bytes memory blsPubkey, address validatorAddress, address delegator) external view returns (bytes32);
+        function delegationDigest(bytes memory blsPubkey, address validatorAddress, address delegator, uint256 deadline) external view returns (bytes32);
         /// Issuance not yet distributed to validators (public variable getter).
         function undistributedIssuance() external view returns (uint256);
         /// Sets the GSMA region identifier for a validator (0=unspecified, 1-255=assigned regions).
@@ -255,4 +255,20 @@ pub struct EpochState {
     /// This time plus the `EpochInfo::epochDuration` creates the timestamp for the next epoch
     /// boundary.
     pub epoch_start: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::{primitives::keccak256, sol_types::SolCall};
+
+    /// The hand-written `delegationDigest` binding must track the on-chain 4-argument selector. If the
+    /// contract selector changes and this binding does not, `tn_delegationDigest` reverts at runtime
+    /// instead of failing to compile, so pin the selector here.
+    #[test]
+    fn delegation_digest_binding_selector_is_current() {
+        let expected: [u8; 4] =
+            keccak256("delegationDigest(bytes,address,address,uint256)")[..4].try_into().unwrap();
+        assert_eq!(ConsensusRegistry::delegationDigestCall::SELECTOR, expected);
+    }
 }

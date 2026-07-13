@@ -134,6 +134,7 @@ pub trait TelcoinNetworkRpcExtApi {
         bls_pubkey: Bytes,
         validator_address: Address,
         delegator: Address,
+        deadline: U256,
     ) -> TelcoinNetworkRpcResult<B256>;
     /// Return the BLS12-381 proof of possession message: `blsPubkey || validatorAddress`.
     ///
@@ -322,11 +323,13 @@ where
         bls_pubkey: Bytes,
         validator_address: Address,
         delegator: Address,
+        deadline: U256,
     ) -> TelcoinNetworkRpcResult<B256> {
         let calldata = ConsensusRegistry::delegationDigestCall {
             blsPubkey: bls_pubkey,
             validatorAddress: validator_address,
             delegator,
+            deadline,
         }
         .abi_encode()
         .into();
