@@ -12135,6 +12135,8 @@ dependencies = [
 name = "tn-snapshot"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "eyre",
  "futures",
  "metrics",

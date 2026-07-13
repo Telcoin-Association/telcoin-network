@@ -60,6 +60,17 @@ const DECOMPRESS_BUF_SIZE: usize = 256 * 1024;
 /// zstd compression level; a fast default suited to write-once snapshot artifacts.
 const ZSTD_LEVEL: i32 = 3;
 
+/// Maximum size, in bytes, of a snapshot JSON document that [`SnapshotStore::get_json_bytes`] will
+/// buffer into memory.
+///
+/// The two documents this bounds are tiny: a `latest.json` pointer is on the order of 200 bytes,
+/// and even a manifest enumerating thousands of artifacts stays well under 1 MiB, so 8 MiB is
+/// generous headroom for any honest document. The cap matters because these documents are the
+/// *first* thing a booting node fetches from a snapshot bucket, before any trust check has run:
+/// without it a hostile or corrupt backend could advertise — and stream — a multi-gigabyte
+/// `latest.json` and exhaust memory during pre-validation.
+const MAX_JSON_DOC_SIZE: u64 = 8 * 1024 * 1024;
+
 /// Handle to the remote (or local) object store holding a node's snapshots.
 ///
 /// A `SnapshotStore` pairs an [`ObjectStore`] backend with a key `prefix` parsed from the snapshot
@@ -322,10 +333,39 @@ impl SnapshotStore {
     /// Bytes (not a parsed value) are returned so a caller can sha256-check the binding between a
     /// pointer document and the manifest it references. Typed parsing and validation live in the
     /// `manifest` module.
+    ///
+    /// The download is bounded by [`MAX_JSON_DOC_SIZE`]. An object whose advertised size exceeds
+    /// the cap is rejected before a single byte is read; because that advertised size is
+    /// remote-controlled, the running total is also re-checked per streamed chunk so a backend that
+    /// under-reports its size cannot stream past the cap. Either overrun returns
+    /// [`SnapshotError::Integrity`].
     pub async fn get_json_bytes(&self, key: &str) -> SnapshotResult<Vec<u8>> {
         let location = self.location(key)?;
-        let bytes = self.store.get(&location).await?.bytes().await?;
-        Ok(bytes.to_vec())
+        let result = self.store.get(&location).await?;
+
+        // reject up front on the advertised size, before reading any bytes
+        if result.meta.size > MAX_JSON_DOC_SIZE {
+            return Err(SnapshotError::Integrity(format!(
+                "json document {key} advertises {} bytes, exceeding the {MAX_JSON_DOC_SIZE}-byte cap",
+                result.meta.size
+            )));
+        }
+
+        // the advertised size is remote-controlled and cannot be trusted alone: enforce the cap
+        // against the bytes actually delivered, checking before each chunk is buffered so an
+        // overrun never balloons memory.
+        let mut buf = Vec::new();
+        let mut stream = result.into_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if buf.len() as u64 + chunk.len() as u64 > MAX_JSON_DOC_SIZE {
+                return Err(SnapshotError::Integrity(format!(
+                    "json document {key} exceeded the {MAX_JSON_DOC_SIZE}-byte cap mid-stream"
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
     }
 
     /// Upload a small JSON document verbatim.
@@ -531,13 +571,153 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::memory::InMemory;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use object_store::{
+        memory::InMemory, Attributes, CopyOptions, Extensions, GetOptions, GetResult,
+        GetResultPayload, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions,
+        PutPayload, PutResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     /// Build a `file://` store rooted at `dir`.
     fn file_store(dir: &LocalPath) -> SnapshotStore {
         let url = Url::from_directory_path(dir).unwrap();
         SnapshotStore::open(url.as_str()).unwrap()
+    }
+
+    /// An [`ObjectStore`] double whose `get_opts` advertises one size but streams another.
+    ///
+    /// Only `get_opts` is functional; every other method is unreachable in these tests. A hostile
+    /// backend is the only way to exercise the download caps in [`SnapshotStore::get_json_bytes`]
+    /// and [`SnapshotStore::get_verified`], because honest backends (`InMemory`, `LocalFileSystem`)
+    /// always report an accurate size and stream exactly that many bytes.
+    #[derive(Debug)]
+    struct LyingStore {
+        /// metadata to advertise; its `size` is set independent of the bytes actually streamed.
+        meta: ObjectMeta,
+        /// payload emitted for each streamed chunk.
+        chunk: Bytes,
+        /// number of chunks the payload stream yields.
+        n_chunks: usize,
+        /// counts chunks the consumer actually pulled, so a test can prove a mid-stream abort.
+        chunks_pulled: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Display for LyingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LyingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for LyingStore {
+        async fn get_opts(
+            &self,
+            _location: &Path,
+            _options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let counter = self.chunks_pulled.clone();
+            let chunk = self.chunk.clone();
+            let n_chunks = self.n_chunks;
+            let stream = futures::stream::unfold(0usize, move |i| {
+                let counter = counter.clone();
+                let chunk = chunk.clone();
+                async move {
+                    if i >= n_chunks {
+                        None
+                    } else {
+                        // record the pull so a test can assert the guard aborts before the whole
+                        // stream is drained.
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Some((Ok::<_, object_store::Error>(chunk), i + 1))
+                    }
+                }
+            })
+            .boxed();
+
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(stream),
+                meta: self.meta.clone(),
+                range: 0..self.meta.size,
+                attributes: Attributes::default(),
+                extensions: Extensions::default(),
+            })
+        }
+
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _payload: PutPayload,
+            _opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            unimplemented!("LyingStore implements only get_opts")
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            unimplemented!("LyingStore implements only get_opts")
+        }
+
+        fn delete_stream(
+            &self,
+            _locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            unimplemented!("LyingStore implements only get_opts")
+        }
+
+        fn list(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            unimplemented!("LyingStore implements only get_opts")
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            _prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            unimplemented!("LyingStore implements only get_opts")
+        }
+
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: CopyOptions,
+        ) -> object_store::Result<()> {
+            unimplemented!("LyingStore implements only get_opts")
+        }
+    }
+
+    /// Wrap a [`LyingStore`] in a [`SnapshotStore`], returning the shared counter of pulled chunks.
+    ///
+    /// The advertised size is taken from a real `ObjectMeta` (only its `size` is overridden) so the
+    /// double does not need a `chrono` dependency merely to fabricate a last-modified timestamp.
+    async fn lying_store(
+        advertised_size: u64,
+        n_chunks: usize,
+        chunk_len: usize,
+    ) -> (SnapshotStore, Arc<AtomicUsize>) {
+        let seed = InMemory::new();
+        let probe = Path::from("probe");
+        seed.put(&probe, vec![0u8].into()).await.unwrap();
+        let mut meta = seed.head(&probe).await.unwrap();
+        meta.size = advertised_size;
+
+        let chunks_pulled = Arc::new(AtomicUsize::new(0));
+        let store = LyingStore {
+            meta,
+            chunk: Bytes::from(vec![0u8; chunk_len]),
+            n_chunks,
+            chunks_pulled: chunks_pulled.clone(),
+        };
+        (SnapshotStore::with_store(Arc::new(store)), chunks_pulled)
     }
 
     #[test]
@@ -647,6 +827,28 @@ mod tests {
         store.put_json_bytes(SnapshotStore::LATEST_KEY, doc.clone()).await.unwrap();
         let got = store.get_json_bytes(SnapshotStore::LATEST_KEY).await.unwrap();
         assert_eq!(got, doc);
+    }
+
+    #[tokio::test]
+    async fn get_json_bytes_rejects_oversized_document() {
+        let store = SnapshotStore::with_store(Arc::new(InMemory::new()));
+        // one byte over the cap, advertised honestly by InMemory, so the up-front size check fires
+        let doc = vec![b'x'; (MAX_JSON_DOC_SIZE + 1) as usize];
+        store.put_bytes(SnapshotStore::LATEST_KEY, doc).await.unwrap();
+
+        let err = store.get_json_bytes(SnapshotStore::LATEST_KEY).await.unwrap_err();
+        assert!(matches!(err, SnapshotError::Integrity(_)));
+    }
+
+    #[tokio::test]
+    async fn get_json_bytes_caps_a_lying_stream() {
+        // advertise a tiny size to slip past the up-front check, then stream well over the cap
+        let chunk_len = 1024 * 1024;
+        let n_chunks = (MAX_JSON_DOC_SIZE as usize / chunk_len) + 2;
+        let (store, _pulled) = lying_store(16, n_chunks, chunk_len).await;
+
+        let err = store.get_json_bytes(SnapshotStore::LATEST_KEY).await.unwrap_err();
+        assert!(matches!(err, SnapshotError::Integrity(_)));
     }
 
     #[tokio::test]

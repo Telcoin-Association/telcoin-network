@@ -53,6 +53,10 @@ proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 rand = { workspace = true }
 metrics-util = { workspace = true }
+# the ObjectStore test double (LyingStore) needs the async_trait macro to implement the
+# #[async_trait] ObjectStore trait and Bytes to build its payload stream.
+async-trait = { workspace = true }
+bytes = { workspace = true }
 
 [lints]
 workspace = true
