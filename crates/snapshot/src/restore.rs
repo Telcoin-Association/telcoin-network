@@ -646,12 +646,34 @@ async fn install_consensus<TND: TelcoinDirs>(
         db.persist().await.map_err(consensus_error)?;
     }
 
-    // seed the double-buffered latest-consensus slots to epoch N's final consensus number.
-    let final_number = records[n as usize].0.final_consensus.number;
+    // seed the double-buffered latest-consensus slots to epoch N's final consensus number. the
+    // record lookups here are defensive: verify_snapshot guarantees records covers epochs 0..=N,
+    // but install_consensus indexes the chain by the manifest's epoch, so an inconsistent
+    // pairing must fail closed with a verification error rather than panic on an out-of-bounds
+    // record.
+    let final_number = records
+        .get(n as usize)
+        .ok_or_else(|| {
+            SnapshotError::Verification(format!(
+                "manifest epoch {n} has no matching record in the verified chain"
+            ))
+        })?
+        .0
+        .final_consensus
+        .number;
     seed_latest_consensus(&epochs_path, n, final_number).await.map_err(consensus_error)?;
 
     // stage the empty epoch-N pack, whose committee must match records[N-1].next_committee.
-    let previous = records[(n - 1) as usize].0.clone();
+    let previous = n
+        .checked_sub(1)
+        .and_then(|k| records.get(k as usize))
+        .ok_or_else(|| {
+            SnapshotError::Verification(format!(
+                "manifest epoch {n} has no preceding record to reconstruct its committee"
+            ))
+        })?
+        .0
+        .clone();
     let committee_n = reconstruct_committee(n, &previous.next_committee);
     create_empty_epoch_pack(&epochs_path, previous, committee_n).await.map_err(consensus_error)?;
 
@@ -1197,6 +1219,29 @@ mod tests {
         for k in 0..=n {
             assert!(db.record_by_epoch(k).await.is_some(), "record for epoch {k} must be present");
         }
+    }
+
+    #[tokio::test]
+    async fn install_consensus_errors_on_inconsistent_epoch() {
+        // verify_snapshot always produces a records vec covering epochs 0..=manifest.epoch, but
+        // install_consensus indexes the chain by manifest.epoch. if that pairing were ever
+        // inconsistent the lookup must fail closed with a verification error, never panic on the
+        // out-of-bounds record index.
+        let parts = finish(&happy_spec());
+        let mut fx = assemble(&parts, TEST_CHAIN_ID, B256::from([0xaa; 32]));
+        // four records (epochs 0..=3) but a manifest claiming epoch 9: records.get(9) is None.
+        fx.manifest.epoch = 9;
+        let verified = VerifiedSnapshot {
+            manifest: fx.manifest.clone(),
+            records: parts.records.clone(),
+            headers: vec![],
+            state_chunks: vec![],
+        };
+
+        let dir = tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let err = install_consensus(&datadir, &verified).await.unwrap_err();
+        assert!(matches!(err, SnapshotError::Verification(_)), "got {err:?}");
     }
 
     // ----- verify_snapshot_source end-to-end against a file:// bucket -----

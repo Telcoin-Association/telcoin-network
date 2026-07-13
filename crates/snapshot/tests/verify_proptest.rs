@@ -455,43 +455,43 @@ proptest! {
         let verified = run(&fx).map_err(|e| TestCaseError::fail(format!("valid chain rejected: {e}")))?;
 
         // lengths and single state chunk.
-        prop_assert_eq!(verified.records.len(), n + 1);
-        prop_assert_eq!(verified.headers.len(), params.window_len);
-        prop_assert_eq!(verified.state_chunks.len(), 1);
+        prop_assert_eq!(verified.records().len(), n + 1);
+        prop_assert_eq!(verified.headers().len(), params.window_len);
+        prop_assert_eq!(verified.state_chunks().len(), 1);
 
         // every record sits at its own epoch.
-        for (k, (record, _)) in verified.records.iter().enumerate() {
+        for (k, (record, _)) in verified.records().iter().enumerate() {
             prop_assert_eq!(record.epoch, k as u32);
         }
 
         // the epoch-0 committee is exactly the local genesis trust root.
         let genesis_keys: Vec<BlsPublicKey> = fx.genesis.bls_keys().into_iter().collect();
-        prop_assert_eq!(&verified.records[0].0.committee, &genesis_keys);
+        prop_assert_eq!(&verified.records()[0].0.committee, &genesis_keys);
 
         // committees genuinely rotate, and each record chains to its predecessor by digest and
         // inherits the predecessor's next_committee.
-        prop_assert_ne!(&verified.records[0].0.committee, &verified.records[1].0.committee);
+        prop_assert_ne!(&verified.records()[0].0.committee, &verified.records()[1].0.committee);
         for k in 1..=n {
             prop_assert_eq!(
-                &verified.records[k].0.committee,
-                &verified.records[k - 1].0.next_committee
+                &verified.records()[k].0.committee,
+                &verified.records()[k - 1].0.next_committee
             );
-            prop_assert_eq!(verified.records[k].0.parent_hash, verified.records[k - 1].0.digest());
+            prop_assert_eq!(verified.records()[k].0.parent_hash, verified.records()[k - 1].0.digest());
         }
 
         // the returned window is sealed with recomputed hashes that chain consecutively.
-        for i in 1..verified.headers.len() {
+        for i in 1..verified.headers().len() {
             prop_assert_eq!(
-                verified.headers[i].header().number,
-                verified.headers[i - 1].header().number + 1
+                verified.headers()[i].header().number,
+                verified.headers()[i - 1].header().number + 1
             );
-            prop_assert_eq!(verified.headers[i].header().parent_hash, verified.headers[i - 1].hash());
+            prop_assert_eq!(verified.headers()[i].header().parent_hash, verified.headers()[i - 1].hash());
         }
 
         // and it terminates exactly at the manifest's execution checkpoint.
-        let last = verified.headers.last().expect("non-empty window");
-        prop_assert_eq!(last.header().number, verified.manifest.final_state.number);
-        prop_assert_eq!(last.hash(), verified.manifest.final_state.hash);
+        let last = verified.headers().last().expect("non-empty window");
+        prop_assert_eq!(last.header().number, verified.manifest().final_state.number);
+        prop_assert_eq!(last.hash(), verified.manifest().final_state.hash);
     }
 }
 
@@ -756,15 +756,15 @@ fn accepts_concrete_valid_chain() {
     let fx = assemble(&parts, CHAIN_ID, GENESIS_HASH, &params.state_content);
 
     let verified = run(&fx).expect("valid chain must verify");
-    assert_eq!(verified.records.len(), 2);
-    assert_eq!(verified.headers.len(), 4);
-    assert_eq!(verified.state_chunks.len(), 1);
+    assert_eq!(verified.records().len(), 2);
+    assert_eq!(verified.headers().len(), 4);
+    assert_eq!(verified.state_chunks().len(), 1);
     // committees rotate and the handoff holds.
-    assert_ne!(verified.records[0].0.committee, verified.records[1].0.committee);
-    assert_eq!(verified.records[1].0.committee, verified.records[0].0.next_committee);
+    assert_ne!(verified.records()[0].0.committee, verified.records()[1].0.committee);
+    assert_eq!(verified.records()[1].0.committee, verified.records()[0].0.next_committee);
     // the window terminates at the manifest checkpoint.
-    let last = verified.headers.last().unwrap();
-    assert_eq!(last.hash(), verified.manifest.final_state.hash);
+    let last = verified.headers().last().unwrap();
+    assert_eq!(last.hash(), verified.manifest().final_state.hash);
 }
 
 /// Apply a concrete corruption to the concrete chain and return the error.

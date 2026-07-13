@@ -45,22 +45,52 @@ const STREAM_BUF_SIZE: usize = 256 * 1024;
 
 /// A snapshot whose every artifact has passed [`verify_snapshot`].
 ///
-/// Holding a `VerifiedSnapshot` is proof that the trust checks succeeded, so restore can consume
-/// these fields without re-parsing untrusted bytes. The parsed `records` and `headers` are exactly
-/// the structures the checks ran against; `state_chunks` are the compressed on-disk chunk files
-/// whose sha256 digests matched the manifest, listed in manifest order (chunk `0` first) so they
-/// concatenate back into the original state dump.
+/// Holding a `VerifiedSnapshot` is proof that the trust checks ran and succeeded:
+/// [`verify_snapshot`] is the only way to obtain one, and its success is the precondition every
+/// downstream install step builds on. The fields are `pub(crate)` and reachable only through the
+/// read-only accessors `manifest()`, `records()`, `headers()`, and `state_chunks()`, so no code
+/// outside this crate can forge a "verified" snapshot by populating the struct directly and
+/// skipping the checks. Restore consumes the parsed contents without re-parsing untrusted bytes:
+/// `records` and `headers` are exactly the structures the checks ran against, and `state_chunks`
+/// are the compressed on-disk chunk files whose sha256 digests matched the manifest, listed in
+/// manifest order (chunk `0` first) so they concatenate back into the original state dump.
+///
+/// `Clone` is intentionally retained: the restore path clones a `VerifiedSnapshot` into a
+/// `spawn_blocking` closure to run the reth import off the async runtime.
 #[derive(Debug, Clone)]
 pub struct VerifiedSnapshot {
     /// The manifest that was verified, retained for its checkpoints and metadata.
-    pub manifest: Manifest,
+    pub(crate) manifest: Manifest,
     /// The full epoch-record chain, epochs `0..=N` in order, each paired with its certificate.
-    pub records: Vec<(EpochRecord, EpochCertificate)>,
+    pub(crate) records: Vec<(EpochRecord, EpochCertificate)>,
     /// The execution-header window, sealed with freshly recomputed hashes.
-    pub headers: Vec<SealedHeader>,
+    pub(crate) headers: Vec<SealedHeader>,
     /// Paths to the verified, still-compressed state-chunk files, in manifest (concatenation)
     /// order.
-    pub state_chunks: Vec<PathBuf>,
+    pub(crate) state_chunks: Vec<PathBuf>,
+}
+
+impl VerifiedSnapshot {
+    /// The verified manifest, retained for its checkpoints and metadata.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// The verified epoch-record chain, epochs `0..=N` in order, each paired with its certificate.
+    pub fn records(&self) -> &[(EpochRecord, EpochCertificate)] {
+        &self.records
+    }
+
+    /// The verified execution-header window, sealed with freshly recomputed hashes.
+    pub fn headers(&self) -> &[SealedHeader] {
+        &self.headers
+    }
+
+    /// Paths to the verified, still-compressed state-chunk files, in manifest (concatenation)
+    /// order.
+    pub fn state_chunks(&self) -> &[PathBuf] {
+        &self.state_chunks
+    }
 }
 
 /// Per-artifact caps on decompressed size, the anti-zip-bomb guard for [`verify_snapshot`].
@@ -396,7 +426,14 @@ fn verify_manifest_binding(
     n: u32,
     manifest: &Manifest,
 ) -> SnapshotResult<()> {
-    let last = &records[n as usize].0;
+    // defensive .get(): verify_record_chain guarantees a record for epoch n before this runs, but
+    // indexing untrusted-length data by n must fail closed rather than panic if that ever changes.
+    let last = &records
+        .get(n as usize)
+        .ok_or_else(|| {
+            SnapshotError::Verification(format!("record chain is missing the epoch-{n} record"))
+        })?
+        .0;
     if last.digest() != manifest.epoch_record_digest {
         return Err(SnapshotError::Verification(
             "manifest epoch_record_digest does not match the epoch-N record digest".to_string(),
@@ -468,8 +505,26 @@ fn verify_header_window(
     }
 
     // the window must reach back to (or before) epoch n's first block so restore has the full range
-    // it needs; epoch n begins one block after epoch n-1's final state.
-    let epoch_n_start = records[(n - 1) as usize].0.final_state.number + 1;
+    // it needs; epoch n begins one block after epoch n-1's final state. every step is checked: this
+    // fn can be called directly with n == 0 (no epoch n-1 exists), records carries an untrusted
+    // length, and an adversarial final_state.number of u64::MAX must be named a verification
+    // failure rather than silently saturating past the reach-back comparison below.
+    let prev_final = n
+        .checked_sub(1)
+        .and_then(|k| records.get(k as usize))
+        .ok_or_else(|| {
+            SnapshotError::Verification(format!(
+                "record chain lacks the epoch before {n} needed to anchor the header window start"
+            ))
+        })?
+        .0
+        .final_state
+        .number;
+    let epoch_n_start = prev_final.checked_add(1).ok_or_else(|| {
+        SnapshotError::Verification(format!(
+            "epoch {n}'s predecessor final_state.number is u64::MAX; the header window start overflows"
+        ))
+    })?;
     let first_number = sealed[0].header().number;
     if first_number > epoch_n_start {
         return Err(SnapshotError::Verification(format!(
@@ -1088,6 +1143,20 @@ pub(crate) mod tests {
         let mut fx = happy_fixture();
         fx.manifest.counts.headers = 3;
         expect_verification(run(&fx).unwrap_err(), "counts.headers");
+    }
+
+    #[test]
+    fn header_window_missing_prev_record_is_error_not_panic() {
+        // verify_header_window normally runs after verify_record_chain has guaranteed a record for
+        // every epoch 0..=n. called directly with n == 0 there is no epoch n-1 to anchor the window
+        // start, so the previous-record lookup must return a verification error rather than
+        // underflowing `n - 1` and panicking on the out-of-bounds record index.
+        let parts = finish(&happy_spec());
+        let fx = assemble(&parts, 2017, B256::from([0xaau8; 32]));
+        // a single record and n == 0: the anchor lookup for epoch n-1 has nothing to read.
+        let single = &parts.records[..1];
+        let err = verify_header_window(parts.headers.clone(), single, 0, &fx.manifest).unwrap_err();
+        expect_verification(err, "anchor the header window");
     }
 
     // ----- artifact / manifest rejections -----
