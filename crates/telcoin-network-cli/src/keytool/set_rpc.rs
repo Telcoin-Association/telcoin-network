@@ -96,7 +96,7 @@ impl SetRpcArgs {
         } else {
             // clap guarantees --http is present unless --clear.
             let rpc = build_worker_rpc(self.http.clone(), self.ws.clone())?
-                .expect("clap requires --http unless --clear");
+                .ok_or_else(|| eyre::eyre!("clap requires --http unless --clear"))?;
             if node_info.p2p_info.worker.rpc.is_some() {
                 warn!(target: "tn::keytool", "overwriting existing worker RPC endpoint");
             }
