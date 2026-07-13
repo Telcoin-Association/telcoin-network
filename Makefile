@@ -147,8 +147,9 @@ docker-login:
 	gcloud auth configure-docker us-docker.pkg.dev ;
 
 # build and push latest adiri image for amd64 and arm64
+# CARGO_FEATURES=adiri compiles in the testnet fork logic (ConsensusRegistry fork, ADIRI_DUP_BATCH_EPOCH).
 docker-adiri:
-	docker buildx build -f ./etc/Dockerfile --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
 
 # push local adiri:latest to the gcloud artifact registry
 docker-push:
