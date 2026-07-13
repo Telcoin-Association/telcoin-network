@@ -22,7 +22,9 @@ use tn_config::{Config, ConfigFmt, ConfigTrait as _, TelcoinDirs};
 use tn_reth::{RethChainSpec, RethCommand, RethConfig, RethEnv};
 use tn_snapshot::{
     export::{export_epoch, ExportArgs},
-    restore::{restore_from_snapshot, verify_snapshot_source, RestoreReceipt, VerifiedSummary},
+    restore::{
+        restore_from_snapshot, verify_snapshot_source, RestoreReceipt, VerifiedSummary, VerifyMode,
+    },
     service::publish_exported,
     store::SnapshotStore,
 };
@@ -131,15 +133,26 @@ pub struct VerifyArgs {
     /// As with `restore`, pinning bypasses the pointer; when omitted, the chosen epoch is logged.
     #[arg(long, value_name = "EPOCH")]
     pub epoch: Option<u32>,
+
+    /// Skip the from-scratch state-root recompute, checking only each state chunk's sha256.
+    ///
+    /// By default `verify` also rebuilds the plain-state dump into a throwaway datadir and
+    /// recomputes the state root exactly as a restore would, which catches a chunk that hashes
+    /// correctly yet decodes to the wrong state. That rebuild costs a restore's worth of disk and
+    /// time; this flag skips it for a faster, disk-light structural-only check.
+    #[arg(long)]
+    pub skip_state_root: bool,
 }
 
 impl VerifyArgs {
     /// Download and fully verify the snapshot, then print the verified summary. Nothing is written
     /// to the datadir.
     async fn execute(self, datadir: PathBuf) -> eyre::Result<()> {
-        let VerifyArgs { source, epoch } = self;
-        // no RethConfig needed: verify downloads and checks, but never installs.
-        let summary = verify_snapshot_source(&datadir, &source, epoch).await?;
+        let VerifyArgs { source, epoch, skip_state_root } = self;
+        // no RethConfig needed: verify downloads and checks, but never installs. deep verify builds
+        // its own throwaway RethConfig from the local genesis.
+        let mode = if skip_state_root { VerifyMode::SkipStateRoot } else { VerifyMode::Deep };
+        let summary = verify_snapshot_source(&datadir, &source, epoch, mode).await?;
         print_verified_summary(&summary);
         Ok(())
     }
@@ -365,6 +378,14 @@ fn print_verified_summary(summary: &VerifiedSummary) {
     println!("  headers:          {}", summary.counts.headers);
     println!("  records:          {}", summary.counts.records);
     println!("  fee derivable:    {}", summary.fee_derivable);
+    match summary.state_root {
+        Some(root) => println!("  state root:       {root} (recomputed from state chunks)"),
+        None => {
+            println!(
+                "  state root:       skipped (--skip-state-root); chunks checked by sha256 only"
+            )
+        }
+    }
     println!("  chain id:         {}", summary.chain_id);
     println!("  node version:     {}", summary.node_version);
     println!("  source:           {}", summary.source_url);
@@ -438,6 +459,26 @@ mod tests {
         };
         assert_eq!(args.source, "gs://bucket");
         assert_eq!(args.epoch, Some(3));
+        // deep state-root verification is the default; the opt-out flag is absent here.
+        assert!(!args.skip_state_root);
+    }
+
+    #[test]
+    fn parse_verify_with_skip_state_root() {
+        let cli = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "snapshot",
+            "verify",
+            "--source",
+            "file:///tmp/bucket",
+            "--skip-state-root",
+        ])
+        .expect("cli parsed");
+        let super::SnapshotSubcommand::Verify(args) = snapshot_command(cli).command else {
+            panic!("expected the verify subcommand");
+        };
+        assert_eq!(args.source, "file:///tmp/bucket");
+        assert!(args.skip_state_root, "--skip-state-root must set the opt-out flag");
     }
 
     #[test]

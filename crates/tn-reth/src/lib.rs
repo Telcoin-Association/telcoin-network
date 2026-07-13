@@ -263,7 +263,11 @@ pub struct TxFeedEntry {
 }
 
 /// Reth specific command line args.
-#[derive(Debug, Parser, Clone)]
+///
+/// `Default` is derived so callers that need a reth config without any operator-supplied flags
+/// (for example the snapshot deep-verify dry-run, which rebuilds state into a throwaway datadir)
+/// can construct one directly. Every flattened member derives `Default` from its reth clap args.
+#[derive(Debug, Parser, Clone, Default)]
 pub struct RethCommand {
     /// All rpc related arguments
     #[clap(flatten)]

@@ -4,8 +4,12 @@
 //! node's startup auto-restore both drive. It downloads a snapshot from remote object storage,
 //! re-establishes trust against the local genesis/committee, and lays the verified state down onto
 //! an empty datadir — never overwriting existing chain data. [`verify_snapshot_source`] runs the
-//! same download-and-verify path but stops short of installing anything, so an operator can vet a
-//! bucket before committing to a restore.
+//! same download-and-verify path but installs nothing, so an operator can vet a bucket before
+//! committing to a restore. By default it goes further than the structural [`verify_snapshot`]
+//! checks: [`deep_verify_state`] rebuilds the state into a throwaway datadir and recomputes the
+//! state root exactly as a restore would, so a state chunk that hashes correctly yet decodes to the
+//! wrong state is caught before an operator trusts the bucket ([`VerifyMode::SkipStateRoot`] opts
+//! out for a faster, disk-light structural check).
 //!
 //! # Trust
 //!
@@ -47,9 +51,10 @@ use std::{
     fs,
     io::{self, BufReader, Read},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, TelcoinDirs};
-use tn_reth::{RethChainSpec, RethConfig, RethEnv, SnapshotRestorer};
+use tn_reth::{RethChainSpec, RethCommand, RethConfig, RethEnv, SnapshotRestorer};
 use tn_storage::{
     consensus::{create_empty_epoch_pack, seed_latest_consensus},
     epoch_records::EpochRecordDb,
@@ -168,21 +173,45 @@ pub async fn restore_from_snapshot<TND: TelcoinDirs>(
 /// consult [`has_chain_data`] or the restore marker — a snapshot can be vetted regardless of what
 /// the datadir already holds.
 ///
+/// `mode` selects the depth of the state check. [`VerifyMode::Deep`] (the default) follows the
+/// structural verification with a from-scratch state-root rebuild into a throwaway datadir — a
+/// dry-run of the restore install that catches a state chunk which hashes correctly yet decodes to
+/// the wrong state, at the cost of a restore's worth of disk and time.
+/// [`VerifyMode::SkipStateRoot`] stops after structural verification and the per-chunk sha256
+/// check. Either way the staging directory — which in Deep mode holds the throwaway reth datadir —
+/// is wiped on every exit path.
+///
 /// # Errors
 ///
-/// Returns [`SnapshotError::MissingTrustRoot`] if the local genesis/committee are absent, and the
-/// same resolution, integrity, and verification errors as [`restore_from_snapshot`].
+/// Returns [`SnapshotError::MissingTrustRoot`] if the local genesis/committee are absent, the same
+/// resolution, integrity, and verification errors as [`restore_from_snapshot`], and (in
+/// [`VerifyMode::Deep`]) [`SnapshotError::Verification`] if the state does not rebuild to the
+/// certified boundary.
 pub async fn verify_snapshot_source<TND: TelcoinDirs>(
     datadir: &TND,
     source_url: &str,
     epoch: Option<u32>,
+    mode: VerifyMode,
 ) -> SnapshotResult<VerifiedSummary> {
     let trust = load_trust_root(datadir)?;
     let staging_root = datadir.snapshots_path().join("verify-staging");
-    let outcome = prepare_snapshot(source_url, &trust, epoch, &staging_root).await;
+
+    // resolve/download/verify and, in Deep mode, the from-scratch state-root rebuild all run inside
+    // one async block so the staging directory is wiped on EVERY exit path — including a
+    // deep-verify failure, whose throwaway reth datadir lives under staging.
+    let outcome = async {
+        let prepared = prepare_snapshot(source_url, &trust, epoch, &staging_root).await?;
+        let state_root = match mode {
+            VerifyMode::Deep => Some(deep_verify_state(&trust, &prepared).await?),
+            VerifyMode::SkipStateRoot => None,
+        };
+        Ok::<_, SnapshotError>((prepared, state_root))
+    }
+    .await;
     // verification leaves no trace, whether it passed or failed.
     let _ = fs::remove_dir_all(&staging_root);
-    let prepared = outcome?;
+    let (prepared, state_root) = outcome?;
+
     let manifest = prepared.verified.manifest;
     Ok(VerifiedSummary {
         epoch: manifest.epoch,
@@ -194,7 +223,28 @@ pub async fn verify_snapshot_source<TND: TelcoinDirs>(
         genesis_hash: trust.genesis_hash,
         node_version: manifest.node_version,
         source_url: source_url.to_string(),
+        state_root,
     })
+}
+
+/// Whether [`verify_snapshot_source`] recomputes the snapshot's state root from scratch.
+///
+/// Structural verification (the record chain, manifest binding, and header window) runs in both
+/// modes. This selects whether it is followed by a deep, from-scratch state-root rebuild — a
+/// dry-run of the restore install into a throwaway datadir — which is the only check that proves
+/// the opaque state chunks actually reconstruct the certified execution boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerifyMode {
+    /// Recompute the state root by rebuilding the state into a throwaway datadir. This is the
+    /// default: it costs a restore's worth of disk and time, but it is the only check that catches
+    /// a state chunk that hashes as advertised yet decodes to state that does not rebuild to
+    /// the certified boundary.
+    #[default]
+    Deep,
+    /// Skip the state-root rebuild, trusting each state chunk's sha256 and decompression check
+    /// alone. Faster and disk-light, but blind to a chunk whose bytes hash correctly yet decode to
+    /// the wrong state.
+    SkipStateRoot,
 }
 
 /// A record of a completed restore, serialized to `snapshots/last-restore.json`.
@@ -247,6 +297,13 @@ pub struct VerifiedSummary {
     pub node_version: String,
     /// The object-store URL the snapshot was verified from.
     pub source_url: String,
+    /// State root recomputed by the deep verify rebuild, or `None` when the state-root check was
+    /// skipped.
+    ///
+    /// `Some(root)` means the state chunks were rebuilt from scratch into a throwaway datadir and
+    /// the recomputed root matched the certified boundary header; `None` means only each chunk's
+    /// sha256 was checked (`--skip-state-root`).
+    pub state_root: Option<B256>,
 }
 
 /// Filename of the restore receipt written under the snapshots directory.
@@ -286,6 +343,12 @@ struct TrustRoot {
     genesis_hash: B256,
     /// EVM chain id from the local genesis.
     chain_id: u64,
+    /// The reth chain spec built from the local genesis.
+    ///
+    /// Retained so deep verification can rebuild the snapshot's state against the exact genesis
+    /// this node trusts, and so [`genesis_hash`](Self::genesis_hash) is derived from the same
+    /// spec rather than re-deriving it.
+    chain: Arc<RethChainSpec>,
 }
 
 /// A downloaded, verified snapshot staged on disk, ready to install or summarize.
@@ -308,12 +371,13 @@ fn load_trust_root<TND: TelcoinDirs>(datadir: &TND) -> SnapshotResult<TrustRoot>
         .map_err(|_| SnapshotError::MissingTrustRoot)?;
 
     // read chain_id before genesis is consumed into the chain spec, then derive the same genesis
-    // hash reth's init_genesis would compute for this config.
+    // hash reth's init_genesis would compute for this config. the spec is retained on the trust
+    // root so deep verification rebuilds state against the exact genesis this node trusts.
     let chain_id = genesis.config.chain_id;
-    let chain_spec: RethChainSpec = genesis.into();
-    let genesis_hash = chain_spec.sealed_genesis_header().hash();
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let genesis_hash = chain.sealed_genesis_header().hash();
 
-    Ok(TrustRoot { committee, genesis_hash, chain_id })
+    Ok(TrustRoot { committee, genesis_hash, chain_id, chain })
 }
 
 /// Load the trust root and enforce the install preconditions, in the order an auto-restore caller
@@ -570,7 +634,9 @@ async fn install<TND: TelcoinDirs>(
         let staging_dir = staging_dir.to_path_buf();
         let reth_db_path = datadir.reth_db_path();
         tokio::task::spawn_blocking(move || {
-            install_reth(&reth_db_path, &reth_config, &verified, &staging_dir)
+            // a real restore enforces the fee precondition: the installed node must be able to
+            // derive its first epoch-entry base fees.
+            rebuild_reth_state(&reth_db_path, &reth_config, &verified, &staging_dir, true)
         })
         .await
         .map_err(|e| SnapshotError::Other(eyre::eyre!("snapshot install task failed: {e}")))??
@@ -579,17 +645,27 @@ async fn install<TND: TelcoinDirs>(
     Ok(state_root)
 }
 
-/// Rebuild the reth database from the verified state dump and header window.
+/// Rebuild a reth database from the verified state dump and header window into `reth_db_path`.
+///
+/// Shared by the restore install ([`install`], via `spawn_blocking`) and the deep-verify dry-run
+/// ([`deep_verify_state`], via its own `spawn_blocking`); it is itself synchronous and blocking, so
+/// callers must keep it off the async runtime — it must never nest a `spawn_blocking` of its own.
 ///
 /// Owns the reth database for the duration: [`SnapshotRestorer::open`] takes the handle by value
 /// and [`finish`](SnapshotRestorer::finish) consumes the restorer, so on both success and failure
 /// the MDBX environment is released by the time this returns — a prerequisite for
 /// [`delete_chain_data`] to remove the files if a later step fails.
-fn install_reth(
+///
+/// `enforce_fee_precondition` gates the resumability check: a restore passes `true` so the
+/// installed node is guaranteed to derive its first epoch-entry base fees; deep verification passes
+/// `false` because it only recomputes the state root into a datadir it discards and never resumes,
+/// so the registry-state-dependent fee walk is out of scope.
+fn rebuild_reth_state(
     reth_db_path: &Path,
     reth_config: &RethConfig,
     verified: &VerifiedSnapshot,
     staging_dir: &Path,
+    enforce_fee_precondition: bool,
 ) -> SnapshotResult<B256> {
     let final_state = verified.manifest.final_state;
 
@@ -609,12 +685,55 @@ fn install_reth(
     let state_root = restorer.import_state(BufReader::new(reader), etl_dir)?;
 
     // the restored node enters epoch N+1; confirm the shipped window seeds its first base fees.
-    let entered = verified.manifest.epoch.saturating_add(1);
-    restorer.derive_fee_precondition(entered, &verified.headers)?;
+    // this is a resumability gate needing registry state, not an integrity check, so deep
+    // verification (which throws its datadir away) skips it.
+    if enforce_fee_precondition {
+        let entered = verified.manifest.epoch.saturating_add(1);
+        restorer.derive_fee_precondition(entered, &verified.headers)?;
+    }
 
     // consumes the restorer, releasing the db handle
     restorer.finish(final_state)?;
     Ok(state_root)
+}
+
+/// Deep-verify a prepared snapshot by rebuilding its state into a throwaway datadir.
+///
+/// This is a dry-run of the restore install: it stands up a fresh reth datadir under the verify
+/// staging directory, scaffolds the verified header window, re-imports the plain-state dump, and
+/// lets reth recompute the state root FROM SCRATCH, hard-failing on any mismatch with the certified
+/// `header(B).state_root`. It is the only check that proves the opaque state chunks actually
+/// reconstruct the boundary the record chain certifies — [`verify_snapshot`] pins and bounds those
+/// bytes by sha256 and decompression cap but never replays them.
+///
+/// The rebuild is blocking (MDBX writes + ETL), so it runs on the blocking pool. Because the
+/// restore path already wraps [`rebuild_reth_state`] in its own `spawn_blocking`, this calls the
+/// shared helper directly inside a single `spawn_blocking` rather than nesting another. Everything
+/// it writes lives under `prepared.staging_dir/deep-verify`, which the caller wipes on every path.
+///
+/// # Errors
+///
+/// Returns [`SnapshotError::Verification`] if the state does not rebuild to the certified boundary,
+/// and [`SnapshotError::Other`] if the blocking task fails to join.
+async fn deep_verify_state(trust: &TrustRoot, prepared: &Prepared) -> SnapshotResult<B256> {
+    let deep_datadir = prepared.staging_dir.join("deep-verify");
+    // a default reth command (no operator flags), the trusted local chain spec, and the throwaway
+    // datadir. verify never opens an RPC server, so the defaults are sufficient.
+    let reth_config =
+        RethConfig::new(RethCommand::default(), None, &deep_datadir, false, trust.chain.clone());
+    let verified = prepared.verified.clone();
+    let reth_db_path = deep_datadir.reth_db_path();
+
+    tokio::task::spawn_blocking(move || {
+        rebuild_reth_state(&reth_db_path, &reth_config, &verified, &deep_datadir, false)
+    })
+    .await
+    .map_err(|e| SnapshotError::Other(eyre::eyre!("deep state verification task failed: {e}")))?
+    .map_err(|e| {
+        SnapshotError::Verification(format!(
+            "deep state verification failed (state does not rebuild to the certified boundary): {e}"
+        ))
+    })
 }
 
 /// Seed the consensus datadir so a restored node opens the current epoch and backfills from `N`.
@@ -862,13 +981,15 @@ mod tests {
     use super::*;
     use crate::{
         manifest::FORMAT_VERSION,
-        verify::tests::{assemble, finish, happy_spec},
+        verify::tests::{
+            assemble, assemble_with_state, finish, happy_spec, happy_spec_with_state_root, Fixture,
+        },
     };
     use rand::{rngs::StdRng, SeedableRng};
-    use std::collections::BTreeSet;
-    use tempfile::tempdir;
+    use std::collections::{BTreeMap, BTreeSet};
+    use tempfile::{tempdir, TempDir};
     use tn_storage::consensus::ConsensusChain;
-    use tn_types::BlsKeypair;
+    use tn_types::{test_genesis, BlsKeypair, Bytes, GenesisAccount, U256};
     use url::Url;
 
     /// The chain id used by the test trust root and every fixture manifest.
@@ -912,11 +1033,17 @@ mod tests {
 
     #[tokio::test]
     async fn verify_source_missing_trust_root() {
-        // verify does not install, but still refuses without a local trust root
+        // verify does not install, but still refuses without a local trust root, before any mode
+        // distinction matters (the trust root loads first).
         let dir = tempdir().unwrap();
-        let err = verify_snapshot_source(&dir.path().to_path_buf(), "file:///dev/null", None)
-            .await
-            .unwrap_err();
+        let err = verify_snapshot_source(
+            &dir.path().to_path_buf(),
+            "file:///dev/null",
+            None,
+            VerifyMode::Deep,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, SnapshotError::MissingTrustRoot), "got {err:?}");
     }
 
@@ -1284,14 +1411,19 @@ mod tests {
         store.put_bytes(LATEST_KEY, pointer.to_json().unwrap()).await.unwrap();
 
         let url = Url::from_directory_path(bucket.path()).unwrap();
-        let summary = verify_snapshot_source(&datadir, url.as_str(), None)
-            .await
-            .expect("a valid published snapshot must verify against the local trust root");
+        // the fixture's state chunk is opaque bytes that cannot rebuild, so this exercises the
+        // shallow path with SkipStateRoot; the deep path is covered end-to-end by
+        // deep_verify_recomputes_state_root_end_to_end.
+        let summary =
+            verify_snapshot_source(&datadir, url.as_str(), None, VerifyMode::SkipStateRoot)
+                .await
+                .expect("a valid published snapshot must verify against the local trust root");
 
         assert_eq!(summary.epoch, n);
         assert_eq!(summary.chain_id, chain_id);
         assert_eq!(summary.genesis_hash, genesis_hash);
         assert_eq!(summary.final_state, fx.manifest.final_state);
+        assert_eq!(summary.state_root, None, "SkipStateRoot must not recompute a state root");
         // verification leaves no staging directory behind
         assert!(!datadir.snapshots_path().join("verify-staging").exists());
     }
@@ -1389,5 +1521,179 @@ mod tests {
         // a second call is idempotent: File::create truncates an existing marker without error
         write_marker_durably(&snapshots, &marker).expect("second marker write must succeed");
         assert!(marker.exists(), "marker must still exist after an idempotent re-write");
+    }
+
+    // ----- deep state-root verification (real reth rebuild) -----
+
+    /// A 32-byte storage word holding the integer `n`.
+    fn word(n: u64) -> B256 {
+        B256::from(U256::from(n).to_be_bytes::<32>())
+    }
+
+    /// Export the genesis EVM state (an EOA plus a storage-bearing contract) to a reth init-state
+    /// JSONL dump, returning the exec genesis, its chain binding, its genesis state root, and the
+    /// dump bytes. This is the real dump a deep verify rebuilds and re-roots.
+    async fn export_genesis_state() -> (Genesis, u64, B256, B256, Vec<u8>) {
+        let eoa = Address::from([0x0a; 20]);
+        let contract = Address::from([0x0c; 20]);
+        // PUSH1 0 PUSH1 0 STOP: some non-trivial bytecode to carry through the dump.
+        let code = Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0x00]);
+        let genesis = test_genesis().extend_accounts([
+            (
+                eoa,
+                GenesisAccount {
+                    nonce: Some(7),
+                    balance: U256::from(1_000u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                contract,
+                GenesisAccount {
+                    nonce: Some(1),
+                    balance: U256::from(42u64),
+                    code: Some(code),
+                    storage: Some(BTreeMap::from([(B256::from([0x01; 32]), word(111))])),
+                    private_key: None,
+                },
+            ),
+        ]);
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
+        let genesis_header = chain.sealed_genesis_header();
+        let chain_id = genesis.config.chain_id;
+        let genesis_hash = genesis_header.hash();
+        let state_root = genesis_header.state_root;
+
+        // stand up a temp reth chain so init_genesis populates the plain-state tables, then pin and
+        // export exactly the genesis state at its real root.
+        let export_dir = tempdir().unwrap();
+        let tm = TaskManager::new("deep-verify-export");
+        let reth_env = RethEnv::new_for_temp_chain(chain, export_dir.path(), &tm, None).unwrap();
+        let mut dump = Vec::new();
+        reth_env.pin_state_view().unwrap().export_state_jsonl(state_root, &mut dump).unwrap();
+
+        (genesis, chain_id, genesis_hash, state_root, dump)
+    }
+
+    /// Publish an assembled fixture (artifacts, manifest, then pointer) to a fresh `file://` bucket
+    /// and return the bucket tempdir (kept alive by the caller) and its URL.
+    async fn publish_fixture(fx: &Fixture) -> (TempDir, String) {
+        let bucket = tempdir().unwrap();
+        let store = file_store(bucket.path());
+        let n = fx.manifest.epoch;
+        for entry in &fx.manifest.artifacts {
+            store
+                .put_file(
+                    &SnapshotStore::artifact_key(n, &entry.name),
+                    &fx.staged.join(&entry.name),
+                )
+                .await
+                .unwrap();
+        }
+        let manifest_bytes = fx.manifest.to_json().unwrap();
+        store.put_bytes(&SnapshotStore::manifest_key(n), manifest_bytes.clone()).await.unwrap();
+        let pointer = Pointer {
+            format_version: FORMAT_VERSION,
+            chain_id: fx.chain_id,
+            epoch: n,
+            manifest_key: SnapshotStore::manifest_key(n),
+            manifest_sha256: sha256_hex(&manifest_bytes),
+            updated_at: 1,
+        };
+        store.put_bytes(LATEST_KEY, pointer.to_json().unwrap()).await.unwrap();
+        let url = Url::from_directory_path(bucket.path()).unwrap().to_string();
+        (bucket, url)
+    }
+
+    #[tokio::test]
+    async fn deep_verify_recomputes_state_root_end_to_end() {
+        let (genesis, chain_id, genesis_hash, state_root, dump) = export_genesis_state().await;
+
+        // the record chain's genesis committee goes in committee.yaml; the exec genesis whose state
+        // the dump carries goes in genesis.yaml. the header window pins the exported state root so
+        // the rebuilt datadir's header(B).state_root matches the dump reth re-roots against.
+        let parts = finish(&happy_spec_with_state_root(state_root));
+        let datadir_dir = tempdir().unwrap();
+        let datadir = datadir_dir.path().to_path_buf();
+        write_trust_root(&datadir, &parts.genesis, &genesis);
+
+        let fx = assemble_with_state(&parts, chain_id, genesis_hash, &dump);
+        let (_bucket, url) = publish_fixture(&fx).await;
+
+        let summary = verify_snapshot_source(&datadir, &url, None, VerifyMode::Deep)
+            .await
+            .expect("deep verify must accept a snapshot whose state rebuilds to the boundary");
+        assert_eq!(
+            summary.state_root,
+            Some(state_root),
+            "deep verify must recompute the certified boundary state root"
+        );
+        // the throwaway deep-verify datadir lives under staging, which is wiped on success.
+        assert!(
+            !datadir.snapshots_path().join("verify-staging").exists(),
+            "staging must be wiped after a deep verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_verify_rejects_tampered_state_chunk() {
+        let (genesis, chain_id, genesis_hash, state_root, dump) = export_genesis_state().await;
+
+        // append one extra, well-formed account line. the chunk is assembled AFTER the tamper, so
+        // its sha256 (and the shallow integrity check) still match; only rebuilding the state
+        // notices the recomputed root no longer equals the certified header(B).state_root.
+        #[derive(Serialize)]
+        struct AccountLine {
+            #[serde(flatten)]
+            account: GenesisAccount,
+            address: Address,
+        }
+        let mut tampered = dump.clone();
+        let extra = AccountLine {
+            account: GenesisAccount {
+                nonce: Some(1),
+                balance: U256::from(500u64),
+                code: None,
+                storage: None,
+                private_key: None,
+            },
+            address: Address::from([0xee; 20]),
+        };
+        tampered.extend_from_slice(serde_json::to_string(&extra).unwrap().as_bytes());
+        tampered.push(b'\n');
+
+        let parts = finish(&happy_spec_with_state_root(state_root));
+        let datadir_dir = tempdir().unwrap();
+        let datadir = datadir_dir.path().to_path_buf();
+        write_trust_root(&datadir, &parts.genesis, &genesis);
+
+        let fx = assemble_with_state(&parts, chain_id, genesis_hash, &tampered);
+        let (_bucket, url) = publish_fixture(&fx).await;
+
+        // the gap deep verify closes: the tampered chunk's sha256 matches the manifest, so shallow
+        // verification accepts it and reports no recomputed root.
+        let summary = verify_snapshot_source(&datadir, &url, None, VerifyMode::SkipStateRoot)
+            .await
+            .expect("shallow verify accepts a chunk whose sha256 matches");
+        assert_eq!(summary.state_root, None, "SkipStateRoot must not recompute a state root");
+
+        // deep verify rebuilds the state; the extra account diverges the recomputed root from the
+        // certified boundary, so the rebuild hard-fails as a verification error.
+        let err = verify_snapshot_source(&datadir, &url, None, VerifyMode::Deep).await.unwrap_err();
+        match err {
+            SnapshotError::Verification(msg) => {
+                assert!(msg.contains("deep state verification failed"), "{msg}")
+            }
+            other => panic!("expected Verification, got {other:?}"),
+        }
+        // staging (holding the throwaway deep-verify datadir) is wiped even on a deep-verify
+        // failure.
+        assert!(
+            !datadir.snapshots_path().join("verify-staging").exists(),
+            "staging must be wiped after a deep-verify failure"
+        );
     }
 }

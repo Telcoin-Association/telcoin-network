@@ -403,7 +403,16 @@ fn build_base_spec(params: &ChainParams) -> ChainSpec {
             if k == n {
                 final_state_n
             } else if k == n - 1 {
-                BlockNumHash::new(epoch_n_start - 1, B256::from([0x13u8; 32]))
+                // epoch n-1 closes one block before epoch n begins. when gap > 0 that block falls
+                // INSIDE the shipped window, where the in-window final_state<->header linkage
+                // requires the real recomputed hash at that height (`headers[gap-1]`); when gap ==
+                // 0 it sits one block below the window and any hash is inert.
+                let hash = if params.gap > 0 {
+                    SealedHeader::seal_slow(headers[params.gap - 1].clone()).hash()
+                } else {
+                    B256::from([0x13u8; 32])
+                };
+                BlockNumHash::new(epoch_n_start - 1, hash)
             } else {
                 // earlier epochs are unconstrained by verify; distinct small checkpoints suffice.
                 BlockNumHash::new(10 * (k as u64 + 1), B256::from([k as u8 + 1; 32]))
@@ -530,6 +539,10 @@ enum Corruption {
     /// Collapse a later epoch's `final_consensus` height onto its predecessor's, breaking the
     /// strict increase across the chain.
     NonMonotonicFinalConsensus { pick: u64 },
+    /// Move epoch N-1's `final_state` onto a block inside the shipped window but lie about its
+    /// hash, so only the in-window `final_state`<->header linkage catches it (chain, binding,
+    /// monotonicity, and window links all still hold).
+    InWindowFinalStateHash,
     /// Break one header's parent link.
     HeaderLink { pick: u64 },
     /// Mutate the last header via a non-linking field so the recomputed window no longer ends at
@@ -579,6 +592,7 @@ fn arb_corruption() -> impl Strategy<Value = Corruption> {
         any::<u64>().prop_map(|epoch_pick| Corruption::DuplicateCommitteeKey { epoch_pick }),
         Just(Corruption::SubQuorumLast),
         any::<u64>().prop_map(|pick| Corruption::NonMonotonicFinalConsensus { pick }),
+        Just(Corruption::InWindowFinalStateHash),
         any::<u64>().prop_map(|pick| Corruption::HeaderLink { pick }),
         Just(Corruption::FinalStateBinding),
         Just(Corruption::ManifestDigest),
@@ -631,6 +645,15 @@ fn apply_spec_corruption(c: &Corruption, spec: &mut ChainSpec, rng: &mut StdRng)
                                               // collapse this epoch's consensus checkpoint onto its predecessor's, so the broken
                                               // strict-increase is the only violated invariant.
             spec.final_consensus[k] = spec.final_consensus[k - 1];
+        }
+        Corruption::InWindowFinalStateHash => {
+            // put epoch N-1's final_state on the window's second block (WINDOW_START+1, always in
+            // window since window_len >= 3) with a bogus hash. the window carries a real recomputed
+            // header there, so the record chain, binding, monotonicity, and window links all still
+            // hold — only the in-window final_state<->header linkage fires. (N-1 == 0 when N == 1:
+            // epoch 0 has no predecessor to trail and the tip still sits above WINDOW_START+1.)
+            spec.final_states[n - 1] =
+                BlockNumHash::new(WINDOW_START + 1, B256::from([0xE7u8; 32]));
         }
         Corruption::HeaderLink { pick } => {
             let i = *pick as usize % spec.headers.len();

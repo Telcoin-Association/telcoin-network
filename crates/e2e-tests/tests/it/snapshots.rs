@@ -77,8 +77,9 @@ const UPLOAD_REJECT_TEST: &str = "snapshot_upload_reject";
 /// 2. asserts the bucket shape (the `latest.json` pointer parses, names an
 ///    `epoch-<N>/manifest.json` that exists, and that manifest lists the expected artifacts, all
 ///    present on disk),
-/// 3. runs the standalone `snapshot verify` subcommand against a fresh trust root as a cheap
-///    bucket-integrity check,
+/// 3. runs the standalone `snapshot verify` subcommand against a fresh trust root as a
+///    bucket-integrity check that, deep by default, also recomputes the boundary state root from
+///    scratch,
 /// 4. spawns a FRESH observer (new datadir, same genesis fixtures) with `--snapshot-source file://<bucket>`
 ///    so it auto-restores before opening its database,
 /// 5. asserts the auto-restore installed the epoch (the restore receipt on disk) and that the
@@ -212,8 +213,10 @@ async fn test_snapshot_upload_and_restore_across_epoch_boundary_inner() -> eyre:
     let restore_dir = temp_path.join("restore-node");
     config_fresh_observer_datadir(&temp_path, "restore-node")?;
 
-    // cheap bucket-integrity assertion: the standalone `snapshot verify` subcommand downloads and
-    // fully verifies the snapshot against the fresh trust root, installing nothing.
+    // bucket-integrity assertion: the standalone `snapshot verify` subcommand downloads and fully
+    // verifies the snapshot against the fresh trust root, installing nothing. deep by default, it
+    // also rebuilds the state and recomputes the boundary state root, so this drives that path
+    // end-to-end against a real published snapshot.
     assert_snapshot_verifies(bin, &temp_path, &restore_dir, &bucket_url)?;
 
     // start the restore node; it auto-restores the boundary state before opening its database.
@@ -575,8 +578,10 @@ fn assert_bucket_shape(bucket_path: &Path) -> eyre::Result<u64> {
 
 /// Run the standalone `snapshot verify` subcommand against `bucket_url`, using `datadir`'s genesis
 /// as the trust root. It downloads and fully verifies the snapshot but installs nothing, so it is a
-/// cheap, self-contained bucket-integrity assertion. `cwd` scopes any stray log output to the
-/// temp dir.
+/// self-contained bucket-integrity assertion. Verify runs deep by default (no `--skip-state-root`),
+/// so this also drives the from-scratch state-root recompute end-to-end and asserts the summary
+/// reports a recomputed — not skipped — state root. `cwd` scopes any stray log output to the temp
+/// dir.
 fn assert_snapshot_verifies(
     bin: &'static TestBinary,
     cwd: &Path,
@@ -594,12 +599,22 @@ fn assert_snapshot_verifies(
         .arg(bucket_url)
         .output()
         .expect("failed to run `snapshot verify`");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "`snapshot verify --source {bucket_url}` failed ({:?})\nstdout:\n{}\nstderr:\n{}",
+        "`snapshot verify --source {bucket_url}` failed ({:?})\nstdout:\n{stdout}\nstderr:\n{}",
         output.status,
-        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+    // deep verify is the default, so the summary recomputes and prints the boundary state root
+    // rather than reporting it skipped — this drives the real from-scratch rebuild end-to-end.
+    assert!(
+        stdout.contains("state root:"),
+        "`snapshot verify` must recompute and print the state root by default (deep verify)\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("skipped"),
+        "`snapshot verify` without --skip-state-root must not report a skipped state root\nstdout:\n{stdout}"
     );
     Ok(())
 }

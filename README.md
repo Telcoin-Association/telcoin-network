@@ -190,7 +190,7 @@ telcoin-network node --observer --snapshot-source <URL> --chain adiri --datadir 
 
 - Verification is **always full**; the trust root is the LOCAL `committee.yaml`, never the bucket. Without a local genesis/committee, restore refuses with a missing-trust-root error.
 - The restored epoch is **logged prominently**. A malicious bucket cannot forge a snapshot for the wrong committee, but it can withhold the newest one and serve an older, still-valid snapshot. Passing `--epoch N` pins the choice, bypasses the `latest.json` pointer, and defeats withholding.
-- `telcoin-network snapshot verify --source <URL> [--epoch N]` runs the same download-and-verify path but installs nothing, so a bucket can be vetted before committing to a restore.
+- `telcoin-network snapshot verify --source <URL> [--epoch N]` runs the same download-and-verify path but installs nothing, so a bucket can be vetted before committing to a restore. By default it also recomputes the state root the way a restore would — a dry-run rebuild of the plain-state dump into a throwaway datadir it discards afterward — so a chunk that hashes correctly but decodes to the wrong state is still caught. That rebuild costs roughly a restore's worth of disk and time; pass `--skip-state-root` to check only each chunk's sha256 and skip it.
 - `telcoin-network snapshot create --out <URL>` exports and uploads a snapshot from a **stopped** node whose tip sits exactly on an epoch boundary — an out-of-band alternative to the background uploader.
 
 ### Caveats

@@ -140,7 +140,16 @@ impl Default for DecompressLimits {
 /// - **binding**: the last record's digest, `final_state`, and `final_consensus` equal the
 ///   manifest's.
 /// - **header window**: non-empty, consecutively numbered, internally hash-linked, ending exactly
-///   at `manifest.final_state`, and starting no later than epoch `N`'s first block.
+///   at `manifest.final_state`, starting no later than epoch `N`'s first block, and agreeing with
+///   every record whose `final_state` falls inside the window (the header recomputed at that height
+///   must hash to the record's claimed `final_state`).
+///
+/// This is the shallow, in-memory trust gate: it is purely structural and cryptographic and never
+/// rebuilds EVM state. State chunks are integrity-checked (sha256) and bounded-decompressed, but
+/// not replayed, so a chunk that hashes correctly yet decodes to the wrong state passes here. The
+/// from-scratch state-root recompute that closes that gap is deep verification, driven by the
+/// restore path (`restore`'s `deep_verify_state`, and the actual install in
+/// [`restore_from_snapshot`](crate::restore::restore_from_snapshot)).
 ///
 /// # Errors
 ///
@@ -380,6 +389,19 @@ fn verify_record_chain(
                 prev.final_consensus.number
             )));
         }
+        // final_state is the epoch's closing execution block number, which likewise only ever moves
+        // forward: each epoch ends at a strictly higher block than the last. a non-increasing
+        // final_state would let a later record claim an execution boundary at or below its
+        // predecessor's, which the in-window header linkage below then anchors against the wrong
+        // header height.
+        if record.final_state.number <= prev.final_state.number {
+            return Err(SnapshotError::Verification(format!(
+                "record for epoch {k} final_state number {} does not increase over epoch {} ({})",
+                record.final_state.number,
+                k - 1,
+                prev.final_state.number
+            )));
+        }
     }
 
     // pass 3: verify every record's aggregate-BLS certificate. this is the expensive pass, a
@@ -531,6 +553,40 @@ fn verify_header_window(
             "header window starts at block {first_number}, after epoch {n} begins at block {epoch_n_start}"
         )));
     }
+
+    // every record whose final_state height falls inside the shipped window must agree with the
+    // header the window recomputes at that height. the window is re-sealed from bytes and
+    // internally hash-linked, so it is the trustless source of truth for the execution chain
+    // across its range; a record claiming a final_state hash that disagrees with the verified
+    // header at the same number is asserting an execution boundary the snapshot cannot actually
+    // restore to. records whose final_state lies below the window are earlier epochs the window
+    // does not carry, and are left to their own snapshots.
+    let last_number = last.header().number;
+    for (record, _cert) in records {
+        let fs = record.final_state;
+        if fs.number < first_number || fs.number > last_number {
+            continue;
+        }
+        // consecutive numbering (checked above) makes height-to-index exact; `.get()` keeps an
+        // adversarial number from indexing out of bounds even though the range check already covers
+        // it.
+        let at_height = sealed.get((fs.number - first_number) as usize).ok_or_else(|| {
+            SnapshotError::Verification(format!(
+                "record for epoch {} claims final_state at block {}, inside the header window, but no header sits at that height",
+                record.epoch, fs.number
+            ))
+        })?;
+        if at_height.hash() != fs.hash {
+            return Err(SnapshotError::Verification(format!(
+                "record for epoch {} claims final_state {} at block {}, but the verified header at that height hashes to {}",
+                record.epoch,
+                fs.hash,
+                fs.number,
+                at_height.hash()
+            )));
+        }
+    }
+
     Ok(sealed)
 }
 
@@ -749,12 +805,15 @@ pub(crate) mod tests {
         cert
     }
 
-    /// Build `count` internally hash-linked headers starting at block `start`.
+    /// Build `count` internally hash-linked headers starting at block `start`, each pinning
+    /// `state_root`.
     ///
     /// Alternating headers carry `Some` post-merge fields (base fee, withdrawals root) while the
     /// rest leave them `None`, so the JSON header codec is exercised on exactly the `Option` mix
-    /// that makes a positional BCS encoding of `ExecHeader` unsound.
-    fn build_headers(start: u64, count: usize) -> Vec<ExecHeader> {
+    /// that makes a positional BCS encoding of `ExecHeader` unsound. `state_root` is a parameter so
+    /// deep-verify fixtures can make the window terminate at a real exported execution state root;
+    /// structural fixtures pass `B256::ZERO`.
+    fn build_headers(start: u64, count: usize, state_root: B256) -> Vec<ExecHeader> {
         let mut headers = Vec::with_capacity(count);
         let mut parent = B256::from([0x77u8; 32]);
         for i in 0..count {
@@ -766,6 +825,7 @@ pub(crate) mod tests {
             let header = ExecHeader {
                 number: start + i as u64,
                 parent_hash: parent,
+                state_root,
                 base_fee_per_gas,
                 withdrawals_root,
                 ..Default::default()
@@ -777,7 +837,19 @@ pub(crate) mod tests {
     }
 
     /// A valid 4-epoch (N=3) rotating chain whose header window covers epoch 3's first block.
+    ///
+    /// The window carries a zero state root; use [`happy_spec_with_state_root`] when a fixture
+    /// needs the window to pin a real execution state root (deep verification).
     pub(crate) fn happy_spec() -> ChainSpec {
+        happy_spec_with_state_root(B256::ZERO)
+    }
+
+    /// Like [`happy_spec`], but every window header pins `state_root`.
+    ///
+    /// Deep-verify fixtures pass the exported genesis state root so a rebuilt datadir's
+    /// `header(B).state_root` matches the plain-state dump the snapshot ships. Because the header
+    /// hashes fold in `state_root`, the derived `final_state` checkpoints follow automatically.
+    pub(crate) fn happy_spec_with_state_root(state_root: B256) -> ChainSpec {
         let mut rng = StdRng::seed_from_u64(42);
         // rotating committees with a size change to exercise both.
         let sizes = [4usize, 4, 5, 4];
@@ -788,7 +860,7 @@ pub(crate) mod tests {
 
         let window_start = 1000u64;
         let count = 6usize;
-        let headers = build_headers(window_start, count);
+        let headers = build_headers(window_start, count, state_root);
         let last = SealedHeader::seal_slow(headers[count - 1].clone());
         let final_state_n = BlockNumHash::new(last.header().number, last.hash());
 
@@ -867,20 +939,33 @@ pub(crate) mod tests {
         serde_json::to_vec(headers).expect("encode headers")
     }
 
-    /// Stage all three artifacts and derive a manifest bound to the chain.
+    /// Opaque default state-chunk bytes for fixtures that never rebuild EVM state; verify checks
+    /// their integrity and decompresses them but never parses them.
+    const OPAQUE_STATE_CHUNK: &[u8] = b"root-line\naccount-a\naccount-b\n";
+
+    /// Stage all three artifacts and derive a manifest bound to the chain, using opaque state
+    /// bytes.
     pub(crate) fn assemble(parts: &ChainParts, chain_id: u64, genesis_hash: B256) -> Fixture {
+        assemble_with_state(parts, chain_id, genesis_hash, OPAQUE_STATE_CHUNK)
+    }
+
+    /// Like [`assemble`], but stages `state` as the single state chunk.
+    ///
+    /// Deep-verify fixtures pass a real reth init-state JSONL dump so the staged chunk actually
+    /// rebuilds to the certified boundary; [`assemble`] delegates here with [`OPAQUE_STATE_CHUNK`],
+    /// staying byte-identical for the structural tests that never rebuild.
+    pub(crate) fn assemble_with_state(
+        parts: &ChainParts,
+        chain_id: u64,
+        genesis_hash: B256,
+        state: &[u8],
+    ) -> Fixture {
         let dir = tempdir().unwrap();
         let staged = dir.path().to_path_buf();
         let n = parts.records.len() as u32 - 1;
         let last = &parts.records[n as usize].0;
 
-        // opaque state bytes: verify checks integrity and decompresses, but never parses them.
-        let state = write_artifact(
-            &staged,
-            "state-000.jsonl.zst",
-            ArtifactKind::StateChunk,
-            b"root-line\naccount-a\naccount-b\n",
-        );
+        let state = write_artifact(&staged, "state-000.jsonl.zst", ArtifactKind::StateChunk, state);
         let headers = write_artifact(
             &staged,
             "headers.rlp.zst",
@@ -1091,6 +1176,21 @@ pub(crate) mod tests {
         expect_verification(run(&fx).unwrap_err(), "does not increase");
     }
 
+    #[test]
+    fn rejects_non_monotonic_final_state() {
+        // an equal final_state height between epochs 1 and 2 is not a strict increase.
+        let mut spec = happy_spec();
+        spec.final_states[2] = spec.final_states[1];
+        let fx = assemble(&finish(&spec), 2017, B256::from([0xaau8; 32]));
+        expect_verification(run(&fx).unwrap_err(), "final_state number");
+
+        // a strictly decreasing final_state height is likewise rejected.
+        let mut spec = happy_spec();
+        spec.final_states[2] = BlockNumHash::new(5, B256::from([0x22u8; 32]));
+        let fx = assemble(&finish(&spec), 2017, B256::from([0xaau8; 32]));
+        expect_verification(run(&fx).unwrap_err(), "final_state number");
+    }
+
     // ----- manifest binding rejections -----
 
     #[test]
@@ -1143,6 +1243,31 @@ pub(crate) mod tests {
         let mut fx = happy_fixture();
         fx.manifest.counts.headers = 3;
         expect_verification(run(&fx).unwrap_err(), "counts.headers");
+    }
+
+    #[test]
+    fn rejects_in_window_final_state_hash_mismatch() {
+        let mut spec = happy_spec();
+        // epoch 2 now closes at block 1000 — inside the shipped window [1000..=1005] and still
+        // strictly monotonic (199 < 1000 < 1005) — but claims a hash the verified header at 1000
+        // does not have. the record chain, manifest binding, and window-internal links all still
+        // hold, so only the in-window final_state<->header linkage can catch it.
+        spec.final_states[2] = BlockNumHash::new(1000, B256::from([0xEEu8; 32]));
+        let fx = assemble(&finish(&spec), 2017, B256::from([0xaau8; 32]));
+        expect_verification(run(&fx).unwrap_err(), "verified header at that height hashes to");
+    }
+
+    #[test]
+    fn accepts_in_window_final_state_with_real_hash() {
+        let mut spec = happy_spec();
+        // epoch 2 legitimately closes at block 1000, inside the window, with the header's real
+        // recomputed hash: a truthful in-window final_state must pass the linkage (positive control
+        // for rejects_in_window_final_state_hash_mismatch).
+        let header_1000 = SealedHeader::seal_slow(spec.headers[0].clone());
+        assert_eq!(header_1000.header().number, 1000);
+        spec.final_states[2] = BlockNumHash::new(1000, header_1000.hash());
+        let fx = assemble(&finish(&spec), 2017, B256::from([0xaau8; 32]));
+        run(&fx).expect("a truthful in-window final_state must verify");
     }
 
     #[test]

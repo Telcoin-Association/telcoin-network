@@ -29,11 +29,16 @@
 //! 3. **Header window.** The shipped execution headers must be non-empty, consecutively numbered,
 //!    internally hash-linked, and end exactly at `final_state`, tying the certified boundary block
 //!    back through a verifiable header chain.
-//! 4. **From-scratch state-root recompute.** On import, `tn-reth` scaffolds the boundary header
-//!    from the verified window, re-imports the plain-state dump, and recomputes the state root FROM
-//!    SCRATCH, hard-failing on any mismatch with the header's `state_root` (then re-checking that
+//! 4. **From-scratch state-root recompute.** The plain-state dump is rebuilt from scratch and its
+//!    recomputed root hard-checked against the certified boundary header's `state_root`. `restore`
+//!    does this as it imports the state into the datadir; `verify` does it too, by default, as a
+//!    dry-run rebuild into a throwaway datadir it discards afterward (opt out with
+//!    `--skip-state-root`, which then trusts each chunk's sha256 alone). Either way `tn-reth`
+//!    scaffolds the boundary header from the verified window, re-imports the dump, recomputes the
+//!    state root FROM SCRATCH, and hard-fails on any mismatch (restore additionally re-checks that
 //!    the reconstructed tip hash equals `final_state`). Because the BLS-certified block hash
-//!    already commits to that state root, tampered state cannot survive the recompute.
+//!    already commits to that state root, tampered state cannot survive the recompute — the sha256
+//!    and decompression checks alone only pin the bytes, not the state they decode to.
 //!
 //! Every check compares typed values, never serialized strings: a digest and a hash have more than
 //! one textual encoding, so string comparison would be both wrong and fragile.
