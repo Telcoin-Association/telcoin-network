@@ -151,8 +151,12 @@ impl<DB: Database> Subscriber<DB> {
         // This save will essentially mark this consensus output as written in stone (added to the
         // consensus chain). This does NOT imply execution although it will be sent off for
         // execution.
-        save_consensus(consensus_output.clone(), &mut consensus_chain, self.consensus_bus.metrics())
-            .await?;
+        save_consensus(
+            consensus_output.clone(),
+            &mut consensus_chain,
+            self.consensus_bus.metrics(),
+        )
+        .await?;
 
         // Once we've drained through the staged partial pack's final output, it has all been
         // written to the main pack in order — drop the staging dir.

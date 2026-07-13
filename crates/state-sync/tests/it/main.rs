@@ -40,9 +40,13 @@ async fn test_sync_save_consensus() {
         ConsensusOutput::new(sub_dag, B256::ZERO.into(), 1, false, VecDeque::new(), vec![]);
 
     // Save consensus using state_sync
-    state_sync::save_consensus(output, &mut consensus_chain, &tn_primary::PrimaryMetrics::default())
-        .await
-        .unwrap();
+    state_sync::save_consensus(
+        output,
+        &mut consensus_chain,
+        &tn_primary::PrimaryMetrics::default(),
+    )
+    .await
+    .unwrap();
 
     // Verify the consensus was saved
     let saved = consensus_chain.consensus_header_by_number(1).await.unwrap();
@@ -83,7 +87,11 @@ async fn test_sync_parent_hash_chain() {
         let output =
             ConsensusOutput::new(sub_dag.clone(), parent_hash, i, false, VecDeque::new(), vec![]);
 
-        state_sync::save_consensus(output, &mut consensus_chain, &tn_primary::PrimaryMetrics::default())
+        state_sync::save_consensus(
+            output,
+            &mut consensus_chain,
+            &tn_primary::PrimaryMetrics::default(),
+        )
         .await
         .unwrap();
 
@@ -132,9 +140,13 @@ async fn test_sync_lookup_by_hash() {
     let output =
         ConsensusOutput::new(sub_dag.clone(), B256::ZERO.into(), 1, false, VecDeque::new(), vec![]);
 
-    state_sync::save_consensus(output, &mut consensus_chain, &tn_primary::PrimaryMetrics::default())
-        .await
-        .unwrap();
+    state_sync::save_consensus(
+        output,
+        &mut consensus_chain,
+        &tn_primary::PrimaryMetrics::default(),
+    )
+    .await
+    .unwrap();
 
     // Compute the expected digest
     let expected_digest = ConsensusHeader::digest_from_parts(B256::ZERO.into(), &sub_dag, 1);
