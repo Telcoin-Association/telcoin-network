@@ -12,7 +12,9 @@ use std::{
 use crate::{
     proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus, ConsensusBusApp,
 };
-use futures::{AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _};
+use futures::{
+    AsyncReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _, TryFutureExt as _,
+};
 use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
@@ -234,6 +236,27 @@ enum EpochPackAttempt {
     Unsupported,
     /// The peer answered but the exchange failed; try the next peer.
     Failed(NetworkError),
+}
+
+/// One epoch-pack fetch over the typed sync protocol, as threaded unchanged
+/// through every per-peer probe (`request_epoch_pack_sync` down to the stream
+/// exchange). Bundles what the exchange needs so each probe hop takes the peer
+/// plus this instead of six loose parameters.
+#[derive(Clone, Copy)]
+struct EpochPackSyncRequest<'a> {
+    /// The epoch whose pack is requested.
+    epoch: Epoch,
+    /// `None` requests the full pack; `Some(n)` requests a verifiable prefix
+    /// stopping after consensus number `n`.
+    last_consensus_number: Option<u64>,
+    /// Record of the epoch being fetched; the streamed pack verifies against it.
+    epoch_record: &'a EpochRecord,
+    /// The preceding epoch's record, anchoring verification.
+    previous_epoch: &'a EpochRecord,
+    /// Destination chain the served pack imports into.
+    consensus_chain: &'a ConsensusChain,
+    /// Timeout applied when importing the streamed records.
+    record_timeout: Duration,
 }
 
 /// RAII guard for an admitted inbound sync epoch-pack stream.
@@ -702,7 +725,9 @@ impl PrimaryNetworkHandle {
     /// Full-pack fetch is typed-only (no legacy fallback): this returns `Err`, and
     /// the caller retries, when no connected peer successfully serves a pack over
     /// the sync protocol (no peers, all unsupported, or all failed to import). See
-    /// [`Self::request_epoch_pack_sync`] for the per-peer probe behavior.
+    /// [`Self::request_epoch_pack_sync`] for the per-peer probe behavior. The partial
+    /// prefix ([`Self::request_partial_epoch_pack`]) reuses the same probe over the
+    /// sync protocol but keeps a legacy fallback.
     pub async fn request_epoch_pack(
         &self,
         epoch_record: &EpochRecord,
@@ -748,8 +773,9 @@ impl PrimaryNetworkHandle {
     /// Shared implementation for full ([`Self::request_epoch_pack`]) and partial
     /// ([`Self::request_partial_epoch_pack`]) epoch pack streaming. A full pack
     /// (`last_consensus_number` is `None`) is fetched over the typed sync protocol
-    /// only; a partial prefix (`Some`) still negotiates over the legacy stream path,
-    /// which has no typed sync request variant yet.
+    /// only; a partial prefix (`Some`) is fetched over the sync protocol first and
+    /// falls back to the legacy stream path for peers that do not yet serve the
+    /// `EpochPackPartial` sync variant.
     async fn request_epoch_pack_inner(
         &self,
         epoch_record: &EpochRecord,
@@ -764,21 +790,40 @@ impl PrimaryNetworkHandle {
         // fallback was removed so that a full-pack fetch hard-fails (and the caller
         // retries) when no connected peer serves the `/tn-primary-sync` protocol,
         // rather than silently syncing over the legacy stream path. This forces
-        // peers to upgrade. The partial-prefix transfer has no typed sync request
-        // variant yet, so it still negotiates over the legacy path below.
+        // peers to upgrade.
         let Some(last_consensus_number) = last_consensus_number else {
             return self
-                .request_epoch_pack_sync(
+                .request_epoch_pack_sync(EpochPackSyncRequest {
                     epoch,
+                    last_consensus_number: None,
                     epoch_record,
                     previous_epoch,
                     consensus_chain,
                     record_timeout,
-                )
+                })
                 .await;
         };
 
-        // Partial prefix: negotiate the stream over the legacy path. Try up to three
+        // Partial prefix (#739, step 9): try the typed sync protocol first (the same
+        // per-peer probe as the full pack), then fall back to the legacy stream path
+        // below for peers that do not yet serve the `EpochPackPartial` sync variant.
+        // The sync probe is penalty-exempt; `is_ok` avoids matching the `Result`.
+        if self
+            .request_epoch_pack_sync(EpochPackSyncRequest {
+                epoch,
+                last_consensus_number: Some(last_consensus_number),
+                epoch_record,
+                previous_epoch,
+                consensus_chain,
+                record_timeout,
+            })
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        // Legacy fallback: negotiate the stream over the legacy path. Try up to three
         // times (from three peers) to get consensus. This could be a lot more
         // complicated but this KISS method should work fine.
         let (request, kind) = (
@@ -889,14 +934,8 @@ impl PrimaryNetworkHandle {
     /// that imports; otherwise `Err` (full-pack fetch has no legacy fallback, so the
     /// caller retries). A peer that does not answer is cached unsyncable (skipping
     /// its probe next time); the probe is penalty-exempt either way.
-    async fn request_epoch_pack_sync(
-        &self,
-        epoch: Epoch,
-        epoch_record: &EpochRecord,
-        previous_epoch: &EpochRecord,
-        consensus_chain: &ConsensusChain,
-        record_timeout: Duration,
-    ) -> NetworkResult<()> {
+    async fn request_epoch_pack_sync(&self, sync: EpochPackSyncRequest<'_>) -> NetworkResult<()> {
+        let EpochPackSyncRequest { epoch, last_consensus_number, .. } = sync;
         let peers = self.handle.connected_peers().await?;
 
         // Probe candidate peers one at a time (the async analog of a short-circuiting
@@ -911,17 +950,7 @@ impl PrimaryNetworkHandle {
             })
             .take(MAX_EPOCH_SYNC_PROBES)
             .then(move |peer| async move {
-                match self
-                    .sync_epoch_pack_from_peer(
-                        peer,
-                        epoch,
-                        epoch_record,
-                        previous_epoch,
-                        consensus_chain,
-                        record_timeout,
-                    )
-                    .await
-                {
+                match self.sync_epoch_pack_from_peer(peer, sync).await {
                     EpochPackAttempt::Imported => {
                         self.sync_capability.lock().insert(peer, true);
                         info!(
@@ -933,11 +962,21 @@ impl PrimaryNetworkHandle {
                         true
                     }
                     EpochPackAttempt::Unsupported => {
-                        self.sync_capability.lock().insert(peer, false);
+                        // Only a FULL-pack `Unsupported` authoritatively proves the peer
+                        // does not speak `/tn-primary-sync`. A PARTIAL `Unsupported` is
+                        // ambiguous: the peer may be on an earlier item that serves full
+                        // packs but cannot decode the newer `EpochPackPartial` variant, so
+                        // it must not cache `false` and hide that peer from full-pack sync.
+                        // (Partial still honors a `false` a full probe wrote and caches
+                        // `true` on success, so it dedups without poisoning.)
+                        if last_consensus_number.is_none() {
+                            self.sync_capability.lock().insert(peer, false);
+                        }
                         debug!(
                             target: "primary::network",
                             %peer,
-                            "peer did not answer epoch pack sync; caching unsyncable this epoch"
+                            partial = last_consensus_number.is_some(),
+                            "peer did not answer epoch pack sync; skipping this probe"
                         );
                         false
                     }
@@ -971,27 +1010,19 @@ impl PrimaryNetworkHandle {
     async fn sync_epoch_pack_from_peer(
         &self,
         peer: BlsPublicKey,
-        epoch: Epoch,
-        epoch_record: &EpochRecord,
-        previous_epoch: &EpochRecord,
-        consensus_chain: &ConsensusChain,
-        record_timeout: Duration,
+        sync: EpochPackSyncRequest<'_>,
     ) -> EpochPackAttempt {
-        self.try_sync_epoch_pack_exchange(
-            peer,
-            epoch,
-            epoch_record,
-            previous_epoch,
-            consensus_chain,
-            record_timeout,
-        )
-        .await
-        .map_or_else(|attempt| attempt, |()| EpochPackAttempt::Imported)
+        self.try_sync_epoch_pack_exchange(peer, sync)
+            .await
+            .map_or_else(|attempt| attempt, |()| EpochPackAttempt::Imported)
     }
 
-    /// Open a `/tn-primary-sync` stream, write the [`PrimarySyncRequest::EpochPack`]
-    /// request in the opening frame, and stream the pack through
-    /// [`ConsensusChain::stream_import`].
+    /// Open a `/tn-primary-sync` stream, write the epoch-pack request in the opening
+    /// frame, and stream the pack into the consensus chain. `last_consensus_number`
+    /// selects the transfer: `None` requests the full pack ([`PrimarySyncRequest::EpochPack`])
+    /// and imports it in place via [`ConsensusChain::stream_import`]; `Some(number)`
+    /// requests a verifiable prefix ([`PrimarySyncRequest::EpochPackPartial`]) and imports
+    /// it into a side staging dir via [`ConsensusChain::import_partial_to_staging`].
     ///
     /// `Err(EpochPackAttempt::Unsupported)` means the peer did not answer the
     /// protocol (negotiation failed, or it negotiated but never `Ack`ed), so it is
@@ -1004,12 +1035,16 @@ impl PrimaryNetworkHandle {
     async fn try_sync_epoch_pack_exchange(
         &self,
         peer: BlsPublicKey,
-        epoch: Epoch,
-        epoch_record: &EpochRecord,
-        previous_epoch: &EpochRecord,
-        consensus_chain: &ConsensusChain,
-        record_timeout: Duration,
+        sync: EpochPackSyncRequest<'_>,
     ) -> Result<(), EpochPackAttempt> {
+        let EpochPackSyncRequest {
+            epoch,
+            last_consensus_number,
+            epoch_record,
+            previous_epoch,
+            consensus_chain,
+            record_timeout,
+        } = sync;
         // open the sync stream, flattening the command-channel and stream-open
         // results. Only a genuine negotiation failure (`UpgradeFailed`) is a
         // pre-cutover peer that does not advertise the protocol -> Unsupported
@@ -1029,7 +1064,13 @@ impl PrimaryNetworkHandle {
         // write the request in the opening frame. Negotiation already succeeded, so
         // the peer is sync-capable; a write failure is transient -> try next.
         let max_frame = sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
-        let request = SyncFrame::Req(PrimarySyncRequest::EpochPack { epoch });
+        // full pack vs a verifiable partial prefix: select the request variant through
+        // the `Option`'s combinator (no Some/None branch).
+        let request = SyncFrame::Req(
+            last_consensus_number.map_or(PrimarySyncRequest::EpochPack { epoch }, |number| {
+                PrimarySyncRequest::EpochPackPartial { epoch, last_consensus_number: number }
+            }),
+        );
         let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
         write_frame(&mut stream, &request, &mut encode_buffer, &mut compressed_buffer, max_frame)
             .await
@@ -1075,22 +1116,43 @@ impl PrimaryNetworkHandle {
 
         match first {
             // accepted: reassemble the `Data`/`End` frames into a contiguous reader
-            // and import it. A bad pack is the peer's fault on the legacy path, but
-            // the sync path is metrics-only during rollout: classify it `Failed`
-            // (try next peer) without a penalty.
-            SyncFrame::Ack => consensus_chain
-                .stream_import(
-                    sync_codec::sync_pack_reader(stream),
-                    epoch_record,
-                    previous_epoch,
-                    record_timeout,
-                )
-                .await
-                .map_err(|e| {
-                    EpochPackAttempt::Failed(NetworkError::RPCError(format!(
-                        "failed to import epoch pack over sync stream: {e}"
-                    )))
-                }),
+            // and import it. A full pack imports in place; a partial prefix imports to
+            // a side staging dir so it cannot race the in-order build of the current
+            // epoch's main pack (matching the legacy responder split). A bad pack is
+            // the peer's fault on the legacy path, but the sync path is metrics-only
+            // during rollout: classify it `Failed` (try next peer) without a penalty.
+            SyncFrame::Ack => {
+                let reader = sync_codec::sync_pack_reader(stream);
+                // pick the import target on `last_consensus_number.is_some()` (a bool,
+                // not an `Option` pattern-match); each branch normalizes to
+                // `Result<(), EpochPackAttempt>` then boxes so the `if` unifies their
+                // distinct future types.
+                let import = if last_consensus_number.is_some() {
+                    consensus_chain
+                        .import_partial_to_staging(
+                            reader,
+                            epoch_record,
+                            previous_epoch,
+                            record_timeout,
+                        )
+                        .map_err(|e| {
+                            EpochPackAttempt::Failed(NetworkError::RPCError(format!(
+                                "failed to import partial epoch pack over sync stream: {e}"
+                            )))
+                        })
+                        .boxed()
+                } else {
+                    consensus_chain
+                        .stream_import(reader, epoch_record, previous_epoch, record_timeout)
+                        .map_err(|e| {
+                            EpochPackAttempt::Failed(NetworkError::RPCError(format!(
+                                "failed to import epoch pack over sync stream: {e}"
+                            )))
+                        })
+                        .boxed()
+                };
+                import.await
+            }
             // sync-capable, but shedding load or lacking the pack: try next peer
             SyncFrame::Deny(reason) => Err(EpochPackAttempt::Failed(NetworkError::RPCRetryable(
                 format!("peer denied epoch pack sync request: {reason:?}"),
@@ -1703,7 +1765,25 @@ where
             match request {
                 SyncFrame::Req(PrimarySyncRequest::EpochPack { epoch }) => {
                     request_handler
-                        .process_sync_epoch_pack_stream(peer, stream, epoch, &consensus_chain)
+                        .process_sync_epoch_pack_stream(peer, stream, epoch, None, &consensus_chain)
+                        .await?;
+                }
+                // `EpochPackPartial` over sync (item 9): serve the verifiable prefix of
+                // an in-progress epoch, replacing the legacy `StreamEpochPartial`
+                // ack-plus-digest path. Same serve as the full pack, bounded to the
+                // prefix length by `Some(last_consensus_number)`.
+                SyncFrame::Req(PrimarySyncRequest::EpochPackPartial {
+                    epoch,
+                    last_consensus_number,
+                }) => {
+                    request_handler
+                        .process_sync_epoch_pack_stream(
+                            peer,
+                            stream,
+                            epoch,
+                            Some(last_consensus_number),
+                            &consensus_chain,
+                        )
                         .await?;
                 }
                 // `MissingCertificates` over sync (item 7): serve the matching

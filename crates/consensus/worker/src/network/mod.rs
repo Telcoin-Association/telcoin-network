@@ -609,7 +609,10 @@ where
             .and_then(Result::ok);
             let Some(request) = request else {
                 warn!(target: "worker::network", %peer, "no readable sync request frame");
-                let _ = stream.close().await;
+                // bound the best-effort close so a peer that sent no readable frame
+                // and then stops reading cannot pin the held admission permit on the
+                // FIN flush; mirrors the shed/malformed bounded closes above.
+                let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
                 return Ok(());
             };
 

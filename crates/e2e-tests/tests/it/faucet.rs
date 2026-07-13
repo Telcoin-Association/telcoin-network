@@ -1,6 +1,6 @@
 //! Integration test for faucet drip functionality.
 //!
-//! Tests calling the StablecoinManager's permissionless `drip()` function directly
+//! Tests calling the StablecoinManager's permissionless `dripTo()` function directly
 //! via `eth_sendRawTransaction`. The contract mints TEL via the precompile at 0x7e1
 //! and stablecoins via ERC20 mint. Rate limiting is handled by the contract's `_checkDrip()`.
 
@@ -10,7 +10,10 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tn_config::{fetch_file_content_relative_to_manifest, Config, ConfigFmt, ConfigTrait};
-use tn_reth::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
+use tn_reth::{
+    faucet_mint_role_slot, test_utils::TransactionFactory, RethChainSpec, RethEnv,
+    TELCOIN_PRECOMPILE_ADDRESS,
+};
 use tn_types::{
     adiri_genesis, hex, sol, Address, Encodable2718 as _, Genesis, GenesisAccount, SolValue,
     TaskManager, B256, U256,
@@ -21,6 +24,10 @@ use tracing::{debug, info};
 #[tokio::test]
 async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     // faucet interface
+    //
+    // mirrors `tn-contracts/artifacts/StablecoinManager.json`; every call below is encoded
+    // through these generated call types so a selector can never drift from its params
+    // again (see #863)
     sol!(
         #[allow(clippy::too_many_arguments)]
         #[sol(rpc)]
@@ -33,10 +40,18 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
                 uint256 initMinLimit;
                 uint256 dripAmount_;
                 uint256 nativeDripAmount_;
+                uint256 baseDripCooldown_;
             }
 
             function initialize(StablecoinManagerInitParams calldata initParams) external;
-            function drip(address token, address recipient) external;
+            function UpdateXYZ(
+                address token,
+                bool validity,
+                uint256 maxLimit,
+                uint256 minLimit,
+                uint256 baseDripAmount
+            ) external;
+            function dripTo(address recipient, address token, uint256 amount) external;
         }
     );
 
@@ -51,6 +66,7 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
             ) external;
             function decimals() external view returns (uint8);
             function balanceOf(address account) external view returns (uint256);
+            function grantRole(bytes32 role, address account) external;
         }
     );
 
@@ -103,7 +119,6 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     );
 
     // get data for faucet proxy deployment w/ initdata
-    let faucet_init_selector = [22, 173, 166, 177];
     let deployed_token_bytes = vec![];
     let init_max_limit = U256::MAX;
     let init_min_limit = U256::from(1_000);
@@ -111,20 +126,27 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     let tel_amount =
         U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256"); // 1 $TEL
 
-    // encode initialization struct
-    let init_params = StablecoinManager::StablecoinManagerInitParams {
-        admin_: factory_address,
-        maintainer_: factory_address,
-        tokens_: deployed_token_bytes,
-        initMaxLimit: init_max_limit,
-        initMinLimit: init_min_limit,
-        dripAmount_: xyz_amount,
-        nativeDripAmount_: tel_amount,
+    // 1 day; must be nonzero (`_setBaselineDripCooldown` rejects writing the value already
+    // stored, and the fresh slot is zero). The value never gates this test: every drip
+    // below targets a fresh recipient, whose cooldown clock starts at zero.
+    let base_drip_cooldown = U256::from(60 * 60 * 24);
+
+    // encode initialization call (selector + params struct) via the generated binding
+    let init_call = StablecoinManager::initializeCall {
+        initParams: StablecoinManager::StablecoinManagerInitParams {
+            admin_: factory_address,
+            maintainer_: factory_address,
+            tokens_: deployed_token_bytes,
+            initMaxLimit: init_max_limit,
+            initMinLimit: init_min_limit,
+            dripAmount_: xyz_amount,
+            nativeDripAmount_: tel_amount,
+            baseDripCooldown_: base_drip_cooldown,
+        },
     }
     .abi_encode();
 
     // construct create data for faucet proxy address
-    let init_call = [&faucet_init_selector, &init_params[..]].concat();
     let constructor_params = (faucet_impl_address, init_call.clone()).abi_encode_params();
     let proxy_json =
         fetch_file_content_relative_to_manifest("../../tn-contracts/artifacts/ERC1967Proxy.json");
@@ -140,9 +162,12 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     let faucet_create_data = [proxy_initcode.clone().as_slice(), &constructor_params[..]].concat();
 
     // construct create data for stablecoin proxy
-    let stablecoin_init_selector = [22, 36, 246, 198];
-    let stablecoin_init_params = ("name", "symbol", 6).abi_encode_params();
-    let stablecoin_init_call = [&stablecoin_init_selector, &stablecoin_init_params[..]].concat();
+    let stablecoin_init_call = Stablecoin::initializeCall {
+        name_: "name".to_string(),
+        symbol_: "symbol".to_string(),
+        decimals_: 6,
+    }
+    .abi_encode();
     let stablecoin_constructor_params =
         (stablecoin_impl_address, stablecoin_init_call.clone()).abi_encode_params();
     let stablecoin_create_data =
@@ -152,19 +177,27 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     let faucet_proxy_address = factory_address.create(0);
     let stablecoin_address = factory_address.create(1);
 
-    // construct `updateXYZ()` data
-    let updatexyz_selector = [233, 174, 163, 150];
-    let updatexyz_params = (stablecoin_address, true, U256::MAX, U256::ZERO).abi_encode_params();
-    let updatexyz_call = [&updatexyz_selector, &updatexyz_params[..]].concat().into();
+    // construct `UpdateXYZ()` data enabling the stablecoin for drips; the inherited 4-arg
+    // overload reverts with `UpdateXYZRequiresBaseDripAmount`, so the token's baseline
+    // drip amount is seeded here via StablecoinManager's 5-arg overload
+    let updatexyz_call = StablecoinManager::UpdateXYZCall {
+        token: stablecoin_address,
+        validity: true,
+        maxLimit: U256::MAX,
+        minLimit: U256::ZERO,
+        baseDripAmount: xyz_amount,
+    }
+    .abi_encode()
+    .into();
 
     // construct `grantRole(minter_role)` on stablecoin to faucet proxy
-    let grant_role_selector = [47, 47, 241, 93];
-    let minter_role_params = (
-        B256::from_str("0x9f2df0fed2c77648de5860a4cc508cd0818c85b8b8a1ab4ceeef8d981c8956a6")?,
-        faucet_proxy_address,
-    )
-        .abi_encode_params();
-    let minter_role_call = [&grant_role_selector, &minter_role_params[..]].concat().into();
+    let minter_role_call = Stablecoin::grantRoleCall {
+        // keccak256("MINTER_ROLE")
+        role: B256::from_str("0x9f2df0fed2c77648de5860a4cc508cd0818c85b8b8a1ab4ceeef8d981c8956a6")?,
+        account: faucet_proxy_address,
+    }
+    .abi_encode()
+    .into();
 
     // assemble eip1559 transactions using constructed datas
     let pre_genesis_chain: Arc<RethChainSpec> = Arc::new(tmp_genesis.into());
@@ -217,18 +250,51 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     )?;
     // fetch state to be set on the faucet proxy address
     let execution_bundle = tmp_reth_env
-        .execution_outcome_for_tests(raw_txs, &pre_genesis_chain.sealed_genesis_header());
+        .execution_outcome_for_tests(raw_txs, &pre_genesis_chain.sealed_genesis_header())?;
     let execution_storage_faucet = &execution_bundle
         .state
         .get(&faucet_proxy_address)
-        .expect("faucet address missing from bundle state")
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "faucet proxy missing from bundle state: its CREATE landed at a different \
+                 address than the one predicted from the deployer's nonce 0"
+            )
+        })?
         .storage;
     // fetch state to be set on the stablecoin address
     let execution_storage_stablecoin = &execution_bundle
         .state
         .get(&stablecoin_address)
-        .expect("stablecoin address missing from bundle state")
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "stablecoin proxy missing from bundle state: its CREATE landed at a different \
+                 address than the one predicted from the deployer's nonce 1"
+            )
+        })?
         .storage;
+
+    // extend (never replace) the canonical TEL precompile genesis account with the faucet
+    // proxy's mint role: its nonzero code (`0xfe`) is what exempts the account from
+    // EIP-158 state clearing, which would otherwise delete it at the end of the first
+    // block that touches the precompile, silently wiping the mint-role and total-supply
+    // slots and reverting every subsequent drip
+    let tel_precompile_genesis_account = genesis
+        .alloc
+        .get(&TELCOIN_PRECOMPILE_ADDRESS)
+        .cloned()
+        .ok_or_else(|| eyre::eyre!("TEL precompile account missing from genesis template"))?;
+    let tel_precompile_storage = tel_precompile_genesis_account
+        .storage
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .chain(std::iter::once((
+            faucet_mint_role_slot(faucet_proxy_address).into(),
+            B256::with_last_byte(1),
+        )))
+        .collect();
+    let tel_precompile_genesis_account =
+        tel_precompile_genesis_account.with_storage(Some(tel_precompile_storage));
 
     // real genesis: configure genesis accounts for proxy deployment
     let genesis_accounts = vec![
@@ -265,6 +331,10 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
                         .collect(),
                 )),
         ),
+        // authorize the faucet proxy to call the TEL precompile's `mint(address,uint256)`:
+        // seed its mint-role slot in genesis, mirroring what a runtime `grantMintRole`
+        // from the governance safe writes
+        (TELCOIN_PRECOMPILE_ADDRESS, tel_precompile_genesis_account),
     ];
 
     // create and launch validator nodes on local network
@@ -299,9 +369,17 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     debug!(target: "faucet-test", "starting balance: {starting_tel_balance:?}");
     assert_eq!(U256::from_str(&starting_tel_balance)?, U256::ZERO);
 
-    // call drip(address(0), recipient) for TEL via the contract directly
-    let drip_calldata =
-        StablecoinManager::dripCall { token: Address::ZERO, recipient }.abi_encode();
+    // native TEL is keyed by the conventional eth pseudo-address (`NATIVE_TOKEN_POINTER`
+    // in tn-contracts' TNFaucet.sol), not `address(0)`
+    let native_token_pointer = Address::from_str("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE")?;
+    let encode_drip = |recipient: Address, token: Address, amount: U256| {
+        StablecoinManager::dripToCall { recipient, token, amount }.abi_encode()
+    };
+
+    // call dripTo(recipient, native, 1 TEL) for TEL via the contract directly; the amount
+    // is the baseline max seeded at initialization, and `_checkDrip` floors requests at
+    // one tenth of that max
+    let drip_calldata = encode_drip(recipient, native_token_pointer, tel_amount);
     let drip_tx = caller.create_eip1559(
         chain.clone(),
         None,
@@ -327,11 +405,9 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     .await?
     .expect("expected TEL balance timeout");
 
-    // call drip(stablecoin, new_recipient) for XYZ
+    // call dripTo(new_recipient, stablecoin, 1 XYZ) for XYZ
     let new_recipient = Address::random();
-    let xyz_drip_calldata =
-        StablecoinManager::dripCall { token: stablecoin_address, recipient: new_recipient }
-            .abi_encode();
+    let xyz_drip_calldata = encode_drip(new_recipient, stablecoin_address, xyz_amount);
     let xyz_drip_tx = caller.create_eip1559(
         chain.clone(),
         None,
@@ -385,9 +461,7 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     let drip_txs: Vec<_> = random_addresses
         .iter()
         .map(|&address| {
-            let drip_calldata =
-                StablecoinManager::dripCall { token: Address::ZERO, recipient: address }
-                    .abi_encode();
+            let drip_calldata = encode_drip(address, native_token_pointer, tel_amount);
             let tx = caller.create_eip1559(
                 chain.clone(),
                 None,

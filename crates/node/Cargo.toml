@@ -40,6 +40,17 @@ reth-metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+# Propagate the adiri-testnet feature to every downstream crate that has adiri-gated fork logic, so
+# a `--features adiri` node build actually compiles it in. tn-node has no adiri code of its own.
+adiri = [
+    "tn-engine/adiri",
+    "tn-executor/adiri",
+    "tn-reth/adiri",
+    "tn-storage/adiri",
+    "tn-types/adiri",
+]
+
 [dev-dependencies]
 metrics-util = { workspace = true }
 rand = { workspace = true }

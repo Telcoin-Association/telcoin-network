@@ -20,12 +20,10 @@ use alloy::{
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
-use reth_primitives::{sign_message, Account};
+use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
-use reth_provider::{AccountReader as _, StateProvider, StateProviderBox, StateProviderFactory};
-use reth_revm::{
-    context::result::ResultAndState, database::StateProviderDatabase, db::BundleState, State,
-};
+use reth_provider::{StateProvider, StateProviderBox, StateProviderFactory};
+use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
@@ -69,11 +67,6 @@ impl RethEnv {
         Ok(self.inner.blockchain_provider.state_by_block_hash(hash)?)
     }
 
-    /// Retrieve the account balance.
-    pub fn retrieve_account(&self, address: &Address) -> TnRethResult<Option<Account>> {
-        Ok(self.inner.blockchain_provider.basic_account(address)?)
-    }
-
     /// Create an EVM-environment from state provider.
     pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
         let header = self.header(hash)?.expect("provided hash in header table");
@@ -89,21 +82,6 @@ impl RethEnv {
             .create_evm(db, self.inner.evm_config.evm_env(&header)?))
     }
 
-    /// Execute a read-only system call against a contract and return the result.
-    ///
-    /// Useful for integration tests that need to read precompile state after
-    /// block execution without importing the `Evm` trait.
-    pub fn read_contract_state(
-        &self,
-        block_hash: BlockHash,
-        contract: Address,
-        calldata: Bytes,
-    ) -> eyre::Result<ResultAndState> {
-        use reth_evm::Evm;
-        let mut evm = self.tn_evm(block_hash)?;
-        Ok(evm.transact_system_call(crate::system_calls::SYSTEM_ADDRESS, contract, calldata)?)
-    }
-
     /// Test utility to execute batch and return execution outcome.
     ///
     /// This is useful for simulating execution results for account state changes.
@@ -113,7 +91,7 @@ impl RethEnv {
         &self,
         txs: Vec<Vec<u8>>,
         parent: &SealedHeader,
-    ) -> BundleState {
+    ) -> eyre::Result<BundleState> {
         // create "empty" header with default values
         let mut header = ExecHeader {
             parent_hash: parent.hash(),
@@ -139,16 +117,21 @@ impl RethEnv {
             requests_hash: None,
         };
 
-        // decode transactions
-        let mut decoded_txs = Vec::with_capacity(txs.len());
-        let mut signers = Vec::with_capacity(txs.len());
-        for tx_bytes in &txs {
-            let tx = recover_raw_transaction(tx_bytes)
-                .expect("raw transaction recovered for test")
-                .into_inner();
-            signers.push(tx.recover_signer().expect("recover signer for test tx"));
-            decoded_txs.push(tx);
-        }
+        // decode transactions and recover their signers
+        let (decoded_txs, signers): (Vec<_>, Vec<_>) = txs
+            .iter()
+            .map(|tx_bytes| {
+                let tx = recover_raw_transaction(tx_bytes)
+                    .map_err(|e| eyre::eyre!("recover raw test transaction: {e:?}"))?
+                    .into_inner();
+                let signer = tx
+                    .recover_signer()
+                    .map_err(|e| eyre::eyre!("recover signer for test tx: {e:?}"))?;
+                Ok::<_, eyre::Report>((tx, signer))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
 
         // update header's transactions root
         header.transactions_root = if txs.is_empty() {
@@ -169,14 +152,22 @@ impl RethEnv {
 
         // create execution db
         let mut db = StateProviderDatabase::new(
-            self.latest().expect("provider retrieves latest during test batch execution"),
+            self.latest()
+                .map_err(|e| eyre::eyre!("provider retrieves latest for test batch: {e:?}"))?,
         );
         let executor = self.inner.evm_config.executor(&mut db);
         let res = executor
             .execute(&RecoveredBlock::new_unhashed(block, signers))
-            .expect("execute one block");
+            .map_err(|e| eyre::eyre!("execute one block for test: {e:?}"))?;
 
-        res.state
+        // a reverted tx still commits (with a failed receipt), silently yielding bundle
+        // state that is missing the tx's intended effects; fail loudly with the receipts
+        // so the offending tx is identifiable instead of surfacing later as missing
+        // genesis state (see #863)
+        let all_succeeded = res.result.receipts.iter().all(|receipt| receipt.success);
+        all_succeeded.then_some(res.state).ok_or_else(|| {
+            eyre::eyre!("setup tx reverted during simulated execution: {:?}", res.result.receipts)
+        })
     }
 
     /// Retrieve validator rewards.
@@ -728,6 +719,18 @@ pub fn test_genesis_with_consensus_registry_and_workers(
     num_validators: usize,
     worker_configs: Vec<(u8, u64)>,
 ) -> Genesis {
+    try_test_genesis_with_consensus_registry_and_workers(num_validators, worker_configs)
+        .expect("create consensus registry genesis accounts")
+}
+
+/// Fallible [`test_genesis_with_consensus_registry_and_workers`]: returns the genesis-creation
+/// error instead of panicking, so tests can assert that a ceremony with contract-illegal
+/// `worker_configs` (strategy > `MAX_STRATEGY`, empty list) fails loudly instead of committing
+/// a reverted constructor's empty storage.
+pub fn try_test_genesis_with_consensus_registry_and_workers(
+    num_validators: usize,
+    worker_configs: Vec<(u8, u64)>,
+) -> eyre::Result<Genesis> {
     // deterministic committee-eligible validator addresses (0x11.., 0x22.., ...)
     let all_validators: Vec<Address> = (1..=num_validators)
         .map(|i| Address::from_slice(&[(i as u8).wrapping_mul(0x11); 20]))
@@ -783,5 +786,4 @@ pub fn test_genesis_with_consensus_registry_and_workers(
         governance,
         worker_configs,
     )
-    .expect("create consensus registry genesis accounts")
 }

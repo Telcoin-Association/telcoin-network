@@ -38,4 +38,5 @@ workspace = true
 
 [features]
 default = []
+# Adiri testnet fork logic gated on `tn_types::forks` — pull in the constants.
 adiri = ["tn-types/adiri"]

@@ -227,6 +227,165 @@ where
         Ok(())
     }
 
+    /// The upgraded `ConsensusRegistry` runtime bytecode and its code hash, sourced from the same
+    /// embedded artifact genesis deploys (`CONSENSUS_REGISTRY_JSON` `deployedBytecode.object`).
+    ///
+    /// Materialized once. The embedded artifact is a compile-time `include_str!` constant (the same
+    /// bytes genesis generation decodes, and exercised by the fork unit test), so a decode failure
+    /// here is a corrupt build — uniform across the fleet — not a live-node runtime condition;
+    /// hence `expect` rather than a fallible return.
+    #[cfg(feature = "adiri")]
+    fn consensus_registry_runtime_code() -> &'static (reth_revm::bytecode::Bytecode, B256) {
+        use reth_revm::bytecode::Bytecode;
+        use std::sync::LazyLock;
+
+        static CODE: LazyLock<(Bytecode, B256)> = LazyLock::new(|| {
+            let value = crate::RethEnv::fetch_value_from_json_str(
+                crate::CONSENSUS_REGISTRY_JSON,
+                Some("deployedBytecode.object"),
+            )
+            .expect("embedded consensus registry artifact json is valid");
+            let hex_str = value.as_str().expect("registry deployedBytecode.object is a string");
+            let raw =
+                alloy::hex::decode(hex_str).expect("registry deployedBytecode.object is valid hex");
+            let bytecode = Bytecode::new_raw(raw.into());
+            let code_hash = bytecode.hash_slow();
+            (bytecode, code_hash)
+        });
+
+        &CODE
+    }
+
+    /// Apply the in-protocol `ConsensusRegistry` fork.
+    ///
+    /// Swaps the deployed registry runtime bytecode to the upgraded version — preserving the
+    /// account's balance, nonce, and **all** existing storage (the new state is a clean append, so
+    /// the swap rewrites only the account-code leaf) — then runs the one-time
+    /// `migrateValidatorSets()` that back-fills the appended per-status `validatorSets` and cached
+    /// `eligibleValidatorCount` from the preserved `currentStatus` source of truth.
+    ///
+    /// Fires exactly once, from the epoch-closing block that concludes
+    /// `CONSENSUS_REGISTRY_FORK_EPOCH - 1`, as the FIRST step of that block's close-epoch handling
+    /// — before `applyIncentives`/`concludeEpoch`, which then run on the swapped-in code with
+    /// the migrated sets (the new committee read and eligible-count guard require them). From
+    /// this block onward every node runs on the new code with populated sets.
+    ///
+    /// Determinism: the production path (`context_for_next_block`) and the replay path
+    /// (`context_for_block`) build an identical `ctx.nonce`/`ctx.close_epoch` from the same
+    /// `ConsensusOutput`, and this routine is a pure function of the committed state plus the
+    /// embedded artifact, so every node re-derives a byte-identical `state_root`.
+    ///
+    /// Fatal on failure — a partial or failed migration diverges state across the fleet.
+    #[cfg(feature = "adiri")]
+    fn apply_consensus_registry_fork(&mut self) -> TnRethResult<()> {
+        // revm `Database` trait provides `basic`; imported anonymously to avoid clashing with the
+        // `alloy_evm::Database` already in module scope.
+        use reth_revm::{
+            state::{Account, AccountInfo, AccountStatus, EvmState},
+            Database as _,
+        };
+
+        let (code, code_hash) = Self::consensus_registry_runtime_code().clone();
+
+        // Preserve the registry account's balance + nonce; only the code changes. Reading via
+        // `basic` also loads the account into the `State` cache so the code-only commit below takes
+        // the `change` path (info updated, storage left intact) rather than creating a new account.
+        let current = self
+            .evm
+            .db_mut()
+            .basic(CONSENSUS_REGISTRY_ADDRESS)
+            .map_err(|e| TnRethError::EVMCustom(format!("registry account read failed: {e}")))?
+            .unwrap_or_default();
+
+        // Fail closed on an unexpected pre-fork deployment. The swap + `migrateValidatorSets()`
+        // assume the exact storage layout of the pinned pre-fork registry code (the registry is
+        // non-upgradeable, so on the live chain this is the fixed genesis code hash); migrating
+        // over anything else risks silent state corruption. Abort the block instead — the check is
+        // a pure function of committed state, so every fork-capable node fails uniformly rather
+        // than diverging.
+        if current.code_hash != tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH {
+            error!(
+                target: "engine",
+                pre_swap_code_hash = %current.code_hash,
+                expected = %tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH,
+                "consensus registry fork failing closed: unexpected pre-fork registry code",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "consensus registry fork failing closed: pre-swap code hash {} does not match \
+                 the pinned pre-fork deployment {}",
+                current.code_hash,
+                tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH,
+            )));
+        }
+
+        debug!(
+            target: "engine",
+            pre_swap_code_hash = %current.code_hash,
+            new_code_hash = %code_hash,
+            "applying consensus registry fork",
+        );
+
+        // Commit a code-only override: an empty storage map and a plain `Touched` status (never
+        // `Created`/`SelfDestructed`) so no storage slot enters the bundle and the existing storage
+        // root is preserved — only the single account-code leaf changes. The new bytecode is
+        // carried inline on the account info, so it is registered in the bundle's contracts
+        // (for post-restart `code_by_hash`) and is immediately loadable by the migration
+        // call below.
+        let account = Account {
+            info: AccountInfo {
+                balance: current.balance,
+                nonce: current.nonce,
+                code_hash,
+                code: Some(code),
+                ..Default::default()
+            },
+            status: AccountStatus::Touched,
+            ..Default::default()
+        };
+        self.evm.db_mut().commit(EvmState::from_iter([(CONSENSUS_REGISTRY_ADDRESS, account)]));
+
+        // Run the one-time migration. Dispatches to the just-swapped new code.
+        let calldata = ConsensusRegistry::migrateValidatorSetsCall {}.abi_encode().into();
+        let mut res = match self.evm.transact_system_call(
+            SYSTEM_ADDRESS,
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                error!(target: "engine", "error executing consensus registry migration: {:?}", e);
+                return Err(TnRethError::EVMCustom(format!(
+                    "consensus registry migration failed: {e}"
+                )));
+            }
+        };
+        if !res.result.is_success() {
+            error!(target: "engine", "failed consensus registry migration: {:?}", res.result);
+            return Err(TnRethError::EVMCustom("failed consensus registry migration".to_string()));
+        }
+
+        // clean up SYSTEM_ADDRESS — only touched as the system caller, not a real state change
+        res.state.remove(&SYSTEM_ADDRESS);
+        self.evm.db_mut().commit(res.state);
+
+        // Read back the rebuilt eligible count for an operational confirmation log. Best-effort and
+        // deliberately non-fatal: the migration is already committed above, so a hiccup on this
+        // cosmetic read must not abort the block (which would discard a valid, deterministic
+        // migration) — and must not alarm at `error!` either, hence the `try_` variant + `debug!`.
+        // Pure read — state is not committed.
+        let calldata = ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into();
+        let eligible = self
+            .try_read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)
+            .inspect_err(|e| {
+                debug!(target: "engine", "non-fatal eligible-count readback after migration failed: {e}");
+            })
+            .ok()
+            .and_then(|data| <U256 as alloy::sol_types::SolValue>::abi_decode(&data).ok());
+
+        tracing::info!(target: "engine", ?eligible, %code_hash, "consensus registry fork applied");
+        Ok(())
+    }
+
     /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
     fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> TnRethResult<Bytes> {
         // shuffle all validators for new committee
@@ -271,29 +430,7 @@ where
     fn shuffle_new_committee(&mut self, randomness: B256) -> TnRethResult<Vec<Address>> {
         let new_committee_size = self.next_committee_size()?;
 
-        // Read the committee-eligible validator pool from the consensus registry. The registry's
-        // per-status `getValidators`/`getValidatorsInfo` return ONLY the exact status set; the
-        // committee-eligible pool is the union of `{ Active, PendingActivation, PendingExit }` (the
-        // statuses for which `_eligibleForCommitteeNextEpoch` is true). The registry computes the
-        // O(1) eligible *count* on-chain and expects the protocol to assemble the eligible *pool*
-        // by unioning these queries off-chain. We use `getValidatorsInfo` (full structs)
-        // because the pending-exit validators are separated out below by `currentStatus`.
-        let mut all_active_validators: Vec<ConsensusRegistry::ValidatorInfo> = Vec::new();
-        for status in [
-            ValidatorStatus::Active,
-            ValidatorStatus::PendingActivation,
-            ValidatorStatus::PendingExit,
-        ] {
-            let calldata = ConsensusRegistry::getValidatorsInfoCall { status: status.into() }
-                .abi_encode()
-                .into();
-            let state =
-                self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
-            trace!(target: "engine", ?status, "get validators call:\n{:?}", state);
-            let validators: Vec<ConsensusRegistry::ValidatorInfo> =
-                alloy::sol_types::SolValue::abi_decode(&state)?;
-            all_active_validators.extend(validators);
-        }
+        let all_active_validators = self.read_committee_eligible_pool()?;
 
         debug!(target: "engine",  "validators pre-shuffle {:?}", all_active_validators);
 
@@ -345,34 +482,145 @@ where
         Ok(new_committee)
     }
 
-    /// Read state on-chain.
+    /// Read the committee-eligible validator pool from the consensus registry.
+    ///
+    /// The registry's per-status `getValidators`/`getValidatorsInfo` return ONLY the exact status
+    /// set; the committee-eligible pool is the union of `{ Active, PendingActivation, PendingExit
+    /// }` (the statuses for which `_eligibleForCommitteeNextEpoch` is true). The registry computes
+    /// the O(1) eligible *count* on-chain and expects the protocol to assemble the eligible *pool*
+    /// by unioning these queries off-chain. We use `getValidatorsInfo` (full structs) because the
+    /// pending-exit validators are separated out by `currentStatus` in `shuffle_new_committee`.
+    fn read_committee_eligible_pool(
+        &mut self,
+    ) -> TnRethResult<Vec<ConsensusRegistry::ValidatorInfo>> {
+        // While the deployed registry still carries the pre-fork adiri code, `getValidatorsInfo`
+        // does not exist on-chain — speak the legacy ABI instead. This keeps every pre-fork epoch
+        // close (fresh-node onboarding, full resync, a fork-capable build deployed before
+        // `CONSENSUS_REGISTRY_FORK_EPOCH`) executing byte-identically to the historical chain. At
+        // the fork boundary `apply_consensus_registry_fork` swaps the code first, so this gate
+        // already sees the upgraded hash and takes the post-fork read below.
+        #[cfg(feature = "adiri")]
+        if self.registry_code_is_pre_fork()? {
+            return self.read_committee_eligible_pool_legacy();
+        }
+
+        let mut all_active_validators: Vec<ConsensusRegistry::ValidatorInfo> = Vec::new();
+        for status in [
+            ValidatorStatus::Active,
+            ValidatorStatus::PendingActivation,
+            ValidatorStatus::PendingExit,
+        ] {
+            let calldata = ConsensusRegistry::getValidatorsInfoCall { status: status.into() }
+                .abi_encode()
+                .into();
+            let state =
+                self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+            trace!(target: "engine", ?status, "get validators call:\n{:?}", state);
+            let validators: Vec<ConsensusRegistry::ValidatorInfo> =
+                alloy::sol_types::SolValue::abi_decode(&state)?;
+            all_active_validators.extend(validators);
+        }
+
+        Ok(all_active_validators)
+    }
+
+    /// Whether the deployed `ConsensusRegistry` still carries the pre-fork adiri runtime code.
+    ///
+    /// Compares the registry account's code hash against the pinned
+    /// [`tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]. A pure `basic()` read: the
+    /// account is neither touched nor committed, so the gate never enters the bundle/state root —
+    /// it is a deterministic function of committed state, identical on the production and replay
+    /// paths.
+    ///
+    /// A DB error propagates as an error; only a genuinely absent account (impossible on any real
+    /// TN chain) falls through to the default (non-pre-fork) hash. An infra failure must never be
+    /// silently read as "not V1".
+    #[cfg(feature = "adiri")]
+    fn registry_code_is_pre_fork(&mut self) -> TnRethResult<bool> {
+        // revm `Database` trait provides `basic`; imported anonymously to avoid clashing with the
+        // `alloy_evm::Database` already in module scope.
+        use reth_revm::Database as _;
+
+        let code_hash = self
+            .evm
+            .db_mut()
+            .basic(CONSENSUS_REGISTRY_ADDRESS)
+            .map_err(|e| TnRethError::EVMCustom(format!("registry account read failed: {e}")))?
+            .unwrap_or_default()
+            .code_hash;
+
+        Ok(code_hash == tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH)
+    }
+
+    /// Read the committee-eligible pool via the PRE-fork registry ABI.
+    ///
+    /// Byte-exact replay of the protocol read every pre-fork epoch close was produced with: the
+    /// pre-fork contract's `getValidators(uint8)` folds the whole committee-eligible union into
+    /// the `Active` query and returns full `ValidatorInfo` structs. One call, one decode — the
+    /// single-call return order feeds the Fisher-Yates shuffle exactly as the historical chain
+    /// computed it, so re-executed pre-fork blocks derive byte-identical committees and state
+    /// roots.
+    ///
+    /// The `getValidators(uint8)` selector is identical pre/post fork (only the declared return
+    /// type changed), so encoding through the current `getValidatorsCall` binding produces the
+    /// same calldata bytes the pre-fork node sent; the pre-fork `ValidatorInfo[]` return payload
+    /// is decoded directly via `SolValue` (the struct layout is byte-identical across the fork),
+    /// bypassing the binding's post-fork `address[]` return type.
+    #[cfg(feature = "adiri")]
+    fn read_committee_eligible_pool_legacy(
+        &mut self,
+    ) -> TnRethResult<Vec<ConsensusRegistry::ValidatorInfo>> {
+        let calldata =
+            ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
+                .abi_encode()
+                .into();
+        let state =
+            self.read_state_on_chain(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        trace!(target: "engine", "legacy get validators call:\n{:?}", state);
+        let validators: Vec<ConsensusRegistry::ValidatorInfo> =
+            alloy::sol_types::SolValue::abi_decode(&state)?;
+
+        Ok(validators)
+    }
+
+    /// Read state on-chain, logging any failure at `error!` level.
+    ///
+    /// Thin wrapper over [`Self::try_read_state_on_chain`] for consensus-critical reads, where a
+    /// failure aborts the block and warrants an operator-facing error log.
     fn read_state_on_chain(
         &mut self,
         caller: Address,
         contract: Address,
         calldata: Bytes,
     ) -> TnRethResult<Bytes> {
+        self.try_read_state_on_chain(caller, contract, calldata).inspect_err(|e| {
+            error!(target: "engine", ?caller, ?contract, "failed to read state on chain: {e}");
+        })
+    }
+
+    /// Read state on-chain without logging failures.
+    ///
+    /// The two failure cases (the system call itself erroring vs an unsuccessful execution
+    /// result) stay distinguishable through the error strings. Callers pick the log level their
+    /// context warrants: consensus-critical reads go through [`Self::read_state_on_chain`]
+    /// (`error!`), best-effort reads log at `debug!`.
+    fn try_read_state_on_chain(
+        &mut self,
+        caller: Address,
+        contract: Address,
+        calldata: Bytes,
+    ) -> TnRethResult<Bytes> {
         // read from state
-        let res = match self.evm.transact_system_call(caller, contract, calldata) {
-            Ok(res) => res,
-            Err(e) => {
-                // fatal error
-                error!(target: "engine", ?caller, ?contract, "failed to read state on chain: {}", e);
-                return Err(TnRethError::EVMCustom(format!("failed to read state on chain: {e}")));
-            }
-        };
+        let res = self
+            .evm
+            .transact_system_call(caller, contract, calldata)
+            .map_err(|e| TnRethError::EVMCustom(format!("failed to read state on chain: {e}")))?;
 
         // retrieve data from execution result
-        let data = match res.result {
-            ExecutionResult::Success { output, .. } => output.into_data(),
-            e => {
-                // fatal error
-                error!(target: "engine", "error reading state on chain: {:?}", e);
-                return Err(TnRethError::EVMCustom(format!("error reading state on chain: {e:?}")));
-            }
-        };
-
-        Ok(data)
+        match res.result {
+            ExecutionResult::Success { output, .. } => Ok(output.into_data()),
+            e => Err(TnRethError::EVMCustom(format!("error reading state on chain: {e:?}"))),
+        }
     }
 
     /// Return the next committee size.
@@ -545,6 +793,34 @@ where
         // potentially close epoch boundary
         if let Some(randomness) = self.ctx.close_epoch {
             debug!(target: "engine", ?randomness, "ctx indicates close epoch");
+
+            // In-protocol ConsensusRegistry fork boundary. `deconstruct_nonce(nonce).0` is the
+            // epoch being concluded by this block; firing when `concluding_epoch + 1 ==
+            // FORK_EPOCH` makes the swapped code + migrated per-status sets live for
+            // the remainder of this very block.
+            //
+            // This MUST run BEFORE the rewards/conclude calls below. `shuffle_new_committee`
+            // (inside `apply_closing_epoch_contract_call`) routes its committee-pool read
+            // by the registry's code hash (`read_committee_eligible_pool`): swapping first
+            // flips that gate to the post-fork `getValidatorsInfo` union for the remainder
+            // of this very block, and the new `concludeEpoch` guards the committee size
+            // against the cached `eligibleValidatorCount` that only `migrateValidatorSets`
+            // populates — so the fork leads. Reward math and the epoch transition then run
+            // on the new code over the byte-identical preserved storage. (Every epoch close
+            // BEFORE this boundary sees the pre-fork code hash and takes the gate's legacy
+            // branch instead, keeping pre-fork history re-executable on this same binary.)
+            //
+            // Both the production and replay paths reach this with an identical `ctx`, so the
+            // resulting `state_root` is byte-identical across the fleet.
+            #[cfg(feature = "adiri")]
+            if tn_types::deconstruct_nonce(self.ctx.nonce).0.checked_add(1)
+                == Some(tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH)
+            {
+                self.apply_consensus_registry_fork().map_err(|e| {
+                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+                })?;
+            }
+
             self.apply_consensus_block_rewards(self.ctx.rewards_counter.get_address_counts())
                 .map_err(|e| {
                     BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))

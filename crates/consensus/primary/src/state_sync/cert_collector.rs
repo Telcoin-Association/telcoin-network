@@ -62,7 +62,7 @@ where
         // explicitly, so the legacy request-response size cap no longer applies. The field is kept
         // only for BCS wire compatibility of the retained `/0.0.1`
         // `PrimaryRequest::MissingCertificates` variant (removed at the coordinated `/0.0.2` bump,
-        // item 9 of #739); this local rebuild exists solely to reuse `get_bounds()`, which ignores
+        // item 9 of #739); this local rebuild exists solely to reuse `get_bounds`, which ignores
         // it, so a fixed dummy is correct.
         const SYNC_PATH_UNUSED_RESPONSE_CAP: usize = 0;
         let request = MissingCertificatesRequest {
@@ -70,7 +70,16 @@ where
             skip_rounds,
             max_response_size: SYNC_PATH_UNUSED_RESPONSE_CAP,
         };
-        let (lower_bound, skip_rounds) = request.get_bounds()?;
+        // Bound the request *before* anything is materialized (see
+        // `MissingCertificatesRequest::get_bounds`): the committee size caps how many
+        // per-authority entries a peer can name, and the per-authority container/cardinality gates
+        // keep a compressed bitmap under the RPC size cap from decoding to billions of rounds and
+        // OOM-ing the node. The per-authority loop below re-checks the cardinality limit as a
+        // defense-in-depth secondary guard.
+        let max_skip_rounds =
+            config.network_config().sync_config().max_skip_rounds_for_missing_certs;
+        let max_authorities = config.committee().size();
+        let (lower_bound, skip_rounds) = request.get_bounds(max_skip_rounds, max_authorities)?;
 
         // initialize the fetch queue with the first round for each authority
         let mut fetch_queue = BinaryHeap::new();

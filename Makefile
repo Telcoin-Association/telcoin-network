@@ -107,13 +107,22 @@ test-cargo:
 test-faucet:
 	cargo nextest run --package telcoin-network --features faucet --test it ;
 
+# Build the node binary once so e2e test processes reuse it via TN_BIN_PATH instead of
+# rebuilding it through escargot (~3-10s of cargo overhead per test process).
+.PHONY: build-e2e-bin
+build-e2e-bin:
+	cargo build --bin telcoin-network --features tn-storage/test-utils --target-dir $(CURDIR)/target ;
+
+# Location of the binary built by build-e2e-bin, passed to the e2e tests via TN_BIN_PATH.
+E2E_BIN := $(CURDIR)/target/debug/telcoin-network
+
 # run restart integration tests
-test-restarts:
-	cargo nextest run --run-ignored all test_restarts ;
+test-restarts: build-e2e-bin
+	TN_BIN_PATH=$(E2E_BIN) cargo nextest run --run-ignored all test_restarts ;
 
 # run e2e tests
-test-e2e:
-	cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+test-e2e: build-e2e-bin
+	TN_BIN_PATH=$(E2E_BIN) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
@@ -138,8 +147,9 @@ docker-login:
 	gcloud auth configure-docker us-docker.pkg.dev ;
 
 # build and push latest adiri image for amd64 and arm64
+# CARGO_FEATURES=adiri compiles in the testnet fork logic (ConsensusRegistry fork, ADIRI_DUP_BATCH_EPOCH).
 docker-adiri:
-	docker buildx build -f ./etc/Dockerfile --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
 
 # push local adiri:latest to the gcloud artifact registry
 docker-push:
@@ -181,10 +191,10 @@ revert-submodule:
 	cd tn-contracts && git checkout $(COMMIT_SHA)
 
 # workspace tests that don't require faucet credentials
-public-tests:
-	cargo nextest run --workspace --exclude tn-faucet --no-fail-fast ;
-	cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
-	cargo nextest run --run-ignored all test_restarts ;
+public-tests: build-e2e-bin
+	TN_BIN_PATH=$(E2E_BIN) cargo nextest run --workspace --exclude tn-faucet --no-fail-fast ;
+	TN_BIN_PATH=$(E2E_BIN) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH=$(E2E_BIN) cargo nextest run --run-ignored all test_restarts ;
 
 # local checks to ensure PR is ready
 pr:

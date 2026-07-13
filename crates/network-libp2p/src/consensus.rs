@@ -31,9 +31,11 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
+use lru::LruCache;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
+    num::NonZeroUsize,
     time::Duration,
 };
 use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
@@ -50,6 +52,22 @@ use tracing::{debug, error, info, instrument, trace, warn};
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
 mod network_tests;
+
+/// Hard cap on the number of distinct peers retained in
+/// [`ConsensusNetwork::published_to_peers`], the de-dup set that records which peers we have
+/// already pushed our [`NodeRecord`] to.
+///
+/// Without a cap this set grows once per distinct `PeerId` ever connected and is never cleaned up
+/// (a `PeerId` is a peer-minted cryptographic identity, so a churn of fresh identities grows it
+/// without bound), which on a RAM-capped node is a slow but guaranteed OOM. Backing the set with a
+/// capacity-bounded LRU caps its resident size to this many entries (~64-80 B each, so well under
+/// 1 MB) while preserving the de-dup intent: an actively (re)connecting peer is promoted on every
+/// connect and so is never the eviction victim, and only a peer absent long enough to fall out of
+/// the LRU is re-pushed to on its eventual return - at worst once, which is self-limiting.
+///
+/// The value is a generous multiple of the live-peer target (`PeerConfig::max_peers()` defaults to
+/// ~33), so the LRU only ever evicts peers well outside the current working set. See issue #828.
+const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("10_000 is nonzero");
 
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
@@ -224,9 +242,15 @@ where
     /// A peer connecting for the first time needs our record before it can resolve
     /// our BLS key, so we push it on `PeerConnected`. A peer that reconnects (or that
     /// flaps repeatedly, as observed with banned peers in adiri testnet) should already have
-    /// the record in their persistent kad store. This list is per-process-lifetime in case nodes
-    /// restart.
-    published_to_peers: HashSet<PeerId>,
+    /// the record in their persistent kad store, so we skip the push for peers already in here.
+    ///
+    /// A capacity-bounded LRU rather than an unbounded set: entries are never removed on
+    /// disconnect (removing them would re-enable the exact kad re-push amplification on flapping
+    /// peers that this de-dup gate exists to prevent), so an unbounded set would grow once per
+    /// distinct `PeerId` ever seen and eventually OOM a RAM-capped node. The LRU caps resident
+    /// size at [`MAX_PUBLISHED_TO_PEERS`] and promotes actively (re)connecting peers so they are
+    /// never evicted; see that constant for the full rationale.
+    published_to_peers: LruCache<PeerId, ()>,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
 }
@@ -455,7 +479,7 @@ where
             key_config,
             task_spawner,
             node_record,
-            published_to_peers: HashSet::new(),
+            published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             metrics: SwarmMetrics::new_for(&network_type),
         })
     }
@@ -549,6 +573,18 @@ where
             vec![peer].into_iter(),
             kad::Quorum::One,
         );
+    }
+
+    /// Record that we have pushed our [`NodeRecord`] to `peer_id`, returning `true` the first time
+    /// we see a peer (i.e. when a direct push is warranted) and `false` for a peer we have already
+    /// pushed to.
+    ///
+    /// Backed by the capacity-bounded [`Self::published_to_peers`] LRU so this de-dup gate cannot
+    /// grow without bound. A hit promotes the peer to most-recently-used, so an actively
+    /// (re)connecting peer is never evicted and never re-pushed to; only a peer absent long enough
+    /// to fall out of the LRU is pushed to again on its eventual return.
+    fn mark_published_to_peer(&mut self, peer_id: PeerId) -> bool {
+        self.published_to_peers.put(peer_id, ()).is_none()
     }
 
     /// Run the network loop to process incoming gossip.
@@ -1535,8 +1571,8 @@ where
 
                 // First-time connections need a direct record push so the peer can resolve
                 // our BLS key without waiting for the next kad publication interval. Skip
-                // on reconnects to avoid amplifying the local kad store on flapping peers
-                if self.published_to_peers.insert(peer_id) {
+                // on reconnects to avoid amplifying the local kad store on flapping peers.
+                if self.mark_published_to_peer(peer_id) {
                     self.publish_our_data_to_peer(peer_id);
                 }
 
@@ -1840,7 +1876,14 @@ where
                     .put(record)
                     .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
                 trace!(target: "network-kad", "Got record {key} {value:?}");
-                self.swarm.behaviour_mut().peer_manager.add_known_peer(key, value.info);
+                // a peer pushing its own record over its own connection (source == the record's
+                // network identity) also confirms its identity so a live non-committee connection
+                // (e.g. an nvv in the gossip mesh) is retained; relayed and non-self records stay
+                // committee-gated (issue #827).
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .add_self_advertised_peer(source, key, value.info);
             } else {
                 // A peer republishing a slightly stale (but signature-valid) record is
                 // expected after restarts and benign — the local store keeps the newer
@@ -1930,7 +1973,7 @@ where
                 self.swarm
                     .behaviour_mut()
                     .peer_manager
-                    .add_known_peer(query.request, node_record.info);
+                    .add_discovered_peer(query.request, node_record.info);
             }
         }
     }

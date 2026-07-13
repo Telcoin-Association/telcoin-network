@@ -4,6 +4,10 @@ ENV RUSTUP_TOOLCHAIN=1.94
 
 WORKDIR /usr/src/telcoin-network
 
+# Cargo features for the node build. Empty by default (mainnet/default image); the `docker-adiri`
+# target passes `--build-arg CARGO_FEATURES=adiri` to compile in the Adiri-testnet fork logic.
+ARG CARGO_FEATURES=
+
 # install dependencies
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -27,7 +31,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=./target,sharing=locked \
     rm -rf /usr/local/cargo/registry/src \
-    && cargo build --bin telcoin-network --release \
+    && cargo build -p telcoin-network --bin telcoin-network --release ${CARGO_FEATURES:+--features ${CARGO_FEATURES}} \
     && mv ./target/release/telcoin-network /tmp/
 
 # production image

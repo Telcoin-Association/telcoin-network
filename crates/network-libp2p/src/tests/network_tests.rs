@@ -1543,6 +1543,14 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
 
     let malicious_addr = config_2.primary_address();
 
+    // honest must resolve malicious_bls -> peer id to penalize it. the committee gate added in
+    // #827 drops kad-discovered records for non-committee keys, so register the malicious peer
+    // explicitly (an operator-provisioned, pinned path) instead. unlike committee membership this
+    // does not make honest re-dial the peer, so the Fatal ban disconnects and stays disconnected.
+    honest_peer
+        .add_explicit_peer(malicious_bls, config_2.primary_networkkey(), malicious_addr.clone())
+        .await?;
+
     // Connect malicious to honest
     malicious_peer
         .add_explicit_peer(
@@ -2608,6 +2616,14 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
         network.run().await.expect("nvv network run failed!");
     });
     nvv.start_listening(nvv_config.primary_address()).await?;
+    // seed the nvv's committee (target + the rest) BEFORE it connects so target's rpc-bearing
+    // record is retained the moment it arrives via kad; the committee gate added in #827 drops
+    // records for non-committee keys, and a late seed misses the record's first delivery. an nvv
+    // following the chain learns the committee from epoch state.
+    let committee_keys = std::iter::once(target_peer_bls)
+        .chain(committee.iter().map(|p| p.config.key_config().primary_public_key()))
+        .collect();
+    nvv.update_committees(Default::default(), committee_keys, Default::default()).await?;
     nvv.add_trusted_peer_and_dial(
         target_peer_bls,
         target_peer_net.clone(),
@@ -2696,6 +2712,14 @@ async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()>
     assert!(node_record.info.rpc.is_none());
     assert_eq!(node_record.info.multiaddrs, vec![peer2.config.primary_address()]);
 
+    // owner is a committee member so the gated discovery path (#827) retains its record;
+    // production applies committee membership from epoch state before processing records.
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        std::iter::once(owner_bls).collect(),
+        Default::default(),
+    );
+
     // an inbound put request stores the record and promotes it into `known_peers`
     network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
     assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&kad_record.key).is_some());
@@ -2748,6 +2772,14 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
         publisher: Some(owner_peer_id),
         expires: None,
     };
+
+    // owner is a committee member so the gated discovery path (#827) retains its record;
+    // production applies committee membership from epoch state before processing records.
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        std::iter::once(owner_bls).collect(),
+        Default::default(),
+    );
 
     network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
 
@@ -2941,6 +2973,77 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
         accepted_gossip_event(message, Some(bls), None);
     assert_matches!(event, NetworkEvent::Gossip { relayer: Some(got), .. } if got == bls);
     Ok(())
+}
+
+/// Regression test for issue #828: `published_to_peers` is a per-process-lifetime de-dup gate that
+/// is never cleaned on disconnect, so as an unbounded set it grew once per distinct `PeerId` ever
+/// seen and would eventually OOM a RAM-capped node. It is now a capacity-bounded LRU: a flood of
+/// fresh peer identities must pin it at [`MAX_PUBLISHED_TO_PEERS`] and never grow past it.
+#[tokio::test]
+async fn test_published_to_peers_is_bounded() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // The field is initialized at the intended cap and starts empty.
+    assert_eq!(network.published_to_peers.cap(), MAX_PUBLISHED_TO_PEERS);
+    assert_eq!(network.published_to_peers.len(), 0);
+
+    // Each fresh, never-before-seen peer is a first-time push (this is exactly what the
+    // `PeerEvent::PeerConnected` arm does when it sees a new `PeerId`). Overrun the cap and
+    // assert the set never grows past it.
+    let cap = MAX_PUBLISHED_TO_PEERS.get();
+    for _ in 0..(cap + 100) {
+        let peer_id = PeerId::random();
+        assert!(
+            network.mark_published_to_peer(peer_id),
+            "a never-before-seen peer must register as a first-time push"
+        );
+        assert!(
+            network.published_to_peers.len() <= cap,
+            "published_to_peers must never exceed its LRU capacity"
+        );
+    }
+
+    // The flood pinned the set at capacity rather than growing without bound.
+    assert_eq!(
+        network.published_to_peers.len(),
+        cap,
+        "a flood of distinct peers fills the LRU to exactly its capacity and stays there"
+    );
+}
+
+/// Regression test for issue #828: bounding `published_to_peers` must not reintroduce the kad
+/// re-push amplification the gate exists to prevent. An actively (re)connecting peer must stay
+/// resident in the LRU - so it keeps de-duping and is never re-pushed to - even while a flood of
+/// fresh peers churns the rest of the set.
+#[tokio::test]
+async fn test_published_to_peers_keeps_active_peer_resident() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // First sight of our sticky peer warrants a one-time push.
+    let sticky = PeerId::random();
+    assert!(
+        network.mark_published_to_peer(sticky),
+        "first sight of a peer must register as a first-time push"
+    );
+
+    // The sticky peer keeps reconnecting while enough fresh identities connect to overrun the
+    // cap. Because every reconnect promotes it to most-recently-used, it is never the eviction
+    // victim - unlike a plain insertion-order set, which would drop it after `cap` fresh inserts.
+    for _ in 0..(MAX_PUBLISHED_TO_PEERS.get() + 100) {
+        assert!(
+            !network.mark_published_to_peer(sticky),
+            "a reconnecting peer we have already pushed to must not be re-pushed"
+        );
+        network.mark_published_to_peer(PeerId::random());
+    }
+
+    // Despite the flood, the continually-active peer survived eviction and still de-dups.
+    assert!(
+        !network.mark_published_to_peer(sticky),
+        "an actively reconnecting peer must survive LRU eviction (no re-push storm)"
+    );
 }
 
 /// Regression for issue #819: a resolved author identity is carried on the delivered gossip
