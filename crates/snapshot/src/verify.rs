@@ -30,6 +30,7 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs::File,
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -298,6 +299,11 @@ fn verify_record_chain(
                 record.epoch
             )));
         }
+        // both committee lists must name distinct validators. next_committee is checked here as
+        // well as committee because epoch N's next_committee is consumed unchecked by restore's
+        // reconstruct_committee, so a duplicate there would otherwise slip through.
+        reject_duplicate_keys(record.epoch, "committee", &record.committee)?;
+        reject_duplicate_keys(record.epoch, "next_committee", &record.next_committee)?;
     }
 
     // pass 2b: epoch 0 anchors to the local genesis committee. production builds this record's
@@ -342,6 +348,28 @@ fn verify_record_chain(
         if !record.verify_with_cert(cert) {
             return Err(SnapshotError::Verification(format!(
                 "record for epoch {k} failed certificate verification (digest, quorum, or aggregate signature)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a committee-key list that names the same [`BlsPublicKey`] more than once.
+///
+/// A record's `committee` and `next_committee` must each be a set of distinct validators. A
+/// duplicate is dangerous because the certificate is an aggregate BLS signature checked against the
+/// keys gathered by committee index: one physical validator sitting at two positions can sign the
+/// epoch message once and have its key counted at every position it occupies, pushing the aggregate
+/// over the member-count super-quorum while representing a single vote. BLS aggregation is linear,
+/// so the signature over a repeated key verifies against that same repeated key — the certificate
+/// check alone cannot catch it. Rejecting duplicates up front keeps "super-quorum of members"
+/// honest and is the reason this runs in the cheap structural pass, before any pairing.
+fn reject_duplicate_keys(epoch: u32, field: &str, keys: &[BlsPublicKey]) -> SnapshotResult<()> {
+    let mut seen: HashSet<&BlsPublicKey> = HashSet::with_capacity(keys.len());
+    for key in keys {
+        if !seen.insert(key) {
+            return Err(SnapshotError::Verification(format!(
+                "record for epoch {epoch} lists duplicate key {key} in its {field}"
             )));
         }
     }
@@ -958,6 +986,28 @@ pub(crate) mod tests {
         let mut rng = StdRng::seed_from_u64(123);
         fx.genesis = committee_of(&sort_keys(gen_keys(4, &mut rng)));
         expect_verification(run(&fx).unwrap_err(), "trust-root mismatch");
+    }
+
+    #[test]
+    fn rejects_duplicate_committee_key() {
+        let mut spec = happy_spec();
+        // epoch 1's committee lists the same key twice. the dedup pass (2a) fires before the
+        // handoff pass (2c), so the duplicate — not the handoff mismatch it also induces — is the
+        // rejection, and a single physical validator cannot occupy two quorum slots.
+        spec.committees[1][1] = spec.committees[1][0].clone();
+        let fx = assemble(&finish(&spec), 2017, B256::from([0xaau8; 32]));
+        expect_verification(run(&fx).unwrap_err(), "in its committee");
+    }
+
+    #[test]
+    fn rejects_duplicate_next_committee_key() {
+        let mut spec = happy_spec();
+        let n = spec.committees.len() - 1;
+        // epoch N's next_committee is never checked by the handoff, but restore's
+        // reconstruct_committee consumes it, so a duplicate there must still be rejected.
+        spec.next_committees[n][1] = spec.next_committees[n][0];
+        let fx = assemble(&finish(&spec), 2017, B256::from([0xaau8; 32]));
+        expect_verification(run(&fx).unwrap_err(), "in its next_committee");
     }
 
     // ----- manifest binding rejections -----

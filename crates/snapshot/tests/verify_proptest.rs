@@ -522,6 +522,9 @@ enum Corruption {
     /// Swap one committee member of a later epoch for a fresh key, breaking the handoff from its
     /// predecessor's `next_committee`.
     Handoff { epoch_pick: u64, pos_pick: u64 },
+    /// List the same key twice in a later epoch's committee, so the record names a duplicate
+    /// validator.
+    DuplicateCommitteeKey { epoch_pick: u64 },
     /// Certify the last record with one signer fewer than its super-quorum.
     SubQuorumLast,
     /// Break one header's parent link.
@@ -570,6 +573,7 @@ fn arb_corruption() -> impl Strategy<Value = Corruption> {
         Just(Corruption::Epoch0Parent),
         (any::<u64>(), any::<u64>())
             .prop_map(|(epoch_pick, pos_pick)| Corruption::Handoff { epoch_pick, pos_pick }),
+        any::<u64>().prop_map(|epoch_pick| Corruption::DuplicateCommitteeKey { epoch_pick }),
         Just(Corruption::SubQuorumLast),
         any::<u64>().prop_map(|pick| Corruption::HeaderLink { pick }),
         Just(Corruption::FinalStateBinding),
@@ -606,6 +610,12 @@ fn apply_spec_corruption(c: &Corruption, spec: &mut ChainSpec, rng: &mut StdRng)
             let j = *pos_pick as usize % spec.committees[k].len();
             // the fresh key differs from the one epoch k-1's next_committee still advertises at j.
             spec.committees[k][j] = Arc::new(BlsKeypair::generate(rng));
+        }
+        Corruption::DuplicateCommitteeKey { epoch_pick } => {
+            let k = 1 + (*epoch_pick as usize % n); // a later epoch, never the genesis committee
+                                                    // list the same key twice; the dedup pass fires before the handoff pass, so the
+                                                    // duplicate is the rejection.
+            spec.committees[k][1] = spec.committees[k][0].clone();
         }
         Corruption::SubQuorumLast => {
             let size = spec.committees[n].len();
