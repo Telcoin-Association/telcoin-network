@@ -255,12 +255,16 @@ fn verify_artifact_integrity(staged_dir: &Path, entry: &ArtifactEntry) -> Snapsh
 /// Runs every record-chain invariant: contiguous epochs `0..=n`, epoch `0` bound to the trust root,
 /// `parent_hash`/`next_committee` chaining for later epochs, and a super-quorum certificate on
 /// every record. The manifest's `counts.records` is enforced against the actual length.
+///
+/// The cheap structural checks run before any BLS pairing; certificates are verified last, so a
+/// malformed or foreign chain is rejected without paying for a single signature verification.
 fn verify_record_chain(
     records: &[(EpochRecord, EpochCertificate)],
     n: u32,
     genesis_committee: &Committee,
     manifest: &Manifest,
 ) -> SnapshotResult<()> {
+    // pass 1: length. every later pass iterates this vector, so pin its length first.
     let expected_len = n as usize + 1;
     if records.len() != expected_len {
         return Err(SnapshotError::Verification(format!(
@@ -276,23 +280,28 @@ fn verify_record_chain(
         )));
     }
 
-    // every record must sit at its own epoch and be certified by a super-quorum of its committee.
-    for (k, (record, cert)) in records.iter().enumerate() {
+    // the passes below are ordered cheapest-first, and the per-record BLS certificate check (pass
+    // 3) runs last on purpose. each `verify_with_cert` costs a pairing per signer, and the
+    // records vector is decompressed under a cap that admits millions of entries, so a hostile
+    // bucket could otherwise force millions of pairings just by shipping a long, well-formed
+    // but foreign chain. the structural passes are all O(1) per record, and the epoch-0 anchor
+    // (pass 2b) pins the chain to this node's local genesis committee, so a snapshot for a
+    // different chain dies at zero pairings.
+
+    // pass 2a: every record must sit at its own epoch. this runs before the anchor and link passes
+    // because their messages describe records as "epoch k", which is only meaningful once index and
+    // epoch coincide.
+    for (k, (record, _cert)) in records.iter().enumerate() {
         if record.epoch != k as u32 {
             return Err(SnapshotError::Verification(format!(
                 "record at index {k} claims epoch {}, expected {k}",
                 record.epoch
             )));
         }
-        if !record.verify_with_cert(cert) {
-            return Err(SnapshotError::Verification(format!(
-                "record for epoch {k} failed certificate verification (digest, quorum, or aggregate signature)"
-            )));
-        }
     }
 
-    // epoch 0 anchors to the local genesis committee. production builds this record's committee
-    // from `Committee::bls_keys` (a sorted set), so compare against the same ordered key
+    // pass 2b: epoch 0 anchors to the local genesis committee. production builds this record's
+    // committee from `Committee::bls_keys` (a sorted set), so compare against the same ordered key
     // material; a mismatch means the snapshot belongs to a different chain than this node.
     let genesis_keys: Vec<BlsPublicKey> = genesis_committee.bls_keys().into_iter().collect();
     if records[0].0.committee != genesis_keys {
@@ -307,7 +316,8 @@ fn verify_record_chain(
         ));
     }
 
-    // later records chain by parent digest and inherit the previous epoch's next_committee.
+    // pass 2c: later records chain by parent digest and inherit the previous epoch's
+    // next_committee.
     for k in 1..records.len() {
         let record = &records[k].0;
         let prev = &records[k - 1].0;
@@ -321,6 +331,17 @@ fn verify_record_chain(
             return Err(SnapshotError::Verification(format!(
                 "record for epoch {k} committee does not match epoch {} next_committee (handoff mismatch)",
                 k - 1
+            )));
+        }
+    }
+
+    // pass 3: verify every record's aggregate-BLS certificate. this is the expensive pass, a
+    // pairing per signer, and runs last so the cheap structural checks above reject a malformed
+    // or foreign chain before any pairing is computed.
+    for (k, (record, cert)) in records.iter().enumerate() {
+        if !record.verify_with_cert(cert) {
+            return Err(SnapshotError::Verification(format!(
+                "record for epoch {k} failed certificate verification (digest, quorum, or aggregate signature)"
             )));
         }
     }
@@ -922,6 +943,21 @@ pub(crate) mod tests {
         spec.parent_overrides[0] = Some(EpochDigest::from(B256::from([0x01u8; 32])));
         let fx = assemble(&finish(&spec), 2017, B256::from([0xaau8; 32]));
         expect_verification(run(&fx).unwrap_err(), "non-zero parent_hash");
+    }
+
+    #[test]
+    fn foreign_chain_rejected_before_certificate_checks() {
+        // garbage every certificate: were the BLS pass to run first, epoch 0's record would fail
+        // with "certificate verification" before any structural check could speak.
+        let mut parts = finish(&happy_spec());
+        for (_record, cert) in &mut parts.records {
+            cert.epoch_hash = EpochDigest::from(B256::from([0xEEu8; 32]));
+        }
+        let mut fx = assemble(&parts, 2017, B256::from([0xaau8; 32]));
+        // a foreign trust root: the cheap epoch-0 anchor must fire before any pairing is computed.
+        let mut rng = StdRng::seed_from_u64(123);
+        fx.genesis = committee_of(&sort_keys(gen_keys(4, &mut rng)));
+        expect_verification(run(&fx).unwrap_err(), "trust-root mismatch");
     }
 
     // ----- manifest binding rejections -----
