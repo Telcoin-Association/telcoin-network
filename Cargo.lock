@@ -11589,6 +11589,7 @@ name = "telcoin-network-cli"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "backoff",
  "bs58",
  "clap",
  "comfy-table",

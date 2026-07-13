@@ -244,6 +244,30 @@ pub enum SnapshotError {
     Other(#[from] eyre::Report),
 }
 
+impl SnapshotError {
+    /// Returns `true` if this error is transient — a retry on the same input might succeed.
+    ///
+    /// Boot-time auto-restore uses this to decide whether to retry a failed download. A flaky
+    /// object store (throttling, a 5xx, a dropped connection) or a [`Timeout`](Self::Timeout)
+    /// is worth retrying; a deterministic failure is not. A
+    /// [`NotFound`](object_store::Error::NotFound) is deliberately treated as PERMANENT: on a
+    /// read-after-write-consistent store a missing `latest.json` or artifact will not appear
+    /// within a boot's retry budget, so retrying only delays a startup that should fail fast.
+    /// Every verification, integrity, manifest, or precondition failure is deterministic and
+    /// therefore permanent — including [`EpochTooOld`](Self::EpochTooOld), which reflects
+    /// operator policy, not a flaky source.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            // a missing object won't materialize within a boot's retry budget on a
+            // read-after-write-consistent store, so NotFound is permanent; every other object-store
+            // failure (throttling, 5xx, connection resets) is worth retrying.
+            SnapshotError::ObjectStore(object_store::Error::NotFound { .. }) => false,
+            SnapshotError::ObjectStore(_) | SnapshotError::Timeout(_) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Result alias for fallible snapshot operations.
 pub type SnapshotResult<T> = Result<T, SnapshotError>;
 
@@ -380,5 +404,38 @@ mod tests {
         fs::create_dir_all(&snapshots).unwrap();
         fs::write(snapshots.join(RESTORE_INCOMPLETE_MARKER), b"").unwrap();
         assert!(has_chain_data(&dd));
+    }
+
+    #[tokio::test]
+    async fn transience_classification() {
+        use object_store::{memory::InMemory, path::Path as ObjPath, ObjectStoreExt as _};
+
+        // a timeout is transient: the deadline may have been a blip.
+        assert!(SnapshotError::Timeout("slow".into()).is_transient());
+
+        // a real NotFound is permanent: a read-after-write-consistent bucket will not surface the
+        // missing object within a boot's retry budget. obtain a genuine NotFound from the store
+        // rather than constructing one, so the arm is tested against the real variant shape.
+        let not_found = InMemory::new().get(&ObjPath::from("missing")).await.unwrap_err();
+        assert!(matches!(not_found, object_store::Error::NotFound { .. }), "expected NotFound");
+        assert!(!SnapshotError::ObjectStore(not_found).is_transient());
+
+        // any other object-store failure (throttling, 5xx, connection reset) is transient.
+        let generic = object_store::Error::Generic { store: "test", source: "boom".into() };
+        assert!(SnapshotError::ObjectStore(generic).is_transient());
+
+        // every deterministic error is permanent: a retry cannot change the outcome.
+        for err in [
+            SnapshotError::Verification("bad sig".into()),
+            SnapshotError::Integrity("digest mismatch".into()),
+            SnapshotError::Manifest("bad layout".into()),
+            SnapshotError::ChainDataExists,
+            SnapshotError::MissingTrustRoot,
+            SnapshotError::RestoreIncomplete,
+            SnapshotError::Io(std::io::Error::other("disk full")),
+            SnapshotError::EpochTooOld { resolved: 3, min_epoch: 5 },
+        ] {
+            assert!(!err.is_transient(), "{err:?} must be permanent");
+        }
     }
 }

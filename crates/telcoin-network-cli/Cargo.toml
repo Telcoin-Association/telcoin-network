@@ -12,6 +12,7 @@ authors = [
 ]
 
 [dependencies]
+backoff = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 comfy-table = "7.2.2"
 eyre = { workspace = true }

@@ -7,8 +7,10 @@ use core::fmt;
 use eyre::WrapErr as _;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
-use tn_config::{Config, KeyConfig, TelcoinDirs};
+use std::{
+    future::Future, net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism,
+};
+use tn_config::{Config, KeyConfig, RetryConfig, TelcoinDirs};
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethCommand, RethConfig};
 use tn_snapshot::{
@@ -17,7 +19,7 @@ use tn_snapshot::{
 };
 use tn_types::Epoch;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Avaliable "named" chains.
 /// These will have embedded config files and can be joined after gereating keys.
@@ -340,7 +342,14 @@ async fn maybe_restore_from_snapshot<TND: TelcoinDirs>(
     min_epoch: Option<u32>,
     reth_config: &RethConfig,
 ) -> eyre::Result<()> {
-    let outcome = restore_from_snapshot(datadir, source_url, None, min_epoch, reth_config).await;
+    // retry transient source errors (a flaky object store, a timeout) on a bounded boot budget:
+    // they all occur before the restore marker is written, so re-running re-enters a clean
+    // precheck. permanent failures (verification, a precondition, the min-epoch floor) stop at
+    // once.
+    let outcome = restore_with_retry(RetryConfig::default(), source_url, || {
+        restore_from_snapshot(datadir, source_url, None, min_epoch, reth_config)
+    })
+    .await;
     match interpret_auto_restore(outcome, source_url)? {
         Some(epoch) => {
             info!(
@@ -359,6 +368,48 @@ async fn maybe_restore_from_snapshot<TND: TelcoinDirs>(
         }
     }
     Ok(())
+}
+
+/// Run `op` under `retry`, classifying [`SnapshotError`]s as transient or permanent for backoff.
+///
+/// Boot auto-restore's transient failures (a flaky object store, a timeout) all originate in the
+/// download-and-verify phase, strictly BEFORE the restore marker is written, so re-running the
+/// whole operation re-enters a clean precheck on an untouched datadir. A transient error is retried
+/// with a warning; every permanent error (verification, integrity, a precondition, an operator-set
+/// floor) stops immediately. Only startup auto-restore retries — the manual `snapshot
+/// restore`/`verify` paths are interactive, so an operator retries them by hand. See
+/// [`RetryConfig`] for the schedule.
+async fn restore_with_retry<F, Fut>(
+    retry: RetryConfig,
+    source_url: &str,
+    mut op: F,
+) -> SnapshotResult<RestoreReceipt>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = SnapshotResult<RestoreReceipt>>,
+{
+    retry
+        .retry(|| {
+            // build the operation's future eagerly, then move it into the mapping block so the
+            // returned future never borrows `op` — the shape backoff's FnMut operation requires.
+            let attempt = op();
+            async move {
+                attempt.await.map_err(|err| {
+                    if err.is_transient() {
+                        warn!(
+                            target: "tn::snapshot",
+                            error = %err,
+                            source = %source_url,
+                            "snapshot auto-restore hit a transient source error; retrying"
+                        );
+                        backoff::Error::transient(err)
+                    } else {
+                        backoff::Error::permanent(err)
+                    }
+                })
+            }
+        })
+        .await
 }
 
 /// Interpret a snapshot auto-restore outcome as a startup decision.
@@ -386,6 +437,10 @@ fn interpret_auto_restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
     use tn_snapshot::{manifest::Counts, DEFAULT_KEEP_LAST};
     use tn_types::{BlockNumHash, ConsensusNumHash, B256};
 
@@ -394,6 +449,33 @@ mod tests {
         let mut argv = vec!["tn"];
         argv.extend_from_slice(extra);
         NodeCommand::<NoArgs>::try_parse_from(argv).expect("node command parsed").snapshot
+    }
+
+    /// A minimal restore receipt for the interpret and retry tests.
+    fn a_receipt() -> RestoreReceipt {
+        RestoreReceipt {
+            epoch: 9,
+            final_state: BlockNumHash::default(),
+            final_consensus: ConsensusNumHash::default(),
+            state_root: B256::default(),
+            counts: Counts::default(),
+            chain_id: 2017,
+            genesis_hash: B256::default(),
+            node_version: String::new(),
+            source_url: String::new(),
+            restored_at: 0,
+        }
+    }
+
+    /// A retry config with millisecond intervals and a short budget so the retry tests finish fast.
+    fn fast_retry() -> RetryConfig {
+        RetryConfig {
+            initial_retry_interval: Duration::from_millis(1),
+            max_retry_interval: Duration::from_millis(1),
+            retry_delay_multiplier: 1.0,
+            retry_delay_rand_factor: 0.0,
+            retrying_max_elapsed_time: Some(Duration::from_millis(50)),
+        }
     }
 
     #[test]
@@ -464,19 +546,8 @@ mod tests {
 
     #[test]
     fn interpret_restore_installs_on_success() {
-        let receipt = RestoreReceipt {
-            epoch: 9,
-            final_state: BlockNumHash::default(),
-            final_consensus: ConsensusNumHash::default(),
-            state_root: B256::default(),
-            counts: Counts::default(),
-            chain_id: 2017,
-            genesis_hash: B256::default(),
-            node_version: String::new(),
-            source_url: String::new(),
-            restored_at: 0,
-        };
-        let decision = interpret_auto_restore(Ok(receipt), "file:///bucket").expect("ok outcome");
+        let decision =
+            interpret_auto_restore(Ok(a_receipt()), "file:///bucket").expect("ok outcome");
         assert_eq!(decision, Some(9));
     }
 
@@ -502,5 +573,52 @@ mod tests {
             let _ = interpret_auto_restore(Err(err), "file:///bucket")
                 .expect_err("non-skip errors must fail startup");
         }
+    }
+
+    #[tokio::test]
+    async fn retry_recovers_from_transient_errors() {
+        let attempts = AtomicUsize::new(0);
+        let outcome = restore_with_retry(fast_retry(), "file:///bucket", || {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(SnapshotError::Timeout("flaky".into()))
+                } else {
+                    Ok(a_receipt())
+                }
+            }
+        })
+        .await;
+        assert!(outcome.is_ok(), "transient errors must be retried through to success");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "two transient failures then a success");
+    }
+
+    #[tokio::test]
+    async fn retry_stops_immediately_on_permanent_error() {
+        let attempts = AtomicUsize::new(0);
+        let outcome = restore_with_retry(fast_retry(), "file:///bucket", || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<RestoreReceipt, _>(SnapshotError::Verification("bad sig".into())) }
+        })
+        .await;
+        assert!(matches!(outcome, Err(SnapshotError::Verification(_))), "got {outcome:?}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "a permanent error must not be retried");
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_after_budget() {
+        let attempts = AtomicUsize::new(0);
+        let outcome = restore_with_retry(fast_retry(), "file:///bucket", || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<RestoreReceipt, _>(SnapshotError::Timeout("always".into())) }
+        })
+        .await;
+        // the transient error never clears, so retry exhausts its elapsed-time budget and returns
+        // the last error rather than looping forever.
+        assert!(matches!(outcome, Err(SnapshotError::Timeout(_))), "got {outcome:?}");
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "a transient error must be retried at least once before giving up"
+        );
     }
 }
