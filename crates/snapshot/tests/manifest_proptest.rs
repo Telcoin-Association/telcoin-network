@@ -58,9 +58,14 @@ fn arb_artifact_kind() -> impl Strategy<Value = ArtifactKind> {
     ]
 }
 
-/// Arbitrary artifact entry with an arbitrary (unicode-capable) name.
+/// Arbitrary artifact entry with a separator-free name.
+///
+/// `Manifest::validate` requires each artifact name to be a single path component, so the name
+/// strategy is drawn from a separator-free, non-empty character set. `arb_manifest` additionally
+/// prefixes each name with its index, which makes names unique and rules out the `.`/`..` specials.
 fn arb_artifact_entry() -> impl Strategy<Value = ArtifactEntry> {
-    (any::<String>(), arb_artifact_kind(), any::<u64>(), arb_sha256_hex())
+    let name = prop::string::string_regex("[a-zA-Z0-9._-]{1,16}").expect("static regex is valid");
+    (name, arb_artifact_kind(), any::<u64>(), arb_sha256_hex())
         .prop_map(|(name, kind, size, sha256)| ArtifactEntry { name, kind, size, sha256 })
 }
 
@@ -106,20 +111,32 @@ fn arb_manifest() -> impl Strategy<Value = Manifest> {
             (chain_id, genesis_hash, epoch),
             (final_state, final_consensus, epoch_record_digest),
             (created_at, node_version, artifacts, counts, fee_derivable),
-        )| Manifest {
-            format_version: FORMAT_VERSION,
-            kind: KIND_STATE_ONLY.to_string(),
-            chain_id,
-            genesis_hash,
-            epoch,
-            final_state,
-            final_consensus,
-            epoch_record_digest,
-            created_at,
-            node_version,
-            artifacts,
-            counts,
-            fee_derivable,
+        )| {
+            // prefix each name with its index so names are unique and never `.`/`..`; combined with
+            // the separator-free base this satisfies Manifest::validate for any generated set.
+            let artifacts = artifacts
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut entry)| {
+                    entry.name = format!("{i:03}-{}", entry.name);
+                    entry
+                })
+                .collect();
+            Manifest {
+                format_version: FORMAT_VERSION,
+                kind: KIND_STATE_ONLY.to_string(),
+                chain_id,
+                genesis_hash,
+                epoch,
+                final_state,
+                final_consensus,
+                epoch_record_digest,
+                created_at,
+                node_version,
+                artifacts,
+                counts,
+                fee_derivable,
+            }
         },
     )
 }

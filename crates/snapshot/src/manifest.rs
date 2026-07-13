@@ -116,12 +116,21 @@ impl Manifest {
         Ok(serde_json::to_vec(self)?)
     }
 
-    /// Check the version and kind invariants that every consumer relies on.
+    /// Check the version, kind, and artifact-name invariants that every consumer relies on.
+    ///
+    /// Every consumer joins an artifact's [`name`](ArtifactEntry::name) onto a local staging
+    /// directory to form the path it downloads to, so each name must be a single relative path
+    /// component: non-empty, neither `.` nor `..`, and free of `/` or `\` separators. A name
+    /// carrying a separator or a parent reference could otherwise escape the staging directory and
+    /// write to an arbitrary path. Names must also be unique, because two entries sharing a name
+    /// would silently overwrite one another in staging. The exporter only ever emits single, unique
+    /// component names, so an honest publisher is unaffected; the check runs on both parse and
+    /// serialize so a tampered manifest is rejected before any artifact is fetched.
     ///
     /// # Errors
     ///
-    /// Returns [`SnapshotError::Manifest`] if `format_version` is not [`FORMAT_VERSION`] or `kind`
-    /// is not [`KIND_STATE_ONLY`].
+    /// Returns [`SnapshotError::Manifest`] if `format_version` is not [`FORMAT_VERSION`], `kind` is
+    /// not [`KIND_STATE_ONLY`], or any artifact name is not a unique single path component.
     pub fn validate(&self) -> SnapshotResult<()> {
         if self.format_version != FORMAT_VERSION {
             return Err(SnapshotError::Manifest(format!(
@@ -134,6 +143,25 @@ impl Manifest {
                 "unsupported manifest kind {:?} (expected {KIND_STATE_ONLY:?})",
                 self.kind
             )));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.artifacts.len());
+        for artifact in &self.artifacts {
+            let name = artifact.name.as_str();
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.contains('\\')
+            {
+                return Err(SnapshotError::Manifest(format!(
+                    "artifact name {name:?} is not a single relative path component"
+                )));
+            }
+            if !seen.insert(name) {
+                return Err(SnapshotError::Manifest(format!(
+                    "artifact name {name:?} is listed more than once"
+                )));
+            }
         }
         Ok(())
     }
@@ -400,6 +428,32 @@ mod tests {
 
         let err = Manifest::from_json(&bytes).unwrap_err();
         assert!(matches!(err, SnapshotError::Manifest(_)), "expected Manifest error, got {err:?}");
+    }
+
+    #[test]
+    fn artifact_names_must_be_single_components() {
+        for bad in ["", ".", "..", "a/b", "/abs", "a\\b", "../x"] {
+            let mut manifest = sample_manifest();
+            manifest.artifacts[0].name = bad.to_string();
+            // serialize raw (bypassing to_json's outbound validation) so from_json runs the check
+            // on the parse path every consumer uses
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            let err = Manifest::from_json(&bytes).unwrap_err();
+            assert!(
+                matches!(err, SnapshotError::Manifest(_)),
+                "name {bad:?} must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_artifact_names_are_rejected() {
+        let mut manifest = sample_manifest();
+        let name = manifest.artifacts[0].name.clone();
+        manifest.artifacts[1].name = name;
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let err = Manifest::from_json(&bytes).unwrap_err();
+        assert!(matches!(err, SnapshotError::Manifest(_)), "got {err:?}");
     }
 
     #[test]
