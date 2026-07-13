@@ -30,6 +30,9 @@
 //! deletes the partial chain data this run created (reth db, static files, consensus db) but KEEPS
 //! the marker, so [`has_chain_data`] keeps reporting `true` and an operator must clear the datadir
 //! before another attempt.
+//!
+//! Once every install step succeeds the marker is cleared BEFORE the informational receipt is
+//! written, so a failure writing that receipt can never re-quarantine an already-restored datadir.
 
 use crate::{
     has_chain_data,
@@ -55,7 +58,7 @@ use tn_types::{
     now, Address, BlockNumHash, BlsPublicKey, Committee, CommitteeBuilder, ConsensusNumHash, Epoch,
     Genesis, TaskManager, B256,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Restore a verified snapshot from `source_url` onto `datadir`, returning a receipt of what
 /// landed.
@@ -127,7 +130,9 @@ pub async fn restore_from_snapshot<TND: TelcoinDirs>(
             }
         };
 
-    // step 6: write the receipt, clear the marker, and drop the staging directory.
+    // step 6: installation is complete. clear the marker, then write a best-effort receipt, then
+    // drop the staging directory. clearing the marker before writing the receipt is load-bearing
+    // (see finalize_restore).
     let manifest = &prepared.verified.manifest;
     let receipt = RestoreReceipt {
         epoch: manifest.epoch,
@@ -141,8 +146,7 @@ pub async fn restore_from_snapshot<TND: TelcoinDirs>(
         source_url: source_url.to_string(),
         restored_at: now(),
     };
-    fs::write(snapshots_path.join(LAST_RESTORE_FILENAME), serde_json::to_vec_pretty(&receipt)?)?;
-    let _ = fs::remove_file(&marker);
+    finalize_restore(&snapshots_path, &marker, &receipt);
     let _ = fs::remove_dir_all(&staging_root);
 
     info!(
@@ -670,6 +674,36 @@ fn delete_chain_data<TND: TelcoinDirs>(datadir: &TND) {
     let _ = fs::remove_dir_all(datadir.consensus_db_path());
 }
 
+/// Finalize a completed restore: clear the incomplete-restore marker, then write the receipt.
+///
+/// The ordering is load-bearing. By the time this runs every install step has succeeded, so the
+/// datadir holds a good restored snapshot. Removing the marker FIRST means a failure writing the
+/// purely-informational receipt can never re-quarantine that good datadir. An earlier version wrote
+/// the receipt first and propagated its error, which surfaced as a fatal
+/// [`SnapshotError::RestoreIncomplete`] on the next boot even though the restore had in fact
+/// completed. Both the marker removal and the receipt write are therefore best-effort: any failure
+/// is logged and swallowed, never returned.
+fn finalize_restore(snapshots_path: &Path, marker: &Path, receipt: &RestoreReceipt) {
+    if let Err(e) = fs::remove_file(marker) {
+        warn!(
+            target: "tn::snapshot",
+            error = %e,
+            "restore completed but clearing the incomplete-restore marker failed; the datadir stays quarantined until the marker is cleared manually"
+        );
+    }
+
+    match serde_json::to_vec_pretty(receipt) {
+        Ok(bytes) => {
+            if let Err(e) = fs::write(snapshots_path.join(LAST_RESTORE_FILENAME), bytes) {
+                warn!(target: "tn::snapshot", error = %e, "restore completed but writing the receipt failed");
+            }
+        }
+        Err(e) => {
+            warn!(target: "tn::snapshot", error = %e, "restore completed but serializing the receipt failed");
+        }
+    }
+}
+
 /// Wrap a consensus-store error (which is not part of the crate's `From` set) as
 /// [`SnapshotError::Other`].
 fn consensus_error<E: std::fmt::Display>(err: E) -> SnapshotError {
@@ -1195,5 +1229,55 @@ mod tests {
         assert!(!static_files.exists(), "static files must be removed");
         assert!(!cdb.exists(), "consensus db must be removed");
         assert!(marker.exists(), "the marker must survive so the datadir stays quarantined");
+    }
+
+    // ----- restore finalization -----
+
+    /// A minimal restore receipt for the finalize tests.
+    fn a_receipt() -> RestoreReceipt {
+        RestoreReceipt {
+            epoch: 7,
+            final_state: BlockNumHash::new(4200, B256::from([0x22; 32])),
+            final_consensus: ConsensusNumHash::new(99, B256::from([0x33; 32]).into()),
+            state_root: B256::from([0x44; 32]),
+            counts: Counts::default(),
+            chain_id: TEST_CHAIN_ID,
+            genesis_hash: B256::from([0x11; 32]),
+            node_version: "tn-test/0.1.0".to_string(),
+            source_url: "file:///bucket".to_string(),
+            restored_at: 1,
+        }
+    }
+
+    #[test]
+    fn finalize_restore_removes_marker_then_writes_receipt() {
+        let dir = tempdir().unwrap();
+        let snapshots = dir.path().join("snapshots");
+        fs::create_dir_all(&snapshots).unwrap();
+        let marker = snapshots.join(RESTORE_INCOMPLETE_MARKER);
+        fs::write(&marker, b"").unwrap();
+
+        let receipt = a_receipt();
+        finalize_restore(&snapshots, &marker, &receipt);
+
+        assert!(!marker.exists(), "marker must be cleared");
+        let bytes = fs::read(snapshots.join(LAST_RESTORE_FILENAME)).unwrap();
+        let parsed: RestoreReceipt = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed, receipt, "the written receipt must parse back to the original");
+    }
+
+    #[test]
+    fn finalize_restore_survives_receipt_write_failure() {
+        let dir = tempdir().unwrap();
+        let snapshots = dir.path().join("snapshots");
+        fs::create_dir_all(&snapshots).unwrap();
+        let marker = snapshots.join(RESTORE_INCOMPLETE_MARKER);
+        fs::write(&marker, b"").unwrap();
+        // pre-create the receipt path AS A DIRECTORY so the receipt write fails
+        fs::create_dir_all(snapshots.join(LAST_RESTORE_FILENAME)).unwrap();
+
+        // must not panic and must still clear the marker despite the receipt write failing
+        finalize_restore(&snapshots, &marker, &a_receipt());
+        assert!(!marker.exists(), "marker must be cleared even when the receipt write fails");
     }
 }
