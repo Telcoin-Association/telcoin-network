@@ -527,6 +527,9 @@ enum Corruption {
     DuplicateCommitteeKey { epoch_pick: u64 },
     /// Certify the last record with one signer fewer than its super-quorum.
     SubQuorumLast,
+    /// Collapse a later epoch's `final_consensus` height onto its predecessor's, breaking the
+    /// strict increase across the chain.
+    NonMonotonicFinalConsensus { pick: u64 },
     /// Break one header's parent link.
     HeaderLink { pick: u64 },
     /// Mutate the last header via a non-linking field so the recomputed window no longer ends at
@@ -575,6 +578,7 @@ fn arb_corruption() -> impl Strategy<Value = Corruption> {
             .prop_map(|(epoch_pick, pos_pick)| Corruption::Handoff { epoch_pick, pos_pick }),
         any::<u64>().prop_map(|epoch_pick| Corruption::DuplicateCommitteeKey { epoch_pick }),
         Just(Corruption::SubQuorumLast),
+        any::<u64>().prop_map(|pick| Corruption::NonMonotonicFinalConsensus { pick }),
         any::<u64>().prop_map(|pick| Corruption::HeaderLink { pick }),
         Just(Corruption::FinalStateBinding),
         Just(Corruption::ManifestDigest),
@@ -621,6 +625,12 @@ fn apply_spec_corruption(c: &Corruption, spec: &mut ChainSpec, rng: &mut StdRng)
             let size = spec.committees[n].len();
             let quorum = ((size * 2) / 3) + 1;
             spec.signer_positions[n] = (0..quorum - 1).collect();
+        }
+        Corruption::NonMonotonicFinalConsensus { pick } => {
+            let k = 1 + (*pick as usize % n); // a later epoch; epoch 0 has no predecessor to trail
+                                              // collapse this epoch's consensus checkpoint onto its predecessor's, so the broken
+                                              // strict-increase is the only violated invariant.
+            spec.final_consensus[k] = spec.final_consensus[k - 1];
         }
         Corruption::HeaderLink { pick } => {
             let i = *pick as usize % spec.headers.len();

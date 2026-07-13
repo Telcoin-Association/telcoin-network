@@ -198,6 +198,12 @@ impl EpochRecordDb {
     }
 
     /// Update final_numbers with record data.
+    ///
+    /// `final_consensus.number` is the epoch's last consensus block number and must be strictly
+    /// increasing across epochs. Appending a new epoch therefore requires a number strictly greater
+    /// than the current tail, and re-saving an already-recorded epoch requires the same number it
+    /// was first recorded with — the records pack is append-only and keeps the first record, so a
+    /// differing number could only desync this cache from the pack and corrupt `number_to_epoch`.
     fn update_finals(&self, record: &EpochRecord) -> Result<(), EpochDbError> {
         let epoch = record.epoch as usize;
         let number = record.final_consensus.number;
@@ -207,8 +213,21 @@ impl EpochRecordDb {
             return Err(EpochDbError::EpochOutOfOrder(finals_len as u32, epoch as u32));
         }
         if epoch < finals_len {
-            finals[epoch] = number;
+            // re-save of an already-recorded epoch: the number must match what the pack holds.
+            if finals[epoch] != number {
+                return Err(EpochDbError::FinalConsensusMismatch(
+                    record.epoch,
+                    number,
+                    finals[epoch],
+                ));
+            }
         } else {
+            // new tail: must strictly exceed the previous epoch's number (epoch 0 has no floor).
+            if let Some(&last) = finals.last() {
+                if number <= last {
+                    return Err(EpochDbError::FinalConsensusOutOfOrder(record.epoch, number, last));
+                }
+            }
             finals.push(number);
         }
         Ok(())
@@ -390,8 +409,10 @@ impl EpochRecordDb {
     ///
     /// Uses binary search (`partition_point`) over `final_numbers` for O(log n)
     /// lookup. The vector is guaranteed sorted because [`update_finals`] enforces
-    /// sequential epoch insertion. If `number` is beyond the last stored epoch,
-    /// returns `last_epoch + 1` (the current in-progress epoch).
+    /// sequential epoch insertion and a strictly-increasing `final_consensus`
+    /// number on every append (a re-save of an existing epoch must repeat the
+    /// recorded number, so it cannot perturb the order). If `number` is beyond the
+    /// last stored epoch, returns `last_epoch + 1` (the current in-progress epoch).
     pub fn number_to_epoch(&self, number: u64) -> Epoch {
         let finals = self.final_numbers.lock();
         finals.partition_point(|final_num| number > *final_num) as u32
@@ -704,6 +725,8 @@ pub enum EpochDbError {
     Open(Arc<OpenError>),
     EpochAlreadySaved,
     EpochOutOfOrder(Epoch, Epoch),
+    FinalConsensusOutOfOrder(Epoch, u64, u64),
+    FinalConsensusMismatch(Epoch, u64, u64),
     SendFailed,
     ReceiveFailed,
     PersistError(String),
@@ -723,6 +746,18 @@ impl Display for EpochDbError {
             EpochDbError::EpochAlreadySaved => write!(f, "Epoch record already saved"),
             EpochDbError::EpochOutOfOrder(expected, got) => {
                 write!(f, "Epochs must be saved in order; expected {expected}, got {got}")
+            }
+            EpochDbError::FinalConsensusOutOfOrder(epoch, number, previous) => {
+                write!(
+                    f,
+                    "epoch {epoch} final_consensus number {number} must exceed the previous epoch's {previous}"
+                )
+            }
+            EpochDbError::FinalConsensusMismatch(epoch, number, recorded) => {
+                write!(
+                    f,
+                    "epoch {epoch} re-saved with final_consensus number {number} but {recorded} already recorded"
+                )
             }
             EpochDbError::SendFailed => write!(f, "Internal channel send failed"),
             EpochDbError::ReceiveFailed => write!(f, "Internal channel receive failed"),
@@ -768,7 +803,7 @@ mod test {
         Signer as _,
     };
 
-    use crate::epoch_records::{EpochRecordDb, RECORDS_NAME};
+    use crate::epoch_records::{EpochDbError, EpochRecordDb, RECORDS_NAME};
 
     // Minimal BlsSigner wrapper around a BlsKeypair.
     #[derive(Clone)]
@@ -832,6 +867,16 @@ mod test {
         }
         let cert = EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
         (record, cert)
+    }
+
+    /// Build a minimal [`EpochRecord`] carrying only the two fields `update_finals` reads: the
+    /// epoch and its `final_consensus` number.
+    fn record_with(epoch: Epoch, final_number: u64) -> EpochRecord {
+        EpochRecord {
+            epoch,
+            final_consensus: ConsensusNumHash::new(final_number, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
@@ -1022,5 +1067,62 @@ mod test {
 
         // Beyond the one-epoch fallback horizon there is nothing to serve.
         assert!(db.get_committee_keys(3).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_finals_monotonic_append() {
+        let temp_dir = TempDir::with_prefix("test_update_finals_monotonic").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+
+        // epoch 0 seeds the tail with no floor to clear; a strictly higher number then appends.
+        db.update_finals(&record_with(0, 10)).expect("append epoch 0");
+        db.update_finals(&record_with(1, 20)).expect("append epoch 1");
+
+        // update_finals runs before the background channel send, so an out-of-order number is
+        // rejected synchronously. equal to the current tail is not a strict increase.
+        match db.update_finals(&record_with(2, 20)) {
+            Err(EpochDbError::FinalConsensusOutOfOrder(epoch, number, previous)) => {
+                assert_eq!((epoch, number, previous), (2, 20, 20));
+            }
+            other => panic!("expected FinalConsensusOutOfOrder for an equal number, got {other:?}"),
+        }
+        // lower than the tail is likewise rejected.
+        match db.update_finals(&record_with(2, 15)) {
+            Err(EpochDbError::FinalConsensusOutOfOrder(epoch, number, previous)) => {
+                assert_eq!((epoch, number, previous), (2, 15, 20));
+            }
+            other => panic!("expected FinalConsensusOutOfOrder for a lower number, got {other:?}"),
+        }
+        // a strictly higher number extends the tail.
+        db.update_finals(&record_with(2, 30)).expect("append epoch 2");
+
+        // the ascending tail [10, 20, 30] keeps number_to_epoch's binary search correct.
+        assert_eq!(db.number_to_epoch(5), 0);
+        assert_eq!(db.number_to_epoch(10), 0);
+        assert_eq!(db.number_to_epoch(11), 1);
+        assert_eq!(db.number_to_epoch(20), 1);
+        assert_eq!(db.number_to_epoch(30), 2);
+        assert_eq!(db.number_to_epoch(31), 3);
+    }
+
+    #[tokio::test]
+    async fn test_update_finals_conflicting_resave() {
+        let temp_dir = TempDir::with_prefix("test_update_finals_resave").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+
+        db.update_finals(&record_with(0, 10)).expect("append epoch 0");
+        db.update_finals(&record_with(1, 20)).expect("append epoch 1");
+
+        // re-saving an epoch with its recorded number is idempotent.
+        db.update_finals(&record_with(0, 10)).expect("idempotent re-save");
+
+        // re-saving with a different number is rejected: the append-only pack keeps the original,
+        // so the cache must not diverge from it.
+        match db.update_finals(&record_with(0, 99)) {
+            Err(EpochDbError::FinalConsensusMismatch(epoch, number, recorded)) => {
+                assert_eq!((epoch, number, recorded), (0, 99, 10));
+            }
+            other => panic!("expected FinalConsensusMismatch, got {other:?}"),
+        }
     }
 }

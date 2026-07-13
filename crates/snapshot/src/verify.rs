@@ -339,6 +339,17 @@ fn verify_record_chain(
                 k - 1
             )));
         }
+        // final_consensus is the epoch's last consensus block number, so it must strictly increase
+        // across the chain: number_to_epoch binary-searches these numbers, and two epochs sharing a
+        // consensus height (or one going backwards) would corrupt that mapping.
+        if record.final_consensus.number <= prev.final_consensus.number {
+            return Err(SnapshotError::Verification(format!(
+                "record for epoch {k} final_consensus number {} does not increase over epoch {} ({})",
+                record.final_consensus.number,
+                k - 1,
+                prev.final_consensus.number
+            )));
+        }
     }
 
     // pass 3: verify every record's aggregate-BLS certificate. this is the expensive pass, a
@@ -1008,6 +1019,21 @@ pub(crate) mod tests {
         spec.next_committees[n][1] = spec.next_committees[n][0];
         let fx = assemble(&finish(&spec), 2017, B256::from([0xaau8; 32]));
         expect_verification(run(&fx).unwrap_err(), "in its next_committee");
+    }
+
+    #[test]
+    fn rejects_non_monotonic_final_consensus() {
+        // an equal consensus height between epochs 1 and 2 is not a strict increase.
+        let mut spec = happy_spec();
+        spec.final_consensus[2] = spec.final_consensus[1];
+        let fx = assemble(&finish(&spec), 2017, B256::from([0xaau8; 32]));
+        expect_verification(run(&fx).unwrap_err(), "does not increase");
+
+        // a strictly decreasing consensus height is likewise rejected.
+        let mut spec = happy_spec();
+        spec.final_consensus[2] = ConsensusNumHash::new(5, B256::from([0x22u8; 32]).into());
+        let fx = assemble(&finish(&spec), 2017, B256::from([0xaau8; 32]));
+        expect_verification(run(&fx).unwrap_err(), "does not increase");
     }
 
     // ----- manifest binding rejections -----
