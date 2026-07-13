@@ -434,6 +434,16 @@ async fn resolve_manifest(
                     pointer.chain_id
                 )));
             }
+            // the pointer's manifest_key must be exactly the canonical key for the epoch it names.
+            // the sha256 binding below pins the manifest's CONTENT but not its LOCATION, so without
+            // this a bucket could redirect a valid pointer at an off-layout object it controls.
+            let canonical_key = SnapshotStore::manifest_key(pointer.epoch);
+            if pointer.manifest_key != canonical_key {
+                return Err(SnapshotError::Manifest(format!(
+                    "latest.json manifest_key {:?} is not the canonical key {canonical_key:?} for epoch {}",
+                    pointer.manifest_key, pointer.epoch
+                )));
+            }
             let manifest_bytes = store.get_json_bytes(&pointer.manifest_key).await?;
             let actual = sha256_hex(&manifest_bytes);
             if !actual.eq_ignore_ascii_case(&pointer.manifest_sha256) {
@@ -444,6 +454,14 @@ async fn resolve_manifest(
             }
             let manifest = Manifest::from_json(&manifest_bytes)?;
             check_manifest_chain(&manifest, chain_id)?;
+            // the canonical-key check pins the layout; this pins the manifest's own epoch to the
+            // one the pointer advertised, so a pointer cannot name epoch X while serving epoch Y.
+            if manifest.epoch != pointer.epoch {
+                return Err(SnapshotError::Manifest(format!(
+                    "latest.json advertises epoch {} but the manifest at its canonical key is epoch {}",
+                    pointer.epoch, manifest.epoch
+                )));
+            }
             Ok((manifest.epoch, manifest))
         }
     }
@@ -994,6 +1012,60 @@ mod tests {
             epoch: 3,
             manifest_key: SnapshotStore::manifest_key(3),
             manifest_sha256: "00".repeat(32),
+            updated_at: 1,
+        };
+        store.put_bytes(LATEST_KEY, pointer.to_json().unwrap()).await.unwrap();
+
+        let err = resolve_manifest(&store, TEST_CHAIN_ID, None).await.unwrap_err();
+        assert!(matches!(err, SnapshotError::Manifest(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_noncanonical_manifest_key() {
+        let bucket = tempdir().unwrap();
+        let store = file_store(bucket.path());
+        let fx = assemble(&finish(&happy_spec()), TEST_CHAIN_ID, B256::from([0xaa; 32]));
+        let n = fx.manifest.epoch;
+        let manifest_bytes = fx.manifest.to_json().unwrap();
+
+        // publish the real manifest at BOTH its canonical key and an off-layout key
+        store.put_bytes(&SnapshotStore::manifest_key(n), manifest_bytes.clone()).await.unwrap();
+        store.put_bytes("evil/manifest.json", manifest_bytes.clone()).await.unwrap();
+
+        // the pointer names the off-layout key with the CORRECT sha, so only the canonical-key
+        // check can reject it: this proves the layout rule beats the sha binding.
+        let pointer = Pointer {
+            format_version: FORMAT_VERSION,
+            chain_id: TEST_CHAIN_ID,
+            epoch: n,
+            manifest_key: "evil/manifest.json".to_string(),
+            manifest_sha256: sha256_hex(&manifest_bytes),
+            updated_at: 1,
+        };
+        store.put_bytes(LATEST_KEY, pointer.to_json().unwrap()).await.unwrap();
+
+        let err = resolve_manifest(&store, TEST_CHAIN_ID, None).await.unwrap_err();
+        assert!(matches!(err, SnapshotError::Manifest(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_pointer_epoch_mismatch() {
+        let bucket = tempdir().unwrap();
+        let store = file_store(bucket.path());
+        let fx = assemble(&finish(&happy_spec()), TEST_CHAIN_ID, B256::from([0xaa; 32]));
+        let n = fx.manifest.epoch;
+        let manifest_bytes = fx.manifest.to_json().unwrap();
+
+        // publish the epoch-n manifest at epoch n+1's canonical key and point at n+1 with the
+        // correct sha: the layout check passes, so the manifest.epoch cross-check must fire.
+        let key = SnapshotStore::manifest_key(n + 1);
+        store.put_bytes(&key, manifest_bytes.clone()).await.unwrap();
+        let pointer = Pointer {
+            format_version: FORMAT_VERSION,
+            chain_id: TEST_CHAIN_ID,
+            epoch: n + 1,
+            manifest_key: key,
+            manifest_sha256: sha256_hex(&manifest_bytes),
             updated_at: 1,
         };
         store.put_bytes(LATEST_KEY, pointer.to_json().unwrap()).await.unwrap();

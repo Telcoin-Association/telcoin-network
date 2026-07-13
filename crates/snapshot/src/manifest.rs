@@ -189,10 +189,13 @@ pub struct Pointer {
     pub chain_id: u64,
     /// Epoch of the snapshot this pointer currently advertises as latest.
     pub epoch: Epoch,
-    /// Opaque object-store key of the referenced [`Manifest`] within the bucket.
+    /// Object-store key of the referenced [`Manifest`] within the bucket.
     ///
-    /// The key layout (zero-padded `epoch-<N>` directories) is owned by the store module; this
-    /// field carries whatever key that module produced, unmodified.
+    /// The key layout (zero-padded `epoch-<N>` directories) is owned by the store module. A
+    /// consumer resolving `latest.json` must reject any value that is not the canonical key for
+    /// [`epoch`](Self::epoch): the [`manifest_sha256`](Self::manifest_sha256) binding pins the
+    /// manifest's content but not its location, so an off-layout key is treated as a tampered
+    /// pointer rather than followed.
     pub manifest_key: String,
     /// Lowercase-hex sha256 of the referenced manifest's serialized bytes.
     pub manifest_sha256: String,
