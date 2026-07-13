@@ -555,4 +555,196 @@ mod epoch_vote_collector_tests {
         // Shutdown
         node_shutdown.notify();
     }
+
+    /// C1: a vote from a key outside the record committee (ejected mid-epoch) is ignored
+    /// entirely — it neither counts toward quorum nor blocks later member votes.
+    #[tokio::test]
+    async fn test_collector_rejects_ejected_nonmember_vote() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let ejected = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+
+        // Node is kp1, a member of the post-ejection committee
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        // Post-ejection record: committee of 4, super_quorum = (4*2)/3 + 1 = 3.
+        // The ejected key is absent from the committee.
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir =
+            TempDir::with_prefix("test_collector_rejects_ejected_nonmember_vote").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+
+        // Mock network: drain commands and reply to Publish
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = Notifier::new();
+
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.subscribe(),
+        );
+
+        // The ejected key signs a valid vote for the correct record — must not be counted
+        let kc_ejected = KeyConfig::new_with_testing_key(ejected);
+        let ejected_vote = epoch_rec.sign_vote(&kc_ejected);
+        consensus_bus.app().new_epoch_votes().send(ejected_vote).await.unwrap();
+
+        // One member vote: with the self-sign that is only 2 of 3 required
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc2)).await.unwrap();
+
+        // Send the epoch record — collector wakes up, self-signs, reads buffered votes
+        consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+
+        // kp1 (self) + kp2 = 2 < 3: the ejected vote must not tip this over quorum
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(
+            consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_none(),
+            "non-member vote must not count toward quorum"
+        );
+
+        // The third member vote completes quorum
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
+
+        // After reaching quorum the collector waits up to 1s for more votes before aggregating
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+
+        let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
+        assert_eq!(cert.epoch_hash, epoch_hash);
+        assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
+        // Exactly the three members signed (committee indices 0..=2); the ejected key has
+        // no index in the record committee and is absent from the bitmap
+        assert_eq!(cert.signed_authorities.len(), 3, "only member votes may be counted");
+        assert!(cert.signed_authorities.contains(0));
+        assert!(cert.signed_authorities.contains(1));
+        assert!(cert.signed_authorities.contains(2));
+
+        // Shutdown
+        node_shutdown.notify();
+    }
+
+    /// C2: a node whose own key is not in the record committee (ejected mid-epoch, demoted
+    /// to observer next epoch) must not self-sign, but still stores the cert formed by the
+    /// remaining members' votes so it can keep following the chain.
+    #[tokio::test]
+    async fn test_ejected_node_does_not_self_sign_but_stores_cert() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let ejected = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+
+        // Node is the ejected validator: NOT in the record committee
+        let key_config = KeyConfig::new_with_testing_key(ejected);
+
+        // Post-ejection record: committee of 4, super_quorum = (4*2)/3 + 1 = 3
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir =
+            TempDir::with_prefix("test_ejected_node_does_not_self_sign_but_stores_cert").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+
+        // Mock network: drain commands and reply to Publish
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = Notifier::new();
+
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.subscribe(),
+        );
+
+        // Three member votes form quorum without any self-sign from the ejected node
+        let kc1 = KeyConfig::new_with_testing_key(kp1);
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc1)).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc2)).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
+
+        // Send the epoch record — the self-sign gate must skip the non-member node key
+        consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+
+        // Quorum (3 of 4) reached without a fourth vote: collector waits its 1s straggler
+        // window before aggregating
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+
+        let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
+        assert_eq!(cert.epoch_hash, epoch_hash);
+        assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
+        // Only the three voting members are in the bitmap — no self-signature was added
+        assert_eq!(cert.signed_authorities.len(), 3, "ejected node must not self-sign");
+        assert!(cert.signed_authorities.contains(0));
+        assert!(cert.signed_authorities.contains(1));
+        assert!(cert.signed_authorities.contains(2));
+
+        // Shutdown
+        node_shutdown.notify();
+    }
 }

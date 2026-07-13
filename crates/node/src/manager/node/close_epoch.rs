@@ -16,6 +16,7 @@
 
 use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
+use std::collections::BTreeSet;
 use tn_config::TelcoinDirs;
 use tn_reth::recover_raw_transaction;
 use tn_storage::tables::{
@@ -23,8 +24,9 @@ use tn_storage::tables::{
     NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
 };
 use tn_types::{
-    Batch, BlockHash, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput,
-    Database as TNDatabase, Epoch, EpochDigest, EpochRecord, TaskManager, TnReceiver,
+    Batch, BlockHash, BlockNumHash, BlsPublicKey, ConsensusHeaderDigest, ConsensusNumHash,
+    ConsensusOutput, Database as TNDatabase, Epoch, EpochDigest, EpochRecord, TaskManager,
+    TnReceiver,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
@@ -206,27 +208,10 @@ where
 
         let committee_keys = engine.validators_for_epoch(epoch).await?;
         let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
-        let parent_hash = if epoch == 0 {
-            EpochDigest::default()
-        } else if let Some(prev) = self.consensus_chain.epochs().record_by_epoch(epoch - 1).await {
-            if committee_keys != prev.next_committee {
-                error!(
-                    target: "epoch-manager",
-                    "Last epochs next committee not equal to this epochs committee! previous {:?}, current {:?}",
-                    prev.next_committee,
-                    committee_keys
-                );
-                return Err(eyre!(
-                    "Last epochs next committee not equal to this epochs committee!"
-                ));
-            }
-            prev.digest()
+        let prev_record = if epoch == 0 {
+            None
         } else {
-            error!(
-                target: "epoch-manager",
-                "failed to find previous epoch record when starting epoch",
-            );
-            return Err(eyre!("failed to find previous epoch record when starting epoch"));
+            self.consensus_chain.epochs().record_by_epoch(epoch - 1).await
         };
         let last_consensus_header = self
             .last_consensus_header
@@ -235,14 +220,14 @@ where
         let target_hash = last_consensus_header.digest();
         let parent_state = self.consensus_bus.latest_execution_block_num_hash();
 
-        let epoch_rec = EpochRecord {
+        let epoch_rec = build_epoch_record(
             epoch,
-            committee: committee_keys,
-            next_committee: next_committee_keys,
-            parent_hash,
-            final_state: parent_state,
-            final_consensus: ConsensusNumHash::new(last_consensus_header.number, target_hash),
-        };
+            committee_keys,
+            next_committee_keys,
+            prev_record.as_ref(),
+            parent_state,
+            ConsensusNumHash::new(last_consensus_header.number, target_hash),
+        )?;
 
         self.consensus_chain.epochs().save_record(epoch_rec.clone()).await?;
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
@@ -271,5 +256,246 @@ where
         // Note do not clear OurNodeBatchesCache here- we need to keep those until we process the
         // orphans and clear then.
         Ok(())
+    }
+}
+
+/// Build the finalized [`EpochRecord`] for a just-completed epoch.
+///
+/// The committee keys are the fresh on-chain reads for `epoch` and `epoch + 1`
+/// at the canonical tip; `prev` is the stored record for `epoch - 1`, required
+/// for every epoch after 0. The new record chains to `prev` via `parent_hash`,
+/// and the committee read for this epoch must be compatible with the previous
+/// record's `next_committee` under [`EpochRecord::committee_compatible`]: the
+/// same set (in any stored order), or a tolerated shrink when governance ejects
+/// a validator mid-epoch (`burn` / slash-to-zero swap-and-pops the on-chain
+/// committee array). A committee that grew, swapped in an unknown member, or
+/// shrank below the sync tolerance is still an error rather than silently
+/// recorded — sync would reject such a record, so producing it would only hide
+/// the divergence.
+pub fn build_epoch_record(
+    epoch: Epoch,
+    committee_keys: Vec<BlsPublicKey>,
+    next_committee_keys: Vec<BlsPublicKey>,
+    prev: Option<&EpochRecord>,
+    final_state: BlockNumHash,
+    final_consensus: ConsensusNumHash,
+) -> eyre::Result<EpochRecord> {
+    let parent_hash = if epoch == 0 {
+        EpochDigest::default()
+    } else if let Some(prev) = prev {
+        prev.digest()
+    } else {
+        error!(
+            target: "epoch-manager",
+            "failed to find previous epoch record when starting epoch",
+        );
+        return Err(eyre!("failed to find previous epoch record when starting epoch"));
+    };
+
+    let record = EpochRecord {
+        epoch,
+        committee: committee_keys,
+        next_committee: next_committee_keys,
+        parent_hash,
+        final_state,
+        final_consensus,
+    };
+
+    if let Some(prev) = prev {
+        let expected: BTreeSet<BlsPublicKey> = prev.next_committee.iter().copied().collect();
+        if !record.committee_compatible(&expected) {
+            error!(
+                target: "epoch-manager",
+                "Last epochs next committee not compatible with this epochs committee! previous {:?}, current {:?}",
+                prev.next_committee,
+                record.committee
+            );
+            return Err(eyre!(
+                "Last epochs next committee not compatible with this epochs committee!"
+            ));
+        }
+        if record.committee.len() < expected.len() {
+            let ejected: Vec<_> =
+                expected.iter().filter(|key| !record.committee.contains(key)).collect();
+            warn!(
+                target: "epoch-manager",
+                ?ejected,
+                epoch,
+                "committee shrank mid-epoch: validator(s) ejected on-chain; recording shrunken committee"
+            );
+        }
+    }
+
+    Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_types::BlsKeypair;
+
+    /// Deterministic BLS public keys, one per seed byte.
+    fn keys(seeds: std::ops::Range<u8>) -> Vec<BlsPublicKey> {
+        seeds.map(|i| *BlsKeypair::generate(&mut StdRng::from_seed([i; 32])).public()).collect()
+    }
+
+    /// A previous-epoch record promising `next_committee` for the epoch under test.
+    fn prev_record(next_committee: Vec<BlsPublicKey>) -> EpochRecord {
+        EpochRecord {
+            epoch: 0,
+            committee: next_committee.clone(),
+            next_committee,
+            ..Default::default()
+        }
+    }
+
+    fn final_state() -> BlockNumHash {
+        BlockNumHash::new(42, BlockHash::repeat_byte(7))
+    }
+
+    fn final_consensus() -> ConsensusNumHash {
+        ConsensusNumHash::new(9, ConsensusHeaderDigest::default())
+    }
+
+    /// B1: identical committee handoff succeeds and preserves the read order.
+    #[test]
+    fn build_epoch_record_unchanged_committee() {
+        let five = keys(0..5);
+        let prev = prev_record(five.clone());
+        let rec = build_epoch_record(
+            1,
+            five.clone(),
+            five.clone(),
+            Some(&prev),
+            final_state(),
+            final_consensus(),
+        )
+        .expect("unchanged committee handoff must succeed");
+        assert_eq!(rec.epoch, 1);
+        assert_eq!(rec.parent_hash, prev.digest());
+        assert_eq!(rec.committee, five, "stored order must be exactly the on-chain read order");
+        assert_eq!(rec.next_committee, five);
+        assert_eq!(rec.final_state, final_state());
+        assert_eq!(rec.final_consensus, final_consensus());
+    }
+
+    /// B2: a governance `burn` mid-epoch swap-and-pops the ejected key out of the on-chain
+    /// committee array, so the closing read is a 4-member subset of the 5 the previous
+    /// record promised. The record must still build or every node halts at the boundary.
+    #[test]
+    fn build_epoch_record_tolerates_mid_epoch_ejection() {
+        let five = keys(0..5);
+        let prev = prev_record(five.clone());
+        // swap-and-pop of five[2]: the last element moves into its slot
+        let shrunken = vec![five[0], five[1], five[4], five[3]];
+        let rec = build_epoch_record(
+            1,
+            shrunken.clone(),
+            shrunken.clone(),
+            Some(&prev),
+            final_state(),
+            final_consensus(),
+        )
+        .expect("mid-epoch ejection must not prevent the epoch record from building");
+        assert_eq!(rec.committee, shrunken);
+        assert_eq!(rec.parent_hash, prev.digest());
+    }
+
+    /// B3: the same five keys in a different stored order are the same committee.
+    #[test]
+    fn build_epoch_record_reordered_only() {
+        let five = keys(0..5);
+        let prev = prev_record(five.clone());
+        let mut rotated = five.clone();
+        rotated.rotate_left(2);
+        let rec = build_epoch_record(
+            1,
+            rotated.clone(),
+            five.clone(),
+            Some(&prev),
+            final_state(),
+            final_consensus(),
+        )
+        .expect("same committee in a different stored order must succeed");
+        assert_eq!(rec.committee, rotated);
+        assert_eq!(rec.parent_hash, prev.digest());
+    }
+
+    /// B4: shrinking past the tolerance floor or bound stays an error — producing a record
+    /// sync would reject only hides the divergence.
+    #[test]
+    fn build_epoch_record_rejects_below_tolerance() {
+        // 4 -> 3 violates the minimum-committee floor of 4
+        let four = keys(0..4);
+        let prev = prev_record(four.clone());
+        let three = four[..3].to_vec();
+        assert!(build_epoch_record(
+            1,
+            three.clone(),
+            three,
+            Some(&prev),
+            final_state(),
+            final_consensus()
+        )
+        .is_err());
+
+        // 8 -> 5 violates the ceil(2n/3) tolerance bound (needs >= 6 of 8)
+        let eight = keys(0..8);
+        let prev = prev_record(eight.clone());
+        let five = eight[..5].to_vec();
+        assert!(build_epoch_record(
+            1,
+            five.clone(),
+            five,
+            Some(&prev),
+            final_state(),
+            final_consensus()
+        )
+        .is_err());
+    }
+
+    /// B5: a committee containing a key the previous record never promised is rejected —
+    /// current committees cannot legitimately grow or swap members mid-epoch.
+    #[test]
+    fn build_epoch_record_rejects_unknown_member() {
+        let five = keys(0..5);
+        let prev = prev_record(five.clone());
+        let fresh = *BlsKeypair::generate(&mut StdRng::from_seed([99; 32])).public();
+        let committee = vec![five[0], five[1], five[2], five[3], fresh];
+        assert!(build_epoch_record(
+            1,
+            committee.clone(),
+            committee,
+            Some(&prev),
+            final_state(),
+            final_consensus()
+        )
+        .is_err());
+    }
+
+    /// B6: epoch 0 has no previous record to hand off from.
+    #[test]
+    fn build_epoch_record_epoch_zero_skips_handoff() {
+        let five = keys(0..5);
+        let rec = build_epoch_record(
+            0,
+            five.clone(),
+            five.clone(),
+            None,
+            final_state(),
+            final_consensus(),
+        )
+        .expect("epoch 0 must build without a previous record");
+        assert_eq!(rec.parent_hash, EpochDigest::default());
+        assert_eq!(rec.committee, five);
+    }
+
+    /// B7: any later epoch without its previous record is an error.
+    #[test]
+    fn build_epoch_record_missing_prev_errors() {
+        let five = keys(0..5);
+        assert!(build_epoch_record(1, five.clone(), five, None, final_state(), final_consensus())
+            .is_err());
     }
 }
