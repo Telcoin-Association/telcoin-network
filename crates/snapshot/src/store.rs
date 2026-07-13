@@ -261,10 +261,12 @@ impl SnapshotStore {
     /// Download `key` to `dest`, enforcing both `expected_size` and `expected_sha256_hex`.
     ///
     /// The object is streamed to `dest` and hashed as it is written. The object's advertised size
-    /// is checked before the destination file is created; the streamed byte count and sha256 digest
-    /// are checked after. Any mismatch — or any transport error mid-stream — removes the partial
-    /// destination file and returns [`SnapshotError::Integrity`] naming the key and the expected
-    /// versus actual values. `expected_sha256_hex` is compared case-insensitively.
+    /// is checked before the destination file is created, and the running byte count is bounded by
+    /// `expected_size` as it streams, so a backend that advertises the right size but then streams
+    /// more is stopped mid-download rather than after the excess reaches disk. The final byte count
+    /// and sha256 digest are checked after. Any mismatch — or any transport error mid-stream —
+    /// removes the partial destination file and returns [`SnapshotError::Integrity`] naming the key
+    /// and the expected versus actual values. `expected_sha256_hex` is compared case-insensitively.
     pub async fn get_verified(
         &self,
         key: &str,
@@ -297,6 +299,15 @@ impl SnapshotStore {
                 let chunk = chunk?;
                 hasher.update(&chunk);
                 size += chunk.len() as u64;
+                // abort before writing this chunk: a hostile backend can advertise the right size
+                // yet stream unbounded bytes, so stop the moment the running total passes
+                // expected_size rather than letting the post-loop check catch it after the excess
+                // has been written to disk.
+                if size > expected_size {
+                    return Err(SnapshotError::Integrity(format!(
+                        "size mismatch for {key}: expected {expected_size}, stream exceeded it mid-download"
+                    )));
+                }
                 file.write_all(&chunk).await?;
             }
             file.flush().await?;
@@ -818,6 +829,25 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SnapshotError::Integrity(_)));
         assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn get_verified_aborts_mid_stream_on_oversized_object() {
+        // advertised size matches expectations, but the backend streams eight times as much
+        let expected_size = 1024u64;
+        let (store, pulled) = lying_store(expected_size, 8, 1024).await;
+
+        let staging = tempdir().unwrap();
+        let dest = staging.path().join("out.bin");
+        let key = SnapshotStore::artifact_key(1, "big.bin");
+        let err =
+            store.get_verified(&key, expected_size, &"00".repeat(32), &dest).await.unwrap_err();
+
+        assert!(matches!(err, SnapshotError::Integrity(_)));
+        // the partial destination is cleaned up
+        assert!(!dest.exists());
+        // the guard must fire mid-stream, before the whole payload is drained
+        assert!(pulled.load(Ordering::SeqCst) < 8);
     }
 
     #[tokio::test]
