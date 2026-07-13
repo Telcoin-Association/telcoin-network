@@ -15,6 +15,7 @@ use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethCommand, RethConfig};
 use tn_snapshot::{
     restore::{restore_from_snapshot, RestoreReceipt},
+    store::redact_url,
     SnapshotError, SnapshotResult, UploadConfig,
 };
 use tn_types::Epoch;
@@ -355,7 +356,7 @@ async fn maybe_restore_from_snapshot<TND: TelcoinDirs>(
             info!(
                 target: "tn::snapshot",
                 epoch,
-                source = %source_url,
+                source = %redact_url(source_url),
                 "snapshot auto-restore installed epoch {epoch}; a bucket cannot forge a snapshot \
                  but CAN withhold a newer one — confirm this is the expected epoch"
             );
@@ -399,7 +400,7 @@ where
                         warn!(
                             target: "tn::snapshot",
                             error = %err,
-                            source = %source_url,
+                            source = %redact_url(source_url),
                             "snapshot auto-restore hit a transient source error; retrying"
                         );
                         backoff::Error::transient(err)
@@ -428,9 +429,9 @@ fn interpret_auto_restore(
         // the datadir already holds chain data: a normal restart, not an error.
         Err(SnapshotError::ChainDataExists) => Ok(None),
         // any other failure leaves the datadir empty or quarantined; never boot past it.
-        Err(err) => {
-            Err(err).wrap_err_with(|| format!("snapshot auto-restore from {source_url} failed"))
-        }
+        Err(err) => Err(err).wrap_err_with(|| {
+            format!("snapshot auto-restore from {} failed", redact_url(source_url))
+        }),
     }
 }
 

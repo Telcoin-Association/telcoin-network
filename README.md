@@ -171,6 +171,7 @@ Supported URL schemes and the credentials each reads from the process environmen
 
 Operational notes:
 
+- **URL-embedded credentials are redacted.** A `user:pass@` in a snapshot URL is stripped from logs, the persisted restore receipt, and console output; only the scheme, host, port, and path are shown.
 - Run **one uploader per bucket prefix**. Publishing is last-writer-wins on `latest.json`, so two uploaders pointed at the same prefix will race the pointer.
 - Set a bucket **lifecycle rule to abort/expire incomplete multipart uploads**. A cancelled upload can leave orphaned parts that snapshot pruning does not clean up.
 

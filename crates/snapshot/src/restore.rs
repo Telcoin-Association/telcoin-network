@@ -41,7 +41,7 @@
 use crate::{
     has_chain_data,
     manifest::{Counts, Manifest, Pointer, LATEST_KEY},
-    store::SnapshotStore,
+    store::{redact_url, SnapshotStore},
     verify::{verify_snapshot, DecompressLimits, VerifiedSnapshot},
     SnapshotError, SnapshotResult, RESTORE_INCOMPLETE_MARKER,
 };
@@ -158,7 +158,8 @@ pub async fn restore_from_snapshot<TND: TelcoinDirs>(
         chain_id: trust.chain_id,
         genesis_hash: trust.genesis_hash,
         node_version: manifest.node_version.clone(),
-        source_url: source_url.to_string(),
+        // redact any url-embedded credentials before this receipt is persisted to disk.
+        source_url: redact_url(source_url),
         restored_at: now(),
     };
     finalize_restore(&snapshots_path, &marker, &receipt);
@@ -233,7 +234,8 @@ pub async fn verify_snapshot_source<TND: TelcoinDirs>(
         chain_id: trust.chain_id,
         genesis_hash: trust.genesis_hash,
         node_version: manifest.node_version,
-        source_url: source_url.to_string(),
+        // redact any url-embedded credentials before this summary is printed to the console.
+        source_url: redact_url(source_url),
         state_root,
     })
 }
@@ -280,7 +282,11 @@ pub struct RestoreReceipt {
     pub genesis_hash: B256,
     /// Version string of the node that produced the snapshot.
     pub node_version: String,
-    /// The object-store URL the snapshot was restored from.
+    /// The object-store URL the snapshot was restored from, with any embedded credentials
+    /// redacted.
+    ///
+    /// Redacted at construction via [`redact_url`] because this receipt is persisted to
+    /// `last-restore.json`; a `user:pass@` in the source URL must never be written to disk.
     pub source_url: String,
     /// Unix timestamp (seconds) at which the restore completed.
     pub restored_at: u64,
@@ -306,7 +312,11 @@ pub struct VerifiedSummary {
     pub genesis_hash: B256,
     /// Version string of the node that produced the snapshot.
     pub node_version: String,
-    /// The object-store URL the snapshot was verified from.
+    /// The object-store URL the snapshot was verified from, with any embedded credentials
+    /// redacted.
+    ///
+    /// Redacted at construction via [`redact_url`] because this summary is printed to the console;
+    /// a `user:pass@` in the source URL must never reach stdout.
     pub source_url: String,
     /// State root recomputed by the deep verify rebuild, or `None` when the state-root check was
     /// skipped.
@@ -431,13 +441,15 @@ async fn prepare_snapshot(
     // to the local chain but its artifact list is still remote-controlled in size.
     let total_artifact_bytes = check_artifact_budgets(&manifest)?;
 
+    // redact any url-embedded credentials before the chosen epoch is logged.
+    let redacted_source = redact_url(source_url);
     if epoch.is_some() {
-        info!(target: "tn::snapshot", epoch = chosen_epoch, source = source_url, "resolved pinned snapshot epoch");
+        info!(target: "tn::snapshot", epoch = chosen_epoch, source = %redacted_source, "resolved pinned snapshot epoch");
     } else {
         info!(
             target: "tn::snapshot",
             epoch = chosen_epoch,
-            source = source_url,
+            source = %redacted_source,
             "resolved latest snapshot epoch (a bucket can withhold newer snapshots; pin --epoch to override)"
         );
     }

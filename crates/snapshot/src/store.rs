@@ -142,7 +142,8 @@ impl SnapshotStore {
             "file" => {
                 let dir = parsed.to_file_path().map_err(|()| {
                     SnapshotError::Other(eyre::eyre!(
-                        "file url must be an absolute path with an empty host: {url}"
+                        "file url must be an absolute path with an empty host: {}",
+                        redact_url(url)
                     ))
                 })?;
                 std::fs::create_dir_all(&dir)?;
@@ -543,6 +544,49 @@ impl SnapshotStore {
     }
 }
 
+/// Redact URL-embedded credentials (the `user:pass@` userinfo) from a URL-like string.
+///
+/// A snapshot source URL may carry credentials in its authority component, as in
+/// `https://user:pass@host/path`. Those credentials must never reach logs, the persisted restore
+/// receipt, or console output, so every site that renders a snapshot URL for a human passes it
+/// through this function first.
+///
+/// The implementation is deliberately textual rather than [`Url`]-based for two reasons: it must
+/// also sanitize malformed strings that only ever surface inside error messages (where parsing has
+/// already failed), and it must return a credential-free input byte-for-byte unchanged so honest
+/// URLs are never mangled. It locates the authority — the segment after `://`, ending at the first
+/// `/`, `?`, or `#` — and strips everything up to and including the *last* `@` within it. Using
+/// `rfind` is intentional: an unencoded `@` inside a password would otherwise leave part of the
+/// credential behind. A string with no `://` scheme separator, or whose authority holds no `@`, is
+/// returned unchanged.
+pub fn redact_url(url: &str) -> String {
+    // no scheme separator: not a url this helper understands, so leave it exactly as given.
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let authority_start = scheme_end + "://".len();
+
+    // the authority ends at the first path, query, or fragment delimiter (or the end of the input).
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| authority_start + offset);
+
+    // strip userinfo through the last '@' inside the authority; rfind is defensive against an
+    // unencoded '@' in the password itself.
+    match url[authority_start..authority_end].rfind('@') {
+        Some(at) => {
+            // '@' is one byte, so the host begins immediately after it.
+            let userinfo_end = authority_start + at + 1;
+            let mut redacted = String::with_capacity(url.len() - (userinfo_end - authority_start));
+            redacted.push_str(&url[..authority_start]);
+            redacted.push_str(&url[userinfo_end..]);
+            redacted
+        }
+        // no credentials in the authority: return the input byte-for-byte unchanged.
+        None => url.to_string(),
+    }
+}
+
 /// A [`Write`] adapter that tallies the total number of bytes written through it.
 ///
 /// Used to measure a zstd-compressed stream's on-disk size without a second `stat` of the file.
@@ -767,6 +811,30 @@ mod tests {
     fn open_rejects_malformed_url() {
         let err = SnapshotStore::open("not a url").unwrap_err();
         assert!(matches!(err, SnapshotError::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo_only() {
+        // credentials in the authority are removed; scheme, host, port, path, and query survive.
+        assert_eq!(redact_url("https://user:pass@host:8443/p?q"), "https://host:8443/p?q");
+        assert_eq!(redact_url("https://user@host/p"), "https://host/p");
+        // an unencoded '@' in the password: rfind strips through the LAST '@'.
+        assert_eq!(redact_url("http://u:p@ss@host/"), "http://host/");
+        // the authority ends at the query delimiter, so an '@' in the query is left intact.
+        assert_eq!(redact_url("https://user@host?x=@y"), "https://host?x=@y");
+
+        // credential-free inputs are returned byte-for-byte unchanged.
+        for unchanged in [
+            "https://host/p",
+            "s3://bucket/prefix",
+            "file:///abs/path",
+            "/plain/path",
+            "not a url",
+            // the '@' is in the path, not the authority, so nothing is stripped.
+            "https://host/a@b",
+        ] {
+            assert_eq!(redact_url(unchanged), unchanged);
+        }
     }
 
     #[tokio::test]

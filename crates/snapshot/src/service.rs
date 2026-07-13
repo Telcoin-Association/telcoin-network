@@ -32,7 +32,7 @@ use crate::{
     export::{export_epoch, ExportArgs, ExportedSnapshot},
     manifest::{Pointer, FORMAT_VERSION},
     metrics::{JobOutcome, SnapshotMetrics},
-    store::SnapshotStore,
+    store::{redact_url, SnapshotStore},
     SnapshotError, SnapshotResult, UploadConfig,
 };
 use sha2::{Digest as _, Sha256};
@@ -127,7 +127,7 @@ impl SnapshotUploader {
         store.list_epochs().await.map_err(|err| {
             SnapshotError::Other(eyre::eyre!(
                 "snapshot uploader could not reach the object store at {}: {err}",
-                config.url
+                redact_url(&config.url)
             ))
         })?;
 
@@ -481,7 +481,7 @@ async fn run_job(
     ctx.metrics.record_job(JobOutcome::Uploaded);
     ctx.metrics.last_uploaded_epoch.set(f64::from(epoch));
     info!(
-        target: "tn::snapshot", epoch, bucket = %ctx.config.url,
+        target: "tn::snapshot", epoch, bucket = %redact_url(&ctx.config.url),
         artifacts = summary.artifacts, bytes = summary.bytes,
         "published epoch snapshot"
     );

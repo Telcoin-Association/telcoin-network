@@ -26,7 +26,7 @@ use tn_snapshot::{
         restore_from_snapshot, verify_snapshot_source, RestoreReceipt, VerifiedSummary, VerifyMode,
     },
     service::publish_exported,
-    store::SnapshotStore,
+    store::{redact_url, SnapshotStore},
 };
 use tn_storage::epoch_records::EpochRecordDb;
 use tn_types::{gas_accumulator::RewardsCounter, now, Genesis, TaskManager, B256};
@@ -287,14 +287,14 @@ impl CreateArgs {
         let _ = std::fs::remove_dir_all(&staging_root);
 
         println!("snapshot created and published");
-        println!("  bucket:    {out}");
+        println!("  bucket:    {}", redact_url(&out));
         println!("  epoch:     {epoch}");
         println!("  artifacts: {}", summary.artifacts);
         println!("  bytes:     {}", summary.bytes);
         info!(
             target: "tn::snapshot",
             epoch,
-            bucket = %out,
+            bucket = %redact_url(&out),
             artifacts = summary.artifacts,
             bytes = summary.bytes,
             "published epoch snapshot"
