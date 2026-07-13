@@ -29,7 +29,7 @@ use tokio::{
 use tracing::{debug, error, warn};
 
 use crate::{
-    archive::data_file::fsync_directory,
+    archive::data_file::{create_dir_synced, fsync_directory},
     consensus_pack::{ConsensusPack, PackError, DATA_NAME},
     epoch_records::{EpochDbError, EpochRecordDb},
 };
@@ -1192,8 +1192,9 @@ pub async fn seed_latest_consensus(
     number: u64,
 ) -> Result<(), ConsensusChainError> {
     // The node creates this directory before opening the chain; do the same so the helper is
-    // self-sufficient when called stand-alone by a restore tool.
-    std::fs::create_dir_all(base_path)?;
+    // self-sufficient when called stand-alone by a restore tool. create_dir_synced also fsyncs
+    // the parent so the new epochs-directory entry itself survives a crash.
+    create_dir_synced(base_path)?;
     let latest = LatestConsensus::new(base_path)?;
     // The slots alternate on each update, so two writes land the value in BOTH files. This keeps
     // the read-time tie-break (and the single-slot-corruption fallback) from ever surfacing a
@@ -1201,6 +1202,11 @@ pub async fn seed_latest_consensus(
     latest.update(epoch, number).await;
     latest.update(epoch, number).await;
     latest.persist().await;
+    // persist() above fsyncs each slot file's CONTENTS, but not the epochs-directory entries that
+    // name the freshly created slot files, so fsync the directory to make those entries durable
+    // too (matching the epoch-pack path in consensus_pack.rs). Without it a crash could lose the
+    // new slot files and resurface a stale (0, 0) latest-consensus on a restored datadir.
+    fsync_directory(base_path)?;
     Ok(())
 }
 
