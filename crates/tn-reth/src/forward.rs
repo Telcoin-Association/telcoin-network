@@ -12,13 +12,38 @@
 //! [`submit_txn_if_mine`]: tn_types::BatchValidation::submit_txn_if_mine
 
 use crate::recover_raw_transaction;
-use alloy::providers::{Provider as _, RootProvider};
+use alloy::{
+    providers::{Provider as _, RootProvider},
+    transports::{RpcError, TransportErrorKind},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tn_types::{BlsPublicKey, RpcInfo, TaskSpawner, TxnForwarder};
+use tokio::time::timeout;
 use tracing::{debug, warn};
+
+/// Bounds a single validator's `eth_sendRawTransaction` round-trip so one unresponsive endpoint
+/// cannot stall the fallback chain; on timeout the forward tries the next validator.
+const FORWARD_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds the total time spent forwarding one transaction across all its fallback validators, so a
+/// whole unresponsive committee cannot make a single transaction cost `committee_size` back-to-back
+/// [`FORWARD_SEND_TIMEOUT`]s. When it elapses the transaction is left unforwarded and the next one
+/// proceeds.
+const FORWARD_TX_BUDGET: Duration = Duration::from_secs(15);
+
+/// JSON-RPC error codes reth returns for a validator-local, transient condition (a full pool,
+/// `-32003`, or an internal/IO error, `-32603`) rather than a verdict on the transaction itself.
+/// The forward falls through to the next advertised validator on these, since another validator
+/// may still accept the transaction.
+const TRANSIENT_RPC_CODES: [i64; 2] = [-32003, -32603];
+
+/// Substring of reth's `eth_sendRawTransaction` error message when the transaction is already in a
+/// validator's pool (`code -32000`). Treated as a successful delivery, not a failure to retry.
+const ALREADY_KNOWN_MESSAGE: &str = "already known";
 
 /// Forwards observer transactions to validators over their advertised JSON-RPC endpoints.
 #[derive(Clone)]
@@ -117,34 +142,69 @@ impl TxnForwarder for WorkerRpcForwarder {
                 let owner = owning_validator(tx, committee_size, &committee_slots);
                 let ordered = owner.into_iter().chain(fallbacks.iter().cloned());
 
-                let mut tried = BTreeSet::new();
-                let mut forwarded = false;
-                for key in ordered {
-                    if !tried.insert(key) {
-                        continue;
-                    }
-                    let Some(provider) = providers.get(&key) else {
-                        continue;
-                    };
-                    match provider.send_raw_transaction(tx.as_slice()).await {
-                        Ok(_) => {
-                            forwarded = true;
-                            break;
+                // Bound the whole fallback chain for this transaction: even if every advertised
+                // validator accepts the connection but never answers, one transaction cannot cost
+                // more than `FORWARD_TX_BUDGET` before the next transaction proceeds.
+                let outcome = timeout(FORWARD_TX_BUDGET, async {
+                    let mut tried = BTreeSet::new();
+                    let mut result = ForwardOutcome::NoEndpointReached;
+                    for key in ordered {
+                        if !tried.insert(key) {
+                            continue;
                         }
-                        Err(err) => {
-                            debug!(
-                                target: "worker::forward",
-                                %err,
-                                "failed to forward transaction to a validator RPC; trying next"
-                            );
+                        let Some(provider) = providers.get(&key) else {
+                            continue;
+                        };
+                        // Bound each validator's round-trip: an endpoint that accepts the
+                        // connection but never answers must not stall the whole fallback chain.
+                        let disposition = timeout(
+                            FORWARD_SEND_TIMEOUT,
+                            provider.send_raw_transaction(tx.as_slice()),
+                        )
+                        .await
+                        .map_or_else(
+                            |_elapsed| Disposition::TryNext("send timed out".to_string()),
+                            |res| res.err().map_or(Disposition::Delivered, classify_error),
+                        );
+
+                        match disposition {
+                            // Delivered, or a considered rejection every validator would repeat:
+                            // either way this transaction is done, so stop the fallback chain.
+                            Disposition::Delivered => {
+                                result = ForwardOutcome::Delivered;
+                                break;
+                            }
+                            Disposition::Rejected(reason) => {
+                                result = ForwardOutcome::Rejected(reason);
+                                break;
+                            }
+                            // Endpoint-local problem (timeout, transport error, full pool): the
+                            // transaction's fate is unknown here, so try the next validator.
+                            Disposition::TryNext(reason) => {
+                                debug!(
+                                    target: "worker::forward",
+                                    reason = %reason,
+                                    "validator RPC did not accept the forwarded transaction; trying next"
+                                );
+                            }
                         }
                     }
-                }
-                if !forwarded {
-                    warn!(
+                    result
+                })
+                .await
+                .unwrap_or(ForwardOutcome::NoEndpointReached);
+
+                match outcome {
+                    ForwardOutcome::Delivered => {}
+                    ForwardOutcome::Rejected(reason) => warn!(
+                        target: "worker::forward",
+                        reason = %reason,
+                        "a validator rejected the forwarded transaction; not retrying other validators"
+                    ),
+                    ForwardOutcome::NoEndpointReached => warn!(
                         target: "worker::forward",
                         "could not forward transaction to any advertised validator RPC"
-                    );
+                    ),
                 }
             }
             Ok(())
@@ -166,6 +226,53 @@ fn owning_validator(
     bytes.copy_from_slice(&sender.as_slice()[0..8]);
     let slot = (u64::from_le_bytes(bytes) % committee_size) as usize;
     committee_slots.get(slot).cloned()
+}
+
+/// What to do after one timed attempt to forward a transaction to one validator.
+#[derive(Debug, PartialEq, Eq)]
+enum Disposition {
+    /// The validator accepted the transaction, or it was already in a validator's pool.
+    Delivered,
+    /// The validator returned a considered rejection of the transaction itself (bad nonce,
+    /// underpriced, invalid, wrong fork). No other validator will accept it either.
+    Rejected(String),
+    /// This endpoint gave no verdict (timeout, transport error, or a transient full pool); the
+    /// transaction may still be accepted by another validator.
+    TryNext(String),
+}
+
+/// Terminal result of forwarding one transaction across the ordered validators.
+#[derive(Debug, PartialEq, Eq)]
+enum ForwardOutcome {
+    /// A validator accepted it (or already had it).
+    Delivered,
+    /// A validator gave a considered rejection, so the chain was stopped without delivery.
+    Rejected(String),
+    /// No advertised validator gave a verdict (all timed out or were unreachable).
+    NoEndpointReached,
+}
+
+/// Classify a failed `send_raw_transaction` by whether the server returned a JSON-RPC error (a
+/// verdict about the transaction) or the transport failed (an endpoint problem).
+fn classify_error(err: RpcError<TransportErrorKind>) -> Disposition {
+    err.as_error_resp().map(|payload| (payload.code, payload.message.to_string())).map_or_else(
+        || Disposition::TryNext(err.to_string()),
+        |(code, message)| classify_server_error(code, message),
+    )
+}
+
+/// Classify a server-side JSON-RPC rejection of a forwarded transaction.
+fn classify_server_error(code: i64, message: String) -> Disposition {
+    if TRANSIENT_RPC_CODES.contains(&code) {
+        // A full pool or an internal error is validator-local; another validator may accept it.
+        Disposition::TryNext(message)
+    } else if message.to_ascii_lowercase().contains(ALREADY_KNOWN_MESSAGE) {
+        // Already in a validator's pool: the transaction is delivered.
+        Disposition::Delivered
+    } else {
+        // Every validator shares consensus state, so a considered rejection repeats everywhere.
+        Disposition::Rejected(format!("code {code}: {message}"))
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +326,31 @@ mod tests {
 
         assert_eq!(second.len(), 1);
         assert_eq!(cached_urls(&forwarder), vec!["http://127.0.0.1:8545/".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn classify_server_error_maps_reth_rejections() -> eyre::Result<()> {
+        // A duplicate ("already known", code -32000) is a delivery, not a failure to retry.
+        assert_eq!(
+            classify_server_error(-32000, "already known".to_string()),
+            Disposition::Delivered
+        );
+        // A full pool (code -32003) is transient: fall through to the next validator.
+        assert_eq!(
+            classify_server_error(-32003, "txpool is full".to_string()),
+            Disposition::TryNext("txpool is full".to_string())
+        );
+        // An internal error (code -32603) is also validator-local: try the next validator.
+        assert_eq!(
+            classify_server_error(-32603, "database error".to_string()),
+            Disposition::TryNext("database error".to_string())
+        );
+        // A considered rejection (nonce too low, code -32000) stops the fallback chain.
+        assert!(matches!(
+            classify_server_error(-32000, "nonce too low: next nonce 42, tx nonce 41".to_string()),
+            Disposition::Rejected(_)
+        ));
         Ok(())
     }
 }
