@@ -561,7 +561,20 @@ async fn install<TND: TelcoinDirs>(
     verified: &VerifiedSnapshot,
     staging_dir: &Path,
 ) -> SnapshotResult<B256> {
-    let state_root = install_reth(datadir, reth_config, verified, staging_dir)?;
+    // the reth import is fully blocking (MDBX writes + ETL) and long-running. the manual CLI
+    // restore path reaches here without reth's block_in_place guard, so run it on the blocking pool
+    // to avoid stalling the async runtime for the duration of the import (mirrors verify).
+    let state_root = {
+        let reth_config = reth_config.clone();
+        let verified = verified.clone();
+        let staging_dir = staging_dir.to_path_buf();
+        let reth_db_path = datadir.reth_db_path();
+        tokio::task::spawn_blocking(move || {
+            install_reth(&reth_db_path, &reth_config, &verified, &staging_dir)
+        })
+        .await
+        .map_err(|e| SnapshotError::Other(eyre::eyre!("snapshot install task failed: {e}")))??
+    };
     install_consensus(datadir, verified).await?;
     Ok(state_root)
 }
@@ -572,8 +585,8 @@ async fn install<TND: TelcoinDirs>(
 /// and [`finish`](SnapshotRestorer::finish) consumes the restorer, so on both success and failure
 /// the MDBX environment is released by the time this returns — a prerequisite for
 /// [`delete_chain_data`] to remove the files if a later step fails.
-fn install_reth<TND: TelcoinDirs>(
-    datadir: &TND,
+fn install_reth(
+    reth_db_path: &Path,
     reth_config: &RethConfig,
     verified: &VerifiedSnapshot,
     staging_dir: &Path,
@@ -582,7 +595,7 @@ fn install_reth<TND: TelcoinDirs>(
 
     // build and own the reth db from the caller's config, exactly as the node CLI does before
     // constructing a RethEnv. the local task manager only supervises the restorer's env.
-    let reth_db = RethEnv::new_database(reth_config, datadir.reth_db_path())?;
+    let reth_db = RethEnv::new_database(reth_config, reth_db_path)?;
     let task_manager = TaskManager::new("snapshot-restore");
     let restorer = SnapshotRestorer::open(reth_config, reth_db, &task_manager)?;
 
