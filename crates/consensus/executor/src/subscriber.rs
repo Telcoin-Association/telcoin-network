@@ -151,7 +151,8 @@ impl<DB: Database> Subscriber<DB> {
         // This save will essentially mark this consensus output as written in stone (added to the
         // consensus chain). This does NOT imply execution although it will be sent off for
         // execution.
-        save_consensus(consensus_output.clone(), &mut consensus_chain).await?;
+        save_consensus(consensus_output.clone(), &mut consensus_chain, self.consensus_bus.metrics())
+            .await?;
 
         // Once we've drained through the staged partial pack's final output, it has all been
         // written to the main pack in order — drop the staging dir.
@@ -282,7 +283,7 @@ impl<DB: Database> Subscriber<DB> {
         output: ConsensusOutput,
     ) -> SubscriberResult<()> {
         debug!(target: "subscriber", output=?output.digest(), "saving next output");
-        save_consensus(output.clone(), consensus_chain).await?;
+        save_consensus(output.clone(), consensus_chain, self.consensus_bus.metrics()).await?;
         debug!(target: "subscriber", "broadcasting output...");
         // Publish the consensus result now that we are totally finished.
         let number = output.number();
@@ -393,6 +394,7 @@ impl<DB: Database> Subscriber<DB> {
                                     if let Err(e) = save_consensus(
                                         output.clone(),
                                         &mut consensus_chain,
+                                        self.consensus_bus.metrics(),
                                     ).await {
                                         warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
                                         break;

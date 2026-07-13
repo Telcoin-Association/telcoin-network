@@ -12,7 +12,7 @@ use tn_test_utils_committee as _;
 
 use std::time::Duration;
 use tn_config::ConsensusConfig;
-use tn_primary::{ConsensusBusApp, NodeMode};
+use tn_primary::{ConsensusBusApp, NodeMode, PrimaryMetrics};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusCache};
 use tn_types::{
     ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch, TaskError,
@@ -107,11 +107,17 @@ pub fn spawn_state_sync<DB: Database>(
 pub async fn save_consensus(
     consensus_output: ConsensusOutput,
     consensus_chain: &mut ConsensusChain,
+    metrics: &PrimaryMetrics,
 ) -> eyre::Result<u64> {
     let output_bytes = consensus_chain.save_consensus_output(consensus_output).await?;
     // Note it is ok to leave batches in NodeBatchesCache until the epoch ends (when the table is
     // cleared). Make sure we have persisted the consensus output before we execute.
     consensus_chain.persist_current().await?;
+    // A zero byte count means this output was old consensus not written to the current pack;
+    // recording it as the "most recent" output size would be misleading.
+    if output_bytes > 0 {
+        metrics.record_consensus_output_bytes(output_bytes);
+    }
     Ok(output_bytes)
 }
 
