@@ -12011,6 +12011,7 @@ dependencies = [
  "tn-primary",
  "tn-reth",
  "tn-rpc",
+ "tn-snapshot",
  "tn-storage",
  "tn-test-utils",
  "tn-test-utils-committee",

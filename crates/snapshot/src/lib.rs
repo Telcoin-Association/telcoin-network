@@ -20,9 +20,9 @@
 //!    for epochs `0..=N`. Epoch `0`'s record must commit to the local genesis committee with a zero
 //!    `parent_hash`; every later record must chain to its predecessor by `parent_hash` and inherit
 //!    the predecessor's `next_committee`; and every record must carry an aggregate-BLS certificate
-//!    signed by a super-quorum (`2/3 + 1` of voting power) of *its own* committee. Committee `N`
-//!    thereby certifies who committee `N+1` is, so trust walks from genesis to the snapshot epoch
-//!    without ever trusting the bucket.
+//!    signed by a super-quorum (`2/3 + 1` of committee members; all members carry equal voting
+//!    power) of *its own* committee. Committee `N` thereby certifies who committee `N+1` is, so
+//!    trust walks from genesis to the snapshot epoch without ever trusting the bucket.
 //! 2. **Manifest binding.** Record `N`'s digest, `final_state` (the closing execution block number
 //!    and hash), and `final_consensus` must equal the [`Manifest`](manifest::Manifest)'s. The
 //!    certified chain now pins the exact boundary block the snapshot claims.

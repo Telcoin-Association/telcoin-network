@@ -22,9 +22,8 @@ use alloy::providers::{Provider, ProviderBuilder};
 use clap::Parser as _;
 use e2e_tests::{
     config_local_testnet_with_epoch_duration, config_local_testnet_with_worker_fee_configs,
-    get_telcoin_network_binary, setup_log_dir,
+    get_telcoin_network_binary, setup_log_dir, TestBinary,
 };
-use escargot::CargoRun;
 use std::{path::Path, process::Child, time::Duration};
 use telcoin_network_cli::keytool::KeyArgs;
 use tn_reth::system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS};
@@ -428,7 +427,7 @@ fn read_latest_epoch(latest_json: &Path) -> Option<u64> {
 /// same helper starts both the uploader (`--snapshot-upload`) and the restore (`--snapshot-source`)
 /// observers on distinct datadirs. Kept local to this file rather than added to the shared harness.
 fn spawn_observer_node(
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     base_dir: &Path,
     subdir: &str,
     rpc_port: u16,
@@ -579,7 +578,7 @@ fn assert_bucket_shape(bucket_path: &Path) -> eyre::Result<u64> {
 /// cheap, self-contained bucket-integrity assertion. `cwd` scopes any stray log output to the
 /// temp dir.
 fn assert_snapshot_verifies(
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     cwd: &Path,
     datadir: &Path,
     bucket_url: &str,
