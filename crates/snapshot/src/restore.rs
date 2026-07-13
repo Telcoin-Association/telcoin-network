@@ -110,11 +110,12 @@ pub async fn restore_from_snapshot<TND: TelcoinDirs>(
     };
 
     // install begins: the marker's presence means the on-disk data can no longer be trusted until a
-    // restore completes. if writing it fails, no install has happened, so treat it as a pre-install
-    // failure (wipe staging, no marker).
-    if let Err(e) = fs::write(&marker, b"") {
+    // restore completes. write it durably (fsync file + dir) so a crash right after install cannot
+    // lose it and silently un-quarantine the datadir. if writing it fails, no install has happened,
+    // so treat it as a pre-install failure (wipe staging, no marker).
+    if let Err(e) = write_marker_durably(&snapshots_path, &marker) {
         let _ = fs::remove_dir_all(&staging_root);
-        return Err(SnapshotError::Io(e));
+        return Err(e);
     }
 
     // steps 4-5: install the reth state, then the consensus records/packs. a failure now deletes
@@ -674,6 +675,38 @@ fn delete_chain_data<TND: TelcoinDirs>(datadir: &TND) {
     let _ = fs::remove_dir_all(datadir.consensus_db_path());
 }
 
+/// Write the restore-incomplete marker durably before install begins.
+///
+/// The marker is the datadir's quarantine flag: while it exists, [`has_chain_data`] reports `true`
+/// and both manual and automatic restore refuse to run. Reth's own install commits its state
+/// durably and INDEPENDENTLY, under a different directory, so if the marker were only buffered in
+/// the page cache when power was lost the machine could come back up with reth's state at block `B`
+/// but no marker and no consensus store — a datadir that looks restorable but is actually
+/// half-built and silently un-quarantined. Fsyncing the marker file and its parent directory puts
+/// the quarantine flag on disk before any install step runs, closing that gap.
+///
+/// On failure the marker is removed best-effort: no install has begun, so the datadir does not
+/// warrant a quarantine.
+///
+/// # Errors
+///
+/// Returns [`SnapshotError::Io`] if the snapshots directory or the marker cannot be created or
+/// synced.
+fn write_marker_durably(snapshots_path: &Path, marker: &Path) -> SnapshotResult<()> {
+    let write = || -> io::Result<()> {
+        tn_storage::archive::data_file::create_dir_synced(snapshots_path)?;
+        let file = fs::File::create(marker)?;
+        file.sync_all()?;
+        tn_storage::archive::data_file::fsync_directory(snapshots_path)
+    };
+    if let Err(e) = write() {
+        // no install happened, so leave nothing behind that would quarantine the datadir.
+        let _ = fs::remove_file(marker);
+        return Err(SnapshotError::Io(e));
+    }
+    Ok(())
+}
+
 /// Finalize a completed restore: clear the incomplete-restore marker, then write the receipt.
 ///
 /// The ordering is load-bearing. By the time this runs every install step has succeeded, so the
@@ -691,6 +724,10 @@ fn finalize_restore(snapshots_path: &Path, marker: &Path, receipt: &RestoreRecei
             "restore completed but clearing the incomplete-restore marker failed; the datadir stays quarantined until the marker is cleared manually"
         );
     }
+
+    // fsync the directory so the marker's removal is durable; a crash must not resurrect the
+    // just-removed marker and re-quarantine an already-completed restore.
+    let _ = tn_storage::archive::data_file::fsync_directory(snapshots_path);
 
     match serde_json::to_vec_pretty(receipt) {
         Ok(bytes) => {
@@ -1279,5 +1316,20 @@ mod tests {
         // must not panic and must still clear the marker despite the receipt write failing
         finalize_restore(&snapshots, &marker, &a_receipt());
         assert!(!marker.exists(), "marker must be cleared even when the receipt write fails");
+    }
+
+    #[test]
+    fn write_marker_durably_creates_dir_and_marker() {
+        let dir = tempdir().unwrap();
+        // the snapshots directory does not exist yet; the helper must create it
+        let snapshots = dir.path().join("snapshots");
+        let marker = snapshots.join(RESTORE_INCOMPLETE_MARKER);
+
+        write_marker_durably(&snapshots, &marker).expect("marker write must succeed");
+        assert!(marker.exists(), "marker must exist after a durable write");
+
+        // a second call is idempotent: File::create truncates an existing marker without error
+        write_marker_durably(&snapshots, &marker).expect("second marker write must succeed");
+        assert!(marker.exists(), "marker must still exist after an idempotent re-write");
     }
 }
