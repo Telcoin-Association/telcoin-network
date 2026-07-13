@@ -554,7 +554,6 @@ where
 mod tests {
     use super::*;
     use tn_network_libp2p::SyncFrameError;
-    use tokio::io::AsyncReadExt as _;
 
     /// Frame `bytes` through [`write_pack_data_frames`] into an in-memory buffer.
     async fn frame_pack(bytes: &[u8]) -> Vec<u8> {
