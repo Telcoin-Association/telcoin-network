@@ -67,7 +67,7 @@ async fn collect_epoch_records(
             let hash = rec.final_consensus.hash;
             // Don't know the output bytes so use 0.  If we could get them (already have the output)
             // we won't need them...
-            if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash, 0) {
+            if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash) {
                 debug!(
                     target: "epoch-manager",
                     "epoch record sync downloaded up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",
@@ -164,7 +164,7 @@ async fn collect_epoch_records(
     if let Some((epoch, number, hash)) = best_final_consensus {
         // Don't know the output bytes so use 0.  If we could get them (already have the output) we
         // won't need them...
-        if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash, 0) {
+        if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash) {
             info!(
                 target: "epoch-manager",
                 "updating last published consensus num hash up to epoch {result_epoch}, final consensus at block {number} ({hash}) - notifying state sync",

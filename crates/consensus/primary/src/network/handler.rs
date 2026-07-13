@@ -151,7 +151,7 @@ where
         // lags behind a burst of empty consensus rounds.
         let committed_round = self.consensus_bus.committed_round();
         let effective_exec_round = exec_round.max(processed_consensus_round).max(committed_round);
-        let (_last_consensus_epoch, last_consensus_number, _, _) =
+        let (_last_consensus_epoch, last_consensus_number, _) =
             self.consensus_bus.published_consensus_num_hash();
         // Use GC depth to estimate how many rounds we can be behind.
         // Subtract ten here so if we are right on the GC depth we will still go inactive (small
@@ -286,16 +286,9 @@ where
                 // header hash) against the signature.
                 // Used to track signature counts as well to avoid any mismatched data errors.
                 let consensus_result_hash = result.digest();
-                let ConsensusResult {
-                    epoch,
-                    round,
-                    number,
-                    hash,
-                    validator: key,
-                    signature,
-                    consensus_bytes,
-                } = *result;
-                let (_old_epoch, old_number, old_hash, _) =
+                let ConsensusResult { epoch, round, number, hash, validator: key, signature } =
+                    *result;
+                let (_old_epoch, old_number, old_hash) =
                     self.consensus_bus.published_consensus_num_hash();
                 if hash == old_hash || old_number >= number {
                     // We have already dealt with this hash or we are past this output.
@@ -382,12 +375,7 @@ where
                         // sure it is valid. Receivers will count on
                         // this being verified.
                         info!(target: "primary", "got new consensus {number}/{hash}");
-                        self.consensus_bus.publish_consensus_num_hash_if_newer(
-                            epoch,
-                            number,
-                            hash,
-                            consensus_bytes,
-                        );
+                        self.consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash);
                         self.consensus_certs.lock().clear();
                     }
                 } else {

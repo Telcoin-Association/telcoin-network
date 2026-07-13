@@ -243,8 +243,8 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     loop {
         tokio::select! {
             _ = rx_gossip_update.changed() => {
-                let (epoch, number, hash, consensus_bytes) = *rx_gossip_update.borrow_and_update();
-                let _ = consensus_bus.consensus_request_queue().send((epoch, number, hash, consensus_bytes)).await;
+                let (epoch, number, hash) = *rx_gossip_update.borrow_and_update();
+                let _ = consensus_bus.consensus_request_queue().send((epoch, number, hash)).await;
                 debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
             }
 
@@ -515,7 +515,7 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     consensus_chain: ConsensusChain,
     rx_shutdown: Noticer,
     task_spawner: TaskSpawner,
-    mut rx_consensus_request: impl TnReceiver<(Epoch, u64, ConsensusHeaderDigest, u64)>,
+    mut rx_consensus_request: impl TnReceiver<(Epoch, u64, ConsensusHeaderDigest)>,
 ) {
     // Attempt to clear the consensus header cache on startup.
     // This should not really be needed (records are evicted as they are processed) but
@@ -536,7 +536,7 @@ pub async fn spawn_fetch_recent_consensus<DB: TNDatabase>(
     loop {
         tokio::select! {
             req = rx_consensus_request.recv() => {
-                let Some((epoch, number, hash, _consensus_bytes)) = req else {
+                let Some((epoch, number, hash)) = req else {
                     // We lost our channel so shutdown- this is a critical task so node will stop.
                     return;
                 };

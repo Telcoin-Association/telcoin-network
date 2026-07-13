@@ -274,7 +274,7 @@ where
         // This needs to be created early so required machinery for other tasks exists when needed.
         let mut worker = worker_node.new_worker().await?;
         let current_epoch = primary.current_committee().await.epoch();
-        let (current_consensus_epoch, _, _, _) = self.consensus_bus.published_consensus_num_hash();
+        let (current_consensus_epoch, _, _) = self.consensus_bus.published_consensus_num_hash();
         if current_epoch < current_consensus_epoch {
             // If we are starting an epoch behind consensus then make sure we have requested this
             // pack file. The request will not do anything if we have the pack or it's
