@@ -176,6 +176,8 @@ mod evm;
 pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
+#[cfg(feature = "faucet")]
+pub use evm::faucet_mint_role_slot;
 #[cfg(not(feature = "faucet"))]
 pub use evm::TIMELOCK_DURATION;
 pub use evm::{
