@@ -217,6 +217,24 @@ pub enum SnapshotError {
     #[error("restore did not complete; datadir is in an inconsistent state")]
     RestoreIncomplete,
 
+    /// The resolved snapshot epoch is below the operator-configured minimum, so restore refused
+    /// it.
+    ///
+    /// A bucket cannot forge a snapshot for the wrong committee, but it CAN serve an older,
+    /// still-valid one in place of the newest. An operator-set floor (`--snapshot-min-epoch`)
+    /// turns that unauthenticated-freshness gap into a hard bound on how far back an
+    /// attacker-chosen start may be.
+    #[error(
+        "resolved snapshot epoch {resolved} is below the configured minimum epoch {min_epoch}; \
+         the bucket may be withholding newer snapshots"
+    )]
+    EpochTooOld {
+        /// The snapshot epoch resolution selected, whether pinned or taken from `latest.json`.
+        resolved: u32,
+        /// The operator-configured minimum epoch the restore requires.
+        min_epoch: u32,
+    },
+
     /// An operation exceeded its deadline.
     #[error("snapshot operation timed out: {0}")]
     Timeout(String),

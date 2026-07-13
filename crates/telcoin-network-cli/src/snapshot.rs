@@ -112,7 +112,10 @@ impl RestoreArgs {
 
         // errors surface as-is: ChainDataExists / MissingTrustRoot / RestoreIncomplete carry
         // precise messages an auto-restore caller (and an operator) can act on.
-        let receipt = restore_from_snapshot(&datadir, &source, epoch, &bundle.config).await?;
+        //
+        // manual restore applies no min-epoch floor: an operator can pin --epoch directly, so a
+        // floor would only add a knob without adding safety the pin does not already provide.
+        let receipt = restore_from_snapshot(&datadir, &source, epoch, None, &bundle.config).await?;
         print_restore_receipt(&datadir, &receipt);
         Ok(())
     }

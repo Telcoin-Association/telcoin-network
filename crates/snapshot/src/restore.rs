@@ -77,6 +77,12 @@ use tracing::{info, warn};
 /// `epoch` pins the snapshot to a specific epoch and bypasses the bucket's `latest.json` pointer;
 /// `None` selects the newest snapshot the pointer advertises (see the module's withholding caveat).
 ///
+/// `min_epoch`, when set, is an operator-configured floor: a resolved epoch below it is refused
+/// with [`SnapshotError::EpochTooOld`]. Because a bucket can serve an older, still-valid snapshot
+/// in place of the newest, the floor bounds how far back an attacker-chosen start may be. It is
+/// checked before any fetch on a pinned `epoch`, and against the authoritative manifest epoch on
+/// the pointer path.
+///
 /// # Preconditions
 ///
 /// - The local genesis and committee must exist, or [`SnapshotError::MissingTrustRoot`] is
@@ -89,13 +95,15 @@ use tracing::{info, warn};
 ///
 /// # Errors
 ///
-/// Returns the specific precondition errors above, plus [`SnapshotError::Manifest`] /
+/// Returns the specific precondition errors above, plus [`SnapshotError::EpochTooOld`] when a
+/// `min_epoch` floor is set and the resolved epoch is below it, [`SnapshotError::Manifest`] /
 /// [`SnapshotError::Integrity`] / [`SnapshotError::Verification`] from resolution and verification,
 /// and [`SnapshotError::Other`] wrapping any reth or consensus-store failure during installation.
 pub async fn restore_from_snapshot<TND: TelcoinDirs>(
     datadir: &TND,
     source_url: &str,
     epoch: Option<u32>,
+    min_epoch: Option<u32>,
     reth_config: &RethConfig,
 ) -> SnapshotResult<RestoreReceipt> {
     // trust root and preconditions first: nothing is downloaded until the datadir is proven empty.
@@ -106,7 +114,8 @@ pub async fn restore_from_snapshot<TND: TelcoinDirs>(
     // steps 2-3: resolve, download, and verify into a staging directory. a failure here is before
     // install begins, so it only wipes staging and leaves no marker.
     let staging_root = snapshots_path.join("restore-staging");
-    let prepared = match prepare_snapshot(source_url, &trust, epoch, &staging_root).await {
+    let prepared = match prepare_snapshot(source_url, &trust, epoch, min_epoch, &staging_root).await
+    {
         Ok(prepared) => prepared,
         Err(e) => {
             let _ = fs::remove_dir_all(&staging_root);
@@ -200,7 +209,9 @@ pub async fn verify_snapshot_source<TND: TelcoinDirs>(
     // one async block so the staging directory is wiped on EVERY exit path — including a
     // deep-verify failure, whose throwaway reth datadir lives under staging.
     let outcome = async {
-        let prepared = prepare_snapshot(source_url, &trust, epoch, &staging_root).await?;
+        // verify reports what a bucket serves rather than gating a boot on it, so it applies no
+        // operator min-epoch floor (that floor lives on the node's auto-restore path).
+        let prepared = prepare_snapshot(source_url, &trust, epoch, None, &staging_root).await?;
         let state_root = match mode {
             VerifyMode::Deep => Some(deep_verify_state(&trust, &prepared).await?),
             VerifyMode::SkipStateRoot => None,
@@ -401,17 +412,20 @@ fn precheck<TND: TelcoinDirs>(datadir: &TND) -> SnapshotResult<TrustRoot> {
 
 /// Resolve, download, and verify a snapshot into `<staging_root>/epoch-<N>/`.
 ///
-/// Shared by [`restore_from_snapshot`] and [`verify_snapshot_source`]. The chosen epoch is logged
-/// prominently: withholding is the one attack a valid trust root cannot rule out, so an operator
-/// must be able to see which epoch was served.
+/// Shared by [`restore_from_snapshot`] and [`verify_snapshot_source`]. `min_epoch`, when set,
+/// refuses a resolved epoch below the operator floor (see [`resolve_manifest`]) before any artifact
+/// is downloaded. The chosen epoch is logged prominently: withholding is the one attack a valid
+/// trust root cannot rule out, so an operator must be able to see which epoch was served.
 async fn prepare_snapshot(
     source_url: &str,
     trust: &TrustRoot,
     epoch: Option<u32>,
+    min_epoch: Option<u32>,
     staging_root: &Path,
 ) -> SnapshotResult<Prepared> {
     let store = SnapshotStore::open(source_url)?;
-    let (chosen_epoch, manifest) = resolve_manifest(&store, trust.chain_id, epoch).await?;
+    let (chosen_epoch, manifest) =
+        resolve_manifest(&store, trust.chain_id, epoch, min_epoch).await?;
 
     // enforce artifact count and total-size budgets before any download; the manifest is now bound
     // to the local chain but its artifact list is still remote-controlled in size.
@@ -476,13 +490,21 @@ async fn prepare_snapshot(
 /// A pinned epoch fetches `epoch-<N>/manifest.json` directly and bypasses the pointer. The pointer
 /// path additionally binds the pointer to the manifest by a sha256 of the manifest bytes, so a
 /// tampered manifest cannot be substituted behind a valid pointer.
+///
+/// `min_epoch`, when set, is enforced before any fetch on the pinned path (the pin is
+/// operator-controlled) and against the authoritative `manifest.epoch` on the pointer path, so a
+/// withholding bucket cannot push a fresh node below the operator's floor.
 async fn resolve_manifest(
     store: &SnapshotStore,
     chain_id: u64,
     epoch: Option<u32>,
+    min_epoch: Option<u32>,
 ) -> SnapshotResult<(u32, Manifest)> {
     match epoch {
         Some(n) => {
+            // reject a pinned epoch below the operator floor before any network fetch: the pin is
+            // fully operator-controlled, so no authenticated manifest is needed to decide.
+            enforce_min_epoch(n, min_epoch)?;
             let bytes = store.get_json_bytes(&SnapshotStore::manifest_key(n)).await?;
             let manifest = Manifest::from_json(&bytes)?;
             if manifest.epoch != n {
@@ -531,6 +553,10 @@ async fn resolve_manifest(
                     pointer.epoch, manifest.epoch
                 )));
             }
+            // enforce the operator floor on the AUTHORITATIVE manifest epoch, now that it is bound
+            // to the local chain and cross-checked against the pointer. the pointer's advertised
+            // epoch is unauthenticated, so the floor must gate the manifest's own epoch.
+            enforce_min_epoch(manifest.epoch, min_epoch)?;
             Ok((manifest.epoch, manifest))
         }
     }
@@ -543,6 +569,22 @@ fn check_manifest_chain(manifest: &Manifest, chain_id: u64) -> SnapshotResult<()
             "manifest targets chain {}, local chain is {chain_id}",
             manifest.chain_id
         )));
+    }
+    Ok(())
+}
+
+/// Reject a resolved snapshot epoch that falls below the operator-configured floor.
+///
+/// The floor is an operator's only defense against a bucket that withholds the newest snapshot and
+/// serves an older, still-valid one: freshness is unauthenticated, so a valid trust root cannot
+/// rule that out. The bound is inclusive — an epoch equal to `min_epoch` is accepted — and a `None`
+/// floor accepts any epoch. Callers enforce it on the pinned epoch before any fetch and on the
+/// authoritative manifest epoch on the pointer path.
+fn enforce_min_epoch(resolved: u32, min_epoch: Option<u32>) -> SnapshotResult<()> {
+    if let Some(min) = min_epoch {
+        if resolved < min {
+            return Err(SnapshotError::EpochTooOld { resolved, min_epoch: min });
+        }
     }
     Ok(())
 }
@@ -1207,7 +1249,8 @@ mod tests {
             .unwrap();
 
         // no latest.json is uploaded: a pinned epoch must resolve without the pointer
-        let (epoch, manifest) = resolve_manifest(&store, TEST_CHAIN_ID, Some(n)).await.unwrap();
+        let (epoch, manifest) =
+            resolve_manifest(&store, TEST_CHAIN_ID, Some(n), None).await.unwrap();
         assert_eq!(epoch, n);
         assert_eq!(manifest, fx.manifest);
     }
@@ -1231,7 +1274,7 @@ mod tests {
         };
         store.put_bytes(LATEST_KEY, pointer.to_json().unwrap()).await.unwrap();
 
-        let err = resolve_manifest(&store, TEST_CHAIN_ID, None).await.unwrap_err();
+        let err = resolve_manifest(&store, TEST_CHAIN_ID, None, None).await.unwrap_err();
         assert!(matches!(err, SnapshotError::Integrity(_)), "got {err:?}");
     }
 
@@ -1249,7 +1292,7 @@ mod tests {
         };
         store.put_bytes(LATEST_KEY, pointer.to_json().unwrap()).await.unwrap();
 
-        let err = resolve_manifest(&store, TEST_CHAIN_ID, None).await.unwrap_err();
+        let err = resolve_manifest(&store, TEST_CHAIN_ID, None, None).await.unwrap_err();
         assert!(matches!(err, SnapshotError::Manifest(_)), "got {err:?}");
     }
 
@@ -1277,7 +1320,7 @@ mod tests {
         };
         store.put_bytes(LATEST_KEY, pointer.to_json().unwrap()).await.unwrap();
 
-        let err = resolve_manifest(&store, TEST_CHAIN_ID, None).await.unwrap_err();
+        let err = resolve_manifest(&store, TEST_CHAIN_ID, None, None).await.unwrap_err();
         assert!(matches!(err, SnapshotError::Manifest(_)), "got {err:?}");
     }
 
@@ -1303,8 +1346,68 @@ mod tests {
         };
         store.put_bytes(LATEST_KEY, pointer.to_json().unwrap()).await.unwrap();
 
-        let err = resolve_manifest(&store, TEST_CHAIN_ID, None).await.unwrap_err();
+        let err = resolve_manifest(&store, TEST_CHAIN_ID, None, None).await.unwrap_err();
         assert!(matches!(err, SnapshotError::Manifest(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_pinned_epoch_below_min() {
+        let bucket = tempdir().unwrap();
+        let store = file_store(bucket.path());
+
+        // upload NOTHING: a pinned epoch below the floor must be rejected before any fetch, so
+        // resolution cannot depend on the manifest existing. a fetch attempt here would surface an
+        // object-store error instead of EpochTooOld.
+        let err = resolve_manifest(&store, TEST_CHAIN_ID, Some(3), Some(5)).await.unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::EpochTooOld { resolved: 3, min_epoch: 5 }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_latest_below_min() {
+        let bucket = tempdir().unwrap();
+        let store = file_store(bucket.path());
+        let fx = assemble(&finish(&happy_spec()), TEST_CHAIN_ID, B256::from([0xaa; 32]));
+        let n = fx.manifest.epoch;
+        let manifest_bytes = fx.manifest.to_json().unwrap();
+        store.put_bytes(&SnapshotStore::manifest_key(n), manifest_bytes.clone()).await.unwrap();
+        let pointer = Pointer {
+            format_version: FORMAT_VERSION,
+            chain_id: TEST_CHAIN_ID,
+            epoch: n,
+            manifest_key: SnapshotStore::manifest_key(n),
+            manifest_sha256: sha256_hex(&manifest_bytes),
+            updated_at: 1,
+        };
+        store.put_bytes(LATEST_KEY, pointer.to_json().unwrap()).await.unwrap();
+
+        // the pointer resolves to a valid epoch-n manifest, but the floor is n+1: the floor must
+        // reject the authoritative manifest epoch after the chain and layout checks have passed.
+        let err = resolve_manifest(&store, TEST_CHAIN_ID, None, Some(n + 1)).await.unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::EpochTooOld { resolved, min_epoch } if resolved == n && min_epoch == n + 1),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_accepts_epoch_at_min() {
+        let bucket = tempdir().unwrap();
+        let store = file_store(bucket.path());
+        let fx = assemble(&finish(&happy_spec()), TEST_CHAIN_ID, B256::from([0xaa; 32]));
+        let n = fx.manifest.epoch;
+        store
+            .put_bytes(&SnapshotStore::manifest_key(n), fx.manifest.to_json().unwrap())
+            .await
+            .unwrap();
+
+        // the floor is inclusive: a resolved epoch exactly equal to the minimum must resolve.
+        let (epoch, manifest) =
+            resolve_manifest(&store, TEST_CHAIN_ID, Some(n), Some(n)).await.unwrap();
+        assert_eq!(epoch, n);
+        assert_eq!(manifest, fx.manifest);
     }
 
     // ----- consensus install (the C5 consensus-side contract) -----

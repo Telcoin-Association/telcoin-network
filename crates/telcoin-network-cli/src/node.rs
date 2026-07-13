@@ -197,7 +197,13 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             ext,
             node_name: _,
             tracing_url: _,
-            snapshot: NodeSnapshotArgs { snapshot_upload, snapshot_keep_last, snapshot_source },
+            snapshot:
+                NodeSnapshotArgs {
+                    snapshot_upload,
+                    snapshot_keep_last,
+                    snapshot_source,
+                    snapshot_min_epoch,
+                },
         } = self;
 
         // set up reth node config for engine components
@@ -221,6 +227,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
                 tokio::runtime::Handle::current().block_on(maybe_restore_from_snapshot(
                     &tn_datadir,
                     source,
+                    snapshot_min_epoch,
                     &node_config,
                 ))
             })?;
@@ -285,6 +292,17 @@ pub struct NodeSnapshotArgs {
     /// read credentials from the standard per-scheme environment variables (for example `AWS_*`).
     #[arg(long, value_name = "URL", env = "TN_SNAPSHOT_SOURCE")]
     pub snapshot_source: Option<String>,
+
+    /// Minimum epoch a startup auto-restore will accept from `--snapshot-source`.
+    ///
+    /// A malicious or misconfigured bucket cannot forge a snapshot for the wrong committee, but it
+    /// CAN serve an older, still-valid one in place of the newest. Setting a floor bounds how far
+    /// back an attacker-chosen start may be: a resolved epoch below this value fails startup
+    /// rather than booting on stale state. Only meaningful alongside `--snapshot-source`; when
+    /// unset the node accepts whatever epoch the bucket's `latest.json` advertises. Manual
+    /// `snapshot restore` has no floor — pin `--epoch` instead.
+    #[arg(long, value_name = "EPOCH", env = "TN_SNAPSHOT_MIN_EPOCH")]
+    pub snapshot_min_epoch: Option<u32>,
 }
 
 /// Reject the observer-only `--snapshot-upload` flag on a validator node.
@@ -311,15 +329,18 @@ fn ensure_snapshot_upload_is_observer_only(
 /// Runs only before the reth database is created, so the datadir is either empty (restore
 /// proceeds) or already populated (restore is refused with
 /// [`SnapshotError::ChainDataExists`], which is skipped here). The always-latest pointer is
-/// used because the node flag does not expose an epoch pin. On success the installed epoch is
-/// logged prominently: a valid trust root cannot rule out a bucket withholding a newer,
-/// still-valid snapshot, so an operator must be able to see which epoch was installed.
+/// used because the node flag does not expose an epoch pin; `min_epoch` (from
+/// `--snapshot-min-epoch`) is the operator's floor against a bucket that withholds the newest
+/// snapshot and serves an older, still-valid one. On success the installed epoch is logged
+/// prominently: a valid trust root cannot rule out withholding, so an operator must be able to see
+/// which epoch was installed.
 async fn maybe_restore_from_snapshot<TND: TelcoinDirs>(
     datadir: &TND,
     source_url: &str,
+    min_epoch: Option<u32>,
     reth_config: &RethConfig,
 ) -> eyre::Result<()> {
-    let outcome = restore_from_snapshot(datadir, source_url, None, reth_config).await;
+    let outcome = restore_from_snapshot(datadir, source_url, None, min_epoch, reth_config).await;
     match interpret_auto_restore(outcome, source_url)? {
         Some(epoch) => {
             info!(
@@ -381,6 +402,7 @@ mod tests {
         assert_eq!(args.snapshot_upload, None);
         assert_eq!(args.snapshot_source, None);
         assert_eq!(args.snapshot_keep_last, DEFAULT_KEEP_LAST);
+        assert_eq!(args.snapshot_min_epoch, None);
     }
 
     #[test]
@@ -392,10 +414,13 @@ mod tests {
             "7",
             "--snapshot-source",
             "file:///tmp/bucket",
+            "--snapshot-min-epoch",
+            "12",
         ]);
         assert_eq!(args.snapshot_upload.as_deref(), Some("s3://bucket/prefix"));
         assert_eq!(args.snapshot_keep_last, 7);
         assert_eq!(args.snapshot_source.as_deref(), Some("file:///tmp/bucket"));
+        assert_eq!(args.snapshot_min_epoch, Some(12));
     }
 
     #[test]
@@ -405,13 +430,16 @@ mod tests {
         std::env::set_var("TN_SNAPSHOT_UPLOAD", "gs://bucket");
         std::env::set_var("TN_SNAPSHOT_KEEP_LAST", "5");
         std::env::set_var("TN_SNAPSHOT_SOURCE", "az://container");
+        std::env::set_var("TN_SNAPSHOT_MIN_EPOCH", "8");
         let args = parse_snapshot_args(&[]);
         std::env::remove_var("TN_SNAPSHOT_UPLOAD");
         std::env::remove_var("TN_SNAPSHOT_KEEP_LAST");
         std::env::remove_var("TN_SNAPSHOT_SOURCE");
+        std::env::remove_var("TN_SNAPSHOT_MIN_EPOCH");
         assert_eq!(args.snapshot_upload.as_deref(), Some("gs://bucket"));
         assert_eq!(args.snapshot_keep_last, 5);
         assert_eq!(args.snapshot_source.as_deref(), Some("az://container"));
+        assert_eq!(args.snapshot_min_epoch, Some(8));
     }
 
     #[test]
