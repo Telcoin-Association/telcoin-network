@@ -95,18 +95,28 @@ impl NetworkConfig {
     }
 }
 
+/// The maximum size, in bytes, of a gossip message payload (`GossipMessage::data`).
+///
+/// This is a protocol constant, not a per-node tunable, and is deliberately identical on every
+/// node. The gossip reject path Fatal-bans the *relaying* peer for delivering an oversized payload
+/// (`RejectReason::TooLarge` -> `RejectPenalty::FatalRelayer`), and that attribution is sound only
+/// if every honest node applies the identical bound: under gossipsub `Strict` validation a peer
+/// that deems a message `TooLarge` reports `Reject` and never forwards it, so a delivered oversized
+/// payload is genuine relayer misbehavior. The bound is enforced symmetrically on both the publish
+/// path (the network layer refuses to originate a larger message) and the receive path, so an
+/// honest node never emits one for its peers to reject. A per-node bound would instead let an
+/// honest relayer configured with a larger limit be Fatal-banned for forwarding a payload that is
+/// under its own limit but over ours, so the bound is fixed here network-wide rather than read from
+/// operator config. The largest legitimate gossip message is a `Certificate`; 12,000 bytes is sized
+/// to accommodate it.
+pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 12_000;
+
 /// Configurations for libp2p library.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct LibP2pConfig {
     /// Maximum message size between request/response network messages in bytes.
     pub max_rpc_message_size: usize,
-    /// Maximum message size for gossipped network messages in bytes.
-    ///
-    /// The largest gossip message is likely a `Certificate`.
-    /// The default of 12,000 bytes should be enough for legit gossip.
-    /// Large messages should not be gossipped
-    pub max_gossip_message_size: usize,
     /// The maximum duration to keep an idle connection alive between peers.
     ///
     /// The strategy for TN is to rely on QUIC to send keep alive messages instead of adding
@@ -181,7 +191,6 @@ impl Default for LibP2pConfig {
     fn default() -> Self {
         Self {
             max_rpc_message_size: 1024 * 1024,                    // 1 MiB
-            max_gossip_message_size: 12_000,                      // 12kb
             max_idle_connection_timeout: Duration::from_secs(65), // same as quic handshake
             max_px_disconnects: 10,
             px_disconnect_timeout: Duration::from_secs(3),
@@ -503,7 +512,6 @@ mod tests {
         let yaml = r#"
 libp2p_config:
   max_rpc_message_size: 2097152
-  max_gossip_message_size: 12000
   max_idle_connection_timeout:
     secs: 65
     nanos: 0
