@@ -1410,7 +1410,6 @@ impl RethEnv {
         /// concurrent 8 TB virtual reservations exhaust the address space and MDBX aborts
         /// env-open with ENOMEM ("Cannot allocate memory (12)"). A temp chain never holds a
         /// full node's history, so a small ceiling is safe and lets many envs coexist.
-        /// (`cargo nextest`, one process per test, never hit this — hence `make test` passed.)
         const TEMP_CHAIN_DB_MAX_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
         /// Grow the temp DB file in small increments so throwaway DBs stay tiny on disk
         /// (reth pairs its 8 TB default with a 4 GiB step; mirror reth's `test()` 4 MiB step).
