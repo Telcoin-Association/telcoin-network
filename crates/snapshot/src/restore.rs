@@ -247,6 +247,30 @@ pub struct VerifiedSummary {
 /// Filename of the restore receipt written under the snapshots directory.
 const LAST_RESTORE_FILENAME: &str = "last-restore.json";
 
+/// Maximum number of artifact entries a manifest may list before restore or verify refuses it.
+///
+/// State chunks rotate at roughly 256 MiB uncompressed, so 4096 artifacts already covers on the
+/// order of a terabyte of state — far beyond any realistic snapshot. The cap exists to stop a
+/// hostile bucket from advertising a million-entry manifest that would exhaust memory or file
+/// descriptors before a single byte is verified. It is a documented constant in v1; making it
+/// operator-configurable is deferred.
+const MAX_MANIFEST_ARTIFACTS: usize = 4096;
+
+/// Maximum combined size, in bytes, of every artifact a manifest may list (compressed, as stored).
+///
+/// This budgets the download itself. [`DecompressLimits`] bounds only the DECOMPRESSED size of each
+/// chunk, so it cannot substitute for a cap on the compressed bytes actually pulled to disk. A
+/// documented constant in v1; operator configurability is deferred.
+const MAX_TOTAL_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+
+/// Multiplier applied to the download size when checking free disk.
+///
+/// The download is only the first consumer of disk: restore then rebuilds a reth database and ETL
+/// scratch from it, and deep verification does the same into a throwaway datadir, so the installed
+/// footprint needs headroom BEYOND the raw download budget. A factor of two is a coarse but safe
+/// floor for that combined footprint.
+const DISK_HEADROOM_FACTOR: u64 = 2;
+
 /// The local trust root a snapshot is verified against: the genesis committee plus the genesis
 /// binding (`chain_id` + `genesis_hash`) all read from the node's own configuration.
 #[derive(Debug)]
@@ -320,6 +344,10 @@ async fn prepare_snapshot(
     let store = SnapshotStore::open(source_url)?;
     let (chosen_epoch, manifest) = resolve_manifest(&store, trust.chain_id, epoch).await?;
 
+    // enforce artifact count and total-size budgets before any download; the manifest is now bound
+    // to the local chain but its artifact list is still remote-controlled in size.
+    let total_artifact_bytes = check_artifact_budgets(&manifest)?;
+
     if epoch.is_some() {
         info!(target: "tn::snapshot", epoch = chosen_epoch, source = source_url, "resolved pinned snapshot epoch");
     } else {
@@ -338,6 +366,10 @@ async fn prepare_snapshot(
         fs::remove_dir_all(&staging_dir)?;
     }
     fs::create_dir_all(&staging_dir)?;
+
+    // refuse now if the filesystem cannot hold the download plus install/verify headroom, rather
+    // than filling the disk mid-install and quarantining the datadir.
+    check_free_disk(&staging_dir, total_artifact_bytes)?;
 
     // download every artifact, integrity-checked as it streams to disk
     for entry in &manifest.artifacts {
@@ -425,6 +457,73 @@ fn check_manifest_chain(manifest: &Manifest, chain_id: u64) -> SnapshotResult<()
             manifest.chain_id
         )));
     }
+    Ok(())
+}
+
+/// Enforce the manifest's artifact-count and total-size budgets, returning the summed size.
+///
+/// Runs after [`resolve_manifest`] has bound the manifest to the local chain but before any
+/// artifact is fetched, so a hostile bucket cannot make a fresh node download an unbounded number
+/// or volume of objects. The returned total feeds [`check_free_disk`]. The sum uses
+/// `saturating_add` so a manifest full of `u64::MAX` sizes reports the cap as exceeded rather than
+/// overflowing.
+///
+/// # Errors
+///
+/// Returns [`SnapshotError::Manifest`] if the artifact count exceeds [`MAX_MANIFEST_ARTIFACTS`] or
+/// the combined size exceeds [`MAX_TOTAL_ARTIFACT_BYTES`].
+fn check_artifact_budgets(manifest: &Manifest) -> SnapshotResult<u64> {
+    let count = manifest.artifacts.len();
+    if count > MAX_MANIFEST_ARTIFACTS {
+        return Err(SnapshotError::Manifest(format!(
+            "manifest lists {count} artifacts, exceeding the maximum of {MAX_MANIFEST_ARTIFACTS}"
+        )));
+    }
+    let total = manifest.artifacts.iter().fold(0u64, |acc, entry| acc.saturating_add(entry.size));
+    if total > MAX_TOTAL_ARTIFACT_BYTES {
+        return Err(SnapshotError::Manifest(format!(
+            "manifest artifacts total {total} bytes, exceeding the maximum of {MAX_TOTAL_ARTIFACT_BYTES}"
+        )));
+    }
+    Ok(total)
+}
+
+/// Refuse to start a download that cannot fit under `staging_dir`'s filesystem with headroom.
+///
+/// `needed` is the combined compressed size returned by [`check_artifact_budgets`]; the check
+/// requires `needed * DISK_HEADROOM_FACTOR` free because the download is only the first consumer of
+/// disk (restore rebuilds a reth database and ETL scratch from it, and deep verification does the
+/// same in a throwaway datadir). Checking up front turns a mid-install `ENOSPC` — which would
+/// quarantine the datadir — into a clean pre-install refusal.
+///
+/// On non-Unix targets `statvfs` is unavailable, so this is a no-op: a full disk still fails the
+/// download safely, just without the early check.
+///
+/// # Errors
+///
+/// Returns [`SnapshotError::Other`] if the free space is below `needed * DISK_HEADROOM_FACTOR`, or
+/// if the filesystem cannot be queried.
+#[cfg(unix)]
+fn check_free_disk(staging_dir: &Path, needed: u64) -> SnapshotResult<()> {
+    let stat = rustix::fs::statvfs(staging_dir).map_err(|e| {
+        SnapshotError::Other(eyre::eyre!(
+            "failed to query free disk for the snapshot download: {e}"
+        ))
+    })?;
+    let available = stat.f_bavail.saturating_mul(stat.f_frsize);
+    let required = needed.saturating_mul(DISK_HEADROOM_FACTOR);
+    if available < required {
+        return Err(SnapshotError::Other(eyre::eyre!(
+            "insufficient free disk for snapshot: {available} bytes available, need {required} \
+             ({needed} bytes to download x{DISK_HEADROOM_FACTOR} headroom for install and verify)"
+        )));
+    }
+    Ok(())
+}
+
+/// No-op free-disk check on targets without `statvfs`.
+#[cfg(not(unix))]
+fn check_free_disk(_staging_dir: &Path, _needed: u64) -> SnapshotResult<()> {
     Ok(())
 }
 
@@ -786,6 +885,61 @@ mod tests {
         let mut out = Vec::new();
         let err = reader.read_to_end(&mut out).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ----- download budgets -----
+
+    /// A realistic manifest to exercise the budget checks against.
+    fn a_manifest() -> Manifest {
+        assemble(&finish(&happy_spec()), TEST_CHAIN_ID, B256::from([0xaa; 32])).manifest
+    }
+
+    #[test]
+    fn budgets_reject_too_many_artifacts() {
+        let mut manifest = a_manifest();
+        let entry = manifest.artifacts[0].clone();
+        manifest.artifacts = vec![entry; MAX_MANIFEST_ARTIFACTS + 1];
+        let err = check_artifact_budgets(&manifest).unwrap_err();
+        assert!(matches!(err, SnapshotError::Manifest(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn budgets_reject_total_size_over_cap() {
+        let mut manifest = a_manifest();
+        let mut first = manifest.artifacts[0].clone();
+        let mut second = first.clone();
+        // two artifacts each just under half of u64::MAX: saturating_add must report the cap as
+        // exceeded without panicking on overflow.
+        first.size = u64::MAX / 2;
+        second.size = u64::MAX / 2;
+        manifest.artifacts = vec![first, second];
+        let err = check_artifact_budgets(&manifest).unwrap_err();
+        assert!(matches!(err, SnapshotError::Manifest(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn budgets_accept_a_realistic_manifest() {
+        let manifest = a_manifest();
+        let total =
+            check_artifact_budgets(&manifest).expect("a realistic manifest must pass the budgets");
+        let expected: u64 = manifest.artifacts.iter().map(|entry| entry.size).sum();
+        assert_eq!(total, expected, "returned total must equal the summed artifact sizes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn free_disk_rejects_impossible_requirement() {
+        let dir = tempdir().unwrap();
+        // no real filesystem has u64::MAX bytes free, so this must be refused
+        let err = check_free_disk(dir.path(), u64::MAX).unwrap_err();
+        assert!(matches!(err, SnapshotError::Other(_)), "got {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn free_disk_accepts_zero_requirement() {
+        let dir = tempdir().unwrap();
+        check_free_disk(dir.path(), 0).expect("a zero-byte requirement always fits");
     }
 
     // ----- manifest resolution -----

@@ -42,6 +42,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 eyre = { workspace = true }
 url = { workspace = true }
+# free-disk budget check before download (unix statvfs)
+rustix = { workspace = true }
 
 # metrics
 metrics = { workspace = true }

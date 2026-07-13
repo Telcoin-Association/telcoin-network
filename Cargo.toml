@@ -224,6 +224,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 # remote object storage for snapshots; keep native-tls out of the lockfile (rustls only)
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"] }
+# free-disk budget check before a snapshot download (unix statvfs); already in the lockfile
+rustix = { version = "1.1", features = ["fs"] }
 # worker-gateway http server (bin/worker-gateway)
 axum = { version = "0.8.6", default-features = false }
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
