@@ -128,14 +128,63 @@ pub struct MissingCertificatesRequest {
 impl MissingCertificatesRequest {
     /// Deserialize the [RoaringBitmap] representing the difference between the requesting peer's
     /// lower boundary and their GC round.
+    ///
+    /// Every skip-round entry is attacker-controlled, so three request-shaped allocations are
+    /// bounded here, each rejected before it happens:
+    /// - `max_authorities` (the caller passes the committee size) bounds the number of
+    ///   `skip_rounds` entries (GHSA-wwqq-q2xx-4jf9). One bitmap per committee authority is the
+    ///   invariant; nothing else limits how many entries a peer can name in a single request, and
+    ///   each accepted entry costs a decode plus a retained `BTreeSet`.
+    /// - `max_skip_rounds_per_authority` (the committee's `max_skip_rounds_for_missing_certs`)
+    ///   bounds each bitmap twice (GHSA-4ggp-fcpj-g9f3): once on the container count read straight
+    ///   from the serialized header *before* [`RoaringBitmap::deserialize_from`] allocates anything
+    ///   (a few hundred KiB of run-encoded bitmap would otherwise decompress to hundreds of MiB of
+    ///   heap during deserialization -- roaring 0.10 has no run store, so every run container is
+    ///   expanded into an array/bitmap store), and once on the decoded cardinality *before* the
+    ///   `O(cardinality)` collect below.
     pub(crate) fn get_bounds(
         &self,
+        max_skip_rounds_per_authority: usize,
+        max_authorities: usize,
     ) -> PrimaryNetworkResult<(Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>)> {
+        // One skip-round bitmap per committee authority is the documented invariant; reject a
+        // request naming more authorities than the committee has before decoding anything.
+        (self.skip_rounds.len() <= max_authorities).then_some(()).ok_or_else(|| {
+            PrimaryNetworkError::InvalidRequest(format!(
+                "skip_rounds authority count exceeds committee size: {} > {max_authorities}",
+                self.skip_rounds.len()
+            ))
+        })?;
+
+        let max_cardinality = u64::try_from(max_skip_rounds_per_authority).unwrap_or(u64::MAX);
         let skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>> = self
             .skip_rounds
             .iter()
             .map(|(k, serialized)| {
-                let rounds = RoaringBitmap::deserialize_from(&serialized[..])?
+                // Reject a decompression bomb *before* `deserialize_from` materializes it: the
+                // header declares the container count, and a genuine bitmap of cardinality N spans
+                // at most N containers, so the cardinality limit doubles as a sound container-count
+                // limit that never rejects a well-formed request while capping the ~8 KiB-per-
+                // container heap that deserialization would otherwise allocate.
+                let containers = roaring_container_count(serialized)?;
+                (containers <= max_cardinality).then_some(()).ok_or_else(|| {
+                    PrimaryNetworkError::InvalidRequest(format!(
+                        "skip_rounds bitmap declares too many containers: {containers} > {max_cardinality}"
+                    ))
+                })?;
+
+                let bitmap = RoaringBitmap::deserialize_from(&serialized[..])?;
+
+                // Reject on cardinality *before* the `O(cardinality)` collect: the container bound
+                // still admits up to `max_cardinality` full (65_536-round) containers.
+                let cardinality = bitmap.len();
+                (cardinality <= max_cardinality).then_some(()).ok_or_else(|| {
+                    PrimaryNetworkError::InvalidRequest(format!(
+                        "skip_rounds bitmap too large: {cardinality} > {max_cardinality}"
+                    ))
+                })?;
+
+                let rounds = bitmap
                     .into_iter()
                     .map(|r| {
                         // r: u32 == Round; reject rather than wrap (release) or panic (debug)
@@ -182,6 +231,44 @@ impl MissingCertificatesRequest {
     pub fn set_max_response_size(mut self, max_size: usize) -> Self {
         self.max_response_size = max_size;
         self
+    }
+}
+
+/// Cookie prefixing a serialized [`RoaringBitmap`] with no run containers: a `u32` container count
+/// follows it. (roaring 0.10.12, `bitmap/serialization.rs`.)
+const ROARING_SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
+/// Cookie (low 16 bits) prefixing a serialized [`RoaringBitmap`] that may contain run containers:
+/// the container count minus one is packed into the high 16 bits of the cookie word.
+const ROARING_SERIAL_COOKIE: u32 = 12347;
+
+/// Number of containers declared in a serialized [`RoaringBitmap`] header, read without
+/// materializing the bitmap.
+///
+/// Roaring's portable format opens with either [`ROARING_SERIAL_COOKIE_NO_RUNCONTAINER`] followed
+/// by a `u32` count or [`ROARING_SERIAL_COOKIE`] with `count - 1` packed into the cookie word's
+/// high 16 bits; this reads only that count so a caller can bound a bitmap's size before allocating
+/// its containers. Mirrors `RoaringBitmap::deserialize_from`. Errors on a truncated header or an
+/// unrecognized cookie (both of which `deserialize_from` would also reject).
+fn roaring_container_count(serialized: &[u8]) -> PrimaryNetworkResult<u64> {
+    let le_u32 = |start: usize| -> PrimaryNetworkResult<u32> {
+        serialized
+            .get(start..start.saturating_add(4))
+            .and_then(|word| <[u8; 4]>::try_from(word).ok())
+            .map(u32::from_le_bytes)
+            .ok_or_else(|| {
+                PrimaryNetworkError::InvalidRequest("skip_rounds bitmap header truncated".into())
+            })
+    };
+
+    let cookie = le_u32(0)?;
+    if cookie == ROARING_SERIAL_COOKIE_NO_RUNCONTAINER {
+        le_u32(4).map(u64::from)
+    } else if cookie & 0xFFFF == ROARING_SERIAL_COOKIE {
+        Ok(u64::from(cookie >> 16) + 1)
+    } else {
+        Err(PrimaryNetworkError::InvalidRequest(
+            "skip_rounds bitmap has an unrecognized roaring cookie".into(),
+        ))
     }
 }
 

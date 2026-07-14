@@ -32,6 +32,37 @@ use crate::{
 /// Timeout for streaming a single batch from peer. Batches capped at 1MB.
 const BATCH_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Timeout bounding the gap before each per-chunk count header while reading a
+/// batch response stream.
+///
+/// A count header is emitted by the responder only *after* it bulk-loads that
+/// chunk's batches from its database (`send_batches_over_stream`), so, unlike an
+/// individual batch read, the inter-chunk gap can legitimately exceed the short
+/// `BATCH_STREAM_TIMEOUT`; reusing that timeout here would spuriously disconnect
+/// an honest sender whose chunk-boundary DB fetch is slow. It is sized instead to
+/// be at least the responder's own whole-stream `SEND_STREAM_TIMEOUT` self-cap
+/// (`handler.rs`): an honest sender always emits the next count within that
+/// window (or aborts its own send first), whereas a peer that stalls
+/// indefinitely before the next count is disconnected rather than parking the
+/// requester (and its `MAX_CONCURRENT_BATCH_STREAMS` slot) forever.
+const INTER_CHUNK_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
+
+/// Compile-time guard for the invariant above: the inter-chunk tolerance must be
+/// at least the responder's whole-stream self-cap, or an honest sender whose next
+/// count header is delayed by its per-chunk DB load could be disconnected.
+/// Raising `SEND_STREAM_TIMEOUT` above this without widening it here fails the
+/// build.
+const _: () =
+    assert!(INTER_CHUNK_STREAM_TIMEOUT.as_secs() >= super::handler::SEND_STREAM_TIMEOUT.as_secs());
+
+/// Overall deadline for reading a complete legacy batch response. Mirrors the
+/// responder's `SEND_STREAM_TIMEOUT` (200s, at which the sender aborts its own
+/// send) plus headroom for transit of the final bytes, so an honest transfer
+/// always completes within it while a peer that only trickles progress — keeping
+/// each individual read just under the per-read bound — cannot stall the fetch
+/// for the full per-batch budget.
+const BATCH_READ_TOTAL_TIMEOUT: Duration = Duration::from_secs(210);
+
 /// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the request
 /// frame is written. A peer that negotiated the sync protocol but does not answer
 /// (e.g. an item-4 node that registered the protocol but reads the stream on the
@@ -599,90 +630,154 @@ impl WorkerNetworkHandle {
     /// `[chunk_count][batches...][flush]` per chunk. This method loops
     /// reading chunks until the stream closes.
     ///
-    /// SAFETY: this method times out if a batch fails to stream within time limit. If this
-    /// happens, the entire stream is shut down.
+    /// SAFETY: the read cannot hang or be dragged out indefinitely. Four bounds
+    /// combine: an overall [`BATCH_READ_TOTAL_TIMEOUT`] on the whole exchange
+    /// (mirroring the responder's own `SEND_STREAM_TIMEOUT` send cap, so a peer
+    /// that only trickles progress is cut off while an honest transfer still
+    /// completes); an [`INTER_CHUNK_STREAM_TIMEOUT`] bounding the wait before each
+    /// per-chunk count header (so a peer cannot park this requester between chunks
+    /// even while the overall deadline still has budget); the per-batch
+    /// [`BATCH_STREAM_TIMEOUT`] on each `read_batch`; and a cap on the number of
+    /// chunk headers at the request's chunk span
+    /// (`ceil(requested / BATCH_DIGESTS_READ_CHUNK_SIZE)`). The cap is essential
+    /// because a fast run of zero-count chunks makes no `.await` yield, so no
+    /// timeout can interrupt it — erroring out on the cap is what breaks that
+    /// busy-loop.
     pub(crate) async fn read_and_validate_batches_with_timeout<S: AsyncRead + Unpin + Send>(
         &self,
         stream: &mut S,
         requested_digests: &BTreeSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
-        // allocate reusable buffers
-        //
-        // SAFETY: num of requests capped by `MAX_CONCURRENT_BATCH_STREAMS`
-        let max_size = max_batch_size(self.epoch);
-        let mut decode_buffer = Vec::with_capacity(max_size);
-        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+        // a well-behaved sender writes exactly one chunk header per group of
+        // `BATCH_DIGESTS_READ_CHUNK_SIZE` requested digests (see
+        // `send_batches_over_stream`), each header optionally followed by that many
+        // batches. Capping the headers we read to that span stops a peer from
+        // spinning this loop forever with an endless run of zero-count (no-progress)
+        // chunks: the running-total guard never trips on a zero count and the
+        // per-batch timeout never engages for an empty chunk, so a plain timeout
+        // cannot break the loop — the cap can.
+        let max_chunks =
+            requested_digests.len().div_ceil(stream_codec::BATCH_DIGESTS_READ_CHUNK_SIZE);
 
-        // SAFETY: requested_digests is capped to MAX_BATCH_DIGESTS_PER_REQUEST (500) above.
-        // Worst-case allocation: 500 entries of (B256, Batch) where each batch is up to 1MB.
-        // This bounds memory to ~500MB rather than the theoretical ~33GB from 33k digests.
-        let mut batches = Vec::with_capacity(requested_digests.len());
-        let mut received_digests = HashSet::with_capacity(requested_digests.len());
-
-        // read chunks until stream closes (sender writes multiple chunks for large requests)
-        loop {
-            // try to read next chunk count — StreamClosed means transfer complete
-            let batch_chunk_count = match stream_codec::read_chunk_count(stream).await {
-                Ok(count) => count as usize,
-                Err(super::error::WorkerNetworkError::StreamClosed) => break,
-                Err(e) => {
-                    return Err(NetworkError::RPCError(format!("Failed to read batch count: {e}")))
-                }
-            };
-
-            // validate running total doesn't exceed requested
-            if batches.len() + batch_chunk_count > requested_digests.len() {
-                return Err(NetworkError::ProtocolError(format!(
-                    "Peer sent too many batches: expected {}, received {}",
-                    requested_digests.len(),
-                    batches.len() + batch_chunk_count
-                )));
-            }
-
-            // validate each batch as it arrives - immediately return error for malformed batches
+        // bound the entire exchange. The responder caps its own send at
+        // `SEND_STREAM_TIMEOUT`, so an honest transfer always finishes within this
+        // deadline while a peer that stalls or trickles is cut off. A genuine stall
+        // parks on `Pending`, so this timeout fires; the busy-loop case is handled
+        // by `max_chunks` above.
+        let read = async {
+            // allocate reusable buffers
             //
-            // SAFETY: ensure timeout for stream per batch (disconnect if no progress made)
-            for i in 0..batch_chunk_count {
-                let batch = tokio::time::timeout(
-                    BATCH_STREAM_TIMEOUT,
-                    stream_codec::read_batch(
-                        stream,
-                        &mut decode_buffer,
-                        &mut compressed_buffer,
-                        self.epoch,
-                    ),
+            // SAFETY: num of requests capped by `MAX_CONCURRENT_BATCH_STREAMS`
+            let max_size = max_batch_size(self.epoch);
+            let mut decode_buffer = Vec::with_capacity(max_size);
+            let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
+
+            // SAFETY: requested_digests is capped to MAX_BATCH_DIGESTS_PER_REQUEST (500) above.
+            // Worst-case allocation: 500 entries of (B256, Batch) where each batch is up to 1MB.
+            // This bounds memory to ~500MB rather than the theoretical ~33GB from 33k digests.
+            let mut batches = Vec::with_capacity(requested_digests.len());
+            let mut received_digests = HashSet::with_capacity(requested_digests.len());
+            let mut chunks_read = 0usize;
+
+            // read chunks until stream closes (sender writes multiple chunks for large requests)
+            loop {
+                // read the next chunk-count header, bounding the wait before it so a
+                // peer cannot stall indefinitely between chunks and park this
+                // requester (and its `MAX_CONCURRENT_BATCH_STREAMS` slot) forever. A
+                // clean `StreamClosed` becomes a `None` break-sentinel (transfer
+                // complete); any other error propagates.
+                let next_count = tokio::time::timeout(
+                    INTER_CHUNK_STREAM_TIMEOUT,
+                    stream_codec::read_chunk_count(stream),
                 )
                 .await
                 .map_err(|_| {
-                    warn!(target: "worker::network", "timeout streaming batch");
+                    warn!(target: "worker::network", "timeout waiting for next batch chunk count");
                     NetworkError::Timeout
                 })?
-                .map_err(|e| {
-                    warn!(target: "worker::network", ?e, "error reading batch from stream");
-                    NetworkError::RPCError(format!("Failed to read batch {}: {e}", i))
-                })?;
+                .map_or_else(
+                    |e| {
+                        if matches!(e, super::error::WorkerNetworkError::StreamClosed) {
+                            Ok(None)
+                        } else {
+                            Err(NetworkError::RPCError(format!("Failed to read batch count: {e}")))
+                        }
+                    },
+                    |count| Ok(Some(count as usize)),
+                )?;
 
-                let batch_digest = batch.digest();
+                // `None` = the sender closed the stream after its last chunk: done.
+                let Some(batch_chunk_count) = next_count else { break };
 
-                // validate batch was requested
-                if !requested_digests.contains(&batch_digest) {
+                // a well-behaved sender never writes more chunk headers than the
+                // request spans; anything beyond that is a peer making no progress.
+                chunks_read += 1;
+                if chunks_read > max_chunks {
                     return Err(NetworkError::ProtocolError(format!(
-                        "Peer sent unexpected batch with digest {batch_digest}"
+                        "Peer sent more than the expected {max_chunks} batch chunks"
                     )));
                 }
 
-                // validate batch is unique (no duplicates)
-                if !received_digests.insert(batch_digest) {
+                // validate running total doesn't exceed requested
+                if batches.len() + batch_chunk_count > requested_digests.len() {
                     return Err(NetworkError::ProtocolError(format!(
-                        "Peer sent duplicate batch with digest {batch_digest}"
+                        "Peer sent too many batches: expected {}, received {}",
+                        requested_digests.len(),
+                        batches.len() + batch_chunk_count
                     )));
                 }
 
-                batches.push((batch_digest, batch));
+                // validate each batch as it arrives - immediately return error for malformed
+                // batches
+                //
+                // SAFETY: ensure timeout for stream per batch (disconnect if no progress made)
+                for i in 0..batch_chunk_count {
+                    let batch = tokio::time::timeout(
+                        BATCH_STREAM_TIMEOUT,
+                        stream_codec::read_batch(
+                            stream,
+                            &mut decode_buffer,
+                            &mut compressed_buffer,
+                            self.epoch,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        warn!(target: "worker::network", "timeout streaming batch");
+                        NetworkError::Timeout
+                    })?
+                    .map_err(|e| {
+                        warn!(target: "worker::network", ?e, "error reading batch from stream");
+                        NetworkError::RPCError(format!("Failed to read batch {}: {e}", i))
+                    })?;
+
+                    let batch_digest = batch.digest();
+
+                    // validate batch was requested
+                    if !requested_digests.contains(&batch_digest) {
+                        return Err(NetworkError::ProtocolError(format!(
+                            "Peer sent unexpected batch with digest {batch_digest}"
+                        )));
+                    }
+
+                    // validate batch is unique (no duplicates)
+                    if !received_digests.insert(batch_digest) {
+                        return Err(NetworkError::ProtocolError(format!(
+                            "Peer sent duplicate batch with digest {batch_digest}"
+                        )));
+                    }
+
+                    batches.push((batch_digest, batch));
+                }
             }
-        }
 
-        Ok(batches)
+            Ok::<_, NetworkError>(batches)
+        };
+
+        tokio::time::timeout(BATCH_READ_TOTAL_TIMEOUT, read).await.map_err(|_elapsed| {
+            warn!(target: "worker::network", "timeout reading batch stream");
+            NetworkError::Timeout
+        })?
     }
 
     /// Report penalty to peer manager.

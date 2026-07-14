@@ -8,23 +8,39 @@
 
 use proptest::prelude::*;
 use rand::{rngs::StdRng, SeedableRng};
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{LazyLock, Mutex},
+};
 use tn_types::{Address, Authority, BlsKeypair, BlsPublicKey, Committee};
 
 /// Create a test committee with the given number of authorities, all with voting power 1.
+///
+/// Committees are memoized by size: BLS key generation dominates test runtime and the
+/// generated keys are never asserted on, so reusing one committee per size is equivalent.
 fn create_test_committee(seed: u64, size: usize) -> Committee {
-    let mut rng = StdRng::seed_from_u64(seed);
+    static CACHE: LazyLock<Mutex<HashMap<usize, Committee>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    let authorities: BTreeMap<BlsPublicKey, Authority> = (0..size)
-        .map(|_| {
-            let keypair = BlsKeypair::generate(&mut rng);
-            let authority =
-                Authority::new_for_test(*keypair.public(), Address::random_with(&mut rng));
-            (*keypair.public(), authority)
+    CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(size)
+        .or_insert_with(|| {
+            let mut rng = StdRng::seed_from_u64(seed);
+
+            let authorities: BTreeMap<BlsPublicKey, Authority> = (0..size)
+                .map(|_| {
+                    let keypair = BlsKeypair::generate(&mut rng);
+                    let authority =
+                        Authority::new_for_test(*keypair.public(), Address::random_with(&mut rng));
+                    (*keypair.public(), authority)
+                })
+                .collect();
+
+            Committee::new_for_test(authorities, 0, BTreeMap::new())
         })
-        .collect();
-
-    Committee::new_for_test(authorities, 0, BTreeMap::new())
+        .clone()
 }
 
 proptest! {

@@ -92,6 +92,79 @@ async fn test_request_vote_too_new() {
     );
 }
 
+/// Regression for #789: a committee member can craft its own round-0 header (the Vote path is
+/// committee-gated). Before the fix, `check_for_missing_parents` evaluated `header.round() - 1`
+/// at round 0, wrapping to `u32::MAX` on the release binary and leaving a stale
+/// `(u32::MAX, digest)` requested-parent entry. The header is now rejected before parent tracking,
+/// so no underflow occurs and no stale state is left behind.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_round_zero_rejected() {
+    const NUM_PARENTS: usize = 10;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(NUM_PARENTS).unwrap())
+        .build();
+    let target = fixture.authorities().next().unwrap();
+    let author = fixture.authorities().nth(2).unwrap();
+    let author_id = author.id();
+    let author_peer = *author.authority().protocol_key();
+
+    let cb = ConsensusBus::new();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+            .await
+            .unwrap();
+    // Need a dummy parent so we can request a vote.
+    let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
+    cb.app().recent_blocks().send_modify(|blocks| {
+        blocks.push_latest(
+            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
+            Some(dummy_parent),
+        )
+    });
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+    let handler = RequestHandler::new(
+        target.consensus_config(),
+        cb.app().clone(),
+        synchronizer.clone(),
+        consensus_chain,
+    );
+
+    // Mock certificates to use as (bogus) parent digests on the crafted header.
+    let committee: Committee = fixture.committee();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let ids: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
+    let (certificates, _next_parents) =
+        make_optimal_signed_certificates(1..=3, &genesis, &committee, ids.as_slice());
+    let all_certificates = certificates.into_iter().collect::<Vec<_>>();
+    let round_2_certs = all_certificates[NUM_PARENTS..(NUM_PARENTS * 2)].to_vec();
+
+    // Craft a self-consistent round-0 header with non-empty parents, mirroring the attack shape.
+    let test_header = author
+        .header_builder(&fixture.committee())
+        .author(author_id)
+        .round(0)
+        .latest_execution_block(BlockNumHash::default())
+        .parents(round_2_certs.iter().map(|c| c.digest()).collect())
+        .with_payload_batch(&fixture_batch_with_transactions(10), 0)
+        .build();
+
+    // The round-0 header is rejected before parent tracking: no underflow, no stale entry.
+    let result =
+        timeout(Duration::from_secs(5), handler.vote(author_peer, test_header, Vec::new())).await;
+    let result = result.unwrap();
+    assert!(
+        matches!(result, Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidRound(_)))),
+        "{result:?}"
+    );
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_request_vote_has_missing_execution_block() {
     const NUM_PARENTS: usize = 10;

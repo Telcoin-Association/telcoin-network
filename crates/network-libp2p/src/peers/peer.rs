@@ -27,10 +27,23 @@ pub(super) struct Peer {
     network_key: Option<NetworkPublicKey>,
     /// The peer's score - used to derive [Reputation].
     score: Score,
-    /// The multiaddrs this node has witnessed the peer using.
+    /// The multiaddrs associated with this peer: addresses observed on real connections plus any
+    /// self-advertised addresses folded in via [`Self::update_net`].
     ///
-    /// These are used to manage the banning process and are exchanged with peers.
+    /// These drive dialing and are exchanged with peers. They are deliberately NOT the source for
+    /// ban accounting: a self-advertised address is attacker-controlled, so counting it toward the
+    /// per-IP ban would let a peer poison an unrelated IP. Ban accounting uses
+    /// [`Self::observed_ip_addresses`] instead.
     multiaddrs: HashSet<Multiaddr>,
+    /// IP addresses this node has actually observed the peer connecting from.
+    ///
+    /// Populated only by real inbound/outbound connection events ([`Self::register_incoming`] /
+    /// [`Self::register_outgoing`]); self-advertised addresses folded in through
+    /// [`Self::update_net`] never land here. This is the sole source for
+    /// [`Self::known_ip_addresses`] and therefore for the per-IP ban counter, so a peer can only
+    /// contribute an IP it genuinely presented on a connection. An attacker cannot get an honest
+    /// peer's IP banned by advertising it in a signed record (GHSA-6qcj-p42p-779j).
+    observed_ip_addresses: HashSet<IpAddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
     /// Whether the node operator explicitly allowlisted this peer.
@@ -60,6 +73,7 @@ impl Peer {
             score: Score::new_max(),
             operator_allowlisted: true,
             multiaddrs: Default::default(),
+            observed_ip_addresses: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
@@ -78,6 +92,7 @@ impl Peer {
             score: Score::default(),
             operator_allowlisted: false,
             multiaddrs: addrs.into_iter().collect(),
+            observed_ip_addresses: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
@@ -97,13 +112,19 @@ impl Peer {
             score: Score::new_max(),
             operator_allowlisted: false,
             multiaddrs: Default::default(),
+            observed_ip_addresses: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
             routable: false,
         }
     }
 
-    /// Update keys and network address.
+    /// Update keys and merge advertised network addresses.
+    ///
+    /// The merged addresses are self-advertised (they arrive on a peer record, not on an observed
+    /// connection). They are used for dialing and peer exchange only and are never treated as
+    /// observed connection IPs, so they do not feed the per-IP ban counter
+    /// ([`Self::observed_ip_addresses`] / GHSA-6qcj-p42p-779j).
     pub(super) fn update_net(
         &mut self,
         bls_public_key: BlsPublicKey,
@@ -134,16 +155,22 @@ impl Peer {
         self.score.reputation()
     }
 
-    /// Return an iterator of known ip addresses for a peer.
+    /// Return an iterator of the IP addresses this node has observed the peer connecting from.
+    ///
+    /// Derived only from observed connection addresses ([`Self::observed_ip_addresses`]), never
+    /// from self-advertised addresses, so it is safe to use as the per-IP ban-counter source: an
+    /// attacker cannot inflate an honest peer's ban count by advertising its IP
+    /// (GHSA-6qcj-p42p-779j).
     pub(super) fn known_ip_addresses(&self) -> impl Iterator<Item = IpAddr> + '_ {
-        self.multiaddrs.iter().filter_map(|addr| {
-            addr.iter().find_map(|protocol| {
-                match protocol {
-                    Protocol::Ip4(ip) => Some(ip.into()),
-                    Protocol::Ip6(ip) => Some(ip.into()),
-                    _ => None, // ignore others
-                }
-            })
+        self.observed_ip_addresses.iter().copied()
+    }
+
+    /// Extract the IP address carried by a multiaddr, if any.
+    fn ip_from_multiaddr(addr: &Multiaddr) -> Option<IpAddr> {
+        addr.iter().find_map(|protocol| match protocol {
+            Protocol::Ip4(ip) => Some(ip.into()),
+            Protocol::Ip6(ip) => Some(ip.into()),
+            _ => None, // ignore others
         })
     }
 
@@ -212,7 +239,12 @@ impl Peer {
     ///
     /// This method also updates the number of incoming connections +1.
     pub(super) fn register_incoming(&mut self, multiaddr: Multiaddr) {
-        self.multiaddrs.insert(multiaddr.clone());
+        // an observed connection address: record its IP as one the peer genuinely presented, which
+        // is the only kind of IP allowed to feed the per-IP ban counter (GHSA-6qcj-p42p-779j)
+        if let Some(ip) = Self::ip_from_multiaddr(&multiaddr) {
+            self.observed_ip_addresses.insert(ip);
+        }
+        self.multiaddrs.insert(multiaddr);
 
         match &mut self.connection_status {
             ConnectionStatus::Connected { num_in, .. } => *num_in += 1,
@@ -231,7 +263,12 @@ impl Peer {
     ///
     /// This method also updates the number of outgoing connections +1.
     pub(super) fn register_outgoing(&mut self, multiaddr: Multiaddr) {
-        self.multiaddrs.insert(multiaddr.clone());
+        // an observed connection address: record its IP as one the peer genuinely presented, which
+        // is the only kind of IP allowed to feed the per-IP ban counter (GHSA-6qcj-p42p-779j)
+        if let Some(ip) = Self::ip_from_multiaddr(&multiaddr) {
+            self.observed_ip_addresses.insert(ip);
+        }
+        self.multiaddrs.insert(multiaddr);
 
         match &mut self.connection_status {
             ConnectionStatus::Connected { num_out, .. } => *num_out += 1,

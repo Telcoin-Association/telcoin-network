@@ -5,8 +5,10 @@ use crate::{
     common::{TestPrimaryRequest, TestPrimaryResponse},
     TNCodec,
 };
-use libp2p::StreamProtocol;
-use tn_types::{Certificate, Header, HeaderDigest};
+use libp2p::{Multiaddr, StreamProtocol};
+use rand::{rngs::StdRng, SeedableRng};
+use std::collections::{HashMap, HashSet};
+use tn_types::{BlsKeypair, Certificate, Header, HeaderDigest, NetworkKeypair, NetworkPublicKey};
 
 #[tokio::test]
 async fn test_encode_decode_same_message() {
@@ -42,6 +44,48 @@ async fn test_encode_decode_same_message() {
     let decoded =
         codec.read_response(&protocol, &mut encoded.as_ref()).await.expect("read valid response");
     assert_eq!(decoded, response);
+}
+
+/// The dedicated peer-exchange goodbye codec round-trips a bare [`PeerExchangeMap`]
+/// in both directions: the request carries the disconnecting node's exchange map
+/// and the response carries the (empty today) ack.
+#[tokio::test]
+async fn test_peer_exchange_codec_round_trip() {
+    let max_chunk_size = 1024 * 1024; // 1mb
+    let mut codec = PeerExchangeCodec::new(max_chunk_size);
+    let protocol = StreamProtocol::new("/tn-test-peer-exchange");
+
+    // a representative goodbye payload
+    let mut rng = StdRng::from_seed([0; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
+    let multiaddr: Multiaddr = "/ip4/127.0.0.1/udp/38300/quic-v1".parse().expect("valid multiaddr");
+    let exchange = PeerExchangeMap::from(HashMap::from([(bls, (net, HashSet::from([multiaddr])))]));
+
+    // encode and decode the exchange as the request
+    let mut encoded = Vec::new();
+    codec
+        .write_request(&protocol, &mut encoded, exchange.clone())
+        .await
+        .expect("write valid peer exchange request");
+    let decoded = codec
+        .read_request(&protocol, &mut encoded.as_ref())
+        .await
+        .expect("read valid peer exchange request");
+    assert_eq!(decoded, exchange);
+
+    // the empty ack round-trips as the response
+    let mut encoded = Vec::new();
+    let ack = PeerExchangeMap::default();
+    codec
+        .write_response(&protocol, &mut encoded, ack.clone())
+        .await
+        .expect("write valid peer exchange ack");
+    let decoded = codec
+        .read_response(&protocol, &mut encoded.as_ref())
+        .await
+        .expect("read valid peer exchange ack");
+    assert_eq!(decoded, ack);
 }
 
 #[tokio::test]

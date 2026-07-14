@@ -228,6 +228,44 @@ async fn wait_for_peer_discovery<Req: TNMessage, Res: TNMessage>(
     }
 }
 
+/// Poll an async `condition` until it returns `true`, or fail once `timeout_duration` elapses.
+///
+/// A bounded, self-synchronizing replacement for a fixed `sleep` that only guesses
+/// at how long an asynchronous swarm event (gossip mesh grafting, subscription
+/// propagation, connection teardown plus pending-request cleanup) takes. It folds
+/// over a bounded sequence of ~10ms poll attempts, carrying the first resolved
+/// verdict forward: `Some(Ok(()))` once the condition holds, `Some(Err(_))` if a
+/// poll itself errors, and `None` while still waiting. An exhausted fold (still
+/// `None`) means the deadline passed. Mirrors the poll shape of
+/// [`wait_for_peer_discovery`] but is generic over the polled condition.
+async fn wait_until<F, Fut>(
+    timeout_duration: Duration,
+    description: &str,
+    condition: F,
+) -> eyre::Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = eyre::Result<bool>>,
+{
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    let attempts = (timeout_duration.as_millis() / POLL_INTERVAL.as_millis()).max(1);
+    let condition = &condition;
+
+    futures::stream::iter(0..attempts)
+        .fold(None, move |resolved: Option<eyre::Result<()>>, attempt| async move {
+            if resolved.is_some() {
+                resolved
+            } else {
+                if attempt > 0 {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                condition().await.map(|met| met.then_some(())).transpose()
+            }
+        })
+        .await
+        .unwrap_or_else(|| Err(eyre!("timed out waiting for condition: {description}")))
+}
+
 #[tokio::test]
 async fn test_valid_req_restt() -> eyre::Result<()> {
     // start honest peer1 network
@@ -359,8 +397,15 @@ async fn test_valid_req_res_connection_closed_cleanup() -> eyre::Result<()> {
     peer2_network_task.abort();
     assert!(peer2_network_task.await.unwrap_err().is_cancelled());
 
-    // allow peer1 to process disconnect
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // wait for peer1 to observe the disconnect and drain its pending request,
+    // instead of guessing at how long the teardown plus outbound-failure delivery takes
+    let handle = &peer1;
+    wait_until(
+        Duration::from_secs(5),
+        "peer1 clears its pending request after peer2 disconnects",
+        move || async move { Ok(handle.get_pending_request_count().await? == 0) },
+    )
+    .await?;
 
     // peer1 removes pending requests
     let count = peer1.get_pending_request_count().await?;
@@ -921,8 +966,21 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
     let sealed_block = random_block.seal_slow();
     let expected_result = Vec::from(&sealed_block);
 
-    // sleep for gossip connection time lapse
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // wait until the publisher has observed a TEST_TOPIC subscriber before publishing.
+    // cvv is not subscribed itself, so `publish` fans out only to peers whose
+    // subscription has already propagated here; poll for that instead of guessing.
+    let topic_hash = TopicHash::from_raw(TEST_TOPIC);
+    let topic_ref = &topic_hash;
+    let handle = &cvv;
+    wait_until(
+        Duration::from_secs(5),
+        "publisher observes a TEST_TOPIC subscriber",
+        move || async move {
+            let peers = handle.all_peers().await?;
+            Ok(peers.values().any(|topics| topics.contains(topic_ref)))
+        },
+    )
+    .await?;
 
     // publish on wrong topic - no peers
     let expected_failure = cvv.publish("WRONG_TOPIC".into(), expected_result.clone()).await;
@@ -984,8 +1042,21 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     let sealed_block = random_block.seal_slow();
     let expected_result = Vec::from(&sealed_block);
 
-    // sleep for gossip connection time lapse
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // wait until the publisher has observed a TEST_TOPIC subscriber before publishing.
+    // cvv is not subscribed itself, so `publish` fans out only to peers whose
+    // subscription has already propagated here; poll for that instead of guessing.
+    let topic_hash = TopicHash::from_raw(TEST_TOPIC);
+    let topic_ref = &topic_hash;
+    let handle = &cvv;
+    wait_until(
+        Duration::from_secs(5),
+        "publisher observes a TEST_TOPIC subscriber",
+        move || async move {
+            let peers = handle.all_peers().await?;
+            Ok(peers.values().any(|topics| topics.contains(topic_ref)))
+        },
+    )
+    .await?;
 
     // publish correct message and wait to receive
     let _message_id = cvv.publish(TEST_TOPIC.into(), expected_result.clone()).await?;
@@ -1231,6 +1302,140 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A pruned peer that does not support the dedicated peer-exchange protocol still
+/// receives the goodbye.
+///
+/// The raw swarm below advertises only the legacy `/tn-primary-{chain}/0.0.1`
+/// req-res protocol, exactly the wire surface of a not-yet-upgraded node. The
+/// target's goodbye attempt on `/tn-primary-peer-exchange-{chain}/0.0.1` fails
+/// with `UnsupportedProtocols` (penalty-exempt) and must fall back to the
+/// `PeerExchange` variant embedded in the legacy request enum.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre::Result<()> {
+    tn_types::test_utils::init_test_tracing();
+    // 4 committee peers fill the target to its limit; validators are protected from
+    // pruning, so the raw legacy peer is deterministically the excess one
+    let committee = NonZeroUsize::new(5).unwrap();
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().target_num_peers = 4;
+    network_config.peer_config_mut().peer_excess_factor = 0.1;
+    network_config.peer_config_mut().excess_peers_reconnection_timeout = Duration::from_secs(10);
+    network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+    network_config.libp2p_config_mut().k_bucket_size = committee;
+
+    let (mut target_peer, mut other_peers, _task_manager) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            committee,
+            Some(network_config.clone()),
+        );
+
+    // spawn target network
+    let target_network = target_peer.network.take().expect("target network is some");
+    tokio::spawn(async move {
+        let res = target_network.run().await;
+        debug!(target: "network", ?res, "target network shutdown");
+    });
+    target_peer.network_handle.start_listening(target_peer.config.primary_address()).await?;
+    let target_addr = target_peer.config.primary_address();
+    let target_peer_bls = target_peer.config.key_config().primary_public_key();
+    let target_peer_net = target_peer.config.primary_networkkey();
+
+    // fill the target with protected committee peers
+    for peer in other_peers.iter_mut() {
+        let peer_network = peer.network.take().expect("peer network is some");
+        tokio::spawn(async move {
+            let res = peer_network.run().await;
+            debug!(target: "network", ?res, "peer network shutdown");
+        });
+        peer.network_handle.start_listening(peer.config.primary_address()).await?;
+        peer.network_handle
+            .add_explicit_peer(target_peer_bls, target_peer_net.clone(), target_addr.clone())
+            .await?;
+        target_peer
+            .network_handle
+            .add_explicit_peer(
+                peer.config.key_config().primary_public_key(),
+                peer.config.primary_networkkey(),
+                peer.config.primary_address(),
+            )
+            .await?;
+        peer.network_handle.dial_by_bls(target_peer_bls).await?;
+
+        // give time for connection to establish and libp2p state to stabilize
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // raw legacy peer: the target's main req-res protocol only, no dedicated
+    // peer-exchange protocol
+    let chain_id = network_config.libp2p_config().chain_id;
+    let raw_keypair = NetworkKeypair::generate_ed25519();
+    let raw_peer_id: PeerId = raw_keypair.public().into();
+    let legacy_codec = TNCodec::<TestWorkerRequest, TestWorkerResponse>::new(
+        network_config.libp2p_config().max_rpc_message_size,
+    );
+    let legacy_req_res = request_response::Behaviour::with_codec(
+        legacy_codec,
+        vec![(NetworkType::Primary.req_res_protocol(chain_id)?, ProtocolSupport::Full)],
+        request_response::Config::default(),
+    );
+    let mut raw_swarm = SwarmBuilder::with_existing_identity(raw_keypair)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|_| legacy_req_res)
+        .map_err(|e| eyre!("raw swarm behaviour: {e:?}"))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+        .build();
+
+    // excess dial: accepted (max_peers = ceil(4 * 1.1) = 5), then pruned with px
+    raw_swarm.dial(target_addr.clone())?;
+
+    // drive the raw swarm: capture the legacy embedded goodbye and ack it
+    let (goodbye_tx, goodbye_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut goodbye_tx = Some(goodbye_tx);
+        loop {
+            if let SwarmEvent::Behaviour(request_response::Event::Message {
+                message: request_response::Message::Request { request, channel, .. },
+                ..
+            }) = raw_swarm.select_next_some().await
+            {
+                if let TestWorkerRequest::PeerExchange(map) = request {
+                    let ack = TestWorkerResponse::from(PeerExchangeMap::default());
+                    let _ = raw_swarm.behaviour_mut().send_response(channel, ack);
+                    if let Some(tx) = goodbye_tx.take() {
+                        let _ = tx.send(map);
+                    }
+                }
+            }
+        }
+    });
+
+    // the target prunes the excess raw peer on a heartbeat; the goodbye must reach
+    // the legacy peer on the embedded path (which requires the dedicated-protocol
+    // attempt to have failed over)
+    let goodbye = timeout(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 10), goodbye_rx)
+        .await
+        .expect("legacy peer received the goodbye before timeout")?;
+    assert!(
+        !goodbye.0.is_empty(),
+        "the fallback goodbye should carry the target's known peers for discovery"
+    );
+
+    // the ack resolves the pending exchange and the target disconnects promptly
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut still_connected = true;
+    while still_connected && tokio::time::Instant::now() < deadline {
+        still_connected =
+            target_peer.network_handle.connected_peer_ids().await?.contains(&raw_peer_id);
+        if still_connected {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    assert!(!still_connected, "target should disconnect the raw legacy peer after the goodbye");
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     // Create a custom config with short halflife for quicker testing
@@ -1337,6 +1542,14 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     let malicious_bls = config_2.key_config().primary_public_key();
 
     let malicious_addr = config_2.primary_address();
+
+    // honest must resolve malicious_bls -> peer id to penalize it. the committee gate added in
+    // #827 drops kad-discovered records for non-committee keys, so register the malicious peer
+    // explicitly (an operator-provisioned, pinned path) instead. unlike committee membership this
+    // does not make honest re-dial the peer, so the Fatal ban disconnects and stays disconnected.
+    honest_peer
+        .add_explicit_peer(malicious_bls, config_2.primary_networkkey(), malicious_addr.clone())
+        .await?;
 
     // Connect malicious to honest
     malicious_peer
@@ -1512,8 +1725,14 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
             .await?;
     }
 
-    // Wait for connections to stabilize
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 2)).await;
+    // Wait for every peer to connect to the target, instead of assuming a fixed
+    // number of heartbeats is enough
+    let handle = &target_peer.network_handle;
+    let expected = other_peers.len();
+    wait_until(Duration::from_secs(10), "all peers connected to target", move || async move {
+        Ok(handle.connected_peer_ids().await?.len() == expected)
+    })
+    .await?;
 
     // Verify all peers are connected to target
     let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
@@ -2397,6 +2616,14 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
         network.run().await.expect("nvv network run failed!");
     });
     nvv.start_listening(nvv_config.primary_address()).await?;
+    // seed the nvv's committee (target + the rest) BEFORE it connects so target's rpc-bearing
+    // record is retained the moment it arrives via kad; the committee gate added in #827 drops
+    // records for non-committee keys, and a late seed misses the record's first delivery. an nvv
+    // following the chain learns the committee from epoch state.
+    let committee_keys = std::iter::once(target_peer_bls)
+        .chain(committee.iter().map(|p| p.config.key_config().primary_public_key()))
+        .collect();
+    nvv.update_committees(Default::default(), committee_keys, Default::default()).await?;
     nvv.add_trusted_peer_and_dial(
         target_peer_bls,
         target_peer_net.clone(),
@@ -2485,6 +2712,14 @@ async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()>
     assert!(node_record.info.rpc.is_none());
     assert_eq!(node_record.info.multiaddrs, vec![peer2.config.primary_address()]);
 
+    // owner is a committee member so the gated discovery path (#827) retains its record;
+    // production applies committee membership from epoch state before processing records.
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        std::iter::once(owner_bls).collect(),
+        Default::default(),
+    );
+
     // an inbound put request stores the record and promotes it into `known_peers`
     network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
     assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&kad_record.key).is_some());
@@ -2504,6 +2739,61 @@ async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()>
 
     // honest pre-upgrade sender is not penalized
     assert!(!network.swarm.behaviour().peer_manager.peer_banned(&owner_peer_id));
+
+    Ok(())
+}
+
+/// Regression (GHSA-j24g-gqj4-9vj8): an inbound `PUT_VALUE` with `publisher =
+/// None` and a `key` equal to the node's own discovery-record key must NOT
+/// delete the node's own record from the local store.
+///
+/// `publisher = None` short-circuits to the reject path before any signature
+/// check, and the pre-fix reject path called `remove_record(&record.key)` with
+/// the sender-supplied key. Because the node's own record is the only
+/// locally-published record, that call deleted it, and since we only re-provide
+/// our record at startup, the deletion persisted until restart. The reject path
+/// must perform no store mutation keyed on attacker-supplied input.
+#[tokio::test]
+async fn test_publisherless_put_cannot_delete_own_record() -> eyre::Result<()> {
+    use libp2p::kad;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // Seed our own discovery record into the local store with the same record
+    // `provide_our_data` publishes at startup: keyed on our BLS public key with
+    // `publisher = Some(local_peer_id)`, the only record `remove_record` can touch.
+    let own_record = network.get_peer_record();
+    network.swarm.behaviour_mut().kademlia.store_mut().put(own_record.clone())?;
+    assert!(
+        network.swarm.behaviour_mut().kademlia.store_mut().get(&own_record.key).is_some(),
+        "own discovery record present before the attack",
+    );
+
+    // An arbitrary connected peer sends a PUT keyed on our own record key with no
+    // publisher. No signature and no committee membership are required.
+    let attacker = *peer2.network.swarm.local_peer_id();
+    let malicious = kad::Record {
+        key: own_record.key.clone(),
+        value: vec![0xde, 0xad, 0xbe, 0xef],
+        publisher: None,
+        expires: None,
+    };
+    network.process_kad_put_request(attacker, malicious)?;
+
+    // The node's own authoritative record must survive intact: it is only
+    // re-provided at startup, so a deletion here would persist until restart.
+    // Assert it is still present AND unchanged, covering both the "delete" and
+    // "mutate" halves of the advisory's acceptance criterion. (Compare the stable
+    // fields; `expires` loses precision across the store's SystemTime<->Instant
+    // round-trip, as noted in `test_newer_kad_record_replaced`.)
+    let survived = network.swarm.behaviour_mut().kademlia.store_mut().get(&own_record.key).expect(
+        "own discovery record must survive a publisher=None reject-path put (GHSA-j24g-gqj4-9vj8)",
+    );
+    assert_eq!(survived.key, own_record.key);
+    assert_eq!(survived.value, own_record.value);
+    assert_eq!(survived.publisher, own_record.publisher);
 
     Ok(())
 }
@@ -2537,6 +2827,14 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
         publisher: Some(owner_peer_id),
         expires: None,
     };
+
+    // owner is a committee member so the gated discovery path (#827) retains its record;
+    // production applies committee membership from epoch state before processing records.
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        std::iter::once(owner_bls).collect(),
+        Default::default(),
+    );
 
     network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
 
@@ -2732,6 +3030,77 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
     Ok(())
 }
 
+/// Regression test for issue #828: `published_to_peers` is a per-process-lifetime de-dup gate that
+/// is never cleaned on disconnect, so as an unbounded set it grew once per distinct `PeerId` ever
+/// seen and would eventually OOM a RAM-capped node. It is now a capacity-bounded LRU: a flood of
+/// fresh peer identities must pin it at [`MAX_PUBLISHED_TO_PEERS`] and never grow past it.
+#[tokio::test]
+async fn test_published_to_peers_is_bounded() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // The field is initialized at the intended cap and starts empty.
+    assert_eq!(network.published_to_peers.cap(), MAX_PUBLISHED_TO_PEERS);
+    assert_eq!(network.published_to_peers.len(), 0);
+
+    // Each fresh, never-before-seen peer is a first-time push (this is exactly what the
+    // `PeerEvent::PeerConnected` arm does when it sees a new `PeerId`). Overrun the cap and
+    // assert the set never grows past it.
+    let cap = MAX_PUBLISHED_TO_PEERS.get();
+    for _ in 0..(cap + 100) {
+        let peer_id = PeerId::random();
+        assert!(
+            network.mark_published_to_peer(peer_id),
+            "a never-before-seen peer must register as a first-time push"
+        );
+        assert!(
+            network.published_to_peers.len() <= cap,
+            "published_to_peers must never exceed its LRU capacity"
+        );
+    }
+
+    // The flood pinned the set at capacity rather than growing without bound.
+    assert_eq!(
+        network.published_to_peers.len(),
+        cap,
+        "a flood of distinct peers fills the LRU to exactly its capacity and stays there"
+    );
+}
+
+/// Regression test for issue #828: bounding `published_to_peers` must not reintroduce the kad
+/// re-push amplification the gate exists to prevent. An actively (re)connecting peer must stay
+/// resident in the LRU - so it keeps de-duping and is never re-pushed to - even while a flood of
+/// fresh peers churns the rest of the set.
+#[tokio::test]
+async fn test_published_to_peers_keeps_active_peer_resident() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // First sight of our sticky peer warrants a one-time push.
+    let sticky = PeerId::random();
+    assert!(
+        network.mark_published_to_peer(sticky),
+        "first sight of a peer must register as a first-time push"
+    );
+
+    // The sticky peer keeps reconnecting while enough fresh identities connect to overrun the
+    // cap. Because every reconnect promotes it to most-recently-used, it is never the eviction
+    // victim - unlike a plain insertion-order set, which would drop it after `cap` fresh inserts.
+    for _ in 0..(MAX_PUBLISHED_TO_PEERS.get() + 100) {
+        assert!(
+            !network.mark_published_to_peer(sticky),
+            "a reconnecting peer we have already pushed to must not be re-pushed"
+        );
+        network.mark_published_to_peer(PeerId::random());
+    }
+
+    // Despite the flood, the continually-active peer survived eviction and still de-dups.
+    assert!(
+        !network.mark_published_to_peer(sticky),
+        "an actively reconnecting peer must survive LRU eviction (no re-push storm)"
+    );
+}
+
 /// Regression for issue #819: a resolved author identity is carried on the delivered gossip
 /// event so the application layer can charge an author-content fault to the author rather than
 /// the forwarding relayer.
@@ -2763,9 +3132,10 @@ fn author_attributable_reject_charges_the_author_never_the_relayer() {
     }
 }
 
-/// An oversized payload is the only relayer-attributable reject — the size bound is deterministic
-/// network-wide, so under `Strict` validation an honest peer never forwards one — and it is
-/// charged to the forwarder only once its BLS identity has resolved (the author's resolution is
+/// An oversized payload is the only relayer-attributable reject — the size bound is a compile-time
+/// protocol constant (`MAX_GOSSIP_MESSAGE_SIZE`), identical on every honest node and enforced on
+/// both the publish and receive paths, so an honest peer never originates or forwards one — and it
+/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution is
 /// irrelevant), mirroring the Accept path's unresolved-relayer skip.
 #[test]
 fn oversized_reject_penalizes_only_a_resolved_relayer() {
@@ -2776,4 +3146,25 @@ fn oversized_reject_penalizes_only_a_resolved_relayer() {
         );
         assert_eq!(RejectReason::TooLarge.penalty(false, author_resolved), RejectPenalty::Skip);
     }
+}
+
+/// #872: a node must never originate a gossip payload larger than `MAX_GOSSIP_MESSAGE_SIZE`. Honest
+/// peers reject an oversized payload as `RejectReason::TooLarge` and Fatal-attribute it to the
+/// relaying peer, which on the first hop is the originator — so the publish path enforces the same
+/// bound as `verify_gossip`, refusing an oversized message locally with
+/// `PublishError::MessageTooLarge` instead of letting the originator be banned by its peers.
+#[tokio::test]
+async fn oversized_publish_is_refused_locally() -> eyre::Result<()> {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { network_handle: cvv, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // one byte over the bound is refused at origination, before it can reach any peer
+    let too_big = vec![0u8; MAX_GOSSIP_MESSAGE_SIZE + 1];
+    let err = cvv.publish(TEST_TOPIC.into(), too_big).await.expect_err("oversized publish refused");
+    assert_matches!(err, NetworkError::Publish(PublishError::MessageTooLarge));
+
+    Ok(())
 }

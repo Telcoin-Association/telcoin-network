@@ -56,6 +56,31 @@ pub enum PrimarySyncRequest {
         /// Per-authority rounds to skip, each serialized as a RoaringBitmap.
         skip_rounds: Vec<(AuthorityIdentifier, Vec<u8>)>,
     },
+    /// Request a verifiable PREFIX of an epoch's consensus pack file, stopping
+    /// after the consensus output with `last_consensus_number`.
+    ///
+    /// Folds the legacy `StreamEpochPartial` ack-plus-digest handshake into a
+    /// single open. Unlike [`Self::EpochPack`] (a complete epoch), this streams
+    /// the in-progress current epoch up to an already-committed, verifiable
+    /// point; `last_consensus_number` is a chain consensus number, not a
+    /// pack-relative index.
+    EpochPackPartial {
+        /// The epoch whose consensus data is requested.
+        epoch: Epoch,
+        /// The final (inclusive) consensus header number to stream up to.
+        last_consensus_number: u64,
+    },
+    /// Request the raw bytes of a single consensus output by chain consensus
+    /// number.
+    ///
+    /// Folds the legacy `StreamConsensusOutput` ack-plus-digest handshake into a
+    /// single open. This streams exactly one output's pack-file-encoded bytes; the
+    /// requester decodes them with the epoch committee and verifies the decoded
+    /// header digest before use.
+    ConsensusOutput {
+        /// The chain consensus number of the requested output.
+        number: u64,
+    },
 }
 
 #[cfg(test)]
@@ -96,6 +121,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn primary_partial_epoch_pack_request_round_trips() {
+        let request = PrimarySyncRequest::EpochPackPartial { epoch: 7, last_consensus_number: 41 };
+        assert_eq!(roundtrip_req(request.clone()).await, SyncFrame::Req(request));
+    }
+
+    #[tokio::test]
     async fn primary_missing_certificates_request_round_trips() {
         let request = PrimarySyncRequest::MissingCertificates {
             exclusive_lower_bound: 12,
@@ -104,6 +135,12 @@ mod tests {
                 (AuthorityIdentifier::from_bytes([2u8; 32]), vec![0xBE, 0xEF]),
             ],
         };
+        assert_eq!(roundtrip_req(request.clone()).await, SyncFrame::Req(request));
+    }
+
+    #[tokio::test]
+    async fn primary_consensus_output_request_round_trips() {
+        let request = PrimarySyncRequest::ConsensusOutput { number: 41 };
         assert_eq!(roundtrip_req(request.clone()).await, SyncFrame::Req(request));
     }
 
@@ -128,5 +165,16 @@ mod tests {
         })
         .expect("encode missing certificates");
         assert_eq!(missing.first(), Some(&1));
+
+        let partial = bcs::to_bytes(&PrimarySyncRequest::EpochPackPartial {
+            epoch: 0,
+            last_consensus_number: 0,
+        })
+        .expect("encode partial epoch pack");
+        assert_eq!(partial.first(), Some(&2));
+
+        let consensus_output = bcs::to_bytes(&PrimarySyncRequest::ConsensusOutput { number: 0 })
+            .expect("encode consensus output");
+        assert_eq!(consensus_output.first(), Some(&3));
     }
 }

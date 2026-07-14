@@ -9,7 +9,7 @@ use jsonrpsee::proc_macros::rpc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tn_reth::{
-    error::{RegistryReadError, RegistryReadResult},
+    error::{EvmReadError, EvmReadResult},
     system_calls::ConsensusRegistry,
     RethEnv,
 };
@@ -444,7 +444,7 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
     async fn spawn_registry_read<R, F>(&self, read: F) -> TelcoinNetworkRpcResult<R>
     where
         R: Send + 'static,
-        F: FnOnce(RethEnv) -> RegistryReadResult<R> + Send + 'static,
+        F: FnOnce(RethEnv) -> EvmReadResult<R> + Send + 'static,
     {
         // bound concurrent blocking reads; queues (does not reject) at capacity, mirroring
         // reth's eth_call guard. acquire only fails if the semaphore is closed, which never
@@ -471,10 +471,10 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
                 TNRpcError::Internal
             })?
             .map_err(|err| match &err {
-                RegistryReadError::Revert { output, .. } => {
+                EvmReadError::Revert { output, .. } => {
                     TNRpcError::Revert { message: err.to_string(), output: output.clone() }
                 }
-                RegistryReadError::Internal(_) => {
+                EvmReadError::Internal(_) => {
                     tracing::debug!(
                         target: "tn::rpc",
                         error = ?err,

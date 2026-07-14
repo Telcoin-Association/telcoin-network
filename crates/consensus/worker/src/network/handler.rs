@@ -7,10 +7,15 @@ use super::{
 use crate::{
     batch_fetcher::get_batch_local_cache,
     metrics::WorkerMetrics,
-    network::{stream_codec, PendingBatchStream},
+    network::{stream_codec, PendingBatchStream, MAX_CONCURRENT_GOSSIP_PREFETCHES},
 };
 use futures::AsyncWriteExt as _;
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use parking_lot::Mutex;
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     write_frame, GossipMessage, Stream, SyncFrame, SyncFrameError, WorkerSyncRequest,
@@ -21,12 +26,63 @@ use tn_types::{
     ensure, now, try_decode, BatchValidation, BlsPublicKey, Database, Epoch, SealedBatch, WorkerId,
     B256,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 /// Total timeout for sending all batches over a stream.
 /// Prevents slow-reader attacks where a peer accepts a stream but never reads.
-/// Set for 500MB through emerging market worse-case 20MB/s upload
-const SEND_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
+/// Set for 500MB through emerging market worse-case 20MB/s upload.
+///
+/// Exposed to the requester side (`handle.rs`), which sizes its per-chunk-count
+/// read tolerance (`INTER_CHUNK_STREAM_TIMEOUT`) to be at least this whole-stream
+/// cap so an honest sender is never disconnected mid-transfer.
+pub(crate) const SEND_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
+
+/// RAII guard for an admitted gossip-triggered batch prefetch.
+///
+/// Holds a global concurrency permit and marks the batch digest as having a
+/// prefetch in flight. Dropping it releases the permit and clears the in-flight
+/// mark, so a completed, failed, or aborted prefetch frees a concurrency slot and
+/// re-enables a later prefetch of the same digest.
+#[derive(Debug)]
+struct PrefetchPermit {
+    /// Global concurrency permit, released on drop.
+    _permit: OwnedSemaphorePermit,
+    /// Shared set of digests with an in-flight prefetch; `digest` is removed on drop.
+    in_flight: Arc<Mutex<HashSet<B256>>>,
+    /// The digest this permit tracks.
+    digest: B256,
+}
+
+impl Drop for PrefetchPermit {
+    fn drop(&mut self) {
+        self.in_flight.lock().remove(&self.digest);
+    }
+}
+
+/// Try to admit one gossip-triggered batch prefetch for `digest`.
+///
+/// Returns `None` to skip the prefetch when either guard trips:
+/// - concurrency: the semaphore already holds [`MAX_CONCURRENT_GOSSIP_PREFETCHES`] in-flight
+///   prefetches, so load is shed rather than amplified;
+/// - dedup: a prefetch for `digest` is already in flight, so a re-gossiped digest collapses to a
+///   single fetch.
+///
+/// On success the returned [`PrefetchPermit`] holds the permit and the in-flight
+/// mark until dropped. Together these bound the fetch fan-out a Byzantine author can
+/// trigger by gossiping many distinct (or repeated) batch digests.
+fn try_admit_prefetch(
+    semaphore: &Arc<Semaphore>,
+    in_flight: &Arc<Mutex<HashSet<B256>>>,
+    digest: B256,
+) -> Option<PrefetchPermit> {
+    // Cap concurrency: shed when the semaphore is full.
+    let permit = semaphore.clone().try_acquire_owned().ok()?;
+    // Dedup: skip (releasing `permit`) when a prefetch for this digest is already in
+    // flight. `insert` returns `false` when the digest is already present.
+    in_flight.lock().insert(digest).then_some(())?;
+    Some(PrefetchPermit { _permit: permit, in_flight: in_flight.clone(), digest })
+}
 
 /// The type that handles requests from peers.
 ///
@@ -43,6 +99,17 @@ pub struct RequestHandler<DB> {
     network_handle: WorkerNetworkHandle,
     /// Prometheus metrics for peer batch handling.
     metrics: WorkerMetrics,
+    /// Digests with a gossip-triggered batch prefetch currently in flight.
+    ///
+    /// Deduplicates concurrent prefetches for the same digest so a repeated
+    /// (possibly forged) gossiped digest cannot by itself trigger a fetch storm.
+    /// Shared across clones via `Arc`; bounded by `prefetch_semaphore` (an entry is
+    /// retained only while its permit is held).
+    in_flight_prefetch: Arc<Mutex<HashSet<B256>>>,
+    /// Caps concurrent gossip-triggered batch prefetches at
+    /// [`MAX_CONCURRENT_GOSSIP_PREFETCHES`], shedding beyond that to bound the fetch
+    /// fan-out a Byzantine author can trigger by gossiping many distinct digests.
+    prefetch_semaphore: Arc<Semaphore>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -57,7 +124,15 @@ where
         network_handle: WorkerNetworkHandle,
     ) -> Self {
         let metrics = WorkerMetrics::new_for_worker(id);
-        Self { id, validator, consensus_config, network_handle, metrics }
+        Self {
+            id,
+            validator,
+            consensus_config,
+            network_handle,
+            metrics,
+            in_flight_prefetch: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GOSSIP_PREFETCHES)),
+        }
     }
 
     /// Process gossip from the committee.
@@ -93,6 +168,23 @@ where
                     get_batch_local_cache(batch_hash, self.consensus_config.node_storage(),),
                     Ok(Some(_))
                 ) {
+                    // Deduplicate and cap gossip-triggered prefetches before fanning
+                    // out a fetch. A Byzantine committee author can gossip many
+                    // distinct (possibly forged) digests; without this gate each one
+                    // would trigger an unbounded, undeduplicated `request_batches`
+                    // fan-out across the worker mesh. `_prefetch` holds the dedup mark
+                    // and a concurrency permit for the whole fetch, releasing both on
+                    // scope exit. When admission declines (a prefetch for this digest
+                    // is already in flight, or the cap is reached) the prefetch is
+                    // skipped: it is a best-effort optimization and a genuinely needed
+                    // batch is fetched on demand later.
+                    let Some(_prefetch) = try_admit_prefetch(
+                        &self.prefetch_semaphore,
+                        &self.in_flight_prefetch,
+                        batch_hash,
+                    ) else {
+                        return Ok(());
+                    };
                     // If batch is missing from db, then request from peer.
                     // If we are a CVV then we should already have it.
                     // This allows non-CVVs to pre fetch batches they will soon need.
@@ -224,8 +316,13 @@ where
             }
         }
 
-        // attempt to close the stream gracefully
-        let _ = stream.close().await;
+        // attempt to close the stream gracefully, bounded so a peer that stops
+        // reading cannot pin this legacy responder task (and the admission permit
+        // it holds via `PendingBatchStream`) on the FIN flush. Mirrors the bounded
+        // close in `process_sync_batches_stream` and the trailing writes in `mod.rs`;
+        // every best-effort trailing op on this task is time-bounded.
+        let _ =
+            tokio::time::timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
 
         Ok(())
     }
@@ -355,5 +452,85 @@ where
             consensus_chain,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::{try_admit_prefetch, MAX_CONCURRENT_GOSSIP_PREFETCHES};
+    use parking_lot::Mutex;
+    use std::{collections::HashSet, sync::Arc};
+    use tn_types::B256;
+    use tokio::sync::Semaphore;
+
+    /// A prefetch pool sized to the production cap.
+    fn new_pool() -> (Arc<Semaphore>, Arc<Mutex<HashSet<B256>>>) {
+        (
+            Arc::new(Semaphore::new(MAX_CONCURRENT_GOSSIP_PREFETCHES)),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+    }
+
+    /// A distinct batch digest (no `rand` feature dependency).
+    fn digest(seed: u8) -> B256 {
+        B256::from([seed; 32])
+    }
+
+    /// A second prefetch for a digest already in flight is refused, releases the
+    /// permit it transiently acquired (no slot leak), and the digest becomes
+    /// admissible again once the first prefetch is dropped.
+    #[test]
+    fn dedups_in_flight_digest() {
+        let (semaphore, in_flight) = new_pool();
+        let d = digest(1);
+
+        let first = try_admit_prefetch(&semaphore, &in_flight, d).expect("first prefetch admitted");
+        assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_GOSSIP_PREFETCHES - 1);
+
+        // duplicate while the first is in flight -> refused, and the transient permit
+        // it briefly acquired is released, so exactly one slot stays held
+        assert!(
+            try_admit_prefetch(&semaphore, &in_flight, d).is_none(),
+            "duplicate digest must be deduplicated"
+        );
+        assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_GOSSIP_PREFETCHES - 1);
+
+        // dropping the first prefetch clears the mark and frees the slot
+        drop(first);
+        assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_GOSSIP_PREFETCHES);
+        assert!(
+            try_admit_prefetch(&semaphore, &in_flight, d).is_some(),
+            "digest is admissible again once the prior prefetch finished"
+        );
+    }
+
+    /// Concurrency is capped: distinct digests beyond the cap are shed, and slots
+    /// free again once the outstanding prefetches are dropped.
+    #[test]
+    fn caps_concurrency_and_sheds_excess() {
+        let (semaphore, in_flight) = new_pool();
+
+        let held: Vec<_> = (0..MAX_CONCURRENT_GOSSIP_PREFETCHES)
+            .map(|i| {
+                try_admit_prefetch(&semaphore, &in_flight, digest(i as u8))
+                    .expect("prefetch within cap admitted")
+            })
+            .collect();
+        assert_eq!(held.len(), MAX_CONCURRENT_GOSSIP_PREFETCHES);
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // a fresh distinct digest at the cap is shed rather than amplified
+        assert!(
+            try_admit_prefetch(&semaphore, &in_flight, digest(u8::MAX)).is_none(),
+            "distinct digest beyond the cap must be shed"
+        );
+
+        // releasing the outstanding prefetches frees the slots again
+        drop(held);
+        assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_GOSSIP_PREFETCHES);
+        assert!(
+            try_admit_prefetch(&semaphore, &in_flight, digest(u8::MAX)).is_some(),
+            "a freed slot admits a new prefetch"
+        );
     }
 }

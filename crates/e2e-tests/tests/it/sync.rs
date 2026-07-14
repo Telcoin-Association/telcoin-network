@@ -13,9 +13,10 @@ use crate::common::{
     network_advancing, send_and_confirm, start_observer, start_validator, ProcessGuard,
 };
 
-/// Epoch duration (in seconds) used by the pack-import test. Mirrors the value used by
-/// `epochs.rs::EPOCH_DURATION` so that epoch boundaries occur on the same cadence under
-/// test-utils.
+/// Epoch duration (in seconds) used by the pack-import test. Held at 10s independently of
+/// `epochs.rs::EPOCH_DURATION` (which #897 cut to 5s): this pack-import regression test is
+/// outside that four-test scope, and 10s keeps ample margin for the epoch-0
+/// close + certify + observer pack-import path.
 const PACK_IMPORT_EPOCH_DURATION: u64 = 10;
 
 /// Regression test: an observer joining after epoch 0 has been closed and certified must

@@ -411,7 +411,7 @@ where
         // Ensure the worker's transaction pool charges the accumulator's base fee for this epoch.
         // On the init path above the pool was created with this value; this call additionally
         // covers the respawn path, where initialization is skipped.
-        engine.set_worker_base_fee(worker_id, base_fee).await;
+        engine.set_worker_base_fee(worker_id, base_fee).await?;
 
         let network_handle = self
             .worker_network_handle

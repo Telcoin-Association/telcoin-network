@@ -57,6 +57,11 @@ type AuthEquivocationMap = HashMap<
     TokioMutex<Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>>,
 >;
 
+/// A pending consensus-result signature tally: a monotonic recency sequence (bumped every time a
+/// new distinct signer is added, used for LRU eviction) paired with the set of committee members
+/// that have signed this result. See the `consensus_certs` field and GHSA-2r5c-c4h7-gp5h.
+type ConsensusCertTally = (u64, HashSet<BlsPublicKey>);
+
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
 pub(crate) struct RequestHandler<DB> {
@@ -77,7 +82,7 @@ pub(crate) struct RequestHandler<DB> {
     /// Used to stop validator equivocation early.
     auth_last_vote: Arc<AuthEquivocationMap>,
     /// Track consensus headers until we hit a simple quorum then send on.
-    consensus_certs: Arc<Mutex<HashMap<ConsensusResultDigest, HashSet<BlsPublicKey>>>>,
+    consensus_certs: Arc<Mutex<HashMap<ConsensusResultDigest, ConsensusCertTally>>>,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
 }
@@ -305,7 +310,10 @@ where
                         // skip it.  So this seems like the place.  And of course
                         // close any windows to double counting a signature.
                         let guard = self.consensus_certs.lock();
-                        if guard.get(&consensus_result_hash).and_then(|set| set.get(&key)).is_some()
+                        if guard
+                            .get(&consensus_result_hash)
+                            .and_then(|(_, signers)| signers.get(&key))
+                            .is_some()
                         {
                             // We have already counted this signature so ignore.
                             return Ok(());
@@ -322,17 +330,35 @@ where
                         // valid.
                         enough_sigs = (committee.len() / 3) + 1;
                         let mut guard = self.consensus_certs.lock();
-                        if guard.len() > 20 {
-                            // Small sanity check to make it more difficult for a malicious
-                            // committee member to fill up
-                            // consensus_certs.  Attempt to evict any records that don't appear
-                            // relavent when more that 20 entries
-                            // (should not have this many under normal conditions).
-                            // We would expect a malicious validator to flood a lot of singleton
-                            // results.
-                            guard.retain(|k, s| *k == consensus_result_hash || s.len() > 1);
+                        // Hard-cap the tally map so a flood of validly-signed but non-quorum
+                        // results cannot grow it without bound. `consensus_certs` is cleared
+                        // wholesale on every quorum (below), so under honest operation only a few
+                        // entries are ever live (typically one, for the next consensus number).
+                        //
+                        // Eviction is by least-recently-updated (LRU), NOT by signer count. A real
+                        // consensus result is signed once by each honest validator in a burst as
+                        // the network commits it, so its tally is bumped to most-recently-used on
+                        // every distinct signer and is never the eviction victim while it climbs to
+                        // quorum. Evicting by fewest-signers instead would be steerable: colluding
+                        // members can co-sign fakes that carry more signers than an honest tally
+                        // still gathering its first signatures, and so evict genuine progress.
+                        // Honest validators gossip each result only once, so an evicted honest
+                        // signature is lost for good; LRU keeps the actively-updated honest tally
+                        // and evicts the stale, frozen fakes instead. See GHSA-2r5c-c4h7-gp5h.
+                        let next_seq = guard.values().map(|(seq, _)| *seq).max().unwrap_or(0) + 1;
+                        if guard.len() >= super::MAX_CONSENSUS_CERTS
+                            && !guard.contains_key(&consensus_result_hash)
+                        {
+                            let evict = guard
+                                .iter()
+                                .min_by_key(|(_, (seq, _))| *seq)
+                                .map(|(digest, _)| *digest);
+                            if let Some(evict) = evict {
+                                guard.remove(&evict);
+                            }
                         }
-                        let set = guard.entry(consensus_result_hash).or_default();
+                        let (seq, set) = guard.entry(consensus_result_hash).or_default();
+                        *seq = next_seq;
                         set.insert(key);
                         sigs = set.len();
                     }
@@ -529,6 +555,12 @@ where
 
         // validate header
         header.validate(committee)?;
+
+        // A proposed header is always at round >= 1; round 0 is reserved for genesis certificates
+        // and is never voted on. Reject a round-0 header here, before parent tracking, so
+        // `check_for_missing_parents` never evaluates `header.round() - 1` at round 0 (see #789).
+        ensure!(header.round() != 0, HeaderError::InvalidRound(header.digest()).into());
+
         let max_round =
             self.consensus_bus.committed_round() + self.consensus_config.parameters().gc_depth;
         // Make sure the header is not unreasonable in the future.
@@ -822,7 +854,9 @@ where
 
         // filter out parents that were already requested and new ones
         unknown_certs.retain(|digest| {
-            let key = (header.round() - 1, *digest);
+            // `saturating_sub` matches the style used for `limit` above and keeps this helper
+            // underflow-safe on its own; `vote_inner` already rejects round 0 (see #789).
+            let key = (header.round().saturating_sub(1), *digest);
             if let std::collections::btree_map::Entry::Vacant(e) = current_requests.entry(key) {
                 e.insert(header.author().clone());
                 true
@@ -868,8 +902,9 @@ where
     ///
     /// Returns the full pack-file encoded output for `number` so a peer can reconstruct the
     /// [`tn_types::ConsensusOutput`] (batches + consensus header) without a separate batch fetch.
-    /// The bytes are streamed to the requesting peer (see `send_consensus_output_over_stream`),
-    /// because a single output can exceed the request/response message-size limit.
+    /// The bytes are streamed to the requesting peer over the typed sync protocol (see
+    /// `process_sync_consensus_output_stream`), because a single output can exceed the
+    /// request/response message-size limit.
     pub(super) async fn consensus_output_bytes(
         &self,
         number: u64,
@@ -1030,49 +1065,7 @@ where
         Ok(())
     }
 
-    /// Send a single consensus output's raw bytes over a stream.
-    ///
-    /// If the output is unavailable locally, the stream is simply closed with no bytes; the
-    /// requesting peer observes EOF and retries another peer.
-    pub(super) async fn send_consensus_output_over_stream<S>(
-        &self,
-        mut stream: S,
-        number: u64,
-        buffer_timeout: Duration,
-        peer: BlsPublicKey,
-    ) -> PrimaryNetworkResult<()>
-    where
-        S: AsyncWrite + Unpin + Send,
-    {
-        match self.consensus_output_bytes(number).await {
-            Ok(bytes) => {
-                // write in chunks so a single timeout bounds a slow reader
-                for chunk in bytes.chunks(16 * 1024) {
-                    timeout(buffer_timeout, stream.write_all(chunk)).await??;
-                }
-            }
-            Err(e) => {
-                // Benign miss (e.g. not-yet-served during catch-up): close with no bytes so the
-                // peer retries elsewhere. Closing below also handles the unavailable case.
-                debug!(
-                    target: "primary::network",
-                    %peer,
-                    ?number,
-                    ?e,
-                    "consensus output unavailable for stream; closing with no bytes"
-                );
-            }
-        }
-
-        // attempt to close the stream gracefully
-        if let Err(e) = stream.close().await {
-            tracing::warn!(target: "primary::network", %peer, ?number, ?e, "stream close failed");
-        }
-
-        Ok(())
-    }
-
-    /// Process request to open a stream for an epoch pack or a single consensus output.
+    /// Process request to open a stream for an epoch pack (full or partial prefix).
     pub(super) async fn process_request_epoch_stream(
         &self,
         peer: BlsPublicKey,
@@ -1141,27 +1134,6 @@ where
                     warn!(target: "primary::network", %peer, ?e, "failed to send partial epoch over stream")
                 })
             }
-            StreamRequestKind::ConsensusOutput(number) => {
-                debug!(
-                    target: "primary::network",
-                    %peer,
-                    ?request_digest,
-                    number,
-                    "processing inbound consensus output stream"
-                );
-
-                // set timeout to prevent slow-read attack
-                self.send_consensus_output_over_stream(
-                    stream,
-                    number,
-                    SEND_STREAM_BUFFER_TIMEOUT,
-                    peer,
-                )
-                .await
-                .inspect_err(|e| {
-                    warn!(target: "primary::network", %peer, ?e, "failed to send consensus output over stream")
-                })
-            }
         }
     }
 
@@ -1180,9 +1152,10 @@ where
         peer: BlsPublicKey,
         mut stream: Stream,
         epoch: Epoch,
+        stop_number: Option<u64>,
         consensus_chain: &ConsensusChain,
     ) -> PrimaryNetworkResult<()> {
-        debug!(target: "primary::network", %peer, epoch, "serving inbound sync epoch pack stream");
+        debug!(target: "primary::network", %peer, epoch, ?stop_number, "serving inbound sync epoch pack stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
         // bound the whole serve; flatten the timeout's outer Result into the send's
@@ -1192,6 +1165,7 @@ where
                 &mut stream,
                 consensus_chain,
                 epoch,
+                stop_number,
                 SEND_STREAM_BUFFER_TIMEOUT,
                 peer,
             ),
@@ -1299,6 +1273,75 @@ where
             warn!(target: "primary::network", %peer, ?e, "failed to serve sync missing certificates stream");
             // bound the best-effort error write: a peer that read the `Ack` then
             // stopped reading would otherwise pin this responder task.
+            let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
+                let _ = write_frame(
+                    &mut stream,
+                    &SyncFrame::<PrimarySyncRequest>::Err(SyncFrameError::Internal),
+                    &mut encode_buffer,
+                    &mut compressed_buffer,
+                    max_frame,
+                )
+                .await;
+            })
+            .await;
+        }
+
+        // attempt to close the stream gracefully, bounded so a peer that stops
+        // reading cannot pin this responder task on the FIN flush
+        let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
+
+        Ok(())
+    }
+
+    /// Serve an inbound single-consensus-output sync exchange.
+    ///
+    /// The exchange has already been admitted against the concurrency caps and its
+    /// opening `Req(ConsensusOutput { number })` frame read by the caller. This
+    /// resolves the output bytes (with the same brief catch-up wait as before, via
+    /// [`Self::consensus_output_bytes`]) and streams them with
+    /// [`send_sync_consensus_output_over_stream`]: an available output is sent as
+    /// `Ack` + `Data`* + `End`; a benign miss (unknown number, or one not yet built
+    /// during catch-up) sheds with a [`SyncFrame::Deny`]`(Unavailable)` frame so the
+    /// requester retries elsewhere. A send failure is logged and best-effort signalled
+    /// with [`SyncFrame::Err`]; it is not a peer fault, so no penalty is returned
+    /// (metrics-only during the item-9b rollout, like the epoch-pack sync path).
+    ///
+    /// [`send_sync_consensus_output_over_stream`]: crate::network::sync_codec::send_sync_consensus_output_over_stream
+    pub(super) async fn process_sync_consensus_output_stream(
+        &self,
+        peer: BlsPublicKey,
+        mut stream: Stream,
+        number: u64,
+    ) -> PrimaryNetworkResult<()> {
+        debug!(target: "primary::network", %peer, number, "serving inbound sync consensus output stream");
+        let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
+
+        // resolve the output bytes; a benign miss is shed with `Deny(Unavailable)`
+        // inside the serve helper (not a peer fault), so drop the error into `None`.
+        let bytes = self.consensus_output_bytes(number).await.ok();
+
+        // bound the whole serve; flatten the timeout's outer Result into the send's
+        let served = timeout(
+            SEND_SYNC_PACK_TIMEOUT,
+            crate::network::sync_codec::send_sync_consensus_output_over_stream(
+                &mut stream,
+                bytes,
+                SEND_STREAM_BUFFER_TIMEOUT,
+                peer,
+                number,
+            ),
+        )
+        .await
+        .map_err(PrimaryNetworkError::from)
+        .and_then(|served| served);
+
+        // a send failure or timeout is logged and best-effort signalled so the
+        // requester stops waiting; it is not a peer fault, so no penalty
+        if let Err(e) = served {
+            warn!(target: "primary::network", %peer, ?e, "failed to serve sync consensus output stream");
+            // bound the best-effort error write: a peer that read the `Ack` then
+            // stopped reading would otherwise pin this responder task.
+            let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
             let _ = timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, async {
                 let _ = write_frame(
                     &mut stream,
