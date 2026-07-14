@@ -4,8 +4,8 @@ use alloy::providers::{Provider, ProviderBuilder};
 use e2e_tests::config_local_testnet_with_epoch_duration;
 use std::time::Duration;
 use tn_reth::system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS};
+use tn_test_utils::wait_until;
 use tn_types::{get_available_tcp_port, EpochCertificate, EpochRecord};
-use tokio::time::Instant;
 use tracing::info;
 
 use crate::common::{
@@ -80,36 +80,28 @@ async fn test_observer_pack_imports_after_epoch_close_inner() -> eyre::Result<()
     let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
 
     // (a) wait for epoch 0 to close
-    let deadline = Instant::now() + Duration::from_secs(PACK_IMPORT_EPOCH_DURATION * 4);
-    loop {
-        let info = registry.getCurrentEpochInfo().call().await?;
-        if info.epochId > 0 {
-            info!(target: "restart-test", current_epoch = info.epochId, "epoch 0 closed");
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(eyre::eyre!(
-                "epoch 0 did not close within {}s",
-                PACK_IMPORT_EPOCH_DURATION * 4
-            ));
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    wait_until(Duration::from_secs(PACK_IMPORT_EPOCH_DURATION * 4), "epoch 0 to close", || async {
+        Ok(registry.getCurrentEpochInfo().call().await?.epochId > 0)
+    })
+    .await?;
+    let info = registry.getCurrentEpochInfo().call().await?;
+    info!(target: "restart-test", current_epoch = info.epochId, "epoch 0 closed");
 
     // (b) wait for tn_epochRecord(0) to return a certified record
-    let deadline = Instant::now() + Duration::from_secs(PACK_IMPORT_EPOCH_DURATION * 3);
-    let validator_record_0: (EpochRecord, EpochCertificate) = loop {
-        match provider
-            .raw_request::<_, (EpochRecord, EpochCertificate)>("tn_epochRecord".into(), (0u32,))
-            .await
-        {
-            Ok(rec) => break rec,
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(e) => return Err(eyre::eyre!("epoch 0 record never certified: {e}")),
-        }
-    };
+    wait_until(
+        Duration::from_secs(PACK_IMPORT_EPOCH_DURATION * 3),
+        "epoch 0 record to be certified on validator",
+        || async {
+            Ok(provider
+                .raw_request::<_, (EpochRecord, EpochCertificate)>("tn_epochRecord".into(), (0u32,))
+                .await
+                .is_ok())
+        },
+    )
+    .await?;
+    let validator_record_0: (EpochRecord, EpochCertificate) = provider
+        .raw_request::<_, (EpochRecord, EpochCertificate)>("tn_epochRecord".into(), (0u32,))
+        .await?;
     assert!(
         validator_record_0.0.verify_with_cert(&validator_record_0.1),
         "validator-side epoch-0 record fails self-verify"
@@ -126,39 +118,35 @@ async fn test_observer_pack_imports_after_epoch_close_inner() -> eyre::Result<()
     // racing with EVM execution lag. The deadline allows pack download + verify + apply
     // on top of normal observer startup.
     let validator_height = get_latest_consensus_header_number(&client_urls[0])?;
-    let max_secs = (PACK_IMPORT_EPOCH_DURATION * 6).max(60) as i32;
-    let mut caught_up = false;
-    for _ in 0..max_secs {
-        if let Ok(obs_height) = get_latest_consensus_header_number(&obs_url) {
-            if obs_height >= validator_height {
-                info!(target: "restart-test", obs_height, validator_height, "observer caught up via pack import");
-                caught_up = true;
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    assert!(
-        caught_up,
-        "observer did not catch up within {max_secs}s — pack import likely failed. Check logs in test_logs/observer_pack_import/"
-    );
+    let max_secs = (PACK_IMPORT_EPOCH_DURATION * 6).max(60);
+    wait_until(
+        Duration::from_secs(max_secs),
+        "observer to catch up via pack import (check logs in test_logs/observer_pack_import/)",
+        || async {
+            Ok(get_latest_consensus_header_number(&obs_url)
+                .is_ok_and(|obs_height| obs_height >= validator_height))
+        },
+    )
+    .await?;
+    info!(target: "restart-test", validator_height, "observer caught up via pack import");
 
     // The observer must reconstruct the epoch-0 pack chain: ask for tn_epochRecord(0)
     // and confirm it self-verifies and matches the validator's record byte-for-byte.
     let obs_provider = ProviderBuilder::new().connect_http(obs_url.parse()?);
-    let deadline = Instant::now() + Duration::from_secs(PACK_IMPORT_EPOCH_DURATION * 3);
-    let observer_record_0: (EpochRecord, EpochCertificate) = loop {
-        match obs_provider
-            .raw_request::<_, (EpochRecord, EpochCertificate)>("tn_epochRecord".into(), (0u32,))
-            .await
-        {
-            Ok(rec) => break rec,
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(e) => return Err(eyre::eyre!("observer epoch 0 record never available: {e}")),
-        }
-    };
+    wait_until(
+        Duration::from_secs(PACK_IMPORT_EPOCH_DURATION * 3),
+        "epoch 0 record to be available on observer",
+        || async {
+            Ok(obs_provider
+                .raw_request::<_, (EpochRecord, EpochCertificate)>("tn_epochRecord".into(), (0u32,))
+                .await
+                .is_ok())
+        },
+    )
+    .await?;
+    let observer_record_0: (EpochRecord, EpochCertificate) = obs_provider
+        .raw_request::<_, (EpochRecord, EpochCertificate)>("tn_epochRecord".into(), (0u32,))
+        .await?;
     assert!(
         observer_record_0.0.verify_with_cert(&observer_record_0.1),
         "observer epoch-0 record fails self-verify after pack import"

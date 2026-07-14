@@ -3142,6 +3142,7 @@ dependencies = [
  "tn-config",
  "tn-node",
  "tn-reth",
+ "tn-test-utils",
  "tn-types",
  "tokio",
  "tracing",
@@ -11634,6 +11635,7 @@ dependencies = [
  "tn-network-types",
  "tn-reth",
  "tn-storage",
+ "tn-test-utils",
  "tn-types",
  "tn-worker",
  "tokio",
@@ -11645,9 +11647,11 @@ name = "tn-batch-validator"
 version = "0.1.0"
 dependencies = [
  "assert_matches",
+ "eyre",
  "rayon",
  "tempfile",
  "tn-reth",
+ "tn-test-utils",
  "tn-types",
  "tokio",
 ]
@@ -11860,6 +11864,7 @@ dependencies = [
  "tn-primary",
  "tn-reth",
  "tn-storage",
+ "tn-test-utils",
  "tn-test-utils-committee",
  "tn-types",
  "tokio",
@@ -11973,6 +11978,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "eyre",
+ "futures",
  "indexmap 2.13.0",
  "telcoin-network-cli",
  "tempfile",
@@ -11981,6 +11987,7 @@ dependencies = [
  "tn-reth",
  "tn-test-utils-committee",
  "tn-types",
+ "tokio",
 ]
 
 [[package]]

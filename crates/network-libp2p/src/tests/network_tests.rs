@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
-use tn_test_utils::CommitteeFixture;
+use tn_test_utils::{wait_until, CommitteeFixture};
 use tn_types::{BlsKeypair, Certificate, Header, TaskManager};
 use tokio::{sync::mpsc, time::timeout};
 
@@ -215,55 +215,10 @@ async fn wait_for_peer_discovery<Req: TNMessage, Res: TNMessage>(
     expected_bls: BlsPublicKey,
     timeout_duration: Duration,
 ) -> eyre::Result<()> {
-    let deadline = tokio::time::Instant::now() + timeout_duration;
-    loop {
-        let peers = handle.connected_peers().await?;
-        if peers.contains(&expected_bls) {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(eyre!("timed out waiting for peer BLS key discovery via kademlia"));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// Poll an async `condition` until it returns `true`, or fail once `timeout_duration` elapses.
-///
-/// A bounded, self-synchronizing replacement for a fixed `sleep` that only guesses
-/// at how long an asynchronous swarm event (gossip mesh grafting, subscription
-/// propagation, connection teardown plus pending-request cleanup) takes. It folds
-/// over a bounded sequence of ~10ms poll attempts, carrying the first resolved
-/// verdict forward: `Some(Ok(()))` once the condition holds, `Some(Err(_))` if a
-/// poll itself errors, and `None` while still waiting. An exhausted fold (still
-/// `None`) means the deadline passed. Mirrors the poll shape of
-/// [`wait_for_peer_discovery`] but is generic over the polled condition.
-async fn wait_until<F, Fut>(
-    timeout_duration: Duration,
-    description: &str,
-    condition: F,
-) -> eyre::Result<()>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = eyre::Result<bool>>,
-{
-    const POLL_INTERVAL: Duration = Duration::from_millis(10);
-    let attempts = (timeout_duration.as_millis() / POLL_INTERVAL.as_millis()).max(1);
-    let condition = &condition;
-
-    futures::stream::iter(0..attempts)
-        .fold(None, move |resolved: Option<eyre::Result<()>>, attempt| async move {
-            if resolved.is_some() {
-                resolved
-            } else {
-                if attempt > 0 {
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
-                condition().await.map(|met| met.then_some(())).transpose()
-            }
-        })
-        .await
-        .unwrap_or_else(|| Err(eyre!("timed out waiting for condition: {description}")))
+    wait_until(timeout_duration, "peer BLS key discovery via kademlia", move || async move {
+        Ok(handle.connected_peers().await?.contains(&expected_bls))
+    })
+    .await
 }
 
 #[tokio::test]
@@ -885,7 +840,10 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
         )
         .await?;
     primary.dial_by_bls(worker_bls).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    wait_until(Duration::from_secs(5), "transport connection across roles establishes", || async {
+        Ok(primary.connected_peer_ids().await?.contains(&worker_peer_id))
+    })
+    .await?;
     assert!(
         primary.connected_peer_ids().await?.contains(&worker_peer_id),
         "transport connection across roles should establish"
@@ -1162,8 +1120,12 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         // connect to target
         peer.network_handle.dial_by_bls(target_peer_bls).await?;
 
-        // give time for connection to establish and libp2p state to stabilize
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // wait for the connection to establish and libp2p state to stabilize
+        let peer_handle = &peer.network_handle;
+        wait_until(Duration::from_secs(5), "peer connects to target", move || async move {
+            Ok(peer_handle.connected_peers().await?.contains(&target_peer_bls))
+        })
+        .await?;
     }
 
     // allow heartbeat to trigger peer pruning - increased to give libp2p time to
@@ -1361,8 +1323,12 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
             .await?;
         peer.network_handle.dial_by_bls(target_peer_bls).await?;
 
-        // give time for connection to establish and libp2p state to stabilize
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // wait for the connection to establish and libp2p state to stabilize
+        let peer_handle = &peer.network_handle;
+        wait_until(Duration::from_secs(5), "peer connects to target", move || async move {
+            Ok(peer_handle.connected_peers().await?.contains(&target_peer_bls))
+        })
+        .await?;
     }
 
     // raw legacy peer: the target's main req-res protocol only, no dedicated
@@ -1422,16 +1388,15 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
     );
 
     // the ack resolves the pending exchange and the target disconnects promptly
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut still_connected = true;
-    while still_connected && tokio::time::Instant::now() < deadline {
-        still_connected =
-            target_peer.network_handle.connected_peer_ids().await?.contains(&raw_peer_id);
-        if still_connected {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-    assert!(!still_connected, "target should disconnect the raw legacy peer after the goodbye");
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(10), "target disconnects the raw legacy peer", || async {
+        Ok(!target_handle.connected_peer_ids().await?.contains(&raw_peer_id))
+    })
+    .await?;
+    assert!(
+        !target_peer.network_handle.connected_peer_ids().await?.contains(&raw_peer_id),
+        "target should disconnect the raw legacy peer after the goodbye"
+    );
 
     Ok(())
 }
@@ -1476,8 +1441,11 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
     // Connect peers
     peer1.dial_by_bls(peer2_bls).await?;
 
-    // Wait a beat for peer2 to recieve peer1 bls key.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for peer2 to be connected (receives peer1 bls key).
+    wait_until(Duration::from_secs(5), "peer2 is connected", || async {
+        Ok(peer1.connected_peer_ids().await?.contains(&peer2_id))
+    })
+    .await?;
 
     // Verify connection established
     let connected_peers = peer1.connected_peer_ids().await?;
@@ -1488,9 +1456,13 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
         peer1.report_penalty(peer2_bls, Penalty::Medium).await;
     }
 
-    // Wait briefly for penalties to be processed by the network task,
-    // but capture score before the next heartbeat can decay it
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for the penalties to lower peer2's score below the default.
+    wait_until(
+        Duration::from_secs(5),
+        "peer2 score drops below default after penalties",
+        || async { Ok(peer1.peer_score(peer2_id).await?.is_some_and(|s| s < default_score)) },
+    )
+    .await?;
 
     // Check peer2's score is lower but still connected
     let score_after_penalty = peer1.peer_score(peer2_id).await?.unwrap();
@@ -1499,8 +1471,13 @@ async fn test_score_decay_and_reconnection() -> eyre::Result<()> {
         "{score_after_penalty} not less than {default_score}"
     );
 
-    // Wait for scores to recover through heartbeats
-    tokio::time::sleep(Duration::from_secs(4 * TEST_HEARTBEAT_INTERVAL)).await;
+    // Wait for scores to recover (decay toward 0) through heartbeats.
+    wait_until(
+        Duration::from_secs(4 * TEST_HEARTBEAT_INTERVAL + 5),
+        "peer2 score recovers above the post-penalty low",
+        || async { Ok(peer1.peer_score(peer2_id).await?.is_some_and(|s| s > score_after_penalty)) },
+    )
+    .await?;
 
     // Check score improved (decayed toward 0)
     let score_after_decay = peer1.peer_score(peer2_id).await?.unwrap();
@@ -1561,8 +1538,11 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
         .await?;
     malicious_peer.dial_by_bls(config_1.key_config().primary_public_key()).await?;
 
-    // Wait for connection to establish
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for the connection to establish
+    wait_until(Duration::from_secs(5), "malicious peer connects to honest", || async {
+        Ok(honest_peer.connected_peer_ids().await?.contains(&malicious_id))
+    })
+    .await?;
 
     debug!(target: "peer-manager", ?malicious_id, ?malicious_bls, "assessing fatal penalty!!");
     // Report fatal penalty for malicious peer
@@ -1716,8 +1696,12 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
             .await?;
         peer.network_handle.dial_by_bls(target_bls).await?;
 
-        // Give time for connection to establish
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait for the connection to establish
+        let peer_handle = &peer.network_handle;
+        wait_until(Duration::from_secs(5), "peer connects to target", move || async move {
+            Ok(peer_handle.connected_peers().await?.contains(&target_bls))
+        })
+        .await?;
 
         // subscribe to test topic with target peer as authorized publisher
         peer.network_handle
@@ -1801,8 +1785,11 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
         .await?;
     peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
 
-    // Wait for connection to establish
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the connection to establish
+    wait_until(Duration::from_secs(5), "peer2 connects initially", || async {
+        Ok(peer1.connected_peer_ids().await?.contains(&peer2_id))
+    })
+    .await?;
 
     // Verify connection established
     let connected_peers = peer1.connected_peer_ids().await?;
@@ -1851,8 +1838,11 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     // peer2 should dial peer1 - but try dial to reconnecting peer2 and ignore `AlreadyConnectedErr`
     let _ = peer1.dial_by_bls(config_2.key_config().primary_public_key()).await;
 
-    // Wait for connection to reestablish
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the connection to reestablish
+    wait_until(Duration::from_secs(5), "peer2 reconnects after unban", || async {
+        Ok(peer1.connected_peer_ids().await?.contains(&peer2_id))
+    })
+    .await?;
 
     // Verify connection reestablished
     let connected_peers_after = peer1.connected_peer_ids().await?;
@@ -1928,8 +1918,12 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
         )
         .await?;
 
-    // Wait for connection to establish
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the connection to establish
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(5), "target connects to peer1", || async {
+        Ok(target_handle.connected_peer_ids().await?.contains(&peer1_id))
+    })
+    .await?;
 
     // Apply fatal penalty to peer1 - should ban it and its IP
     target_peer
@@ -2009,8 +2003,11 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     // Connect peers
     peer1.dial_by_bls(peer2_bls).await?;
 
-    // Wait for connection to establish
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the connection to establish
+    wait_until(Duration::from_secs(5), "peer2 connects initially", || async {
+        Ok(peer1.connected_peer_ids().await?.contains(&peer2_id))
+    })
+    .await?;
 
     // Verify connection established
     let connected_peers = peer1.connected_peer_ids().await?;
@@ -2044,8 +2041,13 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     })
     .await?;
 
-    // Wait for epoch processing
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
+    // Wait for epoch processing to lift peer2's score above zero.
+    wait_until(
+        Duration::from_secs(TEST_HEARTBEAT_INTERVAL + 5),
+        "peer2 score turns positive after new epoch",
+        || async { Ok(peer1.peer_score(peer2_id).await?.is_some_and(|s| s > 0.0)) },
+    )
+    .await?;
 
     // Verify peer2's score has improved and is trusted
     let score_after_epoch = peer1.peer_score(peer2_id).await?.unwrap();
@@ -2056,8 +2058,11 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
         let dial_result = peer1.dial_by_bls(peer2_bls).await;
         assert!(dial_result.is_ok(), "Should be able to reconnect to peer2 after new epoch");
 
-        // Wait for connection to reestablish
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the connection to reestablish
+        wait_until(Duration::from_secs(5), "peer2 reconnects after new epoch", || async {
+            Ok(peer1.connected_peer_ids().await?.contains(&peer2_id))
+        })
+        .await?;
     }
 
     // Verify connection is established
@@ -2097,7 +2102,10 @@ async fn test_rotate_does_not_disconnect_previous_committee() -> eyre::Result<()
         )
         .await?;
     peer1.dial_by_bls(peer2_bls).await?;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_until(Duration::from_secs(5), "peer2 connects before rotation", || async {
+        Ok(peer1.connected_peer_ids().await?.contains(&peer2_id))
+    })
+    .await?;
     assert!(
         peer1.connected_peer_ids().await?.contains(&peer2_id),
         "peer2 should be connected before rotation"
@@ -2207,7 +2215,10 @@ async fn test_gossip_explicit_peer_includes_next_committee() -> eyre::Result<()>
         .await?;
 
     // Allow the connection to establish and gossipsub to graft.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until(Duration::from_secs(5), "next-committee peer connects to publisher", || async {
+        Ok(publisher.connected_peer_ids().await?.contains(&next_id))
+    })
+    .await?;
 
     assert!(
         publisher.connected_peer_ids().await?.contains(&next_id),
@@ -2287,8 +2298,12 @@ async fn test_get_kad_records() -> eyre::Result<()> {
             )
             .await?;
 
-        // Give time for connection to establish
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the connection to establish
+        let peer_handle = &peer.network_handle;
+        wait_until(Duration::from_secs(5), "peer connects to target", move || async move {
+            Ok(peer_handle.connected_peers().await?.contains(&target_peer_bls))
+        })
+        .await?;
 
         peer.network_handle
             .subscribe_with_publishers(TEST_TOPIC.into(), peer.config.committee_pub_keys())
@@ -2452,16 +2467,10 @@ async fn test_killed_peer_record_expires_local_record_survives() -> eyre::Result
     // Poll until peer1 has stored peer2's record. `publish_our_data_to_peer`
     // fires on PeerConnected, but the actual record-store write only lands
     // after a round trip.
-    let kad_recv_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if peer1_handle.kad_store_get(peer2_bls).await?.is_some() {
-            break;
-        }
-        if tokio::time::Instant::now() >= kad_recv_deadline {
-            return Err(eyre!("timed out waiting for peer1 to receive peer2's kad record"));
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    wait_until(Duration::from_secs(5), "peer1 receives peer2's kad record", || async {
+        Ok(peer1_handle.kad_store_get(peer2_bls).await?.is_some())
+    })
+    .await?;
 
     // Sanity: peer1's own record also present before peer2 dies.
     assert!(
@@ -2604,7 +2613,11 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
                 target_peer_addr.clone(),
             )
             .await?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let peer_handle = &peer.network_handle;
+        wait_until(Duration::from_secs(5), "peer connects to target", move || async move {
+            Ok(peer_handle.connected_peers().await?.contains(&target_peer_bls))
+        })
+        .await?;
     }
 
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;

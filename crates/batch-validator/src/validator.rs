@@ -236,6 +236,7 @@ mod tests {
     use std::{path::Path, str::FromStr, sync::Arc};
     use tempfile::TempDir;
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
+    use tn_test_utils::wait_until;
     use tn_types::{
         max_batch_gas, test_genesis, Address, Batch, Bytes, Encodable2718 as _, FromHex,
         GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
@@ -673,7 +674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_submit_txn_if_mine_routes_to_correct_slot() {
+    async fn test_submit_txn_if_mine_routes_to_correct_slot() -> eyre::Result<()> {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let TestTools { validator, tx_pool, .. } = test_tools(tmp_dir.path(), &task_manager).await;
@@ -695,12 +696,13 @@ mod tests {
         validator.submit_txn_if_mine(&encoded, committee_size, expected_slot);
 
         // Poll for the spawned task to complete
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tx_pool.pool_size().pending == 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            assert!(tokio::time::Instant::now() < deadline, "timeout waiting for tx in pool");
-        }
+        wait_until(std::time::Duration::from_secs(5), "txs inserted into pool", || async {
+            Ok(tx_pool.pool_size().pending >= 1)
+        })
+        .await?;
         assert_eq!(tx_pool.pool_size().pending, 1);
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -732,7 +734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_submit_txn_if_mine_same_sender_same_slot() {
+    async fn test_submit_txn_if_mine_same_sender_same_slot() -> eyre::Result<()> {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let TestTools { validator, tx_pool, .. } = test_tools(tmp_dir.path(), &task_manager).await;
@@ -756,12 +758,13 @@ mod tests {
         }
 
         // Poll for all 3 spawned tasks to complete
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tx_pool.pool_size().pending < 3 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            assert!(tokio::time::Instant::now() < deadline, "timeout waiting for txs in pool");
-        }
+        wait_until(std::time::Duration::from_secs(5), "txs inserted into pool", || async {
+            Ok(tx_pool.pool_size().pending >= 3)
+        })
+        .await?;
         assert_eq!(tx_pool.pool_size().pending, 3);
+
+        Ok(())
     }
 
     #[test]
