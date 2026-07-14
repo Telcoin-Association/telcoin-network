@@ -835,9 +835,9 @@ mod test {
         assert_eq!(report.missing_batch_count(BatchClass::Absent), 0);
     }
 
-    /// v1: same corruption in the header-first layout. To land the moved batch in group 5, splice it
-    /// just *after* consensus header 5 (a v1 group's batches follow its header). Present-but-wrong-
-    /// group → Misordered at 3; orphan in group 5 → ExtraBatch at 5.
+    /// v1: same corruption in the header-first layout. To land the moved batch in group 5, splice
+    /// it just *after* consensus header 5 (a v1 group's batches follow its header).
+    /// Present-but-wrong- group → Misordered at 3; orphan in group 5 → ExtraBatch at 5.
     #[test]
     fn test_validate_misordered_batch_v1() {
         let (temp_dir, committee, chain) = setup();
@@ -880,8 +880,8 @@ mod test {
         let outputs = make_outputs(&committee, chain, 5);
         let (mut records, _) = build_records(epoch0_meta(&committee), &outputs, 1);
 
-        // Swap the first two Batch records that follow consensus header 3 (its group has 4 batches),
-        // breaking the ascending-digest order without changing the set.
+        // Swap the first two Batch records that follow consensus header 3 (its group has 4
+        // batches), breaking the ascending-digest order without changing the set.
         let header3 = records
             .iter()
             .position(|r| matches!(r, PackRecord::Consensus(h) if h.number == 3))
@@ -952,8 +952,9 @@ mod test {
                 "v{version}: expected NonSequentialConsensusNumber(expected 5, found 99); issues: {:?}",
                 report.issues
             );
-            // The chain check alone misses this: the final header has no successor whose parent_hash
-            // would mismatch, so no ChainBreak fires — the sequential check is what catches it.
+            // The chain check alone misses this: the final header has no successor whose
+            // parent_hash would mismatch, so no ChainBreak fires — the sequential check
+            // is what catches it.
             let chain_breaks =
                 report.issues.iter().filter(|i| matches!(i, PackIssue::ChainBreak { .. })).count();
             assert_eq!(
