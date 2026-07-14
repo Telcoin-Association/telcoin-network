@@ -302,4 +302,59 @@ mod tests {
         assert!(PrimaryNetworkError::UnknownConsensusHeaderCert(ConsensusHeaderDigest::default())
             .is_author_content_fault());
     }
+
+    /// Finding #871 attribution guard. `process_gossip` charges the accountable peer with
+    /// `if fault.is_author_content_fault() { author } else { relayer }.zip((&fault).into())`, so
+    /// for each fault this PR moved to the author arm the charged party is the authenticated
+    /// author and the penalty is the fault's own. Both halves are asserted here: a future edit
+    /// that re-routes a variant to the relayer, or drops its penalty (which `zip` would silently
+    /// swallow, charging no one), fails this test. The mirror of the selection is exercised by the
+    /// closing control case, and the honest relayer's protection is what the change exists for.
+    #[test]
+    fn moved_gossip_faults_charge_the_author_not_the_relayer() {
+        // the penalty the gossip handler charges the *author*, or `None` if the fault is not
+        // author-content (so the relayer would be charged instead) or carries no penalty
+        let author_penalty = |fault: &PrimaryNetworkError| {
+            fault.is_author_content_fault().then(|| Option::<Penalty>::from(fault)).flatten()
+        };
+
+        // certificate: unsigned / bad-signature -> Fatal, charged to the author
+        assert!(matches!(
+            author_penalty(&PrimaryNetworkError::Certificate(CertManagerError::Certificate(
+                CertificateError::Unsigned
+            ))),
+            Some(Penalty::Fatal)
+        ));
+        assert!(matches!(
+            author_penalty(&PrimaryNetworkError::Certificate(CertManagerError::Certificate(
+                CertificateError::InvalidSignature
+            ))),
+            Some(Penalty::Fatal)
+        ));
+        // epoch vote: bad signature (PeerNotAuthor) / non-committee key (UnknownAuthority) -> Fatal
+        assert!(matches!(
+            author_penalty(&PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)),
+            Some(Penalty::Fatal)
+        ));
+        assert!(matches!(
+            author_penalty(&PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(
+                "key not in committee".to_string()
+            ))),
+            Some(Penalty::Fatal)
+        ));
+        // consensus result: bad signature -> Mild
+        assert!(matches!(
+            author_penalty(&PrimaryNetworkError::UnknownConsensusHeaderCert(
+                ConsensusHeaderDigest::default()
+            )),
+            Some(Penalty::Mild)
+        ));
+
+        // control: a non-content fault is not author-charged, so the relayer arm is taken and the
+        // author penalty is `None` even though the fault itself carries one
+        let relayer_fault = PrimaryNetworkError::InvalidEpochRequest;
+        assert!(!relayer_fault.is_author_content_fault());
+        assert!(author_penalty(&relayer_fault).is_none());
+        assert!(matches!(Option::<Penalty>::from(&relayer_fault), Some(Penalty::Medium)));
+    }
 }
