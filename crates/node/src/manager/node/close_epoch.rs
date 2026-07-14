@@ -358,7 +358,7 @@ mod tests {
         ConsensusNumHash::new(9, ConsensusHeaderDigest::default())
     }
 
-    /// B1: identical committee handoff succeeds and preserves the read order.
+    /// identical committee handoff succeeds and preserves the read order.
     #[test]
     fn build_epoch_record_unchanged_committee() {
         let five = keys(0..5);
@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(rec.final_consensus, final_consensus());
     }
 
-    /// B2: a governance `burn` mid-epoch swap-and-pops the ejected key out of the on-chain
+    /// a governance `burn` mid-epoch swap-and-pops the ejected key out of the on-chain
     /// committee array, so the closing read is a 4-member subset of the 5 the previous
     /// record promised. The record must still build or every node halts at the boundary.
     #[test]
@@ -402,7 +402,7 @@ mod tests {
         assert_eq!(rec.parent_hash, prev.digest());
     }
 
-    /// B3: the same five keys in a different stored order are the same committee.
+    /// the same five keys in a different stored order are the same committee.
     #[test]
     fn build_epoch_record_reordered_only() {
         let five = keys(0..5);
@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(rec.parent_hash, prev.digest());
     }
 
-    /// B4: shrinking past the tolerance floor or bound stays an error — producing a record
+    /// shrinking past the tolerance floor or bound stays an error — producing a record
     /// sync would reject only hides the divergence.
     #[test]
     fn build_epoch_record_rejects_below_tolerance() {
@@ -455,7 +455,7 @@ mod tests {
         .is_err());
     }
 
-    /// B5: a committee containing a key the previous record never promised is rejected —
+    /// a committee containing a key the previous record never promised is rejected —
     /// current committees cannot legitimately grow or swap members mid-epoch.
     #[test]
     fn build_epoch_record_rejects_unknown_member() {
@@ -474,7 +474,7 @@ mod tests {
         .is_err());
     }
 
-    /// B6: epoch 0 has no previous record to hand off from.
+    /// epoch 0 has no previous record to hand off from.
     #[test]
     fn build_epoch_record_epoch_zero_skips_handoff() {
         let five = keys(0..5);
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(rec.committee, five);
     }
 
-    /// B7: any later epoch without its previous record is an error.
+    /// any later epoch without its previous record is an error.
     #[test]
     fn build_epoch_record_missing_prev_errors() {
         let five = keys(0..5);

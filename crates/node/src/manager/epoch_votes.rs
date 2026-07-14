@@ -556,7 +556,7 @@ mod epoch_vote_collector_tests {
         node_shutdown.notify();
     }
 
-    /// C1: a vote from a key outside the record committee (ejected mid-epoch) is ignored
+    /// a vote from a key outside the record committee (ejected mid-epoch) is ignored
     /// entirely — it neither counts toward quorum nor blocks later member votes.
     #[tokio::test]
     async fn test_collector_rejects_ejected_nonmember_vote() {
@@ -658,7 +658,7 @@ mod epoch_vote_collector_tests {
         node_shutdown.notify();
     }
 
-    /// C2: a node whose own key is not in the record committee (ejected mid-epoch, demoted
+    /// a node whose own key is not in the record committee (ejected mid-epoch, demoted
     /// to observer next epoch) must not self-sign, but still stores the cert formed by the
     /// remaining members' votes so it can keep following the chain.
     #[tokio::test]
