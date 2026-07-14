@@ -959,7 +959,7 @@ impl RethEnv {
 
         if let Some((leader_round, consensus_num_hash, engine_update_tx)) = engine_update {
             engine_update_tx
-                .try_send((
+                .blocking_send((
                     leader_round,
                     consensus_num_hash,
                     Some(canonical_head.clone_sealed_header()),

@@ -689,9 +689,13 @@ mod tests {
             // execute output to trigger canonical update
             let args = BuildArguments::new(reth_env.clone(), output.clone(), parent);
             let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
-            let final_header =
-                execute_consensus_output(args, gas_accumulator.clone(), engine_update_tx)
-                    .expect("output executed");
+            // spawn blocking for payload_builder::blocking_recv
+            let owned_ga = gas_accumulator.clone();
+            let final_header = tokio::task::spawn_blocking(move || {
+                execute_consensus_output(args, owned_ga, engine_update_tx).expect("output executed")
+            })
+            .await
+            .unwrap();
 
             // update values for next loop
             parent = final_header;
