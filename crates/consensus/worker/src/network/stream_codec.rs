@@ -232,6 +232,96 @@ mod tests {
         output
     }
 
+    /// An [`AsyncRead`] that serves a fixed prefix of bytes and then parks
+    /// forever (`Poll::Pending`) without ever closing the stream. Models a peer
+    /// that streams one complete chunk and then stalls before the next
+    /// chunk-count header, the GHSA-hh6m-5822-6w25 inter-chunk stall.
+    struct StallAfterPrefix {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl futures::AsyncRead for StallAfterPrefix {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.pos >= this.data.len() {
+                // prefix exhausted: never make progress, never signal EOF
+                return std::task::Poll::Pending;
+            }
+            let remaining = &this.data[this.pos..];
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            this.pos += n;
+            std::task::Poll::Ready(Ok(n))
+        }
+    }
+
+    /// Regression for GHSA-hh6m-5822-6w25: a peer that streams one complete
+    /// chunk and then stalls before the next chunk-count header must not park
+    /// the requester forever. The inter-chunk count read is now timeout-bounded,
+    /// so the reader returns [`NetworkError::Timeout`] instead of hanging. The
+    /// paused clock advances to the timeout deterministically, so the test does
+    /// not wait real time.
+    #[tokio::test(start_paused = true)]
+    async fn test_read_and_validate_times_out_on_inter_chunk_stall() {
+        use tn_network_libp2p::error::NetworkError;
+
+        // one batch, so the responder emits exactly one chunk: [count=1][batch].
+        let batches = create_test_batches(1);
+        let db = setup_batch_db(&batches);
+        let temp_dir = TempDir::new().expect("tempdir");
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain");
+        let digests: BTreeSet<B256> = batches.iter().map(|b| b.digest()).collect();
+
+        // serialize that single chunk, then never send more and never close it.
+        let mut prefix = Vec::new();
+        send_batches_over_stream(&mut prefix, &db, &consensus_chain, &digests, 0)
+            .await
+            .expect("send batches");
+        let mut stream = StallAfterPrefix { data: prefix, pos: 0 };
+
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+        // Reads chunk 0 immediately, then parks at the chunk-1 count read. The
+        // stalling reader never registers a waker, so it is the inter-chunk
+        // timeout's own Sleep that keeps a timer live; under the paused clock the
+        // runtime auto-advances to that (nearest) timer, which fires and yields
+        // Ok(Err(Timeout)) without waiting real time. The outer 1h guard keeps a
+        // future revert from hanging CI.
+        //
+        // cq2q's whole-exchange BATCH_READ_TOTAL_TIMEOUT (210s) also wraps this
+        // read and maps to the same NetworkError::Timeout, so asserting on the
+        // error alone would still pass if the inter-chunk fix were reverted to a
+        // bare await (the 210s outer bound would fire instead). Pin the elapsed
+        // paused time to the inner INTER_CHUNK_STREAM_TIMEOUT (200s) window,
+        // strictly below the 210s outer deadline, so a revert fails here rather
+        // than passing on the outer bound.
+        let start = tokio::time::Instant::now();
+        let guarded = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            handle.read_and_validate_batches_with_timeout(&mut stream, &digests),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(guarded, Ok(Err(NetworkError::Timeout))),
+            "inter-chunk stall must time out (not hang), got {guarded:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(200)
+                && elapsed < std::time::Duration::from_secs(210),
+            "the 200s inter-chunk bound (not the 210s whole-exchange deadline) must fire; \
+             elapsed {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_write_read_batch_roundtrip() {
         let batch =

@@ -25,8 +25,12 @@ use tracing::{debug, warn};
 
 /// Total timeout for sending all batches over a stream.
 /// Prevents slow-reader attacks where a peer accepts a stream but never reads.
-/// Set for 500MB through emerging market worse-case 20MB/s upload
-const SEND_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
+/// Set for 500MB through emerging market worse-case 20MB/s upload.
+///
+/// Exposed to the requester side (`handle.rs`), which sizes its per-chunk-count
+/// read tolerance (`INTER_CHUNK_STREAM_TIMEOUT`) to be at least this whole-stream
+/// cap so an honest sender is never disconnected mid-transfer.
+pub(crate) const SEND_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// The type that handles requests from peers.
 ///

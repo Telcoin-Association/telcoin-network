@@ -32,6 +32,8 @@ reth-metrics = { workspace = true }
 
 [dev-dependencies]
 metrics-util = { workspace = true }
+# `test-util` (paused clock) is dev-only; features union with the [dependencies] tokio entry.
+tokio = { workspace = true, features = ["test-util"] }
 tn-batch-validator = { workspace = true, features = ["test-utils"] }
 tempfile = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
