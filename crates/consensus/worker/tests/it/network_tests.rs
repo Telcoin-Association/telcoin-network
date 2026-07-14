@@ -285,6 +285,50 @@ async fn test_batch_gossip_stream_accepted_opens_stream() {
     assert!(stream_request_acked, "stream request should have been acked");
 }
 
+/// A prefetch already in flight for a digest deduplicates a repeat gossip of the
+/// same digest: the second `process_gossip` returns without emitting any further
+/// `request_batches` network command. This is the wiring that bounds a Byzantine
+/// author's gossip-driven fetch amplification.
+#[tokio::test]
+async fn test_batch_gossip_prefetch_deduplicates_in_flight_digest() {
+    let TestTypes { mut network_commands_rx, handler, task_manager, committee: _ } =
+        create_test_types();
+    let batch_digest = B256::random();
+    let data = tn_types::encode(&WorkerGossip::Batch(0, batch_digest));
+    let make_msg = || GossipMessage {
+        source: None,
+        data: data.clone(),
+        sequence_number: None,
+        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0)),
+    };
+
+    // Task A: the first prefetch. It reaches `request_batches` (emitting a network
+    // command) and then parks awaiting a reply, holding the in-flight dedup slot for
+    // this digest. A clone shares the same prefetch dedup set + concurrency semaphore.
+    let handler_a = handler.clone();
+    let msg_a = make_msg();
+    task_manager.spawn_task("prefetch-a", async move {
+        let _ = handler_a.pub_process_gossip_for_test(&msg_a).await;
+        Ok(())
+    });
+
+    // Wait until A has entered `request_batches` (its first command). From here A is
+    // parked with the dedup slot held; we deliberately never reply.
+    let _first = network_commands_rx.recv().await.expect("first prefetch emits a command");
+
+    // Task B: a duplicate gossip for the same digest. It must be deduplicated and
+    // return without emitting any network command of its own.
+    let msg_b = make_msg();
+    handler.pub_process_gossip_for_test(&msg_b).await.expect("duplicate gossip returns Ok");
+
+    // The duplicate emitted nothing: no second fetch fan-out for an in-flight digest.
+    assert_matches!(
+        network_commands_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "duplicate gossip must not trigger a second batch fetch"
+    );
+}
+
 // ============================================================================
 // Stream Request Error Tests
 // ============================================================================
