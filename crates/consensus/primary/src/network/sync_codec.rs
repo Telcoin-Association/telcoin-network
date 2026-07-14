@@ -18,7 +18,7 @@
 use crate::error::PrimaryNetworkResult;
 use futures::{
     io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite},
-    AsyncWriteExt as _, StreamExt as _, TryStreamExt as _,
+    AsyncWriteExt as _, FutureExt as _, StreamExt as _, TryFutureExt as _, TryStreamExt as _,
 };
 use std::time::Duration;
 use tn_network_libp2p::{read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame};
@@ -84,18 +84,24 @@ const MISSING_CERTS_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serve an accepted epoch-pack sync exchange over `stream`.
 ///
-/// A full epoch pack is all-or-nothing: if the complete, verifiable pack is not
-/// held, the responder sheds with [`SyncFrame::Deny`]`(`[`DenyReason::Unavailable`]`)`
-/// so the requester retries another peer immediately instead of waiting out its
-/// ack timeout. Otherwise it writes [`SyncFrame::Ack`], streams the pack as
-/// [`SyncFrame::Data`] frames, and ends with [`SyncFrame::End`]. Each frame write
-/// is bounded by `buffer_timeout` so a peer that stops reading cannot stall the
+/// `stop_number` selects the transfer: `None` serves the complete epoch pack,
+/// `Some(last_consensus_number)` serves the verifiable PREFIX up to that consensus
+/// output (the partial in-progress epoch, [`ConsensusChain::get_partial_epoch_stream`]).
+/// Either way the transfer is all-or-nothing: if the requested pack (or its prefix)
+/// is not held, the responder sheds with
+/// [`SyncFrame::Deny`]`(`[`DenyReason::Unavailable`]`)` so the requester retries
+/// another peer immediately instead of waiting out its ack timeout. Otherwise it
+/// writes [`SyncFrame::Ack`], streams the pack as [`SyncFrame::Data`] frames, and
+/// ends with [`SyncFrame::End`]. A partial transfer bounds the source reader to the
+/// prefix length so it never streams past the verifiable point. Each frame write is
+/// bounded by `buffer_timeout` so a peer that stops reading cannot stall the
 /// responder task on an unbounded write. The caller has already admitted the
 /// exchange against the concurrency caps and read the opening request frame.
 pub(crate) async fn send_sync_epoch_pack_over_stream<S>(
     stream: &mut S,
     consensus_chain: &ConsensusChain,
     epoch: Epoch,
+    stop_number: Option<u64>,
     buffer_timeout: Duration,
     peer: BlsPublicKey,
 ) -> PrimaryNetworkResult<()>
@@ -104,9 +110,26 @@ where
 {
     let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
 
-    // the complete pack is not held: shed cleanly so the requester retries elsewhere
-    let Ok(mut epoch_stream) = consensus_chain.get_epoch_stream(epoch).await else {
-        debug!(target: "primary::network", %peer, epoch, "epoch pack unavailable; denying sync request");
+    // resolve the source reader and its byte cap through the `Option`'s combinator
+    // rather than a Some/None branch: a full pack streams to EOF (`u64::MAX` never
+    // bounds the `take` below), a partial prefix is capped at its `[0, end)`
+    // verifiable length. Both arms normalize to one boxed future so `map_or_else`
+    // can pick either; a missing pack (or an out-of-range partial stop point) sheds
+    // cleanly so the requester retries elsewhere.
+    let source = stop_number
+        .map_or_else(
+            || {
+                consensus_chain
+                    .get_epoch_stream(epoch)
+                    .map_ok(|reader| (reader, u64::MAX))
+                    .map_err(drop)
+                    .boxed()
+            },
+            |number| consensus_chain.get_partial_epoch_stream(epoch, number).map_err(drop).boxed(),
+        )
+        .await;
+    let Ok((epoch_stream, cap)) = source else {
+        debug!(target: "primary::network", %peer, epoch, ?stop_number, "epoch pack unavailable; denying sync request");
         write_one_frame(
             stream,
             &SyncFrame::Deny(DenyReason::Unavailable),
@@ -131,7 +154,10 @@ where
     )
     .await?;
 
-    write_pack_data_frames(&mut epoch_stream, stream, buffer_timeout).await?;
+    // a partial transfer caps the reader at the prefix length; a full transfer
+    // resolved `cap` to `u64::MAX`, which never bounds the read, so this streams to
+    // EOF.
+    write_pack_data_frames(&mut epoch_stream.take(cap), stream, buffer_timeout).await?;
     Ok(())
 }
 
@@ -615,7 +641,6 @@ where
 mod tests {
     use super::*;
     use tn_network_libp2p::SyncFrameError;
-    use tokio::io::AsyncReadExt as _;
 
     /// Frame `bytes` through [`write_pack_data_frames`] into an in-memory buffer.
     async fn frame_pack(bytes: &[u8]) -> Vec<u8> {

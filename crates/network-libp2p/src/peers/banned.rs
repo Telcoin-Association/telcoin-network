@@ -44,15 +44,22 @@ impl BannedPeers {
 
         ip_addresses
             .filter(|ip| {
-                match self.banned_peers_by_ip.get_mut(ip) {
-                    Some(count) => {
+                self.banned_peers_by_ip
+                    .get_mut(ip)
+                    .map(|count| {
                         // reduce count
                         *count = count.saturating_sub(1);
+                        *count
+                    })
+                    .is_some_and(|count| {
+                        // drop keys that no longer track a banned peer so the map
+                        // cannot grow without bound as distinct IPs churn
+                        if count == 0 {
+                            self.banned_peers_by_ip.remove(ip);
+                        }
                         // return ip if no longer associated with a banned peer
-                        !self.ip_banned(ip)
-                    }
-                    None => false,
-                }
+                        count <= BANNED_PEERS_PER_IP_THRESHOLD
+                    })
             })
             .collect()
     }

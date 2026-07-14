@@ -555,6 +555,12 @@ where
 
         // validate header
         header.validate(committee)?;
+
+        // A proposed header is always at round >= 1; round 0 is reserved for genesis certificates
+        // and is never voted on. Reject a round-0 header here, before parent tracking, so
+        // `check_for_missing_parents` never evaluates `header.round() - 1` at round 0 (see #789).
+        ensure!(header.round() != 0, HeaderError::InvalidRound(header.digest()).into());
+
         let max_round =
             self.consensus_bus.committed_round() + self.consensus_config.parameters().gc_depth;
         // Make sure the header is not unreasonable in the future.
@@ -848,7 +854,9 @@ where
 
         // filter out parents that were already requested and new ones
         unknown_certs.retain(|digest| {
-            let key = (header.round() - 1, *digest);
+            // `saturating_sub` matches the style used for `limit` above and keeps this helper
+            // underflow-safe on its own; `vote_inner` already rejects round 0 (see #789).
+            let key = (header.round().saturating_sub(1), *digest);
             if let std::collections::btree_map::Entry::Vacant(e) = current_requests.entry(key) {
                 e.insert(header.author().clone());
                 true
@@ -1144,9 +1152,10 @@ where
         peer: BlsPublicKey,
         mut stream: Stream,
         epoch: Epoch,
+        stop_number: Option<u64>,
         consensus_chain: &ConsensusChain,
     ) -> PrimaryNetworkResult<()> {
-        debug!(target: "primary::network", %peer, epoch, "serving inbound sync epoch pack stream");
+        debug!(target: "primary::network", %peer, epoch, ?stop_number, "serving inbound sync epoch pack stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
         // bound the whole serve; flatten the timeout's outer Result into the send's
@@ -1156,6 +1165,7 @@ where
                 &mut stream,
                 consensus_chain,
                 epoch,
+                stop_number,
                 SEND_STREAM_BUFFER_TIMEOUT,
                 peer,
             ),

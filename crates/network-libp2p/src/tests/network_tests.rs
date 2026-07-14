@@ -1543,6 +1543,14 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
 
     let malicious_addr = config_2.primary_address();
 
+    // honest must resolve malicious_bls -> peer id to penalize it. the committee gate added in
+    // #827 drops kad-discovered records for non-committee keys, so register the malicious peer
+    // explicitly (an operator-provisioned, pinned path) instead. unlike committee membership this
+    // does not make honest re-dial the peer, so the Fatal ban disconnects and stays disconnected.
+    honest_peer
+        .add_explicit_peer(malicious_bls, config_2.primary_networkkey(), malicious_addr.clone())
+        .await?;
+
     // Connect malicious to honest
     malicious_peer
         .add_explicit_peer(
@@ -2608,6 +2616,14 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
         network.run().await.expect("nvv network run failed!");
     });
     nvv.start_listening(nvv_config.primary_address()).await?;
+    // seed the nvv's committee (target + the rest) BEFORE it connects so target's rpc-bearing
+    // record is retained the moment it arrives via kad; the committee gate added in #827 drops
+    // records for non-committee keys, and a late seed misses the record's first delivery. an nvv
+    // following the chain learns the committee from epoch state.
+    let committee_keys = std::iter::once(target_peer_bls)
+        .chain(committee.iter().map(|p| p.config.key_config().primary_public_key()))
+        .collect();
+    nvv.update_committees(Default::default(), committee_keys, Default::default()).await?;
     nvv.add_trusted_peer_and_dial(
         target_peer_bls,
         target_peer_net.clone(),
@@ -2696,6 +2712,14 @@ async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()>
     assert!(node_record.info.rpc.is_none());
     assert_eq!(node_record.info.multiaddrs, vec![peer2.config.primary_address()]);
 
+    // owner is a committee member so the gated discovery path (#827) retains its record;
+    // production applies committee membership from epoch state before processing records.
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        std::iter::once(owner_bls).collect(),
+        Default::default(),
+    );
+
     // an inbound put request stores the record and promotes it into `known_peers`
     network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
     assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&kad_record.key).is_some());
@@ -2715,6 +2739,61 @@ async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()>
 
     // honest pre-upgrade sender is not penalized
     assert!(!network.swarm.behaviour().peer_manager.peer_banned(&owner_peer_id));
+
+    Ok(())
+}
+
+/// Regression (GHSA-j24g-gqj4-9vj8): an inbound `PUT_VALUE` with `publisher =
+/// None` and a `key` equal to the node's own discovery-record key must NOT
+/// delete the node's own record from the local store.
+///
+/// `publisher = None` short-circuits to the reject path before any signature
+/// check, and the pre-fix reject path called `remove_record(&record.key)` with
+/// the sender-supplied key. Because the node's own record is the only
+/// locally-published record, that call deleted it, and since we only re-provide
+/// our record at startup, the deletion persisted until restart. The reject path
+/// must perform no store mutation keyed on attacker-supplied input.
+#[tokio::test]
+async fn test_publisherless_put_cannot_delete_own_record() -> eyre::Result<()> {
+    use libp2p::kad;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // Seed our own discovery record into the local store with the same record
+    // `provide_our_data` publishes at startup: keyed on our BLS public key with
+    // `publisher = Some(local_peer_id)`, the only record `remove_record` can touch.
+    let own_record = network.get_peer_record();
+    network.swarm.behaviour_mut().kademlia.store_mut().put(own_record.clone())?;
+    assert!(
+        network.swarm.behaviour_mut().kademlia.store_mut().get(&own_record.key).is_some(),
+        "own discovery record present before the attack",
+    );
+
+    // An arbitrary connected peer sends a PUT keyed on our own record key with no
+    // publisher. No signature and no committee membership are required.
+    let attacker = *peer2.network.swarm.local_peer_id();
+    let malicious = kad::Record {
+        key: own_record.key.clone(),
+        value: vec![0xde, 0xad, 0xbe, 0xef],
+        publisher: None,
+        expires: None,
+    };
+    network.process_kad_put_request(attacker, malicious)?;
+
+    // The node's own authoritative record must survive intact: it is only
+    // re-provided at startup, so a deletion here would persist until restart.
+    // Assert it is still present AND unchanged, covering both the "delete" and
+    // "mutate" halves of the advisory's acceptance criterion. (Compare the stable
+    // fields; `expires` loses precision across the store's SystemTime<->Instant
+    // round-trip, as noted in `test_newer_kad_record_replaced`.)
+    let survived = network.swarm.behaviour_mut().kademlia.store_mut().get(&own_record.key).expect(
+        "own discovery record must survive a publisher=None reject-path put (GHSA-j24g-gqj4-9vj8)",
+    );
+    assert_eq!(survived.key, own_record.key);
+    assert_eq!(survived.value, own_record.value);
+    assert_eq!(survived.publisher, own_record.publisher);
 
     Ok(())
 }
@@ -2748,6 +2827,14 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
         publisher: Some(owner_peer_id),
         expires: None,
     };
+
+    // owner is a committee member so the gated discovery path (#827) retains its record;
+    // production applies committee membership from epoch state before processing records.
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        std::iter::once(owner_bls).collect(),
+        Default::default(),
+    );
 
     network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
 
@@ -2943,6 +3030,77 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
     Ok(())
 }
 
+/// Regression test for issue #828: `published_to_peers` is a per-process-lifetime de-dup gate that
+/// is never cleaned on disconnect, so as an unbounded set it grew once per distinct `PeerId` ever
+/// seen and would eventually OOM a RAM-capped node. It is now a capacity-bounded LRU: a flood of
+/// fresh peer identities must pin it at [`MAX_PUBLISHED_TO_PEERS`] and never grow past it.
+#[tokio::test]
+async fn test_published_to_peers_is_bounded() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // The field is initialized at the intended cap and starts empty.
+    assert_eq!(network.published_to_peers.cap(), MAX_PUBLISHED_TO_PEERS);
+    assert_eq!(network.published_to_peers.len(), 0);
+
+    // Each fresh, never-before-seen peer is a first-time push (this is exactly what the
+    // `PeerEvent::PeerConnected` arm does when it sees a new `PeerId`). Overrun the cap and
+    // assert the set never grows past it.
+    let cap = MAX_PUBLISHED_TO_PEERS.get();
+    for _ in 0..(cap + 100) {
+        let peer_id = PeerId::random();
+        assert!(
+            network.mark_published_to_peer(peer_id),
+            "a never-before-seen peer must register as a first-time push"
+        );
+        assert!(
+            network.published_to_peers.len() <= cap,
+            "published_to_peers must never exceed its LRU capacity"
+        );
+    }
+
+    // The flood pinned the set at capacity rather than growing without bound.
+    assert_eq!(
+        network.published_to_peers.len(),
+        cap,
+        "a flood of distinct peers fills the LRU to exactly its capacity and stays there"
+    );
+}
+
+/// Regression test for issue #828: bounding `published_to_peers` must not reintroduce the kad
+/// re-push amplification the gate exists to prevent. An actively (re)connecting peer must stay
+/// resident in the LRU - so it keeps de-duping and is never re-pushed to - even while a flood of
+/// fresh peers churns the rest of the set.
+#[tokio::test]
+async fn test_published_to_peers_keeps_active_peer_resident() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // First sight of our sticky peer warrants a one-time push.
+    let sticky = PeerId::random();
+    assert!(
+        network.mark_published_to_peer(sticky),
+        "first sight of a peer must register as a first-time push"
+    );
+
+    // The sticky peer keeps reconnecting while enough fresh identities connect to overrun the
+    // cap. Because every reconnect promotes it to most-recently-used, it is never the eviction
+    // victim - unlike a plain insertion-order set, which would drop it after `cap` fresh inserts.
+    for _ in 0..(MAX_PUBLISHED_TO_PEERS.get() + 100) {
+        assert!(
+            !network.mark_published_to_peer(sticky),
+            "a reconnecting peer we have already pushed to must not be re-pushed"
+        );
+        network.mark_published_to_peer(PeerId::random());
+    }
+
+    // Despite the flood, the continually-active peer survived eviction and still de-dups.
+    assert!(
+        !network.mark_published_to_peer(sticky),
+        "an actively reconnecting peer must survive LRU eviction (no re-push storm)"
+    );
+}
+
 /// Regression for issue #819: a resolved author identity is carried on the delivered gossip
 /// event so the application layer can charge an author-content fault to the author rather than
 /// the forwarding relayer.
@@ -2974,9 +3132,10 @@ fn author_attributable_reject_charges_the_author_never_the_relayer() {
     }
 }
 
-/// An oversized payload is the only relayer-attributable reject — the size bound is deterministic
-/// network-wide, so under `Strict` validation an honest peer never forwards one — and it is
-/// charged to the forwarder only once its BLS identity has resolved (the author's resolution is
+/// An oversized payload is the only relayer-attributable reject — the size bound is a compile-time
+/// protocol constant (`MAX_GOSSIP_MESSAGE_SIZE`), identical on every honest node and enforced on
+/// both the publish and receive paths, so an honest peer never originates or forwards one — and it
+/// is charged to the forwarder only once its BLS identity has resolved (the author's resolution is
 /// irrelevant), mirroring the Accept path's unresolved-relayer skip.
 #[test]
 fn oversized_reject_penalizes_only_a_resolved_relayer() {
@@ -2987,4 +3146,25 @@ fn oversized_reject_penalizes_only_a_resolved_relayer() {
         );
         assert_eq!(RejectReason::TooLarge.penalty(false, author_resolved), RejectPenalty::Skip);
     }
+}
+
+/// #872: a node must never originate a gossip payload larger than `MAX_GOSSIP_MESSAGE_SIZE`. Honest
+/// peers reject an oversized payload as `RejectReason::TooLarge` and Fatal-attribute it to the
+/// relaying peer, which on the first hop is the originator — so the publish path enforces the same
+/// bound as `verify_gossip`, refusing an oversized message locally with
+/// `PublishError::MessageTooLarge` instead of letting the originator be banned by its peers.
+#[tokio::test]
+async fn oversized_publish_is_refused_locally() -> eyre::Result<()> {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { network_handle: cvv, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // one byte over the bound is refused at origination, before it can reach any peer
+    let too_big = vec![0u8; MAX_GOSSIP_MESSAGE_SIZE + 1];
+    let err = cvv.publish(TEST_TOPIC.into(), too_big).await.expect_err("oversized publish refused");
+    assert_matches!(err, NetworkError::Publish(PublishError::MessageTooLarge));
+
+    Ok(())
 }

@@ -39,6 +39,7 @@ assert_matches = { workspace = true }
 [features]
 default = []
 test-utils = ["dep:eyre"]
+# Adiri testnet fork logic gated on `tn_types::forks` — pull in the constants.
 adiri = ["tn-types/adiri"]
 
 [lints]
