@@ -197,6 +197,32 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     assert_eq!(expected, gas_accumulator.rewards_counter().get_address_counts());
     assert_eq!(expected, recovered.rewards_counter().get_address_counts());
 
+    // Simulate the crash window: rewind the finalized marker to a mid-chain header, as if the
+    // node died between the blocks-commit and finalize-commit transactions. Calling
+    // finalize_block directly is safe here: the watches are plain non-monotonic setters, and
+    // the engine has exited so the in-memory tree is empty and remove_persisted_blocks no-ops.
+    let tip_header = reth_env.finalized_header()?.expect("live run finalized the tip");
+    let rewind_to =
+        reth_env.sealed_header_by_number(tip_header.number / 2)?.expect("mid-chain header exists");
+    reth_env.finalize_block(rewind_to.clone())?;
+    let stale = reth_env.finalized_header()?.expect("rewound finalized header");
+    assert_eq!(stale.number, rewind_to.number, "precondition: the marker lags the tip");
+
+    // startup's heal advances the marker back to the persisted tip...
+    reth_env.heal_finalized_to_persisted_tip()?;
+    let healed = reth_env.finalized_header()?.expect("healed finalized header");
+    assert_eq!(healed.number, tip_header.number, "heal restores the marker to the tip");
+    assert_eq!(healed.hash(), tip_header.hash(), "healed marker carries the tip's hash");
+
+    // ...so a fresh catchup rebuilds the gap rounds' gas AND leader counts in full: identical
+    // to the live accumulator, with the leader bound coming from the healed tip's nonce
+    let healed_recovery = GasAccumulator::new(1);
+    healed_recovery.rewards_counter().set_committee(fixture.committee());
+    catchup_accumulator(reth_env.clone(), &healed_recovery, &mut consensus_chain, canonical_epoch)
+        .await?;
+    assert_eq!(gas_accumulator.get_values(worker_id), healed_recovery.get_values(worker_id));
+    assert_eq!(expected, healed_recovery.rewards_counter().get_address_counts());
+
     Ok(())
 }
 
@@ -261,7 +287,7 @@ async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()
 
     // the every-epoch setter updates the pool (covers the respawn path where init is skipped).
     let new_fee = base_fee + 50;
-    execution_node.set_worker_base_fee(worker_id, new_fee).await;
+    execution_node.set_worker_base_fee(worker_id, new_fee).await?;
     let pool = execution_node.get_worker_transaction_pool(&worker_id).await?;
     assert_eq!(
         pool.block_info().pending_basefee,
@@ -898,19 +924,30 @@ fn extend_canonical_chain(reth_env: &RethEnv, block: ExecutedBlock) -> eyre::Res
 }
 
 /// Catchup pins every chain-derived input (scan range, worker-count read block, leader-count
-/// bound) to the ONE finalized header, and guards that header's epoch against the canonical
-/// tip's. A finalized marker lagging the canonical tip WITHIN the epoch is legal (blocks and
-/// the marker commit in separate transactions): the pinned inputs stay internally consistent
-/// and the restore proceeds. A lag that crosses an epoch boundary would pin every input to the
-/// WRONG epoch's state, so catchup refuses with the cross-view guard error instead of silently
-/// rebuilding against it.
+/// bound) to the ONE finalized header, and startup heals that marker to the persisted
+/// canonical tip BEFORE catchup runs (`RethEnv::heal_finalized_to_persisted_tip`). A lagging
+/// marker is the crash-window artifact of blocks and the marker committing in separate
+/// transactions; healing it is sound because every persisted canonical block is
+/// consensus-final by construction.
 ///
-/// Chain shape: block 1 (epoch 0, worker 0, one executed transfer) is canonical AND finalized;
-/// block 2 (epoch 0) is canonical but NOT finalized — the legal mid-epoch lag; block 3 closes
-/// epoch 0 and is canonical but NOT finalized — the boundary-crossing lag.
+/// Phase A — mid-epoch lag (block 1 finalized; block 2 canonical-only; both carry a real
+/// transfer): catchup ALONE still pins its scan to the stale marker and undercounts (control),
+/// while heal-then-catchup counts BOTH blocks' gas — the startup sequence recovers the gap.
+///
+/// Phase B — boundary-crossing lag (block 3 closes epoch 0, canonical-only): catchup ALONE
+/// refuses with the cross-view guard error (control — post-heal, a firing guard means genuine
+/// database inconsistency, so it stays a tripwire), while heal-then-catchup for the entered
+/// epoch 1 succeeds where startup previously hard-halted: the marker advances to the closing
+/// block, epoch 1's first block (4) lies past the healed tip (3), and the empty scan counts
+/// zero gas.
+///
+/// Leader counting stays out of scope here: Phase A's healed pin (round 1, epoch 0) walks this
+/// test's EMPTY consensus DB (a harmless no-op), and Phase B's pin carries epoch 0's nonce
+/// while the entered epoch is 1, so the epoch gate skips it. `test_catchup_accumulator` covers
+/// healed leader recounts against real consensus data.
 #[tokio::test]
-async fn catchup_guards_finality_lag_across_epoch_boundary() -> eyre::Result<()> {
-    let temp_dir = TempDir::with_prefix("catchup_pinned_finalized")?;
+async fn catchup_heals_finality_lag_across_epoch_boundary() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("catchup_heals_finality_lag")?;
     // committee fixture only backs the consensus-chain handle catchup takes
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .with_rng(StdRng::seed_from_u64(8991))
@@ -918,8 +955,8 @@ async fn catchup_guards_finality_lag_across_epoch_boundary() -> eyre::Result<()>
     let mut consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
 
-    // registry-backed genesis (so the epoch-closing system call can run at block 2) with a
-    // funded sender so block 1 carries real gas
+    // registry-backed genesis (so the epoch-closing system call can run at block 3) with a
+    // funded sender so blocks 1 and 2 carry real gas
     let mut tx_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
     let genesis = test_genesis_with_consensus_registry(4).extend_accounts([(
         tx_factory.address(),
@@ -934,14 +971,12 @@ async fn catchup_guards_finality_lag_across_epoch_boundary() -> eyre::Result<()>
     )?;
     let reth_env = execution_node.get_reth_env().await;
 
-    // worker 0's on-chain fee for epoch 0: distinguishable from MIN and from the poison below
+    // worker 0's on-chain fee for epoch 0: distinguishable from MIN
     let worker_id: WorkerId = 0;
     let chain_fee = MIN_PROTOCOL_BASE_FEE + 77;
 
     // block 1: mid-epoch-0 block carrying worker 0's fee and one executed transfer (so gas
-    // stats accumulate) - canonical AND finalized. Leader round 0 keeps catchup's leader-count
-    // stage (gated on `last_executed_round > 0`) out of scope; this test pins the fee-restore
-    // and gas-stat stages.
+    // stats accumulate) - canonical AND finalized
     let transfer = tx_factory.create_eip1559_encoded(
         chain.clone(),
         None,
@@ -961,45 +996,82 @@ async fn catchup_guards_finality_lag_across_epoch_boundary() -> eyre::Result<()>
     )?;
     let block1_header = extend_canonical_chain(&reth_env, block1)?;
     reth_env.finalize_block(block1_header.clone())?;
+    assert!(block1_header.gas_used > 0, "block 1's transfer must land for sharp gas assertions");
 
-    // block 2 (epoch 0): canonical but NOT finalized - the legal mid-epoch finality lag
-    let no_txs: Vec<Vec<u8>> = vec![];
+    // block 2 (epoch 0): canonical but NOT finalized - the crash-window mid-epoch lag - with a
+    // second executed transfer so the healed recount is measurably larger than the control
+    let transfer2 = tx_factory.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(Address::random()),
+        U256::from(1),
+        Default::default(),
+    );
     let output2 = manual_consensus_output(1, 0, 2, false);
     let payload2 = payload_with_base_fee(block1_header.clone(), &output2, chain_fee, worker_id);
-    let block2 =
-        reth_env.build_block_from_batch_payload(payload2, &no_txs, block1_header.hash(), &[])?;
+    let block2 = reth_env.build_block_from_batch_payload(
+        payload2,
+        &vec![transfer2],
+        block1_header.hash(),
+        &[],
+    )?;
     let block2_header = extend_canonical_chain(&reth_env, block2)?;
+    assert!(block2_header.gas_used > 0, "block 2's transfer must land for sharp gas assertions");
 
-    // negative control: finalized (block 1) and canonical (block 2) agree on the epoch, so the
-    // guard must not fire and the restore scans the range pinned to the finalized header
+    // Phase A control: catchup ALONE pins its scan to the stale marker (block 1), passes the
+    // guard (same epoch), and misses block 2's gas - the undercount the startup heal prevents
     let canonical_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
     assert_eq!(canonical_epoch, 0, "mid-epoch canonical tip stays in epoch 0");
     let recovered = GasAccumulator::new(1);
     catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
         .await?;
     let (blocks_counted, gas_used, _gas_limit) = recovered.get_values(worker_id);
-    assert!(blocks_counted > 0, "legal mid-epoch lag must not skip the restore");
+    assert!(blocks_counted > 0, "mid-epoch lag alone must not skip the restore");
     assert_eq!(
         gas_used, block1_header.gas_used,
-        "the scan is bounded by the finalized header, not the canonical tip",
+        "catchup alone is bounded by the stale finalized marker and misses block 2",
     );
     // catchup leaves fees to the entry seeding: block 1's non-MIN fee is NOT adopted
     assert_eq!(recovered.base_fee(worker_id).base_fee(), MIN_PROTOCOL_BASE_FEE);
 
+    // Phase A heal: the marker advances to the persisted canonical tip through finalize_block,
+    // updating the in-memory watch catchup reads alongside the database row
+    reth_env.heal_finalized_to_persisted_tip()?;
+    let healed = reth_env.finalized_header()?.expect("healed finalized header");
+    assert_eq!(healed.number, block2_header.number, "heal advances the marker to the tip");
+    assert_eq!(healed.hash(), block2_header.hash(), "healed marker carries the tip's hash");
+
+    // Phase A: heal-then-catchup (the startup sequence) recovers the gap block's gas
+    let recovered = GasAccumulator::new(1);
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, canonical_epoch)
+        .await?;
+    let (_blocks_counted, gas_used, _gas_limit) = recovered.get_values(worker_id);
+    assert_eq!(
+        gas_used,
+        block1_header.gas_used + block2_header.gas_used,
+        "healed catchup counts the previously-unfinalized block 2",
+    );
+
     // block 3: closes epoch 0 - canonical but NOT finalized (the lag now crosses the boundary)
+    let no_txs: Vec<Vec<u8>> = vec![];
     let output3 = manual_consensus_output(2, 0, 3, true);
     let payload3 = payload_with_base_fee(block2_header.clone(), &output3, chain_fee, worker_id);
     let block3 =
         reth_env.build_block_from_batch_payload(payload3, &no_txs, block2_header.hash(), &[])?;
-    extend_canonical_chain(&reth_env, block3)?;
+    let block3_header = extend_canonical_chain(&reth_env, block3)?;
 
     // precondition: the views genuinely disagree at epoch granularity - the canonical tip's
-    // epoch state places the epoch start PAST the finalized header
+    // epoch state places the epoch start PAST the finalized header (block 2 after Phase A)
     let finalized = reth_env.finalized_header()?.expect("finalized header");
-    assert_eq!(finalized.number, block1_header.number, "finality pinned at block 1");
-    assert_eq!(finalized.hash(), block1_header.hash(), "pinned header carries its hash");
+    assert_eq!(finalized.number, block2_header.number, "finality pinned at block 2");
     let tip_state = reth_env.epoch_state_from_canonical_tip()?;
     assert_eq!(tip_state.epoch, 1, "canonical tip state crossed the epoch boundary");
+    assert_eq!(
+        tip_state.epoch_info.blockHeight,
+        block3_header.number + 1,
+        "epoch 1's first block is the one after the closing block",
+    );
     assert!(
         tip_state.epoch_info.blockHeight > finalized.number,
         "entered-epoch range start ({}) must exceed the finalized range end ({})",
@@ -1007,7 +1079,9 @@ async fn catchup_guards_finality_lag_across_epoch_boundary() -> eyre::Result<()>
         finalized.number,
     );
 
-    // the guard refuses the restore rather than rebuilding against the wrong epoch's state
+    // Phase B control: catchup ALONE refuses the boundary-crossing lag rather than rebuilding
+    // against the wrong epoch's state - the guard stays a tripwire (post-heal, its firing
+    // means genuine database inconsistency)
     let recovered = GasAccumulator::new(1);
     let err =
         catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, tip_state.epoch)
@@ -1015,11 +1089,76 @@ async fn catchup_guards_finality_lag_across_epoch_boundary() -> eyre::Result<()>
             .expect_err("boundary-crossing finality lag must refuse the restore");
     assert!(
         err.to_string().contains("across an epoch boundary"),
-        "error must identify the cross-boundary finalized-marker lag: {err}",
+        "error must identify the cross-boundary view disagreement: {err}",
     );
     // the guard fires before any write: the accumulator is untouched
     assert_eq!(recovered.num_workers(), 1);
     assert_eq!(recovered.get_values(worker_id), (0, 0, 0));
+
+    // Phase B heal: the marker advances across the epoch boundary to the closing block
+    reth_env.heal_finalized_to_persisted_tip()?;
+    let healed = reth_env.finalized_header()?.expect("healed finalized header");
+    assert_eq!(healed.number, block3_header.number, "heal advances the marker to block 3");
+    assert_eq!(healed.hash(), block3_header.hash(), "healed marker carries block 3's hash");
+
+    // Phase B: heal-then-catchup recovers where startup previously hard-halted. The healed pin
+    // is epoch 0's closing block, whose epoch state reports the entered epoch 1: the guard
+    // passes, the scan (4..=3) is empty, the worker count syncs from chain state, and leader
+    // counting is skipped (the pin's nonce carries epoch 0, not 1)
+    let recovered = GasAccumulator::new(1);
+    catchup_accumulator(reth_env.clone(), &recovered, &mut consensus_chain, tip_state.epoch)
+        .await?;
+    assert_eq!(recovered.num_workers(), 1, "worker count synced from chain state");
+    assert_eq!(
+        recovered.get_values(worker_id),
+        (0, 0, 0),
+        "entered epoch 1 has no executed blocks yet - the healed scan is empty",
+    );
+
+    Ok(())
+}
+
+/// The heal refuses a node whose finalized marker points PAST the persisted canonical tip: the
+/// marker only ever trails the tip (blocks commit first), so a marker ahead of it means the
+/// execution database lost blocks this node already attested as final.
+#[tokio::test]
+async fn heal_errors_when_finalized_marker_ahead_of_tip() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("heal_marker_ahead")?;
+    let execution_node =
+        default_test_execution_node(None, None, &temp_dir.path().join("reth"), None)?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // Plant a marker past the (genesis-only) tip. finalize_block with a fabricated header is
+    // safe here: its hash is not in the in-memory block map, so remove_persisted_blocks no-ops.
+    let ahead = SealedHeader::new(ExecHeader { number: 5, ..Default::default() }, B256::random());
+    reth_env.finalize_block(ahead)?;
+
+    let err = reth_env
+        .heal_finalized_to_persisted_tip()
+        .expect_err("a marker past the tip means the db lost attested blocks");
+    assert!(
+        err.to_string().contains("ahead of the persisted canonical tip"),
+        "error must name the marker-ahead condition: {err}",
+    );
+
+    Ok(())
+}
+
+/// On a fresh genesis chain the heal is a no-op: the marker was never written, the tip is
+/// genesis, and genesis must STAY unfinalized so
+/// `finalized_block_hash_number_for_startup`'s genesis fallback still marks a fresh node.
+#[tokio::test]
+async fn heal_noop_on_fresh_genesis() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("heal_fresh_genesis")?;
+    let execution_node =
+        default_test_execution_node(None, None, &temp_dir.path().join("reth"), None)?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    reth_env.heal_finalized_to_persisted_tip()?;
+    assert!(
+        reth_env.finalized_header()?.is_none(),
+        "fresh genesis stays unfinalized after the heal",
+    );
 
     Ok(())
 }

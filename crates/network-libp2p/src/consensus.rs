@@ -19,8 +19,8 @@ use crate::{
 use futures::StreamExt as _;
 use libp2p::{
     gossipsub::{
-        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance, Topic,
-        TopicHash,
+        self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
+        PublishError, Topic, TopicHash,
     },
     kad::{self, store::RecordStore, Mode, QueryId},
     request_response::{
@@ -31,12 +31,14 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
+use lru::LruCache;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
+    num::NonZeroUsize,
     time::Duration,
 };
-use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig};
+use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, MAX_GOSSIP_MESSAGE_SIZE};
 use tn_types::{
     encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
     TnSender, WorkerId,
@@ -50,6 +52,22 @@ use tracing::{debug, error, info, instrument, trace, warn};
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
 mod network_tests;
+
+/// Hard cap on the number of distinct peers retained in
+/// [`ConsensusNetwork::published_to_peers`], the de-dup set that records which peers we have
+/// already pushed our [`NodeRecord`] to.
+///
+/// Without a cap this set grows once per distinct `PeerId` ever connected and is never cleaned up
+/// (a `PeerId` is a peer-minted cryptographic identity, so a churn of fresh identities grows it
+/// without bound), which on a RAM-capped node is a slow but guaranteed OOM. Backing the set with a
+/// capacity-bounded LRU caps its resident size to this many entries (~64-80 B each, so well under
+/// 1 MB) while preserving the de-dup intent: an actively (re)connecting peer is promoted on every
+/// connect and so is never the eviction victim, and only a peer absent long enough to fall out of
+/// the LRU is re-pushed to on its eventual return - at worst once, which is self-limiting.
+///
+/// The value is a generous multiple of the live-peer target (`PeerConfig::max_peers()` defaults to
+/// ~33), so the LRU only ever evicts peers well outside the current working set. See issue #828.
+const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("10_000 is nonzero");
 
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
@@ -224,9 +242,15 @@ where
     /// A peer connecting for the first time needs our record before it can resolve
     /// our BLS key, so we push it on `PeerConnected`. A peer that reconnects (or that
     /// flaps repeatedly, as observed with banned peers in adiri testnet) should already have
-    /// the record in their persistent kad store. This list is per-process-lifetime in case nodes
-    /// restart.
-    published_to_peers: HashSet<PeerId>,
+    /// the record in their persistent kad store, so we skip the push for peers already in here.
+    ///
+    /// A capacity-bounded LRU rather than an unbounded set: entries are never removed on
+    /// disconnect (removing them would re-enable the exact kad re-push amplification on flapping
+    /// peers that this de-dup gate exists to prevent), so an unbounded set would grow once per
+    /// distinct `PeerId` ever seen and eventually OOM a RAM-capped node. The LRU caps resident
+    /// size at [`MAX_PUBLISHED_TO_PEERS`] and promotes actively (re)connecting peers so they are
+    /// never evicted; see that constant for the full rationale.
+    published_to_peers: LruCache<PeerId, ()>,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
 }
@@ -455,7 +479,7 @@ where
             key_config,
             task_spawner,
             node_record,
-            published_to_peers: HashSet::new(),
+            published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             metrics: SwarmMetrics::new_for(&network_type),
         })
     }
@@ -549,6 +573,18 @@ where
             vec![peer].into_iter(),
             kad::Quorum::One,
         );
+    }
+
+    /// Record that we have pushed our [`NodeRecord`] to `peer_id`, returning `true` the first time
+    /// we see a peer (i.e. when a direct push is warranted) and `false` for a peer we have already
+    /// pushed to.
+    ///
+    /// Backed by the capacity-bounded [`Self::published_to_peers`] LRU so this de-dup gate cannot
+    /// grow without bound. A hit promotes the peer to most-recently-used, so an actively
+    /// (re)connecting peer is never evicted and never re-pushed to; only a peer absent long enough
+    /// to fall out of the LRU is pushed to again on its eventual return.
+    fn mark_published_to_peer(&mut self, peer_id: PeerId) -> bool {
+        self.published_to_peers.put(peer_id, ()).is_none()
     }
 
     /// Run the network loop to process incoming gossip.
@@ -720,8 +756,18 @@ where
                 send_or_log_error!(reply, peer_id, "LocalPeerId");
             }
             NetworkCommand::Publish { topic, msg, reply } => {
-                let res =
-                    self.swarm.behaviour_mut().gossipsub.publish(TopicHash::from_raw(topic), msg);
+                // Enforce `MAX_GOSSIP_MESSAGE_SIZE` at origination, symmetrically with the
+                // receive-side check in `verify_gossip`. Honest peers reject an oversized payload
+                // as `RejectReason::TooLarge` and Fatal-attribute it to the
+                // relaying peer; on the first hop that relayer is the originator,
+                // so a node that published an oversized message would be banned by
+                // its own neighbours. Refuse locally with a clear error instead, so
+                // origination and forwarding apply the identical bound.
+                let res = if msg.len() > MAX_GOSSIP_MESSAGE_SIZE {
+                    Err(PublishError::MessageTooLarge)
+                } else {
+                    self.swarm.behaviour_mut().gossipsub.publish(TopicHash::from_raw(topic), msg)
+                };
                 if res.is_ok() {
                     self.metrics.record_gossip_published();
                 }
@@ -1419,8 +1465,10 @@ where
     ///
     /// Messages are only published by current committee nodes and must be within max size.
     fn verify_gossip(&self, gossip: &GossipMessage) -> GossipAcceptance {
-        // verify message size
-        if gossip.data.len() > self.config.max_gossip_message_size {
+        // verify message size against the network-wide protocol constant (not per-node config):
+        // the reject path attributes an oversized payload to the relaying peer, which is sound only
+        // if every honest node applies the identical bound. See `MAX_GOSSIP_MESSAGE_SIZE`.
+        if gossip.data.len() > MAX_GOSSIP_MESSAGE_SIZE {
             return GossipAcceptance::Reject(RejectReason::TooLarge);
         }
 
@@ -1535,8 +1583,8 @@ where
 
                 // First-time connections need a direct record push so the peer can resolve
                 // our BLS key without waiting for the next kad publication interval. Skip
-                // on reconnects to avoid amplifying the local kad store on flapping peers
-                if self.published_to_peers.insert(peer_id) {
+                // on reconnects to avoid amplifying the local kad store on flapping peers.
+                if self.mark_published_to_peer(peer_id) {
                     self.publish_our_data_to_peer(peer_id);
                 }
 
@@ -1815,8 +1863,17 @@ where
         // reject record
         if publisher_is_banned || source_is_banned {
             error!(target: "network-kad", ?publisher_is_banned, ?source_is_banned, ?source, publisher=?record.publisher, "rejecting put request for record");
-            // handle race condition with PM
-            self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
+            // Do NOT `remove_record(&record.key)` on the reject path. Kademlia runs
+            // with `StoreInserts::FilterBoth`, so this inbound record was never
+            // written to the store; the only record `remove_record` can delete is one
+            // the local node itself published (libp2p removes a key only when the
+            // stored record's publisher is our own peer id; see libp2p-kad
+            // behaviour.rs). The sole locally-published record is our own discovery
+            // record, keyed on our BLS public key with `expires: None`, so an
+            // unauthenticated PUT carrying `publisher = None` and `key = our own key`
+            // would delete it. Because we only re-provide at startup, that deletion
+            // then persists until restart. Reject with a penalty only; never mutate
+            // the store on a key supplied by the sender.
 
             // assess penalty for pushing record without publisher
             if record.publisher.is_none() {
@@ -1840,7 +1897,14 @@ where
                     .put(record)
                     .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
                 trace!(target: "network-kad", "Got record {key} {value:?}");
-                self.swarm.behaviour_mut().peer_manager.add_known_peer(key, value.info);
+                // a peer pushing its own record over its own connection (source == the record's
+                // network identity) also confirms its identity so a live non-committee connection
+                // (e.g. an nvv in the gossip mesh) is retained; relayed and non-self records stay
+                // committee-gated (issue #827).
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .add_self_advertised_peer(source, key, value.info);
             } else {
                 // A peer republishing a slightly stale (but signature-valid) record is
                 // expected after restarts and benign — the local store keeps the newer
@@ -1930,7 +1994,7 @@ where
                 self.swarm
                     .behaviour_mut()
                     .peer_manager
-                    .add_known_peer(query.request, node_record.info);
+                    .add_discovered_peer(query.request, node_record.info);
             }
         }
     }
@@ -1956,10 +2020,12 @@ enum GossipAcceptance {
 /// of the reason; the distinction only governs peer scoring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RejectReason {
-    /// The payload exceeds `max_gossip_message_size`. The bound is a shared constant, so under
-    /// gossipsub `Strict` validation an honest peer computes the same verdict and never forwards
-    /// the message: a peer that forwards an oversized payload is itself misbehaving, so the
-    /// relaying peer is accountable.
+    /// The payload exceeds [`MAX_GOSSIP_MESSAGE_SIZE`]. That bound is a compile-time protocol
+    /// constant, identical on every honest node, and enforced on both the publish path (the size
+    /// guard in the `NetworkCommand::Publish` handler) and the receive path here. An honest node
+    /// therefore never originates an oversized payload, and under gossipsub `Strict` validation
+    /// never forwards one either: a peer that delivers an oversized payload is itself misbehaving,
+    /// so the relaying peer is accountable.
     TooLarge,
     /// The message author is absent, has no resolved BLS identity, or is not an authorized
     /// publisher for the topic. The fault is the author's, not the forwarder's: an honest relayer
@@ -1986,9 +2052,11 @@ impl RejectReason {
     /// Decide the peer-scoring outcome for this reject, given whether the relaying peer's and the
     /// message author's BLS identities have resolved.
     ///
-    /// An oversized payload is charged to the relaying peer: the size bound is a shared constant,
-    /// so under gossipsub `Strict` validation an honest peer computes the same verdict and never
-    /// forwards one, making a forwarded oversized payload relayer misbehavior. An unauthorized
+    /// An oversized payload is charged to the relaying peer: the size bound is a compile-time
+    /// protocol constant ([`MAX_GOSSIP_MESSAGE_SIZE`]), identical on every honest node and enforced
+    /// on both the publish and receive paths, so an honest peer never originates one and (under
+    /// gossipsub `Strict` validation) never forwards one, making a delivered oversized payload
+    /// relayer misbehavior. An unauthorized
     /// author is charged to the *author*, never the forwarder — an honest relayer merely forwarded
     /// content the author is responsible for (the reject-path analogue of #801/#785), and an honest
     /// author authorized under a neighbouring committee view is spared downstream by the committee

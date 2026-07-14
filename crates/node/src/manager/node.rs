@@ -57,6 +57,16 @@ pub(crate) const WORKER_TASK_BASE: &str = "Worker Task";
 /// a small bound is enough and keeps a buggy ExEx from growing it without limit.
 const EXEX_EVENT_CAPACITY: usize = 16;
 
+/// Capacity of the manager → engine `to_engine` channel.
+///
+/// Each item is a full [`ConsensusOutput`] (subdag + batches), and the engine additionally
+/// bounds its own backlog at [`tn_engine::MAX_QUEUED_OUTPUTS`], so total in-flight memory is
+/// capped at roughly `TO_ENGINE_CAPACITY + MAX_QUEUED_OUTPUTS` outputs. A deep channel here
+/// would defeat the engine's bound by buffering the backlog one hop upstream; 64 absorbs
+/// bursts (e.g. restart replay) while a persistently full channel backpressures the epoch
+/// manager's forwarder instead of consuming memory.
+const TO_ENGINE_CAPACITY: usize = 64;
+
 /// The long-running owner that oversees epoch transitions.
 ///
 /// One instance exists for the lifetime of the process. It holds the resources that must survive
@@ -160,12 +170,15 @@ pub(crate) struct EpochManager<P, DB> {
 ///
 /// Every chain-derived input (the block scan range's start and end, the worker-count read block,
 /// and the epoch used to bound leader counting) is pinned to the single finalized
-/// [`SealedHeader`]. `canonical_epoch` is the epoch the caller read from the canonical tip: when
-/// the epoch state pinned to the finalized header disagrees with it, the finalized marker lags
-/// the canonical tip across an epoch boundary and every pinned input would describe the WRONG
-/// epoch, so the restore hard-errors instead. The comparison is at epoch granularity only — a
-/// legal mid-epoch finalized lag (blocks and the finalized marker commit in separate
-/// transactions) must pass.
+/// [`SealedHeader`]. Startup heals the finalized marker to the persisted canonical tip
+/// (`RethEnv::heal_finalized_to_persisted_tip`) before calling this, so on the production path
+/// the pinned header IS the canonical tip and the scan misses nothing. `canonical_epoch` is the
+/// epoch the caller read from the canonical tip; the guard comparing it against the pinned
+/// header's epoch remains as a tripwire: a mismatch after the heal means the two views diverge
+/// for a reason the heal could not repair (database inconsistency), so the restore hard-errors
+/// rather than rebuilding against the wrong epoch's state. The comparison stays at epoch
+/// granularity, so an unhealed mid-epoch lag (possible only for callers that skip the heal,
+/// e.g. tests) still passes.
 ///
 /// A scanned header referencing a worker id at or beyond the synced count fails the restore with
 /// a descriptive error; the same condition panics in [`GasAccumulator::inc_block`] on the live
@@ -186,19 +199,21 @@ pub async fn catchup_accumulator(
         // yield a silently empty range that drops the restore.
         let epoch_state = reth_env.epoch_state_at_header(&block)?;
 
-        // Cross-view guard: a finalized marker stranded in a previous epoch would pin the whole
-        // restore (scan range, worker count, leader-count bound) to the wrong epoch's state.
-        // Operator hint: this is a finalized-marker lag across an epoch boundary at startup —
-        // an artifact of the crash window between the blocks-commit and finalize-commit
-        // transactions — not data corruption. Epoch granularity only: a mid-epoch lag of a
-        // round is legal and passes.
+        // Cross-view guard: a finalized header pinned in a different epoch than the canonical
+        // tip would pin the whole restore (scan range, worker count, leader-count bound) to the
+        // wrong epoch's state. Startup heals the finalized marker to the persisted canonical
+        // tip (`RethEnv::heal_finalized_to_persisted_tip`) before this restore runs, so the
+        // benign crash-window lag can no longer reach this comparison — a firing guard means
+        // the two views still disagree after the heal: genuine database inconsistency.
+        // Investigate the database; do not restart-loop past this.
         if epoch_state.epoch != canonical_epoch {
             return Err(eyre!(
                 "startup accumulator restore: finalized header {} pins epoch {} but the \
-                 canonical tip reports epoch {canonical_epoch} — the finalized marker lags the \
-                 canonical tip across an epoch boundary (crash window between the blocks-commit \
-                 and finalize-commit transactions; not data corruption). Refusing to rebuild gas \
-                 stats against the wrong epoch's state",
+                 canonical tip reports epoch {canonical_epoch} — the views disagree across an \
+                 epoch boundary even though startup heals the finalized marker to the canonical \
+                 tip before this restore. This is database inconsistency, not the benign \
+                 crash-window marker lag; refusing to rebuild gas stats against the wrong \
+                 epoch's state",
                 block.number,
                 epoch_state.epoch,
             ));
@@ -786,8 +801,10 @@ where
 
     /// Build the process-lifetime components, then drive the epoch loop until shutdown.
     ///
-    /// Startup proceeds in order: create the execution engine and start it, recover the
-    /// [`GasAccumulator`] via [`catchup_accumulator`], spawn the long-running p2p networks
+    /// Startup proceeds in order: create the execution engine and start it, heal any
+    /// crash-window finalized-marker lag to the persisted canonical tip
+    /// (`RethEnv::heal_finalized_to_persisted_tip` — before anything reads the marker), recover
+    /// the [`GasAccumulator`] via [`catchup_accumulator`], spawn the long-running p2p networks
     /// ([`spawn_node_networks`](Self::spawn_node_networks)), subscribe the primary to the
     /// epoch-vote and consensus-output gossip topics, spawn the epoch-record and vote
     /// collectors, restore execution state ([`try_restore_state`](Self::try_restore_state)),
@@ -807,12 +824,18 @@ where
         // Prime the last forwarded consensus number at startup.
         // Normally this is not needed but is a layer of safety in case
         // run_epoch() does not process any output for some reason.
-        self.last_forwarded_consensus_number = self.consensus_chain.latest_consensus_number();
+        // Use the same anchor the subscriber numbers new output from (pack ground truth,
+        // falling back over the executed tip) rather than the slot-file hint: the hint can be
+        // stale after a hard crash, and a low prime would make `wait_for_epoch_boundary`'s
+        // continuity check report a spurious gap on the first live output (and the leftover
+        // drain re-forward already-executed output).
+        self.last_forwarded_consensus_number =
+            state_sync::last_consensus_parent(&self.consensus_bus, &self.consensus_chain).await.1;
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
         // create channels for engine that survive the lifetime of the node
-        let (to_engine, for_engine) = mpsc::channel(1000);
+        let (to_engine, for_engine) = mpsc::channel(TO_ENGINE_CAPACITY);
 
         // Create the epoch gas accumulator with a single worker slot. The on-chain WorkerConfigs
         // contract is the absolute source of truth for the worker count: catchup_accumulator
@@ -834,11 +857,15 @@ where
             )
             .await?;
 
+        // Heal a finalized marker left lagging the persisted canonical tip by a crash between
+        // the blocks-commit and finalize-commit transactions BEFORE anything reads the marker:
+        // the catchup below pins every chain-derived input to the finalized header.
+        let reth_env = engine.get_reth_env().await;
+        reth_env.heal_finalized_to_persisted_tip()?;
         // retrieve epoch information from canonical tip on startup
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
         // The canonical epoch cross-checks the finalized header catchup pins its reads to.
-        let reth_env = engine.get_reth_env().await;
         catchup_accumulator(reth_env, &gas_accumulator, &mut self.consensus_chain, epoch).await?;
 
         // read the network config or use the default, then stamp the genesis chain id

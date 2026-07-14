@@ -58,6 +58,7 @@ dirs-next = { workspace = true }
 bs58 = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tn-types = { workspace = true, features = ["test-utils"] }
@@ -72,4 +73,8 @@ vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }
 workspace = true
 
 [features]
-adiri = []
+# Enables the insecure key-generation twins (weak PBKDF2 rounds) for tests.
+# Purely additive: it must never change how the secure paths behave.
+test-utils = ["tn-config/test-utils"]
+# Adiri testnet: propagate to the node graph + this crate's directly-gated fork logic.
+adiri = ["tn-node/adiri", "tn-reth/adiri", "tn-storage/adiri", "tn-types/adiri"]

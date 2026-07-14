@@ -2,8 +2,7 @@
 //!
 //! Process management, cleanup guards, and helpers used across all test modules.
 
-use e2e_tests::setup_log_dir;
-use escargot::CargoRun;
+use e2e_tests::{setup_log_dir, TestBinary};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
 use jsonrpsee::{
@@ -244,7 +243,9 @@ where
     let mut resp = client.request(command, params.clone()).await;
     let mut i = 0;
     while i < retries && resp.is_err() {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Short backoff: these retries mask brief RPC unavailability (e.g. a node
+        // mid-restart), so poll ~4x/sec instead of once a second.
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let client = HttpClientBuilder::default()
             .request_timeout(Duration::from_secs(10))
             .build(node)
@@ -318,7 +319,7 @@ pub(crate) fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// Start a process running a validator node.
 pub(crate) fn start_validator(
     instance: usize,
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     base_dir: &Path,
     rpc_port: u16,
     test: &str,
@@ -330,7 +331,7 @@ pub(crate) fn start_validator(
 /// Start a validator node process with additional CLI arguments (e.g. `--metrics`).
 pub(crate) fn start_validator_with_args(
     instance: usize,
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     base_dir: &Path,
     rpc_port: u16,
     test: &str,
@@ -369,7 +370,7 @@ pub(crate) fn start_validator_with_args(
 /// Start a process running an observer node.
 pub(crate) fn start_observer(
     instance: usize,
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     base_dir: &Path,
     rpc_port: u16,
     test: &str,

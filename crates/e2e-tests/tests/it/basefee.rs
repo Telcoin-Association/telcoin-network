@@ -46,8 +46,9 @@ use crate::common::{
     network_advancing, send_tel, start_validator, ProcessGuard,
 };
 
-/// Epoch duration (seconds) for base-fee tests. Mirrors `epochs.rs::EPOCH_DURATION` so boundaries
-/// occur on the same cadence under the `test-utils` feature.
+/// Epoch duration (seconds) for base-fee tests. Held at 10s independently of
+/// `epochs.rs::EPOCH_DURATION` (which #897 cut to 5s): these base-fee tests are outside that
+/// four-test scope, and 10s keeps ample margin for their epoch-boundary assertions.
 const EPOCH_DURATION: u64 = 10;
 
 /// Static fee used by the deterministic tests. A clearly non-`MIN` value so any block produced

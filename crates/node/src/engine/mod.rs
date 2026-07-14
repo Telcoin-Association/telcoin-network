@@ -165,9 +165,13 @@ impl ExecutionNode {
     ///
     /// Called every epoch so the pool charges the accumulator's current base fee for the worker,
     /// including on the respawn path where [`Self::initialize_worker_components`] is skipped.
-    pub async fn set_worker_base_fee(&self, worker_id: WorkerId, base_fee: u64) {
+    pub async fn set_worker_base_fee(
+        &self,
+        worker_id: WorkerId,
+        base_fee: u64,
+    ) -> eyre::Result<()> {
         let guard = self.internal.read().await;
-        guard.set_worker_base_fee(worker_id, base_fee);
+        guard.set_worker_base_fee(worker_id, base_fee)
     }
 
     /// Respawn any tasks on the worker network when we get a new epoch task manager.
