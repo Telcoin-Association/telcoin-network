@@ -805,8 +805,7 @@ where
     /// crash-window finalized-marker lag to the persisted canonical tip
     /// (`RethEnv::heal_finalized_to_persisted_tip` — before anything reads the marker), recover
     /// the [`GasAccumulator`] via [`catchup_accumulator`], spawn the long-running p2p networks
-    /// ([`spawn_node_networks`](Self::spawn_node_networks)), subscribe the primary to the
-    /// epoch-vote and consensus-output gossip topics, spawn the epoch-record and vote
+    /// ([`spawn_node_networks`](Self::spawn_node_networks)), spawn the epoch-record and vote
     /// collectors, restore execution state ([`try_restore_state`](Self::try_restore_state)),
     /// and spawn the engine-update task. It then requests any missing epoch pack files and
     /// launches the app-scoped consensus fetch workers.
@@ -877,14 +876,10 @@ where
         self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();
-        primary_network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::epoch_vote_topic(network_config.chain_id()))
-            .await?;
-        primary_network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::consensus_output_topic(network_config.chain_id()))
-            .await?;
+        // The epoch-vote and consensus-output gossip topics are subscribed per epoch in
+        // `spawn_primary_network_for_epoch` with a committee-restricted publisher set (issue
+        // #912), alongside `primary_topic`, so their authorized publishers track committee
+        // rotation. They are intentionally not subscribed here in the process-lifetime path.
         state_sync::spawn_epoch_record_collector(
             self.consensus_chain.clone(),
             primary_network_handle.clone(),

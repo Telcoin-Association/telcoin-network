@@ -445,8 +445,12 @@ where
     ///
     /// This operates on the per-epoch interface, not the swarm itself. Every epoch refreshes
     /// the previous/current/next committee membership (via [`init_network_for_epoch`]) and the
-    /// gossip publisher set so the network bans and routes against the current committee. The
-    /// listener is bound only on the initial epoch.
+    /// gossip publisher sets so the network bans and routes against the current committee. The
+    /// `primary_topic` (certificates) is restricted to the current committee, while the
+    /// `consensus_output_topic` and `epoch_vote_topic` are restricted to the previous/current/next
+    /// committee window (issue #912): both carry epoch-boundary traffic from validators rotating
+    /// out or in, so their publisher set must span the same window the peer manager exempts from
+    /// penalties. The listener is bound only on the initial epoch.
     ///
     /// Peers are dialed when this node is a CVV (it must reach the other CVVs) or when it has no
     /// connected peers; a non-committee node that already has peers does not pester the
@@ -483,6 +487,18 @@ where
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
+        // Consensus-output and epoch-vote gossip crosses epoch boundaries: a validator rotating
+        // out (now in the previous committee) may emit late gossip, and one rotating in (in the
+        // next committee) may start early. Their authorized-publisher set is therefore the
+        // previous/current/next committee window, the same window the peer manager exempts from
+        // penalties via `update_committees`. Build it here, before the committee sets are moved
+        // into `init_network_for_epoch`.
+        let boundary_publishers: HashSet<BlsPublicKey> = previous_committee_keys
+            .iter()
+            .chain(committee_keys.iter())
+            .chain(next_committee_keys.iter())
+            .copied()
+            .collect();
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
             bootstrap_peers,
@@ -510,6 +526,25 @@ where
             .subscribe_with_publishers(
                 tn_config::LibP2pConfig::primary_topic(consensus_config.chain_id()),
                 committee_keys.into_iter().collect(),
+            )
+            .await?;
+        // Restrict consensus-output and epoch-vote gossip to committee publishers (issue #912),
+        // mirroring `primary_topic` above, so a non-committee node's gossip on these topics is
+        // rejected by `verify_gossip` and never propagated. Re-subscribing every epoch keeps the
+        // publisher set tracking committee rotation. Both use the wider boundary window so late
+        // gossip from a rotated-out validator and early gossip from a rotating-in one still relay.
+        network_handle
+            .inner_handle()
+            .subscribe_with_publishers(
+                tn_config::LibP2pConfig::consensus_output_topic(consensus_config.chain_id()),
+                boundary_publishers.clone(),
+            )
+            .await?;
+        network_handle
+            .inner_handle()
+            .subscribe_with_publishers(
+                tn_config::LibP2pConfig::epoch_vote_topic(consensus_config.chain_id()),
+                boundary_publishers,
             )
             .await?;
 
