@@ -897,11 +897,24 @@ impl PeerManager {
         self.known_peers.get(bls_key).and_then(|info| info.rpc.clone())
     }
 
-    /// Return a snapshot of every known authority that has advertised an [RpcInfo].
-    pub(crate) fn all_rpcs(&self) -> Vec<(BlsPublicKey, RpcInfo)> {
-        self.known_peers
+    /// Return the advertised [RpcInfo] for every current-committee validator, and
+    /// chase node records for current members that are still unknown.
+    ///
+    /// Scoped to the current committee: pinned operator peers and previous/next
+    /// committee members never appear, even if they advertised RPC info. For any
+    /// current member with no known record, kad discovery is (re)triggered via
+    /// [`PeerEvent::MissingAuthorities`] — the same path `update_committees` takes at
+    /// epoch start — so a polling caller converges as records arrive. Members whose
+    /// record is known but carries no RPC info did not advertise one and are skipped
+    /// without a re-fetch.
+    pub(crate) fn current_committee_rpcs(&mut self) -> Vec<(BlsPublicKey, RpcInfo)> {
+        let current = self.peers.current_committee().clone();
+        self.trigger_missing_authorities(&current);
+        current
             .iter()
-            .filter_map(|(bls, info)| info.rpc.clone().map(|rpc| (*bls, rpc)))
+            .filter_map(|bls| {
+                self.known_peers.get(bls).and_then(|info| info.rpc.clone()).map(|rpc| (*bls, rpc))
+            })
             .collect()
     }
 
