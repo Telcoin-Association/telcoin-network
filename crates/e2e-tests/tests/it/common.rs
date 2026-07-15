@@ -25,6 +25,7 @@ use std::{
     time::Duration,
 };
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
+use tn_test_utils::wait_until_blocking;
 use tn_types::{
     address, get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address, RpcInfo,
 };
@@ -297,24 +298,9 @@ pub(crate) fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
     // exist or an epoch closes, so we cannot rely on block_number advancing
     // during idle periods. Actual block production is verified later by
     // send_and_confirm().
-    let mut i = 0;
-    loop {
-        let mut all_responsive = true;
-        for url in client_urls {
-            if get_block_number(url).is_err() {
-                all_responsive = false;
-                break;
-            }
-        }
-        if all_responsive {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_secs(1));
-        i += 1;
-        if i > 45 {
-            return Err(eyre::eyre!("Network not responding within 45 seconds!"));
-        }
-    }
+    wait_until_blocking(Duration::from_secs(45), "all nodes advancing", || {
+        Ok(client_urls.iter().all(|url| get_block_number(url).is_ok()))
+    })
 }
 
 /// Start a process running a validator node.
@@ -521,8 +507,6 @@ pub(crate) fn send_and_confirm(
     let expected = current + amount;
     send_tel(node, key, to_account, amount, 250, 21000, nonce)?;
 
-    // sleep
-    std::thread::sleep(Duration::from_millis(1000));
     info!(target: "restart-test", "calling get_positive_balance_with_retry...");
 
     // get positive bal and kill child2 if error

@@ -15,6 +15,7 @@ use tn_reth::{
     RethChainSpec, RethEnv,
 };
 use tn_storage::{open_db, tables::NodeBatchesCache};
+use tn_test_utils::wait_until;
 use tn_types::{
     gas_accumulator::GasAccumulator, test_genesis, Address, Batch, BatchValidation, Bytes,
     Certificate, CertifiedBatch, CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Database,
@@ -26,7 +27,7 @@ use tokio::time::timeout;
 use tracing::debug;
 
 #[tokio::test]
-async fn test_make_batch_el_to_cl() {
+async fn test_make_batch_el_to_cl() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().expect("temp dir");
     let task_manager = TaskManager::default();
     //
@@ -140,17 +141,17 @@ async fn test_make_batch_el_to_cl() {
     //=== Test batch flow
     //
 
-    // wait for new batch
-    let mut sealed_batch = None;
-    for _ in 0..5 {
-        let _ = tokio::time::sleep(Duration::from_secs(1)).await;
-        // Ensure the batch is stored
-        if let Some((digest, wb)) = store.iter::<NodeBatchesCache>().next() {
-            sealed_batch = Some(SealedBatch::new(wb, digest));
-            break;
-        }
-    }
-    let sealed_batch = sealed_batch.unwrap();
+    // wait for new batch to be stored
+    wait_until(Duration::from_secs(5), "batch stored", || async {
+        Ok(store.iter::<NodeBatchesCache>().next().is_some())
+    })
+    .await?;
+    // re-fetch the stored batch once the store has converged
+    let sealed_batch = store
+        .iter::<NodeBatchesCache>()
+        .next()
+        .map(|(digest, wb)| SealedBatch::new(wb, digest))
+        .expect("batch in store after wait");
 
     // ensure batch validator succeeds
     let batch_validator =
@@ -174,12 +175,16 @@ async fn test_make_batch_el_to_cl() {
     let batch_txs = sealed_batch.batch().transactions();
     assert_eq!(batch_txs, expected_batch.batch().transactions());
 
-    // ensure enough time passes for store to pass
-    let _ = tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // ensure the batch is stored before reading it back
+    wait_until(Duration::from_secs(5), "batch stored by digest", || async {
+        Ok(store
+            .get::<NodeBatchesCache>(&expected_batch.digest())
+            .is_ok_and(|maybe| maybe.is_some()))
+    })
+    .await?;
     let first_batch = store.iter::<NodeBatchesCache>().next();
     debug!("first batch? {:?}", first_batch);
 
-    // Ensure the batch is stored
     let batch_from_store = store
         .get::<NodeBatchesCache>(&expected_batch.digest())
         .expect("store searched for batch")
@@ -191,6 +196,8 @@ async fn test_make_batch_el_to_cl() {
     let pending_pool_len = txpool.pool_size().pending;
     debug!("pool_size(): {:?}", txpool.pool_size());
     assert_eq!(pending_pool_len, 0);
+
+    Ok(())
 }
 
 /// Create 5 transactions.
@@ -381,7 +388,7 @@ async fn test_batch_builder_produces_valid_batches() {
 /// First 3 mined in first block.
 /// Before a canonical state change, mine the 4th transaction in the next block.
 #[tokio::test]
-async fn test_canonical_notification_updates_pool() {
+async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
     //
     //=== Execution Layer
     //
@@ -505,8 +512,11 @@ async fn test_canonical_notification_updates_pool() {
     let _final_header = execute_consensus_output(args, GasAccumulator::default(), engine_update_tx)
         .expect("output executed");
 
-    // sleep to ensure canonical update received before ack
-    let _ = tokio::time::sleep(Duration::from_secs(1)).await;
+    // wait for canonical update to settle the pool before ack
+    wait_until(Duration::from_secs(5), "pool pending reaches 1 after canonical update", || async {
+        Ok(txpool.pool_size().pending == 1)
+    })
+    .await?;
 
     // assert 4th transaction demoted to queued pool
     let pool_size = txpool.pool_size();
@@ -539,4 +549,6 @@ async fn test_canonical_notification_updates_pool() {
     let pool_size = txpool.pool_size();
     assert_eq!(pool_size.queued, 0);
     assert_eq!(pool_size.pending, 0);
+
+    Ok(())
 }
