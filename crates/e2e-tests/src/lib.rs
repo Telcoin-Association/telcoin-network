@@ -397,19 +397,35 @@ pub fn get_telcoin_network_binary() -> &'static TestBinary {
             return TestBinary::Prebuilt(path);
         }
 
+        // TN_BIN_PATH is unset, so build the node binary in-process via escargot. At
+        // opt-level 0 this is a multi-minute compile, and nextest captures stdout/stderr, so
+        // without this notice the first e2e test looks frozen until the build finishes. Announce
+        // it on stderr (shown on completion, and live under `--no-capture`) so the delay is
+        // attributable rather than an invisible hang.
+        eprintln!(
+            "e2e: TN_BIN_PATH not set; building telcoin-network via cargo before the first test. \
+             This can take several minutes at opt-level 0, and nextest hides it until the build \
+             finishes (add `--no-capture` to watch it). To skip it, run `make test-e2e`, or \
+             prebuild with `cargo build --bin telcoin-network --features tn-storage/test-utils` \
+             and export TN_BIN_PATH=\"$(pwd)/target/debug/telcoin-network\" from the workspace root."
+        );
         info!("building main binary for e2e tests");
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
         let path = PathBuf::from(manifest_dir);
         let workspace_root =
             path.parent().and_then(|p| p.parent()).expect("Cannot find workspace root");
 
+        // No `.current_target()`: passing `--target <triple>` would emit into
+        // `target/<triple>/debug/`, a tree that shares no artifacts with the plain
+        // `target/debug/` that `make build-e2e-bin` and ordinary `cargo build` populate, forcing
+        // a guaranteed cold rebuild. Building into `target/debug/` lets escargot reuse an already
+        // compiled binary (reported "Fresh" by cargo) instead.
         TestBinary::Cargo(
             CargoBuild::new()
                 .bin("telcoin-network")
                 .features("tn-storage/test-utils")
                 .manifest_path(workspace_root.join("Cargo.toml"))
                 .target_dir(workspace_root.join("target"))
-                .current_target()
                 .run()
                 .expect("Failed to build telcoin-network binary"),
         )
