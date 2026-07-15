@@ -9,8 +9,8 @@ use tn_types::{get_available_tcp_port, EpochCertificate, EpochRecord};
 use tracing::info;
 
 use crate::common::{
-    address_from_word, get_key, get_latest_consensus_header_number, network_advancing,
-    send_and_confirm, start_observer, start_validator, ProcessGuard,
+    address_from_word, advertise_worker_rpc, get_key, get_latest_consensus_header_number,
+    network_advancing, send_and_confirm, start_observer, start_validator, ProcessGuard,
 };
 
 /// Epoch duration (in seconds) used by the pack-import test. Held at 10s independently of
@@ -67,6 +67,9 @@ async fn test_observer_pack_imports_after_epoch_close_inner() -> eyre::Result<()
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
         client_urls[i].push_str(&format!(":{rpc_port}"));
+        // The late-joining observer forwards accepted txns to the committee's advertised
+        // RPC endpoints; without this the forward has no targets and txns are dropped.
+        advertise_worker_rpc(&temp_path, i, rpc_port)?;
         guard.push(start_validator(i, &bin, &temp_path, rpc_port, "observer_pack_import", 0));
     }
 

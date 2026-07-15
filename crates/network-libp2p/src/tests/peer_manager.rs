@@ -853,6 +853,41 @@ async fn test_self_advertised_connected_peer_confirmed_not_cached_and_bounded() 
 }
 
 #[tokio::test]
+async fn test_self_advertised_multiaddr_set_is_bounded() {
+    // Regression (GHSA-29v6-gvv5-45gx): a non-committee peer that republishes its OWN signed
+    // record over and over, each time advertising a brand-new distinct multiaddr, must not grow
+    // its stored multiaddr set without bound. Before the fix every accepted record `extend`ed the
+    // peer's `multiaddrs` set, so 1_000 records left ~1_000 addresses on a single entry (unbounded
+    // memory growth and O(N) reputation/ban scans). The per-peer cap now bounds the set regardless
+    // of how many records the peer publishes, while a legitimate single-address peer is unaffected.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // one non-committee peer, self-advertising over its own connection (source == advertised id, so
+    // the sender has proven it owns the transport key and takes the confirm-identity path)
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([21; 32])).public();
+
+    for _ in 0..1_000 {
+        let info = NetworkInfo {
+            pubkey: netkey.clone(),
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+            rpc: None,
+        };
+        peer_manager.add_self_advertised_peer(peer_id, bls, info);
+    }
+
+    let count = peer_manager.peer_multiaddr_count(&peer_id);
+    assert!(
+        matches!(count, Some(n) if n <= crate::peers::MAX_MULTIADDRS_PER_PEER),
+        "a self-advertised republish flood must keep the stored multiaddr set within \
+         MAX_MULTIADDRS_PER_PEER ({}), got {count:?}",
+        crate::peers::MAX_MULTIADDRS_PER_PEER
+    );
+}
+
+#[tokio::test]
 async fn test_known_peers_pruned_on_rotation_but_pinned_survive() {
     // Regression (issue #827): committee members discovered in one epoch must not accumulate across
     // rotations, while operator-provisioned (pinned) peers must never be evicted.

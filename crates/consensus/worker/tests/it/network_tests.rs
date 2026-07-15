@@ -120,20 +120,10 @@ async fn test_batch_gossip_topics() {
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
 
-    // Test swapped topics, must fail.
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic(0));
+    // A batch gossiped on any other topic must be rejected as an invalid topic.
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let bad_msg = GossipMessage { source: None, data, sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
-    let gossip = WorkerGossip::Txn(vec![]);
-    let data = tn_types::encode(&gossip);
-    let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
-    assert!(handler.pub_process_gossip_for_test(&bad_msg).await.is_err());
-
-    // Use the correct topic for a txn and make sure it works.
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_txn_topic(0));
-    let good_msg = GossipMessage { source: None, data, sequence_number: None, topic };
-    assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
 }
 
 /// The handler validates gossip topics against the chain id from its config, not a

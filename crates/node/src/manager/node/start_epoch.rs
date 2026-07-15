@@ -34,9 +34,12 @@ use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, NodeMode, StateSynchronizer,
 };
-use tn_reth::system_calls::{
-    ConsensusRegistry::{self, EpochInfo},
-    EpochState,
+use tn_reth::{
+    system_calls::{
+        ConsensusRegistry::{self, EpochInfo},
+        EpochState,
+    },
+    WorkerRpcForwarder,
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
@@ -430,11 +433,18 @@ where
         )
         .await?;
 
+        // Observer transaction forwarding: a non-committee worker forwards each transaction it
+        // accepts to the JSON-RPC endpoint of the validator that owns it, discovered over
+        // kademlia (issue #804).
+        let forwarder =
+            Arc::new(WorkerRpcForwarder::new(network_handle.get_task_spawner().clone()));
+
         let worker = WorkerNode::new(
             worker_id,
             consensus_config.clone(),
             network_handle.clone(),
             validator,
+            forwarder,
             self.consensus_chain.clone(),
         );
 
@@ -612,8 +622,9 @@ where
     /// committee peers — the peer manager drops dials to peers already connected — then waits
     /// for peers before spawning the network on the epoch-scoped spawner.
     ///
-    /// Two topics are subscribed: the worker transaction topic, and the batch topic restricted to
-    /// committee publishers so non-CVVs can prefetch batches (harmless for CVVs).
+    /// The batch topic is subscribed, restricted to committee publishers so non-CVVs can
+    /// prefetch batches (harmless for CVVs). Non-CVVs push the transactions they accept to
+    /// the committee over RPC rather than gossiping them (issue #804).
     #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_network_for_epoch(
         &mut self,
@@ -683,12 +694,7 @@ where
 
         Self::wait_for_network_peers(network_handle.inner_handle(), "worker network").await?;
 
-        // update the authorized publishers for gossip every epoch
-        network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::worker_txn_topic(consensus_config.chain_id()))
-            .await?;
-        // Get gossip from committee members about batches.
+        // Get gossip from committee members about batches every epoch.
         // Useful for non-CVVs to prefetch and harmless for CVVs.
         network_handle
             .inner_handle()

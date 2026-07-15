@@ -19,8 +19,8 @@ use tn_network_libp2p::{
     write_frame, Penalty, StreamError, StreamKind, SyncFrame, WorkerSyncRequest,
 };
 use tn_types::{
-    encode, max_batch_size, try_decode, Batch, BlockHash, BlsPublicKey, Epoch, SealedBatch,
-    TaskSpawner, B256,
+    encode, max_batch_size, try_decode, Batch, BlockHash, BlsPublicKey, Epoch, RpcInfo,
+    SealedBatch, TaskSpawner, B256,
 };
 use tracing::{debug, warn};
 
@@ -153,12 +153,16 @@ impl WorkerNetworkHandle {
         Ok(())
     }
 
-    /// Publish a transaction (as raw bytes) worker network.
-    /// Do this when not a committee member so a CVV can include the txn.
-    pub(crate) async fn publish_txn(&self, txn: Vec<u8>) -> NetworkResult<()> {
-        let data = encode(&WorkerGossip::Txn(txn));
-        self.handle.publish(tn_config::LibP2pConfig::worker_txn_topic(self.chain_id), data).await?;
-        Ok(())
+    /// Snapshot of every committee validator's advertised JSON-RPC endpoint, discovered over
+    /// kademlia.
+    ///
+    /// A non-committee ("observer") worker uses this to forward the transactions it accepts to
+    /// the validators that own them (issue #804), instead of pushing them over the worker
+    /// protocol. Returns an empty list if no validator has advertised an endpoint.
+    pub(crate) async fn get_all_validator_rpcs(
+        &self,
+    ) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
+        self.handle.get_all_validator_rpcs().await
     }
 
     /// Report a new batch to a peer.

@@ -24,9 +24,10 @@ use std::{
     sync::{Condvar, Mutex},
     time::Duration,
 };
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
 use tn_test_utils::wait_until_blocking;
 use tn_types::{
-    address, get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address,
+    address, get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address, RpcInfo,
 };
 use tokio::runtime::Builder;
 use tracing::{error, info};
@@ -351,6 +352,27 @@ pub(crate) fn start_validator_with_args(
     setup_log_dir(&mut command, instance, test, run);
 
     command.spawn().expect("failed to execute")
+}
+
+/// Advertise a validator's JSON-RPC endpoint on its worker record.
+///
+/// The genesis ceremony leaves `p2p_info.worker.rpc` unset, and a non-committee node
+/// forwards accepted transactions to whatever endpoints committee validators advertise
+/// (issue #804); with none advertised, observer-submitted transactions are dropped.
+/// Call this between the config ceremony and `start_validator`, passing the same
+/// `rpc_port` the validator will serve `--http` on; the node re-signs the record from
+/// its `node-info.yaml` at startup, so editing the file is sufficient.
+pub(crate) fn advertise_worker_rpc(
+    base_dir: &Path,
+    instance: usize,
+    rpc_port: u16,
+) -> eyre::Result<()> {
+    let path = base_dir.join(format!("validator-{}", instance + 1)).join("node-info.yaml");
+    let mut node_info = Config::load_from_path::<NodeInfo>(&path, ConfigFmt::YAML)?;
+    node_info.p2p_info.worker.rpc =
+        Some(RpcInfo { http: format!("http://127.0.0.1:{rpc_port}").parse()?, ws: None });
+    Config::write_to_path(&path, &node_info, ConfigFmt::YAML)?;
+    Ok(())
 }
 
 /// Start a process running an observer node.
