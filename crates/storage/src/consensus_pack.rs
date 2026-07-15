@@ -2824,6 +2824,77 @@ pub(crate) mod test {
         drop(pack);
     }
 
+    /// A v0 (batches-first) pack that stores a SHARED batch (one digest referenced by two certs)
+    /// must serve that output as v1 (header-first) bytes that decode back to the identical output,
+    /// with the shared batch reassigned to BOTH certs. Guards the exact mixed-testnet path: a
+    /// pre-upgrade v0 file served as v1 for a duplicate-batch output.
+    #[tokio::test]
+    async fn test_v0_shared_batch_served_as_v1_bytes() {
+        use crate::consensus_pack::{bytes_to_output, bytes_to_verified_output};
+        use std::io::Cursor;
+        use tokio::io::BufReader;
+
+        let temp_dir = TempDir::with_prefix("test_v0_shared_v1").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Genuine v0 (batches-first) pack on disk.
+        let pack = ConsensusPack::open_append_version(
+            temp_dir.path(),
+            previous_epoch,
+            committee.clone(),
+            0,
+        )
+        .expect("open v0 pack");
+        assert_eq!(pack.version, 0, "constructor must produce a v0 pack file");
+
+        // Output 1 shares one batch across two certs; output 2 is a normal output confirming the
+        // pack keeps serving cleanly after a duplicate.
+        let out1 = make_test_output_shared_batch(
+            &committee,
+            chain.clone(),
+            1,
+            ConsensusHeader::default().digest(),
+        );
+        let out2 = make_test_output(&committee, 2, chain.clone(), 2, out1.digest().into());
+        pack.save_consensus_output(out1.clone()).await.unwrap();
+        pack.save_consensus_output(out2.clone()).await.unwrap();
+        pack.persist().await.expect("persist");
+
+        for original in [&out1, &out2] {
+            let number = original.number();
+            // v0 stored -> served as v1 (header-first) bytes.
+            let bytes = pack.get_consensus_output_bytes(number).await.expect("bytes");
+
+            // v1 decode reconstructs the identical output, including the shared batch assigned to
+            // both certs (compare_outputs deep-checks batch_digests incl. the dup and each cert).
+            let decoded = bytes_to_output(
+                BufReader::new(Cursor::new(bytes.clone())),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+            )
+            .await
+            .expect("v1 decode");
+            compare_outputs(&decoded, original);
+
+            // The verified single-output path also round-trips a v0-origin shared-batch output.
+            let verified = bytes_to_verified_output(
+                BufReader::new(Cursor::new(bytes)),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+                original.digest(),
+            )
+            .await
+            .expect("verified v1 decode");
+            compare_outputs(&verified, original);
+        }
+        drop(pack);
+    }
+
     /// CP2: get_consensus_output with a number below start_consensus_number must error rather
     /// than saturating to index 0 and silently returning the first output.
     #[tokio::test]
