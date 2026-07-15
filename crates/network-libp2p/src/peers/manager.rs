@@ -837,6 +837,12 @@ impl PeerManager {
         }
     }
 
+    /// Number of distinct multiaddrs currently retained for `peer_id`, if it is tracked.
+    #[cfg(test)]
+    pub(crate) fn peer_multiaddr_count(&self, peer_id: &PeerId) -> Option<usize> {
+        self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
+    }
+
     /// Validate the advertised endpoint, register the peer's network identity, cache its info, and
     /// close the committee trust window if it belongs to a tracked slot.
     ///
