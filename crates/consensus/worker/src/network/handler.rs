@@ -222,25 +222,6 @@ where
                     }
                 }
             }
-            WorkerGossip::Txn(tx_bytes) => {
-                ensure!(
-                    topic.to_string().eq(&tn_config::LibP2pConfig::worker_txn_topic(
-                        self.consensus_config.chain_id()
-                    )),
-                    WorkerNetworkError::InvalidTopic
-                );
-                if let Some(authority) = self.consensus_config.authority() {
-                    let committee = self.consensus_config.committee();
-                    let authorities = committee.authorities();
-                    let size = authorities.len();
-                    for (slot, auth) in authorities.into_iter().enumerate() {
-                        if &auth == authority {
-                            self.validator.submit_txn_if_mine(&tx_bytes, size as u64, slot as u64);
-                            break;
-                        }
-                    }
-                }
-            }
         }
 
         Ok(())
