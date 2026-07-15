@@ -2748,7 +2748,7 @@ async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()>
 
     // no rpc was advertised so lookups return None
     assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner_bls).is_none());
-    assert!(network.swarm.behaviour().peer_manager.all_rpcs().is_empty());
+    assert!(network.swarm.behaviour_mut().peer_manager.current_committee_rpcs().is_empty());
 
     // honest pre-upgrade sender is not penalized
     assert!(!network.swarm.behaviour().peer_manager.peer_banned(&owner_peer_id));
@@ -2864,7 +2864,7 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
     assert_eq!(peer_id, owner_peer_id);
     assert_eq!(multiaddrs, vec![peer2.config.primary_address()]);
     assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner_bls).is_none());
-    assert!(network.swarm.behaviour().peer_manager.all_rpcs().is_empty());
+    assert!(network.swarm.behaviour_mut().peer_manager.current_committee_rpcs().is_empty());
 
     // the sender was not penalized
     assert!(!network.swarm.behaviour().peer_manager.peer_banned(&owner_peer_id));
