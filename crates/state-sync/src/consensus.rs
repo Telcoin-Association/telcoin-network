@@ -34,11 +34,13 @@ enum ConsensusHeaderResult {
 /// Retrieve a verified consensus OUTPUT (header + batches) for `number` and cache it.
 ///
 /// `hash` is the already-verified consensus header digest for `number` — it comes from validated
-/// consensus gossip (the tip) or from a verified descendant's `parent_hash`. We pull the full
-/// output BYTES from a peer (`request_consensus_output`), decode them with the epoch committee, and
-/// verify the decoded header's digest equals `hash` BEFORE caching. This upholds the invariant that
-/// we never cache/execute an output that is not verified (directly by gossip, or as an ancestor of
-/// one). The walk proceeds recent→earliest, so each cached entry is a verified output.
+/// consensus gossip (the tip) or from a verified descendant's `parent_hash`.
+/// `request_consensus_output` pulls the output from a peer and, because the v1 pack is
+/// header-first, stream-decodes it with the epoch committee and verifies the decoded header's
+/// digest equals `hash` BEFORE buffering batches — so a wrong/forked output is rejected (and the
+/// peer penalized) without ever materializing it. This upholds the invariant that we never
+/// cache/execute an output that is not verified (directly by gossip, or as an ancestor of one). The
+/// walk proceeds recent→earliest, so each cached entry is a verified output.
 async fn get_consensus_output<DB: TNDatabase>(
     number: u64,
     hash: ConsensusHeaderDigest,
@@ -60,31 +62,19 @@ async fn get_consensus_output<DB: TNDatabase>(
             ConsensusHeaderResult::Done
         };
     }
-    // Pull the full output bytes from any peer.
-    let bytes = match network.request_consensus_output(number).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            warn!(target: "tn::observer", %e, ?hash, ?number, "failed to fetch consensus output from peer");
-            return ConsensusHeaderResult::Retry;
-        }
-    };
-    // Decode with the epoch's committee (resolves cert authors -> execution addresses).
-    let epoch = consensus_chain.epochs().number_to_epoch(number);
-    let output = match consensus_chain.decode_consensus_output(epoch, bytes).await {
+    // Pull, stream-decode, and header-hash-verify the output from any peer in one shot. The v1
+    // pack is header-first, so the fetch checks the decoded header digest against `hash` before
+    // buffering batches and returns only a verified output; a wrong-hash peer is penalized and
+    // skipped inside the probe.
+    let output = match network.request_consensus_output(number, consensus_chain, hash).await {
         Ok(output) => output,
         Err(e) => {
-            // Includes the case where we do not yet hold this epoch's committee/pack.
-            warn!(target: "tn::observer", ?e, ?number, "failed to decode consensus output, will retry");
+            // Includes no peer serving it yet, or not yet holding this epoch's committee/pack.
+            warn!(target: "tn::observer", %e, ?hash, ?number, "failed to fetch/verify consensus output from peer, will retry");
             return ConsensusHeaderResult::Retry;
         }
     };
     let header = output.consensus_header();
-    // VERIFY: the decoded output must match the already-verified hash. A peer that returns a
-    // wrong/forked output is rejected here and never cached or executed.
-    if header.digest() != hash {
-        warn!(target: "tn::observer", ?number, expected = ?hash, got = ?header.digest(), "consensus output digest mismatch - rejecting");
-        return ConsensusHeaderResult::Retry;
-    }
     let parent = header.parent_hash;
     if let Err(e) = db.insert::<ConsensusCache>(&number, &output) {
         error!(target: "state-sync", ?e, "error saving a consensus output to cache storage!");

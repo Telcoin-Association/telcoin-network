@@ -412,6 +412,27 @@ impl ConsensusPack {
         bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee).await
     }
 
+    /// Stream-decode a v1 (header-first) pack-encoded [`ConsensusOutput`] from `reader`, verifying
+    /// the header's digest equals `expected_digest` the instant the header record is read — BEFORE
+    /// any batch record is buffered. Used on the requested-output receive path so an unverified
+    /// peer stream cannot force buffering/decoding more than a single ≤`MAX_RECORD_SIZE` header
+    /// record before the known hash is checked. Uses this pack's committee (author -> execution
+    /// address) and compression, so the pack must be for the same epoch as the stream.
+    pub async fn decode_output_stream<R: AsyncRead + Unpin>(
+        &self,
+        reader: R,
+        expected_digest: ConsensusHeaderDigest,
+    ) -> Result<ConsensusOutput, PackError> {
+        bytes_to_verified_output(
+            reader,
+            self.compression,
+            Duration::from_secs(5),
+            &self.committee,
+            expected_digest,
+        )
+        .await
+    }
+
     /// Load and return the pack file bytes for consensus output form this epoch.
     pub async fn get_consensus_output_bytes(&self, number: u64) -> Result<Vec<u8>, PackError> {
         self.get_error()?;
@@ -957,24 +978,37 @@ impl Inner {
         let mut pack =
             Self { data, consensus_pos_idx, consensus_digests, batch_digests, epoch_meta };
         loop {
+            // The header's parent link is verified INSIDE the decoder via
+            // `HeaderExpectation::Parent` — early (before batches) on the v1 header-first path — so
+            // a forked/forged output is rejected before its batches are buffered. `parent_digest`
+            // advances to this output's digest for the next iteration below.
             let output = if stream_iter.version() == 0 {
-                match iter_to_output_legacy(&mut stream_iter, timeout, &pack.epoch_meta.committee)
-                    .await
+                match iter_to_output_legacy(
+                    &mut stream_iter,
+                    timeout,
+                    &pack.epoch_meta.committee,
+                    HeaderExpectation::Parent(parent_digest),
+                )
+                .await
                 {
                     Ok(output) => output,
                     Err(PackError::NotConsensus) => break,
                     Err(e) => return Err(e),
                 }
             } else {
-                match iter_to_output(&mut stream_iter, timeout, &pack.epoch_meta.committee).await {
+                match iter_to_output(
+                    &mut stream_iter,
+                    timeout,
+                    &pack.epoch_meta.committee,
+                    HeaderExpectation::Parent(parent_digest),
+                )
+                .await
+                {
                     Ok(output) => output,
                     Err(PackError::NotConsensus) => break,
                     Err(e) => return Err(e),
                 }
             };
-            if output.parent_hash() != parent_digest {
-                return Err(PackError::InvalidConsensusChain);
-            }
             let consensus_number = output.number();
             if consensus_number > final_consensus_number {
                 return Err(PackError::InvalidConsensusNumber(
@@ -1375,6 +1409,45 @@ const MAX_BATCHES_PER_OUTPUT: usize = 1_000;
 #[cfg(test)]
 const MAX_BATCHES_PER_OUTPUT: usize = 50;
 
+/// What the caller already knows about the consensus header of the output being decoded, used to
+/// reject a bad or forged header the instant it is read — before any `Batch` record is buffered.
+///
+/// The header-first (v1) pack ordering makes this early check possible: the `ConsensusHeader` is
+/// the first record, so an authenticated header (or a verified parent link) bounds everything that
+/// follows to the batches it declares.
+#[derive(Debug, Clone, Copy)]
+pub enum HeaderExpectation {
+    /// Nothing is known up front (local reads / full-pack replay): no early check.
+    None,
+    /// The header's OWN digest is known (single-output fetch against an already-verified hash). A
+    /// mismatch is [`PackError::UnexpectedConsensusDigest`].
+    Digest(ConsensusHeaderDigest),
+    /// The header's PARENT digest is known (epoch-pack forward chain link). A mismatch is
+    /// [`PackError::InvalidConsensusChain`].
+    Parent(ConsensusHeaderDigest),
+}
+
+/// Verify a freshly read `header` against what the caller already knows ([`HeaderExpectation`]).
+/// Called the instant the header record is decoded — before reading batches on the v1 path — so a
+/// wrong/forged header is rejected without buffering the batches it declares.
+fn check_header_expectation(
+    header: &ConsensusHeader,
+    expectation: HeaderExpectation,
+) -> Result<(), PackError> {
+    match expectation {
+        HeaderExpectation::None => Ok(()),
+        HeaderExpectation::Digest(expected) => {
+            let got = header.digest();
+            (got == expected)
+                .then_some(())
+                .ok_or(PackError::UnexpectedConsensusDigest { expected, got })
+        }
+        HeaderExpectation::Parent(expected) => {
+            (header.parent_hash == expected).then_some(()).ok_or(PackError::InvalidConsensusChain)
+        }
+    }
+}
+
 /// Take an async stream of bytes that in pack file representation of ConsensusOutput and return the
 /// ConsensusOutput.
 pub async fn bytes_to_output<R: AsyncRead + Unpin>(
@@ -1387,7 +1460,27 @@ pub async fn bytes_to_output<R: AsyncRead + Unpin>(
         AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, PACK_VERSION)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
-    iter_to_output(&mut stream_iter, timeout, committee).await
+    iter_to_output(&mut stream_iter, timeout, committee, HeaderExpectation::None).await
+}
+
+/// Take an async (v1, header-first) stream of pack-encoded ConsensusOutput bytes and return the
+/// ConsensusOutput, verifying the header's digest equals `expected_digest` the instant it is read —
+/// BEFORE any batch record is buffered. Used on the requested-output receive path, where the
+/// expected header hash is already known (from verified gossip / a verified descendant's parent).
+/// A mismatch is [`PackError::UnexpectedConsensusDigest`] and no batch bytes are read.
+pub async fn bytes_to_verified_output<R: AsyncRead + Unpin>(
+    stream: R,
+    compression: PackCompression,
+    timeout: Duration,
+    committee: &Committee,
+    expected_digest: ConsensusHeaderDigest,
+) -> Result<ConsensusOutput, PackError> {
+    let mut stream_iter =
+        AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, PACK_VERSION)
+            .await
+            .map_err(|e| PackError::ReadError(e.to_string()))?;
+    iter_to_output(&mut stream_iter, timeout, committee, HeaderExpectation::Digest(expected_digest))
+        .await
 }
 
 /// Take an async stream of bytes that in pack file representation of ConsensusOutput and return the
@@ -1401,7 +1494,7 @@ pub async fn bytes_to_output_legacy<R: AsyncRead + Unpin>(
     let mut stream_iter = AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, 0)
         .await
         .map_err(|e| PackError::ReadError(e.to_string()))?;
-    iter_to_output_legacy(&mut stream_iter, timeout, committee).await
+    iter_to_output_legacy(&mut stream_iter, timeout, committee, HeaderExpectation::None).await
 }
 
 /// Private helper to read the next record from a pack iterator or timeout if it takes
@@ -1423,6 +1516,7 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     stream_iter: &mut AsyncPackIter<PackRecord, R>,
     timeout: Duration,
     committee: &Committee,
+    expectation: HeaderExpectation,
 ) -> Result<ConsensusOutput, PackError> {
     let mut referenced_batches = HashSet::new();
     let consensus_header = if let Some(record) = next_output_record(stream_iter, timeout).await? {
@@ -1438,6 +1532,10 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     } else {
         return Err(PackError::NotConsensus);
     };
+    // Header-first (v1): verify what the caller already knows BEFORE reading/buffering any batches.
+    // An authenticated header (Digest) or a verified parent link (Parent) bounds everything that
+    // follows to the batches the header declares; a wrong/forged header is rejected here.
+    check_header_expectation(&consensus_header, expectation)?;
     let parent_hash = consensus_header.parent_hash;
     let deliver = consensus_header.sub_dag;
     let num_blocks = deliver.num_primary_batches();
@@ -1568,6 +1666,7 @@ async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
     stream_iter: &mut AsyncPackIter<PackRecord, R>,
     timeout: Duration,
     committee: &Committee,
+    expectation: HeaderExpectation,
 ) -> Result<ConsensusOutput, PackError> {
     let mut header = None;
     let mut available_batches = HashMap::new();
@@ -1592,6 +1691,10 @@ async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
                 available_batches.insert(batch_digest, batch);
             }
             PackRecord::Consensus(consensus_header) => {
+                // v0 is header-last, so this is as early as the check can run (batches are already
+                // buffered); it keeps the parent-link/digest invariant co-located with the header
+                // read so `stream_import` need not re-check after decode.
+                check_header_expectation(&consensus_header, expectation)?;
                 for header in consensus_header.sub_dag.headers() {
                     for (digest, _) in header.payload().iter() {
                         if !available_batches.contains_key(digest) {
@@ -1792,6 +1895,12 @@ pub enum PackError {
     TooManyBatches(usize),
     /// Data pack file version is too new.
     InvalidVersion(u16, u16),
+    /// A streamed consensus header's digest did not match the expected (already-verified) digest.
+    /// Signals an unambiguous fork or peer misbehavior on the requested-output receive path.
+    UnexpectedConsensusDigest {
+        expected: ConsensusHeaderDigest,
+        got: ConsensusHeaderDigest,
+    },
 }
 
 impl Error for PackError {}
@@ -1840,6 +1949,9 @@ impl Display for PackError {
             }
             PackError::InvalidVersion(expected, got) => {
                 write!(f, "Pack file version too new: got {got}, expected {expected}")
+            }
+            PackError::UnexpectedConsensusDigest { expected, got } => {
+                write!(f, "Consensus header digest mismatch: expected {expected}, got {got}")
             }
         }
     }
@@ -2471,13 +2583,143 @@ pub(crate) mod test {
         assert!(matches!(res, Err(PackError::TooManyBatches(_))), "expected TooManyBatches");
     }
 
+    /// The verified single-output decode ([`bytes_to_verified_output`]) accepts an output whose
+    /// header hashes to the expected digest and returns the equal output, and rejects one that does
+    /// not with [`PackError::UnexpectedConsensusDigest`] carrying the real header digest.
+    #[tokio::test]
+    async fn test_bytes_to_verified_output_accepts_and_rejects() {
+        use crate::consensus_pack::{bytes_to_verified_output, PackError};
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_verified_output").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("open pack");
+        let parent = ConsensusHeader::default().digest();
+        let original = make_test_output(&committee, 0, chain, 1, parent);
+        pack.save_consensus_output(original.clone()).await.unwrap();
+        pack.persist().await.expect("persist");
+        // v1 pack serves header-first record bytes (no data header), exactly what the sync stream
+        // reassembles and what `bytes_to_verified_output` (open_partial) consumes.
+        let bytes = pack.get_consensus_output_bytes(1).await.expect("bytes");
+
+        // Correct digest: accepted and equal to the original.
+        let decoded = bytes_to_verified_output(
+            Cursor::new(bytes.clone()),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+            original.digest(),
+        )
+        .await
+        .expect("verified decode");
+        compare_outputs(&decoded, &original);
+
+        // Wrong digest: rejected with UnexpectedConsensusDigest reporting the real header digest.
+        let wrong = ConsensusHeader::default().digest();
+        assert_ne!(wrong, original.digest(), "wrong digest must differ from the real one");
+        let res = bytes_to_verified_output(
+            Cursor::new(bytes),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+            wrong,
+        )
+        .await;
+        match res {
+            Err(PackError::UnexpectedConsensusDigest { expected, got }) => {
+                assert_eq!(expected, wrong);
+                assert_eq!(got, original.digest());
+            }
+            other => panic!("expected UnexpectedConsensusDigest, got {other:?}"),
+        }
+        drop(pack);
+    }
+
+    /// Load-bearing security assertion: the verified decode rejects a wrong-hash header BEFORE
+    /// reading any batch. Fed a header-only stream (the header declares batches, none follow), a
+    /// wrong expected digest yields [`PackError::UnexpectedConsensusDigest`] — NOT a
+    /// missing/too-many-batches error — proving the header hash is checked before batch records are
+    /// read (so an unverified peer cannot force buffering the declared batches). A zero-batch
+    /// header with the correct digest is accepted (the `num_blocks == 0` short-circuit runs
+    /// only after the header check passes).
+    #[tokio::test]
+    async fn test_bytes_to_verified_output_rejects_before_batches() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_verified_output, PackError, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_verified_early").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // Serialize a single Consensus header record (v1: header first) with NO batch records.
+        let header_only = |name: &str, header: PackRecord| -> Vec<u8> {
+            let path = temp_dir.path().join(name);
+            {
+                let mut pack: Pack<PackRecord> =
+                    Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                        .expect("open pack");
+                pack.append(&header).expect("append header");
+                pack.commit().expect("commit");
+            }
+            std::fs::read(&path).expect("read file")[DATA_HEADER_BYTES..].to_vec()
+        };
+
+        // A header that declares batches, with none following. A wrong expected digest is caught at
+        // the header — if the check ran after batches this would be a MissingBatch / read error.
+        let output = make_test_output(&committee, 0, chain, 1, ConsensusHeader::default().digest());
+        assert!(output.sub_dag().num_primary_batches() > 0, "header must declare batches");
+        let records =
+            header_only("hdr", PackRecord::Consensus(Box::new(output.consensus_header())));
+        let res = bytes_to_verified_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+            ConsensusHeader::default().digest(),
+        )
+        .await;
+        match res {
+            Err(PackError::UnexpectedConsensusDigest { got, .. }) => {
+                assert_eq!(got, output.digest(), "must report the real header digest");
+            }
+            other => {
+                panic!("expected UnexpectedConsensusDigest before any batch read, got {other:?}")
+            }
+        }
+
+        // A zero-batch header with the CORRECT digest is accepted.
+        let empty = ConsensusHeader::default();
+        let records = header_only("empty", PackRecord::Consensus(Box::new(empty.clone())));
+        let decoded = bytes_to_verified_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+            empty.digest(),
+        )
+        .await
+        .expect("zero-batch verified decode");
+        assert_eq!(decoded.consensus_header().digest(), empty.digest());
+    }
+
     /// A v0 (legacy, batches-first) pack must serve its outputs as v1 (header-first) bytes via
     /// `get_consensus_output_bytes`, so all peer-facing bytes are v1 regardless of on-disk format.
     #[tokio::test]
     async fn test_v0_output_served_as_v1_bytes() {
         use crate::{
             archive::pack_iter::AsyncPackIter,
-            consensus_pack::{bytes_to_output, bytes_to_output_legacy, PackRecord},
+            consensus_pack::{
+                bytes_to_output, bytes_to_output_legacy, bytes_to_verified_output, PackError,
+                PackRecord,
+            },
         };
         use std::io::Cursor;
         use tokio::io::BufReader;
@@ -2537,6 +2779,31 @@ pub(crate) mod test {
             .await
             .expect("v1 decode");
             compare_outputs(&decoded, original);
+
+            // 2b. The verified single-output decode accepts these served v1 bytes with the real
+            //     header digest and rejects a flipped digest with UnexpectedConsensusDigest.
+            let verified = bytes_to_verified_output(
+                BufReader::new(Cursor::new(bytes.clone())),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+                original.digest(),
+            )
+            .await
+            .expect("verified v1 decode");
+            compare_outputs(&verified, original);
+            let rejected = bytes_to_verified_output(
+                BufReader::new(Cursor::new(bytes.clone())),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+                ConsensusHeader::default().digest(),
+            )
+            .await;
+            assert!(
+                matches!(rejected, Err(PackError::UnexpectedConsensusDigest { .. })),
+                "flipped digest must be rejected, got {rejected:?}"
+            );
 
             // 3. The bytes are truly re-ordered: the legacy (batches-first) decoder rejects them.
             let legacy = bytes_to_output_legacy(
