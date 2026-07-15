@@ -2,9 +2,10 @@
 
 use super::common::{kill_child, ProcessGuard};
 use crate::common::{
-    address_from_word, get_balance, get_balance_above_with_retry, get_block, get_block_number,
-    get_key, get_latest_consensus_header_number, get_node_info, get_positive_balance_with_retry,
-    network_advancing, send_and_confirm, send_tel, start_observer, start_validator, WEI_PER_TEL,
+    address_from_word, advertise_worker_rpc, get_balance, get_balance_above_with_retry, get_block,
+    get_block_number, get_key, get_latest_consensus_header_number, get_node_info,
+    get_positive_balance_with_retry, network_advancing, send_and_confirm, send_tel, start_observer,
+    start_validator, WEI_PER_TEL,
 };
 use e2e_tests::{config_local_testnet, TestBinary};
 use eyre::Report;
@@ -436,6 +437,9 @@ fn test_restarts_observer() -> eyre::Result<()> {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
         client_urls[i].push_str(&format!(":{rpc_port}"));
+        // The observer forwards accepted txns to the committee's advertised RPC
+        // endpoints; without this the forward has no targets and txns are dropped.
+        advertise_worker_rpc(&temp_path, i, rpc_port)?;
         guard.push(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")

@@ -5,26 +5,43 @@ use crate::common::{ensure_score_config, random_ip_addr};
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use std::net::Ipv4Addr;
 
-/// Helper function to create a peer with specific IP addresses.
+/// Build a `/ip/<ip>/tcp/8000` multiaddr for the given IP.
+fn multiaddr_with_ip(ip: IpAddr) -> Multiaddr {
+    let mut multiaddr = Multiaddr::empty();
+    match ip {
+        IpAddr::V4(ipv4) => multiaddr.push(Protocol::Ip4(ipv4)),
+        IpAddr::V6(ipv6) => multiaddr.push(Protocol::Ip6(ipv6)),
+    }
+    multiaddr.push(Protocol::Tcp(8000));
+    multiaddr
+}
+
+/// Helper function to create a peer whose given IPs were observed on real connections.
 fn create_peer_with_ips(ips: Vec<IpAddr>) -> Peer {
     ensure_score_config(None);
 
     let mut peer = Peer::default_for_test();
 
-    // add multiaddrs with the specified IPs
+    // register each IP as an observed outgoing connection address
     for ip in ips {
-        let mut multiaddr = Multiaddr::empty();
-        match ip {
-            IpAddr::V4(ipv4) => multiaddr.push(Protocol::Ip4(ipv4)),
-            IpAddr::V6(ipv6) => multiaddr.push(Protocol::Ip6(ipv6)),
-        }
-        multiaddr.push(Protocol::Tcp(8000));
-
-        // add the multiaddr to the peer
-        peer.register_outgoing(multiaddr);
+        peer.register_outgoing(multiaddr_with_ip(ip));
     }
 
     peer
+}
+
+/// Fold self-advertised multiaddrs into a peer's record without any observed connection, mirroring
+/// the `add_self_advertised_peer` -> `update_net` path a kad `NodeRecord` takes. These addresses
+/// are attacker-controllable and must never feed the per-IP ban counter (GHSA-6qcj-p42p-779j).
+fn advertise_ips(peer: &mut Peer, ips: &[IpAddr]) {
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_types::{BlsKeypair, BlsPublicKey, NetworkKeypair, NetworkPublicKey};
+
+    let mut rng = StdRng::from_seed([1; 32]);
+    let bls: BlsPublicKey = *BlsKeypair::generate(&mut rng).public();
+    let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let multiaddrs = ips.iter().copied().map(multiaddr_with_ip).collect();
+    peer.update_net(bls, network_key, multiaddrs);
 }
 
 #[test]
@@ -360,4 +377,60 @@ fn test_remove_banned_peer_keeps_entry_until_zero() {
     // second removal drives the count to zero and must prune the entry
     banned_peers.remove_banned_peer(std::iter::once(ip));
     assert!(!banned_peers.banned_peers_by_ip.contains_key(&ip));
+}
+
+/// Regression for GHSA-6qcj-p42p-779j: an IP a peer only self-advertised (never presented on a
+/// real connection) must never feed the per-IP ban counter. A non-committee observer could
+/// otherwise advertise an honest peer's IP in a signed kad record and, once two such Sybils are
+/// banned, flip that honest IP to banned - denying the honest peer's real inbound connections.
+#[test]
+fn test_advertised_only_ip_never_feeds_ban_counter() {
+    ensure_score_config(None);
+    let mut banned_peers = BannedPeers::default();
+    // fixed, distinct addresses (TEST-NET blocks) so the test is deterministic - the attacker IPs
+    // must never collide with the victim IP or the observed-vs-advertised assertions below become
+    // ambiguous
+    let victim_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+
+    // enough Sybils to cross the per-IP block threshold if the advertised IP were counted
+    for i in 0..=BANNED_PEERS_PER_IP_THRESHOLD {
+        let attacker_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, (i + 1) as u8));
+        let mut sybil = Peer::default_for_test();
+        // the Sybil actually connects from its own attacker IP (observed)...
+        sybil.register_outgoing(multiaddr_with_ip(attacker_ip));
+        // ...while its self-advertised record additionally carries the victim's IP
+        advertise_ips(&mut sybil, &[victim_ip]);
+
+        // the ban-counter source is observed-only: the attacker IP is present, the advertised
+        // victim IP is not
+        assert!(
+            sybil.known_ip_addresses().any(|ip| ip == attacker_ip),
+            "the observed connection IP must feed the ban counter"
+        );
+        assert!(
+            !sybil.known_ip_addresses().any(|ip| ip == victim_ip),
+            "an advertised-only IP must not appear in the ban-counter source"
+        );
+
+        banned_peers.add_banned_peer(&sybil);
+    }
+
+    // every Sybil advertised the victim IP, but it was never observed on a real connection, so it
+    // must stay below the per-IP block threshold and off the banned-ip set
+    assert!(
+        !banned_peers.ip_banned(&victim_ip),
+        "an honest peer's advertised-only IP must never be IP-banned"
+    );
+    assert!(!banned_peers.banned_ips().contains(&victim_ip));
+
+    // positive control: peers actually OBSERVED at the victim IP still cross the threshold, so the
+    // legitimate per-IP ban is intact
+    let mut observed = BannedPeers::default();
+    for _ in 0..=BANNED_PEERS_PER_IP_THRESHOLD {
+        observed.add_banned_peer(&create_peer_with_ips(vec![victim_ip]));
+    }
+    assert!(
+        observed.ip_banned(&victim_ip),
+        "an IP genuinely observed on real connections still bans normally"
+    );
 }

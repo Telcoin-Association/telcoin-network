@@ -64,6 +64,17 @@ pub const MAX_BATCH_DIGESTS_PER_REQUEST: usize = 500;
 /// slots ([`MAX_CONCURRENT_BATCH_STREAMS`]) and starve its peers.
 pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 
+/// Maximum number of concurrent gossip-triggered batch prefetches.
+///
+/// When a committee worker gossips an accepted batch digest, a peer that is missing
+/// the batch prefetches it, and that fetch fans out to every connected peer (see
+/// [`handle::WorkerNetworkHandle::request_batches`]). Prefetching is a best-effort
+/// optimization: a genuinely needed batch is still fetched on demand later. Capping
+/// the number in flight (and deduplicating by digest) stops a Byzantine author from
+/// amplifying bandwidth/connection load across the worker mesh by gossiping many
+/// distinct (possibly forged) digests. Load beyond the cap is shed, not queued.
+pub const MAX_CONCURRENT_GOSSIP_PREFETCHES: usize = 8;
+
 /// Timeout for reading the opening request frame of an inbound sync stream.
 ///
 /// A peer that opens a sync stream but never sends its request frame trips this

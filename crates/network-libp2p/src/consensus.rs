@@ -69,6 +69,15 @@ mod network_tests;
 /// ~33), so the LRU only ever evicts peers well outside the current working set. See issue #828.
 const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("10_000 is nonzero");
 
+/// Maximum number of multiaddrs a single signed `NodeRecord` may advertise.
+///
+/// A legitimate node advertises exactly one address per record (see `get_peer_record`), so this is
+/// generous headroom. A record exceeding it is rejected at validation, bounding the attacker-chosen
+/// address data admitted per record before it can accumulate on the peer entry
+/// (GHSA-29v6-gvv5-45gx). This is defence in depth for the per-peer set cap
+/// `MAX_MULTIADDRS_PER_PEER`; that set cap is what bounds accumulation across repeated records.
+const MAX_ADVERTISED_MULTIADDRS: usize = 16;
+
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
 /// The behavior composes multiple sub-behaviors:
@@ -524,6 +533,21 @@ where
 
         // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
         let (pubkey, node_record) = NodeRecord::decode_and_verify(record.value.as_ref(), &key)?;
+
+        // reject records advertising an implausible number of addresses: a legitimate record
+        // carries a single address, so a large set is only ever an attempt to inflate the
+        // publisher's stored multiaddrs without bound (GHSA-29v6-gvv5-45gx). This bounds the
+        // attacker-chosen data admitted per record; the per-peer `MAX_MULTIADDRS_PER_PEER` cap is
+        // what bounds accumulation across repeated records.
+        if node_record.info.multiaddrs.len() > MAX_ADVERTISED_MULTIADDRS {
+            warn!(
+                target: "network-kad",
+                count = node_record.info.multiaddrs.len(),
+                max = MAX_ADVERTISED_MULTIADDRS,
+                "NodeRecord validation failed: advertised multiaddr count exceeds cap"
+            );
+            return None;
+        }
 
         // verify publisher matches the network public key in the record
         // this prevents replay attacks where malicious nodes republish outdated records
