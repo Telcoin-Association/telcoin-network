@@ -436,25 +436,35 @@ where
                     )),
                     PrimaryNetworkError::InvalidTopic
                 );
-                // Verify the BLS signature
-                ensure!(
-                    vote.check_signature(),
-                    PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
-                );
-                // Verify committee membership if the epoch record is available
-                if let Some((epoch_rec, _)) =
-                    self.consensus_chain.epochs().get_epoch_by_hash(vote.epoch_hash).await
-                {
+                // Authorize before verifying. `epoch_vote_topic` is an open gossip topic, so any
+                // observer can publish an `EpochVote` with arbitrary fields; `check_signature` is a
+                // full BLS pairing verify, so verifying first lets a non-committee observer force
+                // one verify per message on every honest primary (GHSA-j2g4-553f-875r). The
+                // collector only ever uses a vote whose author is a committee member of
+                // `vote.epoch` (`manage_epoch_votes` drops the rest), so gate on
+                // committee membership by epoch number first and pay the verify
+                // only for a member of a known epoch. Mirrors the `Consensus` arm
+                // above. Membership is by epoch *number*, not `epoch_hash`, so a
+                // member's vote for a forked/alternative record is still admitted (the collector's
+                // equivocation path needs it). A non-member yields the benign, non-penalizing
+                // `PeerNotInCommittee` rather than `PeerNotAuthor`, which is `Fatal` and, on the
+                // gossip path, charged to the honest relayer rather than the author.
+                if let Some(committee) = self.get_committee(vote.epoch).await {
                     ensure!(
-                        epoch_rec.committee.contains(&vote.public_key),
-                        PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(format!(
-                            "{} not in committee for epoch {}",
-                            vote.public_key, vote.epoch_hash
-                        )))
+                        committee.contains(&vote.public_key),
+                        PrimaryNetworkError::PeerNotInCommittee(Box::new(vote.public_key))
                     );
+                    ensure!(
+                        vote.check_signature(),
+                        PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+                    );
+                    // Fire-and-forget: no oneshot, no blocking
+                    let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
                 }
-                // Fire-and-forget: no oneshot, no blocking
-                let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
+                // Unknown epoch (no committee yet): we cannot authenticate the vote and the
+                // collector cannot use it, so drop it. The outgoing committee republishes votes
+                // until quorum, so a vote that races ahead of its epoch record is re-delivered
+                // once the epoch is known.
             }
         }
 

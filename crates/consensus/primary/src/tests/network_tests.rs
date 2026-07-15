@@ -35,8 +35,8 @@ use tn_types::{
     encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
     BlockHeader, BlockNumHash, BlsKeypair, BlsPublicKey, BlsSigner as _, Certificate,
     CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch,
-    EpochVote, ExecHeader, Hash as _, HeaderDigest, ReputationScores, Round, SealedHeader,
-    TaskManager, VoteDigest, VoteInfo, B256,
+    EpochRecord, EpochVote, ExecHeader, Hash as _, HeaderDigest, ReputationScores, Round,
+    SealedHeader, TaskManager, TnReceiver as _, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -887,14 +887,14 @@ async fn test_primary_batch_gossip_topics() {
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&good_msg).await.is_ok());
 
-    // EpochVote::default() has an invalid signature, so check_signature() fails in the handler
-    // and returns InvalidHeader(PeerNotAuthor).
+    // EpochVote::default()'s all-zero public_key is not a committee member, so the committee gate
+    // rejects it (before the signature verify); see GHSA-j2g4-553f-875r.
     let gossip = PrimaryGossip::EpochVote(Box::new(EpochVote::default()));
     let data = tn_types::encode(&gossip);
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     let res = handler.process_gossip(&good_msg).await;
-    // Not rejected for InvalidTopic — rejected for invalid signature instead.
+    // Not rejected for InvalidTopic — rejected for non-committee membership instead.
     assert!(!matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
     let gossip = PrimaryGossip::Certificate(Box::new(Certificate::default()));
@@ -916,6 +916,143 @@ async fn test_primary_batch_gossip_topics() {
     let topic = TopicHash::from_raw(tn_config::LibP2pConfig::consensus_output_topic(0));
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
+}
+
+// ============================================================================
+// EpochVote Authorization-Before-Verify Tests (GHSA-j2g4-553f-875r)
+// ============================================================================
+// `epoch_vote_topic` is an open gossip topic, so a non-committee observer can publish an
+// `EpochVote` with arbitrary fields. The handler must authorize a vote (committee membership by
+// epoch number) *before* paying the expensive BLS pairing verify, must drop a vote for an
+// unknown epoch before the verify, and must not turn a bad vote into a `Fatal` penalty charged
+// to the honest relayer.
+
+/// Build a gossip message carrying `vote` on `epoch_vote_topic` for `chain_id`.
+fn epoch_vote_gossip(vote: EpochVote, chain_id: u64) -> GossipMessage {
+    let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::epoch_vote_topic(chain_id));
+    GossipMessage { source: None, data, sequence_number: None, topic }
+}
+
+/// A vote whose `public_key` is not in the committee for a *known* epoch must be rejected by the
+/// committee gate *before* the signature verify. The error variant is the evidence: had the
+/// verify run first, the garbage signature would surface as `InvalidHeader(PeerNotAuthor)` (a
+/// `Fatal` penalty charged to the relayer on the gossip path); the gate running first surfaces
+/// the benign, non-penalizing `PeerNotInCommittee`. This is the core guarantee of
+/// GHSA-j2g4-553f-875r.
+#[tokio::test]
+async fn test_epoch_vote_non_committee_rejected_before_verify() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // `EpochVote::default()` is epoch 0 (a known committee in the fixture) with an all-zero
+    // `public_key` that is not a committee member and a garbage signature.
+    let mut rx = consensus_bus.subscribe_new_epoch_votes();
+    let res = handler.process_gossip(&epoch_vote_gossip(EpochVote::default(), 0)).await;
+
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::PeerNotInCommittee(_)),
+        "a non-committee vote for a known epoch must be rejected by the committee gate before the \
+         verify (which would yield the Fatal PeerNotAuthor charged to the relayer): {res:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+        "a rejected vote must not reach the collector"
+    );
+    Ok(())
+}
+
+/// A vote for an epoch whose committee the node does not know must be dropped *before* the verify
+/// (so a garbage `epoch`/`epoch_hash` cannot force a pairing verify), and dropped silently — no
+/// error, no penalty. Under the pre-fix ordering the garbage signature ran through the verify and
+/// surfaced `InvalidHeader(PeerNotAuthor)`; here it returns `Ok`.
+#[tokio::test]
+async fn test_epoch_vote_unknown_epoch_dropped_before_verify() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // Epoch 9999 has no committee in the fixture, so `get_committee` returns `None`.
+    let mut rx = consensus_bus.subscribe_new_epoch_votes();
+    let vote = EpochVote { epoch: 9999, ..Default::default() };
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+
+    assert!(
+        res.is_ok(),
+        "an unknown-epoch vote must be dropped before the verify (pre-fix this returned \
+         Err(PeerNotAuthor) from the verify): {res:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+        "an unknown-epoch vote must not reach the collector"
+    );
+    Ok(())
+}
+
+/// A valid vote from a committee member of a known epoch must pass the committee gate and the
+/// verify and be forwarded to the collector. Guards the reorder against over-rejecting
+/// legitimate votes (a liveness regression).
+#[tokio::test]
+async fn test_epoch_vote_valid_committee_member_forwarded() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // Sign a vote for epoch 0 (the fixture's current committee) with a real committee member's
+    // key, so `public_key` is a committee member and `check_signature` succeeds.
+    let auth = committee.authorities().next().expect("committee has authorities");
+    let key_config = auth.consensus_config().key_config().clone();
+    let epoch_rec = EpochRecord { epoch: 0, ..Default::default() };
+    let vote = epoch_rec.sign_vote(&key_config);
+    assert!(vote.check_signature(), "test vote must be validly signed");
+
+    let mut rx = consensus_bus.subscribe_new_epoch_votes();
+    handler.process_gossip(&epoch_vote_gossip(vote, 0)).await?;
+
+    let received = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+        .await
+        .expect("a valid committee vote must be forwarded to the collector")
+        .expect("epoch vote channel unexpectedly closed");
+    assert_eq!(received.public_key, vote.public_key);
+    assert_eq!(received.epoch, vote.epoch);
+    Ok(())
+}
+
+/// Documents the residual of GHSA-j2g4-553f-875r. An attacker who copies a committee member's
+/// public BLS key (public information) passes the committee gate, so a garbage-signed
+/// impersonation vote still reaches `check_signature` (forcing one pairing verify) and fails it
+/// with `InvalidHeader(PeerNotAuthor)`. That variant is relayer-attributed and `Fatal`, matching
+/// how the codebase attributes other embedded-signer faults; the peer manager's `Validator` trust
+/// exemption means a committee relayer is never banned, so consensus-mesh peers are safe. Fully
+/// removing this residual (the forced verify and the attribution edge for a non-committee relayer)
+/// needs the network-layer topic restriction, not the handler.
+#[tokio::test]
+async fn test_epoch_vote_committee_key_bad_sig_reaches_verify() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // A real committee member's public key with a default (invalid) signature: the gate admits it
+    // (the key is in the committee), so the verify runs and fails.
+    let member = committee
+        .authorities()
+        .next()
+        .expect("committee has authorities")
+        .consensus_config()
+        .key_config()
+        .public_key();
+    let vote = EpochVote { epoch: 0, public_key: member, ..Default::default() };
+
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)),
+        "a committee-key vote with a bad signature must reach and fail the verify (PeerNotAuthor), \
+         documenting the copied-key residual: {res:?}"
+    );
+    Ok(())
 }
 
 // ============================================================================
