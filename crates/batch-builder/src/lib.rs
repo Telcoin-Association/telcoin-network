@@ -368,8 +368,8 @@ mod tests {
     use tn_storage::{open_db, tables::NodeBatchesCache};
     use tn_types::{
         gas_accumulator::GasAccumulator, test_genesis, Bytes, Certificate, CommittedSubDag,
-        ConsensusHeaderDigest, ConsensusOutput, Database, GenesisAccount, TaskManager,
-        MIN_PROTOCOL_BASE_FEE, U160, U256,
+        ConsensusHeaderDigest, ConsensusOutput, Database, GenesisAccount, NoopTxnForwarder,
+        TaskManager, MIN_PROTOCOL_BASE_FEE, U160, U256,
     };
     use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
     use tokio::time::timeout;
@@ -413,6 +413,8 @@ mod tests {
             store.clone(),
             timeout,
             WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+            Arc::new(NoopTxnForwarder),
+            Vec::new(),
         );
         block_provider.spawn_batch_builder("test batch builder", &task_manager);
 

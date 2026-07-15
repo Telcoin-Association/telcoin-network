@@ -18,7 +18,7 @@ use tn_storage::{open_db, tables::NodeBatchesCache};
 use tn_types::{
     gas_accumulator::GasAccumulator, test_genesis, Address, Batch, BatchValidation, Bytes,
     Certificate, CertifiedBatch, CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Database,
-    Encodable2718, GenesisAccount, ReputationScores, SealedBatch, TaskManager,
+    Encodable2718, GenesisAccount, NoopTxnForwarder, ReputationScores, SealedBatch, TaskManager,
     MIN_PROTOCOL_BASE_FEE, U160, U256,
 };
 use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
@@ -51,6 +51,8 @@ async fn test_make_batch_el_to_cl() {
         store.clone(),
         timeout,
         WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        Arc::new(NoopTxnForwarder),
+        Vec::new(),
     );
     batch_provider.spawn_batch_builder("test builder", &task_manager);
 
