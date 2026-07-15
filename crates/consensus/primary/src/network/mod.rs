@@ -81,6 +81,13 @@ pub const MAX_CONCURRENT_EPOCH_STREAMS: usize = 5;
 /// `PrimaryGossip::Consensus` handler and GHSA-2r5c-c4h7-gp5h.
 pub(crate) const MAX_CONSENSUS_CERTS: usize = 20;
 
+/// Maximum number of distinct in-flight `consensus_certs` tallies any single committee member
+/// may be a signer of for one consensus number at a time. An honest validator signs exactly one
+/// hash per consensus number, so a signer present in this many distinct live tallies for the same
+/// number is equivocating; its further fresh digests for that number are dropped. Per
+/// `(signer, number)`, not per signer. See the handler and GHSA-pvhw-9pmg-q2hg.
+pub(crate) const MAX_TALLIES_PER_SIGNER_PER_NUMBER: usize = 2;
+
 /// Maximum number of concurrent pending batch requests from a single peer.
 ///
 /// Prevents a single malicious peer from filling all global slots.

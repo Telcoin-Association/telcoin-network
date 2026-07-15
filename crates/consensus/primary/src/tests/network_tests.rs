@@ -5,7 +5,8 @@ use crate::{
     network::{
         message::{PrimaryGossip, PrimaryResponse},
         MissingCertificatesRequest, PendingStreamRequest, RequestHandler, StreamRequestKind,
-        MAX_CONCURRENT_EPOCH_STREAMS, MAX_CONSENSUS_CERTS, PENDING_REQUEST_TIMEOUT,
+        MAX_CONCURRENT_EPOCH_STREAMS, MAX_CONSENSUS_CERTS, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        PENDING_REQUEST_TIMEOUT,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
@@ -1590,12 +1591,14 @@ async fn test_consensus_result_duplicate_signature_counted_once() -> eyre::Resul
     Ok(())
 }
 
-/// A single committee member flooding distinct singleton results must not grow `consensus_certs`
-/// without bound: once the map reaches `MAX_CONSENSUS_CERTS` the handler evicts the
-/// least-recently-updated entry before inserting a new one. The eviction must also not break
-/// legitimate aggregation: a real quorum still publishes afterward.
+/// A single committee member equivocating on one consensus number (many distinct hashes for the
+/// same number) must not grow `consensus_certs` without bound. The per-(signer, number)
+/// equivocation limit caps a lone flooder at `MAX_TALLIES_PER_SIGNER_PER_NUMBER` live tallies for
+/// that number no matter how many hashes it signs. The limit must not break legitimate
+/// aggregation: the SAME validator's genuine signature for a *different* number is not throttled,
+/// so a real quorum still publishes afterward.
 #[tokio::test]
-async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
+async fn test_consensus_certs_same_number_flood_bounded() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
         create_test_types(temp_dir.path()).await;
@@ -1605,24 +1608,25 @@ async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
     let authorities: Vec<_> = committee.authorities().collect();
     assert!(authorities.len() >= quorum, "need at least a quorum of authorities");
 
-    // Flood: 50 distinct one-signature results from a single validator. Each distinct hash maps
-    // to a distinct digest → a new singleton entry, none of which reach quorum, so the map is
-    // never cleared by a publish during the flood.
+    // Flood: 50 distinct hashes for the SAME number (1) from a single validator. Each hash is a
+    // distinct digest, none reaches quorum, so nothing clears the map.
     for _ in 0..50 {
         let hash = ConsensusHeaderDigest::from(B256::random());
         let msg = signed_consensus_gossip(authorities[0], epoch, round, 1, hash);
         handler.process_gossip(&msg).await?;
     }
 
-    // The hard cap must hold the map at or below MAX_CONSENSUS_CERTS despite the 50 distinct
-    // inputs: each new digest seen while the map is full evicts the least-recently-updated entry.
+    // The per-(signer, number) limit holds the flooder to at most MAX_TALLIES_PER_SIGNER_PER_NUMBER
+    // live tallies for number 1, far below the committee-scaled memory cap.
     assert!(
-        handler.consensus_certs_len() <= MAX_CONSENSUS_CERTS,
-        "consensus_certs must stay bounded under a singleton flood, got {}",
+        handler.consensus_certs_len() <= MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        "one signer must not create more than MAX_TALLIES_PER_SIGNER_PER_NUMBER tallies for a \
+         single number, got {}",
         handler.consensus_certs_len(),
     );
 
-    // A legitimate result must still reach quorum and publish after the eviction path has run.
+    // A legitimate result for a DIFFERENT number must still reach quorum and publish — even from a
+    // quorum that includes the flooder, because the limit is per (signer, number), not per signer.
     let hash_l = ConsensusHeaderDigest::from(B256::random());
     for auth in authorities.iter().take(quorum) {
         let msg = signed_consensus_gossip(auth, epoch, round, 2, hash_l);
@@ -1631,7 +1635,7 @@ async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
     assert_eq!(
         consensus_bus.published_consensus_num_hash(),
         (epoch, 2, hash_l),
-        "a legitimate quorum must publish even after singleton eviction",
+        "a legitimate quorum must publish despite the same-number flood",
     );
     // Publishing clears the map.
     assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
@@ -1639,12 +1643,14 @@ async fn test_consensus_certs_eviction_bounds_map() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Two (or more) colluding committee members can co-sign an unbounded stream of distinct
-/// `(number, hash)` tuples. Each tuple then carries two valid signatures, so a heuristic that
-/// only evicts *singleton* entries would keep every one of them and let `consensus_certs` grow
-/// without bound. That is the residual of GHSA-2r5c-c4h7-gp5h that a singleton-only guard leaves
-/// open. The hard cap must bound the map regardless of how many members collude, while still
-/// letting a genuine quorum publish afterward.
+/// Two (or more) colluding committee members can co-sign an unbounded stream of distinct hashes
+/// for the same consensus number. Each tuple then carries two valid signatures, so a heuristic
+/// that only evicts *singleton* entries would keep every one of them (the residual of
+/// GHSA-2r5c-c4h7-gp5h). The per-(signer, number) equivocation limit bounds the map regardless of
+/// how many members collude: each colluder can be a signer of only
+/// `MAX_TALLIES_PER_SIGNER_PER_NUMBER` distinct live tallies for a number, so `f` colluders occupy
+/// at most `f * MAX_TALLIES_PER_SIGNER_PER_NUMBER` tallies. A genuine quorum must still publish
+/// afterward.
 #[tokio::test]
 async fn test_consensus_certs_bounded_under_collusion() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
@@ -1658,9 +1664,9 @@ async fn test_consensus_certs_bounded_under_collusion() -> eyre::Result<()> {
     assert!(quorum > 2, "collusion test needs quorum > 2 so two co-signers stay sub-quorum");
     let authorities: Vec<_> = committee.authorities().collect();
 
-    // Flood: 50 distinct tuples, each co-signed by the SAME two validators. Every resulting entry
-    // has two signers, so a "keep any entry with more than one signer" guard would retain all 50.
-    // None reaches the quorum of three, so no publish clears the map mid-flood.
+    // Flood: 50 distinct hashes for number 1, each co-signed by the SAME two validators. Every
+    // resulting entry has two signers, so a "keep any entry with more than one signer" guard would
+    // retain all 50. None reaches the quorum of three, so no publish clears the map mid-flood.
     for _ in 0..50 {
         let hash = ConsensusHeaderDigest::from(B256::random());
         for auth in authorities.iter().take(2) {
@@ -1669,13 +1675,16 @@ async fn test_consensus_certs_bounded_under_collusion() -> eyre::Result<()> {
         }
     }
 
+    // Two colluders can be signers of at most 2 * MAX_TALLIES_PER_SIGNER_PER_NUMBER live tallies
+    // for number 1 (fewer when they co-sign the same digests, as here).
     assert!(
-        handler.consensus_certs_len() <= MAX_CONSENSUS_CERTS,
-        "consensus_certs must stay bounded even when every entry has multiple signers, got {}",
+        handler.consensus_certs_len() <= 2 * MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        "colluders must not create more than 2 * MAX_TALLIES_PER_SIGNER_PER_NUMBER tallies for one \
+         number, got {}",
         handler.consensus_certs_len(),
     );
 
-    // A legitimate quorum must still publish after the collusion flood and eviction.
+    // A legitimate quorum for a different number must still publish after the collusion flood.
     let hash_l = ConsensusHeaderDigest::from(B256::random());
     for auth in authorities.iter().take(quorum) {
         let msg = signed_consensus_gossip(auth, epoch, round, 2, hash_l);
@@ -1691,17 +1700,15 @@ async fn test_consensus_certs_bounded_under_collusion() -> eyre::Result<()> {
     Ok(())
 }
 
-/// The eviction policy must not let an ongoing flood evict a result that is actively accumulating
-/// honest signatures. Honest validators gossip each consensus result only once, so if an
-/// in-progress tally is evicted between honest signatures those signatures are lost for good and
-/// the result can never reach quorum. This test fills the map, then interleaves a fresh flood
-/// digest between each honest signature so an eviction fires every round while the map is full.
-/// Least-recently-updated eviction keeps the honest tally (bumped on every honest signer) and
-/// evicts the stale fakes, so the quorum still publishes. A fewest-signers policy would instead
-/// evict the honest tally here (it sits at one signer, below the co-signed 2-signer fakes) and
-/// this test would fail: it is the regression guard for that liveness trap (GHSA-2r5c-c4h7-gp5h).
+/// A same-number equivocation flood must not evict an honest tally that is still climbing to
+/// quorum. A Byzantine member signs an unbounded stream of distinct hashes for number 1; before
+/// each honest signature for the real result (number 2) a burst larger than the cap is injected.
+/// Under LRU eviction alone every burst would fill the map and evict the honest tally, and because
+/// honest validators gossip each result only once the lost signatures never return — a permanent
+/// stall (GHSA-2r5c-c4h7-gp5h / GHSA-pvhw-9pmg-q2hg). The per-(signer, number) limit caps the
+/// flooder at a couple of slots so the map never fills and the honest tally survives to publish.
 #[tokio::test]
-async fn test_consensus_certs_honest_quorum_survives_interleaved_flood() -> eyre::Result<()> {
+async fn test_consensus_certs_publisher_flood_cannot_evict_honest_tally() -> eyre::Result<()> {
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
         create_test_types_with_committee_size(temp_dir.path(), NonZeroUsize::new(7).unwrap()).await;
@@ -1709,35 +1716,20 @@ async fn test_consensus_certs_honest_quorum_survives_interleaved_flood() -> eyre
     let (epoch, round) = (0u32, 1u32);
     let quorum = committee.committee().size() / 3 + 1;
     let authorities: Vec<_> = committee.authorities().collect();
-    assert!(authorities.len() >= quorum + 2, "need two colluders plus a distinct honest quorum");
+    assert!(authorities.len() >= quorum + 1, "need a flooder plus a distinct honest quorum");
 
-    // Fill the map to the cap with co-signed (2-signer) fake tallies from two colluding members,
-    // so any further new digest forces an eviction and every fake out-signers a fresh honest tally.
-    for _ in 0..MAX_CONSENSUS_CERTS {
-        let hash = ConsensusHeaderDigest::from(B256::random());
-        for auth in authorities.iter().take(2) {
-            handler.process_gossip(&signed_consensus_gossip(auth, epoch, round, 1, hash)).await?;
-        }
-    }
-    assert_eq!(
-        handler.consensus_certs_len(),
-        MAX_CONSENSUS_CERTS,
-        "map should be full of fake tallies before the interleaved quorum",
-    );
-
-    // Deliver the honest quorum for the real result (number 2). Before each honest signature inject
-    // a fresh singleton flood digest from a colluder, so the map stays full and an eviction fires
-    // every round. LRU must keep the accumulating honest tally through all of it.
     let hash_real = ConsensusHeaderDigest::from(B256::random());
-    for auth in authorities.iter().skip(2).take(quorum) {
-        let flood = ConsensusHeaderDigest::from(B256::random());
-        handler
-            .process_gossip(&signed_consensus_gossip(authorities[0], epoch, round, 1, flood))
-            .await?;
+    for auth in authorities.iter().skip(1).take(quorum) {
+        for _ in 0..(MAX_CONSENSUS_CERTS + 5) {
+            let flood = ConsensusHeaderDigest::from(B256::random());
+            handler
+                .process_gossip(&signed_consensus_gossip(authorities[0], epoch, round, 1, flood))
+                .await?;
+        }
         handler.process_gossip(&signed_consensus_gossip(auth, epoch, round, 2, hash_real)).await?;
         assert!(
-            handler.consensus_certs_len() <= MAX_CONSENSUS_CERTS,
-            "map must stay bounded during the interleaved flood, got {}",
+            handler.consensus_certs_len() <= MAX_TALLIES_PER_SIGNER_PER_NUMBER + 1,
+            "map must stay bounded during the flood, got {}",
             handler.consensus_certs_len(),
         );
     }
@@ -1745,7 +1737,118 @@ async fn test_consensus_certs_honest_quorum_survives_interleaved_flood() -> eyre
     assert_eq!(
         consensus_bus.published_consensus_num_hash(),
         (epoch, 2, hash_real),
-        "the honest tally must survive the interleaved flood and publish at quorum",
+        "the honest tally must survive the same-number flood and publish at quorum",
+    );
+    assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
+
+    Ok(())
+}
+
+/// An honest validator that is the first to gossip several consecutive still-un-quorumed consensus
+/// numbers on a lagging receiver must NOT have its own signatures dropped. Each result is for a
+/// different number, so the per-(signer, number) equivocation limit never fires. A per-signer
+/// limit that counted tallies across all numbers would instead drop the validator's own genuine
+/// signature for the third number — an honest-liveness regression. This is the guard for that
+/// (GHSA-pvhw-9pmg-q2hg): under such a limit `consensus_certs_has(&d3)` is false and number 3
+/// never publishes.
+#[tokio::test]
+async fn test_consensus_certs_honest_creator_across_numbers_not_dropped() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_with_committee_size(temp_dir.path(), NonZeroUsize::new(7).unwrap()).await;
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    let authorities: Vec<_> = committee.authorities().collect();
+    let h = authorities[0];
+
+    let h1 = ConsensusHeaderDigest::from(B256::random());
+    let h2 = ConsensusHeaderDigest::from(B256::random());
+    let h3 = ConsensusHeaderDigest::from(B256::random());
+    let d1 = ConsensusResult::digest_data(epoch, round, 1, h1);
+    let d2 = ConsensusResult::digest_data(epoch, round, 2, h2);
+    let d3 = ConsensusResult::digest_data(epoch, round, 3, h3);
+
+    // H is the first to gossip numbers 1, 2 and 3. None has reached quorum on this receiver yet,
+    // so all three tallies stay live and each contains H. The per-(signer, number) limit does not
+    // fire because each tally is for a different number.
+    handler.process_gossip(&signed_consensus_gossip(h, epoch, round, 1, h1)).await?;
+    handler.process_gossip(&signed_consensus_gossip(h, epoch, round, 2, h2)).await?;
+    handler.process_gossip(&signed_consensus_gossip(h, epoch, round, 3, h3)).await?;
+    assert!(handler.consensus_certs_has(&d1), "H's tally for number 1 must be live");
+    assert!(handler.consensus_certs_has(&d2), "H's tally for number 2 must be live");
+    assert!(handler.consensus_certs_has(&d3), "H's OWN tally for number 3 must NOT be dropped");
+
+    // Number 3 reaches quorum using H's retained signature plus other honest signers.
+    for auth in authorities.iter().skip(1).take(quorum - 1) {
+        handler.process_gossip(&signed_consensus_gossip(auth, epoch, round, 3, h3)).await?;
+    }
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 3, h3),
+        "number 3 must reach quorum including H's retained signature",
+    );
+    Ok(())
+}
+
+/// At a committee large enough that `2 * f` exceeds the `MAX_CONSENSUS_CERTS` floor, a FIXED cap
+/// would let Byzantine members fill the map and evict the honest tally (the large-committee gap;
+/// Telcoin targets ~100 validators). The committee-scaled cap keeps the effective cap above the
+/// Byzantine footprint (`f * MAX_TALLIES_PER_SIGNER_PER_NUMBER`), so the honest result still
+/// reaches quorum and publishes. Committee 34 -> f = 11, quorum = 12, 2f = 22 > 20.
+#[tokio::test]
+async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_with_committee_size(temp_dir.path(), NonZeroUsize::new(34).unwrap())
+            .await;
+
+    let (epoch, round) = (0u32, 1u32);
+    let quorum = committee.committee().size() / 3 + 1;
+    let f = (committee.committee().size() - 1) / 3;
+    assert!(
+        2 * f >= MAX_CONSENSUS_CERTS,
+        "committee must be large enough to break a fixed cap; 2f={}",
+        2 * f
+    );
+    let authorities: Vec<_> = committee.authorities().collect();
+    assert!(authorities.len() >= f + quorum, "need a Byzantine set plus a disjoint honest quorum");
+
+    // Byzantine set = authorities[0..f]; honest quorum = authorities[f..f+quorum]. Before each
+    // honest signature for the real result (number 2), every Byzantine key signs a batch of fresh
+    // distinct hashes for number 1. The per-(signer, number) limit caps the whole Byzantine set at
+    // f * MAX_TALLIES_PER_SIGNER_PER_NUMBER = 2f tallies for number 1, and the committee-scaled cap
+    // (= committee size) stays above that, so the map never fills and the honest number-2 tally is
+    // never evicted. Under a fixed cap this same flood would evict it and number 2 would stall.
+    let hash_real = ConsensusHeaderDigest::from(B256::random());
+    for h in f..(f + quorum) {
+        for b in 0..f {
+            for _ in 0..MAX_TALLIES_PER_SIGNER_PER_NUMBER {
+                let flood = ConsensusHeaderDigest::from(B256::random());
+                handler
+                    .process_gossip(&signed_consensus_gossip(
+                        authorities[b],
+                        epoch,
+                        round,
+                        1,
+                        flood,
+                    ))
+                    .await?;
+            }
+        }
+        handler
+            .process_gossip(&signed_consensus_gossip(authorities[h], epoch, round, 2, hash_real))
+            .await?;
+        assert!(
+            handler.consensus_certs_len() <= 2 * f + 1,
+            "map must stay near the Byzantine footprint (2f) plus the honest tally, got {}",
+            handler.consensus_certs_len(),
+        );
+    }
+
+    assert_eq!(
+        consensus_bus.published_consensus_num_hash(),
+        (epoch, 2, hash_real),
+        "the honest result must survive the large-committee flood and publish",
     );
     assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
 

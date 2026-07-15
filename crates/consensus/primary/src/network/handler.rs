@@ -57,10 +57,20 @@ type AuthEquivocationMap = HashMap<
     TokioMutex<Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>>,
 >;
 
-/// A pending consensus-result signature tally: a monotonic recency sequence (bumped every time a
-/// new distinct signer is added, used for LRU eviction) paired with the set of committee members
-/// that have signed this result. See the `consensus_certs` field and GHSA-2r5c-c4h7-gp5h.
-type ConsensusCertTally = (u64, HashSet<BlsPublicKey>);
+/// A pending consensus-result signature tally.
+///
+/// See the `consensus_certs` field, GHSA-2r5c-c4h7-gp5h, and GHSA-pvhw-9pmg-q2hg.
+#[derive(Default, Debug)]
+struct ConsensusCertTally {
+    /// Monotonic recency sequence, bumped every time a new distinct signer is added. Used for
+    /// least-recently-updated (LRU) eviction.
+    seq: u64,
+    /// The consensus number this tally is for. Used to rate-limit equivocation per
+    /// `(signer, number)`: an honest validator signs exactly one result per consensus number.
+    number: u64,
+    /// The committee members that have signed this result.
+    signers: HashSet<BlsPublicKey>,
+}
 
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
@@ -312,7 +322,7 @@ where
                         let guard = self.consensus_certs.lock();
                         if guard
                             .get(&consensus_result_hash)
-                            .and_then(|(_, signers)| signers.get(&key))
+                            .and_then(|tally| tally.signers.get(&key))
                             .is_some()
                         {
                             // We have already counted this signature so ignore.
@@ -329,38 +339,73 @@ where
                         // Once we have seen 1/3 + 1 committe members have signed this it should be
                         // valid.
                         enough_sigs = (committee.len() / 3) + 1;
+                        // The tally map is hard-capped so a flood of validly-signed but non-quorum
+                        // results cannot grow it without bound. The cap SCALES with committee size
+                        // (with `MAX_CONSENSUS_CERTS` as a floor): the number of Byzantine members
+                        // `f` grows with `n`, and the per-number equivocation limit below lets
+                        // those `f` members occupy at most `f *
+                        // MAX_TALLIES_PER_SIGNER_PER_NUMBER` tallies
+                        // for any one consensus number, which stays below `max_certs` for every
+                        // committee size. A fixed cap would be exceeded once `f` passed
+                        // `cap / MAX_TALLIES_PER_SIGNER_PER_NUMBER`, reactivating eviction and
+                        // reopening the GHSA-pvhw liveness residual.
+                        let max_certs = committee.len().max(super::MAX_CONSENSUS_CERTS);
                         let mut guard = self.consensus_certs.lock();
-                        // Hard-cap the tally map so a flood of validly-signed but non-quorum
-                        // results cannot grow it without bound. `consensus_certs` is cleared
-                        // wholesale on every quorum (below), so under honest operation only a few
-                        // entries are ever live (typically one, for the next consensus number).
+                        // Per-publisher equivocation limit (GHSA-pvhw-9pmg-q2hg). The cap above
+                        // bounds the map's memory; it does not protect liveness. A Byzantine member
+                        // can sign many distinct hashes for the SAME consensus number, and a flood
+                        // of those fresh digests can evict an honest tally still climbing to
+                        // quorum; honest validators gossip each result only
+                        // once, so an evicted honest signature is lost for
+                        // good and that result can never reach quorum.
                         //
+                        // An honest validator signs exactly ONE result (one hash) per consensus
+                        // number. A signer already present in `MAX_TALLIES_PER_SIGNER_PER_NUMBER`
+                        // distinct live tallies for THIS number is equivocating; drop its further
+                        // fresh digests for the number. The limit is per `(signer, number)`, NOT
+                        // per signer, so an honest validator that is the
+                        // first to gossip several consecutive un-quorumed
+                        // numbers is never throttled. Joining an existing
+                        // tally is always allowed (it never grows the map).
+                        //
+                        // Residual (documented follow-up): a single member fabricating one hash
+                        // each for many distinct FUTURE numbers is not
+                        // bounded here and is indistinguishable from an
+                        // honest validator racing ahead. See
+                        // GHSA-pvhw-9pmg-q2hg.
+                        if !guard.contains_key(&consensus_result_hash) {
+                            let signer_tallies_for_number = guard
+                                .values()
+                                .filter(|tally| {
+                                    tally.number == number && tally.signers.contains(&key)
+                                })
+                                .count();
+                            if signer_tallies_for_number >= super::MAX_TALLIES_PER_SIGNER_PER_NUMBER
+                            {
+                                return Ok(());
+                            }
+                        }
                         // Eviction is by least-recently-updated (LRU), NOT by signer count. A real
                         // consensus result is signed once by each honest validator in a burst as
                         // the network commits it, so its tally is bumped to most-recently-used on
                         // every distinct signer and is never the eviction victim while it climbs to
-                        // quorum. Evicting by fewest-signers instead would be steerable: colluding
-                        // members can co-sign fakes that carry more signers than an honest tally
-                        // still gathering its first signatures, and so evict genuine progress.
-                        // Honest validators gossip each result only once, so an evicted honest
-                        // signature is lost for good; LRU keeps the actively-updated honest tally
-                        // and evicts the stale, frozen fakes instead. See GHSA-2r5c-c4h7-gp5h.
-                        let next_seq = guard.values().map(|(seq, _)| *seq).max().unwrap_or(0) + 1;
-                        if guard.len() >= super::MAX_CONSENSUS_CERTS
-                            && !guard.contains_key(&consensus_result_hash)
-                        {
+                        // quorum. Evicting by fewest-signers instead would be steerable. See
+                        // GHSA-2r5c-c4h7-gp5h.
+                        let next_seq = guard.values().map(|tally| tally.seq).max().unwrap_or(0) + 1;
+                        if guard.len() >= max_certs && !guard.contains_key(&consensus_result_hash) {
                             let evict = guard
                                 .iter()
-                                .min_by_key(|(_, (seq, _))| *seq)
+                                .min_by_key(|(_, tally)| tally.seq)
                                 .map(|(digest, _)| *digest);
                             if let Some(evict) = evict {
                                 guard.remove(&evict);
                             }
                         }
-                        let (seq, set) = guard.entry(consensus_result_hash).or_default();
-                        *seq = next_seq;
-                        set.insert(key);
-                        sigs = set.len();
+                        let tally = guard.entry(consensus_result_hash).or_default();
+                        tally.seq = next_seq;
+                        tally.number = number;
+                        tally.signers.insert(key);
+                        sigs = tally.signers.len();
                     }
                     if sigs >= enough_sigs {
                         if self.behind_consensus(epoch, round, Some(number)).await {
@@ -998,6 +1043,13 @@ where
     #[cfg(test)]
     pub(crate) fn consensus_certs_len(&self) -> usize {
         self.consensus_certs.lock().len()
+    }
+
+    /// Whether a tally for the given consensus-result digest is currently live. Test-only
+    /// accessor used to assert per-(signer, number) equivocation behaviour and eviction.
+    #[cfg(test)]
+    pub(crate) fn consensus_certs_has(&self, digest: &ConsensusResultDigest) -> bool {
+        self.consensus_certs.lock().contains_key(digest)
     }
 
     /// Send an epoch pack file over a stream.
