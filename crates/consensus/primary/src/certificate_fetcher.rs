@@ -443,6 +443,15 @@ async fn fetch_and_process_certificates<DB: Database, F: MissingCertFetcher>(
 /// Try to fetch certificates from multiple peers with staggered requests.
 /// Sends requests to peers one at a time with ~5 second intervals between each.
 /// Returns as soon as one peer provides a non-empty response.
+///
+/// Memory envelope: fetches are cancelled only on the first success, so slow, empty, or
+/// invalid responders keep buffering until their per-fetch timeout elapses. Each in-flight
+/// fetch accepts up to the per-exchange cap (`MAX_SYNC_MISSING_CERTS_ACCEPT_BYTES`, ~64.5 MiB),
+/// and up to `min(peers.len(), ceil(per_fetch_timeout / fallback_delay))` run concurrently, so
+/// the requester-side peak is that many times the per-fetch cap (a few hundred MiB with the
+/// defaults, scaling with committee size up to the overlap bound). There is no joint byte
+/// budget shared across in-flight fetches: capping the concurrent fan-out or threading a shared
+/// budget is left as a design decision (issue #822, finding 2).
 async fn fetch_from_peers<F: MissingCertFetcher>(
     network: F,
     peers: Vec<BlsPublicKey>,

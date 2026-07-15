@@ -19,8 +19,8 @@ use tn_network_libp2p::{
     write_frame, Penalty, StreamError, StreamKind, SyncFrame, WorkerSyncRequest,
 };
 use tn_types::{
-    encode, max_batch_size, try_decode, Batch, BlockHash, BlsPublicKey, Epoch, SealedBatch,
-    TaskSpawner, B256,
+    encode, max_batch_size, try_decode, Batch, BlockHash, BlsPublicKey, Epoch, RpcInfo,
+    SealedBatch, TaskSpawner, B256,
 };
 use tracing::{debug, warn};
 
@@ -31,6 +31,29 @@ use crate::{
 
 /// Timeout for streaming a single batch from peer. Batches capped at 1MB.
 const BATCH_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout bounding the gap before each per-chunk count header while reading a
+/// batch response stream.
+///
+/// A count header is emitted by the responder only *after* it bulk-loads that
+/// chunk's batches from its database (`send_batches_over_stream`), so, unlike an
+/// individual batch read, the inter-chunk gap can legitimately exceed the short
+/// `BATCH_STREAM_TIMEOUT`; reusing that timeout here would spuriously disconnect
+/// an honest sender whose chunk-boundary DB fetch is slow. It is sized instead to
+/// be at least the responder's own whole-stream `SEND_STREAM_TIMEOUT` self-cap
+/// (`handler.rs`): an honest sender always emits the next count within that
+/// window (or aborts its own send first), whereas a peer that stalls
+/// indefinitely before the next count is disconnected rather than parking the
+/// requester (and its `MAX_CONCURRENT_BATCH_STREAMS` slot) forever.
+const INTER_CHUNK_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
+
+/// Compile-time guard for the invariant above: the inter-chunk tolerance must be
+/// at least the responder's whole-stream self-cap, or an honest sender whose next
+/// count header is delayed by its per-chunk DB load could be disconnected.
+/// Raising `SEND_STREAM_TIMEOUT` above this without widening it here fails the
+/// build.
+const _: () =
+    assert!(INTER_CHUNK_STREAM_TIMEOUT.as_secs() >= super::handler::SEND_STREAM_TIMEOUT.as_secs());
 
 /// Overall deadline for reading a complete legacy batch response. Mirrors the
 /// responder's `SEND_STREAM_TIMEOUT` (200s, at which the sender aborts its own
@@ -130,12 +153,16 @@ impl WorkerNetworkHandle {
         Ok(())
     }
 
-    /// Publish a transaction (as raw bytes) worker network.
-    /// Do this when not a committee member so a CVV can include the txn.
-    pub(crate) async fn publish_txn(&self, txn: Vec<u8>) -> NetworkResult<()> {
-        let data = encode(&WorkerGossip::Txn(txn));
-        self.handle.publish(tn_config::LibP2pConfig::worker_txn_topic(self.chain_id), data).await?;
-        Ok(())
+    /// Snapshot of every committee validator's advertised JSON-RPC endpoint, discovered over
+    /// kademlia.
+    ///
+    /// A non-committee ("observer") worker uses this to forward the transactions it accepts to
+    /// the validators that own them (issue #804), instead of pushing them over the worker
+    /// protocol. Returns an empty list if no validator has advertised an endpoint.
+    pub(crate) async fn get_all_validator_rpcs(
+        &self,
+    ) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
+        self.handle.get_all_validator_rpcs().await
     }
 
     /// Report a new batch to a peer.
@@ -603,12 +630,15 @@ impl WorkerNetworkHandle {
     /// `[chunk_count][batches...][flush]` per chunk. This method loops
     /// reading chunks until the stream closes.
     ///
-    /// SAFETY: the read cannot hang or be dragged out indefinitely. Three bounds
+    /// SAFETY: the read cannot hang or be dragged out indefinitely. Four bounds
     /// combine: an overall [`BATCH_READ_TOTAL_TIMEOUT`] on the whole exchange
     /// (mirroring the responder's own `SEND_STREAM_TIMEOUT` send cap, so a peer
     /// that only trickles progress is cut off while an honest transfer still
-    /// completes); the per-batch [`BATCH_STREAM_TIMEOUT`] on each `read_batch`; and
-    /// a cap on the number of chunk headers at the request's chunk span
+    /// completes); an [`INTER_CHUNK_STREAM_TIMEOUT`] bounding the wait before each
+    /// per-chunk count header (so a peer cannot park this requester between chunks
+    /// even while the overall deadline still has budget); the per-batch
+    /// [`BATCH_STREAM_TIMEOUT`] on each `read_batch`; and a cap on the number of
+    /// chunk headers at the request's chunk span
     /// (`ceil(requested / BATCH_DIGESTS_READ_CHUNK_SIZE)`). The cap is essential
     /// because a fast run of zero-count chunks makes no `.await` yield, so no
     /// timeout can interrupt it — erroring out on the cap is what breaks that
@@ -651,9 +681,21 @@ impl WorkerNetworkHandle {
 
             // read chunks until stream closes (sender writes multiple chunks for large requests)
             loop {
-                // read the next chunk-count header. A clean `StreamClosed` becomes a
-                // `None` break-sentinel (transfer complete); any other error propagates.
-                let next_count = stream_codec::read_chunk_count(stream).await.map_or_else(
+                // read the next chunk-count header, bounding the wait before it so a
+                // peer cannot stall indefinitely between chunks and park this
+                // requester (and its `MAX_CONCURRENT_BATCH_STREAMS` slot) forever. A
+                // clean `StreamClosed` becomes a `None` break-sentinel (transfer
+                // complete); any other error propagates.
+                let next_count = tokio::time::timeout(
+                    INTER_CHUNK_STREAM_TIMEOUT,
+                    stream_codec::read_chunk_count(stream),
+                )
+                .await
+                .map_err(|_| {
+                    warn!(target: "worker::network", "timeout waiting for next batch chunk count");
+                    NetworkError::Timeout
+                })?
+                .map_or_else(
                     |e| {
                         if matches!(e, super::error::WorkerNetworkError::StreamClosed) {
                             Ok(None)

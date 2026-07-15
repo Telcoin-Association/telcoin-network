@@ -3,6 +3,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc,
     },
@@ -36,11 +37,44 @@ impl<DB: Database> DbTx for LayeredDbTx<DB> {
     }
 }
 
+/// Guard shared by every clone of one logical write txn.
+///
+/// Exactly one `StartTxn` is sent when the logical txn is created, and the guard guarantees
+/// exactly one matching end: `CommitTxn` from the first `commit()` call, or `EndTxn` from `Drop`
+/// if every clone is dropped without committing. Without the end message a dropped txn would
+/// permanently skew the background thread's txn count — commits stop firing, writes stop
+/// persisting to disk, and retained inserts grow forever.
+struct TxnGuard<DB: Database> {
+    tx: Sender<DBMessage<DB>>,
+    committed: AtomicBool,
+}
+
+impl<DB: Database> TxnGuard<DB> {
+    /// Mark the logical txn committed. Returns true for exactly one caller across all clones;
+    /// that caller sends the `CommitTxn`.
+    fn mark_committed(&self) -> bool {
+        !self.committed.swap(true, Ordering::AcqRel)
+    }
+}
+
+impl<DB: Database> Drop for TxnGuard<DB> {
+    fn drop(&mut self) {
+        if !self.committed.load(Ordering::Acquire) {
+            // Abandoned txn (e.g. an error `?`-return with a live txn): tell the DB thread to
+            // end it so the txn count stays balanced. There is no rollback machinery and the
+            // writes are already visible in the mem layer, so the thread commits and warns.
+            // A send error means the thread is already shutting down; nothing to balance.
+            let _ = self.tx.send(DBMessage::EndTxn);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LayeredDbTxMut<DB: Database> {
     mem_db: MemDatabase,
     db: DB,
     tx: Sender<DBMessage<DB>>,
+    guard: Arc<TxnGuard<DB>>,
 }
 
 impl<DB: Database> Debug for LayeredDbTxMut<DB> {
@@ -89,8 +123,53 @@ impl<DB: Database> DbTxMut for LayeredDbTxMut<DB> {
     /// need a read-your-writes guarantee for iteration must call
     /// [`Database::sync_persist`] (or await [`Database::persist`]) after committing.
     fn commit(self) -> eyre::Result<()> {
-        self.tx.send(DBMessage::CommitTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
+        // Only the first commit across all clones of this logical txn sends the message;
+        // afterwards the guard's Drop is a no-op, so exactly one end reaches the DB thread.
+        if self.guard.mark_committed() {
+            self.tx
+                .send(DBMessage::CommitTxn)
+                .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
+        }
         Ok(())
+    }
+}
+
+/// A snapshot of the background thread's internal state, for leak observability.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayeredDbStats {
+    /// Number of boxed key/value inserts retained while waiting for a txn commit.
+    /// Should return to 0 after every commit; sustained growth indicates a leak.
+    pub retained_inserts: usize,
+    /// Number of logical write txns currently overlapped on the physical txn.
+    /// Should be 0 whenever no write txn is outstanding; a value stuck above 0
+    /// means commits have stopped firing (wedged txn count).
+    pub open_txn_count: u64,
+}
+
+/// End one logical write txn on the background thread.
+///
+/// Decrements the overlap count and, once the last logical txn ends, commits the physical txn
+/// and clears any cache-mode retained inserts. Shared by `CommitTxn` and `EndTxn` handling:
+/// overlapped logical txns ride one physical txn, so an abandoned txn must end as a commit —
+/// aborting would discard the other txns' writes, which are already visible in the mem layer.
+fn end_txn<'a, DB: Database>(
+    txn: &mut Option<(DB::TXMut<'a>, u32)>,
+    committed_inserts: &mut Vec<Box<dyn InsertTrait<DB>>>,
+    mem_db: Option<&MemDatabase>,
+) {
+    if let Some((current_txn, count)) = txn.take() {
+        if count <= 1 {
+            if let Err(e) = current_txn.commit() {
+                tracing::error!(target: "layered_db_runner", "DB TXN Commit: {e}")
+            }
+            if let Some(mem_db) = mem_db {
+                for insert in committed_inserts.drain(..) {
+                    insert.clear_insert_mem(mem_db);
+                }
+            }
+        } else {
+            *txn = Some((current_txn, count - 1));
+        }
     }
 }
 
@@ -118,27 +197,26 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
                 }
             }
             DBMessage::CommitTxn => {
-                if let Some((current_txn, count)) = txn.take() {
-                    if count <= 1 {
-                        if let Err(e) = current_txn.commit() {
-                            tracing::error!(target: "layered_db_runner", "DB TXN Commit: {e}")
-                        }
-                        if let Some(mem_db) = mem_db.as_ref() {
-                            for insert in committed_inserts.drain(..) {
-                                insert.clear_insert_mem(mem_db);
-                            }
-                        }
-                    } else {
-                        txn = Some((current_txn, count - 1));
-                    }
-                }
+                end_txn(&mut txn, &mut committed_inserts, mem_db.as_ref());
+            }
+            DBMessage::EndTxn => {
+                tracing::warn!(
+                    target: "layered_db_runner",
+                    "write txn dropped without commit; committing it to keep persistence alive"
+                );
+                end_txn(&mut txn, &mut committed_inserts, mem_db.as_ref());
             }
             DBMessage::Insert(ins) => {
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = ins.insert_txn(txn) {
                         tracing::error!(target: "layered_db_runner", "DB TXN Insert {}: {e}", ins.name())
                     }
-                    committed_inserts.push(ins);
+                    // The retained insert exists only to clear the cache-mode mirror once the
+                    // txn commits. A full-memory DB (mem_db == None) keeps everything in memory
+                    // forever, so retaining here would leak a clone of every value ever written.
+                    if mem_db.is_some() {
+                        committed_inserts.push(ins);
+                    }
                 } else {
                     if let Err(e) = ins.insert(&db) {
                         tracing::error!(target: "layered_db_runner", "DB Insert {}: {e}", ins.name());
@@ -168,6 +246,12 @@ fn db_run<DB: Database>(db: DB, mem_db: Option<MemDatabase>, rx: Receiver<DBMess
             }
             DBMessage::CaughtUp(tx) => {
                 let _ = tx.send(());
+            }
+            DBMessage::Stats(tx) => {
+                let _ = tx.send(LayeredDbStats {
+                    retained_inserts: committed_inserts.len(),
+                    open_txn_count: txn.as_ref().map(|(_, count)| *count as u64).unwrap_or(0),
+                });
             }
             DBMessage::Shutdown => break,
         }
@@ -229,6 +313,24 @@ impl<DB: Database> LayeredDatabase<DB> {
             Some(Arc::new(std::thread::spawn(move || db_run(db_cloned, mem_db_clone, rx))));
         Self { mem_db, db, tx, thread, full_memory }
     }
+
+    /// Snapshot the background thread's retained-insert and open-txn counters.
+    ///
+    /// Processed in queue order, so it reflects all operations sent before this call.
+    pub fn stats(&self) -> eyre::Result<LayeredDbStats> {
+        let (tx, mut rx) = oneshot::channel();
+        self.tx.send(DBMessage::Stats(tx)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
+
+        // Can not use rx.blocking_recv() because it will be called from some tokio tests and that
+        // will panic.
+        loop {
+            match rx.try_recv() {
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(10)),
+                Err(TryRecvError::Closed) => return Err(eyre::eyre!("DB thread gone, FATAL!")),
+                Ok(stats) => return Ok(stats),
+            }
+        }
+    }
 }
 
 impl<DB: Database> Database for LayeredDatabase<DB> {
@@ -262,7 +364,12 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     /// thread for persistance in the background so operations will return quickly.
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
         self.tx.send(DBMessage::StartTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(LayeredDbTxMut { mem_db: self.mem_db.clone(), db: self.db.clone(), tx: self.tx.clone() })
+        Ok(LayeredDbTxMut {
+            mem_db: self.mem_db.clone(),
+            db: self.db.clone(),
+            tx: self.tx.clone(),
+            guard: Arc::new(TxnGuard { tx: self.tx.clone(), committed: AtomicBool::new(false) }),
+        })
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
@@ -468,10 +575,14 @@ impl<T: Table, DB: Database> ClearTrait<DB> for ClearTable<T> {
 enum DBMessage<DB: Database> {
     StartTxn,
     CommitTxn,
+    /// End a logical txn that was dropped without commit (sent by [`TxnGuard::drop`]).
+    /// Handled like a commit plus a warning so the txn count stays balanced.
+    EndTxn,
     Insert(Box<dyn InsertTrait<DB>>),
     Remove(Box<dyn RemoveTrait<DB>>),
     Clear(Box<dyn ClearTrait<DB>>),
     CaughtUp(tokio::sync::oneshot::Sender<()>),
+    Stats(tokio::sync::oneshot::Sender<LayeredDbStats>),
     Shutdown,
 }
 
@@ -480,10 +591,12 @@ impl<DB: Database> Debug for DBMessage<DB> {
         match self {
             DBMessage::StartTxn => write!(f, "StartTxn"),
             DBMessage::CommitTxn => write!(f, "CommitTxn"),
+            DBMessage::EndTxn => write!(f, "EndTxn"),
             DBMessage::Insert(_) => write!(f, "Insert"),
             DBMessage::Remove(_) => write!(f, "Remove"),
             DBMessage::Clear(_) => write!(f, "Clear"),
             DBMessage::CaughtUp(_) => write!(f, "CaughtUp"),
+            DBMessage::Stats(_) => write!(f, "Stats"),
             DBMessage::Shutdown => write!(f, "Shutdown"),
         }
     }
@@ -728,6 +841,145 @@ mod test {
         test_multi_remove(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_multi_remove_2"), false);
         test_multi_remove(db);
+    }
+
+    /// Open a raw mdbx DB and a LayeredDatabase over a clone of it, so tests can observe
+    /// exactly what has been committed to disk independent of the mem layer.
+    fn open_mdbx_with_raw(path: &Path) -> (MdbxDatabase, LayeredDatabase<MdbxDatabase>) {
+        let raw =
+            MdbxDatabase::open(path, 4, 16 * MEGABYTE, 8 * MEGABYTE).expect("Cannot open database");
+        raw.open_table::<TestTable>().expect("failed to open table!");
+        let db = LayeredDatabase::open(raw.clone(), true);
+        db.open_table::<TestTable>().expect("failed to open table!");
+        (raw, db)
+    }
+
+    #[test]
+    fn test_layereddb_dropped_txn_does_not_wedge_commits() {
+        use tn_types::DbTxMut as _;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let (raw, db) = open_mdbx_with_raw(&temp_dir.path().join("mdbx_dropped_txn"));
+
+        // txn dropped without commit — mirrors error paths that `?`-return with a live txn
+        let mut dropped = db.write_txn().expect("write txn");
+        dropped.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        drop(dropped);
+
+        // a normal txn afterwards must still reach disk: without the guard the dropped txn
+        // leaves the thread's count wedged and no commit ever fires again
+        let mut txn = db.write_txn().expect("write txn");
+        txn.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+        txn.commit().expect("commit");
+        db.sync_persist();
+
+        assert_eq!(raw.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
+        assert_eq!(raw.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
+        let stats = db.stats().expect("stats");
+        assert_eq!(stats, super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0 });
+    }
+
+    #[test]
+    fn test_layereddb_overlapped_txn_drop_keeps_count_balanced() {
+        use tn_types::DbTxMut as _;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let (raw, db) = open_mdbx_with_raw(&temp_dir.path().join("mdbx_overlapped_txn"));
+
+        // two logical txns overlap on one physical txn
+        let mut txn_a = db.write_txn().expect("write txn"); // count 1
+        let mut txn_b = db.write_txn().expect("write txn"); // count 2
+        txn_a.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        drop(txn_a); // count back to 1 — must NOT commit the shared physical txn
+        db.sync_persist();
+        assert_eq!(
+            raw.get::<TestTable>(&1).expect("get"),
+            None,
+            "physical txn must stay open while another logical txn is active"
+        );
+        assert_eq!(db.stats().expect("stats").open_txn_count, 1);
+
+        txn_b.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+        txn_b.commit().expect("commit");
+        db.sync_persist();
+        // both writes ride the shared physical txn's commit
+        assert_eq!(raw.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
+        assert_eq!(raw.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
+        assert_eq!(
+            db.stats().expect("stats"),
+            super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0 }
+        );
+    }
+
+    #[test]
+    fn test_layereddb_cloned_txn_commit_sends_exactly_one_end() {
+        use tn_types::DbTxMut as _;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let (raw, db) = open_mdbx_with_raw(&temp_dir.path().join("mdbx_cloned_txn"));
+
+        // `outer` keeps the physical txn open; a stray extra end from `inner`'s clone
+        // would close it early and become observable below
+        let mut outer = db.write_txn().expect("write txn"); // count 1
+        let inner = db.write_txn().expect("write txn"); // count 2
+        let inner_clone = inner.clone();
+        inner.commit().expect("commit"); // count 1: the one CommitTxn for this logical txn
+        drop(inner_clone); // shares the committed guard — must send nothing
+
+        outer.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        db.sync_persist();
+        assert_eq!(db.stats().expect("stats").open_txn_count, 1, "outer txn must still be open");
+        assert_eq!(
+            raw.get::<TestTable>(&1).expect("get"),
+            None,
+            "an extra end message would have committed outer's write already"
+        );
+
+        outer.commit().expect("commit");
+        db.sync_persist();
+        assert_eq!(raw.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
+        assert_eq!(
+            db.stats().expect("stats"),
+            super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0 }
+        );
+    }
+
+    #[test]
+    fn test_layereddb_full_memory_does_not_retain_inserts() {
+        use tn_types::DbTxMut as _;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx(&temp_dir.path().join("mdbx_full_memory_no_retain"), true);
+        for i in 0..100_u64 {
+            let mut txn = db.write_txn().expect("write txn");
+            txn.insert::<TestTable>(&i, &i.to_string()).expect("insert");
+            txn.commit().expect("commit");
+        }
+        db.sync_persist();
+        // Full-memory DBs have no cache mirror to clear, so nothing may be retained after
+        // commit; retention here is the unbounded leak (every insert kept forever).
+        let stats = db.stats().expect("stats");
+        assert_eq!(stats, super::LayeredDbStats { retained_inserts: 0, open_txn_count: 0 });
+        // all keys remain readable
+        for i in 0..100_u64 {
+            assert_eq!(db.get::<TestTable>(&i).expect("get"), Some(i.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_layereddb_cache_mode_clears_mem_after_commit() {
+        use tn_types::DbTxMut as _;
+        const K: u64 = 50;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx(&temp_dir.path().join("mdbx_cache_mode_clears_mem"), false);
+        let mut txn = db.write_txn().expect("write txn");
+        for i in 0..K {
+            txn.insert::<TestTable>(&i, &i.to_string()).expect("insert");
+        }
+        txn.commit().expect("commit");
+        db.sync_persist();
+        let stats = db.stats().expect("stats");
+        assert_eq!(stats.retained_inserts, 0, "retained inserts must drain on commit");
+        assert_eq!(stats.open_txn_count, 0);
+        // The mem mirror must be cleared once the disk commit lands: the cache-mode iter
+        // chains disk + mem, so a stale mirror would yield 2K entries instead of K.
+        assert_eq!(db.iter::<TestTable>().count() as u64, K);
     }
 
     #[test]

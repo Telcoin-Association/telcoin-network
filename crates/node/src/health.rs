@@ -242,9 +242,6 @@ mod tests {
         // liveness path never polls the readiness probe
         let addr = HealthcheckServer::spawn(task_spawner.clone(), port, || async { false }).await?;
 
-        // give server time to start listening
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
         let response = roundtrip(addr, b"GET / HTTP/1.1\r\n\r\n").await?;
 
         // verify http status line
@@ -267,7 +264,6 @@ mod tests {
 
         let port = get_available_tcp_port("127.0.0.1").expect("tcp port assigned by host");
         let addr = HealthcheckServer::spawn(task_spawner.clone(), port, || async { false }).await?;
-        tokio::time::sleep(Duration::from_millis(10)).await;
 
         let response = roundtrip(addr, b"GET /health/workers HTTP/1.1\r\n\r\n").await?;
 
@@ -293,7 +289,6 @@ mod tests {
 
         let port = get_available_tcp_port("127.0.0.1").expect("tcp port assigned by host");
         let addr = HealthcheckServer::spawn(task_spawner.clone(), port, || async { true }).await?;
-        tokio::time::sleep(Duration::from_millis(10)).await;
 
         let response = roundtrip(addr, b"GET /health/workers HTTP/1.1\r\n\r\n").await?;
 

@@ -13,12 +13,15 @@ use tokio::sync::{
 };
 use tracing::{error, info};
 
-use crate::archive::{
-    digest_index::index::HdxIndex,
-    error::{fetch::FetchError, open::OpenError},
-    fxhasher::FxHasher,
-    index::Index as _,
-    pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+use crate::{
+    archive::{
+        digest_index::index::HdxIndex,
+        error::{fetch::FetchError, open::OpenError},
+        fxhasher::FxHasher,
+        index::Index as _,
+        pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+    },
+    consensus_pack::PACK_VERSION,
 };
 
 enum PackMessage {
@@ -238,8 +241,13 @@ impl Inner {
         if !read_only {
             let _ = std::fs::create_dir_all(base_dir);
         }
-        let mut data: Pack<Certificate> =
-            Pack::open(base_dir.join(Self::DATA_NAME), 0, read_only, PackCompression::ZStd)?;
+        let mut data: Pack<Certificate> = Pack::open(
+            base_dir.join(Self::DATA_NAME),
+            0,
+            read_only,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut digest_idx = HdxIndex::open_hdx_file(
             base_dir.join(Self::HASH_NAME),

@@ -152,15 +152,28 @@ If no permits are available, the request gets `ack: false` and the requesting pe
 
 #### Per-Peer Rate Limiting (`MAX_PENDING_REQUESTS_PER_PEER`)
 
-Each peer is limited to `MAX_PENDING_REQUESTS_PER_PEER` (2) concurrent pending requests.
-This prevents a single malicious peer from monopolizing all global semaphore slots:
+Each peer is limited to `MAX_PENDING_REQUESTS_PER_PEER` (2) concurrent in-flight batch
+streams. This prevents a single malicious peer from monopolizing all global semaphore slots.
+
+The cap is the combined limit across every in-flight source that holds a global permit, so
+admission on either path counts all three together (`peer_in_flight`):
 
 ```rust
-let peer_count = pending_map.keys().filter(|(p, _)| *p == peer).count();
+let peer_count = peer_in_flight(&pending_map, &active_legacy, &sync_stream_peers, &peer);
 if peer_count >= MAX_PENDING_REQUESTS_PER_PEER {
     // reject — permit drops, freeing the global slot
 }
 ```
+
+- **legacy pending requests** — entries in `pending_batch_requests` awaiting a stream open.
+- **legacy serving streams** (`active_legacy_streams`) — a legacy request leaves
+  `pending_batch_requests` the moment its stream opens, but still holds its global permit while
+  being served. It is counted here for the full serving lifetime (via `LegacyStreamGuard`), so a
+  peer cannot bypass the cap by promptly opening its pending streams and re-arming new ones.
+- **sync streams** (`sync_stream_peers`) — sync-path exchanges, counted via `SyncStreamPermit`.
+
+Admission takes the locks in the order `pending_batch_requests` -> `active_legacy_streams` ->
+`sync_stream_peers` on both paths, so the two never deadlock.
 
 #### Stale Request Cleanup (`PENDING_REQUEST_TIMEOUT`)
 

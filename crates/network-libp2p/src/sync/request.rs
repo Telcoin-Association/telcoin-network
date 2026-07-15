@@ -70,6 +70,17 @@ pub enum PrimarySyncRequest {
         /// The final (inclusive) consensus header number to stream up to.
         last_consensus_number: u64,
     },
+    /// Request the raw bytes of a single consensus output by chain consensus
+    /// number.
+    ///
+    /// Folds the legacy `StreamConsensusOutput` ack-plus-digest handshake into a
+    /// single open. This streams exactly one output's pack-file-encoded bytes; the
+    /// requester decodes them with the epoch committee and verifies the decoded
+    /// header digest before use.
+    ConsensusOutput {
+        /// The chain consensus number of the requested output.
+        number: u64,
+    },
 }
 
 #[cfg(test)]
@@ -127,6 +138,12 @@ mod tests {
         assert_eq!(roundtrip_req(request.clone()).await, SyncFrame::Req(request));
     }
 
+    #[tokio::test]
+    async fn primary_consensus_output_request_round_trips() {
+        let request = PrimarySyncRequest::ConsensusOutput { number: 41 };
+        assert_eq!(roundtrip_req(request.clone()).await, SyncFrame::Req(request));
+    }
+
     /// The request enums' BCS discriminants ride on the wire (inside the `Req`
     /// frame), so pin them exactly as `frame_tags_are_stable` pins the frame
     /// tags. A reorder would keep the round-trip tests green while changing the
@@ -155,5 +172,9 @@ mod tests {
         })
         .expect("encode partial epoch pack");
         assert_eq!(partial.first(), Some(&2));
+
+        let consensus_output = bcs::to_bytes(&PrimarySyncRequest::ConsensusOutput { number: 0 })
+            .expect("encode consensus output");
+        assert_eq!(consensus_output.first(), Some(&3));
     }
 }

@@ -34,6 +34,9 @@ use crate::archive::{
     position_index::index::PositionIndex,
 };
 
+/// Current version of the epoch pack file.
+const EPOCH_PACK_VERSION: u16 = 0;
+
 enum EpochDbMessage {
     /// Save a "dummy" epoch 0 [`EpochRecord`] without a certificate.
     SaveDummy0Record(EpochRecord),
@@ -488,12 +491,14 @@ impl Inner {
             Self::PACK_EPOCH,
             false,
             PackCompression::ZStd,
+            EPOCH_PACK_VERSION,
         )?;
         let mut certs = Pack::<EpochCertificate>::open(
             base_dir.join(Self::CERTS_NAME),
             Self::CERT_PACK_EPOCH,
             false,
             PackCompression::ZStd,
+            EPOCH_PACK_VERSION,
         )?;
 
         let mut epoch_idx: PositionIndex<u64> = PositionIndex::open_pdx_file(

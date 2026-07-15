@@ -240,11 +240,13 @@ impl AllPeers {
         let mut peer = migrated
             .or(rotated)
             .unwrap_or_else(|| Peer::new(bls_public_key, network_key.clone(), Vec::new()));
-        // apply the rotated-to keys and addresses before normalizing: when a carried record is
-        // mid-ban (`Disconnecting { banned: true }`), `normalize_carried_status` completes the ban
-        // through `add_banned_peer`, which reads the record's `known_ip_addresses`. `update_net`
-        // extends (does not replace) the address set, so updating first records the address the
-        // peer presents on the rotated-to key against the ban, not just the rotated-away one
+        // apply the rotated-to keys and advertised addresses to the carried record. when the
+        // record is mid-ban (`Disconnecting { banned: true }`), `normalize_carried_status` then
+        // completes the ban through `add_banned_peer`, which reads `known_ip_addresses` - the IPs
+        // this node has *observed* the peer connecting from. Those observed IPs live on the carried
+        // record and survive the rotation regardless of this call; the addresses merged here are
+        // self-advertised and feed dialing / peer exchange only, never the per-IP ban counter
+        // (GHSA-6qcj-p42p-779j).
         peer.update_net(bls_public_key, network_key, addrs);
         if carried {
             self.normalize_carried_status(&mut peer);
@@ -1134,6 +1136,12 @@ impl AllPeers {
         committee: HashSet<BlsPublicKey>,
     ) -> Vec<(PeerId, PeerAction)> {
         self.apply_committee_membership(committee)
+    }
+
+    /// The current committee slot, as set from authoritative epoch state by
+    /// [`Self::update_committees`].
+    pub(super) fn current_committee(&self) -> &HashSet<BlsPublicKey> {
+        &self.current_committee
     }
 
     /// Whether `bls_key` sits in any tracked committee slot (previous, current, or next).

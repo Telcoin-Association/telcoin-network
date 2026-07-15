@@ -853,6 +853,41 @@ async fn test_self_advertised_connected_peer_confirmed_not_cached_and_bounded() 
 }
 
 #[tokio::test]
+async fn test_self_advertised_multiaddr_set_is_bounded() {
+    // Regression (GHSA-29v6-gvv5-45gx): a non-committee peer that republishes its OWN signed
+    // record over and over, each time advertising a brand-new distinct multiaddr, must not grow
+    // its stored multiaddr set without bound. Before the fix every accepted record `extend`ed the
+    // peer's `multiaddrs` set, so 1_000 records left ~1_000 addresses on a single entry (unbounded
+    // memory growth and O(N) reputation/ban scans). The per-peer cap now bounds the set regardless
+    // of how many records the peer publishes, while a legitimate single-address peer is unaffected.
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // one non-committee peer, self-advertising over its own connection (source == advertised id, so
+    // the sender has proven it owns the transport key and takes the confirm-identity path)
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([21; 32])).public();
+
+    for _ in 0..1_000 {
+        let info = NetworkInfo {
+            pubkey: netkey.clone(),
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+            rpc: None,
+        };
+        peer_manager.add_self_advertised_peer(peer_id, bls, info);
+    }
+
+    let count = peer_manager.peer_multiaddr_count(&peer_id);
+    assert!(
+        matches!(count, Some(n) if n <= crate::peers::MAX_MULTIADDRS_PER_PEER),
+        "a self-advertised republish flood must keep the stored multiaddr set within \
+         MAX_MULTIADDRS_PER_PEER ({}), got {count:?}",
+        crate::peers::MAX_MULTIADDRS_PER_PEER
+    );
+}
+
+#[tokio::test]
 async fn test_known_peers_pruned_on_rotation_but_pinned_survive() {
     // Regression (issue #827): committee members discovered in one epoch must not accumulate across
     // rotations, while operator-provisioned (pinned) peers must never be evicted.
@@ -885,6 +920,125 @@ async fn test_known_peers_pruned_on_rotation_but_pinned_survive() {
     assert!(
         peer_manager.known_peers.contains_key(&pinned_bls),
         "pinned operator peer must survive rotation"
+    );
+}
+
+/// Build a [`NetworkInfo`] like [`random_network_info`], but advertising a valid [`RpcInfo`].
+fn random_network_info_with_rpc() -> (NetworkInfo, RpcInfo) {
+    let rpc = RpcInfo {
+        http: "https://validator.example.com:8545/".parse().expect("http url"),
+        ws: Some("wss://validator.example.com:8546/".parse().expect("ws url")),
+    };
+    let mut info = random_network_info();
+    info.rpc = Some(rpc.clone());
+    (info, rpc)
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_scoped_to_current_committee() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a pinned rpc-advertising peer; pinning keeps its record through committee rotation
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([21; 32])).public();
+    let (info, rpc) = random_network_info_with_rpc();
+    peer_manager.add_known_peer(bls, info);
+
+    // known and advertising, but not a current-committee member: excluded
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "pinned non-committee peer must not appear in the snapshot"
+    );
+
+    // once the peer joins the current committee its advertised rpc is returned
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    assert_eq!(
+        peer_manager.current_committee_rpcs(),
+        vec![(bls, rpc)],
+        "current-committee member's advertised rpc must be returned"
+    );
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_excludes_previous_and_next_only_members() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([22; 32]);
+
+    // rpc-advertising peers with known records, seeded only into previous and next
+    let previous_bls = *BlsKeypair::generate(&mut rng).public();
+    let next_bls = *BlsKeypair::generate(&mut rng).public();
+    let (previous_info, _) = random_network_info_with_rpc();
+    let (next_info, _) = random_network_info_with_rpc();
+    peer_manager.add_known_peer(previous_bls, previous_info);
+    peer_manager.add_known_peer(next_bls, next_info);
+    peer_manager.update_committees(
+        HashSet::from([previous_bls]),
+        HashSet::new(),
+        HashSet::from([next_bls]),
+    );
+    // isolate the call under test from anything update_committees emitted
+    collect_all_events(&mut peer_manager);
+
+    // neither the outgoing nor the incoming member appears in the snapshot
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "previous/next-only members must not appear in the snapshot"
+    );
+    // and no discovery is triggered: the current committee has no missing records
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "previous/next-only members must not trigger discovery from the snapshot call"
+    );
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_ignores_members_without_advertised_rpc() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a current-committee member with a known record that advertises no rpc
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([23; 32])).public();
+    peer_manager.add_known_peer(bls, random_network_info());
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    // isolate the call under test from anything update_committees emitted
+    collect_all_events(&mut peer_manager);
+
+    // the member advertised nothing, so it is excluded from the snapshot ...
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "member without advertised rpc must be excluded"
+    );
+    // ... and its record is known, so no futile re-discovery is triggered
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "a known record without rpc must not trigger discovery from the snapshot call"
+    );
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_triggers_discovery_for_missing_records() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a current-committee member whose node record was never discovered
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([24; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([unknown_bls]), HashSet::new());
+    // drain the MissingAuthorities that update_committees itself emitted so the assertions
+    // below observe only what the snapshot call emits
+    collect_all_events(&mut peer_manager);
+
+    // no record means no rpc entry, but the call re-triggers kad discovery for the member
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "member without a record has no rpc to report"
+    );
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.len() == 1, "expect one fresh missing authorities event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if *missing == [unknown_bls]
     );
 }
 

@@ -69,6 +69,15 @@ mod network_tests;
 /// ~33), so the LRU only ever evicts peers well outside the current working set. See issue #828.
 const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("10_000 is nonzero");
 
+/// Maximum number of multiaddrs a single signed `NodeRecord` may advertise.
+///
+/// A legitimate node advertises exactly one address per record (see `get_peer_record`), so this is
+/// generous headroom. A record exceeding it is rejected at validation, bounding the attacker-chosen
+/// address data admitted per record before it can accumulate on the peer entry
+/// (GHSA-29v6-gvv5-45gx). This is defence in depth for the per-peer set cap
+/// `MAX_MULTIADDRS_PER_PEER`; that set cap is what bounds accumulation across repeated records.
+const MAX_ADVERTISED_MULTIADDRS: usize = 16;
+
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
 /// The behavior composes multiple sub-behaviors:
@@ -525,6 +534,21 @@ where
         // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
         let (pubkey, node_record) = NodeRecord::decode_and_verify(record.value.as_ref(), &key)?;
 
+        // reject records advertising an implausible number of addresses: a legitimate record
+        // carries a single address, so a large set is only ever an attempt to inflate the
+        // publisher's stored multiaddrs without bound (GHSA-29v6-gvv5-45gx). This bounds the
+        // attacker-chosen data admitted per record; the per-peer `MAX_MULTIADDRS_PER_PEER` cap is
+        // what bounds accumulation across repeated records.
+        if node_record.info.multiaddrs.len() > MAX_ADVERTISED_MULTIADDRS {
+            warn!(
+                target: "network-kad",
+                count = node_record.info.multiaddrs.len(),
+                max = MAX_ADVERTISED_MULTIADDRS,
+                "NodeRecord validation failed: advertised multiaddr count exceeds cap"
+            );
+            return None;
+        }
+
         // verify publisher matches the network public key in the record
         // this prevents replay attacks where malicious nodes republish outdated records
         let expected_peer_id: PeerId = node_record.info.pubkey.clone().into();
@@ -911,7 +935,7 @@ where
                 send_or_log_error!(reply, rpc, "GetValidatorRpc");
             }
             NetworkCommand::GetAllValidatorRpcs { reply } => {
-                let rpcs = self.swarm.behaviour().peer_manager.all_rpcs();
+                let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
             NetworkCommand::OpenStream { peer, kind, reply } => {
@@ -1863,8 +1887,17 @@ where
         // reject record
         if publisher_is_banned || source_is_banned {
             error!(target: "network-kad", ?publisher_is_banned, ?source_is_banned, ?source, publisher=?record.publisher, "rejecting put request for record");
-            // handle race condition with PM
-            self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
+            // Do NOT `remove_record(&record.key)` on the reject path. Kademlia runs
+            // with `StoreInserts::FilterBoth`, so this inbound record was never
+            // written to the store; the only record `remove_record` can delete is one
+            // the local node itself published (libp2p removes a key only when the
+            // stored record's publisher is our own peer id; see libp2p-kad
+            // behaviour.rs). The sole locally-published record is our own discovery
+            // record, keyed on our BLS public key with `expires: None`, so an
+            // unauthenticated PUT carrying `publisher = None` and `key = our own key`
+            // would delete it. Because we only re-provide at startup, that deletion
+            // then persists until restart. Reject with a penalty only; never mutate
+            // the store on a key supplied by the sender.
 
             // assess penalty for pushing record without publisher
             if record.publisher.is_none() {

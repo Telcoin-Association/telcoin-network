@@ -180,11 +180,6 @@ impl LibP2pConfig {
     pub fn worker_batch_topic(chain_id: u64) -> String {
         format!("tn-worker-{chain_id}")
     }
-
-    /// Return the worker-transaction gossip topic for `chain_id`.
-    pub fn worker_txn_topic(chain_id: u64) -> String {
-        format!("tn-txn-{chain_id}")
-    }
 }
 
 impl Default for LibP2pConfig {
@@ -576,7 +571,6 @@ hostname: "my-validator"
         assert_eq!(LibP2pConfig::consensus_output_topic(2017), "tn-consensus-output-2017");
         assert_eq!(LibP2pConfig::epoch_vote_topic(2017), "tn-epoch-vote-2017");
         assert_eq!(LibP2pConfig::worker_batch_topic(2017), "tn-worker-2017");
-        assert_eq!(LibP2pConfig::worker_txn_topic(2017), "tn-txn-2017");
         // a different chain id yields a different topic
         assert_ne!(LibP2pConfig::primary_topic(1), LibP2pConfig::primary_topic(2));
     }

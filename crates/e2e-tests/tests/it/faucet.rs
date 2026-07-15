@@ -14,6 +14,7 @@ use tn_reth::{
     faucet_mint_role_slot, test_utils::TransactionFactory, RethChainSpec, RethEnv,
     TELCOIN_PRECOMPILE_ADDRESS,
 };
+use tn_test_utils::wait_until;
 use tn_types::{
     adiri_genesis, hex, sol, Address, Encodable2718 as _, Genesis, GenesisAccount, SolValue,
     TaskManager, B256, U256,
@@ -344,15 +345,20 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     let genesis: Genesis = Config::load_from_path(&genesis_file, ConfigFmt::YAML)?;
     let chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
 
-    info!(target: "faucet-test", "nodes started - sleeping for 15s...");
-
-    tokio::time::sleep(Duration::from_secs(15)).await;
-
-    // verify all three transports (HTTP, WS, IPC) are reachable
-    verify_all_transports(&endpoints[0]).await?;
+    info!(target: "faucet-test", "nodes started - waiting for the network to produce a block...");
 
     let rpc_url = endpoints[0].http_url.clone();
     let client = HttpClientBuilder::default().build(&rpc_url)?;
+
+    // wait for network convergence by polling until the network produces a block
+    wait_until(Duration::from_secs(30), "network produced a block", || async {
+        let block_number: String = client.request("eth_blockNumber", rpc_params![]).await?;
+        Ok(U256::from_str(&block_number)? > U256::ZERO)
+    })
+    .await?;
+
+    // verify all three transports (HTTP, WS, IPC) are reachable
+    verify_all_transports(&endpoints[0]).await?;
 
     // assert deployer starting balance is properly seeded
     let mut caller = TransactionFactory::new();
@@ -428,32 +434,13 @@ async fn test_faucet_drip_tel_and_xyz_e2e() -> eyre::Result<()> {
     let stablecoin_contract = Stablecoin::new(stablecoin_address, provider.clone());
     let expected_xyz_balance = U256::from(1_000_000); // 1e6 (1 XYZ)
 
-    let result = timeout(duration, async {
-        loop {
-            let actual_xyz_balance: U256 =
-                stablecoin_contract.balanceOf(new_recipient).call().await?;
-            debug!(target: "faucet-test", "actual XYZ balance: {:?}", actual_xyz_balance);
-
-            if actual_xyz_balance == expected_xyz_balance {
-                return Ok::<_, eyre::Report>(actual_xyz_balance);
-            }
-
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+    wait_until(duration, "recipient XYZ balance credited", || async {
+        let actual_xyz_balance: U256 = stablecoin_contract.balanceOf(new_recipient).call().await?;
+        debug!(target: "faucet-test", "actual XYZ balance: {:?}", actual_xyz_balance);
+        Ok(actual_xyz_balance == expected_xyz_balance)
     })
-    .await;
-
-    match result {
-        Ok(Ok(balance)) => {
-            info!(target: "faucet-test", "XYZ balance check completed successfully: {}", balance);
-        }
-        Ok(Err(e)) => {
-            panic!("Error while checking XYZ balance: {e:?}");
-        }
-        Err(_) => {
-            panic!("XYZ balance check timed out");
-        }
-    }
+    .await?;
+    info!(target: "faucet-test", "XYZ balance check completed successfully");
 
     // submit concurrent drip calls for TEL to multiple random addresses
     // prepare all txs from the funded caller (nonces increment sequentially)

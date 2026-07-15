@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn test_archive_pdx_index_single() {
         let tmp_path = TempDir::with_prefix("test_archive_pdx_index").expect("temp dir");
-        let data_header = DataHeader::new(0, PackCompression::ZStd);
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
         let mut idx: PositionIndex<u64> = PositionIndex::open_pdx_file(
             tmp_path.path().join("index.pdx"),
             &data_header,
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn test_archive_pdx_index_double() {
         let tmp_path = TempDir::with_prefix("test_archive_pdx_index_double").expect("temp dir");
-        let data_header = DataHeader::new(0, PackCompression::ZStd);
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
         let mut idx: PositionIndex<(u64, u64)> =
             PositionIndex::open_pdx_file(tmp_path.path(), &data_header, "index2.pdx", false)
                 .expect("pdx file");
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn test_archive_pdx_torn_tail_heals() {
         let tmp_path = TempDir::with_prefix("test_archive_pdx_torn").expect("temp dir");
-        let data_header = DataHeader::new(0, PackCompression::ZStd);
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
         let file = tmp_path.path().join("torn.pdx");
 
         {
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn test_archive_pdx_geometry_mismatch() {
         let tmp_path = TempDir::with_prefix("test_archive_pdx_geometry").expect("temp dir");
-        let data_header = DataHeader::new(0, PackCompression::ZStd);
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
 
         {
             let mut idx: PositionIndex<u64> =

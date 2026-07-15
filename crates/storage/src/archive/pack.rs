@@ -44,8 +44,9 @@ where
         uid_idx: u64,
         read_only: bool,
         compression: PackCompression,
+        version: u16,
     ) -> Result<Self, OpenError> {
-        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression)? })
+        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression, version)? })
     }
 
     /// Length of the Pack file.
@@ -188,9 +189,11 @@ where
         uid_idx: u64,
         read_only: bool,
         compression: PackCompression,
+        version: u16,
     ) -> Result<Self, OpenError> {
-        let (data_file, header) = Self::open_data_file(path, uid_idx, read_only, compression)
-            .map_err(OpenError::DataFileOpen)?;
+        let (data_file, header) =
+            Self::open_data_file(path, uid_idx, read_only, compression, version)
+                .map_err(OpenError::DataFileOpen)?;
         Ok(Self {
             header,
             data_file,
@@ -233,33 +236,14 @@ where
     /// Do the actual insert so the public function can rollback easily on an error.
     fn append_inner(&mut self, value: &V) -> Result<u64, AppendError> {
         let record_pos = self.data_file.len();
-        self.value_buffer.clear();
-        encode_into_buffer(&mut self.value_buffer, value)
-            .map_err(|e| AppendError::SerializeValue(e.to_string()))?;
-        let buffer = match self.header.compression {
-            PackCompression::None => &self.value_buffer,
-            PackCompression::ZStd => {
-                self.compression_buffer.clear();
-                let mut compressor =
-                    zstd::stream::write::Encoder::new(&mut self.compression_buffer, 0)?;
-                compressor.write_all(&self.value_buffer)?;
-                compressor.finish()?;
-                &self.compression_buffer
-            }
-        };
 
-        let mut crc32_hasher = crc32fast::Hasher::new();
-        // Once we have written to write_buffer, it needs to be rolled back before returning an
-        // error. Space for the value length.
-        let value_size = (buffer.len() as u32).to_le_bytes();
-        self.data_file.write_all(&value_size)?;
-        crc32_hasher.update(&value_size);
-
-        self.data_file.write_all(buffer)?;
-        crc32_hasher.update(buffer);
-        let crc32 = crc32_hasher.finalize();
-        self.data_file.write_all(&crc32.to_le_bytes())?;
-
+        write_value(
+            value,
+            &mut self.data_file,
+            &mut self.value_buffer,
+            &mut self.compression_buffer,
+            self.header.compression,
+        )?;
         Ok(record_pos)
     }
 
@@ -332,17 +316,19 @@ where
         uid_idx: u64,
         ro: bool,
         compression: PackCompression,
+        version: u16,
     ) -> Result<(DataFile, DataHeader), LoadHeaderError> {
         let mut data_file = DataFile::open(path, ro)?;
         let file_end = data_file.data_file_end();
 
         let header = if file_end == 0 {
-            let header = DataHeader::new(uid_idx, compression);
+            let header = DataHeader::new(uid_idx, compression, version);
             header.write_header(&mut data_file)?;
             header
         } else {
             let header = DataHeader::load_header(&mut data_file, uid_idx)?;
-            if header.version() != 0 {
+            if header.version() > version {
+                // Do not allow a newer version than we request but allow an older.
                 return Err(LoadHeaderError::InvalidVersion);
             }
             if header.appnum() != 1 {
@@ -449,6 +435,48 @@ where
     }
 }
 
+/// Do the actual insert so the public function can rollback easily on an error.
+pub fn write_value<V, W>(
+    value: &V,
+    writer: &mut W,
+    value_buffer: &mut Vec<u8>,
+    mut compression_buffer: &mut Vec<u8>,
+    compression: PackCompression,
+) -> Result<(), std::io::Error>
+where
+    V: Debug + Serialize,
+    W: ?Sized + std::io::Write,
+{
+    value_buffer.clear();
+    encode_into_buffer(value_buffer, value).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let buffer = match compression {
+        PackCompression::None => value_buffer,
+        PackCompression::ZStd => {
+            compression_buffer.clear();
+            {
+                let mut compressor = zstd::stream::write::Encoder::new(&mut compression_buffer, 0)?;
+                compressor.write_all(value_buffer)?;
+                compressor.finish()?;
+            }
+            compression_buffer
+        }
+    };
+
+    let mut crc32_hasher = crc32fast::Hasher::new();
+    // Once we have written to write_buffer, it needs to be rolled back before returning an
+    // error. Space for the value length.
+    let value_size = (buffer.len() as u32).to_le_bytes();
+    writer.write_all(&value_size)?;
+    crc32_hasher.update(&value_size);
+
+    writer.write_all(buffer)?;
+    crc32_hasher.update(buffer);
+    let crc32 = crc32_hasher.finalize();
+    writer.write_all(&crc32.to_le_bytes())?;
+
+    Ok(())
+}
+
 /// Size of the data file header.
 pub const DATA_HEADER_BYTES: usize = 28;
 
@@ -471,9 +499,9 @@ pub struct DataHeader {
 }
 
 impl DataHeader {
-    pub(crate) fn new(uid_idx: u64, compression: PackCompression) -> Self {
+    pub(crate) fn new(uid_idx: u64, compression: PackCompression, version: u16) -> Self {
         let uid = Self::gen_uid(uid_idx);
-        Self { type_id: *b"telnet", version: 0, uid, appnum: 1, compression }
+        Self { type_id: *b"telnet", version, uid, appnum: 1, compression }
     }
 
     /// Load a DataHeader from source.
@@ -640,7 +668,7 @@ mod tests {
     fn archive_pack_(compression: PackCompression) {
         let tmp_path = TempDir::with_prefix("test_archive_pack_one").expect("temp dir");
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression)
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression, 0)
                 .expect("open pack");
         let pos_1 = db.append(&TestRec { idx: 1, name: "Value One".to_string() }).expect("append");
         let pos_2 = db.append(&TestRec { idx: 2, name: "Value Two".to_string() }).expect("append");
@@ -688,7 +716,7 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression)
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, false, compression, 0)
                 .expect("open pack");
         let pos_1_2 =
             db.append(&TestRec { idx: 6, name: "Value One2".to_string() }).expect("append");
@@ -709,7 +737,7 @@ mod tests {
         drop(db);
 
         let mut db: TestPack =
-            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression)
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression, 0)
                 .expect("open pack");
         let v = db.fetch(pos_1_2).unwrap();
         assert_eq!(v.idx, 6);
@@ -755,8 +783,9 @@ mod tests {
         assert_eq!(v.name, "Value Three2");
         assert!(iter.next().is_none());
 
-        let db: TestPack = Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression)
-            .expect("open pack");
+        let db: TestPack =
+            Pack::open(tmp_path.path().join("pack_test_one"), 0, true, compression, 0)
+                .expect("open pack");
         let mut iter = db.raw_iter().unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);
@@ -809,7 +838,7 @@ mod tests {
         let path = tmp_path.path().join("pack_bomb");
         {
             let _pack: TestPack =
-                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+                Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
         }
         let pos = fs::metadata(&path).expect("metadata").len();
 
@@ -849,7 +878,7 @@ mod tests {
         let path = tmp_path.path().join("pack_corrupt");
         let pos = {
             let mut pack: TestPack =
-                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+                Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
             pack.append(&TestRec { idx: 1, name: "f4 fixture".to_string() }).expect("append")
         };
 
@@ -897,7 +926,7 @@ mod tests {
         let (tmp_dir, pos) = build_pack_with_decompression_bomb();
         let path = tmp_dir.path().join("pack_bomb");
         let mut pack: TestPack =
-            Pack::open(&path, 0, true, PackCompression::ZStd).expect("open pack");
+            Pack::open(&path, 0, true, PackCompression::ZStd, 0).expect("open pack");
         match pack.fetch(pos) {
             Err(FetchError::RequestedDecompressSizeTooLarge(max)) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
@@ -946,7 +975,7 @@ mod tests {
         let (tmp_dir, pos) = build_pack_with_corrupt_zstd_frame();
         let path = tmp_dir.path().join("pack_corrupt");
         let mut pack: TestPack =
-            Pack::open(&path, 0, true, PackCompression::ZStd).expect("open pack");
+            Pack::open(&path, 0, true, PackCompression::ZStd, 0).expect("open pack");
         match pack.fetch(pos) {
             Err(FetchError::IO(_)) | Err(FetchError::DeserializeValue(_)) => {}
             other => panic!("expected IO or DeserializeValue error, got {other:?}"),
@@ -987,16 +1016,16 @@ mod tests {
         let path = tmp_path.path().join("pack_badver");
         {
             let mut pack: TestPack =
-                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+                Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
             pack.append(&TestRec { idx: 1, name: "v".to_string() }).expect("append");
             pack.commit().expect("commit");
         }
-        // Patch version (bytes 6..8) to 1 and re-stamp the header CRC over bytes [0, 24).
+        // Patch version (bytes 6..8) to 100 and re-stamp the header CRC over bytes [0, 24).
         let mut header = [0_u8; DATA_HEADER_BYTES];
         {
             let mut file = OpenOptions::new().read(true).write(true).open(&path).expect("open rw");
             file.read_exact(&mut header).expect("read header");
-            header[6..8].copy_from_slice(&1_u16.to_le_bytes());
+            header[6..8].copy_from_slice(&100_u16.to_le_bytes());
             add_crc32(&mut header);
             file.seek(SeekFrom::Start(0)).expect("seek");
             file.write_all(&header).expect("write header");
@@ -1032,7 +1061,7 @@ mod tests {
         let tmp_path = TempDir::with_prefix("test_read_bytes_oob").expect("temp dir");
         let path = tmp_path.path().join("pack_oob");
         let mut pack: TestPack =
-            Pack::open(&path, 0, false, PackCompression::None).expect("open pack");
+            Pack::open(&path, 0, false, PackCompression::None, 0).expect("open pack");
         pack.append(&TestRec { idx: 1, name: "x".to_string() }).expect("append");
         pack.commit().expect("commit");
 

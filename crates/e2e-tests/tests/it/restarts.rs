@@ -2,9 +2,10 @@
 
 use super::common::{kill_child, ProcessGuard};
 use crate::common::{
-    address_from_word, get_balance, get_balance_above_with_retry, get_block, get_block_number,
-    get_key, get_latest_consensus_header_number, get_node_info, get_positive_balance_with_retry,
-    network_advancing, send_and_confirm, send_tel, start_observer, start_validator, WEI_PER_TEL,
+    address_from_word, advertise_worker_rpc, get_balance, get_balance_above_with_retry, get_block,
+    get_block_number, get_key, get_latest_consensus_header_number, get_node_info,
+    get_positive_balance_with_retry, network_advancing, send_and_confirm, send_tel, start_observer,
+    start_validator, WEI_PER_TEL,
 };
 use e2e_tests::{config_local_testnet, TestBinary};
 use eyre::Report;
@@ -17,6 +18,7 @@ use std::{
     process::Child,
     time::{Duration, Instant},
 };
+use tn_test_utils::wait_until_blocking;
 use tn_types::get_available_tcp_port;
 use tracing::{error, info};
 
@@ -436,6 +438,9 @@ fn test_restarts_observer() -> eyre::Result<()> {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
         client_urls[i].push_str(&format!(":{rpc_port}"));
+        // The observer forwards accepted txns to the committee's advertised RPC
+        // endpoints; without this the forward has no targets and txns are dropped.
+        advertise_worker_rpc(&temp_path, i, rpc_port)?;
         guard.push(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
@@ -555,29 +560,18 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
     guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "late_join", 0));
 
-    // Observer must catch up to at least the validator consensus height we recorded
-    let mut retries = 0;
-    let max_retries = 120; // 120 seconds max
-    let caught_up = loop {
-        if let Ok(obs_consensus_height) = get_latest_consensus_header_number(&obs_url) {
-            if obs_consensus_height >= validator_consensus_height {
-                info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height, "observer caught up");
-                break true;
-            }
-            info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height, retries, "observer still catching up");
-        }
-        retries += 1;
-        if retries >= max_retries {
-            break false;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    };
-
-    // Guard cleanup handles all process shutdown on drop
-    assert!(
-        caught_up,
-        "Observer did not catch up within {max_retries}s. Check logs in test_logs/late_join/"
-    );
+    // Observer must catch up to at least the validator consensus height we recorded.
+    // Guard cleanup handles all process shutdown on drop; on timeout the `?` surfaces the
+    // same effective failure ("observer did not catch up") the old assert produced.
+    wait_until_blocking(
+        Duration::from_secs(120),
+        "observer caught up to validator (test_logs/late_join/)",
+        || {
+            Ok(get_latest_consensus_header_number(&obs_url)
+                .map(|h| h >= validator_consensus_height)
+                .unwrap_or(false))
+        },
+    )?;
     Ok(())
 }
 
@@ -641,24 +635,17 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
     signal::kill(obs_pid, Signal::SIGCONT)?;
     info!(target: "restart-test", "observer resumed, waiting for catchup");
 
-    // Observer must catch up
-    let mut retries = 0;
-    let max_retries = 60;
-    let caught_up = loop {
-        if let Ok(obs_consensus_height) = get_latest_consensus_header_number(&obs_url) {
-            if obs_consensus_height >= validator_consensus_height_during_pause {
-                info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height_during_pause, "observer recovered");
-                break true;
-            }
-        }
-        retries += 1;
-        if retries >= max_retries {
-            break false;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    };
-
-    // Guard cleanup handles all process shutdown on drop
-    assert!(caught_up, "Observer did not recover within {max_retries}s after SIGCONT. Check logs in test_logs/reconnect/");
+    // Observer must catch up. Guard cleanup handles all process shutdown on drop; on timeout
+    // the `?` surfaces the same effective failure ("observer did not recover") the old assert
+    // produced.
+    wait_until_blocking(
+        Duration::from_secs(60),
+        "observer recovered after SIGCONT (test_logs/reconnect/)",
+        || {
+            Ok(get_latest_consensus_header_number(&obs_url)
+                .map(|h| h >= validator_consensus_height_during_pause)
+                .unwrap_or(false))
+        },
+    )?;
     Ok(())
 }

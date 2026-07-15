@@ -23,7 +23,7 @@ use futures::{
 use std::time::Duration;
 use tn_network_libp2p::{read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame};
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{encode, try_decode, BlsPublicKey, Certificate, Epoch};
+use tn_types::{encode, encoded_size, try_decode, BlsPublicKey, Certificate, Epoch};
 use tokio::io::{AsyncRead as TokioAsyncRead, AsyncReadExt as _};
 use tracing::debug;
 
@@ -74,6 +74,11 @@ const MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// responder cap so the batch that carries an honest responder past
 /// [`MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES`] is still accepted, while a responder
 /// that ignores `End` and streams unboundedly is cut off.
+///
+/// This bounds a *single* exchange. The requester (`fetch_from_peers`) staggers several
+/// fetches and cancels only on the first success, so a catch-up round can hold multiple
+/// exchanges open at once; the process-wide requester peak is that concurrency times this
+/// cap. See `fetch_from_peers` for the aggregate envelope (issue #822, finding 2).
 const MAX_SYNC_MISSING_CERTS_ACCEPT_BYTES: usize =
     MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES + MAX_SYNC_CERT_FRAME_SIZE;
 
@@ -298,6 +303,93 @@ where
     }
 }
 
+/// Serve an accepted single-consensus-output sync exchange over `stream`.
+///
+/// `bytes` is the output's pack-file-encoded bytes when the responder holds it, or
+/// `None` when it is unavailable (an unknown number, or one not yet built during
+/// catch-up). An unavailable output sheds with
+/// [`SyncFrame::Deny`]`(`[`DenyReason::Unavailable`]`)` so the requester retries
+/// another peer immediately instead of waiting out its ack timeout. Otherwise it
+/// writes [`SyncFrame::Ack`], streams the bytes as [`SyncFrame::Data`] frames, and
+/// ends with [`SyncFrame::End`]. Reuses the epoch-pack chunk framing
+/// ([`write_pack_data_frames`]) and its [`MAX_SYNC_PACK_FRAME_SIZE`] bound, so the
+/// requester reassembles it with [`read_sync_consensus_output`]. Each frame write
+/// is bounded by `buffer_timeout` so a peer that stops reading cannot pin the
+/// responder task. The caller has already admitted the exchange against the
+/// concurrency caps and read the opening request frame.
+pub(crate) async fn send_sync_consensus_output_over_stream<S>(
+    stream: &mut S,
+    bytes: Option<Vec<u8>>,
+    buffer_timeout: Duration,
+    peer: BlsPublicKey,
+    number: u64,
+) -> PrimaryNetworkResult<()>
+where
+    S: FuturesAsyncWrite + Unpin + Send,
+{
+    let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+
+    // an unavailable output sheds with `Deny(Unavailable)` so the requester retries
+    // elsewhere without waiting out its ack timeout, exactly as the epoch-pack serve
+    // does on a `get_epoch_stream` miss.
+    let Some(bytes) = bytes else {
+        debug!(target: "primary::network", %peer, number, "consensus output unavailable; denying sync request");
+        write_one_frame(
+            stream,
+            &SyncFrame::Deny(DenyReason::Unavailable),
+            &mut encode_buffer,
+            &mut compressed_buffer,
+            MAX_SYNC_PACK_FRAME_SIZE,
+            buffer_timeout,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    // accept and flush immediately so the requester sees the `Ack` within its ack
+    // timeout, then stream the output bytes as fixed-size `Data` frames.
+    write_one_frame(
+        stream,
+        &SyncFrame::Ack,
+        &mut encode_buffer,
+        &mut compressed_buffer,
+        MAX_SYNC_PACK_FRAME_SIZE,
+        buffer_timeout,
+    )
+    .await?;
+    write_pack_data_frames(&mut std::io::Cursor::new(bytes), stream, buffer_timeout).await?;
+    Ok(())
+}
+
+/// Reassemble the `Data`/`End` frames of an accepted consensus-output sync
+/// exchange into a contiguous byte vector, bounded to `max_bytes`.
+///
+/// The caller has already read the opening [`SyncFrame::Ack`]; this reads the
+/// `Data`/`End` stream through [`sync_pack_reader`] (so an [`SyncFrame::Err`] or an
+/// out-of-place frame surfaces as a read error). Each frame is bounded by the
+/// per-frame [`EPOCH_PACK_FRAME_TIMEOUT`] inside the reader (the analog of the
+/// legacy per-read timeout), and a stream exceeding `max_bytes` is rejected with
+/// [`std::io::ErrorKind::InvalidData`] rather than silently truncated, matching the
+/// legacy size guard.
+pub(crate) async fn read_sync_consensus_output<S>(
+    stream: S,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>>
+where
+    S: FuturesAsyncRead + Unpin + Send + 'static,
+{
+    let mut out = Vec::new();
+    // read one byte past the cap so an over-cap stream is detected here rather than
+    // silently truncated by `take`.
+    sync_pack_reader(stream).take(max_bytes as u64 + 1).read_to_end(&mut out).await?;
+    (out.len() <= max_bytes).then_some(out).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "consensus output stream exceeded maximum size",
+        )
+    })
+}
+
 /// Serve an accepted missing-certificates sync exchange over `stream`.
 ///
 /// Writes [`SyncFrame::Ack`], then streams the certificates yielded by `certs` as
@@ -350,7 +442,9 @@ where
     // A storage error yielded by `certs` short-circuits the fold and propagates so the
     // caller signals `SyncFrame::Err`.
     futures::stream::iter(certs)
-        .map(|cert| cert.map(|cert| (encode(&cert).len(), cert)))
+        .map(|cert| {
+            cert.and_then(|cert| encoded_size(&cert).map(|size| (size, cert)).map_err(Into::into))
+        })
         .scan(0usize, |sent, sized| {
             let within_cap = *sent < MAX_SYNC_MISSING_CERTS_RESPONSE_BYTES;
             futures::future::ready(within_cap.then(|| sized.inspect(|(size, _)| *sent += *size)))
@@ -639,6 +733,136 @@ mod tests {
         assert!(
             read_back(framed).await.is_err(),
             "an unexpected control frame mid-stream must surface as a read error"
+        );
+    }
+
+    /// The consensus-output serve writes `Ack` then the exact output bytes as
+    /// `Data`+`End`, and `read_sync_consensus_output` reassembles them
+    /// byte-for-byte across chunk boundaries. This is the wire contract between an
+    /// item-9b responder and an item-9b requester.
+    #[tokio::test]
+    async fn sync_consensus_output_round_trip() {
+        // one full chunk plus a partial one, so the reader spans a frame boundary
+        let original: Vec<u8> =
+            (0..(SYNC_PACK_CHUNK_SIZE + 777)).map(|i| (i % 251) as u8).collect();
+        let mut wire = Vec::new();
+        send_sync_consensus_output_over_stream(
+            &mut wire,
+            Some(original.clone()),
+            Duration::from_secs(5),
+            BlsPublicKey::default(),
+            7,
+        )
+        .await
+        .expect("serve consensus output");
+
+        // consume the opening `Ack`, then reassemble the remaining `Data`/`End` frames
+        let mut cursor = futures::io::Cursor::new(wire);
+        let (mut dec, mut comp) = (Vec::new(), Vec::new());
+        let ack = read_frame::<_, PrimarySyncRequest>(
+            &mut cursor,
+            &mut dec,
+            &mut comp,
+            MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await
+        .expect("read ack");
+        assert!(matches!(ack, SyncFrame::Ack), "first frame must be Ack");
+        let received = read_sync_consensus_output(cursor, SYNC_PACK_CHUNK_SIZE * 8)
+            .await
+            .expect("reassemble output");
+        assert_eq!(received, original, "reassembled bytes must equal the served output");
+    }
+
+    /// An empty served output streams `Ack` then only `End`; the reader yields zero
+    /// bytes cleanly (distinct from the `None`/`Deny` unavailable case below).
+    #[tokio::test]
+    async fn sync_consensus_output_round_trip_empty() {
+        let mut wire = Vec::new();
+        send_sync_consensus_output_over_stream(
+            &mut wire,
+            Some(Vec::new()),
+            Duration::from_secs(5),
+            BlsPublicKey::default(),
+            7,
+        )
+        .await
+        .expect("serve empty consensus output");
+        let mut cursor = futures::io::Cursor::new(wire);
+        let (mut dec, mut comp) = (Vec::new(), Vec::new());
+        let ack = read_frame::<_, PrimarySyncRequest>(
+            &mut cursor,
+            &mut dec,
+            &mut comp,
+            MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await
+        .expect("read ack");
+        assert!(matches!(ack, SyncFrame::Ack), "first frame must be Ack");
+        let received = read_sync_consensus_output(cursor, SYNC_PACK_CHUNK_SIZE * 8)
+            .await
+            .expect("reassemble output");
+        assert!(received.is_empty(), "an empty served output reassembles to zero bytes");
+    }
+
+    /// An unavailable output (`None`) is shed with `Deny(Unavailable)` and no `Ack`,
+    /// so a sync requester retries another peer immediately.
+    #[tokio::test]
+    async fn sync_consensus_output_unavailable_denies() {
+        let mut wire = Vec::new();
+        send_sync_consensus_output_over_stream(
+            &mut wire,
+            None,
+            Duration::from_secs(5),
+            BlsPublicKey::default(),
+            7,
+        )
+        .await
+        .expect("serving an unavailable output sheds cleanly");
+        let (mut dec, mut comp) = (Vec::new(), Vec::new());
+        let frame = read_frame::<_, PrimarySyncRequest>(
+            &mut futures::io::Cursor::new(wire),
+            &mut dec,
+            &mut comp,
+            MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await
+        .expect("read deny");
+        assert!(
+            matches!(frame, SyncFrame::Deny(DenyReason::Unavailable)),
+            "an unavailable output must deny"
+        );
+    }
+
+    /// A served stream exceeding `max_bytes` is rejected rather than silently
+    /// truncated, mirroring the legacy size guard.
+    #[tokio::test]
+    async fn read_sync_consensus_output_rejects_oversize() {
+        let original: Vec<u8> = (0..(SYNC_PACK_CHUNK_SIZE + 10)).map(|i| (i % 251) as u8).collect();
+        let mut wire = Vec::new();
+        send_sync_consensus_output_over_stream(
+            &mut wire,
+            Some(original),
+            Duration::from_secs(5),
+            BlsPublicKey::default(),
+            7,
+        )
+        .await
+        .expect("serve consensus output");
+        let mut cursor = futures::io::Cursor::new(wire);
+        let (mut dec, mut comp) = (Vec::new(), Vec::new());
+        read_frame::<_, PrimarySyncRequest>(
+            &mut cursor,
+            &mut dec,
+            &mut comp,
+            MAX_SYNC_PACK_FRAME_SIZE,
+        )
+        .await
+        .expect("read ack");
+        // cap below the served size: reassembly must error, not truncate
+        assert!(
+            read_sync_consensus_output(cursor, SYNC_PACK_CHUNK_SIZE).await.is_err(),
+            "an over-cap stream must be rejected"
         );
     }
 

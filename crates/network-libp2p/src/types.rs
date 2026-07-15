@@ -514,7 +514,8 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Option<RpcInfo>>,
     },
-    /// Snapshot of all known authority RPCs.
+    /// Snapshot of the current committee's advertised RPCs; triggers kad discovery
+    /// for members with no known record.
     GetAllValidatorRpcs {
         /// The reply to caller.
         reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
@@ -820,11 +821,13 @@ where
         rx.await.map_err(Into::into)
     }
 
-    /// Snapshot of all known authority RPCs.
+    /// Snapshot of the current committee's advertised RPCs.
     ///
-    /// Returns the RPC info for every known authority that has advertised it.
-    /// Callers that need fresh data should call [`Self::find_authorities`] first
-    /// and wait for discovery to complete.
+    /// Returns the RPC info for every current-committee validator that has
+    /// advertised it. Pinned operator peers and previous/next committee members
+    /// never appear. The call itself (re)triggers kad discovery for current
+    /// members whose node records are still unknown, so a polling caller picks
+    /// up their entries on a later call once the records arrive.
     ///
     /// Only worker [`NodeRecord`]s carry RPC info, so this returns entries on a
     /// worker network handle and an empty list on a primary handle. This is the

@@ -36,6 +36,7 @@ tn-storage = { workspace = true, features = ["test-utils"] }
 tn-batch-validator = { workspace = true }
 tn-engine = { workspace = true }
 tn-batch-builder = { workspace = true, features = ["test-utils"] }
+tn-test-utils = { workspace = true }
 
 [features]
 default = []
