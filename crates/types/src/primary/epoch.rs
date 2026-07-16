@@ -92,6 +92,20 @@ impl EpochRecord {
     /// Provide a super quorum, this is 2/3 of committee size plus one.
     /// With this many signers of an epoch record we are safe unless a
     /// super majority of validators are byzantine.
+    ///
+    /// The quorum base is this record's own committee. When that committee is a
+    /// tolerated mid-epoch shrink of the previous record's `next_committee`
+    /// (see [`Self::committee_compatible`]), the margin thins at the floor:
+    /// with `e` expected members shrunk to `n = ceil(2e/3)`, the
+    /// certificate-overlap margin `2 * super_quorum(n) - n` only meets — no
+    /// longer exceeds — the expected committee's fault bound `f = (e - 1) / 3`
+    /// (e.g. e = 10, n = 7: quorum 5, overlap 3 = f). Safety still holds for a
+    /// single step: honest nodes derive the record deterministically (they
+    /// never sign two digests for one epoch), and a shrunken committee must be
+    /// a subset of `expected` with at least `ceil(2e/3)` members, so any
+    /// quorum over it contains more than `f` members of the expected set. This
+    /// argument is per-step only; see the cumulative-shrink caveat on
+    /// [`Self::committee_compatible`].
     pub fn super_quorum(&self) -> usize {
         ((self.committee.len() * 2) / 3) + 1
     }
@@ -114,6 +128,20 @@ impl EpochRecord {
     /// - `n < e`: valid only if the shrunken committee keeps at least 4 members, keeps a BFT-safe
     ///   super majority of the expected committee (`n * 3 >= e * 2`, an integer-safe `n >=
     ///   ceil(2e/3)`), and every member was part of `expected`
+    ///
+    /// # Cumulative-shrink caveat
+    ///
+    /// The `n * 3 >= e * 2` bound is applied per record-chain step, against the
+    /// immediately-previous record only. Consecutive tolerated shrinks
+    /// compound: k shrinking epochs can retain as little as `(2/3)^k` of the
+    /// last full-strength committee (10 -> 7 -> 5 -> 4 in three epochs, each
+    /// step individually valid). A compounded committee's `super_quorum` can
+    /// fall to the fault bound of the original committee (`super_quorum(4) ==
+    /// 3 == (10 - 1) / 3`), so the guarantee that a record quorum always
+    /// exceeds the original committee's byzantine bound holds per step but NOT
+    /// cumulatively. This is a deliberate trade-off to keep the record chain
+    /// live under honest governance ejections; a rolling-baseline bound and an
+    /// on-chain committee floor are tracked as follow-up work.
     pub fn committee_compatible(&self, expected: &BTreeSet<BlsPublicKey>) -> bool {
         let committee: BTreeSet<BlsPublicKey> = self.committee.iter().copied().collect();
         if committee.len() != self.committee.len() {
