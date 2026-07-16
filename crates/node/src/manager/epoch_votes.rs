@@ -60,9 +60,13 @@ async fn manage_epoch_votes(
     if committee_keys.contains(&me) {
         committee_keys.remove(&me);
         let epoch_vote = epoch_rec.sign_vote(&key_config);
-        sigs.push(epoch_vote.signature);
+        // The aggregate must hold exactly one signature per bitmap bit, so a
+        // signature is only ever pushed when its authority index is newly
+        // inserted — a redelivered vote can then never desync the two.
         if let Some(idx) = committee_index.get(&me) {
-            signed_authorities.insert(*idx as u32);
+            if signed_authorities.insert(*idx as u32) {
+                sigs.push(epoch_vote.signature);
+            }
         }
         info!(
             target: "epoch-manager",
@@ -71,14 +75,12 @@ async fn manage_epoch_votes(
         let _ = primary_network.publish_epoch_vote(epoch_vote).await;
         my_vote = Some(epoch_vote);
     }
-    let epoch_hash = epoch_rec.digest();
     // Collect votes from peers
     let mut reached_quorum = false;
     let mut timeout = Duration::from_millis(2500);
     let mut timeouts = 0;
     let mut alt_recs: HashMap<EpochDigest, usize> = HashMap::default();
-    let mut committee_keys: HashSet<BlsPublicKey> = epoch_rec.committee.iter().copied().collect();
-    let committee_size = committee_keys.len() as u64;
+    let committee_size = epoch_rec.committee.len() as u64;
     let quorum = epoch_rec.super_quorum();
     loop {
         tokio::select! {
@@ -96,9 +98,10 @@ async fn manage_epoch_votes(
                         {
                             let source = vote.public_key;
                             if committee_keys.remove(&source) {
-                                sigs.push(vote.signature);
                                 if let Some(idx) = committee_index.get(&source) {
-                                    signed_authorities.insert(*idx as u32);
+                                    if signed_authorities.insert(*idx as u32) {
+                                        sigs.push(vote.signature);
+                                    }
                                 }
                                 if signed_authorities.len() >= quorum as u64 {
                                     reached_quorum = true;
@@ -440,6 +443,101 @@ mod epoch_vote_collector_tests {
         let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
         assert_eq!(cert.epoch_hash, epoch_hash);
         assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
+
+        // Shutdown
+        node_shutdown.notify();
+    }
+
+    /// A redelivered copy of the node's own vote (e.g. a gossip echo) must not add a
+    /// duplicate signature to the aggregate. The vote loop's committee set must keep the
+    /// node's own key removed after self-signing; if the key resurfaces, the echoed
+    /// self-vote pushes a second copy of the node's signature into `sigs` while the
+    /// authority bitmap stays deduplicated — the aggregate then no longer matches the
+    /// bitmap's public keys, certificate verification fails, and no cert is stored.
+    #[tokio::test]
+    async fn test_redelivered_self_vote_does_not_corrupt_aggregate() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+
+        // Node is kp1
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        // Committee of 4: super_quorum = (4*2)/3 + 1 = 3
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir =
+            TempDir::with_prefix("test_redelivered_self_vote_does_not_corrupt_aggregate").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+
+        // Mock network: drain commands and reply to Publish
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = Notifier::new();
+
+        // The node's own vote, as gossip would echo it back
+        let echoed_self_vote = epoch_rec.sign_vote(&key_config);
+
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.subscribe(),
+        );
+
+        // Buffer the echoed self-vote plus two peer votes: kp1 (self-sign) + kp2 + kp3 = quorum 3
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        consensus_bus.app().new_epoch_votes().send(echoed_self_vote).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc2)).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
+
+        // Send the epoch record — collector wakes up, self-signs, reads buffered votes
+        consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+
+        // After reaching quorum the collector waits up to 1s for more votes before aggregating
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+
+        // The cert must exist and verify: a corrupted aggregate (duplicate self-signature)
+        // fails verify_with_cert and is never stored
+        let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
+        assert_eq!(cert.epoch_hash, epoch_hash);
+        assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
+        // Exactly the three distinct signers (committee indices 0..=2) are in the bitmap
+        assert_eq!(cert.signed_authorities.len(), 3, "self vote must be counted exactly once");
+        assert!(cert.signed_authorities.contains(0));
+        assert!(cert.signed_authorities.contains(1));
+        assert!(cert.signed_authorities.contains(2));
 
         // Shutdown
         node_shutdown.notify();
