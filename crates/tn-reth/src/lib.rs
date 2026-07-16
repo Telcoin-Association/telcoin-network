@@ -1709,6 +1709,12 @@ impl RethEnv {
     /// - get current epoch info
     /// - getValidator token id by address
     /// - getValidator info by token id
+    ///
+    /// The committee arrays this returns mutate mid-epoch: a governance `burn` swap-and-pops the
+    /// ejected validator out of the CURRENT epoch's stored committees immediately, so tip reads
+    /// before and after the burn disagree. Epoch-scoped consensus reads (committee construction,
+    /// rewards seeding, quorum) must use [`Self::epoch_state_at_epoch_start`] instead; the tip
+    /// read remains correct for point-in-time queries.
     pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         let canonical_tip = self.canonical_tip();
         debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
@@ -1756,6 +1762,71 @@ impl RethEnv {
         Ok(epoch_state)
     }
 
+    /// Read the CURRENT epoch's [`EpochState`] pinned to the epoch's start state — the previous
+    /// epoch's closing block (genesis for epoch 0) — returning the pin header alongside it.
+    ///
+    /// Bootstrapping reads the current epoch number and its
+    /// [`EpochInfo`](ConsensusRegistry::EpochInfo) at the canonical tip. This is deterministic at
+    /// ANY tip because `concludeEpoch` writes the epoch number and the `EpochInfo` scalars this
+    /// method consumes (`blockHeight`) exactly once at the boundary and never mid-epoch — only
+    /// the committee ARRAYS mutate mid-epoch (governance `burn` swap-and-pops immediately,
+    /// including the committee embedded in `EpochInfo`), which is why the full state read below
+    /// is pinned instead of taken at the tip.
+    ///
+    /// The pin: `epoch_info.blockHeight` is the entered epoch's first block, so `blockHeight - 1`
+    /// is the previous epoch's closing block — the block whose execution ran `concludeEpoch` and
+    /// seated the entered committee. For epoch 0 the pin is genesis, whose execution seeds the
+    /// registry: genesis state IS epoch 0's start state.
+    ///
+    /// Every field of the returned state derives from the previous epoch's closing block, so any
+    /// node entering (or re-entering) the same epoch — fresh boundary crossing, crash-restart
+    /// replay, or ModeChange re-entry, before or after a mid-epoch burn — derives an IDENTICAL
+    /// epoch view (committee membership included).
+    pub fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
+        // boundary-written-once identity read: deterministic at any tip
+        let (epoch, epoch_info) = self.get_current_epoch_info_at_header(&self.canonical_tip())?;
+
+        let pin_header = if epoch == 0 {
+            self.sealed_header_by_number(0)?.ok_or_else(|| eyre::eyre!("missing genesis header"))?
+        } else {
+            let closing_number = epoch_info
+                .blockHeight
+                .checked_sub(1)
+                .ok_or_else(|| eyre::eyre!("current epoch {epoch} reports blockHeight 0"))?;
+            self.sealed_header_by_number(closing_number)?.ok_or_else(|| {
+                eyre::eyre!("missing closing block {closing_number} for current epoch {epoch}")
+            })?
+        };
+        debug!(
+            target: "engine",
+            ?epoch,
+            pin_number = pin_header.number,
+            pin_hash = ?pin_header.hash(),
+            "retrieving epoch state at epoch start"
+        );
+
+        let state = self.epoch_state_at_header(&pin_header)?;
+
+        // Tripwire: `concludeEpoch` executes INSIDE the closing block, so the registry at the
+        // closing header already reports the entered epoch. This can only fire if the registry's
+        // `blockHeight == closing block + 1` convention ever breaks — running a stale committee
+        // is a consensus-safety failure, so fail hard instead of returning the mismatched state.
+        debug_assert_eq!(
+            state.epoch, epoch,
+            "epoch state pinned to the closing block reports a different epoch"
+        );
+        if state.epoch != epoch {
+            return Err(eyre::eyre!(
+                "epoch state pinned to block {} reports epoch {} but the canonical tip reports \
+                 epoch {epoch}",
+                pin_header.number,
+                state.epoch
+            ));
+        }
+
+        Ok((state, pin_header))
+    }
+
     /// Read the latest committee and epoch information from the [ConsensusRegistry] on-chain.
     pub fn validators_for_epoch(
         &self,
@@ -1766,11 +1837,48 @@ impl RethEnv {
         self.read_consensus_registry(calldata).map_err(Into::into)
     }
 
+    /// Read the committee validators for the provided epoch from the [ConsensusRegistry], pinned
+    /// to the state of the block identified by `block_hash`.
+    ///
+    /// Unlike [`Self::validators_for_epoch`], which reads the mutable canonical tip, every node
+    /// issuing this read at the same block decodes the identical committee — even after a
+    /// mid-epoch governance `burn` swap-and-pops the stored committee arrays.
+    pub fn validators_for_epoch_at_block(
+        &self,
+        epoch: u32,
+        block_hash: B256,
+    ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
+        debug!(target: "engine", ?block_hash, "retrieving validators for epoch {epoch} at pinned block");
+        let header = self
+            .sealed_header_by_hash(block_hash)?
+            .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+        let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
+        self.read_consensus_registry_at_header(&header, calldata).map_err(Into::into)
+    }
+
     /// Read the BLS pubkeys for the committee of the provided epoch from the [ConsensusRegistry]
     /// on-chain.
     pub fn bls_pubkeys_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
         let calldata = ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into();
         self.read_consensus_registry(calldata).map_err(Into::into)
+    }
+
+    /// Read the BLS pubkeys for the committee of the provided epoch from the
+    /// [ConsensusRegistry], pinned to the state of the block identified by `block_hash`.
+    ///
+    /// Unlike [`Self::bls_pubkeys_for_epoch`], which reads the mutable canonical tip, every node
+    /// issuing this read at the same block decodes the identical key set — even after a
+    /// mid-epoch governance `burn` swap-and-pops the stored committee arrays.
+    pub fn bls_pubkeys_for_epoch_at_block(
+        &self,
+        epoch: u32,
+        block_hash: B256,
+    ) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
+        let header = self
+            .sealed_header_by_hash(block_hash)?
+            .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+        let calldata = ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into();
+        self.read_consensus_registry_at_header(&header, calldata).map_err(Into::into)
     }
 
     /// Build an EVM at the canonical tip, execute a read-only [ConsensusRegistry] call, and
@@ -1790,7 +1898,45 @@ impl RethEnv {
         })
     }
 
+    /// Build an EVM at `header`'s state, execute a read-only [ConsensusRegistry] call, and
+    /// decode the returned data to `T`.
+    ///
+    /// Convenience wrapper over [`Self::read_consensus_registry_batch_at_header`] for the common
+    /// single-read case (one pinned EVM, one call).
+    pub fn read_consensus_registry_at_header<T>(
+        &self,
+        header: &SealedHeader,
+        calldata: Bytes,
+    ) -> EvmReadResult<T>
+    where
+        T: alloy::sol_types::SolValue,
+        T: From<
+            <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
+        >,
+    {
+        self.read_consensus_registry_batch_at_header(header, vec![calldata])?.pop().ok_or_else(
+            || EvmReadError::Internal("consensus registry batch read returned no result".into()),
+        )
+    }
+
     /// Build a single EVM at the canonical tip and execute several read-only [ConsensusRegistry]
+    /// calls against it, decoding each result to `T`.
+    ///
+    /// Thin specialization of [`Self::read_consensus_registry_batch_at_header`] that pins the
+    /// batch to the canonical tip.
+    pub fn read_consensus_registry_batch<T>(&self, calldatas: Vec<Bytes>) -> EvmReadResult<Vec<T>>
+    where
+        T: alloy::sol_types::SolValue,
+        T: From<
+            <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
+        >,
+    {
+        let canonical_tip = self.canonical_tip();
+        debug!(target: "engine", ?canonical_tip, "reading consensus registry batch at canonical tip");
+        self.read_consensus_registry_batch_at_header(&canonical_tip, calldatas)
+    }
+
+    /// Build a single EVM at `header`'s state and execute several read-only [ConsensusRegistry]
     /// calls against it, decoding each result to `T`.
     ///
     /// Every calldata in a batch must decode to the same Solidity type `T` (current caller: five
@@ -1801,27 +1947,29 @@ impl RethEnv {
     /// validator that changes status between reads. Each call still runs under its own fresh 30M
     /// gas budget (`transact_system_call`), so splitting a large query across calls keeps gas
     /// bounded per call.
-    pub fn read_consensus_registry_batch<T>(&self, calldatas: Vec<Bytes>) -> EvmReadResult<Vec<T>>
+    pub fn read_consensus_registry_batch_at_header<T>(
+        &self,
+        header: &SealedHeader,
+        calldatas: Vec<Bytes>,
+    ) -> EvmReadResult<Vec<T>>
     where
         T: alloy::sol_types::SolValue,
         T: From<
             <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
         >,
     {
-        // create EVM with latest state
-        let canonical_tip = self.canonical_tip();
-        debug!(target: "engine", ?canonical_tip, "reading consensus registry batch at canonical tip");
+        // create EVM with the state at the pinned header
         let state_provider = self
             .inner
             .blockchain_provider
-            .state_by_block_hash(canonical_tip.hash())
+            .state_by_block_hash(header.hash())
             .map_err(|e| EvmReadError::Internal(e.to_string()))?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
         let evm_env = self
             .inner
             .evm_config
-            .evm_env(&canonical_tip)
+            .evm_env(header)
             .map_err(|e| EvmReadError::Internal(e.to_string()))?;
         let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
@@ -3768,6 +3916,199 @@ mod tests {
             assert_eq!(epoch, close);
             assert!(committee.iter().all(|v| v.validatorAddress != target));
         }
+
+        Ok(())
+    }
+
+    /// `epoch_state_at_epoch_start` pins every read to the previous epoch's closing block, so a
+    /// mid-epoch governance `burn` — which swap-and-pops the CURRENT epoch's stored committee
+    /// arrays immediately — moves the canonical-tip view but never the epoch-start view. A node
+    /// entering (or re-entering) the epoch before or after the burn derives the identical
+    /// committee.
+    #[tokio::test]
+    async fn epoch_state_at_epoch_start_pins_pre_burn_committee() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Epoch Start Pin Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // block 1: plain epoch-0 block
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let header1 = block1.recovered_block.clone_sealed_header();
+
+        // block 2: close epoch 0 — `concludeEpoch` executes inside this block, making it epoch
+        // 0's closing block (the header that rules all of epoch 1)
+        let consensus_output = consensus_output_for_tests(2, 1, 2, true);
+        let payload = TNPayload::new_for_test(header1, &consensus_output);
+        let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let closing_header = block2.recovered_block.clone_sealed_header();
+
+        // snapshot A: epoch 1's start state, pinned to epoch 0's closing block
+        let (snapshot_a, pin_a) = reth_env.epoch_state_at_epoch_start()?;
+        assert_eq!(snapshot_a.epoch, 1);
+        assert_eq!(snapshot_a.validators.len(), 5, "full pre-burn committee");
+        assert_eq!(snapshot_a.bls_pubkeys.len(), 5);
+        assert_eq!(pin_a.hash(), closing_header.hash(), "pin is epoch 0's closing block");
+
+        // block 3: governance burns a committee member mid-epoch-1
+        let target = snapshot_a.validators[1].validatorAddress;
+        let target_bls = snapshot_a.bls_pubkeys[1].clone();
+        let mut governance = governance_owner_factory();
+        let burn_tx = governance_burn_tx(&mut governance, chain.clone(), target);
+        let consensus_output = consensus_output_for_tests(2, 1, 3, false);
+        let payload = TNPayload::new_for_test(closing_header, &consensus_output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![burn_tx])?;
+
+        // the tip view shrinks immediately (swap-and-pop)
+        let tip_state = reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(tip_state.epoch, 1);
+        assert_eq!(tip_state.validators.len(), 4, "tip committee shrank post-burn");
+        assert_eq!(tip_state.bls_pubkeys.len(), 4);
+        assert!(tip_state.validators.iter().all(|v| v.validatorAddress != target));
+        assert!(!tip_state.bls_pubkeys.contains(&target_bls));
+
+        // the epoch-start view still returns the full pre-burn set, byte-identical to snapshot A
+        let (snapshot_b, pin_b) = reth_env.epoch_state_at_epoch_start()?;
+        assert_eq!(pin_b.hash(), pin_a.hash(), "pin unchanged by the burn");
+        assert_eq!(snapshot_b.epoch, snapshot_a.epoch);
+        assert_eq!(snapshot_b.epoch_info, snapshot_a.epoch_info);
+        assert_eq!(snapshot_b.epoch_start, snapshot_a.epoch_start);
+        assert_eq!(snapshot_b.validators, snapshot_a.validators);
+        assert_eq!(snapshot_b.bls_pubkeys, snapshot_a.bls_pubkeys);
+        assert!(snapshot_b.validators.iter().any(|v| v.validatorAddress == target));
+        assert!(snapshot_b.bls_pubkeys.contains(&target_bls));
+
+        // the boundary-written-once EpochInfo scalars agree between the tip and pinned reads;
+        // the committee array embedded in EpochInfo is exactly what the burn mutates, so it is
+        // the only field that diverges
+        assert_eq!(tip_state.epoch, snapshot_b.epoch);
+        assert_eq!(tip_state.epoch_info.blockHeight, snapshot_b.epoch_info.blockHeight);
+        assert_eq!(tip_state.epoch_info.epochId, snapshot_b.epoch_info.epochId);
+        assert_eq!(tip_state.epoch_info.epochDuration, snapshot_b.epoch_info.epochDuration);
+        assert_eq!(tip_state.epoch_info.epochIssuance, snapshot_b.epoch_info.epochIssuance);
+        assert_eq!(tip_state.epoch_info.stakeVersion, snapshot_b.epoch_info.stakeVersion);
+        assert_eq!(tip_state.epoch_start, snapshot_b.epoch_start);
+        assert_eq!(tip_state.epoch_info.committee.len(), 4, "burn mutates EpochInfo's committee");
+        assert_eq!(snapshot_b.epoch_info.committee.len(), 5);
+
+        Ok(())
+    }
+
+    /// Next-committee prefetches pinned to the epoch-start header read the PRE-burn future
+    /// committees. At epoch 0's closing block the registry already reports epoch 1 and serves
+    /// `getCommitteeValidators`/`getCommitteeBlsPubkeys` for epochs 2 and 3 (genesis seeds
+    /// epochs 0-2; `concludeEpoch` writes epoch 3's committee inside the closing block), so a
+    /// node re-entering epoch 1 after a mid-epoch burn derives the same future sets it would
+    /// have derived entering before the burn. The tip variants of the same reads observe the
+    /// post-burn (shrunken) sets, proving the pin is what makes the difference.
+    #[tokio::test]
+    async fn pinned_next_committee_prefetch_reads_pre_burn_sets() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Pinned Prefetch Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // block 1: plain epoch-0 block
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let header1 = block1.recovered_block.clone_sealed_header();
+
+        // block 2: close epoch 0 (epoch 0's closing block)
+        let consensus_output = consensus_output_for_tests(2, 1, 2, true);
+        let payload = TNPayload::new_for_test(header1, &consensus_output);
+        let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let closing_header = block2.recovered_block.clone_sealed_header();
+
+        // pre-burn snapshots of the epoch 2 and 3 committees (the tip IS the closing block here)
+        let pre_v2 = reth_env.validators_for_epoch(2)?;
+        let pre_v3 = reth_env.validators_for_epoch(3)?;
+        let pre_b2 = reth_env.bls_pubkeys_for_epoch(2)?;
+        let pre_b3 = reth_env.bls_pubkeys_for_epoch(3)?;
+        assert_eq!(pre_v2.len(), 5);
+        assert_eq!(pre_v3.len(), 5);
+
+        // block 3: governance burns a committee member mid-epoch-1 (with exactly 5 eligible
+        // validators every committee seats all 5, so the target sits in epochs 1, 2, and 3)
+        let EpochState { validators, bls_pubkeys, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        let target = validators[1].validatorAddress;
+        let target_bls = bls_pubkeys[1].clone();
+        let mut governance = governance_owner_factory();
+        let burn_tx = governance_burn_tx(&mut governance, chain.clone(), target);
+        let consensus_output = consensus_output_for_tests(2, 1, 3, false);
+        let payload = TNPayload::new_for_test(closing_header.clone(), &consensus_output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![burn_tx])?;
+
+        // pinned prefetches at the epoch-start header: epoch+1 and epoch+2 relative to the
+        // running epoch 1 still return the PRE-burn sets
+        let (state, pin) = reth_env.epoch_state_at_epoch_start()?;
+        assert_eq!(state.epoch, 1);
+        assert_eq!(pin.hash(), closing_header.hash());
+        let pinned_v2 = reth_env.validators_for_epoch_at_block(2, pin.hash())?;
+        let pinned_v3 = reth_env.validators_for_epoch_at_block(3, pin.hash())?;
+        assert_eq!(pinned_v2, pre_v2, "epoch 2 committee at the pin is the pre-burn set");
+        assert_eq!(pinned_v3, pre_v3, "epoch 3 committee at the pin is the pre-burn set");
+        assert!(pinned_v2.iter().any(|v| v.validatorAddress == target));
+        assert!(pinned_v3.iter().any(|v| v.validatorAddress == target));
+        let pinned_b2 = reth_env.bls_pubkeys_for_epoch_at_block(2, pin.hash())?;
+        let pinned_b3 = reth_env.bls_pubkeys_for_epoch_at_block(3, pin.hash())?;
+        assert_eq!(pinned_b2, pre_b2, "epoch 2 pubkeys at the pin are the pre-burn set");
+        assert_eq!(pinned_b3, pre_b3, "epoch 3 pubkeys at the pin are the pre-burn set");
+        assert!(pinned_b2.contains(&target_bls));
+        assert!(pinned_b3.contains(&target_bls));
+
+        // the tip variant of the same read shows the post-burn set: the pin is what makes the
+        // difference
+        let tip_v2 = reth_env.validators_for_epoch(2)?;
+        assert_eq!(tip_v2.len(), 4);
+        assert!(tip_v2.iter().all(|v| v.validatorAddress != target));
+
+        Ok(())
+    }
+
+    /// In epoch 0 the pin is genesis: genesis execution seeds the registry, so genesis state IS
+    /// epoch 0's start state. The pinned view matches the canonical-tip view field for field at
+    /// genesis and keeps pinning genesis after the chain advances within the epoch.
+    #[tokio::test]
+    async fn epoch_state_at_epoch_start_epoch_zero_pins_genesis() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Epoch Zero Pin Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // fresh chain still in epoch 0: the pin is the genesis header
+        let (state, pin) = reth_env.epoch_state_at_epoch_start()?;
+        assert_eq!(pin.number, 0, "epoch 0 pins genesis");
+        assert_eq!(pin.hash(), chain.sealed_genesis_header().hash());
+
+        // at genesis the tip and the pin are the same block, so the views agree field for field
+        let tip_state = reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(state.epoch, 0);
+        assert_eq!(state.epoch, tip_state.epoch);
+        assert_eq!(state.epoch_info, tip_state.epoch_info);
+        assert_eq!(state.epoch_start, tip_state.epoch_start);
+        assert_eq!(state.validators, tip_state.validators);
+        assert_eq!(state.bls_pubkeys, tip_state.bls_pubkeys);
+        assert_eq!(state.validators.len(), 5);
+
+        // the pin stays genesis after the chain advances within epoch 0
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let (state_after, pin_after) = reth_env.epoch_state_at_epoch_start()?;
+        assert_eq!(pin_after.number, 0);
+        assert_eq!(state_after.epoch, 0);
+        assert_eq!(state_after.validators, state.validators);
+        assert_eq!(state_after.bls_pubkeys, state.bls_pubkeys);
 
         Ok(())
     }
