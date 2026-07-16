@@ -153,6 +153,65 @@ impl Drop for EpochRecordDb {
     }
 }
 
+/// Outcome of validating a downloaded [`EpochRecord`] and [`EpochCertificate`] against the
+/// locally-trusted committee for the requested epoch.
+///
+/// A downloaded record is never trusted on the strength of its own embedded committee: it must
+/// be anchored to the committee the local node already trusts for that epoch. This is the single
+/// result type shared by the state-sync ingest path and the failed-quorum recovery path so
+/// neither can accept a record under weaker rules than the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochRecordValidation {
+    /// The record is anchored to the locally-trusted committee, has the expected parent hash, and
+    /// carries a super-quorum certificate from that committee.
+    Valid,
+    /// The record was checked against the trusted committee but failed one or more of the anchor
+    /// checks. The booleans record which checks passed, for diagnostics. `epoch_matches` is false
+    /// when the record is for a different epoch than the one that was requested.
+    Invalid { epoch_matches: bool, parents_match: bool, committee_valid: bool, cert_valid: bool },
+    /// No locally-trusted anchor is available for the record's epoch (the previous epoch record,
+    /// or the genesis committee, is not stored locally), so the record cannot be validated.
+    /// Callers should retry once the anchor is available rather than treat the record as invalid.
+    NoAnchor,
+}
+
+impl EpochRecordValidation {
+    /// True only for [`EpochRecordValidation::Valid`].
+    pub fn is_valid(&self) -> bool {
+        match self {
+            EpochRecordValidation::Valid => true,
+            EpochRecordValidation::Invalid { .. } | EpochRecordValidation::NoAnchor => false,
+        }
+    }
+}
+
+/// Return true if `committee` (the locally-trusted committee) is compatible with the record's
+/// embedded committee.
+///
+/// These are usually equal, but a validator can be booted and still be in the trusted committee
+/// while absent from `epoch_rec.committee`, so the trusted committee is allowed to be a strict
+/// superset as long as it is a sane size and fully contains the record's committee.
+fn epoch_committee_valid(
+    epoch_rec: &EpochRecord,
+    committee: &std::collections::BTreeSet<BlsPublicKey>,
+) -> bool {
+    let epoch_len = epoch_rec.committee.len();
+    let committee_len = committee.len();
+    let epoch_committee: std::collections::BTreeSet<BlsPublicKey> =
+        epoch_rec.committee.iter().copied().collect();
+    match committee_len.cmp(&epoch_len) {
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => committee == &epoch_committee,
+        std::cmp::Ordering::Greater => {
+            // Require a reasonable committee size (don't let a bogus record with one signer
+            // through) and that the trusted committee fully contains the record's committee.
+            epoch_len >= 4
+                && epoch_len >= ((committee_len / 3) * 2)
+                && epoch_rec.committee.iter().all(|k| committee.contains(k))
+        }
+    }
+}
+
 impl EpochRecordDb {
     /// Open (or create) the epoch records database at `path` for append.
     ///
@@ -395,6 +454,55 @@ impl EpochRecordDb {
     pub fn number_to_epoch(&self, number: u64) -> Epoch {
         let finals = self.final_numbers.lock();
         finals.partition_point(|final_num| number > *final_num) as u32
+    }
+
+    /// Validate a downloaded [`EpochRecord`] and its [`EpochCertificate`] against the
+    /// locally-trusted committee for `epoch`, the epoch slot that was requested from the peer.
+    ///
+    /// The trusted committee and expected parent hash are derived from local state only, never
+    /// from the downloaded record itself: the genesis committee for epoch 0, otherwise the
+    /// previous epoch record's `next_committee`. The record is accepted
+    /// ([`EpochRecordValidation::Valid`]) only when it is actually for `epoch`, has the expected
+    /// parent hash, its committee is anchored to that trusted committee, and its certificate
+    /// carries a super-quorum of signatures from that committee. Anchoring against the requested
+    /// `epoch` (rather than the record's self-declared epoch) prevents a peer from satisfying a
+    /// request for one slot with a self-consistent record for a different slot.
+    ///
+    /// This is the single validation routine shared by the state-sync ingest path and the
+    /// failed-quorum recovery path, so a downloaded record cannot be accepted under weaker rules
+    /// on one path than the other.
+    pub async fn validate_downloaded_record(
+        &self,
+        epoch: Epoch,
+        record: &EpochRecord,
+        cert: &EpochCertificate,
+    ) -> EpochRecordValidation {
+        let anchor: Option<(EpochDigest, std::collections::BTreeSet<BlsPublicKey>)> = if epoch == 0
+        {
+            self.get_committee_keys(0).await.map(|committee| (EpochDigest::default(), committee))
+        } else {
+            self.record_by_epoch(epoch - 1)
+                .await
+                .map(|prev| (prev.digest(), prev.next_committee.iter().copied().collect()))
+        };
+        anchor
+            .map(|(parent_hash, committee)| {
+                let epoch_matches = record.epoch == epoch;
+                let parents_match = parent_hash == record.parent_hash;
+                let committee_valid = epoch_committee_valid(record, &committee);
+                let cert_valid = record.verify_with_cert(cert);
+                if epoch_matches && parents_match && committee_valid && cert_valid {
+                    EpochRecordValidation::Valid
+                } else {
+                    EpochRecordValidation::Invalid {
+                        epoch_matches,
+                        parents_match,
+                        committee_valid,
+                        cert_valid,
+                    }
+                }
+            })
+            .unwrap_or(EpochRecordValidation::NoAnchor)
     }
 }
 
@@ -753,6 +861,7 @@ impl From<io::Error> for EpochDbError {
 #[cfg(test)]
 mod test {
     use std::{
+        collections::BTreeSet,
         fs::OpenOptions,
         io::{Seek as _, SeekFrom},
         sync::Arc,
@@ -767,7 +876,9 @@ mod test {
         Signer as _,
     };
 
-    use crate::epoch_records::{EpochRecordDb, RECORDS_NAME};
+    use crate::epoch_records::{
+        epoch_committee_valid, EpochRecordDb, EpochRecordValidation, RECORDS_NAME,
+    };
 
     // Minimal BlsSigner wrapper around a BlsKeypair.
     #[derive(Clone)]
@@ -959,5 +1070,274 @@ mod test {
         let mut f = OpenOptions::new().read(true).open(&records_path).expect("open records file");
         let healed_len = f.seek(SeekFrom::End(0)).expect("seek");
         assert_eq!(extended_len, healed_len, "garbage bytes should be removed on reopen");
+    }
+
+    /// Generate a deterministic test BLS public key from a seed.
+    fn test_bls_key(seed: u8) -> BlsPublicKey {
+        let mut rng = StdRng::from_seed([seed; 32]);
+        *BlsKeypair::generate(&mut rng).public()
+    }
+
+    /// Create a test [`EpochRecord`] carrying the given committee.
+    fn test_epoch_record(committee: Vec<BlsPublicKey>) -> EpochRecord {
+        EpochRecord { epoch: 1, committee, ..Default::default() }
+    }
+
+    #[test]
+    fn test_epoch_committee_valid_equal_committees() {
+        // When committees are equal in size, they must be exactly equal
+        let keys: Vec<_> = (0..4).map(test_bls_key).collect();
+        let epoch_rec = test_epoch_record(keys.clone());
+        let committee: BTreeSet<_> = keys.into_iter().collect();
+
+        assert!(epoch_committee_valid(&epoch_rec, &committee));
+    }
+
+    #[test]
+    fn test_epoch_committee_valid_equal_but_different() {
+        // Same size but different members should fail
+        let epoch_keys: Vec<_> = (0..4).map(test_bls_key).collect();
+        let other_keys: Vec<_> = (10..14).map(test_bls_key).collect();
+
+        let epoch_rec = test_epoch_record(epoch_keys);
+        let committee: BTreeSet<_> = other_keys.into_iter().collect();
+
+        assert!(!epoch_committee_valid(&epoch_rec, &committee));
+    }
+
+    #[test]
+    fn test_epoch_committee_valid_committee_smaller_than_epoch() {
+        // If committee is smaller than epoch_rec.committee, always invalid
+        let epoch_keys: Vec<_> = (0..4).map(test_bls_key).collect();
+        let smaller_keys: Vec<_> = (0..3).map(test_bls_key).collect();
+
+        let epoch_rec = test_epoch_record(epoch_keys);
+        let committee: BTreeSet<_> = smaller_keys.into_iter().collect();
+
+        assert!(!epoch_committee_valid(&epoch_rec, &committee));
+    }
+
+    #[test]
+    fn test_epoch_committee_valid_committee_larger_valid() {
+        // Committee larger but all epoch members present and epoch >= 4 and >= 2/3
+        let epoch_keys: Vec<_> = (0..4).map(test_bls_key).collect();
+        let mut larger_keys = epoch_keys.clone();
+        larger_keys.push(test_bls_key(10)); // Add one more
+
+        let epoch_rec = test_epoch_record(epoch_keys);
+        let committee: BTreeSet<_> = larger_keys.into_iter().collect();
+
+        // epoch_len=4, committee_len=5, 2/3 of 5 = 3, 4 >= 3 so valid
+        assert!(epoch_committee_valid(&epoch_rec, &committee));
+    }
+
+    #[test]
+    fn test_epoch_committee_valid_epoch_too_small() {
+        // Epoch committee smaller than 4 is invalid (even if all present)
+        let epoch_keys: Vec<_> = (0..3).map(test_bls_key).collect();
+        let mut larger_keys = epoch_keys.clone();
+        larger_keys.push(test_bls_key(10));
+        larger_keys.push(test_bls_key(11));
+
+        let epoch_rec = test_epoch_record(epoch_keys);
+        let committee: BTreeSet<_> = larger_keys.into_iter().collect();
+
+        // epoch_len=3 < 4, so invalid
+        assert!(!epoch_committee_valid(&epoch_rec, &committee));
+    }
+
+    #[test]
+    fn test_epoch_committee_valid_epoch_less_than_two_thirds() {
+        // Epoch committee less than 2/3 of committee is invalid
+        let epoch_keys: Vec<_> = (0..4).map(test_bls_key).collect();
+        // Add many more keys to committee so epoch is < 2/3
+        let mut larger_keys = epoch_keys.clone();
+        for i in 10..20 {
+            larger_keys.push(test_bls_key(i));
+        }
+
+        let epoch_rec = test_epoch_record(epoch_keys);
+        let committee: BTreeSet<_> = larger_keys.into_iter().collect();
+
+        // epoch_len=4, committee_len=14, 2/3 of 14 = 9, 4 < 9 so invalid
+        assert!(!epoch_committee_valid(&epoch_rec, &committee));
+    }
+
+    #[test]
+    fn test_epoch_committee_valid_member_not_in_committee() {
+        // Epoch has a member not in committee - invalid
+        let epoch_keys: Vec<_> = (0..4).map(test_bls_key).collect();
+        let mut committee_keys: Vec<_> = (0..3).map(test_bls_key).collect();
+        committee_keys.push(test_bls_key(10)); // Different key
+        committee_keys.push(test_bls_key(11)); // Extra to make it larger
+
+        let epoch_rec = test_epoch_record(epoch_keys);
+        let committee: BTreeSet<_> = committee_keys.into_iter().collect();
+
+        // epoch key 3 is not in committee
+        assert!(!epoch_committee_valid(&epoch_rec, &committee));
+    }
+
+    #[test]
+    fn test_epoch_committee_valid_boundary_two_thirds() {
+        // Test exactly at 2/3 boundary
+        let epoch_keys: Vec<_> = (0..6).map(test_bls_key).collect();
+        let mut larger_keys = epoch_keys.clone();
+        for i in 10..13 {
+            larger_keys.push(test_bls_key(i));
+        }
+
+        let epoch_rec = test_epoch_record(epoch_keys);
+        let committee: BTreeSet<_> = larger_keys.into_iter().collect();
+
+        // epoch_len=6, committee_len=9, 2/3 of 9 = 6, 6 >= 6 so valid
+        assert!(epoch_committee_valid(&epoch_rec, &committee));
+    }
+
+    #[tokio::test]
+    async fn test_validate_downloaded_record_accepts_anchored_committee() {
+        // A downloaded record whose committee matches the previous epoch's next_committee, with
+        // the expected parent hash and a super-quorum cert, is accepted.
+        let temp_dir = TempDir::with_prefix("validate_accept").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let committee: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &committee, EpochDigest::default());
+        db.save(rec0.clone(), cert0).await.expect("save epoch 0");
+
+        let (rec1, cert1) = make_test_pair(1, &committee, rec0.digest());
+        let validation = db.validate_downloaded_record(1, &rec1, &cert1).await;
+        assert_eq!(validation, EpochRecordValidation::Valid);
+        assert!(validation.is_valid());
+    }
+
+    #[tokio::test]
+    async fn test_validate_downloaded_record_rejects_unanchored_committee() {
+        // Regression for the failed-quorum recovery path: an attacker-committee record with a
+        // certificate self-signed by that same attacker committee is self-consistent (passes
+        // verify_with_cert alone) but must be rejected because its committee is not anchored to
+        // the locally-trusted committee from the previous epoch's next_committee.
+        let temp_dir = TempDir::with_prefix("validate_reject").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let honest: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let attacker: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &honest, EpochDigest::default());
+        db.save(rec0.clone(), cert0).await.expect("save epoch 0");
+
+        let (attacker_rec, attacker_cert) = make_test_pair(1, &attacker, rec0.digest());
+        // The record is self-consistent, so the weak check the recovery path used to rely on
+        // accepts it.
+        assert!(attacker_rec.verify_with_cert(&attacker_cert));
+
+        // The shared anchor rejects it: the committee is not the honest next_committee.
+        let validation = db.validate_downloaded_record(1, &attacker_rec, &attacker_cert).await;
+        assert!(!validation.is_valid());
+        assert_eq!(
+            validation,
+            EpochRecordValidation::Invalid {
+                epoch_matches: true,
+                parents_match: true,
+                committee_valid: false,
+                cert_valid: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_downloaded_record_no_anchor_when_prev_missing() {
+        // With no previous epoch record stored, there is no locally-trusted committee to anchor
+        // against, so even a self-consistent record is not accepted.
+        let temp_dir = TempDir::with_prefix("validate_no_anchor").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let committee: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec1, cert1) = make_test_pair(1, &committee, EpochDigest::default());
+        let validation = db.validate_downloaded_record(1, &rec1, &cert1).await;
+        assert_eq!(validation, EpochRecordValidation::NoAnchor);
+        assert!(!validation.is_valid());
+    }
+
+    #[tokio::test]
+    async fn test_validate_downloaded_record_rejects_wrong_parent_hash() {
+        // A record with the correct anchored committee and a valid self-cert but the wrong parent
+        // hash is rejected: parent-hash chaining is a required part of the anchor, independent of
+        // the committee check.
+        let temp_dir = TempDir::with_prefix("validate_parent").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let committee: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &committee, EpochDigest::default());
+        db.save(rec0.clone(), cert0).await.expect("save epoch 0");
+
+        // Correct committee and a valid cert, but the parent hash is the default digest rather
+        // than epoch 0's digest, so only parents_match should fail.
+        let (rec1, cert1) = make_test_pair(1, &committee, EpochDigest::default());
+        let validation = db.validate_downloaded_record(1, &rec1, &cert1).await;
+        assert!(!validation.is_valid());
+        assert_eq!(
+            validation,
+            EpochRecordValidation::Invalid {
+                epoch_matches: true,
+                parents_match: false,
+                committee_valid: true,
+                cert_valid: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_downloaded_record_accepts_genesis_epoch() {
+        // The epoch-0 branch anchors against the genesis committee (get_committee_keys(0)) with a
+        // default parent hash. A genesis record whose committee is the stored genesis committee is
+        // accepted.
+        let temp_dir = TempDir::with_prefix("validate_genesis").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let committee: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        // Store the genesis record so get_committee_keys(0) resolves the genesis committee.
+        let (rec0, cert0) = make_test_pair(0, &committee, EpochDigest::default());
+        db.save(rec0.clone(), cert0.clone()).await.expect("save epoch 0");
+
+        let validation = db.validate_downloaded_record(0, &rec0, &cert0).await;
+        assert_eq!(validation, EpochRecordValidation::Valid);
+        assert!(validation.is_valid());
+    }
+
+    #[tokio::test]
+    async fn test_validate_downloaded_record_rejects_wrong_epoch() {
+        // A peer answering a request for epoch N must not satisfy it with a self-consistent record
+        // for a different epoch. Even a genuine, correctly-anchored historical record is rejected
+        // when offered for the wrong slot, because the anchor is derived from the requested epoch,
+        // not the record's self-declared epoch.
+        let temp_dir = TempDir::with_prefix("validate_wrong_epoch").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let committee: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        // A legitimate chain: epoch 0 and epoch 1.
+        let (rec0, cert0) = make_test_pair(0, &committee, EpochDigest::default());
+        db.save(rec0.clone(), cert0).await.expect("save epoch 0");
+        let (rec1, cert1) = make_test_pair(1, &committee, rec0.digest());
+        db.save(rec1.clone(), cert1.clone()).await.expect("save epoch 1");
+
+        // rec1 is genuine and correctly anchored for epoch 1, but here it is offered as the answer
+        // to a request for epoch 2. It must be rejected because it is not for the requested epoch.
+        let validation = db.validate_downloaded_record(2, &rec1, &cert1).await;
+        assert!(!validation.is_valid());
+        assert_eq!(
+            validation,
+            EpochRecordValidation::Invalid {
+                epoch_matches: false,
+                parents_match: false,
+                committee_valid: true,
+                cert_valid: true,
+            }
+        );
     }
 }
