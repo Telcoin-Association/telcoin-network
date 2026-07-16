@@ -173,9 +173,12 @@ pub use txn_pool::*;
 use worker::WorkerNetwork;
 pub mod error;
 mod evm;
+pub mod forward;
 pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
+#[cfg(feature = "faucet")]
+pub use evm::faucet_mint_role_slot;
 #[cfg(not(feature = "faucet"))]
 pub use evm::TIMELOCK_DURATION;
 pub use evm::{
@@ -183,6 +186,7 @@ pub use evm::{
     grantMintRoleCall, hasMintRoleCall, mintCall, revokeMintRoleCall, totalSupplyCall,
     BLS_G1_PRECOMPILE_ADDRESS, TELCOIN_PRECOMPILE_ADDRESS,
 };
+pub use forward::WorkerRpcForwarder;
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
@@ -846,6 +850,71 @@ impl RethEnv {
         Ok(())
     }
 
+    /// Advance a lagging finalized marker to the persisted canonical tip.
+    ///
+    /// Blocks commit in [`Self::finish_executing_output`] and the finalized/safe markers commit
+    /// in [`Self::finalize_block`] — two separate database transactions. A crash between them
+    /// restarts the node with `finalized marker < persisted canonical tip`, hiding the gap
+    /// blocks from every marker reader (accumulator catchup, the tx-pool's last-seen seed, the
+    /// RPC `finalized`/`safe` tags).
+    ///
+    /// Advancing the marker is sound because every persisted canonical block is consensus-final
+    /// by construction: blocks only enter the canonical database from committed consensus
+    /// output, so there is no speculative or reorgable segment the marker could overrun. The
+    /// lag is purely a two-transaction persistence artifact.
+    ///
+    /// The heal MUST route through [`Self::finalize_block`] rather than a bare
+    /// `save_finalized_block_number` write: the in-memory finalized/safe watches are seeded
+    /// from the (stale) database at provider construction, and startup marker readers like the
+    /// accumulator catchup consult the watch — a DB-only write would leave them reading the
+    /// stale value.
+    ///
+    /// Replay is unaffected: the missed-consensus watermark derives from the persisted
+    /// execution tip (which this method never moves), not the finalized marker, so healing
+    /// cannot cause `replay_missed_consensus` to re-forward committed output — no
+    /// double-execution is possible.
+    ///
+    /// Call once at startup, before anything reads the marker and before any consensus output
+    /// executes. A marker ahead of the tip fails with
+    /// [`TnRethError::FinalizedMarkerAheadOfTip`]: the execution database lost blocks this node
+    /// already attested as final.
+    ///
+    /// Like every startup tip reader, this trusts the persisted tip itself; a torn write
+    /// between MDBX and static files below the provider is a pre-existing exposure this method
+    /// neither adds to nor guards against.
+    pub fn heal_finalized_to_persisted_tip(&self) -> TnRethResult<()> {
+        // One RO provider = one consistent MDBX snapshot for all three reads. Read errors
+        // PROPAGATE: the public last_block_number()/last_finalized_block_number() wrappers
+        // unwrap_or(0) and would misdiagnose a failed read as tip=0 here.
+        let provider = self.inner.blockchain_provider.database_provider_ro()?;
+        let tip = provider.last_block_number()?;
+        // None = never finalized (fresh genesis). Some(0) is unreachable in production (the
+        // first finalize_block call is for block >= 1), so collapsing None to 0 is safe.
+        let finalized = provider.last_finalized_block_number()?.unwrap_or(0);
+
+        if finalized > tip {
+            return Err(TnRethError::FinalizedMarkerAheadOfTip { finalized, tip });
+        }
+        if finalized == tip {
+            // Normal restart (marker caught up), or fresh genesis (marker never written and
+            // tip = 0): genesis intentionally stays unfinalized so
+            // finalized_block_hash_number_for_startup keeps its genesis fallback.
+            return Ok(());
+        }
+
+        let header =
+            provider.sealed_header(tip)?.ok_or(ProviderError::HeaderNotFound(tip.into()))?;
+        drop(provider);
+        warn!(
+            target: "tn::reth",
+            finalized,
+            tip,
+            "finalized marker lags the persisted canonical tip (crash between the \
+             blocks-commit and finalize-commit transactions); healing marker to tip"
+        );
+        self.finalize_block(header)
+    }
+
     /// This makes all blocks canonical, commits them to the database,
     /// broadcasts new chain on `canon_state_notification_sender`
     /// and set last executed header as the tracked header.
@@ -1340,6 +1409,16 @@ impl RethEnv {
         task_manager: &TaskManager,
         rewards: Option<RewardsCounter>,
     ) -> eyre::Result<Self> {
+        /// MDBX map-size ceiling for throwaway temp-chain envs. reth defaults to 8 TB per
+        /// environment; `cargo test` runs a test binary as threads in ONE process, so N
+        /// concurrent 8 TB virtual reservations exhaust the address space and MDBX aborts
+        /// env-open with ENOMEM ("Cannot allocate memory (12)"). A temp chain never holds a
+        /// full node's history, so a small ceiling is safe and lets many envs coexist.
+        const TEMP_CHAIN_DB_MAX_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+        /// Grow the temp DB file in small increments so throwaway DBs stay tiny on disk
+        /// (reth pairs its 8 TB default with a 4 GiB step; mirror reth's `test()` 4 MiB step).
+        const TEMP_CHAIN_DB_GROWTH_STEP: usize = 4 * 1024 * 1024; // 4 MiB
+
         let node_config = NodeConfig {
             datadir: DatadirArgs {
                 datadir: MaybePlatformPath::from(db_path.as_ref().to_path_buf()),
@@ -1349,6 +1428,12 @@ impl RethEnv {
                 pprof_dumps_path: None,
             },
             chain,
+            // Bound the MDBX geometry for throwaway temp chains (see const docs).
+            db: DatabaseArgs {
+                max_size: Some(TEMP_CHAIN_DB_MAX_SIZE),
+                growth_step: Some(TEMP_CHAIN_DB_GROWTH_STEP),
+                ..Default::default()
+            },
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config);
@@ -2476,6 +2561,303 @@ mod tests {
             .read_contract_at_block(genesis_hash, return_42_addr, Bytes::default())
             .expect("read-only call at genesis succeeds");
         assert_eq!(U256::from_be_slice(&output), U256::from(42));
+
+        Ok(())
+    }
+
+    /// In-protocol `ConsensusRegistry` fork over the PRE-fork testnet registry.
+    ///
+    /// `test_genesis()` embeds the committed testnet `genesis.yaml`, whose `ConsensusRegistry`
+    /// account carries the pre-fork runtime code and validator storage with NO per-status sets —
+    /// the exact on-chain shape the fork upgrades in place. The epoch-closing block that
+    /// concludes `FORK_EPOCH - 1` swaps in the new runtime and runs `migrateValidatorSets()`
+    /// FIRST, then the rewards + conclude calls run on the new code over the byte-identical
+    /// preserved storage.
+    ///
+    /// Asserts: the pre-fork code does not answer the new-ABI eligible-count call; post-fork the
+    /// new code is live and the migration populated a non-empty eligible set; a preserved BLS
+    /// pubkey survives the swap as 96-byte compressed; and the fork block's `state_root` is
+    /// identical across two independent executions (determinism — every node re-derives the
+    /// same root).
+    ///
+    /// NOTE: the fixture is the LIVE pre-fork deployment, pinned by
+    /// `tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH` and its tn-types pin test. If
+    /// `chain-configs/testnet/genesis.yaml` is ever regenerated from the current (post-fork)
+    /// artifact, the `pre.is_err()` probe below fails first — that means the fixture no longer
+    /// mirrors the chain this fork targets; reassess the fork plan rather than updating the
+    /// probes.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_consensus_registry_fork_swaps_code_and_migrates() -> eyre::Result<()> {
+        // pre-fork fixture: old registry code + validator storage, no per-status sets
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let genesis_header = chain.sealed_genesis_header();
+
+        // fork fires when the concluding epoch + 1 == FORK_EPOCH
+        let concluding_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH - 1;
+
+        // one payload, cloned across both executions, so the determinism check compares
+        // byte-identical inputs (`new_for_test` otherwise randomizes
+        // beneficiary/mix_hash/digest per call)
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        // --- env 1: pre-fork state must NOT answer the new-ABI eligible-count call (old code) ---
+        let tmp1 = TempDir::new().unwrap();
+        let tm1 = TaskManager::new("fork test env1");
+        let env1 = RethEnv::new_for_temp_chain(chain.clone(), tmp1.path(), &tm1, None).unwrap();
+        {
+            let state = StateProviderDatabase::new(env1.latest()?);
+            let mut cached = CachedReads::default();
+            let mut db = State::builder()
+                .with_database(cached.as_db_mut(state))
+                .with_bundle_update()
+                .build();
+            let mut evm = env1
+                .inner
+                .evm_config
+                .evm_factory()
+                .create_evm(&mut db, env1.inner.evm_config.evm_env(genesis_header.header())?);
+            let pre = env1.call_consensus_registry::<_, U256>(
+                &mut evm,
+                ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+            );
+            assert!(
+                pre.is_err(),
+                "pre-fork registry (old code) must not expose getEligibleValidatorCount"
+            );
+        }
+
+        // --- produce the fork boundary block on the production path ---
+        let block = execute_payload_and_update_canonical_chain(&env1, payload.clone(), vec![])?;
+        let header = block.recovered_block.clone_sealed_header();
+        let produced_state_root = header.state_root;
+
+        // --- post-fork: new code is live and the sets are migrated ---
+        {
+            let state = StateProviderDatabase::new(env1.latest()?);
+            let mut cached = CachedReads::default();
+            let mut db = State::builder()
+                .with_database(cached.as_db_mut(state))
+                .with_bundle_update()
+                .build();
+            let mut evm = env1
+                .inner
+                .evm_config
+                .evm_factory()
+                .create_evm(&mut db, env1.inner.evm_config.evm_env(header.header())?);
+
+            let eligible = env1
+                .call_consensus_registry::<_, U256>(
+                    &mut evm,
+                    ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+                )
+                .expect("post-fork getEligibleValidatorCount must succeed on the swapped-in code");
+            assert!(eligible > U256::ZERO, "migration must populate a non-zero eligible count");
+
+            // getValidators(Active) now returns address[] (new ABI) from the migrated set
+            let active = env1
+                .call_consensus_registry::<_, Vec<Address>>(
+                    &mut evm,
+                    ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
+                        .abi_encode()
+                        .into(),
+                )
+                .expect("getValidators(Active) must succeed on new code");
+            assert!(!active.is_empty(), "migrated Active set must be non-empty");
+
+            // stored BLS pubkey survives the code swap untouched: still 96-byte compressed
+            let bls = env1
+                .call_consensus_registry::<_, Bytes>(
+                    &mut evm,
+                    ConsensusRegistry::getBlsPubkeyCall { validatorAddress: active[0] }
+                        .abi_encode()
+                        .into(),
+                )
+                .expect("getBlsPubkey must succeed");
+            assert_eq!(bls.len(), 96, "preserved BLS pubkey must remain 96-byte compressed");
+        }
+
+        // --- determinism: an independent execution of the identical block yields the same root ---
+        let tmp2 = TempDir::new().unwrap();
+        let tm2 = TaskManager::new("fork test env2");
+        let env2 = RethEnv::new_for_temp_chain(chain.clone(), tmp2.path(), &tm2, None).unwrap();
+        let block2 = execute_payload_and_update_canonical_chain(&env2, payload, vec![])?;
+        assert_eq!(
+            block2.recovered_block.clone_sealed_header().state_root,
+            produced_state_root,
+            "fork block state_root must be identical across independent executions"
+        );
+
+        Ok(())
+    }
+
+    /// Pre-fork epoch conclusion over the LIVE adiri registry code must speak the legacy ABI.
+    ///
+    /// `test_genesis()` embeds the committed testnet `genesis.yaml` — the registry account
+    /// carries the pre-fork runtime code (pinned by `CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`)
+    /// whose `getValidators(uint8)` returns `ValidatorInfo[]` and which has no
+    /// `getValidatorsInfo`. Concluding a NORMAL (non-fork-boundary) epoch on this state
+    /// exercises the code-hash gate in `read_committee_eligible_pool`: without the gate the
+    /// close reverts fatally (the post-fork ABI is absent on-chain) — the exact path a fresh
+    /// node onboarding to adiri or a full resync executes for every pre-fork epoch boundary.
+    ///
+    /// Asserts: the closing block executes; the registry code hash is untouched (no swap —
+    /// epoch 3 is far from the fork boundary); the post-fork-only eligible-count call still
+    /// fails; and the block's `state_root` is identical across two independent executions.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_pre_fork_epoch_close_uses_legacy_registry_read() -> eyre::Result<()> {
+        // pre-fork fixture: the committed adiri genesis (old registry code + validator storage)
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let genesis_header = chain.sealed_genesis_header();
+
+        // a normal epoch close, far from the fork boundary (`u32::MAX - 1`), so no swap can fire
+        let concluding_epoch = 3;
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp1 = TempDir::new().unwrap();
+        let tm1 = TaskManager::new("legacy read test env1");
+        let env1 = RethEnv::new_for_temp_chain(chain.clone(), tmp1.path(), &tm1, None).unwrap();
+
+        // --- pre-probes: readable failures if the committed genesis fixture is regenerated ---
+        {
+            let state = StateProviderDatabase::new(env1.latest()?);
+            let mut cached = CachedReads::default();
+            let mut db = State::builder()
+                .with_database(cached.as_db_mut(state))
+                .with_bundle_update()
+                .build();
+            let mut evm = env1
+                .inner
+                .evm_config
+                .evm_factory()
+                .create_evm(&mut db, env1.inner.evm_config.evm_env(genesis_header.header())?);
+
+            // legacy ABI: getValidators(Active) folds the committee-eligible pool into one
+            // ValidatorInfo[] response
+            let pool = env1
+                .call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
+                    &mut evm,
+                    ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Active.into() }
+                        .abi_encode()
+                        .into(),
+                )
+                .expect("pre-fork registry must answer the legacy getValidators(Active) read");
+            assert!(!pool.is_empty(), "legacy eligible pool must be non-empty");
+
+            let committee_size = env1
+                .call_consensus_registry::<_, u16>(
+                    &mut evm,
+                    ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+                )
+                .expect("pre-fork registry must answer getNextCommitteeSize");
+            assert!(
+                committee_size as usize <= pool.len(),
+                "genesis fixture must hold enough eligible validators ({}) for the next \
+                 committee ({committee_size}) — was chain-configs/testnet/genesis.yaml \
+                 regenerated?",
+                pool.len(),
+            );
+        }
+
+        // --- the epoch-closing block executes via the legacy read (without the gate: fatal) ---
+        let block = execute_payload_and_update_canonical_chain(&env1, payload.clone(), vec![])?;
+        let header = block.recovered_block.clone_sealed_header();
+        let produced_state_root = header.state_root;
+
+        // --- post: still the pre-fork code — no swap fired, post-fork ABI still absent ---
+        {
+            use reth_provider::StateProvider as _;
+            let code = env1
+                .latest()?
+                .account_code(&CONSENSUS_REGISTRY_ADDRESS)?
+                .expect("registry account must have code");
+            assert_eq!(
+                code.0.hash_slow(),
+                tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH,
+                "a normal pre-fork epoch close must not swap the registry code"
+            );
+
+            let state = StateProviderDatabase::new(env1.latest()?);
+            let mut cached = CachedReads::default();
+            let mut db = State::builder()
+                .with_database(cached.as_db_mut(state))
+                .with_bundle_update()
+                .build();
+            let mut evm = env1
+                .inner
+                .evm_config
+                .evm_factory()
+                .create_evm(&mut db, env1.inner.evm_config.evm_env(header.header())?);
+            let eligible = env1.call_consensus_registry::<_, U256>(
+                &mut evm,
+                ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+            );
+            assert!(
+                eligible.is_err(),
+                "post-fork-only getEligibleValidatorCount must still fail on the pre-fork code"
+            );
+        }
+
+        // --- determinism: an independent execution of the identical block yields the same root ---
+        let tmp2 = TempDir::new().unwrap();
+        let tm2 = TaskManager::new("legacy read test env2");
+        let env2 = RethEnv::new_for_temp_chain(chain.clone(), tmp2.path(), &tm2, None).unwrap();
+        let block2 = execute_payload_and_update_canonical_chain(&env2, payload, vec![])?;
+        assert_eq!(
+            block2.recovered_block.clone_sealed_header().state_root,
+            produced_state_root,
+            "pre-fork epoch-close state_root must be identical across independent executions"
+        );
+
+        Ok(())
+    }
+
+    /// The `ConsensusRegistry` fork must fail closed over an unexpected pre-fork deployment.
+    ///
+    /// The swap + `migrateValidatorSets()` assume the exact storage layout of the pinned
+    /// pre-fork registry code. Here the genesis fixture's registry account is overwritten with
+    /// the post-fork artifact bytes (any hash other than
+    /// `CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH` — a stand-in for an unknown deployment), and the
+    /// fork-boundary block must abort with the fail-closed gate error instead of silently
+    /// migrating over an unverified layout. (Without the gate this block would execute: the
+    /// migration is idempotent on the new code, making this test the discriminating check.)
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_consensus_registry_fork_fails_closed_on_unexpected_code() -> eyre::Result<()> {
+        // overwrite the registry's code (keeping balance + storage) with the post-fork artifact
+        let mut genesis = tn_types::test_genesis();
+        let v2_value = RethEnv::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let v2_code: Bytes =
+            hex::decode(v2_value.as_str().expect("deployedBytecode.object is a string"))?.into();
+        genesis
+            .alloc
+            .get_mut(&CONSENSUS_REGISTRY_ADDRESS)
+            .expect("testnet genesis must allocate the ConsensusRegistry account")
+            .code = Some(v2_code);
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+
+        // drive the fork boundary: the concluding epoch + 1 == CONSENSUS_REGISTRY_FORK_EPOCH
+        let concluding_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH - 1;
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("fail closed test");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        let err = execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect_err("fork over an unexpected registry deployment must abort the block");
+        assert!(
+            format!("{err:#}").contains("failing closed"),
+            "abort must come from the fail-closed code-hash gate, got: {err:#}"
+        );
 
         Ok(())
     }

@@ -38,8 +38,8 @@ All sites live in `crates/network-libp2p/src/consensus.rs`. `NetworkCommand::Rep
 
 | Location                                     | Trigger (immediate guard)                                                     | Severity |
 | -------------------------------------------- | ----------------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:940` | `verify_gossip` rejected `TooLarge` (oversized payload) **and** the relaying peer's BLS has resolved (`RejectPenalty::FatalRelayer`) — the size bound is deterministic network-wide, so under `Strict` validation a peer that forwards an oversized payload is itself misbehaving | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:942` | `verify_gossip` rejected `UnauthorizedAuthor` (author absent / unresolved / unauthorized), or `TooLarge` from an unresolved relayer (`RejectPenalty::Skip`) — author-attributable or unattributable, so the forwarder is not penalized (issues #801/#819) | `None`   |
+| `crates/network-libp2p/src/consensus.rs:1004` | `verify_gossip` rejected `TooLarge` (oversized payload) **and** the relaying peer's BLS has resolved (`RejectPenalty::FatalRelayer`) — the size bound is a compile-time protocol constant (`MAX_GOSSIP_MESSAGE_SIZE`) identical on every honest node, so under `Strict` validation a peer that forwards an oversized payload is itself misbehaving | `Fatal`  |
+| `crates/network-libp2p/src/consensus.rs:1030` | `verify_gossip` rejected `UnauthorizedAuthor` (author absent / unresolved / unauthorized), or `TooLarge` from an unresolved relayer (`RejectPenalty::Skip`) — author-attributable or unattributable, so the forwarder is not penalized (issues #801/#819) | `None`   |
 | `crates/network-libp2p/src/consensus.rs:839` | `GossipEvent::GossipsubNotSupported { peer_id }`                              | `Fatal`  |
 | `crates/network-libp2p/src/consensus.rs:843` | `GossipEvent::SlowPeer { peer_id, failed_messages }`                          | `Mild`   |
 

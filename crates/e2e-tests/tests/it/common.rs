@@ -2,8 +2,7 @@
 //!
 //! Process management, cleanup guards, and helpers used across all test modules.
 
-use e2e_tests::setup_log_dir;
-use escargot::CargoRun;
+use e2e_tests::{setup_log_dir, TestBinary};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
 use jsonrpsee::{
@@ -25,8 +24,10 @@ use std::{
     sync::{Condvar, Mutex},
     time::Duration,
 };
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
+use tn_test_utils::wait_until_blocking;
 use tn_types::{
-    address, get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address,
+    address, get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address, RpcInfo,
 };
 use tokio::runtime::Builder;
 use tracing::{error, info};
@@ -244,7 +245,9 @@ where
     let mut resp = client.request(command, params.clone()).await;
     let mut i = 0;
     while i < retries && resp.is_err() {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Short backoff: these retries mask brief RPC unavailability (e.g. a node
+        // mid-restart), so poll ~4x/sec instead of once a second.
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let client = HttpClientBuilder::default()
             .request_timeout(Duration::from_secs(10))
             .build(node)
@@ -295,30 +298,15 @@ pub(crate) fn network_advancing(client_urls: &[String; 4]) -> eyre::Result<()> {
     // exist or an epoch closes, so we cannot rely on block_number advancing
     // during idle periods. Actual block production is verified later by
     // send_and_confirm().
-    let mut i = 0;
-    loop {
-        let mut all_responsive = true;
-        for url in client_urls {
-            if get_block_number(url).is_err() {
-                all_responsive = false;
-                break;
-            }
-        }
-        if all_responsive {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_secs(1));
-        i += 1;
-        if i > 45 {
-            return Err(eyre::eyre!("Network not responding within 45 seconds!"));
-        }
-    }
+    wait_until_blocking(Duration::from_secs(45), "all nodes advancing", || {
+        Ok(client_urls.iter().all(|url| get_block_number(url).is_ok()))
+    })
 }
 
 /// Start a process running a validator node.
 pub(crate) fn start_validator(
     instance: usize,
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     base_dir: &Path,
     rpc_port: u16,
     test: &str,
@@ -330,7 +318,7 @@ pub(crate) fn start_validator(
 /// Start a validator node process with additional CLI arguments (e.g. `--metrics`).
 pub(crate) fn start_validator_with_args(
     instance: usize,
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     base_dir: &Path,
     rpc_port: u16,
     test: &str,
@@ -366,10 +354,31 @@ pub(crate) fn start_validator_with_args(
     command.spawn().expect("failed to execute")
 }
 
+/// Advertise a validator's JSON-RPC endpoint on its worker record.
+///
+/// The genesis ceremony leaves `p2p_info.worker.rpc` unset, and a non-committee node
+/// forwards accepted transactions to whatever endpoints committee validators advertise
+/// (issue #804); with none advertised, observer-submitted transactions are dropped.
+/// Call this between the config ceremony and `start_validator`, passing the same
+/// `rpc_port` the validator will serve `--http` on; the node re-signs the record from
+/// its `node-info.yaml` at startup, so editing the file is sufficient.
+pub(crate) fn advertise_worker_rpc(
+    base_dir: &Path,
+    instance: usize,
+    rpc_port: u16,
+) -> eyre::Result<()> {
+    let path = base_dir.join(format!("validator-{}", instance + 1)).join("node-info.yaml");
+    let mut node_info = Config::load_from_path::<NodeInfo>(&path, ConfigFmt::YAML)?;
+    node_info.p2p_info.worker.rpc =
+        Some(RpcInfo { http: format!("http://127.0.0.1:{rpc_port}").parse()?, ws: None });
+    Config::write_to_path(&path, &node_info, ConfigFmt::YAML)?;
+    Ok(())
+}
+
 /// Start a process running an observer node.
 pub(crate) fn start_observer(
     instance: usize,
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     base_dir: &Path,
     rpc_port: u16,
     test: &str,
@@ -498,8 +507,6 @@ pub(crate) fn send_and_confirm(
     let expected = current + amount;
     send_tel(node, key, to_account, amount, 250, 21000, nonce)?;
 
-    // sleep
-    std::thread::sleep(Duration::from_millis(1000));
     info!(target: "restart-test", "calling get_positive_balance_with_retry...");
 
     // get positive bal and kill child2 if error

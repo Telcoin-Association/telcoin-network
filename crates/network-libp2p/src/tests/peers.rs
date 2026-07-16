@@ -150,16 +150,23 @@ fn test_upsert_peer_seeds_multiaddrs_for_new_peer() {
     let bls = *BlsKeypair::generate(&mut rng).public();
     all_peers.upsert_peer(bls, network_key, vec![addr.clone()]);
 
-    // the fresh record carries the addr through to peer exchange and ip-ban association,
-    // even though the peer has never connected
+    // the fresh record carries the addr through to peer exchange and dialing, even though the peer
+    // has never connected
     let peer = all_peers.get_peer(&peer_id).expect("peer exists after upsert");
     assert!(peer.exchange_info().unwrap().1.iter().any(|a| a == &addr));
-    let expected_ip = addr.iter().find_map(|p| match p {
+
+    // but a purely self-advertised address is never treated as an observed connection IP, so it
+    // must not feed the per-IP ban counter: otherwise an attacker could advertise an honest peer's
+    // IP and have it banned (GHSA-6qcj-p42p-779j)
+    let advertised_ip = addr.iter().find_map(|p| match p {
         libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::from(ip)),
         libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::from(ip)),
         _ => None,
     });
-    assert!(peer.known_ip_addresses().any(|ip| Some(ip) == expected_ip));
+    assert!(
+        !peer.known_ip_addresses().any(|ip| Some(ip) == advertised_ip),
+        "a self-advertised, never-observed IP must not enter the ban-counter source"
+    );
 }
 
 /// Build a peer with a bls key and two network keys for rotation scenarios:
@@ -407,7 +414,7 @@ fn test_upsert_peer_rotation_normalizes_carried_pending_ban_status() {
 }
 
 #[test]
-fn test_upsert_peer_rotation_pending_ban_records_rotated_address() {
+fn test_upsert_peer_rotation_pending_ban_records_observed_rotated_address() {
     let mut all_peers = create_all_peers(None);
     let (bls, net1, peer_id_1, net2, _peer_id_2) = rotation_keys(36);
 
@@ -427,19 +434,92 @@ fn test_upsert_peer_rotation_pending_ban_records_rotated_address() {
     all_peers.update_connection_status(&other, NewConnectionStatus::Disconnected);
     assert!(!all_peers.ip_banned(&rotated_ip), "a single ban is below the per-ip threshold");
 
-    // the rotating peer is mid-ban under its first network key, presenting a different address
-    let old_addr = create_multiaddr(Some(IpAddr::V4("10.0.0.1".parse().unwrap())));
-    all_peers.upsert_peer(bls, net1, vec![old_addr]);
+    // the rotating peer is confirmed under its first network key and has actually connected from
+    // the shared address (an observed connection IP recorded on the record), then goes mid-ban
+    all_peers.upsert_peer(bls, net1, vec![]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: rotated_addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
     all_peers
         .update_connection_status(&peer_id_1, NewConnectionStatus::Disconnecting { banned: true });
 
-    // it rotates and presents the shared address: normalizing the carried pending ban must record
-    // the rotated-to address (not just the rotated-away one), pushing the shared ip over the
-    // threshold; with the ban recorded before the address update the ip would stay below it
-    all_peers.upsert_peer(bls, net2, vec![rotated_addr]);
+    // it rotates to a new network key: normalizing the carried pending ban records the *observed*
+    // shared address carried on the record, pushing the shared ip over the threshold. an address
+    // it had merely advertised (never connected from) would not count (GHSA-6qcj-p42p-779j).
+    all_peers.upsert_peer(bls, net2, vec![create_multiaddr(None)]);
     assert!(
         all_peers.ip_banned(&rotated_ip),
-        "the rotated-to address must be banned when the carried pending ban is normalized"
+        "the observed rotated-to address must be banned when the carried pending ban is normalized"
+    );
+}
+
+#[test]
+fn test_upsert_peer_rotation_pending_ban_ignores_advertised_rotated_address() {
+    // Security regression (GHSA-6qcj-p42p-779j): the rotation-carry path must bank the address the
+    // rotating peer was actually observed connecting from, but NOT an address it merely
+    // self-advertised. The rotating peer connects from its own attacker IP and only advertises the
+    // victim IP, so normalizing the carried pending ban must push the observed attacker IP over the
+    // block threshold while leaving the advertised victim IP below it.
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, _peer_id_2) = rotation_keys(36);
+
+    let victim_ip = IpAddr::V4("192.168.77.1".parse().unwrap());
+    let victim_addr = create_multiaddr(Some(victim_ip));
+    let attacker_ip = IpAddr::V4("10.0.0.1".parse().unwrap());
+    let attacker_addr = create_multiaddr(Some(attacker_ip));
+
+    // seed BOTH the victim IP and the attacker IP one ban short of the block threshold, each via a
+    // separate peer that genuinely connected from it
+    for (seed_peer, seed_addr) in
+        [(PeerId::random(), &victim_addr), (PeerId::random(), &attacker_addr)]
+    {
+        all_peers.update_connection_status(
+            &seed_peer,
+            NewConnectionStatus::Connected {
+                multiaddr: seed_addr.clone(),
+                direction: ConnectionDirection::Incoming,
+            },
+        );
+        all_peers.update_connection_status(
+            &seed_peer,
+            NewConnectionStatus::Disconnecting { banned: true },
+        );
+        all_peers.update_connection_status(&seed_peer, NewConnectionStatus::Disconnected);
+    }
+    assert!(!all_peers.ip_banned(&victim_ip), "a single ban is below the per-ip threshold");
+    assert!(!all_peers.ip_banned(&attacker_ip), "a single ban is below the per-ip threshold");
+
+    // the rotating peer connects from its OWN address (observed) and goes mid-ban, while merely
+    // advertising the victim's address in its record
+    all_peers.upsert_peer(bls, net1, vec![victim_addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: attacker_addr,
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers
+        .update_connection_status(&peer_id_1, NewConnectionStatus::Disconnecting { banned: true });
+
+    // rotate and keep advertising the victim address; normalizing the carried ban records only the
+    // observed attacker IP
+    all_peers.upsert_peer(bls, net2, vec![victim_addr]);
+
+    // positive control: the carried ban really fired and counted the OBSERVED attacker IP, pushing
+    // it over the threshold - so a green result cannot mean the ban path silently did nothing
+    assert!(
+        all_peers.ip_banned(&attacker_ip),
+        "the observed attacker IP must be banned once the carried pending ban is normalized"
+    );
+    // the advertised-only victim IP stays one ban short of the threshold
+    assert!(
+        !all_peers.ip_banned(&victim_ip),
+        "an address the rotating peer only advertised must not be banned"
     );
 }
 

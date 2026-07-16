@@ -10,10 +10,8 @@ use tn_types::{BlockHash, Epoch, SealedBatch};
 /// Worker messages on the gossip network.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerGossip {
-    /// A new is available.
+    /// A new batch digest is available so non-committee peers can fetch it.
     Batch(Epoch, BlockHash),
-    /// Transaction- published so a committee member can include in a batch.
-    Txn(Vec<u8>),
 }
 
 // impl TNMessage trait for types

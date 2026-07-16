@@ -15,6 +15,7 @@ use std::{collections::BTreeSet, future::Future as _, time::Duration};
 use tn_config::Parameters;
 use tn_network_libp2p::{error::NetworkError, types::NetworkResult};
 use tn_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
+use tn_test_utils::wait_until;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     test_utils::init_test_tracing, BlsPublicKey, BlsSignature, Certificate, Hash as _, Header,
@@ -34,38 +35,34 @@ async fn verify_certificates_in_store<DB: CertificateStore>(
     expected_verified_directly_count: u64,
     expected_verified_indirectly_count: u64,
 ) {
-    let mut missing = None;
+    // Poll until every input certificate is readable in the store (positive convergence),
+    // rather than sleeping a fixed interval between passes.
+    wait_until(
+        Duration::from_secs(20),
+        "all fetched certificates present in store",
+        move || async move {
+            certificates
+                .iter()
+                .try_fold(true, |acc, c| Ok(acc && certificate_store.read(c.digest())?.is_some()))
+        },
+    )
+    .await
+    .expect("all fetched certificates present in store");
+
+    // Re-read once now that convergence is proven, tallying the verification states.
     let mut verified_indirectly = 0;
     let mut verified_directly = 0;
-    for _ in 0..20 {
-        missing = None;
-        verified_directly = 0;
-        verified_indirectly = 0;
-        for (i, _) in certificates.iter().enumerate() {
-            if let Ok(Some(cert)) = certificate_store.read(certificates[i].digest()) {
-                match cert.signature_verification_state() {
-                    SignatureVerificationState::VerifiedDirectly(_) => verified_directly += 1,
-                    SignatureVerificationState::VerifiedIndirectly(_) => verified_indirectly += 1,
-                    _ => panic!(
-                        "Found unexpected stored signature state {:?}",
-                        cert.signature_verification_state()
-                    ),
-                };
-                continue;
-            }
-            missing = Some(i);
-            break;
+    for (i, _) in certificates.iter().enumerate() {
+        if let Ok(Some(cert)) = certificate_store.read(certificates[i].digest()) {
+            match cert.signature_verification_state() {
+                SignatureVerificationState::VerifiedDirectly(_) => verified_directly += 1,
+                SignatureVerificationState::VerifiedIndirectly(_) => verified_indirectly += 1,
+                _ => panic!(
+                    "Found unexpected stored signature state {:?}",
+                    cert.signature_verification_state()
+                ),
+            };
         }
-        if missing.is_none() {
-            break;
-        }
-        sleep(Duration::from_secs(1)).await;
-    }
-    if let Some(i) = missing {
-        panic!(
-            "Missing certificate in store: input index {}, certificate: {:?}",
-            i, certificates[i]
-        );
     }
 
     assert_eq!(
@@ -208,7 +205,7 @@ async fn test_fetch_certificates_basic() {
     let mut first_batch_len = 0;
     let mut first_batch_resp = vec![];
     if let Some((_, inner, reply)) = fake_receiver.recv().await {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(1_000, 4).unwrap();
         assert_eq!(lower_bound, 0);
         assert_eq!(skip_rounds.len(), fixture.authorities().count());
         for rounds in skip_rounds.values() {
@@ -242,14 +239,14 @@ async fn test_fetch_certificates_basic() {
     loop {
         match fake_receiver.recv().await {
             Some((_, inner, reply)) => {
-                let (_, skip_rounds) = inner.get_bounds().unwrap();
+                let (_, skip_rounds) = inner.get_bounds(1_000, 4).unwrap();
                 if skip_rounds.values().next().unwrap().len() == 1 {
                     // Drain the fetch requests sent out before the last reply, when only 1 round in
                     // skip_rounds.
                     reply.send(Ok(first_batch_resp.clone())).unwrap();
                     continue;
                 }
-                let (_, skip_rounds) = inner.get_bounds().unwrap();
+                let (_, skip_rounds) = inner.get_bounds(1_000, 4).unwrap();
                 assert_eq!(skip_rounds.len(), fixture.authorities().count());
                 for (_, rounds) in skip_rounds {
                     let rounds = rounds.into_iter().collect::<Vec<_>>();
@@ -289,7 +286,7 @@ async fn test_fetch_certificates_basic() {
     loop {
         match fake_receiver.try_recv() {
             Ok((_, inner, reply)) => {
-                let (_, skip_rounds) = inner.get_bounds().unwrap();
+                let (_, skip_rounds) = inner.get_bounds(1_000, 4).unwrap();
                 let first_num_skip_rounds = skip_rounds.values().next().unwrap().len();
                 if first_num_skip_rounds == 16 || first_num_skip_rounds == 17 {
                     // Drain the fetch requests sent out before the last reply.
@@ -311,7 +308,7 @@ async fn test_fetch_certificates_basic() {
 
     // Verify the fetch request.
     if let Some((_, inner, reply)) = fake_receiver.recv().await {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(1_000, 4).unwrap();
         assert_eq!(lower_bound, 0);
         assert_eq!(skip_rounds.len(), fixture.authorities().count());
         for rounds in skip_rounds.values() {
@@ -351,7 +348,7 @@ async fn test_fetch_certificates_basic() {
 
     // Verify the fetch request.
     if let Some((_, inner, reply)) = fake_receiver.recv().await {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(1_000, 4).unwrap();
         assert_eq!(lower_bound, 0);
         assert_eq!(skip_rounds.len(), fixture.authorities().count());
         for rounds in skip_rounds.values() {
@@ -383,7 +380,7 @@ async fn test_fetch_certificates_basic() {
 
     // Verify the fetch request.
     if let Some((_, inner, reply)) = fake_receiver.recv().await {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(1_000, 4).unwrap();
         assert_eq!(lower_bound, 0);
         assert_eq!(skip_rounds.len(), fixture.authorities().count());
         for rounds in skip_rounds.values() {
@@ -494,14 +491,17 @@ async fn test_fetch_cancellation_on_success() {
     // Poll under a generous deadline so a slow CI runner simply waits longer rather than
     // failing. Reaching this point also proves the fetch task returned, which is when the
     // fan-out is cancelled.
-    timeout(Duration::from_secs(10), async {
-        while !round1_certs
-            .iter()
-            .all(|cert| certificate_store.read(cert.digest()).unwrap().is_some())
-        {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
+    let round1_certs_ref = &round1_certs;
+    let certificate_store_ref = &certificate_store;
+    wait_until(
+        Duration::from_secs(10),
+        "Round 1 certificates should be stored after a successful fetch",
+        move || async move {
+            round1_certs_ref.iter().try_fold(true, |acc, cert| {
+                Ok(acc && certificate_store_ref.read(cert.digest())?.is_some())
+            })
+        },
+    )
     .await
     .expect("Round 1 certificates should be stored after a successful fetch");
 
@@ -677,7 +677,7 @@ async fn test_gc_round_update_during_fetch() {
 
     // first fetch request
     if let Some((_, inner, reply)) = fake_receiver.recv().await {
-        let (lower_bound, _) = inner.get_bounds().unwrap();
+        let (lower_bound, _) = inner.get_bounds(1_000, 4).unwrap();
         assert_eq!(lower_bound, 0, "initial GC round should be 0");
 
         // don't respond yet
@@ -696,7 +696,7 @@ async fn test_gc_round_update_during_fetch() {
         panic!("Should receive fetch request with updated GC round but timedout");
     };
 
-    let (_lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+    let (_lower_bound, skip_rounds) = inner.get_bounds(1_000, 4).unwrap();
     // verify skip_rounds don't include rounds <= 5
     for rounds in skip_rounds.values() {
         assert!(rounds.iter().all(|&r| r > 5), "should not fetch rounds <= GC round");

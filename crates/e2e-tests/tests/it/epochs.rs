@@ -19,11 +19,12 @@ use tn_reth::{
     test_utils::TransactionFactory,
     RethChainSpec,
 };
+use tn_test_utils::wait_until;
 use tn_types::{
     get_available_tcp_port, test_utils::CommandParser, Address, EpochCertificate, EpochRecord,
     Genesis, GenesisAccount, U256,
 };
-use tokio::time::{timeout, Instant};
+use tokio::time::timeout;
 use tracing::{debug, info};
 
 const NEW_VALIDATOR: &str = "new-validator";
@@ -32,8 +33,12 @@ const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
 const MIN_EPOCHS_TO_TEST: usize = 6;
 // Epoch init creates HDX index files per epoch (open_epoch_pack → new_epoch →
 // ConsensusPack::open_append). With test-utils, these are ~1.3MB each (vs ~130MB in prod).
-// 10s provides margin for parallel test execution and CI load variance.
-const EPOCH_DURATION: u64 = 10;
+// 5s is the consensus minimum epoch duration; halving it from 10s roughly halves the
+// wall time of each epoch test. The two `tn_epochRecord` certificate-availability polls
+// below are floored to an absolute minimum (`.max(..)`) rather than scaling with this
+// constant, because certificate production is a fixed async quorum-voting cost that does
+// not shrink with the epoch cadence.
+const EPOCH_DURATION: u64 = 5;
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
@@ -103,19 +108,11 @@ async fn test_epoch_boundary_inner(
     // n ~= 25 iterations
     for i in 0..25 {
         // poll until the epoch changes, with a generous timeout for parallel test load
-        let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 4);
-        let new_epoch_info = loop {
-            let info = consensus_registry.getCurrentEpochInfo().call().await?;
-            if info != current_epoch_info {
-                break info;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Epoch did not change within {}s on iteration {i}",
-                EPOCH_DURATION * 4
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        };
+        wait_until(Duration::from_secs(EPOCH_DURATION * 4), "epoch to change", || async {
+            Ok(consensus_registry.getCurrentEpochInfo().call().await? != current_epoch_info)
+        })
+        .await?;
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
 
         assert!(new_epoch_info.blockHeight > last_epoch_block_height);
         assert_eq!(new_epoch_info.epochDuration as u64, EPOCH_DURATION);
@@ -147,27 +144,27 @@ async fn test_epoch_boundary_inner(
         for ep in endpoints {
             let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
             for epoch in 0..=latest_epoch {
-                let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 3);
-                let (epoch_rec, cert) = loop {
-                    match provider
-                        .raw_request::<_, (EpochRecord, EpochCertificate)>(
-                            "tn_epochRecord".into(),
-                            (epoch,),
-                        )
-                        .await
-                    {
-                        Ok(result) => break result,
-                        Err(_) if Instant::now() < deadline => {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                        Err(e) => {
-                            return Err(eyre::eyre!(
-                                "epoch record not available for epoch {epoch} on {}: {e}",
-                                ep.http_url
-                            ));
-                        }
-                    }
-                };
+                // Certificate availability is a fixed async quorum-voting cost, so floor
+                // this deadline at 30s instead of letting it shrink with EPOCH_DURATION.
+                wait_until(
+                    Duration::from_secs((EPOCH_DURATION * 3).max(30)),
+                    "epoch record certificate to become available",
+                    || async {
+                        Ok(provider
+                            .raw_request::<_, (EpochRecord, EpochCertificate)>(
+                                "tn_epochRecord".into(),
+                                (epoch,),
+                            )
+                            .await
+                            .is_ok())
+                    },
+                )
+                .await
+                .map_err(|_| {
+                    eyre::eyre!("epoch record not available for epoch {epoch} on {}", ep.http_url)
+                })?;
+                let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
+                    provider.raw_request("tn_epochRecord".into(), (epoch,)).await?;
                 assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
             }
         }
@@ -312,21 +309,13 @@ async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result
     let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
 
     let mut last_epoch_block_height = current_epoch_info.blockHeight;
-    for i in start..start + iterations {
+    for _ in start..start + iterations {
         // poll until the epoch changes, with a generous timeout for parallel test load
-        let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 4);
-        let new_epoch_info = loop {
-            let info = consensus_registry.getCurrentEpochInfo().call().await?;
-            if info != current_epoch_info {
-                break info;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Epoch did not change within {}s on iteration {i}",
-                EPOCH_DURATION * 4
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        };
+        wait_until(Duration::from_secs(EPOCH_DURATION * 4), "epoch to change", || async {
+            Ok(consensus_registry.getCurrentEpochInfo().call().await? != current_epoch_info)
+        })
+        .await?;
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
 
         assert!(new_epoch_info.blockHeight > last_epoch_block_height);
         assert_eq!(new_epoch_info.epochDuration as u64, EPOCH_DURATION);
@@ -406,31 +395,33 @@ async fn test_epoch_sync_inner(
                 .join("data");
             let pack_file_exists = std::fs::exists(file_test).unwrap_or_default();
             assert!(pack_file_exists, "Missing an epoch pack file for {val_name} on epoch {epoch}");
-            // Use 6× epoch duration: when a new validator joins the committee mid-test,
-            // its epoch vote quorum collection can time out (25 × 2.5s = ~62s) before the
-            // failed-quorum P2P fallback runs. The spawn_epoch_record_collector retries
-            // every 5s independently, so 60s gives enough time for it to succeed.
-            let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 6);
-            let (epoch_rec, cert) = loop {
-                match provider
-                    .raw_request::<_, (EpochRecord, EpochCertificate)>(
-                        "tn_epochRecord".into(),
-                        (epoch,),
-                    )
-                    .await
-                {
-                    Ok(result) => break result,
-                    Err(_) if Instant::now() < deadline => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                    Err(e) => {
-                        return Err(eyre::eyre!(
-                            "epoch record not available for validator {val_name} epoch {epoch} on {}: {e}",
-                            ep.http_url
-                        ));
-                    }
-                }
-            };
+            // When a new validator joins the committee mid-test, its epoch vote quorum
+            // collection can time out (25 × 2.5s = ~62s) before the failed-quorum P2P
+            // fallback runs. The spawn_epoch_record_collector retries every 5s
+            // independently, so 60s gives enough time for it to succeed. This is a fixed
+            // cost, so floor the deadline at 60s rather than scaling it with EPOCH_DURATION.
+            wait_until(
+                Duration::from_secs((EPOCH_DURATION * 6).max(60)),
+                "epoch record certificate to become available",
+                || async {
+                    Ok(provider
+                        .raw_request::<_, (EpochRecord, EpochCertificate)>(
+                            "tn_epochRecord".into(),
+                            (epoch,),
+                        )
+                        .await
+                        .is_ok())
+                },
+            )
+            .await
+            .map_err(|_| {
+                eyre::eyre!(
+                    "epoch record not available for validator {val_name} epoch {epoch} on {}",
+                    ep.http_url
+                )
+            })?;
+            let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
+                provider.raw_request("tn_epochRecord".into(), (epoch,)).await?;
             assert!(
                 epoch_rec.verify_with_cert(&cert),
                 "invalid epoch record: {} {}/{} {}!",

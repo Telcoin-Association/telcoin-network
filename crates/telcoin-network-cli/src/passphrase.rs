@@ -87,11 +87,14 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                 }
                 passphrase = Some(buffer.trim_end().to_string()).filter(|s| !s.is_empty());
             }
-            PassSource::Ask => match self.command {
-                Commands::Keytool(_) => {
+            PassSource::Ask => match &self.command {
+                Commands::Keytool(keytool) if keytool.needs_passphrase() => {
                     // Need to ask and confirm before it used to encrypt.
                     passphrase = read_passphrase();
                 }
+                // keytool subcommands that only edit public config (e.g. `set-rpc`)
+                // never touch the BLS key, so don't prompt for a passphrase.
+                Commands::Keytool(_) => {}
                 Commands::Db(_) => {} // DB diagnostics are read-only and do not require keys.
                 Commands::Genesis(_) => {} // Don't need the passphrase..
                 Commands::Node(_) => {
@@ -105,9 +108,15 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                 passphrase = None;
             }
         }
-        // The `db` subcommand is a read-only inspection tool and never needs the BLS key.
-        let needs_passphrase = self.bls_passphrase_source.with_passphrase()
-            && !matches!(self.command, Commands::Db(_));
+        // The `db` subcommand is a read-only inspection tool and `keytool set-rpc`
+        // only edits public config; neither needs the BLS key passphrase.
+        let command_needs_passphrase = match &self.command {
+            Commands::Db(_) => false,
+            Commands::Keytool(keytool) => keytool.needs_passphrase(),
+            Commands::Genesis(_) | Commands::Node(_) => true,
+        };
+        let needs_passphrase =
+            self.bls_passphrase_source.with_passphrase() && command_needs_passphrase;
         if passphrase.is_none() && needs_passphrase {
             bail!(
                 "Error passphrase is required, see the option --bls-passphrase-source for options"

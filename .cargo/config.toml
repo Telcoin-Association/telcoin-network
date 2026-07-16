@@ -8,9 +8,16 @@ incremental = true
 codegen-units = 256
 
 [profile.dev.package."*"]
-# Optimize dependencies (compiled once, cached)
-opt-level = 2
+# Lightly optimize dependencies (opt-1): keeps most of the runtime benefit of a
+# cached dep build while cutting LLVM codegen time on a cold/CI build.
+opt-level = 1
 debug = false
+
+# Build scripts and proc-macros run only at compile time and gain nothing from
+# optimization, so pin them to opt-0 instead of inheriting the package."*" bump.
+[profile.dev.build-override]
+opt-level = 0
+codegen-units = 256
 
 [profile.test]
 debug = "line-tables-only"
@@ -20,5 +27,9 @@ incremental = true
 codegen-units = 256
 
 [profile.test.package."*"]
-opt-level = 2
+opt-level = 1
 debug = false
+
+[profile.test.build-override]
+opt-level = 0
+codegen-units = 256

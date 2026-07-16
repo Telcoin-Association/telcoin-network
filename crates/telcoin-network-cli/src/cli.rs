@@ -209,7 +209,7 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Key management.
     /// Generate or read keys for node management.
     #[command(name = "keytool")]
-    Keytool(keytool::KeyArgs),
+    Keytool(Box<keytool::KeyArgs>),
 
     /// Start the node
     #[command(name = "node")]
