@@ -57,10 +57,20 @@ type AuthEquivocationMap = HashMap<
     TokioMutex<Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>>,
 >;
 
-/// A pending consensus-result signature tally: a monotonic recency sequence (bumped every time a
-/// new distinct signer is added, used for LRU eviction) paired with the set of committee members
-/// that have signed this result. See the `consensus_certs` field and GHSA-2r5c-c4h7-gp5h.
-type ConsensusCertTally = (u64, HashSet<BlsPublicKey>);
+/// A pending consensus-result signature tally.
+///
+/// See the `consensus_certs` field, GHSA-2r5c-c4h7-gp5h, and GHSA-pvhw-9pmg-q2hg.
+#[derive(Default, Debug)]
+struct ConsensusCertTally {
+    /// Monotonic recency sequence, bumped every time a new distinct signer is added. Used for
+    /// least-recently-updated (LRU) eviction.
+    seq: u64,
+    /// The consensus number this tally is for. Used to rate-limit equivocation per
+    /// `(signer, number)`: an honest validator signs exactly one result per consensus number.
+    number: u64,
+    /// The committee members that have signed this result.
+    signers: HashSet<BlsPublicKey>,
+}
 
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
@@ -312,7 +322,7 @@ where
                         let guard = self.consensus_certs.lock();
                         if guard
                             .get(&consensus_result_hash)
-                            .and_then(|(_, signers)| signers.get(&key))
+                            .and_then(|tally| tally.signers.get(&key))
                             .is_some()
                         {
                             // We have already counted this signature so ignore.
@@ -329,38 +339,73 @@ where
                         // Once we have seen 1/3 + 1 committe members have signed this it should be
                         // valid.
                         enough_sigs = (committee.len() / 3) + 1;
+                        // The tally map is hard-capped so a flood of validly-signed but non-quorum
+                        // results cannot grow it without bound. The cap SCALES with committee size
+                        // (with `MAX_CONSENSUS_CERTS` as a floor): the number of Byzantine members
+                        // `f` grows with `n`, and the per-number equivocation limit below lets
+                        // those `f` members occupy at most `f *
+                        // MAX_TALLIES_PER_SIGNER_PER_NUMBER` tallies
+                        // for any one consensus number, which stays below `max_certs` for every
+                        // committee size. A fixed cap would be exceeded once `f` passed
+                        // `cap / MAX_TALLIES_PER_SIGNER_PER_NUMBER`, reactivating eviction and
+                        // reopening the GHSA-pvhw liveness residual.
+                        let max_certs = committee.len().max(super::MAX_CONSENSUS_CERTS);
                         let mut guard = self.consensus_certs.lock();
-                        // Hard-cap the tally map so a flood of validly-signed but non-quorum
-                        // results cannot grow it without bound. `consensus_certs` is cleared
-                        // wholesale on every quorum (below), so under honest operation only a few
-                        // entries are ever live (typically one, for the next consensus number).
+                        // Per-publisher equivocation limit (GHSA-pvhw-9pmg-q2hg). The cap above
+                        // bounds the map's memory; it does not protect liveness. A Byzantine member
+                        // can sign many distinct hashes for the SAME consensus number, and a flood
+                        // of those fresh digests can evict an honest tally still climbing to
+                        // quorum; honest validators gossip each result only
+                        // once, so an evicted honest signature is lost for
+                        // good and that result can never reach quorum.
                         //
+                        // An honest validator signs exactly ONE result (one hash) per consensus
+                        // number. A signer already present in `MAX_TALLIES_PER_SIGNER_PER_NUMBER`
+                        // distinct live tallies for THIS number is equivocating; drop its further
+                        // fresh digests for the number. The limit is per `(signer, number)`, NOT
+                        // per signer, so an honest validator that is the
+                        // first to gossip several consecutive un-quorumed
+                        // numbers is never throttled. Joining an existing
+                        // tally is always allowed (it never grows the map).
+                        //
+                        // Residual (documented follow-up): a single member fabricating one hash
+                        // each for many distinct FUTURE numbers is not
+                        // bounded here and is indistinguishable from an
+                        // honest validator racing ahead. See
+                        // GHSA-pvhw-9pmg-q2hg.
+                        if !guard.contains_key(&consensus_result_hash) {
+                            let signer_tallies_for_number = guard
+                                .values()
+                                .filter(|tally| {
+                                    tally.number == number && tally.signers.contains(&key)
+                                })
+                                .count();
+                            if signer_tallies_for_number >= super::MAX_TALLIES_PER_SIGNER_PER_NUMBER
+                            {
+                                return Ok(());
+                            }
+                        }
                         // Eviction is by least-recently-updated (LRU), NOT by signer count. A real
                         // consensus result is signed once by each honest validator in a burst as
                         // the network commits it, so its tally is bumped to most-recently-used on
                         // every distinct signer and is never the eviction victim while it climbs to
-                        // quorum. Evicting by fewest-signers instead would be steerable: colluding
-                        // members can co-sign fakes that carry more signers than an honest tally
-                        // still gathering its first signatures, and so evict genuine progress.
-                        // Honest validators gossip each result only once, so an evicted honest
-                        // signature is lost for good; LRU keeps the actively-updated honest tally
-                        // and evicts the stale, frozen fakes instead. See GHSA-2r5c-c4h7-gp5h.
-                        let next_seq = guard.values().map(|(seq, _)| *seq).max().unwrap_or(0) + 1;
-                        if guard.len() >= super::MAX_CONSENSUS_CERTS
-                            && !guard.contains_key(&consensus_result_hash)
-                        {
+                        // quorum. Evicting by fewest-signers instead would be steerable. See
+                        // GHSA-2r5c-c4h7-gp5h.
+                        let next_seq = guard.values().map(|tally| tally.seq).max().unwrap_or(0) + 1;
+                        if guard.len() >= max_certs && !guard.contains_key(&consensus_result_hash) {
                             let evict = guard
                                 .iter()
-                                .min_by_key(|(_, (seq, _))| *seq)
+                                .min_by_key(|(_, tally)| tally.seq)
                                 .map(|(digest, _)| *digest);
                             if let Some(evict) = evict {
                                 guard.remove(&evict);
                             }
                         }
-                        let (seq, set) = guard.entry(consensus_result_hash).or_default();
-                        *seq = next_seq;
-                        set.insert(key);
-                        sigs = set.len();
+                        let tally = guard.entry(consensus_result_hash).or_default();
+                        tally.seq = next_seq;
+                        tally.number = number;
+                        tally.signers.insert(key);
+                        sigs = tally.signers.len();
                     }
                     if sigs >= enough_sigs {
                         if self.behind_consensus(epoch, round, Some(number)).await {
@@ -391,25 +436,35 @@ where
                     )),
                     PrimaryNetworkError::InvalidTopic
                 );
-                // Verify the BLS signature
-                ensure!(
-                    vote.check_signature(),
-                    PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
-                );
-                // Verify committee membership if the epoch record is available
-                if let Some((epoch_rec, _)) =
-                    self.consensus_chain.epochs().get_epoch_by_hash(vote.epoch_hash).await
-                {
+                // Authorize before verifying. `epoch_vote_topic` is an open gossip topic, so any
+                // observer can publish an `EpochVote` with arbitrary fields; `check_signature` is a
+                // full BLS pairing verify, so verifying first lets a non-committee observer force
+                // one verify per message on every honest primary (GHSA-j2g4-553f-875r). The
+                // collector only ever uses a vote whose author is a committee member of
+                // `vote.epoch` (`manage_epoch_votes` drops the rest), so gate on
+                // committee membership by epoch number first and pay the verify
+                // only for a member of a known epoch. Mirrors the `Consensus` arm
+                // above. Membership is by epoch *number*, not `epoch_hash`, so a
+                // member's vote for a forked/alternative record is still admitted (the collector's
+                // equivocation path needs it). A non-member yields the benign, non-penalizing
+                // `PeerNotInCommittee` rather than `PeerNotAuthor`, which is `Fatal` and, on the
+                // gossip path, charged to the honest relayer rather than the author.
+                if let Some(committee) = self.get_committee(vote.epoch).await {
                     ensure!(
-                        epoch_rec.committee.contains(&vote.public_key),
-                        PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(format!(
-                            "{} not in committee for epoch {}",
-                            vote.public_key, vote.epoch_hash
-                        )))
+                        committee.contains(&vote.public_key),
+                        PrimaryNetworkError::PeerNotInCommittee(Box::new(vote.public_key))
                     );
+                    ensure!(
+                        vote.check_signature(),
+                        PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+                    );
+                    // Fire-and-forget: no oneshot, no blocking
+                    let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
                 }
-                // Fire-and-forget: no oneshot, no blocking
-                let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
+                // Unknown epoch (no committee yet): we cannot authenticate the vote and the
+                // collector cannot use it, so drop it. The outgoing committee republishes votes
+                // until quorum, so a vote that races ahead of its epoch record is re-delivered
+                // once the epoch is known.
             }
         }
 
@@ -998,6 +1053,13 @@ where
     #[cfg(test)]
     pub(crate) fn consensus_certs_len(&self) -> usize {
         self.consensus_certs.lock().len()
+    }
+
+    /// Whether a tally for the given consensus-result digest is currently live. Test-only
+    /// accessor used to assert per-(signer, number) equivocation behaviour and eviction.
+    #[cfg(test)]
+    pub(crate) fn consensus_certs_has(&self, digest: &ConsensusResultDigest) -> bool {
+        self.consensus_certs.lock().contains_key(digest)
     }
 
     /// Send an epoch pack file over a stream.
