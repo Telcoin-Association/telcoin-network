@@ -19,6 +19,7 @@ tn-config = { workspace = true }
 tn-primary = { workspace = true }
 metrics = { workspace = true }
 reth-metrics = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 metrics-util = { workspace = true }
