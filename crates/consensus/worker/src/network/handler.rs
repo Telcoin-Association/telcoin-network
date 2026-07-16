@@ -23,8 +23,8 @@ use tn_network_libp2p::{
 use tn_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
 use tn_types::{
-    ensure, now, try_decode, BatchValidation, BlsPublicKey, Database, Epoch, SealedBatch, WorkerId,
-    B256,
+    ensure, now, try_decode, Batch, BatchValidation, BlsPublicKey, Database, Epoch, SealedBatch,
+    WorkerId, B256,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
@@ -159,8 +159,6 @@ where
                 // most likely be removed before we can use it and will be fetched
                 // later when needed.
                 ensure!(my_epoch == epoch, WorkerNetworkError::BatchEpochMismatch(epoch, my_epoch));
-                // Retrieve the batch...
-                let store = self.consensus_config.node_storage();
                 // Since we are precaching Batches for the current epoch we only need to check if it
                 // is in the local cache. There should not have been an opertunity
                 // for it to be in the consensus chain yet.
@@ -191,29 +189,10 @@ where
                     let mut missing = BTreeSet::from([batch_hash]);
                     match self.network_handle.request_batches(&mut missing).await {
                         Ok(batches) => {
+                            // Note: retrieving this batch for no reason is wasteful, it should
+                            // only effect nodes catching up old epochs though...
                             if let Some((digest, batch)) = batches.first() {
-                                // Storing batches for future epochs can cause problems.  This might
-                                // open an attack for rogue
-                                // validator to fill disk space, the cache is cleared on
-                                // epoch boundaries anyway, etc.
-                                // Note: retrieving this batch for no reason is wasteful, it should
-                                // only effect nodes catching up old epochs though...
-                                if batch.epoch == self.consensus_config.epoch() {
-                                    store.insert::<NodeBatchesCache>(digest, batch).map_err(
-                                        |e| {
-                                            WorkerNetworkError::Internal(format!(
-                                                "failed to write to batch store: {e}"
-                                            ))
-                                        },
-                                    )?;
-                                } else {
-                                    debug!(
-                                        target: "worker:network",
-                                        batch_epoch = batch.epoch,
-                                        current_epoch = self.consensus_config.epoch(),
-                                        "gossipped batch epoch mismatch - discarding"
-                                    );
-                                }
+                                self.validate_and_cache_prefetched_batch(digest, batch)?;
                             }
                         }
                         Err(e) => {
@@ -225,6 +204,61 @@ where
         }
 
         Ok(())
+    }
+
+    /// Validate a gossip-prefetched batch body, then cache it on success.
+    ///
+    /// The vote-path sync (`PrimaryReceiverHandler::synchronize`) treats a digest
+    /// already present in `NodeBatchesCache` as validated-and-available and skips
+    /// `validate_batch` for it. A body fetched by the gossip prefetch must therefore
+    /// be validated here before it enters that cache, exactly as
+    /// `process_report_batch` does; an invalid body is dropped (never cached) and the
+    /// failure recorded. Without this, a Byzantine committee member could gossip and
+    /// serve a semantically-invalid batch, have every honest worker cache it
+    /// unvalidated, and then get it voted on and certified (issue #933).
+    ///
+    /// A batch for a future epoch is discarded rather than cached: the cache is
+    /// cleared on epoch boundaries and storing it would let a rogue validator waste
+    /// disk on batches that can never be used.
+    fn validate_and_cache_prefetched_batch(
+        &self,
+        digest: &B256,
+        batch: &Batch,
+    ) -> WorkerNetworkResult<()> {
+        if batch.epoch != self.consensus_config.epoch() {
+            debug!(
+                target: "worker:network",
+                batch_epoch = batch.epoch,
+                current_epoch = self.consensus_config.epoch(),
+                "gossipped batch epoch mismatch - discarding"
+            );
+            return Ok(());
+        }
+
+        // `request_batches` guarantees the fetched body hashes to `digest`, so seal
+        // with it and let `validate_batch` re-check the digest along with byte size,
+        // per-transaction decode/recovery, blob exclusion, gas limit, and base fee. A
+        // validation failure means a peer served an invalid body: drop it (do not
+        // cache) and record the failure. This is a content fault of the served body,
+        // not of the gossip relayer, so it is not propagated as an error.
+        let sealed_batch = batch.clone().seal(*digest);
+        if let Err(err) = self
+            .validator
+            .validate_batch(sealed_batch)
+            .inspect_err(|_| self.metrics.record_batch_validation_failure())
+        {
+            warn!(
+                target: "worker:network",
+                ?digest,
+                %err,
+                "gossip-prefetched batch failed validation - discarding"
+            );
+            return Ok(());
+        }
+
+        self.consensus_config.node_storage().insert::<NodeBatchesCache>(digest, batch).map_err(
+            |e| WorkerNetworkError::Internal(format!("failed to write to batch store: {e}")),
+        )
     }
 
     /// Process a new reported batch.
@@ -430,6 +464,16 @@ where
         sealed_batch: SealedBatch,
     ) -> WorkerNetworkResult<()> {
         self.process_report_batch(peer, sealed_batch).await
+    }
+
+    /// Publicly available for tests.
+    /// See [Self::validate_and_cache_prefetched_batch].
+    pub fn pub_validate_and_cache_prefetched_batch(
+        &self,
+        digest: &B256,
+        batch: &Batch,
+    ) -> WorkerNetworkResult<()> {
+        self.validate_and_cache_prefetched_batch(digest, batch)
     }
 
     /// Publicly available for tests.

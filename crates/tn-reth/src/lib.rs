@@ -763,21 +763,31 @@ impl RethEnv {
         // Phase 1: Recover all transactions (ECDSA ecrecover) in parallel via rayon.
         // Always use par_iter — the slight overhead on small batches is negligible
         // compared to the savings on large ones, and avoids an extra code path.
+        //
+        // A transaction whose signer cannot be recovered cannot be executed, but a
+        // certified sub-DAG is fixed and identical on every honest node, so returning
+        // an error here would deterministically halt (and, on restart-replay,
+        // crash-loop) the whole network on a single undecodable transaction. Instead
+        // drop the unrecoverable transactions and continue, mirroring the `InvalidTx`
+        // tolerance of the execute phase below: every node drops the same
+        // transactions from the same certified bytes, so the resulting block stays
+        // deterministic (issue #933). The primary defense is validating batches before
+        // they can be certified; this only bounds the blast radius if one ever is.
         let recovered_txs = transactions
             .par_iter()
-            .map(|tx_bytes| {
+            .filter_map(|tx_bytes| {
                 reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
                     .inspect_err(|e| {
                         error!(
                             target: "engine",
                             batch=?batch_digest,
                             ?tx_bytes,
-                            "failed to recover signer: {e}"
+                            "failed to recover signer, dropping transaction: {e}"
                         )
                     })
-                    .map_err(TnRethError::from)
+                    .ok()
             })
-            .collect::<TnRethResult<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
         // Phase 2: Execute recovered transactions sequentially.
         for recovered in recovered_txs {
