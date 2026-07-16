@@ -23,11 +23,12 @@ use nix::{
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
 use std::{
+    cell::{Cell, RefCell},
     collections::HashMap,
     fmt::Debug,
     ops::RangeInclusive,
     path::Path,
-    process::Child,
+    process::{Child, ExitStatus},
     sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
@@ -38,7 +39,7 @@ use tn_reth::{
     test_utils::TransactionFactory,
     RethChainSpec,
 };
-use tn_test_utils::wait_until_blocking;
+use tn_test_utils::{wait_until, wait_until_blocking};
 use tn_types::{
     address, get_available_tcp_port, keccak256,
     test_utils::{init_test_tracing, CommandParser},
@@ -166,6 +167,46 @@ impl ProcessGuard {
             }
             *slot = None;
         }
+    }
+
+    /// Wait (bounded) for the child at `idx` to exit on its own, without signaling it.
+    ///
+    /// On success the child has been reaped, so its slot is cleared: `kill_all`/`Drop` signal
+    /// raw pids, and the OS may reuse a reaped child's pid, so the guard must never signal it
+    /// again. On timeout (or a `try_wait` error) the child stays guarded so `Drop` still cleans
+    /// it up, and a named-timeout error is returned.
+    pub(crate) fn wait_for_natural_exit(
+        &mut self,
+        idx: usize,
+        timeout: Duration,
+    ) -> eyre::Result<ExitStatus> {
+        let child = self
+            .children
+            .get_mut(idx)
+            .and_then(|slot| slot.as_mut())
+            .ok_or_else(|| eyre::eyre!("no child process at index {idx}"))?;
+
+        // `wait_until_blocking` takes an `Fn` closure, but `try_wait` needs `&mut Child`, so
+        // thread the borrow through a `RefCell` (the poll loop is single-threaded).
+        let child = RefCell::new(child);
+        let status = Cell::new(None);
+        wait_until_blocking(timeout, &format!("child {idx} to exit on its own"), || {
+            match child.borrow_mut().try_wait()? {
+                Some(exit) => {
+                    status.set(Some(exit));
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        })?;
+
+        // The child is reaped; clear its slot so `kill_all`/`Drop` never signal a
+        // possibly-reused pid.
+        self.children[idx] = None;
+
+        status.get().ok_or_else(|| {
+            eyre::eyre!("child {idx} exit status not captured despite exit condition holding")
+        })
     }
 }
 
@@ -860,19 +901,15 @@ pub(crate) async fn loop_epochs(
     let mut last_epoch_block_height = current_epoch_info.blockHeight;
     for i in start..start + iterations {
         // poll until the epoch changes, with a generous timeout for parallel test load
-        let deadline = Instant::now() + Duration::from_secs(epoch_duration * 4);
-        let new_epoch_info = loop {
-            let info = consensus_registry.getCurrentEpochInfo().call().await?;
-            if info != current_epoch_info {
-                break info;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Epoch did not change within {}s on iteration {i}",
-                epoch_duration * 4
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        };
+        wait_until(
+            Duration::from_secs(epoch_duration * 4),
+            &format!("epoch to change on iteration {i}"),
+            || async {
+                Ok(consensus_registry.getCurrentEpochInfo().call().await? != current_epoch_info)
+            },
+        )
+        .await?;
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
 
         assert!(new_epoch_info.blockHeight > last_epoch_block_height);
         assert_eq!(new_epoch_info.epochDuration as u64, epoch_duration);
@@ -987,16 +1024,10 @@ pub(crate) struct EpochSnapshot {
 
 /// Poll a provider until its RPC answers `eth_chainId`.
 pub(crate) async fn wait_for_rpc<P: Provider>(provider: &P) -> eyre::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match provider.get_chain_id().await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(e) => return Err(eyre::eyre!("provider RPC never became available: {e}")),
-        }
-    }
+    wait_until(Duration::from_secs(30), "provider RPC answers eth_chainId", || async {
+        Ok(provider.get_chain_id().await.is_ok())
+    })
+    .await
 }
 
 /// Read the current epoch snapshot from the `ConsensusRegistry`.
@@ -1031,6 +1062,40 @@ pub(crate) async fn wait_for_epoch_at_least<P: Provider>(
         }
         // Poll ~4x/sec: with 5s epochs a 1s cadence adds up to ~1s of slop per boundary.
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Poll `node` until its latest execution block number is at least `min_height`.
+pub(crate) async fn wait_for_head_at_least(
+    node: &str,
+    min_height: u64,
+    timeout_secs: u64,
+) -> eyre::Result<()> {
+    wait_until(
+        Duration::from_secs(timeout_secs),
+        &format!("{node} head to reach block {min_height}"),
+        || async { Ok(get_block_number(node)? >= min_height) },
+    )
+    .await
+}
+
+/// Wait (bounded) for `epoch` to be reached on `http_url`, failing with a message that names the
+/// calling phase instead of hanging until the harness slow-timeout kills the test.
+pub(crate) async fn assert_epoch_reached(
+    http_url: &str,
+    epoch: u32,
+    phase: &str,
+) -> eyre::Result<()> {
+    let provider = ProviderBuilder::new().connect_http(http_url.parse()?);
+    let bound = EPOCH_DURATION * 6;
+    match timeout(Duration::from_secs(bound), wait_for_epoch_at_least(&provider, epoch)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            Err(eyre::eyre!("{phase}: node {http_url} failed reaching epoch {epoch}: {e}"))
+        }
+        Err(_) => {
+            Err(eyre::eyre!("{phase}: node {http_url} did not reach epoch {epoch} within {bound}s"))
+        }
     }
 }
 
@@ -1151,7 +1216,8 @@ pub(crate) async fn fetch_verified_epoch_record(
         {
             Ok(result) => break result,
             Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                // Poll ~4x/sec so the record is picked up promptly once quorum voting completes.
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(e) => {
                 return Err(eyre::eyre!(
@@ -1172,7 +1238,12 @@ pub(crate) async fn fetch_verified_epoch_record(
 }
 
 /// Assert every node in `endpoints` serves a certified, verifying epoch record for every epoch in
-/// `epochs`, and that each node has executed the final block named by each record.
+/// `epochs`, and that each node has executed the final block named by each record with the exact
+/// hash the record commits to.
+///
+/// Hash equality is the cross-node divergence detector: two nodes can both HAVE a block at the
+/// recorded height while disagreeing on its contents (e.g. a different withdrawals_root ⇒ a
+/// different hash), so existence alone cannot catch divergence.
 pub(crate) async fn assert_epoch_records_verify(
     endpoints: &[NodeEndpoints],
     epochs: RangeInclusive<u32>,
@@ -1184,13 +1255,31 @@ pub(crate) async fn assert_epoch_records_verify(
                 fetch_verified_epoch_record(&ep.http_url, epoch, per_record_timeout_secs).await?;
             // Make sure the node has executed the final block from the epoch record.
             // This should prove it has the consensus output as well (i.e. verify the pack data).
-            get_block(&ep.http_url, Some(epoch_rec.final_state.number)).map_err(|e| {
+            let block =
+                get_block(&ep.http_url, Some(epoch_rec.final_state.number)).map_err(|e| {
+                    eyre::eyre!(
+                        "final block {} for epoch {epoch} missing on {}: {e}",
+                        epoch_rec.final_state.number,
+                        ep.http_url
+                    )
+                })?;
+            // The block must be the SAME block the record commits to, not merely one at the
+            // same height (the RPC serves hex strings; the record stores a typed hash).
+            let block_hash = block.get("hash").and_then(Value::as_str).ok_or_else(|| {
                 eyre::eyre!(
-                    "final block {} for epoch {epoch} missing on {}: {e}",
+                    "final block {} for epoch {epoch} on {} has no hash field",
                     epoch_rec.final_state.number,
                     ep.http_url
                 )
             })?;
+            let expected_hash = epoch_rec.final_state.hash.to_string();
+            eyre::ensure!(
+                block_hash.eq_ignore_ascii_case(&expected_hash),
+                "final block {} for epoch {epoch} on {} hash mismatch: node has {block_hash}, \
+                 record commits to {expected_hash}",
+                epoch_rec.final_state.number,
+                ep.http_url
+            );
         }
     }
     Ok(())

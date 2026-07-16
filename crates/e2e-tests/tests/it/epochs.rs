@@ -83,9 +83,7 @@ async fn test_epoch_boundary_inner(
     // track the number of times the new validator was in the epoch committee
     let mut new_validator_in_committee_count = 0;
 
-    // sleep for first epoch with 1s offset and begin assertions loop
-    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
-
+    // No pre-pad sleep is needed here: the loop's first poll waits for the epoch to change.
     let mut shuffled = false;
     let mut latest_epoch = 0u32;
     // the new validator has a 1/6 chance of being selected for the new committee
@@ -296,9 +294,7 @@ async fn test_epoch_sync_inner(
     })
     .await?;
 
-    // sleep for first epoch with 1s offset and begin assertions loop
-    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
-
+    // No pre-pad sleep is needed here: loop_epochs polls until the epoch changes.
     // Go through at least 5 epochs.
     loop_epochs(0, 5, &endpoints[0].http_url, EPOCH_DURATION).await?;
     // Kill a node

@@ -15,11 +15,11 @@
 //!   halts at the first epoch boundary after the burn.
 
 use crate::common::{
-    acquire_test_permit, assert_epoch_records_verify, create_genesis_for_test,
-    fetch_verified_epoch_record, generate_new_validator_txs, get_block_number,
-    get_tx_receipt_block, kill_child, loop_epochs, send_owner_tx, start_nodes,
-    wait_for_epoch_at_least, wait_for_mid_epoch, wait_for_rpc, ProcessGuard, EPOCH_DURATION,
-    INITIAL_STAKE_AMOUNT, NEW_VALIDATOR,
+    acquire_test_permit, assert_epoch_reached, assert_epoch_records_verify,
+    create_genesis_for_test, fetch_verified_epoch_record, generate_new_validator_txs,
+    get_block_number, get_tx_receipt_block, kill_child, loop_epochs, send_owner_tx, start_nodes,
+    wait_for_epoch_at_least, wait_for_head_at_least, wait_for_mid_epoch, wait_for_rpc,
+    ProcessGuard, EPOCH_DURATION, INITIAL_STAKE_AMOUNT, NEW_VALIDATOR,
 };
 use alloy::{
     primitives::{utils::parse_ether, Bytes},
@@ -35,7 +35,7 @@ use tn_reth::{
     RethChainSpec,
 };
 use tn_types::{Address, EpochCertificate, EpochRecord, U256};
-use tokio::time::{timeout, Instant};
+use tokio::time::timeout;
 use tracing::info;
 
 /// Name of the genesis-configured non-committee node used by the mid-epoch ejection test.
@@ -266,36 +266,9 @@ async fn test_validator_ejected_from_future_committee_only() -> eyre::Result<()>
     assert_epoch_records_verify(&endpoints, 0..=latest_closed, EPOCH_DURATION * 6).await?;
 
     // the burned validator's node keeps following the chain (epoch-close blocks keep coming)
-    let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 3);
-    loop {
-        let head_after = get_block_number(newval_url)?;
-        if head_after > head_before.max(burn_block) {
-            break;
-        }
-        eyre::ensure!(
-            Instant::now() < deadline,
-            "burned validator's node head stuck at {head_after} (started {head_before})"
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    wait_for_head_at_least(newval_url, head_before.max(burn_block) + 1, EPOCH_DURATION * 3).await?;
 
     Ok(())
-}
-
-/// Wait (bounded) for `epoch` to be reached on `http_url`, failing with a message that names the
-/// calling phase instead of hanging until the harness slow-timeout kills the test.
-async fn assert_epoch_reached(http_url: &str, epoch: u32, phase: &str) -> eyre::Result<()> {
-    let provider = ProviderBuilder::new().connect_http(http_url.parse()?);
-    let bound = EPOCH_DURATION * 6;
-    match timeout(Duration::from_secs(bound), wait_for_epoch_at_least(&provider, epoch)).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => {
-            Err(eyre::eyre!("{phase}: node {http_url} failed reaching epoch {epoch}: {e}"))
-        }
-        Err(_) => {
-            Err(eyre::eyre!("{phase}: node {http_url} did not reach epoch {epoch} within {bound}s"))
-        }
-    }
 }
 
 #[ignore = "only run independently from all other it tests"]
@@ -588,18 +561,7 @@ async fn test_validator_ejected_from_current_committee_mid_epoch() -> eyre::Resu
 
     // the ejected validator's node keeps following as an observer: its head advances past the
     // transfer's block and it serves the shrunken epoch-E record with a verifying cert
-    let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 3);
-    loop {
-        let head = get_block_number(&victim_url)?;
-        if head > tx_block {
-            break;
-        }
-        eyre::ensure!(
-            Instant::now() < deadline,
-            "ejected validator's node head stuck at {head} (transfer landed at {tx_block})"
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    wait_for_head_at_least(&victim_url, tx_block + 1, EPOCH_DURATION * 3).await?;
     fetch_verified_epoch_record(&victim_url, e, EPOCH_DURATION * 3).await?;
 
     Ok(())
