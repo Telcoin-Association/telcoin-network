@@ -33,11 +33,15 @@ pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 33;
 
 /// Maximum garbage-collection depth, in consensus rounds, that the protocol supports.
 ///
-/// A single `CommittedSubDag` is the causal history of one leader certificate down to
-/// `gc_round + 1`, so it spans at most this many rounds (see `order_dag`). A node's configured
+/// This is the garbage-collection horizon, not the depth a commit actually reaches: `order_dag`
+/// descends only to `gc_round + 1` and additionally skips any round already committed per
+/// authority, so a `CommittedSubDag` is usually only a handful of rounds deep (a leader commits
+/// every couple of rounds).  It serves purely as a safe ceiling: because no certificate at or below
+/// `gc_round` can ever be linked into a commit, no sub-DAG can span more than this many rounds, a
+/// deliberately loose over-estimate that holds regardless of commit cadence.  A node's configured
 /// `gc_depth` is validated against this ceiling by `Parameters::validate`, and the consensus-pack
-/// reconstruction bound (`max_batches_per_output`) is derived from it, so raising this value
-/// requires re-deriving that bound.
+/// reconstruction bound (`max_batches_per_output`) is derived from it as a conservative
+/// over-estimate, so raising this value requires re-deriving that bound.
 pub const MAX_GC_DEPTH: Round = 50;
 
 /// Maximum number of batch digests a single primary `Header` may reference.

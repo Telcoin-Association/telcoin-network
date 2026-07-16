@@ -1314,15 +1314,20 @@ pub(crate) fn verify_epoch_meta(
 /// Upper bound on how many `Batch` records `iter_to_output` will buffer before the terminating
 /// `Consensus` record, derived from the committee that produced the output.
 ///
-/// A single `CommittedSubDag` spans at most [`MAX_GC_DEPTH`] rounds (`order_dag` descends only to
-/// `gc_round + 1`), with at most one certificate per authority per round and at most
+/// [`MAX_GC_DEPTH`] is the garbage-collection horizon, not the depth a commit actually reaches.
+/// `order_dag` descends only to `gc_round + 1` and additionally skips any round already committed
+/// per authority, so in practice a sub-DAG is only a handful of rounds deep (a leader commits every
+/// couple of rounds).  It serves purely as a safe ceiling: because no certificate at or below
+/// `gc_round` can ever be linked into a commit, a single `CommittedSubDag` references certificates
+/// from at most [`MAX_GC_DEPTH`] distinct rounds, a deliberately loose over-estimate that holds
+/// regardless of commit cadence.  With at most one certificate per authority per round and at most
 /// [`MAX_HEADER_NUM_OF_BATCHES`] batches per header (the proposer self-limits and
-/// `Header::validate` rejects oversized inbound headers).  So a legitimately committed output
+/// `Header::validate` rejects oversized inbound headers), a legitimately committed output therefore
 /// references at most `committee.size() * MAX_GC_DEPTH * MAX_HEADER_NUM_OF_BATCHES` unique batches.
 /// Bounding the reader at exactly that maximum keeps the writer and reader in agreement by
-/// construction — every executed output can be reconstructed — while still capping an
-/// unauthenticated peer flood of `Batch` records (the sub-DAG is only authenticated *after* decode,
-/// and the per-record size cap does not bound their count).
+/// construction (every executed output can be reconstructed) while still capping an unauthenticated
+/// peer flood of `Batch` records (the sub-DAG is only authenticated *after* decode, and the
+/// per-record size cap does not bound their count).
 fn max_batches_per_output(committee: &Committee) -> usize {
     committee.size().saturating_mul(MAX_GC_DEPTH as usize).saturating_mul(MAX_HEADER_NUM_OF_BATCHES)
 }
