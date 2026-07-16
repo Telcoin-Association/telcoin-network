@@ -618,4 +618,85 @@ mod tests {
         evm_handle.inc_leader_count(&leader);
         assert_eq!(acc.rewards_counter().leader_counts.lock().get(&leader), Some(&1));
     }
+
+    /// `get_address_counts` resolves every tallied [`AuthorityIdentifier`] through the
+    /// CURRENTLY-set committee: a tallied authority the committee no longer contains is silently
+    /// skipped — its row vanishes from the map (and therefore from `generate_withdrawals`),
+    /// neither zeroed nor errored. The underlying tally survives, so restoring the original
+    /// committee restores the row: the drop is a property of the committee view, not data loss.
+    ///
+    /// This drop semantic is why the epoch-entry committee read must be pinned to the epoch's
+    /// start state (the previous epoch's closing block): a node re-entering an epoch after a
+    /// mid-epoch governance burn that seeds this counter from the post-burn tip committee
+    /// silently drops the ejected leader's reward row, and the withdrawals it builds at the
+    /// epoch close diverge from peers that kept the epoch-start committee — a different
+    /// `withdrawals_root`, so a different closing-block hash.
+    #[test]
+    fn get_address_counts_drops_rows_for_non_committee_authorities() {
+        use crate::{BlsKeypair, CommitteeBuilder};
+        use rand::rng;
+
+        const VICTIM_LEADER_BLOCKS: u32 = 7;
+
+        let mut rng = rng();
+        let keypairs: Vec<BlsKeypair> = (0..4).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let addresses: Vec<Address> = (0..4).map(|i| Address::repeat_byte(i as u8 + 1)).collect();
+
+        // committee A: all 4 authorities (the epoch-start committee)
+        let mut builder = CommitteeBuilder::new(1);
+        for (keypair, address) in keypairs.iter().zip(addresses.iter()) {
+            builder.add_authority(*keypair.public(), *address);
+        }
+        let committee_a = builder.build();
+
+        let counter = RewardsCounter::default();
+        counter.set_committee(committee_a.clone());
+
+        // tally every member; the victim (index 0) gets a distinctive count
+        let ids: Vec<AuthorityIdentifier> = keypairs
+            .iter()
+            .map(|keypair| {
+                committee_a
+                    .authority_by_key(keypair.public())
+                    .expect("keypair is a committee member")
+                    .id()
+            })
+            .collect();
+        let victim_address = addresses[0];
+        for (i, id) in ids.iter().enumerate() {
+            let count = if i == 0 { VICTIM_LEADER_BLOCKS } else { 1 };
+            for _ in 0..count {
+                counter.inc_leader_count(id);
+            }
+        }
+
+        // with committee A set, every member has a row
+        let counts = counter.get_address_counts();
+        assert_eq!(counts.len(), 4);
+        assert_eq!(counts.get(&victim_address), Some(&VICTIM_LEADER_BLOCKS));
+        for address in &addresses[1..] {
+            assert_eq!(counts.get(address), Some(&1));
+        }
+
+        // committee B = A minus the victim (a post-burn tip read's committee)
+        let mut builder = CommitteeBuilder::new(1);
+        for (keypair, address) in keypairs.iter().zip(addresses.iter()).skip(1) {
+            builder.add_authority(*keypair.public(), *address);
+        }
+        counter.set_committee(builder.build());
+
+        // the victim's accumulated count is silently dropped — not zeroed, not an error
+        let counts = counter.get_address_counts();
+        assert_eq!(counts.len(), 3, "the non-member's row is dropped from the view");
+        assert!(!counts.contains_key(&victim_address));
+        for address in &addresses[1..] {
+            assert_eq!(counts.get(address), Some(&1), "surviving rows are unchanged");
+        }
+
+        // the tally itself survived: restoring committee A restores the row intact
+        counter.set_committee(committee_a);
+        let counts = counter.get_address_counts();
+        assert_eq!(counts.len(), 4);
+        assert_eq!(counts.get(&victim_address), Some(&VICTIM_LEADER_BLOCKS));
+    }
 }
