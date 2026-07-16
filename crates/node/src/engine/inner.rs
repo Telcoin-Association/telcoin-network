@@ -382,16 +382,6 @@ impl ExecutionNodeInner {
         self.reth_env.epoch_state_at_epoch_start()
     }
 
-    /// Read committee validator keys for epoch.
-    pub(super) fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
-        Ok(self
-            .reth_env
-            .bls_pubkeys_for_epoch(epoch)?
-            .iter()
-            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
-            .collect())
-    }
-
     /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
     pub(super) fn validators_for_epoch_at_block(
         &self,

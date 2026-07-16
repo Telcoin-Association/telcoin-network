@@ -2202,7 +2202,10 @@ async fn test_epoch_record_chain_across_mid_epoch_ejection() -> eyre::Result<()>
     let reth_env =
         RethEnv::new_for_temp_chain(chain.clone(), reth_dir.path(), &task_manager, None)?;
 
-    // committee reads exactly as the node's engine performs them for `write_epoch_record`
+    // committee reads through the same `getCommitteeBlsPubkeys` path the node performs for
+    // `write_epoch_record`. The node pins that read to the epoch-closing block; every read
+    // below happens while the canonical tip IS the relevant closing block, so the tip read
+    // resolves the identical state.
     let keys_for_epoch = |e: u32| -> eyre::Result<Vec<BlsPublicKey>> {
         Ok(reth_env
             .bls_pubkeys_for_epoch(e)?
