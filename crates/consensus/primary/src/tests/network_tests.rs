@@ -4,7 +4,8 @@ use crate::{
     error::PrimaryNetworkError,
     network::{
         message::{PrimaryGossip, PrimaryResponse},
-        MissingCertificatesRequest, RequestHandler, MAX_CONSENSUS_CERTS,
+        try_admit_epoch_record, MissingCertificatesRequest, RequestHandler,
+        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONSENSUS_CERTS, MAX_PENDING_REQUESTS_PER_PEER,
         MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
@@ -14,9 +15,10 @@ use assert_matches::assert_matches;
 use rand::{rngs::StdRng, SeedableRng};
 use roaring::RoaringBitmap;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     num::NonZeroUsize,
     path::Path,
+    sync::Arc,
     time::Duration,
 };
 use tempfile::TempDir;
@@ -1491,6 +1493,80 @@ async fn test_sync_epoch_pack_unavailable_denies() {
     assert_matches!(
         frame,
         tn_network_libp2p::SyncFrame::Deny(tn_network_libp2p::DenyReason::Unavailable)
+    );
+}
+
+/// `EpochRecord` request-response admission must cap a single peer at
+/// [`MAX_PENDING_REQUESTS_PER_PEER`] concurrent serves and free the slot when a serve ends
+/// (GHSA-vc2r-9cp2-w74j). Before the fix, `process_epoch_record_request` spawned an unbounded,
+/// penalty-free task per request, so a non-committee peer could exhaust task/CPU capacity.
+#[test]
+fn test_epoch_record_admission_enforces_per_peer_cap() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut rng = StdRng::seed_from_u64(1);
+    let peer = *BlsKeypair::generate(&mut rng).public();
+
+    // A single peer is admitted exactly MAX_PENDING_REQUESTS_PER_PEER times.
+    let held: Vec<_> = (0..MAX_PENDING_REQUESTS_PER_PEER)
+        .map(|_| {
+            try_admit_epoch_record(&semaphore, &peers, peer)
+                .expect("a peer under its per-peer cap must be admitted")
+        })
+        .collect();
+    assert_eq!(held.len(), MAX_PENDING_REQUESTS_PER_PEER);
+
+    // The next request from the same peer is refused while its serves are still in flight.
+    assert!(
+        try_admit_epoch_record(&semaphore, &peers, peer).is_none(),
+        "a peer at its per-peer cap must be refused"
+    );
+
+    // Ending the in-flight serves (dropping the permits) frees the peer's slots again.
+    drop(held);
+    assert!(
+        try_admit_epoch_record(&semaphore, &peers, peer).is_some(),
+        "dropping a peer's in-flight serves must free its per-peer capacity"
+    );
+}
+
+/// `EpochRecord` request-response admission must cap the concurrent serve count across all peers
+/// at [`MAX_CONCURRENT_EPOCH_RECORD_REQUESTS`] and free the budget when serves end
+/// (GHSA-vc2r-9cp2-w74j). This bounds the global task-spawn and, since a permit is held for the
+/// serve's lifetime, the total in-flight certificate-wait budget as well.
+#[test]
+fn test_epoch_record_admission_enforces_global_cap() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut rng = StdRng::seed_from_u64(2);
+
+    // Enough distinct peers that the *global* cap, not any per-peer cap, is the binding limit:
+    // one serve per peer fills every global permit while each peer stays under its per-peer cap.
+    let peer_pool: Vec<_> = (0..MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)
+        .map(|_| *BlsKeypair::generate(&mut rng).public())
+        .collect();
+    let held: Vec<_> = peer_pool
+        .iter()
+        .map(|peer| {
+            try_admit_epoch_record(&semaphore, &peers, *peer)
+                .expect("a global permit must be available while the budget is not exhausted")
+        })
+        .collect();
+    assert_eq!(held.len(), MAX_CONCURRENT_EPOCH_RECORD_REQUESTS);
+
+    // A further distinct peer is refused: the global concurrency budget is exhausted even though
+    // this peer is under its own per-peer cap.
+    let extra = *BlsKeypair::generate(&mut rng).public();
+    assert!(
+        try_admit_epoch_record(&semaphore, &peers, extra).is_none(),
+        "a fresh peer must be refused when the global concurrency budget is exhausted"
+    );
+
+    // Ending the in-flight serves frees the global budget again.
+    drop(held);
+    assert!(
+        try_admit_epoch_record(&semaphore, &peers, extra).is_some(),
+        "dropping in-flight serves must free global concurrency"
     );
 }
 

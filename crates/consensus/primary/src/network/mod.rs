@@ -52,6 +52,17 @@ pub(crate) type Res = PrimaryResponse;
 /// so this bounds the true concurrent count—not just the pending map size.
 pub const MAX_CONCURRENT_EPOCH_STREAMS: usize = 5;
 
+/// Maximum number of concurrent `EpochRecord` request-response serves across all peers.
+///
+/// The `EpochRecord` request-response arm is reachable by any peer whose identity resolves
+/// (not committee membership), and each serve does real work: a database lookup plus, for the
+/// in-progress epoch, an up-to-1.5s certificate-wait. Without a bound a peer could spawn
+/// unbounded concurrent, penalty-free serve tasks. A dedicated semaphore (separate from
+/// `MAX_CONCURRENT_EPOCH_STREAMS` so an epoch-record flood and the stream-serving paths never
+/// starve one another) caps the concurrent serve count and, with it, the total in-flight
+/// certificate-wait budget. See GHSA-vc2r-9cp2-w74j.
+pub const MAX_CONCURRENT_EPOCH_RECORD_REQUESTS: usize = 5;
+
 /// Hard cap on the number of distinct pending consensus results tracked in the
 /// handler's `consensus_certs` signature-tally map at any time.
 ///
@@ -177,14 +188,16 @@ struct EpochPackSyncRequest<'a> {
     /// Timeout applied when importing the streamed records.
     record_timeout: Duration,
 }
-/// RAII guard for an admitted inbound sync epoch-pack stream.
+
+/// RAII guard for one admitted in-flight request holding a global concurrency permit
+/// and a per-peer in-flight slot.
 ///
-/// Holds a global concurrency permit and counts toward the peer's per-peer
-/// in-flight total. Dropping it releases the global slot and decrements the
-/// per-peer count, so a finished or aborted exchange frees capacity for the next
-/// sync stream.
+/// Holds a semaphore permit and counts toward the peer's entry in a per-peer in-flight
+/// counter. Dropping it releases the global slot and decrements the per-peer count, so a
+/// finished or aborted request frees capacity again. Reused by the inbound sync epoch-pack
+/// path and the `EpochRecord` request-response path, each with its own semaphore and counter.
 #[derive(Debug)]
-struct SyncStreamPermit {
+pub(crate) struct PeerSlotPermit {
     /// Global concurrency permit, released on drop.
     _permit: OwnedSemaphorePermit,
     /// Shared per-peer in-flight counter, decremented on drop.
@@ -193,7 +206,7 @@ struct SyncStreamPermit {
     peer: BlsPublicKey,
 }
 
-impl Drop for SyncStreamPermit {
+impl Drop for PeerSlotPermit {
     fn drop(&mut self) {
         let mut peers = self.peers.lock();
         if let Some(count) = peers.get_mut(&self.peer) {
@@ -214,13 +227,35 @@ fn try_admit_sync(
     semaphore: &Arc<Semaphore>,
     sync_peers: &Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
     peer: BlsPublicKey,
-) -> Option<SyncStreamPermit> {
+) -> Option<PeerSlotPermit> {
     let permit = semaphore.clone().try_acquire_owned().ok()?;
     let mut sync_guard = sync_peers.lock();
     let sync_count = sync_guard.get(&peer).copied().unwrap_or(0);
     (sync_count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
         *sync_guard.entry(peer).or_insert(0) += 1;
-        SyncStreamPermit { _permit: permit, peers: sync_peers.clone(), peer }
+        PeerSlotPermit { _permit: permit, peers: sync_peers.clone(), peer }
+    })
+}
+
+/// Try to admit one `EpochRecord` request-response serve for `peer`.
+///
+/// Acquires a global permit from the dedicated epoch-record semaphore and admits only while the
+/// peer has fewer than [`MAX_PENDING_REQUESTS_PER_PEER`] in-flight epoch-record serves. Returns
+/// `None` (shedding the global permit) when either cap is hit, so the caller sheds the request
+/// without spawning work. The returned [`PeerSlotPermit`] is held for the serve's lifetime and
+/// frees both caps on drop. Unlike [`try_admit_sync`] this path has its own semaphore and
+/// counter, so it neither consults nor contends the stream pending map.
+pub(crate) fn try_admit_epoch_record(
+    semaphore: &Arc<Semaphore>,
+    peers: &Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    peer: BlsPublicKey,
+) -> Option<PeerSlotPermit> {
+    let permit = semaphore.clone().try_acquire_owned().ok()?;
+    let mut guard = peers.lock();
+    let count = guard.get(&peer).copied().unwrap_or(0);
+    (count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
+        *guard.entry(peer).or_insert(0) += 1;
+        PeerSlotPermit { _permit: permit, peers: peers.clone(), peer }
     })
 }
 
@@ -1041,6 +1076,14 @@ pub struct PrimaryNetwork<DB, Events> {
     /// Admission checks this count against [`MAX_PENDING_REQUESTS_PER_PEER`], the
     /// sole per-peer cap now that every bulk path rides the typed sync protocol.
     sync_stream_peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    /// Semaphore bounding concurrent `EpochRecord` request-response serves.
+    ///
+    /// Separate from `epoch_stream_semaphore` so an epoch-record flood and the stream-serving
+    /// paths never starve one another. See [`MAX_CONCURRENT_EPOCH_RECORD_REQUESTS`].
+    epoch_record_semaphore: Arc<Semaphore>,
+    /// Per-peer count of in-flight `EpochRecord` request-response serves, capped at
+    /// [`MAX_PENDING_REQUESTS_PER_PEER`].
+    epoch_record_peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
 }
 
 impl<DB, Events> PrimaryNetwork<DB, Events>
@@ -1073,6 +1116,8 @@ where
             consensus_chain,
             epoch_stream_semaphore,
             sync_stream_peers: Arc::new(Mutex::new(HashMap::default())),
+            epoch_record_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)),
+            epoch_record_peers: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 
@@ -1227,11 +1272,35 @@ where
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
+        // Admission control: bound concurrent epoch-record serving globally and per peer.
+        //
+        // This request-response arm is reachable by any peer whose identity resolves (not
+        // committee membership) and each serve does real work (a database read plus, for the
+        // in-progress epoch, an up-to-1.5s certificate-wait) while returning no penalty for an
+        // unavailable epoch. Without a bound a peer could spawn unbounded, penalty-free serve
+        // tasks. The permit is held for the serve's lifetime, so the concurrency cap also bounds
+        // the total in-flight certificate-wait budget. See GHSA-vc2r-9cp2-w74j.
+        let Some(permit) =
+            try_admit_epoch_record(&self.epoch_record_semaphore, &self.epoch_record_peers, peer)
+        else {
+            // At capacity: shed in O(1) by dropping the response channel rather than spawning
+            // work, so a flood beyond the cap costs only a permit try. Dropping the channel sends
+            // no rejection over the wire, so the caller (`request_epoch_cert`) rotates to another
+            // peer only after its request-response timeout elapses; that is added catch-up latency
+            // on a background path, not a hang, and only while this primary is at capacity.
+            // Replying "at capacity" instead would reintroduce a per-request task spawn, which is
+            // exactly what this bound removes.
+            return;
+        };
+
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         let task_name = format!("ConsensusOutputReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
+            // hold the admission permit for the serve's lifetime; dropping it on completion (or
+            // cancel) frees the global slot and decrements the per-peer count
+            let _permit = permit;
             tokio::select! {
                 header =
                     request_handler.retrieve_epoch_record(epoch, hash) => {
