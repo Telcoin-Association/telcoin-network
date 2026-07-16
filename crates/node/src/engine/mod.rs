@@ -23,7 +23,7 @@ use tn_rpc::EngineToPrimary;
 use tn_types::{
     gas_accumulator::GasAccumulator, BatchSender, BatchValidation, BlsPublicKey,
     ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader,
-    TaskSpawner, WorkerId,
+    TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -298,9 +298,26 @@ impl ExecutionNode {
         guard.epoch_state_from_canonical_tip()
     }
 
+    /// Read the current epoch's [EpochState] pinned to the previous epoch's closing block
+    /// (genesis for epoch 0), returning the pin header alongside it.
+    pub async fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
+        let guard = self.internal.read().await;
+        guard.epoch_state_at_epoch_start()
+    }
+
     /// Read committee validator keys for epoch.
     pub async fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
         let guard = self.internal.read().await;
         guard.validators_for_epoch(epoch)
+    }
+
+    /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
+    pub async fn validators_for_epoch_at_block(
+        &self,
+        epoch: u32,
+        block_hash: B256,
+    ) -> eyre::Result<Vec<BlsPublicKey>> {
+        let guard = self.internal.read().await;
+        guard.validators_for_epoch_at_block(epoch, block_hash)
     }
 }

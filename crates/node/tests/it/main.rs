@@ -2012,18 +2012,19 @@ async fn test_derive_idle_worker_fee_eip1559_decays_from_last_produced_epoch() -
     Ok(())
 }
 
-/// One epoch-entry pass over the accumulator exactly as `run_epoch` performs it: read the
-/// entered epoch's state from the canonical tip, resolve the previous epoch's closing block
-/// (`blockHeight - 1`, written once at the boundary), and derive+apply the worker count and
-/// every worker's base fee from that pinned state. Epoch 0 has no prior epoch: the count syncs
-/// from genesis `WorkerConfigs` state and fees keep the MIN defaults.
+/// One epoch-entry pass over the accumulator exactly as `run_epoch` performs it: the atomic
+/// `epoch_state_at_epoch_start` read yields the entered epoch's state together with the pin
+/// header — the previous epoch's closing block (`blockHeight - 1`, written once at the
+/// boundary) — and the worker count and every worker's base fee derive+apply from that pinned
+/// state. Epoch 0 has no prior epoch: the count syncs from genesis `WorkerConfigs` state and
+/// fees keep the MIN defaults.
 fn run_epoch_entry_sequence(
     reth_env: &RethEnv,
     gas_accumulator: &GasAccumulator,
 ) -> eyre::Result<()> {
-    // run_epoch reads the entered epoch's info from the canonical tip; the values are written
-    // once at the boundary, so any mid-epoch tip serves identical ones
-    let entered_state = reth_env.epoch_state_from_canonical_tip()?;
+    // run_epoch's entry read is pinned to the previous epoch's closing block; the pin resolves
+    // from boundary-written-once scalars, so any mid-epoch tip yields the identical header
+    let (entered_state, epoch_start_header) = reth_env.epoch_state_at_epoch_start()?;
     if entered_state.epoch == 0 {
         sync_num_workers_from_chain(
             reth_env,
@@ -2031,15 +2032,7 @@ fn run_epoch_entry_sequence(
             entered_state.epoch_info.blockHeight,
         )?;
     } else {
-        let closing_number = entered_state
-            .epoch_info
-            .blockHeight
-            .checked_sub(1)
-            .ok_or_else(|| eyre::eyre!("entered epoch reports blockHeight 0"))?;
-        let closing = reth_env
-            .sealed_header_by_number(closing_number)?
-            .ok_or_else(|| eyre::eyre!("missing closing block {closing_number}"))?;
-        derive_base_fees_for_entered_epoch(reth_env, entered_state.epoch, &closing)?
+        derive_base_fees_for_entered_epoch(reth_env, entered_state.epoch, &epoch_start_header)?
             .apply(gas_accumulator);
     }
     Ok(())
