@@ -26,7 +26,7 @@ use tokio::{
     io::{AsyncRead, BufReader},
     sync::{
         mpsc::{self, Receiver, Sender},
-        oneshot, watch,
+        oneshot,
     },
 };
 use tracing::{debug, error};
@@ -96,7 +96,7 @@ impl PackRecord {
 }
 
 enum PackMessage {
-    ConsensusOutput(ConsensusOutput),
+    ConsensusOutput(ConsensusOutput, oneshot::Sender<Result<u64, PackError>>),
     ContainsConsensusHeaderNumber(u64, oneshot::Sender<bool>),
     ContainsConsensusHeader(ConsensusHeaderDigest, oneshot::Sender<bool>),
     ConsensusHeader(ConsensusHeaderDigest, oneshot::Sender<Option<ConsensusHeader>>),
@@ -121,7 +121,6 @@ enum PackMessage {
 pub struct ConsensusPack {
     tx: Sender<PackMessage>,
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    error: watch::Receiver<Option<PackError>>,
     epoch: Epoch,
     committee: Committee,
     compression: PackCompression,
@@ -129,18 +128,12 @@ pub struct ConsensusPack {
     version: u16, // Version of the underlying data pack file.
 }
 
-fn run_pack_loop(
-    mut inner: Inner,
-    mut rx: Receiver<PackMessage>,
-    tx_error: watch::Sender<Option<PackError>>,
-) {
+fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
     // When this returns None then the channel is consumed and closed, so exit the thread.
     while let Some(msg) = rx.blocking_recv() {
         match msg {
-            PackMessage::ConsensusOutput(output) => {
-                if let Err(e) = inner.save_consensus_output(&output) {
-                    tx_error.send_replace(Some(e));
-                }
+            PackMessage::ConsensusOutput(output, tx) => {
+                let _ = tx.send(inner.save_consensus_output(&output));
             }
             PackMessage::ContainsConsensusHeaderNumber(number, tx) => {
                 let _ = tx.send(inner.contains_consensus_header_number(number));
@@ -240,16 +233,14 @@ impl ConsensusPack {
     ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let (tx_error, error) = watch::channel(None);
         let epoch = committee.epoch();
         let inner = Inner::open_append(path.clone(), &previous_epoch, committee.clone(), version)?;
         let version = inner.version();
         let compression = inner.data.header().compression();
-        let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
+        let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
         Ok(Self {
             tx,
             handle: Arc::new(Mutex::new(Some(handle))),
-            error,
             epoch,
             committee,
             compression,
@@ -262,16 +253,14 @@ impl ConsensusPack {
     pub fn open_append_exists<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let (tx_error, error) = watch::channel(None);
         let inner = Inner::open_append_exists(path.clone(), epoch)?;
         let version = inner.version();
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
-        let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
+        let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
         Ok(Self {
             tx,
             handle: Arc::new(Mutex::new(Some(handle))),
-            error,
             epoch,
             committee,
             compression,
@@ -286,16 +275,14 @@ impl ConsensusPack {
     pub fn open_static<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let (tx_error, error) = watch::channel(None);
         let inner = Inner::open_static(path.clone(), epoch)?;
         let version = inner.version();
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
-        let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
+        let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
         Ok(Self {
             tx,
             handle: Arc::new(Mutex::new(Some(handle))),
-            error,
             epoch,
             committee,
             compression,
@@ -315,7 +302,6 @@ impl ConsensusPack {
     ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let (tx_error, error) = watch::channel(None);
         let inner = Inner::stream_import(
             path,
             stream,
@@ -329,12 +315,11 @@ impl ConsensusPack {
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
         let handle = std::thread::spawn(move || {
-            run_pack_loop(inner, rx, tx_error);
+            run_pack_loop(inner, rx);
         });
         Ok(Self {
             tx,
             handle: Arc::new(Mutex::new(Some(handle))),
-            error,
             epoch,
             committee,
             compression,
@@ -353,29 +338,23 @@ impl ConsensusPack {
         self.epoch
     }
 
-    /// Return a delayed error value.
-    /// Work is sent to a background thread and any errors are recorded.
-    pub fn get_error(&self) -> Result<(), PackError> {
-        match &*self.error.borrow() {
-            Some(e) => Err(e.clone()),
-            None => Ok(()),
-        }
-    }
-
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
-    /// This backgrounds the save, will return any previous error from a past operation.
-    pub async fn save_consensus_output(&self, consensus: ConsensusOutput) -> Result<(), PackError> {
-        self.get_error()?;
-        if self.tx.send(PackMessage::ConsensusOutput(consensus)).await.is_err() {
-            Err(PackError::SendFailed)
+    /// Returns when save is complete and provides how many bytes the output took in the pack file.
+    pub async fn save_consensus_output(
+        &self,
+        consensus: ConsensusOutput,
+    ) -> Result<u64, PackError> {
+        let (tx, rx) = oneshot::channel();
+        let len = if self.tx.send(PackMessage::ConsensusOutput(consensus, tx)).await.is_ok() {
+            rx.await.map_err(|_| PackError::ReceiveFailed)??
         } else {
-            Ok(())
-        }
+            return Err(PackError::SendFailed);
+        };
+        Ok(len)
     }
 
     /// Load and return the consensus output form this epoch.
     pub async fn get_consensus_output(&self, number: u64) -> Result<ConsensusOutput, PackError> {
-        self.get_error()?;
         let (tx, rx) = oneshot::channel();
         let bytes = if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
             rx.await.map_err(|_| PackError::ReceiveFailed)??
@@ -414,7 +393,6 @@ impl ConsensusPack {
 
     /// Load and return the pack file bytes for consensus output form this epoch.
     pub async fn get_consensus_output_bytes(&self, number: u64) -> Result<Vec<u8>, PackError> {
-        self.get_error()?;
         let (tx, rx) = oneshot::channel();
         let mut bytes = if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
             rx.await.map_err(|_| PackError::ReceiveFailed)?
@@ -468,7 +446,6 @@ impl ConsensusPack {
     /// pack containing every output up to and including `number` (plus the data header). Errors
     /// if `number` is outside the range this pack contains.
     pub async fn consensus_output_end(&self, number: u64) -> Result<u64, PackError> {
-        self.get_error()?;
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::OutputEndForConsensus(number, tx)).await.is_ok() {
             rx.await.map_err(|_| PackError::ReceiveFailed)?
@@ -479,7 +456,6 @@ impl ConsensusPack {
 
     /// True if consensus header by digest is found by digest.
     pub async fn contains_consensus_header_number(&self, number: u64) -> Result<bool, PackError> {
-        self.get_error()?;
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::ContainsConsensusHeaderNumber(number, tx)).await.is_ok() {
             Ok(rx.await.map_err(|_| PackError::ReceiveFailed)?)
@@ -525,24 +501,16 @@ impl ConsensusPack {
     }
 
     pub async fn persist(&self) -> Result<(), PackError> {
-        self.get_error()?;
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::Persist(tx)).await;
-        rx.await.map_err(|_| match &*self.error.borrow() {
-            Some(e) => e.clone(),
-            None => PackError::ReceiveFailed,
-        })?
+        rx.await.map_err(|_| PackError::ReceiveFailed)?
     }
 
     // public handle method (sibling of `persist`, consensus_pack.rs:412):
     pub async fn flush_data(&self) -> Result<(), PackError> {
-        self.get_error()?;
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::FlushData(tx)).await;
-        rx.await.map_err(|_| match &*self.error.borrow() {
-            Some(e) => e.clone(),
-            None => PackError::ReceiveFailed,
-        })?
+        rx.await.map_err(|_| PackError::ReceiveFailed)?
     }
 
     /// Read the last committed rounds for authorities from the epoch.
@@ -1015,7 +983,8 @@ impl Inner {
     }
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
-    fn save_consensus_output(&mut self, consensus: &ConsensusOutput) -> Result<(), PackError> {
+    /// Returns the number of bytes the encoded ConsensusOutput takes in the pack file.
+    fn save_consensus_output(&mut self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
         let consensus_number = consensus.number();
         // Adjusted consensus index for this pack file.
         let consensus_idx = consensus_number.saturating_sub(self.epoch_meta.start_consensus_number);
@@ -1034,7 +1003,9 @@ impl Inner {
         if (consensus_idx as usize) < self.consensus_pos_idx.len() {
             // If we have saved this output already then ignore it.
             // Note this can be important when we replay consensus from downloaded pack files.
-            return Ok(());
+            // We do need to return the bytes this output requires in the pack file.
+            let pos = self.consensus_pos_idx.load(consensus_idx)?;
+            return Ok(pos.output_end.saturating_sub(pos.output_start));
         } else if consensus_idx as usize != self.consensus_pos_idx.len() {
             return Err(PackError::InvalidConsensusNumber(
                 self.consensus_pos_idx.len() as u64 + self.epoch_meta.start_consensus_number,
@@ -1063,7 +1034,7 @@ impl Inner {
         self.consensus_digests.set_data_file_length(len);
         self.batch_digests.set_data_file_length(len);
 
-        Ok(())
+        Ok(len.saturating_sub(batch_pos))
     }
 
     /// True if consensus header by digest is found by digest.
@@ -2069,19 +2040,10 @@ pub(crate) mod test {
         let parent = ConsensusHeader::default().digest();
         let wrong = make_test_output(&next_committee, 0, chain.clone(), 1, parent);
         assert_ne!(wrong.sub_dag().leader_epoch(), committee.epoch());
-        pack.save_consensus_output(wrong).await.expect("queued to pack thread");
+        let err = pack.save_consensus_output(wrong).await;
 
-        // The rejection is delivered asynchronously via the watch channel; poll for it.
-        let mut err = None;
-        for _ in 0..100 {
-            if let Err(e) = pack.get_error() {
-                err = Some(e);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         assert!(
-            matches!(err, Some(super::PackError::InvalidEpoch(..))),
+            matches!(err, Err(super::PackError::InvalidEpoch(..))),
             "expected InvalidEpoch, got {err:?}"
         );
     }

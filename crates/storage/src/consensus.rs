@@ -693,11 +693,14 @@ impl ConsensusChain {
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file for the
     /// current epoch. This should be called "in-order" as consensus is executed.
+    /// Returns the number of bytes the encoded Output takes on disk IF this is written to the
+    /// current pack or 0 otherwise (old consensus).
     pub async fn save_consensus_output(
         &self,
         consensus: ConsensusOutput,
-    ) -> Result<(), ConsensusChainError> {
+    ) -> Result<u64, ConsensusChainError> {
         let number = consensus.number();
+        let mut output_bytes = 0;
         if number > self.latest_consensus.number() {
             let epoch = consensus.sub_dag().leader_epoch();
             let pack = &self.current_pack();
@@ -715,7 +718,7 @@ impl ConsensusChain {
                     // If this an open pack file then save.
                     // Note, saving an output that is already in the pack is a no-op, not an error
                     // so this is fine.
-                    pack.save_consensus_output(consensus).await?;
+                    output_bytes = pack.save_consensus_output(consensus).await?;
                 } else if !pack.contains_consensus_header_number(number).await.unwrap_or_default() {
                     // If this is a static file and this output is missing this is an error...
                     error!(target: "consensus-chain", epoch, number, "Failed to update latest consensus, data not in expected pack file.");
@@ -724,7 +727,7 @@ impl ConsensusChain {
                 self.latest_consensus.update(epoch, number).await;
             }
         }
-        Ok(())
+        Ok(output_bytes)
     }
 
     /// Load and return the consensus output from the current epoch.
@@ -1188,7 +1191,7 @@ impl ConsensusChainReader for ConsensusChain {
 }
 
 impl ConsensusChainWriter for ConsensusChain {
-    async fn save_consensus_output(&self, consensus: ConsensusOutput) -> eyre::Result<()> {
+    async fn save_consensus_output(&self, consensus: ConsensusOutput) -> eyre::Result<u64> {
         ConsensusChain::save_consensus_output(self, consensus).await.map_err(Into::into)
     }
 

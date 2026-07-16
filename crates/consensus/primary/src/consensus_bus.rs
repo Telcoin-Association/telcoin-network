@@ -233,7 +233,7 @@ pub struct ConsensusBusAppInner {
 
     /// Watch tracking most recently seen consensus header.
     tx_last_consensus_header: watch::Sender<Option<ConsensusHeader>>,
-    /// Watch tracking the last gossipped consensus block number and hash.
+    /// Watch tracking the last gossipped epoch, consensus block number, hash and consensus bytes.
     tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, ConsensusHeaderDigest)>,
 
     /// Verified consensus OUTPUTs (header + batches) delivered to a following/catching-up
@@ -272,6 +272,7 @@ pub struct ConsensusBusAppInner {
     epoch_request_queue_rx:
         Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
     /// Channel to request consensus headers to cache.
+    /// Fields are epoch, consensus number, consensus digest and consensus output bytes.
     consensus_request_queue: QueChannel<(Epoch, u64, ConsensusHeaderDigest)>,
     /// Prometheus metrics for the primary's consensus pipeline.
     ///

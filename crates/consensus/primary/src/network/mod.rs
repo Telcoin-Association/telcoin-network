@@ -428,6 +428,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Publish a consensus block number and hash of the header.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_consensus(
         &self,
         epoch: Epoch,
