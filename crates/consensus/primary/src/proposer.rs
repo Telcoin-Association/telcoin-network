@@ -25,7 +25,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
 };
 use tn_config::ConsensusConfig;
-use tn_storage::ProposerStore;
+use tn_storage::{tables::LastProposed, ProposerStore};
 use tn_types::{
     now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, Hash as _,
     Header, Noticer, Round, TaskManager, TaskSpawner, TnReceiver, TnSender, WorkerId,
@@ -268,6 +268,14 @@ impl<DB: Database> Proposer<DB> {
         proposer_store
             .write_last_proposed(header)
             .map_err(|e| ProposerError::StoreError(e.to_string()))?;
+
+        // Wait for the `LastProposed` record to be durable before broadcasting. The epoch DB
+        // persists asynchronously, so `write_last_proposed` returns before the record hits disk;
+        // broadcasting first would let a crash in that window lose the record. On restart the
+        // anti-equivocation guard would then read nothing and build a *different* header for this
+        // same round while the pre-crash header is already on the network: equivocation from an
+        // ordinary crash. See issue #934.
+        proposer_store.persist_durable::<LastProposed>().await;
 
         // Send the new header to the `Certifier` that will broadcast and certify it.
         consensus_bus.headers().send(header.clone()).await.map_err(|e| Box::new(e).into())

@@ -18,7 +18,7 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     write_frame, GossipMessage, PrimarySyncRequest, Stream, SyncFrame, SyncFrameError,
 };
-use tn_storage::{consensus::ConsensusChain, CertificateStore, VoteDigestStore};
+use tn_storage::{consensus::ConsensusChain, tables::Votes, CertificateStore, VoteDigestStore};
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
@@ -868,6 +868,14 @@ where
 
         // Update the vote digest store with the vote we just sent.
         self.consensus_config.node_storage().write_vote(&vote)?;
+
+        // Wait for the `Votes` record to be durable before returning the vote to the peer. The
+        // epoch DB persists asynchronously, so `write_vote` returns before the record hits disk;
+        // returning the vote first would let a crash in that window lose the record. On restart the
+        // recast guard would then read nothing and could sign a *different* vote for the same
+        // author/round while the pre-crash vote is already held by the peer: equivocation from an
+        // ordinary crash. See issue #934.
+        self.consensus_config.node_storage().persist_durable::<Votes>().await;
 
         Ok(PrimaryResponse::Vote(vote))
     }
