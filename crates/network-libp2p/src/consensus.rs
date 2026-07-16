@@ -935,7 +935,7 @@ where
                 send_or_log_error!(reply, rpc, "GetValidatorRpc");
             }
             NetworkCommand::GetAllValidatorRpcs { reply } => {
-                let rpcs = self.swarm.behaviour().peer_manager.all_rpcs();
+                let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
             NetworkCommand::OpenStream { peer, kind, reply } => {

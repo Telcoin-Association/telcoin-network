@@ -29,18 +29,21 @@ use tokio::{
         oneshot, watch,
     },
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::archive::{
-    data_file::{create_dir_synced, fsync_directory},
+    data_file::create_dir_synced,
     digest_index::index::HdxIndex,
     error::{fetch::FetchError, open::OpenError},
     fxhasher::FxHasher,
     index::Index as _,
-    pack::{DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
+    pack::{write_value, DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
     pack_iter::AsyncPackIter,
     position_index::index::{PosIndexValue, PositionIndex},
 };
+
+/// Current version for new pack files.
+pub const PACK_VERSION: u16 = 1;
 
 /// Metadata for an Epoch.  Should always be the first record in a consensus pack.
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
@@ -123,6 +126,7 @@ pub struct ConsensusPack {
     committee: Committee,
     compression: PackCompression,
     is_static: bool,
+    version: u16, // Version of the underlying data pack file.
 }
 
 fn run_pack_loop(
@@ -212,11 +216,34 @@ impl ConsensusPack {
         previous_epoch: EpochRecord,
         committee: Committee,
     ) -> Result<ConsensusPack, PackError> {
+        Self::open_append_inner(path, previous_epoch, committee, PACK_VERSION)
+    }
+
+    /// Test-only: open an append pack forcing a specific on-disk data version so tests can
+    /// construct genuine v0 (legacy, batches-first) pack files.
+    #[cfg(test)]
+    pub(crate) fn open_append_version<P: Into<PathBuf>>(
+        path: P,
+        previous_epoch: EpochRecord,
+        committee: Committee,
+        version: u16,
+    ) -> Result<ConsensusPack, PackError> {
+        Self::open_append_inner(path, previous_epoch, committee, version)
+    }
+
+    /// Shared body for [`Self::open_append`] stamping the given on-disk data `version`.
+    fn open_append_inner<P: Into<PathBuf>>(
+        path: P,
+        previous_epoch: EpochRecord,
+        committee: Committee,
+        version: u16,
+    ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
         let epoch = committee.epoch();
-        let inner = Inner::open_append(path.clone(), &previous_epoch, committee.clone())?;
+        let inner = Inner::open_append(path.clone(), &previous_epoch, committee.clone(), version)?;
+        let version = inner.version();
         let compression = inner.data.header().compression();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
         Ok(Self {
@@ -227,6 +254,7 @@ impl ConsensusPack {
             committee,
             compression,
             is_static: false,
+            version,
         })
     }
 
@@ -236,6 +264,7 @@ impl ConsensusPack {
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
         let inner = Inner::open_append_exists(path.clone(), epoch)?;
+        let version = inner.version();
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
@@ -247,6 +276,7 @@ impl ConsensusPack {
             committee,
             compression,
             is_static: false,
+            version,
         })
     }
 
@@ -258,6 +288,7 @@ impl ConsensusPack {
         let path: PathBuf = path.into();
         let (tx_error, error) = watch::channel(None);
         let inner = Inner::open_static(path.clone(), epoch)?;
+        let version = inner.version();
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx, tx_error));
@@ -269,6 +300,7 @@ impl ConsensusPack {
             committee,
             compression,
             is_static: true,
+            version,
         })
     }
 
@@ -293,6 +325,7 @@ impl ConsensusPack {
             timeout,
         )
         .await?;
+        let version = inner.version();
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
         let handle = std::thread::spawn(move || {
@@ -306,6 +339,7 @@ impl ConsensusPack {
             committee,
             compression,
             is_static: true,
+            version,
         })
     }
 
@@ -350,7 +384,22 @@ impl ConsensusPack {
         };
         let cursor = Cursor::new(bytes);
         let reader = BufReader::new(cursor);
-        bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee).await
+        match self.version {
+            0 => {
+                bytes_to_output_legacy(
+                    reader,
+                    self.compression,
+                    Duration::from_secs(5),
+                    &self.committee,
+                )
+                .await
+            }
+            1 => {
+                bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee)
+                    .await
+            }
+            _ => Err(PackError::InvalidVersion(PACK_VERSION, self.version)),
+        }
     }
 
     /// Decode pack-file `bytes` (as produced by [`Self::get_consensus_output_bytes`] / streamed via
@@ -367,10 +416,50 @@ impl ConsensusPack {
     pub async fn get_consensus_output_bytes(&self, number: u64) -> Result<Vec<u8>, PackError> {
         self.get_error()?;
         let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
+        let mut bytes = if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
             rx.await.map_err(|_| PackError::ReceiveFailed)?
         } else {
             Err(PackError::SendFailed)
+        }?;
+        match self.version {
+            0 => {
+                let cursor = Cursor::new(bytes.clone());
+                let reader = BufReader::new(cursor);
+                let out = bytes_to_output_legacy(
+                    reader,
+                    self.compression,
+                    Duration::from_secs(5),
+                    &self.committee,
+                )
+                .await?;
+                let batches = collect_batches(&out);
+                let header: ConsensusHeader = out.into();
+                bytes.clear();
+                let mut value_buffer = Vec::new();
+                let mut compress_buffer = Vec::new();
+                // Re-encode as PackRecord-wrapped records (header first) to match the on-disk v1
+                // format the consumer decodes; the raw v1 serve path (below) returns these same
+                // PackRecord records straight from the pack file.
+                write_value(
+                    &PackRecord::Consensus(Box::new(header)),
+                    &mut bytes,
+                    &mut value_buffer,
+                    &mut compress_buffer,
+                    PackCompression::ZStd,
+                )?;
+                for (_, batch) in batches.into_iter() {
+                    write_value(
+                        &PackRecord::Batch(batch),
+                        &mut bytes,
+                        &mut value_buffer,
+                        &mut compress_buffer,
+                        PackCompression::ZStd,
+                    )?;
+                }
+                Ok(bytes)
+            }
+            1 => Ok(bytes),
+            _ => Err(PackError::InvalidVersion(PACK_VERSION, self.version)),
         }
     }
 
@@ -562,21 +651,11 @@ impl Inner {
             return false;
         }
         if !consensus_pos_idx.is_empty() {
-            let last_record = match consensus_pos_idx.load(consensus_pos_idx.len() as u64 - 1) {
-                Ok(p) => p.consensus_header,
+            let last_record_end = match consensus_pos_idx.load(consensus_pos_idx.len() as u64 - 1) {
+                Ok(p) => p.output_end,
                 Err(_) => return false,
             };
-            let mut iter = match data.raw_iter() {
-                Ok(i) => i,
-                Err(_) => return false,
-            };
-            if iter.set_position(last_record).is_err() {
-                return false;
-            }
-            match (iter.next(), iter.next()) {
-                (Some(_), None) => iter.position().unwrap_or_default() == pack_len,
-                _ => false,
-            }
+            pack_len == last_record_end
         } else {
             true
         }
@@ -613,16 +692,13 @@ impl Inner {
             let mut idx = start_idx;
             loop {
                 if let Ok(last_record) = consensus_pos_idx.load(idx) {
-                    let record_size_res = data.record_size(last_record.consensus_header);
-                    let record_valid = record_size_res.is_ok();
-                    if record_valid {
-                        if idx != start_idx {
-                            // Keep the bytes index in sync with the consensus index so the two
-                            // never diverge in length after healing a damaged pack.
-                            consensus_pos_idx.truncate_to_index(idx)?;
-                        }
-                        new_pack_len = last_record.consensus_header
-                            + record_size_res.unwrap_or_default() as u64;
+                    if idx != start_idx {
+                        // Keep the bytes index in sync with the consensus index so the two
+                        // never diverge in length after healing a damaged pack.
+                        consensus_pos_idx.truncate_to_index(idx)?;
+                    }
+                    new_pack_len = last_record.output_end;
+                    if new_pack_len <= pack_len {
                         break;
                     }
                 }
@@ -634,6 +710,10 @@ impl Inner {
                 }
                 idx -= 1;
             }
+            // Only ever shrink: `truncate` is `set_len`, so a `new_pack_len` above the current
+            // length (an index entry claiming an `output_end` past the data we actually have)
+            // would zero-extend the pack.  Clamp defensively.
+            let new_pack_len = new_pack_len.min(pack_len);
             if new_pack_len != pack_len {
                 data.truncate(new_pack_len)?;
             }
@@ -645,6 +725,11 @@ impl Inner {
         consensus_digests.set_data_file_length(healed_len);
         batch_digests.set_data_file_length(healed_len);
         Ok(())
+    }
+
+    /// Return the version of the underlying data pack file.
+    fn version(&self) -> u16 {
+        self.data.version()
     }
 
     /// Open a PDX index file and return the open index.
@@ -660,65 +745,13 @@ impl Inner {
         Ok(consensus_pos_idx)
     }
 
-    /// Open a PDX index file and return the open index.
-    /// This will handle an update of the index on older testnet epochs.
-    fn open_pdx_file_with_update<P: AsRef<Path>, T: PosIndexValue>(
-        dir: P,
-        read_only: bool,
-        data: &mut Pack<PackRecord>,
-    ) -> Result<PositionIndex<T>, PackError> {
-        let base_dir = dir.as_ref().join(Self::CONSENSUS_POS_NAME);
-        if PositionIndex::<T>::pdx_file_exists(&base_dir, "index.pdx")
-            && !PositionIndex::<T>::pdx_file_exists(&base_dir, "index_pos.pdx")
-        {
-            warn!(target: "consensus_pack", "Found old but not new position index, updating");
-            // We have an old index but, need to create a new one and build it.
-            // This code should only effect OG testnet nodes and should not need
-            // to be maintained forever.
-            let mut old_idx: PositionIndex<u64> =
-                PositionIndex::open_pdx_file(&base_dir, data.header(), "index.pdx", false)
-                    .map_err(OpenError::IndexFileOpen)?;
-            let _ = std::fs::remove_file(base_dir.join("index_pos.pdx.tmp"));
-            let mut new_idx: PositionIndex<IndexPositions> =
-                PositionIndex::open_pdx_file(&base_dir, data.header(), "index_pos.pdx.tmp", false)
-                    .map_err(OpenError::IndexFileOpen)?;
-            let mut end = 0;
-            for i in 0..old_idx.len() {
-                let idx = i as u64;
-                let start = if idx > 0 {
-                    end
-                } else {
-                    DATA_HEADER_BYTES as u64 + data.record_size(DATA_HEADER_BYTES as u64)? as u64
-                };
-                let Ok(pos) = old_idx.load(idx) else {
-                    break;
-                };
-                let Ok(record_size) = data.record_size(pos) else {
-                    break;
-                };
-                end = pos + record_size as u64;
-                new_idx
-                    .save(idx, IndexPositions::new(pos, start, end))
-                    .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
-            }
-            drop(new_idx);
-            drop(old_idx);
-            std::fs::rename(base_dir.join("index_pos.pdx.tmp"), base_dir.join("index_pos.pdx"))?;
-            fsync_directory(&base_dir)?;
-            let _ = std::fs::remove_file(base_dir.join("index.pdx"));
-        }
-        let consensus_pos_idx =
-            PositionIndex::open_pdx_file(&base_dir, data.header(), "index_pos.pdx", read_only)
-                .map_err(OpenError::IndexFileOpen)?;
-        Ok(consensus_pos_idx)
-    }
-
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
     fn open_append<P: AsRef<Path>>(
         path: P,
         previous_epoch: &EpochRecord,
         committee: Committee,
+        version: u16,
     ) -> Result<Self, PackError> {
         let epoch = committee.epoch();
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
@@ -726,7 +759,7 @@ impl Inner {
         let pack_file = base_dir.join(Self::DATA_NAME);
         let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
         let mut data: Pack<PackRecord> =
-            Pack::open(&pack_file, epoch as u64, false, PackCompression::ZStd)?;
+            Pack::open(&pack_file, epoch as u64, false, PackCompression::ZStd, version)?;
         let start_consensus_number =
             if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
         let epoch_meta = EpochMeta {
@@ -749,7 +782,7 @@ impl Inner {
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
         }
-        let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, false, &mut data)?;
+        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -791,12 +824,13 @@ impl Inner {
             epoch as u64,
             false,
             PackCompression::ZStd,
+            PACK_VERSION,
         )?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
             .into_epoch()?;
-        let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, false, &mut data)?;
+        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -833,12 +867,13 @@ impl Inner {
             epoch as u64,
             true,
             PackCompression::ZStd,
+            PACK_VERSION,
         )?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
             .into_epoch()?;
-        let mut consensus_pos_idx = Self::open_pdx_file_with_update(&base_dir, true, &mut data)?;
+        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), true)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -877,27 +912,19 @@ impl Inner {
         final_consensus_number: u64,
         timeout: Duration,
     ) -> Result<Self, PackError> {
-        /// Private helper to read the next record from a pack iterator or timeout if it takes
-        /// longer than timeout.
-        async fn next<R: AsyncRead + Unpin>(
-            iter: &mut AsyncPackIter<PackRecord, R>,
-            timeout: Duration,
-        ) -> Result<Option<PackRecord>, PackError> {
-            match tokio::time::timeout(timeout, iter.next()).await {
-                Ok(Some(Ok(rec))) => Ok(Some(rec)),
-                Ok(Some(Err(e))) => Err(PackError::ReadError(e.to_string())),
-                Ok(None) => Ok(None),
-                Err(_) => Err(PackError::ReadError("timeout".to_string())),
-            }
-        }
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = create_dir_synced(&base_dir);
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
-        let mut data =
-            Pack::open(base_dir.join(Self::DATA_NAME), epoch as u64, false, PackCompression::ZStd)?;
-        let epoch_meta = if let Some(meta) = next(&mut stream_iter, timeout).await? {
+        let mut data = Pack::open(
+            base_dir.join(Self::DATA_NAME),
+            epoch as u64,
+            false,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )?;
+        let epoch_meta = if let Some(meta) = next_output_record(&mut stream_iter, timeout).await? {
             meta.into_epoch()?
         } else {
             return Err(PackError::NotEpoch);
@@ -930,12 +957,21 @@ impl Inner {
         let mut pack =
             Self { data, consensus_pos_idx, consensus_digests, batch_digests, epoch_meta };
         loop {
-            let output =
+            let output = if stream_iter.version() == 0 {
+                match iter_to_output_legacy(&mut stream_iter, timeout, &pack.epoch_meta.committee)
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(PackError::NotConsensus) => break,
+                    Err(e) => return Err(e),
+                }
+            } else {
                 match iter_to_output(&mut stream_iter, timeout, &pack.epoch_meta.committee).await {
                     Ok(output) => output,
                     Err(PackError::NotConsensus) => break,
                     Err(e) => return Err(e),
-                };
+                }
+            };
             if output.parent_hash() != parent_digest {
                 return Err(PackError::InvalidConsensusChain);
             }
@@ -950,6 +986,32 @@ impl Inner {
             pack.save_consensus_output(&output)?;
         }
         Ok(pack)
+    }
+
+    /// Write the batches for consensus to the pack file.
+    fn save_consensus_batches(
+        &mut self,
+        consensus: &ConsensusOutput,
+    ) -> Result<Option<u64>, PackError> {
+        let batches = collect_batches(consensus);
+        let mut first_batch_pos = None;
+        // Save all the required batches into the pack file.
+        for (batch_digest, batch) in batches.into_iter() {
+            let position = self
+                .data
+                .append(&PackRecord::Batch(batch))
+                .map_err(|e| PackError::Append(e.to_string()))?;
+            if first_batch_pos.is_none() {
+                first_batch_pos = Some(position);
+            }
+            self.batch_digests
+                .save(batch_digest, position)
+                .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
+            let len = self.data.file_len();
+            self.consensus_digests.set_data_file_length(len);
+            self.batch_digests.set_data_file_length(len);
+        }
+        Ok(first_batch_pos)
     }
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
@@ -979,41 +1041,17 @@ impl Inner {
                 consensus_number,
             ));
         }
-        let mut batches = BTreeMap::new();
-        // We want to make sure batches are saved to the pack in a deterministic order, so
-        // collect them in a BTreeMap.  We probably don't actually need this but this
-        // means we do not impose any extra restrictions on consensus output.
-        for cert_batch in consensus.batches() {
-            for batch in &cert_batch.batches {
-                let digest = batch.digest();
-                // Should not have duplicate batches across output.
-                // Will work if we do but will save batches more than once in a pack.
-                batches.insert(digest, batch.clone());
-            }
-        }
-        let mut first_batch_pos = None;
-        // Save all the required batcdhes into the pack file.
-        for (batch_digest, batch) in batches.into_iter() {
-            let position = self
-                .data
-                .append(&PackRecord::Batch(batch))
-                .map_err(|e| PackError::Append(e.to_string()))?;
-            if first_batch_pos.is_none() {
-                first_batch_pos = Some(position);
-            }
-            self.batch_digests
-                .save(batch_digest, position)
-                .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
-            let len = self.data.file_len();
-            self.consensus_digests.set_data_file_length(len);
-            self.batch_digests.set_data_file_length(len);
-        }
+        let first_batch_pos =
+            if self.version() == 0 { self.save_consensus_batches(consensus)? } else { None };
         // Now save the consensus header.
         let consensus_digest = consensus.consensus_header_hash();
         let position = self
             .data
             .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
             .map_err(|e| PackError::Append(e.to_string()))?;
+        if self.version() > 0 {
+            self.save_consensus_batches(consensus)?;
+        };
         let batch_pos = if let Some(batch_pos) = first_batch_pos { batch_pos } else { position };
         self.consensus_digests
             .save(consensus_digest.into(), position)
@@ -1256,6 +1294,22 @@ impl Inner {
     }
 }
 
+/// Gathers all the batches from consensus into an ordered Map by digest.
+fn collect_batches(consensus: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
+    let mut batches = BTreeMap::new();
+    // We want to make sure batches are saved to the pack in a deterministic order, so
+    // collect them in a BTreeMap.
+    for cert_batch in consensus.batches() {
+        for batch in &cert_batch.batches {
+            let digest = batch.digest();
+            // Should not have duplicate batches across output.
+            // They will be de-duped in the pack file by the BTreeMap if they do exist.
+            batches.insert(digest, batch.clone());
+        }
+    }
+    batches
+}
+
 /// Verify a streamed [`EpochMeta`] record links correctly to the previous epoch's record.
 ///
 /// Extracted from [`Inner::stream_import`] as a free function (it is stateless) so the offline pack
@@ -1329,10 +1383,39 @@ pub async fn bytes_to_output<R: AsyncRead + Unpin>(
     timeout: Duration,
     committee: &Committee,
 ) -> Result<ConsensusOutput, PackError> {
-    let mut stream_iter = AsyncPackIter::<PackRecord, R>::open_partial(stream, compression)
+    let mut stream_iter =
+        AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, PACK_VERSION)
+            .await
+            .map_err(|e| PackError::ReadError(e.to_string()))?;
+    iter_to_output(&mut stream_iter, timeout, committee).await
+}
+
+/// Take an async stream of bytes that in pack file representation of ConsensusOutput and return the
+/// ConsensusOutput.
+pub async fn bytes_to_output_legacy<R: AsyncRead + Unpin>(
+    stream: R,
+    compression: PackCompression,
+    timeout: Duration,
+    committee: &Committee,
+) -> Result<ConsensusOutput, PackError> {
+    let mut stream_iter = AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, 0)
         .await
         .map_err(|e| PackError::ReadError(e.to_string()))?;
-    iter_to_output(&mut stream_iter, timeout, committee).await
+    iter_to_output_legacy(&mut stream_iter, timeout, committee).await
+}
+
+/// Private helper to read the next record from a pack iterator or timeout if it takes
+/// longer than timeout.
+async fn next_output_record<R: AsyncRead + Unpin>(
+    iter: &mut AsyncPackIter<PackRecord, R>,
+    timeout: Duration,
+) -> Result<Option<PackRecord>, PackError> {
+    match tokio::time::timeout(timeout, iter.next()).await {
+        Ok(Some(Ok(rec))) => Ok(Some(rec)),
+        Ok(Some(Err(e))) => Err(PackError::ReadError(e.to_string())),
+        Ok(None) => Ok(None),
+        Err(_) => Err(PackError::ReadError("timeout".to_string())),
+    }
 }
 
 /// Take an iter over PackRecords that represent a ConsensusOutput and return the ConsensusOutput.
@@ -1341,24 +1424,156 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     timeout: Duration,
     committee: &Committee,
 ) -> Result<ConsensusOutput, PackError> {
-    /// Private helper to read the next record from a pack iterator or timeout if it takes
-    /// longer than timeout.
-    async fn next<R: AsyncRead + Unpin>(
-        iter: &mut AsyncPackIter<PackRecord, R>,
-        timeout: Duration,
-    ) -> Result<Option<PackRecord>, PackError> {
-        match tokio::time::timeout(timeout, iter.next()).await {
-            Ok(Some(Ok(rec))) => Ok(Some(rec)),
-            Ok(Some(Err(e))) => Err(PackError::ReadError(e.to_string())),
-            Ok(None) => Ok(None),
-            Err(_) => Err(PackError::ReadError("timeout".to_string())),
+    let mut referenced_batches = HashSet::new();
+    let consensus_header = if let Some(record) = next_output_record(stream_iter, timeout).await? {
+        match record {
+            PackRecord::EpochMeta(_epoch_meta) => {
+                return Err(PackError::EpochLoad("unexpected epoch meta data found".to_string()))
+            }
+            PackRecord::Batch(_batch) => {
+                return Err(PackError::BatchLoad("unexpected batch found".to_string()))
+            }
+            PackRecord::Consensus(consensus_header) => consensus_header,
+        }
+    } else {
+        return Err(PackError::NotConsensus);
+    };
+    let parent_hash = consensus_header.parent_hash;
+    let deliver = consensus_header.sub_dag;
+    let num_blocks = deliver.num_primary_batches();
+    let num_certs = deliver.len();
+
+    let sub_dag = deliver;
+    if num_blocks == 0 {
+        return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, consensus_header.number));
+    }
+
+    let mut expected_batch_digests = BTreeSet::new();
+    let mut batch_digests = VecDeque::with_capacity(num_certs);
+    for header in sub_dag.headers() {
+        for (digest, _) in header.payload().iter() {
+            expected_batch_digests.insert(*digest);
+            batch_digests.push_back(*digest);
         }
     }
+    let expected_digest_count = expected_batch_digests.len();
+    // Bound how many batch records we will read for one output before the terminating
+    // condition.  The header is read first, so a hostile stream cannot flood batches ahead of
+    // it, but the header's sub-dag (attacker-controlled, bounded only by MAX_RECORD_SIZE) can
+    // still declare a huge number of payload digests.  Reject early — before reading/buffering
+    // any batches — like the legacy path does.  A legitimate ConsensusOutput references far
+    // fewer batches than this.
+    if expected_digest_count > MAX_BATCHES_PER_OUTPUT {
+        return Err(PackError::TooManyBatches(MAX_BATCHES_PER_OUTPUT));
+    }
+    let mut expected_batch_digests = expected_batch_digests.into_iter();
+
+    let mut available_batches = HashMap::new();
+    // Load and verify batches.  Batches are matched positionally against `expected_batch_digests`
+    // (sorted digest order): producers write them in `BTreeMap`/`BTreeSet` digest order (see
+    // `collect_batches` / `save_consensus_batches`), so the stream MUST arrive in that same order.
+    // Out-of-order input is rejected below rather than silently reordered.
+    let mut digest_count = 0;
+    while let Some(record) = next_output_record(stream_iter, timeout).await? {
+        match record {
+            PackRecord::EpochMeta(_epoch_meta) => {
+                return Err(PackError::EpochLoad("unexpected epoch meta data found".to_string()))
+            }
+            PackRecord::Batch(batch) => {
+                let Some(expected_digest) = expected_batch_digests.next() else {
+                    return Err(PackError::EpochLoad("unexpected batch found".to_string()));
+                };
+                let digest = batch.digest();
+                if expected_digest != digest {
+                    return Err(PackError::EpochLoad(format!(
+                        "unexpected batch found, expected {expected_digest}, got {}",
+                        digest
+                    )));
+                }
+                referenced_batches.insert(digest);
+                available_batches.insert(digest, batch);
+                digest_count += 1;
+                if digest_count == expected_digest_count {
+                    // We loaded all the batches, so we are done.
+                    break;
+                }
+            }
+            PackRecord::Consensus(_consensus_header) => {
+                return Err(PackError::EpochLoad("unexpected consensusheader found".to_string()))
+            }
+        }
+    }
+
+    // map all fetched batches to their respective certificates for applying block rewards
+    let mut batches = Vec::with_capacity(num_certs);
+    for header in sub_dag.headers() {
+        // create collection of batches to execute for this certificate
+        let mut cert_batches = Vec::with_capacity(header.payload().len());
+
+        // retrieve fetched batch by digest
+        for digest in header.payload().keys() {
+            if let Some(batch) = available_batches.remove(digest) {
+                cert_batches.push(batch);
+            } else if referenced_batches.contains(digest) {
+                // Handle the case with dup batches.  This should be rare to non-existant so not
+                // worried about the poor efficiency here.  This allows us
+                // to remove in the common case to avoid a batch clone.
+                if let Some(batch) = batches
+                    .iter()
+                    .flat_map(|cb: &CertifiedBatch| cb.batches.iter())
+                    .chain(cert_batches.iter())
+                    .find(|b| b.digest() == *digest)
+                {
+                    #[cfg(not(feature = "adiri"))]
+                    cert_batches.push(batch.clone());
+
+                    #[cfg(feature = "adiri")]
+                    if sub_dag.leader_epoch() > tn_types::forks::ADIRI_DUP_BATCH_EPOCH {
+                        // ADIRI BUG
+                        // Epoch 74 and possibly other early epochs of adiri testnet had a bug
+                        // with duplicate batches. We have to
+                        // recreate it in order to sync testnet so we skip this push
+                        // on adiri with early epochs.
+                        cert_batches.push(batch.clone());
+                    }
+                } else {
+                    return Err(PackError::MissingBatch);
+                }
+            } else {
+                return Err(PackError::MissingBatch);
+            }
+        }
+
+        let address = committee.authority(header.author()).map(|a| a.execution_address());
+        if let Some(address) = address {
+            // main collection for execution
+            batches.push(CertifiedBatch { address, batches: cert_batches });
+        } else {
+            return Err(PackError::MissingAuthority);
+        }
+    }
+    Ok(ConsensusOutput::new(
+        sub_dag,
+        parent_hash,
+        consensus_header.number,
+        false,
+        batch_digests,
+        batches,
+    ))
+}
+
+/// Take an iter over PackRecords that represent a ConsensusOutput and return the ConsensusOutput.
+/// Legacy version, expects Batches then the ConsensusHeader.
+async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
+    stream_iter: &mut AsyncPackIter<PackRecord, R>,
+    timeout: Duration,
+    committee: &Committee,
+) -> Result<ConsensusOutput, PackError> {
     let mut header = None;
     let mut available_batches = HashMap::new();
     let mut referenced_batches = HashSet::new();
     let mut batch_records = 0_usize;
-    while let Some(record) = next(stream_iter, timeout).await? {
+    while let Some(record) = next_output_record(stream_iter, timeout).await? {
         match record {
             PackRecord::EpochMeta(_epoch_meta) => {
                 return Err(PackError::EpochLoad("unexpected epoch meta data found".to_string()))
@@ -1482,6 +1697,8 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
 }
 
 /// Values stored in the position index.
+/// Note for v1 format consensus_header and output_start will be the same value.
+/// Once v0 is gone we can remove or repurpose on of these fields.
 #[derive(Debug, Copy, Clone)]
 struct IndexPositions {
     /// The first byte of the ConsensusHeader record for position.
@@ -1573,6 +1790,8 @@ pub enum PackError {
     ConsensusNumberTooLow,
     ConsensusNumberTooHigh,
     TooManyBatches(usize),
+    /// Data pack file version is too new.
+    InvalidVersion(u16, u16),
 }
 
 impl Error for PackError {}
@@ -1619,6 +1838,9 @@ impl Display for PackError {
             PackError::TooManyBatches(max) => {
                 write!(f, "Too many batches buffered for one consensus output (max {max})")
             }
+            PackError::InvalidVersion(expected, got) => {
+                write!(f, "Pack file version too new: got {got}, expected {expected}")
+            }
         }
     }
 }
@@ -1647,7 +1869,6 @@ pub(crate) mod test {
         collections::VecDeque,
         fs::{File, OpenOptions},
         io::{Seek as _, SeekFrom},
-        path::Path,
         sync::Arc,
         time::Duration,
     };
@@ -1662,12 +1883,8 @@ pub(crate) mod test {
     };
 
     use crate::{
-        archive::{
-            index::Index as _,
-            pack::{DataHeader, PackCompression},
-            position_index::index::PositionIndex,
-        },
-        consensus_pack::{ConsensusPack, IndexPositions, Inner},
+        archive::pack::PackCompression,
+        consensus_pack::{ConsensusPack, Inner, PACK_VERSION},
         mem_db::MemDatabase,
     };
 
@@ -1927,7 +2144,10 @@ pub(crate) mod test {
             pack.save_consensus_output(consensus_output).await.unwrap();
         }
         for i in 0..(num_outputs * 2) {
-            let output_db = pack.get_consensus_output(i as u64 + 1).await.unwrap();
+            let output_db = pack
+                .get_consensus_output(i as u64 + 1)
+                .await
+                .unwrap_or_else(|e| panic!("failed output on {i}: {e}"));
             let output = outputs.get(i as usize).unwrap();
             compare_outputs(&output_db, output);
         }
@@ -2127,141 +2347,6 @@ pub(crate) mod test {
         drop(pack);
     }
 
-    /// Convert a pack directory's position index into the legacy format written by older
-    /// nodes: an "index.pdx" of u64 consensus header positions and no "index_pos.pdx".
-    /// The pack data file is identical between the two formats so this faithfully
-    /// recreates an old pack directory for migration testing.
-    fn make_legacy_index(epoch_dir: &Path) {
-        let idx_dir = epoch_dir.join("idx");
-        let header = DataHeader::new(0, PackCompression::ZStd);
-        let mut new_idx: PositionIndex<IndexPositions> =
-            PositionIndex::open_pdx_file(&idx_dir, &header, "index_pos.pdx", true)
-                .expect("open new index");
-        let mut old_idx: PositionIndex<u64> =
-            PositionIndex::open_pdx_file(&idx_dir, &header, "index.pdx", false)
-                .expect("open legacy index");
-        assert!(old_idx.is_empty(), "legacy index must start empty");
-        for i in 0..new_idx.len() as u64 {
-            let positions = new_idx.load(i).expect("new index entry");
-            old_idx.save(i, positions.consensus_header).expect("save legacy entry");
-        }
-        old_idx.sync().expect("sync legacy index");
-        drop(old_idx);
-        drop(new_idx);
-        std::fs::remove_file(idx_dir.join("index_pos.pdx")).expect("remove new index");
-    }
-
-    /// Test the one time migration of a legacy position index (consensus header positions
-    /// only) to the new index containing consensus output byte ranges.  Covers the append
-    /// path, the read only static path and recovery from a stale tmp file left by a crash
-    /// between the tmp write and the rename.
-    #[tokio::test]
-    async fn test_consensus_pack_index_migration() {
-        let temp_dir = TempDir::with_prefix("test_consensus_pack_migration").expect("temp dir");
-        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let committee = fixture.committee();
-        let previous_epoch = EpochRecord {
-            epoch: 0,
-            committee: committee.bls_keys().iter().copied().collect(),
-            next_committee: committee.bls_keys().iter().copied().collect(),
-            ..Default::default()
-        };
-        let epoch_dir = temp_dir.path().join("epoch-0");
-        let idx_dir = epoch_dir.join("idx");
-
-        // Build a pack with the current format.
-        let pack =
-            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
-                .expect("open pack");
-        let num_outputs = 10;
-        let mut outputs = Vec::new();
-        let mut parent = ConsensusHeader::default().digest();
-        for i in 0..num_outputs {
-            let output = make_test_output(&committee, i % 4, chain.clone(), i as u64 + 1, parent);
-            parent = output.digest().into();
-            outputs.push(output.clone());
-            pack.save_consensus_output(output).await.unwrap();
-        }
-        pack.persist().await.expect("persist");
-        drop(pack);
-
-        // Migrate on the append path.  Reading the first output verifies the migrated
-        // byte range starts after the EpochMeta record.
-        make_legacy_index(&epoch_dir);
-        assert!(PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index.pdx"));
-        assert!(!PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index_pos.pdx"));
-        let pack =
-            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
-                .expect("open legacy pack for append");
-        assert!(
-            PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index_pos.pdx"),
-            "migration creates the new index"
-        );
-        assert!(
-            !PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index.pdx"),
-            "migration removes the old index"
-        );
-        for (i, output) in outputs.iter().enumerate() {
-            let output_db = pack
-                .get_consensus_output(i as u64 + 1)
-                .await
-                .expect(&format!("output {} after append migration", i + 1));
-            compare_outputs(&output_db, output);
-        }
-        // The pack keeps working for new appends after migration.
-        let output = make_test_output(&committee, 0, chain.clone(), num_outputs as u64 + 1, parent);
-        outputs.push(output.clone());
-        pack.save_consensus_output(output).await.unwrap();
-        let output_db = pack
-            .get_consensus_output(num_outputs as u64 + 1)
-            .await
-            .expect("appended output after migration");
-        compare_outputs(&output_db, outputs.last().unwrap());
-        pack.persist().await.expect("persist");
-        drop(pack);
-
-        // Migrate on the read only static path.
-        make_legacy_index(&epoch_dir);
-        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open legacy pack static");
-        for (i, output) in outputs.iter().enumerate() {
-            let output_db = pack
-                .get_consensus_output(i as u64 + 1)
-                .await
-                .expect(&format!("output {} after static migration", i + 1));
-            compare_outputs(&output_db, output);
-        }
-        drop(pack);
-
-        // Migrate with a stale partial tmp file left by a "crash" between the tmp write
-        // and the rename.  The migration must discard it and rebuild.
-        make_legacy_index(&epoch_dir);
-        {
-            let header = DataHeader::new(0, PackCompression::ZStd);
-            let mut stale: PositionIndex<IndexPositions> =
-                PositionIndex::open_pdx_file(&idx_dir, &header, "index_pos.pdx.tmp", false)
-                    .expect("open stale tmp");
-            stale.save(0, IndexPositions::new(1, 1, 1)).expect("save stale entry");
-            stale.sync().expect("sync stale tmp");
-        }
-        assert!(PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index_pos.pdx.tmp"));
-        let pack =
-            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
-                .expect("open legacy pack with stale tmp");
-        assert!(
-            !PositionIndex::<u64>::pdx_file_exists(&idx_dir, "index_pos.pdx.tmp"),
-            "stale tmp removed by migration"
-        );
-        for (i, output) in outputs.iter().enumerate() {
-            let output_db = pack
-                .get_consensus_output(i as u64 + 1)
-                .await
-                .expect(&format!("output {} after stale tmp migration", i + 1));
-            compare_outputs(&output_db, output);
-        }
-        drop(pack);
-    }
-
     fn test_previous_epoch(committee: &Committee) -> EpochRecord {
         EpochRecord {
             epoch: 0,
@@ -2290,7 +2375,8 @@ pub(crate) mod test {
         let path = temp_dir.path().join("batch_only");
         {
             let mut pack: Pack<PackRecord> =
-                Pack::open(&path, 0, false, PackCompression::ZStd).expect("open pack");
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
             let batch = tn_reth::test_utils::batches(chain.clone(), 1).pop().expect("one batch");
             for _ in 0..(MAX_BATCHES_PER_OUTPUT + 5) {
                 pack.append(&PackRecord::Batch(batch.clone())).expect("append batch");
@@ -2308,7 +2394,167 @@ pub(crate) mod test {
             &committee,
         )
         .await;
+        // New format will fail by starting with a batch.  This would be TooManyBatches with v0.
+        assert!(matches!(res, Err(PackError::BatchLoad(_))), "expected BatchLoad");
+    }
+
+    /// CP1b: in the v1 (header-first) format a hostile header whose sub-dag declares more than
+    /// `MAX_BATCHES_PER_OUTPUT` payload digests must be rejected up front — before any batch is
+    /// read — rather than allocating/reading a batch per declared digest.
+    #[tokio::test]
+    async fn test_iter_to_output_caps_expected_batches() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_output, PackError, PackRecord, MAX_BATCHES_PER_OUTPUT},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_expected_cap").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // Craft a single consensus header whose leader references more distinct batch digests
+        // than the cap.
+        let batches = tn_reth::test_utils::batches(chain, MAX_BATCHES_PER_OUTPUT + 5);
+        let authority = committee.authorities().first().expect("authority").id();
+        let mut leader = Certificate::default();
+        leader.update_header_author_for_test(authority);
+        for batch in &batches {
+            let mut builder = HeaderBuilder::from_header(leader.header());
+            builder = builder.with_payload_batch(batch, 0_u16);
+            leader.update_header_for_test(builder.build());
+        }
+        leader.update_header_round_for_test(1);
+        leader.update_header_epoch_for_test(committee.epoch());
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            None,
+        );
+        let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let output = ConsensusOutput::new(
+            sub_dag,
+            ConsensusHeader::default().digest(),
+            1,
+            false,
+            batch_digests,
+            vec![],
+        );
+        assert!(
+            output.sub_dag().num_primary_batches() > MAX_BATCHES_PER_OUTPUT,
+            "test must exceed the cap"
+        );
+
+        // Write just the header record (v1: header first) with no batch records to follow.
+        let path = temp_dir.path().join("header_only");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Consensus(Box::new(output.consensus_header())))
+                .expect("append header");
+            pack.commit().expect("commit");
+        }
+        let file_bytes = std::fs::read(&path).expect("read file");
+        let records = file_bytes[DATA_HEADER_BYTES..].to_vec();
+
+        let res = bytes_to_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
         assert!(matches!(res, Err(PackError::TooManyBatches(_))), "expected TooManyBatches");
+    }
+
+    /// A v0 (legacy, batches-first) pack must serve its outputs as v1 (header-first) bytes via
+    /// `get_consensus_output_bytes`, so all peer-facing bytes are v1 regardless of on-disk format.
+    #[tokio::test]
+    async fn test_v0_output_served_as_v1_bytes() {
+        use crate::{
+            archive::pack_iter::AsyncPackIter,
+            consensus_pack::{bytes_to_output, bytes_to_output_legacy, PackRecord},
+        };
+        use std::io::Cursor;
+        use tokio::io::BufReader;
+
+        let temp_dir = TempDir::with_prefix("test_v0_served_v1").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Force a genuine v0 pack file (header stamped version 0 -> batches-first on disk).
+        let pack = ConsensusPack::open_append_version(
+            temp_dir.path(),
+            previous_epoch,
+            committee.clone(),
+            0,
+        )
+        .expect("open v0 pack");
+        assert_eq!(pack.version, 0, "constructor must produce a v0 pack file");
+
+        let num_outputs = 5;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output = make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+            parent = output.digest();
+            outputs.push(output.clone());
+            pack.save_consensus_output(output).await.unwrap();
+        }
+        pack.persist().await.expect("persist");
+
+        for (i, original) in outputs.iter().enumerate() {
+            let number = i as u64 + 1;
+            let bytes = pack.get_consensus_output_bytes(number).await.expect("bytes");
+
+            // 1. Header-first: the first record must be a Consensus header (v1 ordering). A v0 file
+            //    would have yielded a Batch first.
+            let mut iter = AsyncPackIter::<PackRecord, _>::open_partial(
+                BufReader::new(Cursor::new(bytes.clone())),
+                PackCompression::ZStd,
+                PACK_VERSION,
+            )
+            .await
+            .expect("open partial");
+            match iter.next().await {
+                Some(Ok(PackRecord::Consensus(_))) => {}
+                other => panic!("expected first record to be a Consensus header, got {other:?}"),
+            }
+
+            // 2. Decodes with the v1 decoder and matches the original output.
+            let decoded = bytes_to_output(
+                BufReader::new(Cursor::new(bytes.clone())),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+            )
+            .await
+            .expect("v1 decode");
+            compare_outputs(&decoded, original);
+
+            // 3. The bytes are truly re-ordered: the legacy (batches-first) decoder rejects them.
+            let legacy = bytes_to_output_legacy(
+                BufReader::new(Cursor::new(bytes)),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+            )
+            .await;
+            assert!(legacy.is_err(), "legacy decode of v1 bytes must fail, got {legacy:?}");
+
+            // The local read path still honors the on-disk v0 format (legacy decode).
+            compare_outputs(
+                &pack.get_consensus_output(number).await.expect("local read"),
+                original,
+            );
+        }
+        drop(pack);
     }
 
     /// CP2: get_consensus_output with a number below start_consensus_number must error rather
