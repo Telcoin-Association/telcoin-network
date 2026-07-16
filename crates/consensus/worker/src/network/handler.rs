@@ -7,7 +7,7 @@ use super::{
 use crate::{
     batch_fetcher::get_batch_local_cache,
     metrics::WorkerMetrics,
-    network::{stream_codec, PendingBatchStream, MAX_CONCURRENT_GOSSIP_PREFETCHES},
+    network::{stream_codec, MAX_CONCURRENT_GOSSIP_PREFETCHES},
 };
 use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
@@ -262,71 +262,6 @@ where
         Ok(())
     }
 
-    /// Process request to open stream for batches.
-    pub(super) async fn process_request_batches_stream(
-        &self,
-        peer: BlsPublicKey,
-        pending_request: Option<PendingBatchStream>,
-        mut stream: Stream,
-        request_digest: B256,
-        consensus_chain: &ConsensusChain,
-    ) -> WorkerNetworkResult<()> {
-        // `None` indicates unexpected request
-        let Some(request) = pending_request else {
-            // this is a protocol violation - return error for penalty
-            warn!(
-                target: "worker::network",
-                %peer,
-                ?request_digest,
-                "inbound stream has no matching pending request"
-            );
-            return Err(WorkerNetworkError::UnknownStreamRequest(request_digest));
-        };
-
-        // process request to send batches through stream
-        debug!(
-            target: "worker::network",
-            %peer,
-            ?request_digest,
-            batch_count = request.batch_digests.len(),
-            "processing inbound batch stream"
-        );
-
-        let store = self.consensus_config.node_storage();
-
-        // set timeout to prevent slow-read attack
-        match tokio::time::timeout(
-            SEND_STREAM_TIMEOUT,
-            stream_codec::send_batches_over_stream(
-                &mut stream,
-                store,
-                consensus_chain,
-                &request.batch_digests,
-                request.epoch,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                warn!(target: "worker::network", %peer, ?e, "failed to send batches over stream");
-            }
-            Err(_elapsed) => {
-                warn!(target: "worker::network", %peer, ?request_digest, "sending batches stream timed out");
-            }
-        }
-
-        // attempt to close the stream gracefully, bounded so a peer that stops
-        // reading cannot pin this legacy responder task (and the admission permit
-        // it holds via `PendingBatchStream`) on the FIN flush. Mirrors the bounded
-        // close in `process_sync_batches_stream` and the trailing writes in `mod.rs`;
-        // every best-effort trailing op on this task is time-bounded.
-        let _ =
-            tokio::time::timeout(crate::network::SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
-
-        Ok(())
-    }
-
     /// Serve an admitted inbound sync batch exchange.
     ///
     /// The opening [`SyncFrame::Req`] has already been read and validated by the
@@ -336,8 +271,8 @@ where
     ///
     /// A send failure or storage error is logged and best-effort signalled to the
     /// requester with a [`SyncFrame::Err`] so it stops waiting; it is not a peer
-    /// fault, so no penalty is returned. Like the legacy responder, the sync
-    /// responder reports errors metrics-only during the item-5 rollout.
+    /// fault, so no penalty is returned. The sync responder reports errors
+    /// metrics-only during the item-5 rollout.
     pub(super) async fn process_sync_batches_stream(
         &self,
         peer: BlsPublicKey,
@@ -430,28 +365,6 @@ where
         sealed_batch: SealedBatch,
     ) -> WorkerNetworkResult<()> {
         self.process_report_batch(peer, sealed_batch).await
-    }
-
-    /// Publicly available for tests.
-    /// Sends requested batches over the provided stream.
-    ///
-    /// This is a simplified version for tests that bypasses the pending request mechanism.
-    pub async fn pub_process_request_batches_stream(
-        &self,
-        peer: BlsPublicKey,
-        stream: Stream,
-        pending_request: Option<PendingBatchStream>,
-        request_digest: B256,
-        consensus_chain: &ConsensusChain,
-    ) -> WorkerNetworkResult<()> {
-        self.process_request_batches_stream(
-            peer,
-            pending_request,
-            stream,
-            request_digest,
-            consensus_chain,
-        )
-        .await
     }
 }
 

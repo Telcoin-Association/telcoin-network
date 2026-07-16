@@ -5,7 +5,7 @@ use tn_network_libp2p::Penalty;
 use tn_storage::{consensus::ConsensusChainError, StoreError};
 use tn_types::{
     error::{CertificateError, HeaderError},
-    BcsError, BlockHash, BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochDigest,
+    BcsError, BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochDigest,
 };
 
 /// Result alias for results that possibly return [`PrimaryNetworkError`].
@@ -59,12 +59,6 @@ pub(crate) enum PrimaryNetworkError {
     InvalidTopic,
     #[error(transparent)]
     Timeout(#[from] tokio::time::error::Elapsed),
-    /// No matching pending request for inbound stream.
-    #[error("No pending request matches stream hash")]
-    UnknownStreamRequest(BlockHash),
-    /// A requested pack file stream is not available.
-    #[error("Pack file is not available to stream for epoch {0}")]
-    StreamUnavailable(Epoch),
     /// Pass through from the consesus chain.
     #[error("ConsensusChainError {0}")]
     ConsensusChainError(ConsensusChainError),
@@ -131,8 +125,6 @@ impl PrimaryNetworkError {
             | PrimaryNetworkError::UnavailableEpochDigest(_)
             | PrimaryNetworkError::InvalidEpochRequest
             | PrimaryNetworkError::Timeout(_)
-            | PrimaryNetworkError::UnknownStreamRequest(_)
-            | PrimaryNetworkError::StreamUnavailable(_)
             | PrimaryNetworkError::ConsensusChainError(_) => false,
         }
     }
@@ -187,7 +179,6 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             // No penalty so honest sync flows are not banned during catch-up.
             PrimaryNetworkError::UnknownConsensusOutput(_) => None,
             PrimaryNetworkError::InvalidRequest(_)
-            | PrimaryNetworkError::UnknownStreamRequest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidEpochRequest
             | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
@@ -198,7 +189,6 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             | PrimaryNetworkError::PeerNotInCommittee(_)
             | PrimaryNetworkError::Storage(_)
             | PrimaryNetworkError::Timeout(_)
-            | PrimaryNetworkError::StreamUnavailable(_)
             | PrimaryNetworkError::ConsensusChainError(_)
             | PrimaryNetworkError::Internal(_) => None,
         }

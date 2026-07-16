@@ -3,11 +3,11 @@
 use super::PrimaryResponse;
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
-    network::{message::PrimaryGossip, PendingStreamRequest, StreamRequestKind},
+    network::message::PrimaryGossip,
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBusApp, NodeMode,
 };
-use futures::{AsyncWrite, AsyncWriteExt as _};
+use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -24,10 +24,10 @@ use tn_types::{
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlsPublicKey, Certificate,
     ConsensusResult, ConsensusResultDigest, Database, Epoch, EpochCertificate, EpochDigest,
-    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, ReadStream, Round,
-    SignatureVerificationState, TnSender as _, Vote, B256,
+    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
+    SignatureVerificationState, TnSender as _, Vote,
 };
-use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
+use tokio::{sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
 
 /// Total timeout for sending a 16kb buffer of pack file data.
@@ -1060,143 +1060,6 @@ where
     #[cfg(test)]
     pub(crate) fn consensus_certs_has(&self, digest: &ConsensusResultDigest) -> bool {
         self.consensus_certs.lock().contains_key(digest)
-    }
-
-    /// Send an epoch pack file over a stream.
-    ///
-    /// `stop_number` selects what is sent and is the ONLY difference from the client's perspective
-    /// between a full and a partial transfer:
-    /// - `None`: stream the complete (finished) epoch pack, exactly as before.
-    /// - `Some(n)`: stream only the verifiable prefix up to and including consensus number `n`
-    ///   (used for the in-progress current epoch).
-    pub(super) async fn send_epoch_over_stream<S>(
-        mut stream: S,
-        consensus_chain: &ConsensusChain,
-        epoch: Epoch,
-        stop_number: Option<u64>,
-        buffer_timeout: Duration,
-        peer: BlsPublicKey,
-    ) -> PrimaryNetworkResult<()>
-    where
-        S: AsyncWrite + Unpin + Send,
-    {
-        let mut bytes = vec![0_u8; 16 * 1024]; // Use a 16kb read buffer.
-                                               // `limit` bounds how many data-file bytes we send. `None` streams to EOF (whole epoch);
-                                               // `Some(end)` streams `[0, end)` — the prefix containing outputs up to `stop_number`.
-        let (mut epoch_stream, limit): (Box<dyn ReadStream>, Option<u64>) = match stop_number {
-            None => (
-                consensus_chain
-                    .get_epoch_stream(epoch)
-                    .await
-                    .map_err(|_| PrimaryNetworkError::StreamUnavailable(epoch))?,
-                None,
-            ),
-            Some(number) => {
-                let (epoch_stream, end) = consensus_chain
-                    .get_partial_epoch_stream(epoch, number)
-                    .await
-                    .map_err(|_| PrimaryNetworkError::StreamUnavailable(epoch))?;
-                (epoch_stream, Some(end))
-            }
-        };
-        let mut sent: u64 = 0;
-        loop {
-            // Cap the next read so a partial transfer never sends past `limit`.
-            let to_read = match limit {
-                Some(limit) => {
-                    if sent >= limit {
-                        break;
-                    }
-                    std::cmp::min(bytes.len() as u64, limit - sent) as usize
-                }
-                None => bytes.len(),
-            };
-            let n = epoch_stream.read(&mut bytes[..to_read]).await?;
-            if n == 0 {
-                break;
-            }
-            timeout(buffer_timeout, stream.write_all(&bytes[..n])).await??;
-            sent += n as u64;
-        }
-
-        // attempt to close the stream gracefully
-        if let Err(e) = stream.close().await {
-            tracing::warn!(target: "primary::network", %peer, %epoch, ?e, "stream close failed");
-        }
-
-        Ok(())
-    }
-
-    /// Process request to open a stream for an epoch pack (full or partial prefix).
-    pub(super) async fn process_request_epoch_stream(
-        &self,
-        peer: BlsPublicKey,
-        pending_request: Option<PendingStreamRequest>,
-        stream: Stream,
-        request_digest: B256,
-        consensus_chain: &ConsensusChain,
-    ) -> PrimaryNetworkResult<()> {
-        // `None` indicates unexpected request
-        let Some(request) = pending_request else {
-            // this is a protocol violation - return error for penalty
-            warn!(
-                target: "primary::network",
-                %peer,
-                ?request_digest,
-                "inbound stream has no matching pending request"
-            );
-            return Err(PrimaryNetworkError::UnknownStreamRequest(request_digest));
-        };
-
-        match request.kind() {
-            StreamRequestKind::EpochPack(epoch) => {
-                debug!(
-                    target: "primary::network",
-                    %peer,
-                    ?request_digest,
-                    epoch,
-                    "processing inbound epoch stream"
-                );
-
-                // set timeout to prevent slow-read attack
-                Self::send_epoch_over_stream(
-                    stream,
-                    consensus_chain,
-                    epoch,
-                    None,
-                    SEND_STREAM_BUFFER_TIMEOUT,
-                    peer,
-                )
-                .await
-                .inspect_err(|e| {
-                    warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream")
-                })
-            }
-            StreamRequestKind::EpochPackPartial { epoch, last_consensus_number } => {
-                debug!(
-                    target: "primary::network",
-                    %peer,
-                    ?request_digest,
-                    epoch,
-                    stop_number = last_consensus_number,
-                    "processing inbound partial epoch stream"
-                );
-
-                // set timeout to prevent slow-read attack
-                Self::send_epoch_over_stream(
-                    stream,
-                    consensus_chain,
-                    epoch,
-                    Some(last_consensus_number),
-                    SEND_STREAM_BUFFER_TIMEOUT,
-                    peer,
-                )
-                .await
-                .inspect_err(|e| {
-                    warn!(target: "primary::network", %peer, ?e, "failed to send partial epoch over stream")
-                })
-            }
-        }
     }
 
     /// Serve an inbound epoch-pack sync exchange.

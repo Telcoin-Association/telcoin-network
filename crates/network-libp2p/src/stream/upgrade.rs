@@ -2,65 +2,50 @@ use libp2p::{core::UpgradeInfo, swarm::StreamProtocol, InboundUpgrade, OutboundU
 use std::{
     convert::Infallible,
     future::{ready, Ready},
+    iter::{once, Once},
 };
 
-use crate::{stream::StreamKind, Penalty};
+use crate::Penalty;
 
 /// Protocol upgrade for streaming data.
 ///
-/// Advertises one or more chain-namespaced protocols for negotiation, in
-/// dialer-preference order. An inbound listen advertises both the bulk-transfer
-/// `/tn-stream-{chain}` and the per-role sync protocol and reports which one
-/// negotiated, so the application can route a sync stream to the
-/// [`SyncFrame`](crate::sync::SyncFrame) layer and a legacy stream to the
-/// digest-correlation reader. An outbound open advertises a single chosen
-/// protocol, so the caller already knows which kind it asked for. Both upgrades
-/// return the raw stream; the framing is the caller's concern. The protocols
-/// carry the chain id, so a node only ever establishes streams with peers on the
-/// same chain.
+/// Advertises the single chain-namespaced per-role sync protocol
+/// (`/tn-primary-sync-{chain}` or `/tn-worker-{id}-sync-{chain}`) for
+/// negotiation. Both the inbound and outbound upgrades return the raw stream;
+/// the typed [`SyncFrame`](crate::sync::SyncFrame) framing is the caller's
+/// concern. The protocol carries the chain id, so a node only ever establishes
+/// streams with peers on the same chain.
 #[derive(Debug, Clone)]
 pub(crate) struct TNStreamProtocol {
-    /// Protocols advertised for negotiation, in dialer-preference order. For an
-    /// inbound listen this is `[bulk-transfer, sync]` — the chain-namespaced
-    /// `/tn-stream-{chain}/0.0.1` first, so existing opens keep negotiating it,
-    /// then the per-role sync protocol so a responder also accepts it; for an
-    /// outbound open it is the single chosen protocol.
-    protocols: Vec<StreamProtocol>,
-    /// The per-role sync protocol, used to classify the negotiated protocol of
-    /// an inbound stream as [`StreamKind::Sync`] versus [`StreamKind::Legacy`].
-    sync: StreamProtocol,
+    /// The chain-namespaced per-role sync protocol advertised for negotiation.
+    protocol: StreamProtocol,
 }
 
 impl TNStreamProtocol {
-    /// Create an upgrade advertising `protocols`, in order (bulk-transfer first),
-    /// with `sync` as the per-role sync protocol used to classify an inbound
-    /// negotiation.
-    pub(crate) fn new(protocols: Vec<StreamProtocol>, sync: StreamProtocol) -> Self {
-        Self { protocols, sync }
+    /// Create an upgrade advertising the per-role sync `protocol`.
+    pub(crate) fn new(protocol: StreamProtocol) -> Self {
+        Self { protocol }
     }
 }
 
 impl UpgradeInfo for TNStreamProtocol {
     type Info = StreamProtocol;
-    type InfoIter = std::vec::IntoIter<StreamProtocol>;
+    type InfoIter = Once<StreamProtocol>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        self.protocols.clone().into_iter()
+        once(self.protocol.clone())
     }
 }
 
 impl InboundUpgrade<Stream> for TNStreamProtocol {
-    type Output = (Stream, StreamKind);
+    type Output = Stream;
     type Error = Infallible;
     type Future = Ready<Result<Self::Output, Self::Error>>;
 
-    // Classify the negotiated protocol so the application routes a sync-framed
-    // stream to the `SyncFrame` layer and a legacy stream to the digest reader.
-    // Only the legacy and sync protocols are ever advertised, so anything that
-    // is not the sync protocol is the legacy one.
-    fn upgrade_inbound(self, stream: Stream, protocol: Self::Info) -> Self::Future {
-        let kind = if protocol == self.sync { StreamKind::Sync } else { StreamKind::Legacy };
-        ready(Ok((stream, kind)))
+    // Only the per-role sync protocol is ever advertised; the typed `SyncFrame`
+    // framing is the application layer's concern.
+    fn upgrade_inbound(self, stream: Stream, _: Self::Info) -> Self::Future {
+        ready(Ok(stream))
     }
 }
 
@@ -169,16 +154,14 @@ mod tests {
     use libp2p::{core::UpgradeInfo, StreamProtocol};
     use std::io::ErrorKind;
 
-    /// The upgrade advertises its protocols in the order given (legacy first),
-    /// which is what keeps existing opens negotiating `/tn-stream` while a
-    /// responder still accepts the registered sync protocol.
+    /// The upgrade advertises exactly the per-role sync protocol it was built
+    /// with — the sole stream protocol a node negotiates.
     #[test]
-    fn protocol_info_preserves_order() {
-        let legacy = StreamProtocol::new("/tn-stream/0.0.1");
+    fn protocol_info_advertises_sync_protocol() {
         let sync = StreamProtocol::new("/tn-primary-sync/0.0.1");
-        let upgrade = TNStreamProtocol::new(vec![legacy.clone(), sync.clone()], sync.clone());
+        let upgrade = TNStreamProtocol::new(sync.clone());
         let advertised: Vec<_> = upgrade.protocol_info().collect();
-        assert_eq!(advertised, vec![legacy, sync]);
+        assert_eq!(advertised, vec![sync]);
     }
 
     /// The stream penalty taxonomy must mirror the request-response one: transport
