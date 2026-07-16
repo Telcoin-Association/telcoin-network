@@ -595,14 +595,20 @@ impl PrimaryNetworkHandle {
         expected_hash: ConsensusHeaderDigest,
     ) -> NetworkResult<ConsensusOutput> {
         let peers = self.handle.connected_peers().await?;
+        let epoch = consensus_chain.epochs().number_to_epoch(number);
+        if !consensus_chain.contains_decode_epoch(epoch).await {
+            // We do not have a pack file for epoch and will not be able to decode so bail now.
+            // This should never happen, normally we would downloading consensus for the current
+            // pack file, anything else will not be savable and would not make sense.
+            // This check will just short circuit early if in an invalid state vs loop
+            // over peers continually.
+            return Err(NetworkError::RPCError(
+                "we do not contain a pack file to decode this consensus output".to_string(),
+            ));
+        }
         // Resolve the committee-selecting epoch once and bundle the request so every probe hop
         // carries the chain and the verified hash needed to stream-decode + verify in place.
-        let request = ConsensusOutputSyncRequest {
-            number,
-            epoch: consensus_chain.epochs().number_to_epoch(number),
-            expected_hash,
-            consensus_chain,
-        };
+        let request = ConsensusOutputSyncRequest { number, epoch, expected_hash, consensus_chain };
 
         // Probe candidate peers one at a time (the async analog of a short-circuiting
         // fold): `filter` drops peers cached unsyncable for free, `take` bounds the

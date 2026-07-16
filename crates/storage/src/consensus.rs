@@ -911,6 +911,25 @@ impl ConsensusChain {
         }
     }
 
+    /// True if the consensus chain contains a pack or partial pack for epoch.
+    ///
+    /// Useful to determine if calls will find a pack file to work with (like
+    /// stream_decode_consenus_output()). This will also warm the pack cache if this is not the
+    /// current epochs pack.
+    pub async fn contains_decode_epoch(&self, epoch: Epoch) -> bool {
+        let pack = self.current_pack();
+        if epoch == pack.epoch() {
+            return true;
+        }
+        if let Ok(_pack) = self.get_static(epoch).await {
+            true
+        } else if let Some(staging) = self.staging() {
+            epoch == staging.pack.epoch()
+        } else {
+            false
+        }
+    }
+
     /// Retrieve the raw consensus output bytes by number.
     pub async fn consensus_output_bytes_by_number(
         &self,
