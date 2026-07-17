@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 mod close_epoch;
 mod run_epoch;
 mod start_epoch;
+pub use close_epoch::build_epoch_record;
 pub(crate) use run_epoch::RunEpochMode;
 
 /// Name of the process-lifetime [`TaskManager`] that owns tasks outliving any single epoch

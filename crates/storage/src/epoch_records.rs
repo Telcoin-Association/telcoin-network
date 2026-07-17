@@ -753,6 +753,7 @@ impl From<io::Error> for EpochDbError {
 #[cfg(test)]
 mod test {
     use std::{
+        collections::BTreeSet,
         fs::OpenOptions,
         io::{Seek as _, SeekFrom},
         sync::Arc,
@@ -795,11 +796,23 @@ mod test {
         signers: &[TestSigner],
         parent_hash: EpochDigest,
     ) -> (EpochRecord, EpochCertificate) {
+        let next_committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
+        make_test_pair_with_next(epoch, signers, next_committee, parent_hash)
+    }
+
+    /// Like [`make_test_pair`], but with a `next_committee` that differs from the serving
+    /// committee — the shape an epoch record takes when the validator set changes.
+    fn make_test_pair_with_next(
+        epoch: Epoch,
+        signers: &[TestSigner],
+        next_committee: Vec<BlsPublicKey>,
+        parent_hash: EpochDigest,
+    ) -> (EpochRecord, EpochCertificate) {
         let committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
         let record = EpochRecord {
             epoch,
-            committee: committee.clone(),
-            next_committee: committee,
+            committee,
+            next_committee,
             parent_hash,
             final_consensus: ConsensusNumHash::new(
                 (epoch as u64 + 1) * 10,
@@ -959,5 +972,55 @@ mod test {
         let mut f = OpenOptions::new().read(true).open(&records_path).expect("open records file");
         let healed_len = f.seek(SeekFrom::End(0)).expect("seek");
         assert_eq!(extended_len, healed_len, "garbage bytes should be removed on reopen");
+    }
+
+    /// Committee-key lookups across an epoch whose committee shrank mid-epoch because a
+    /// validator was ejected on-chain (governance `burn` / slash-to-zero). The ejection
+    /// epoch's record carries the shrunken, swap-and-popped committee; the epoch after it
+    /// has no record yet and must be served from the ejection record's `next_committee`.
+    #[tokio::test]
+    async fn test_get_committee_keys_across_ejection_epoch() {
+        let temp_dir = TempDir::with_prefix("test_get_committee_keys_across_ejection_epoch")
+            .expect("temp dir");
+        let mut rng = StdRng::seed_from_u64(0xE1EC7);
+        let signers: Vec<TestSigner> = (0..6).map(|_| TestSigner::new(&mut rng)).collect();
+        let five = &signers[..5];
+        // A new validator activates during epoch 1 and joins the next committee.
+        let incoming = signers[5].public_key();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+
+        // Epoch 0: the full five-member committee.
+        let (rec0, cert0) = make_test_pair(0, five, EpochDigest::default());
+        db.save(rec0.clone(), cert0).await.expect("save rec0");
+
+        // Epoch 1: signers[2] was ejected mid-epoch. Its record carries the shrunken
+        // committee in the on-chain swap-and-pop order, and a next committee that differs
+        // from the serving one (survivors + the incoming validator).
+        let ejected = signers[2].public_key();
+        let survivors =
+            vec![signers[0].clone(), signers[1].clone(), signers[4].clone(), signers[3].clone()];
+        let mut next1: Vec<BlsPublicKey> = survivors.iter().map(|s| s.public_key()).collect();
+        next1.push(incoming);
+        let (rec1, cert1) = make_test_pair_with_next(1, &survivors, next1.clone(), rec0.digest());
+        db.save(rec1, cert1).await.expect("save rec1");
+
+        // Pre-ejection epoch reads the full committee.
+        let keys0 = db.get_committee_keys(0).await.expect("keys for epoch 0");
+        assert_eq!(keys0, five.iter().map(|s| s.public_key()).collect::<BTreeSet<_>>());
+
+        // The ejection epoch reads exactly the shrunken set; the ejected key is gone.
+        let keys1 = db.get_committee_keys(1).await.expect("keys for epoch 1");
+        assert_eq!(keys1, survivors.iter().map(|s| s.public_key()).collect::<BTreeSet<_>>());
+        assert!(!keys1.contains(&ejected));
+
+        // Epoch 2 has no record yet: served from rec1.next_committee (not rec1.committee).
+        let keys2 = db.get_committee_keys(2).await.expect("keys for epoch 2 fallback");
+        assert_eq!(keys2, next1.iter().copied().collect::<BTreeSet<_>>());
+        assert!(keys2.contains(&incoming));
+        assert!(!keys2.contains(&ejected));
+
+        // Beyond the one-epoch fallback horizon there is nothing to serve.
+        assert!(db.get_committee_keys(3).await.is_none());
     }
 }

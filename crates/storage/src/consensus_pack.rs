@@ -2594,4 +2594,87 @@ pub(crate) mod test {
         assert!(pack.get_consensus_output(1).await.is_ok());
         assert!(pack.get_consensus_output(4).await.is_ok());
     }
+
+    /// `verify_epoch_meta` committee linkage across the shapes a mid-epoch on-chain ejection
+    /// (governance `burn` / slash-to-zero) produces. The committee check is set-based
+    /// (`BTreeSet`), so the stored order of `next_committee` must not matter — only shrinking
+    /// or growing the set does.
+    #[test]
+    fn test_verify_epoch_meta_across_ejection_shapes() {
+        use std::collections::BTreeMap;
+
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::{Address, Authority, BlsKeypair, BlsPublicKey, ConsensusNumHash, Epoch};
+
+        use crate::consensus_pack::{verify_epoch_meta, EpochMeta, PackError};
+
+        let mut rng = StdRng::seed_from_u64(0xE2EC7);
+        let keypairs: Vec<BlsKeypair> = (0..5).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let keys: Vec<BlsPublicKey> = keypairs.iter().map(|kp| *kp.public()).collect();
+
+        let build_committee = |members: &[BlsPublicKey], epoch: Epoch| {
+            let authorities = members
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (*k, Authority::new_for_test(*k, Address::repeat_byte(i as u8 + 1))))
+                .collect::<BTreeMap<_, _>>();
+            Committee::new_for_test(authorities, epoch, BTreeMap::default())
+        };
+
+        let meta_for = |epoch: Epoch, committee: &Committee, prev: &EpochRecord| EpochMeta {
+            epoch,
+            committee: committee.clone(),
+            start_consensus_number: prev.final_consensus.number + 1,
+            genesis_exec_state: prev.final_state,
+            genesis_consensus: prev.final_consensus,
+        };
+
+        // Swap-and-pop ejection of keys[2] out of the five-member committee.
+        let survivors = vec![keys[0], keys[1], keys[4], keys[3]];
+        let committee5 = build_committee(&keys, 1);
+        let committee4 = build_committee(&survivors, 1);
+
+        // rec0: pre-ejection record. `next_committee` is deliberately stored in reversed
+        // order to pin that the comparison is order-insensitive.
+        let mut next0 = keys.clone();
+        next0.reverse();
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: next0,
+            final_consensus: ConsensusNumHash::new(10, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+
+        // Full record committee vs full meta committee (any order) → Ok.
+        verify_epoch_meta(1, &rec0, &meta_for(1, &committee5, &rec0))
+            .expect("full vs full must verify");
+
+        // Full record vs shrunken meta → Err: the meta was rebuilt from a post-ejection
+        // chain read while the record predates the burn.
+        let err = verify_epoch_meta(1, &rec0, &meta_for(1, &committee4, &rec0))
+            .expect_err("full vs shrunken must fail");
+        assert!(matches!(err, PackError::InvalidEpoch(1, _)), "got {err:?}");
+
+        // rec1: the ejection epoch's record — committee and next committee both shrunken.
+        let rec1 = EpochRecord {
+            epoch: 1,
+            committee: survivors.clone(),
+            next_committee: survivors.clone(),
+            parent_hash: rec0.digest(),
+            final_consensus: ConsensusNumHash::new(20, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        let committee4_next = committee4.advance_epoch_for_test(2);
+        let committee5_next = committee5.advance_epoch_for_test(2);
+
+        // Shrunken record vs shrunken meta → Ok: the epoch after the ejection opens cleanly.
+        verify_epoch_meta(2, &rec1, &meta_for(2, &committee4_next, &rec1))
+            .expect("shrunken vs shrunken must verify");
+
+        // Shrunken record vs full meta → Err: a committee cannot silently grow back.
+        let err = verify_epoch_meta(2, &rec1, &meta_for(2, &committee5_next, &rec1))
+            .expect_err("shrunken vs full must fail");
+        assert!(matches!(err, PackError::InvalidEpoch(2, _)), "got {err:?}");
+    }
 }
