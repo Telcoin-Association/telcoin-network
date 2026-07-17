@@ -20,7 +20,7 @@ use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
     BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
     ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Hash as _, Round,
-    B256,
+    B256, MAX_GC_DEPTH, MAX_HEADER_NUM_OF_BATCHES,
 };
 use tokio::{
     io::{AsyncRead, BufReader},
@@ -1370,15 +1370,26 @@ pub(crate) fn verify_epoch_meta(
     Ok(())
 }
 
-/// Upper bound on how many `Batch` records `iter_to_output` will buffer before the
-/// terminating `Consensus` record.  This caps memory use when reading a (possibly hostile)
-/// peer stream; a legitimate ConsensusOutput references far fewer batches than this.
-#[cfg(not(test))]
-const MAX_BATCHES_PER_OUTPUT: usize = 1_000;
-/// Lowered in tests so the cap can be exercised cheaply; legitimate test outputs use only a
-/// handful of batches, well under this.
-#[cfg(test)]
-const MAX_BATCHES_PER_OUTPUT: usize = 50;
+/// Upper bound on how many `Batch` records `iter_to_output` will buffer before the terminating
+/// `Consensus` record, derived from the committee that produced the output.
+///
+/// [`MAX_GC_DEPTH`] is the garbage-collection horizon, not the depth a commit actually reaches.
+/// `order_dag` descends only to `gc_round + 1` and additionally skips any round already committed
+/// per authority, so in practice a sub-DAG is only a handful of rounds deep (a leader commits every
+/// couple of rounds).  It serves purely as a safe ceiling: because no certificate at or below
+/// `gc_round` can ever be linked into a commit, a single `CommittedSubDag` references certificates
+/// from at most [`MAX_GC_DEPTH`] distinct rounds, a deliberately loose over-estimate that holds
+/// regardless of commit cadence.  With at most one certificate per authority per round and at most
+/// [`MAX_HEADER_NUM_OF_BATCHES`] batches per header (the proposer self-limits and
+/// `Header::validate` rejects oversized inbound headers), a legitimately committed output therefore
+/// references at most `committee.size() * MAX_GC_DEPTH * MAX_HEADER_NUM_OF_BATCHES` unique batches.
+/// Bounding the reader at exactly that maximum keeps the writer and reader in agreement by
+/// construction (every executed output can be reconstructed) while still capping an unauthenticated
+/// peer flood of `Batch` records (the sub-DAG is only authenticated *after* decode, and the
+/// per-record size cap does not bound their count).
+fn max_batches_per_output(committee: &Committee) -> usize {
+    committee.size().saturating_mul(MAX_GC_DEPTH as usize).saturating_mul(MAX_HEADER_NUM_OF_BATCHES)
+}
 
 /// What the caller already knows about the consensus header of the output being decoded, used to
 /// reject a bad or forged header the instant it is read — before any `Batch` record is buffered.
@@ -1532,8 +1543,9 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     // still declare a huge number of payload digests.  Reject early — before reading/buffering
     // any batches — like the legacy path does.  A legitimate ConsensusOutput references far
     // fewer batches than this.
-    if expected_digest_count > MAX_BATCHES_PER_OUTPUT {
-        return Err(PackError::TooManyBatches(MAX_BATCHES_PER_OUTPUT));
+    let max_batches = max_batches_per_output(committee);
+    if expected_digest_count > max_batches {
+        return Err(PackError::TooManyBatches(max_batches));
     }
     let mut expected_batch_digests = expected_batch_digests.into_iter();
 
@@ -1643,6 +1655,7 @@ async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
     let mut available_batches = HashMap::new();
     let mut referenced_batches = HashSet::new();
     let mut batch_records = 0_usize;
+    let max_batches = max_batches_per_output(committee);
     while let Some(record) = next_output_record(stream_iter, timeout).await? {
         match record {
             PackRecord::EpochMeta(_epoch_meta) => {
@@ -1652,11 +1665,13 @@ async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
                 // Bound how many batch records a (possibly hostile) stream can deliver before the
                 // terminating Consensus record arrives.  Without this an `EpochMeta`/`Consensus`
                 // -less flood of Batch records would grow `available_batches` until OOM; the
-                // per-record size cap (MAX_RECORD_SIZE) only bounds individual records.  A
-                // legitimate ConsensusOutput references far fewer batches than this.
+                // per-record size cap (MAX_RECORD_SIZE) only bounds individual records.  The bound
+                // is the maximum a legitimately committed output for this committee
+                // can reference (see `max_batches_per_output`), so an honest deep
+                // sub-DAG is never rejected.
                 batch_records += 1;
-                if batch_records > MAX_BATCHES_PER_OUTPUT {
-                    return Err(PackError::TooManyBatches(MAX_BATCHES_PER_OUTPUT));
+                if batch_records > max_batches {
+                    return Err(PackError::TooManyBatches(max_batches));
                 }
                 let batch_digest = batch.digest();
                 available_batches.insert(batch_digest, batch);
@@ -1960,16 +1975,70 @@ pub(crate) mod test {
     use tn_reth::RethChainSpec;
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
-        test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-        ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, EpochRecord, Hash, HeaderBuilder,
-        ReputationScores,
+        test_genesis, Batch, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
+        ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, EpochRecord, ExecHeader, Hash,
+        HeaderBuilder, ReputationScores,
     };
 
     use crate::{
         archive::pack::PackCompression,
-        consensus_pack::{ConsensusPack, Inner, PACK_VERSION},
+        consensus_pack::{max_batches_per_output, ConsensusPack, Inner, PACK_VERSION},
         mem_db::MemDatabase,
     };
+
+    /// Build a [`ConsensusOutput`] whose single leader header references `num_batches` unique
+    /// batches, standing in for a deep sub-DAG that exceeds the old fixed reconstruction cap
+    /// but stays within the committee-derived bound.
+    fn make_wide_test_output(
+        committee: &Committee,
+        chain: Arc<RethChainSpec>,
+        number: u64,
+        parent: ConsensusHeaderDigest,
+        num_batches: usize,
+    ) -> ConsensusOutput {
+        // Reuse one transaction across many cheaply-distinct batches (each batch differs only by
+        // its `epoch` field, which is enough to give it a unique digest) so a wide output
+        // does not generate O(n^2) transactions.
+        let txs =
+            tn_reth::test_utils::batches(chain, 1).pop().expect("one batch").transactions().clone();
+        let batches: Vec<Batch> = (0..num_batches as u32)
+            .map(|epoch| Batch::new_for_test(txs.clone(), ExecHeader::default(), 0, epoch))
+            .collect();
+        let authorities = committee.authorities();
+        let authority = authorities.first().expect("committee has authorities");
+        let author_id = authority.id();
+        let producer = authority.execution_address();
+
+        let mut leader = Certificate::default();
+        leader.update_header_author_for_test(author_id);
+        // Accumulate the whole payload on a single builder so the header is only hashed once.
+        let header = batches
+            .iter()
+            .fold(HeaderBuilder::from_header(leader.header()), |builder, batch| {
+                builder.with_payload_batch(batch, 0_u16)
+            })
+            .build();
+        leader.update_header_for_test(header);
+        leader.update_header_round_for_test(1);
+        leader.update_header_epoch_for_test(committee.epoch());
+
+        let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            None,
+        );
+        ConsensusOutput::new(
+            sub_dag,
+            parent,
+            number,
+            false,
+            batch_digests,
+            vec![CertifiedBatch { address: producer, batches }],
+        )
+    }
 
     pub(crate) fn make_test_output(
         committee: &Committee,
@@ -2436,7 +2505,7 @@ pub(crate) mod test {
     async fn test_iter_to_output_caps_buffered_batches() {
         use crate::{
             archive::pack::{Pack, DATA_HEADER_BYTES},
-            consensus_pack::{bytes_to_output, PackError, PackRecord, MAX_BATCHES_PER_OUTPUT},
+            consensus_pack::{bytes_to_output, max_batches_per_output, PackError, PackRecord},
         };
         use std::io::Cursor;
 
@@ -2444,6 +2513,9 @@ pub(crate) mod test {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
+        // The reader bound is derived from this committee, so an unauthenticated flood past it must
+        // still be rejected to guard against OOM.
+        let max_batches = max_batches_per_output(&committee);
 
         // Build a record stream of more batch records than the cap with no Consensus record.
         let path = temp_dir.path().join("batch_only");
@@ -2452,7 +2524,7 @@ pub(crate) mod test {
                 Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
                     .expect("open pack");
             let batch = tn_reth::test_utils::batches(chain.clone(), 1).pop().expect("one batch");
-            for _ in 0..(MAX_BATCHES_PER_OUTPUT + 5) {
+            for _ in 0..(max_batches + 5) {
                 pack.append(&PackRecord::Batch(batch.clone())).expect("append batch");
             }
             pack.commit().expect("commit");
@@ -2472,14 +2544,14 @@ pub(crate) mod test {
         assert!(matches!(res, Err(PackError::BatchLoad(_))), "expected BatchLoad");
     }
 
-    /// CP1b: in the v1 (header-first) format a hostile header whose sub-dag declares more than
-    /// `MAX_BATCHES_PER_OUTPUT` payload digests must be rejected up front — before any batch is
-    /// read — rather than allocating/reading a batch per declared digest.
+    /// CP1b: in the v1 (header-first) format a hostile header whose sub-dag declares more than the
+    /// committee-derived bound (`max_batches_per_output`) of payload digests must be rejected up
+    /// front, before any batch is read, rather than allocating/reading a batch per declared digest.
     #[tokio::test]
     async fn test_iter_to_output_caps_expected_batches() {
         use crate::{
             archive::pack::{Pack, DATA_HEADER_BYTES},
-            consensus_pack::{bytes_to_output, PackError, PackRecord, MAX_BATCHES_PER_OUTPUT},
+            consensus_pack::{bytes_to_output, max_batches_per_output, PackError, PackRecord},
         };
         use std::io::Cursor;
 
@@ -2488,39 +2560,17 @@ pub(crate) mod test {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
 
-        // Craft a single consensus header whose leader references more distinct batch digests
-        // than the cap.
-        let batches = tn_reth::test_utils::batches(chain, MAX_BATCHES_PER_OUTPUT + 5);
-        let authority = committee.authorities().first().expect("authority").id();
-        let mut leader = Certificate::default();
-        leader.update_header_author_for_test(authority);
-        for batch in &batches {
-            let mut builder = HeaderBuilder::from_header(leader.header());
-            builder = builder.with_payload_batch(batch, 0_u16);
-            leader.update_header_for_test(builder.build());
-        }
-        leader.update_header_round_for_test(1);
-        leader.update_header_epoch_for_test(committee.epoch());
-        let sub_dag = CommittedSubDag::new(
-            vec![leader.clone()],
-            leader,
+        // Craft a single consensus header whose leader references more distinct batch digests than
+        // the committee-derived bound, cheaply (one shared tx, header hashed once).
+        let max_batches = max_batches_per_output(&committee);
+        let output = make_wide_test_output(
+            &committee,
+            chain.clone(),
             1,
-            ReputationScores::default(),
-            None,
-        );
-        let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
-        let output = ConsensusOutput::new(
-            sub_dag,
             ConsensusHeader::default().digest(),
-            1,
-            false,
-            batch_digests,
-            vec![],
+            max_batches + 5,
         );
-        assert!(
-            output.sub_dag().num_primary_batches() > MAX_BATCHES_PER_OUTPUT,
-            "test must exceed the cap"
-        );
+        assert!(output.sub_dag().num_primary_batches() > max_batches, "test must exceed the cap");
 
         // Write just the header record (v1: header first) with no batch records to follow.
         let path = temp_dir.path().join("header_only");
@@ -2543,6 +2593,34 @@ pub(crate) mod test {
         )
         .await;
         assert!(matches!(res, Err(PackError::TooManyBatches(_))), "expected TooManyBatches");
+    }
+
+    /// A `ConsensusOutput` that references more than the old fixed 1000-batch cap but stays within
+    /// the committee-derived bound must round-trip through the pack: it is executed live on
+    /// every node, so it must always be reconstructable.  Regression test for the writer/reader
+    /// batch-count asymmetry (#896) — before the fix the write succeeded but the read failed
+    /// with `TooManyBatches`, wedging restart replay and observer sync.
+    #[tokio::test]
+    async fn test_deep_output_round_trips() {
+        let temp_dir = TempDir::with_prefix("test_cp_deep_output").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        let max_batches = max_batches_per_output(&committee);
+        assert!(max_batches > 1_000, "derived bound must exceed the old fixed 1000 cap");
+        // Exceeds the old fixed cap yet stays within the committee-derived bound.
+        let num_batches = 1_100;
+        assert!(num_batches < max_batches, "test output must fit within the derived bound");
+
+        let previous_epoch = test_previous_epoch(&committee);
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("open pack");
+        let parent = ConsensusHeader::default().digest();
+        let output = make_wide_test_output(&committee, chain.clone(), 1, parent, num_batches);
+        pack.save_consensus_output(output.clone()).await.expect("save deep output");
+        let read_back = pack.get_consensus_output(1).await.expect("read back deep output");
+        compare_outputs(&output, &read_back);
     }
 
     /// The verified single-output decode ([`bytes_to_verified_output`]) accepts an output whose
@@ -2931,5 +3009,88 @@ pub(crate) mod test {
         // The healed pack dropped the damaged 5th output; the first four remain readable.
         assert!(pack.get_consensus_output(1).await.is_ok());
         assert!(pack.get_consensus_output(4).await.is_ok());
+    }
+
+    /// `verify_epoch_meta` committee linkage across the shapes a mid-epoch on-chain ejection
+    /// (governance `burn` / slash-to-zero) produces. The committee check is set-based
+    /// (`BTreeSet`), so the stored order of `next_committee` must not matter — only shrinking
+    /// or growing the set does.
+    #[test]
+    fn test_verify_epoch_meta_across_ejection_shapes() {
+        use std::collections::BTreeMap;
+
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::{Address, Authority, BlsKeypair, BlsPublicKey, ConsensusNumHash, Epoch};
+
+        use crate::consensus_pack::{verify_epoch_meta, EpochMeta, PackError};
+
+        let mut rng = StdRng::seed_from_u64(0xE2EC7);
+        let keypairs: Vec<BlsKeypair> = (0..5).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let keys: Vec<BlsPublicKey> = keypairs.iter().map(|kp| *kp.public()).collect();
+
+        let build_committee = |members: &[BlsPublicKey], epoch: Epoch| {
+            let authorities = members
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (*k, Authority::new_for_test(*k, Address::repeat_byte(i as u8 + 1))))
+                .collect::<BTreeMap<_, _>>();
+            Committee::new_for_test(authorities, epoch, BTreeMap::default())
+        };
+
+        let meta_for = |epoch: Epoch, committee: &Committee, prev: &EpochRecord| EpochMeta {
+            epoch,
+            committee: committee.clone(),
+            start_consensus_number: prev.final_consensus.number + 1,
+            genesis_exec_state: prev.final_state,
+            genesis_consensus: prev.final_consensus,
+        };
+
+        // Swap-and-pop ejection of keys[2] out of the five-member committee.
+        let survivors = vec![keys[0], keys[1], keys[4], keys[3]];
+        let committee5 = build_committee(&keys, 1);
+        let committee4 = build_committee(&survivors, 1);
+
+        // rec0: pre-ejection record. `next_committee` is deliberately stored in reversed
+        // order to pin that the comparison is order-insensitive.
+        let mut next0 = keys.clone();
+        next0.reverse();
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: next0,
+            final_consensus: ConsensusNumHash::new(10, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+
+        // Full record committee vs full meta committee (any order) → Ok.
+        verify_epoch_meta(1, &rec0, &meta_for(1, &committee5, &rec0))
+            .expect("full vs full must verify");
+
+        // Full record vs shrunken meta → Err: the meta was rebuilt from a post-ejection
+        // chain read while the record predates the burn.
+        let err = verify_epoch_meta(1, &rec0, &meta_for(1, &committee4, &rec0))
+            .expect_err("full vs shrunken must fail");
+        assert!(matches!(err, PackError::InvalidEpoch(1, _)), "got {err:?}");
+
+        // rec1: the ejection epoch's record — committee and next committee both shrunken.
+        let rec1 = EpochRecord {
+            epoch: 1,
+            committee: survivors.clone(),
+            next_committee: survivors.clone(),
+            parent_hash: rec0.digest(),
+            final_consensus: ConsensusNumHash::new(20, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        let committee4_next = committee4.advance_epoch_for_test(2);
+        let committee5_next = committee5.advance_epoch_for_test(2);
+
+        // Shrunken record vs shrunken meta → Ok: the epoch after the ejection opens cleanly.
+        verify_epoch_meta(2, &rec1, &meta_for(2, &committee4_next, &rec1))
+            .expect("shrunken vs shrunken must verify");
+
+        // Shrunken record vs full meta → Err: a committee cannot silently grow back.
+        let err = verify_epoch_meta(2, &rec1, &meta_for(2, &committee5_next, &rec1))
+            .expect_err("shrunken vs full must fail");
+        assert!(matches!(err, PackError::InvalidEpoch(2, _)), "got {err:?}");
     }
 }

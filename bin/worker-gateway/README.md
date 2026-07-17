@@ -9,10 +9,11 @@ request method, JSON-RPC body, and content type; the header contract is
 deliberately minimal (see Scope).
 
 Because every instance is stateless and identical, the gateway can be scaled
-horizontally: any replica can serve any request. This is PR2 of the epic
-(issue #712) and implements the crate skeleton plus the proxy core. Edge
-protections (rate/size limits, `eth_sendRawTransaction` sanity checks) and
-observability/deployment (Prometheus, Dockerfile, k8s/HPA) land in PR3 and PR4.
+horizontally: any replica can serve any request. This is PR3 of the epic
+(issue #712): it adds the edge protections (per-IP and global rate limits, a
+configurable request-size limit, and shallow `eth_sendRawTransaction` screening)
+on top of the PR2 proxy core. Observability and deployment (Prometheus,
+Dockerfile, k8s/HPA) land in PR4.
 
 ## Scope (v1)
 
@@ -102,6 +103,11 @@ Every flag has an environment-variable fallback.
 | `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `30s` | Upstream per-request deadline. |
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
+| `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `26214400` | Max request body size, in bytes. |
+| `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
+| `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
+| `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
+| `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 
@@ -126,6 +132,55 @@ request that already carries it is rejected (HTTP `508`), so a misconfigured
 upstream or VIP that points back at a gateway breaks the loop at the first
 revisit instead of exhausting file descriptors.
 
+## Edge protections
+
+### Rate limiting
+
+Two token-bucket limiters shed load before a request is buffered or forwarded:
+
+- A **per-client-IP** limiter (`--rate-limit-per-ip`, requests/second, with
+  `--rate-limit-per-ip-burst`) stops any single source monopolizing the workers.
+- A **global** limiter (`--rate-limit-global` / `--rate-limit-global-burst`)
+  caps aggregate throughput to roughly what the upstream workers can absorb.
+
+Either limiter is disabled by setting its rate to `0`; a `0` burst derives twice
+the sustained rate. An over-limit request receives a JSON-RPC `429` (see below),
+never a bare reset.
+
+The client identity is the immediate TCP peer. Run the gateway **edge-facing**:
+behind an untrusted L7 proxy the peer is that proxy, so per-IP limiting would
+meter the proxy, not the real client. Terminate client identity at that proxy,
+or put the per-IP limit there.
+
+> The default rates (`100`/s per IP, `3000`/s global) are conservative starting
+> points, not tuned figures. Set them to your workers' measured capacity before
+> relying on them; they can also be disabled entirely (`0`) if you rate-limit at
+> the ingress.
+
+The gateway's own `GET /health` and `GET /ready` probes are **exempt** from rate
+limiting, so an orchestrator's liveness/readiness checks keep succeeding under a
+flood (rate-limiting them would make the orchestrator kill or depool the pod at
+the worst possible moment).
+
+Per-IP state is bounded: idle buckets are swept periodically and the number of
+tracked IPs is capped, so a wide spread of source IPs cannot grow memory without
+limit.
+
+### Request size
+
+`--max-request-bytes` (default 25 MiB) caps the buffered request body; a larger
+body is rejected with a JSON-RPC "request too large" error before forwarding.
+
+### Transaction screening
+
+A single `eth_sendRawTransaction` call is decoded far enough to reject, at the
+edge, the two cases the worker would also reject — an undecodable payload and an
+EIP-4844 blob transaction (the network does not accept blobs) — saving a wasted
+upstream round-trip. The decode uses the same pooled wire format the worker's
+RPC accepts and never recovers the signer, so it cannot reject a transaction the
+worker would accept. Batches (JSON arrays) and every other method are forwarded
+unchanged and validated by the worker.
+
 ## Gateway endpoints
 
 - `GET /health`: liveness, always `200 OK` while the process runs.
@@ -147,6 +202,9 @@ echoed when it can be recovered.
 | Request body too large | `413` | `-32003` |
 | Proxy loop detected | `508` | `-32004` |
 | Request deadline exceeded | `408` | `-32005` |
+| Rate limit exceeded | `429` | `-32006` |
+| Raw transaction undecodable | `400` | `-32007` |
+| Unsupported transaction type (EIP-4844 blob) | `400` | `-32008` |
 | Request body unreadable (client aborted) | `400` | `-32600` |
 
 The gateway's own codes sit in the JSON-RPC server-error range

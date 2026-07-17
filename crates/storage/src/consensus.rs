@@ -406,6 +406,15 @@ impl ConsensusChain {
             return Err(ConsensusChainError::PrevCommitteeEpochMismatch);
         }
         let old_pack = self.current_pack();
+        // Same-epoch re-entry (mid-epoch restart, or a mode change that re-runs
+        // epoch setup) intentionally reuses the already-open pack, matching on
+        // epoch number alone. The pack's persisted `EpochMeta` — committee
+        // included — is the epoch-START snapshot; chain state can legitimately
+        // diverge from it mid-epoch (a governance burn shrinks the on-chain
+        // committee immediately), so comparing anything beyond the epoch number
+        // here would reject the re-entry and strand the node. Keeping the
+        // original pack is load-bearing: this epoch's consensus output must be
+        // decoded and verified against the committee the epoch started with.
         if old_pack.epoch() == committee.epoch() && !old_pack.is_static() {
             return Ok(());
         }
