@@ -225,6 +225,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::AlreadyVoted(_, _)
         | HeaderError::DuplicateParents
         | HeaderError::TooManyParents(_, _)
+        | HeaderError::TooManyBatches(_, _)
         | HeaderError::UnknownNetworkKey(_)
         | HeaderError::PeerNotAuthor
         | HeaderError::InvalidGenesisParent(_)

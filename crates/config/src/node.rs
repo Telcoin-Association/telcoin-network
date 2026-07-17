@@ -288,7 +288,7 @@ impl Parameters {
     }
 
     fn default_max_header_num_of_batches() -> usize {
-        10
+        tn_types::MAX_HEADER_NUM_OF_BATCHES
     }
 
     fn default_max_header_delay() -> Duration {
@@ -301,7 +301,7 @@ impl Parameters {
 
     /// The default gc depth for consensus.
     pub fn default_gc_depth() -> u32 {
-        50
+        tn_types::MAX_GC_DEPTH
     }
 
     fn default_sync_retry_delay() -> Duration {
@@ -371,6 +371,32 @@ impl Default for Parameters {
 }
 
 impl Parameters {
+    /// Validate protocol-critical parameters against the ceilings the rest of the protocol depends
+    /// on.
+    ///
+    /// `gc_depth` and `max_header_num_of_batches` together bound how many unique batches a single
+    /// committed [`ConsensusOutput`](tn_types::ConsensusOutput) can reference. The consensus-pack
+    /// reader derives its reconstruction bound from [`tn_types::MAX_GC_DEPTH`] and
+    /// [`tn_types::MAX_HEADER_NUM_OF_BATCHES`], so a node configured above those ceilings could
+    /// commit an output that no node (including itself, on restart) can later reconstruct.
+    /// Rejecting such a configuration at startup keeps the producing and reconstructing halves
+    /// in agreement.
+    pub fn validate(&self) -> eyre::Result<()> {
+        eyre::ensure!(
+            self.gc_depth <= tn_types::MAX_GC_DEPTH,
+            "gc_depth {} exceeds the protocol maximum {}",
+            self.gc_depth,
+            tn_types::MAX_GC_DEPTH,
+        );
+        eyre::ensure!(
+            self.max_header_num_of_batches <= tn_types::MAX_HEADER_NUM_OF_BATCHES,
+            "max_header_num_of_batches {} exceeds the protocol maximum {}",
+            self.max_header_num_of_batches,
+            tn_types::MAX_HEADER_NUM_OF_BATCHES,
+        );
+        Ok(())
+    }
+
     /// Tracing::info! for [Self].
     pub fn tracing(&self) {
         info!("Header number of batches threshold set to {}", self.header_num_of_batches_threshold);
@@ -382,5 +408,33 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Max batch delay set to {} ms", self.max_batch_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::Parameters;
+
+    #[test]
+    fn default_parameters_are_within_protocol_ceilings() {
+        Parameters::default().validate().expect("default parameters must validate");
+    }
+
+    #[test]
+    fn parameters_reject_gc_depth_over_ceiling() {
+        let params = Parameters { gc_depth: tn_types::MAX_GC_DEPTH + 1, ..Default::default() };
+        assert!(params.validate().is_err(), "gc_depth over the protocol ceiling must be rejected");
+    }
+
+    #[test]
+    fn parameters_reject_max_header_num_of_batches_over_ceiling() {
+        let params = Parameters {
+            max_header_num_of_batches: tn_types::MAX_HEADER_NUM_OF_BATCHES + 1,
+            ..Default::default()
+        };
+        assert!(
+            params.validate().is_err(),
+            "max_header_num_of_batches over the protocol ceiling must be rejected"
+        );
     }
 }
