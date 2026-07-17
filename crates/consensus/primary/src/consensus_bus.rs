@@ -235,6 +235,15 @@ pub struct ConsensusBusAppInner {
     tx_last_consensus_header: watch::Sender<Option<ConsensusHeader>>,
     /// Watch tracking the last gossipped epoch, consensus block number, hash and consensus bytes.
     tx_last_published_consensus_num_hash: watch::Sender<(Epoch, u64, ConsensusHeaderDigest)>,
+    /// Watch requesting the fetch task backfill a bottom gap the gossip-driven walk cannot reach.
+    ///
+    /// Published by the observer's `state_sync::spawn_stream_consensus_headers` when its catch-up
+    /// loop stalls, carrying `(epoch, target_number, target_hash, floor)`: fill the consensus
+    /// range `floor..=target_number` (walking back from the verified gossip tip
+    /// `target_hash`). Consumed by `state_sync::spawn_fetch_recent_consensus`, which owns the
+    /// in-flight accounting. This is deliberately separate from the gossip watermark so a gap
+    /// below it can still be recovered.
+    tx_consensus_gap: watch::Sender<Option<(Epoch, u64, ConsensusHeaderDigest, u64)>>,
 
     /// Verified consensus OUTPUTs (header + batches) delivered to a following/catching-up
     /// subscriber for execution. Filled by the state-sync forward drain; used only by
@@ -310,6 +319,7 @@ impl ConsensusBusApp {
         let (tx_last_consensus_header, _) = watch::channel(None);
         let (tx_last_published_consensus_num_hash, _) =
             watch::channel((0, 0, ConsensusHeaderDigest::default()));
+        let (tx_consensus_gap, _) = watch::channel(None);
 
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
@@ -333,6 +343,7 @@ impl ConsensusBusApp {
                 tx_recent_blocks,
                 tx_last_consensus_header,
                 tx_last_published_consensus_num_hash,
+                tx_consensus_gap,
                 sync_output,
                 consensus_output,
                 exex_certificates,
@@ -356,6 +367,10 @@ impl ConsensusBusApp {
     pub fn reset_for_epoch(&self) {
         self.inner.tx_committed_round_updates.send_replace(Round::default());
         self.inner.tx_primary_round_updates.send_replace(0u32);
+        // Drop any pending gap request from the prior epoch so the fetch task never backfills a
+        // stale (epoch, number, hash) after we have moved on; the new epoch's stream task will
+        // re-signal if it stalls.
+        self.inner.tx_consensus_gap.send_replace(None);
     }
 
     /// Contains the highest committed round & corresponding gc_round for consensus.
@@ -441,6 +456,18 @@ impl ConsensusBusApp {
                 false
             }
         })
+    }
+
+    /// Watch used by the observer catch-up loop to ask the fetch task to backfill a bottom gap.
+    ///
+    /// Send `Some((epoch, target_number, target_hash, floor))` via `send_replace` to request the
+    /// consensus range `floor..=target_number`; subscribe to consume it in the fetch task. The
+    /// watch coalesces (only the latest request survives), which is intended: the requester
+    /// re-signals with a fresh floor if a request is superseded.
+    pub fn consensus_gap_request(
+        &self,
+    ) -> &watch::Sender<Option<(Epoch, u64, ConsensusHeaderDigest, u64)>> {
+        &self.inner.tx_consensus_gap
     }
 
     /// Track the latest published consensus header block number and hash seen on the gossip
