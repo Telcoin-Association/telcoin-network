@@ -757,7 +757,7 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
     let mut closing_output = outputs.pop().expect("epoch-closing output");
 
     // forward every pre-close output, then wait for the engine to execute each (the engine
-    // sends exactly one update per consensus output) so recovery scans a settled chain
+    // sends exactly one update per consensus output) so every block recovery scans is committed
     let sent = outputs.len();
     for output in outputs {
         to_engine.send(output).await?;
@@ -767,6 +767,13 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
             .await?
             .expect("engine update per output");
     }
+
+    // The engine update is sent from finish_executing_output AFTER the blocks commit but
+    // BEFORE finalize_block writes the finalized marker in its own transaction, so under load
+    // the marker can still lag the persisted tip here. A real restart never reads through that
+    // window: startup heals the marker before anything consults it. Mirror that startup step
+    // so catchup pins the settled tip instead of racing the marker write.
+    reth_env.heal_finalized_to_persisted_tip()?;
 
     // simulate node recovery at startup: catchup sizes the accumulator from pinned chain state
     // and rebuilds gas stats (fees are owned by the entry seeding)
