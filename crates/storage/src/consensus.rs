@@ -1100,6 +1100,70 @@ impl ConsensusChain {
     }
 }
 
+/// Seed the double-buffered `LatestConsensus` slot files under `base_path` to `(epoch, number)`
+/// for a datadir that has never run a node.
+///
+/// A snapshot-restored node holds EVM state as of epoch boundary `N` but an empty consensus
+/// datadir. On startup `request_missing_packs` (in `state-sync`) begins its historical-pack
+/// backfill at [`ConsensusChain::latest_consensus_epoch`]; on an unseeded datadir that reads
+/// `(0, 0)`, so the node would background-download every pack from epoch 0. Seeding to
+/// `(N, final_number)` bounds that scan to epoch `N` and up, and makes [`ConsensusChain::new`] take
+/// its "already running" branch (re-open the current epoch pack via `open_append_exists`) instead
+/// of pre-opening epoch 0 — so a matching empty epoch-`N` pack must also exist (see
+/// [`create_empty_epoch_pack`]).
+///
+/// The write goes through the same `LatestConsensus` path a running node uses, so the persisted
+/// bytes are exactly what a node that legitimately reached `(epoch, number)` would hold. Both slot
+/// files are populated, so a later reopen resolves to `(epoch, number)` regardless of the slot
+/// tie-break and even if one slot is later corrupted. `base_path` is the datadir's epochs path
+/// (the same path passed to [`ConsensusChain::new`]). Must be called before any node opens the
+/// consensus chain.
+pub async fn seed_latest_consensus(
+    base_path: &Path,
+    epoch: Epoch,
+    number: u64,
+) -> Result<(), ConsensusChainError> {
+    // The node creates this directory before opening the chain; do the same so the helper is
+    // self-sufficient when called stand-alone by a restore tool.
+    std::fs::create_dir_all(base_path)?;
+    let latest = LatestConsensus::new(base_path)?;
+    // The slots alternate on each update, so two writes land the value in BOTH files. This keeps
+    // the read-time tie-break (and the single-slot-corruption fallback) from ever surfacing a
+    // stale (0, 0).
+    latest.update(epoch, number).await;
+    latest.update(epoch, number).await;
+    latest.persist().await;
+    Ok(())
+}
+
+/// Create a valid but EMPTY `epoch-{N}` pack under `base_path` so a subsequent
+/// [`ConsensusChain::new`] on a snapshot-restored datadir can open the current epoch (via
+/// `open_append_exists`) instead of erroring on a missing pack directory.
+///
+/// A restore seeds `latest_consensus` to epoch `N` (see [`seed_latest_consensus`]), which makes
+/// `ConsensusChain::new` take its "already running" branch and require the `epoch-{N}` pack to
+/// already exist. This writes only the epoch metadata (no consensus outputs). The real epoch
+/// content is fetched from peers later and swapped in by [`ConsensusChain::stream_import`], which
+/// removes and renames `epoch-{N}` wholesale — so this placeholder is safely replaceable.
+///
+/// `previous_epoch` is the finalized [`EpochRecord`] of epoch `N-1` (its `final_consensus` and
+/// `final_state` seed this epoch's metadata) and `committee` is epoch `N`'s committee, exactly as
+/// [`ConsensusChain::new_epoch`] supplies them during normal operation (so `committee.epoch()` must
+/// be `N`). Idempotent when re-run with the same arguments. Must be called before any node opens
+/// the consensus chain.
+pub async fn create_empty_epoch_pack(
+    base_path: &Path,
+    previous_epoch: EpochRecord,
+    committee: Committee,
+) -> Result<(), ConsensusChainError> {
+    // open_append creates the epoch-{N} directory + data file, writes the EpochMeta record, and
+    // creates the index files. persist() flushes all of that durably (and surfaces any open error)
+    // before the pack is dropped, so open_append_exists can re-open it on the next start.
+    let pack = ConsensusPack::open_append(base_path, previous_epoch, committee)?;
+    pack.persist().await?;
+    Ok(())
+}
+
 impl ConsensusChainReader for ConsensusChain {
     async fn consensus_header_by_digest(
         &self,
@@ -1350,7 +1414,9 @@ impl Drop for ImportPath {
 mod test {
     use tempfile::TempDir;
 
-    use crate::consensus::{ConsensusSlot, LatestConsensus};
+    use crate::consensus::{
+        create_empty_epoch_pack, seed_latest_consensus, ConsensusSlot, LatestConsensus,
+    };
     use std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -1447,6 +1513,82 @@ mod test {
         let latest = LatestConsensus::new(temp_dir.path()).unwrap();
         assert_eq!(latest.epoch(), 0, "both slots corrupt -> fresh start");
         assert_eq!(latest.number(), 0, "both slots corrupt -> fresh start");
+    }
+
+    /// `seed_latest_consensus` on a datadir that never ran a node must persist exactly the
+    /// `(epoch, number)` a legitimately-advanced node would hold. Reopening reads it back through
+    /// the same slot-file path `request_missing_packs` consumes via `latest_consensus_epoch` /
+    /// `latest_consensus_number`, and it survives repeated reopens (both slots populated).
+    #[tokio::test]
+    async fn test_seed_latest_consensus() {
+        let temp_dir = TempDir::with_prefix("test_seed_latest").unwrap();
+        seed_latest_consensus(temp_dir.path(), 7, 4242).await.unwrap();
+
+        let latest = LatestConsensus::new(temp_dir.path()).unwrap();
+        assert_eq!(latest.epoch(), 7, "reopened epoch matches the seed");
+        assert_eq!(latest.number(), 4242, "reopened number matches the seed");
+        drop(latest);
+
+        // Durable across another reopen: both slots hold the value, so the tie-break can't
+        // regress to a stale (0, 0).
+        let latest = LatestConsensus::new(temp_dir.path()).unwrap();
+        assert_eq!(latest.epoch(), 7);
+        assert_eq!(latest.number(), 4242);
+    }
+
+    /// A snapshot restore stages an empty current-epoch pack and seeds `latest_consensus` to that
+    /// epoch. `ConsensusChain::new` must then take its "already running" branch and open the empty
+    /// `epoch-{N}` pack via `open_append_exists` without error, exposing the seeded bookkeeping and
+    /// a valid but empty pack (real content arrives later through `stream_import`).
+    #[tokio::test]
+    async fn test_create_empty_epoch_pack_opens_via_new() {
+        let temp_dir = TempDir::with_prefix("test_empty_epoch_pack").unwrap();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee_zero = fixture.committee();
+
+        // Restore point: boundary of epoch N with the previous epoch's final consensus number.
+        let n: Epoch = 3;
+        let prev_final_number = 300u64;
+        let committee_n = committee_zero.advance_epoch_for_test(n);
+        let previous_epoch = EpochRecord {
+            epoch: n - 1,
+            final_consensus: ConsensusNumHash {
+                number: prev_final_number,
+                hash: ConsensusHeaderDigest::default(),
+            },
+            ..Default::default()
+        };
+
+        // Exactly what a restore tool does before the node opens the chain.
+        seed_latest_consensus(temp_dir.path(), n, prev_final_number).await.unwrap();
+        create_empty_epoch_pack(temp_dir.path(), previous_epoch, committee_n).await.unwrap();
+
+        // The epoch-N directory exists on disk.
+        let epoch_dir = temp_dir.path().join(format!("epoch-{n}"));
+        assert!(std::fs::exists(&epoch_dir).unwrap_or(false), "epoch-{n} dir should exist");
+
+        // `ConsensusChain::new` opens it (else-branch, since latest_consensus.epoch() == N != 0).
+        // The committee_zero argument is only used to pre-open epoch 0, so it is ignored here.
+        let chain = ConsensusChain::new(temp_dir.path().to_owned(), committee_zero)
+            .expect("restored chain must open the staged epoch pack");
+
+        // The seeded bookkeeping is exactly what request_missing_packs reads.
+        assert_eq!(chain.latest_consensus_epoch(), n, "seeded epoch must be exposed");
+        assert_eq!(
+            chain.latest_consensus_number(),
+            prev_final_number,
+            "seeded number must be exposed"
+        );
+
+        // The staged pack opened but holds no consensus headers — a valid EMPTY pack.
+        assert!(
+            chain
+                .latest_consensus_header_from_pack(n)
+                .await
+                .expect("pack read must not error")
+                .is_none(),
+            "freshly-staged epoch-{n} pack must contain no consensus headers"
+        );
     }
 
     #[tokio::test]
