@@ -27,6 +27,11 @@ enum ConsensusHeaderResult {
 }
 
 /// A single consensus-height range `[floor..=ceil]` currently being walked by a fetch task.
+///
+/// Ranges carry no epoch tag even though the tracker is app-scoped (a walk from one epoch can
+/// linger into the next). This is sound ONLY because consensus numbers are globally monotonic
+/// across epochs, so a `(floor, ceil)` pair names a unique height range regardless of epoch. If
+/// numbering ever became per-epoch, two epochs' ranges could alias and a walk could wrongly defer.
 struct WalkRange {
     id: u64,
     floor: u64,
@@ -68,20 +73,48 @@ impl WalkTracker {
         WalkGuard { tracker: self.clone(), id }
     }
 
-    /// Reserve `[floor..=ceil]` only if no in-flight walk already covers all of it. Returns `None`
-    /// when another walk already owns the range: the stall that prompted the request is that walk
-    /// still filling top-down (the execute loop drains bottom-up, so it sees no progress until the
-    /// walk reaches the bottom), not an unfilled gap, so we defer to it rather than duplicate the
-    /// download.
+    /// Reserve `[floor..=ceil]` only if the in-flight walks do not TOGETHER already cover it.
+    /// Returns `None` when they do: the stall that prompted the request is those walks still
+    /// filling top-down (the execute loop drains bottom-up, so it sees no progress until they
+    /// reach the bottom), not an unfilled gap, so we defer rather than duplicate the download.
+    /// Coverage is a UNION test, not a single-range one: during deep catch-up the gossip
+    /// backfills TILE the space (`[0..=n2], [n2+1..=n3], ...`), so no single walk covers a
+    /// full-tip gap request even though together they do, so we sort the overlapping ranges by
+    /// floor and sweep up from `floor`.
     ///
-    /// Deferring is safe even when the covering walk is stuck retrying a height rather than
+    /// Deferring is safe even when a covering walk is stuck retrying a height rather than
     /// progressing: `get_consensus_output` fetches via `request_consensus_output`, which re-samples
     /// peers on every attempt, so a fresh walk would retry the exact same way and gain nothing over
     /// the retries the covering walk is already making. A covering walk that instead panics or is
     /// cancelled releases its reservation on `Drop`, so the next stall re-drives with a fresh walk.
     fn reserve_if_uncovered(&self, floor: u64, ceil: u64) -> Option<WalkGuard> {
         let mut ledger = self.inner.lock();
-        ledger.ranges.iter().all(|r| !(r.floor <= floor && r.ceil >= ceil)).then(|| {
+        let mut ranges: Vec<(u64, u64)> = ledger
+            .ranges
+            .iter()
+            .filter(|r| r.ceil >= floor && r.floor <= ceil)
+            .map(|r| (r.floor, r.ceil))
+            .collect();
+        ranges.sort_unstable();
+        // Sweep upward from `floor`. `needed` is the lowest height still to cover; using `Err` as
+        // the short-circuit signal, a range starting above `needed` leaves a gap
+        // (`Err(false)`), a range reaching `ceil` completes coverage (`Err(true)`),
+        // otherwise advance past it. Running out of ranges without reaching `ceil` (`Ok`)
+        // also means uncovered.
+        let covered = ranges
+            .into_iter()
+            .try_fold(floor, |needed, (range_floor, range_ceil)| {
+                if range_floor > needed {
+                    Err(false)
+                } else if range_ceil >= ceil {
+                    Err(true)
+                } else {
+                    Ok(needed.max(range_ceil.saturating_add(1)))
+                }
+            })
+            .err()
+            .unwrap_or(false);
+        (!covered).then(|| {
             let id = ledger.push(floor, ceil);
             WalkGuard { tracker: self.clone(), id }
         })
@@ -229,6 +262,7 @@ async fn try_partial_pack_catch_up(
     consensus_bus: &ConsensusBusApp,
     network: &PrimaryNetworkHandle,
     consensus_chain: &ConsensusChain,
+    walk_tracker: &WalkTracker,
     epoch: Epoch,
     number: u64,
     hash: ConsensusHeaderDigest,
@@ -279,6 +313,11 @@ async fn try_partial_pack_catch_up(
         ..EpochRecord::default()
     };
     info!(target: "state-sync", epoch, number, our_latest, "bulk catching up current epoch via partial pack stream (staging)");
+    // Reserve exactly the range this stream fills into staging (`our_latest+1..=number`). Staging
+    // publishes atomically, so the observer drain sees nothing and stalls at `our_latest+1` for the
+    // whole stream; without this reservation a catch-up gap fill would race it over the same range.
+    // Held across the await; dropped when this returns (success or fall-back-to-header).
+    let _guard = walk_tracker.reserve(our_latest.saturating_add(1), number);
     match network
         .request_partial_epoch_pack(
             &epoch_record,
@@ -523,6 +562,7 @@ async fn manage_new_consensus<DB: TNDatabase>(
                 &consensus_bus,
                 &network,
                 &consensus_chain,
+                &walk_tracker,
                 epoch,
                 number,
                 hash,
@@ -534,9 +574,8 @@ async fn manage_new_consensus<DB: TNDatabase>(
                 // Note we do this no matter the tasks count "for free"
                 // This should be atypical and must happen and the task count is a loose metric
                 // to avoid tasks running amock anyway.
-                // Register only this backwards header walk (not the partial-pack fast path, which
-                // fills staging directly): the reservation then matches exactly the range this walk
-                // fills top-down, so a catch-up gap fill defers to it instead of racing it.
+                // Reserve this backwards header walk's range (the partial-pack path above reserves
+                // its own) so a catch-up gap fill defers to it instead of racing it.
                 let _guard = walk_tracker.reserve(end_number, number);
                 get_consensus_header_range(
                     number,
@@ -742,6 +781,36 @@ mod tests {
         let gap = tracker.reserve_if_uncovered(1, 100).expect("uncovered gap must fire");
         assert_eq!(tracker.active(), 1);
         drop(gap);
+        assert_eq!(tracker.active(), 0);
+    }
+
+    /// Coverage is a UNION test: during deep catch-up the gossip backfills tile the space, so a
+    /// full-tip gap request must defer when the tiles TOGETHER cover it even though no single tile
+    /// does, but still fire when the tiles leave a real gap.
+    #[test]
+    fn walk_tracker_defers_to_a_covering_union() {
+        let tracker = WalkTracker::default();
+        // Two tiles that together cover [0..=200] (the second floors at the first's ceil + 1).
+        let lo = tracker.reserve(0, 100);
+        let hi = tracker.reserve(101, 200);
+        assert_eq!(tracker.active(), 2);
+
+        // No single tile covers [50..=200], but their union does -> defer.
+        assert!(
+            tracker.reserve_if_uncovered(50, 200).is_none(),
+            "a gap the tiles jointly cover must defer"
+        );
+        assert_eq!(tracker.active(), 2, "a deferred union gap must not spawn a walk");
+
+        // A hole between the tiles means the union does NOT cover -> fire.
+        drop(hi);
+        let with_hole = tracker.reserve(150, 200); // now [0..=100] and [150..=200], gap 101..=149
+        let fill = tracker
+            .reserve_if_uncovered(50, 200)
+            .expect("a range with an uncovered sub-range must fire");
+        drop(fill);
+        drop(with_hole);
+        drop(lo);
         assert_eq!(tracker.active(), 0);
     }
 }

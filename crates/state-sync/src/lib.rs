@@ -201,7 +201,9 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     // out (both are `Copy`) so the borrow of `config` does not outlive this line.
     let sync_config = config.network_config().sync_config();
     let catch_up_poll_interval = sync_config.consensus_header_catch_up_poll_interval;
-    let max_no_progress = sync_config.consensus_header_catch_up_max_no_progress;
+    // Clamp to at least one poll: a misconfigured `= 0` would otherwise make `stall_recheck` zero
+    // and busy-spin the bottom select (and signal a gap before any poll elapses).
+    let max_no_progress = sync_config.consensus_header_catch_up_max_no_progress.max(1);
     // After a stall we hand the fill off to the fetch task and park on the bottom select. Because
     // that fill lands in the cache silently (it never advances the `last_consensus_header` watch
     // for heights at or below the target, so `changed()` does not fire), we also wake on this
