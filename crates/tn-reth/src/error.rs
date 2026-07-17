@@ -32,6 +32,14 @@ pub enum TnRethError {
     /// Error with EVM calls.
     #[error("{0}")]
     EVMCustom(String),
+    /// Snapshot export or restore failure.
+    ///
+    /// Covers snapshot I/O, serialization, and database-inconsistency errors encountered while
+    /// streaming plain state out ([`crate::PinnedStateView`]) or rebuilding it back in
+    /// ([`crate::SnapshotRestorer`]). Kept distinct from [`EVMCustom`](Self::EVMCustom) because
+    /// these failures never originate from an EVM call — they are storage- and format-level.
+    #[error("{0}")]
+    Snapshot(String),
     /// Error forwarding executed block to tree.
     #[error("Failed to forward executed block to tree.")]
     TreeChannelClosed,

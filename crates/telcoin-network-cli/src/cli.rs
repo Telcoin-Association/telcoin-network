@@ -2,6 +2,7 @@
 use crate::{
     db, genesis, keytool, node,
     open_telemetry::init_opentracing_subscriber,
+    snapshot,
     version::{LONG_VERSION, SHORT_VERSION},
     NoArgs,
 };
@@ -191,6 +192,10 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                 let _guard = self.logs.init_tracing()?;
                 command.execute(datadir, passphrase)
             }
+            Commands::Snapshot(command) => {
+                let _guard = self.logs.init_tracing()?;
+                command.execute(datadir)
+            }
         }
     }
 }
@@ -214,6 +219,10 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Start the node
     #[command(name = "node")]
     Node(Box<node::NodeCommand<Ext>>),
+
+    /// Produce, verify, and restore cloud chain snapshots.
+    #[command(name = "snapshot")]
+    Snapshot(Box<snapshot::SnapshotCommand>),
 }
 
 #[cfg(test)]

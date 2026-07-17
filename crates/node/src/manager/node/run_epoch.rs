@@ -361,7 +361,15 @@ where
                 .await?;
 
                 // Write the epoch record to DB and save in manager for next epoch.
-                self.write_epoch_record(&primary, engine).await?;
+                let epoch_rec = self.write_epoch_record(&primary, engine).await?;
+                // observers publish a signed state snapshot for the just-closed epoch. this is the
+                // ONLY snapshot trigger: it fires inside the boundary quiet window with a committed
+                // epoch record, unlike the replay/leftover-drain recovery closes (which pass None to
+                // close_epoch and never write a record). on_epoch_closed is infallible by design, so
+                // a snapshot failure can never break the epoch boundary.
+                if let Some(uploader) = &self.snapshot_uploader {
+                    uploader.on_epoch_closed(&reth_env, epoch_rec).await;
+                }
 
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
                 epoch_boundary_reached = true;

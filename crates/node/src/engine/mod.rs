@@ -20,6 +20,7 @@ use tn_reth::{
     WorkerTxPool,
 };
 use tn_rpc::EngineToPrimary;
+use tn_snapshot::UploadConfig;
 use tn_types::{
     gas_accumulator::GasAccumulator, BatchSender, BatchValidation, BlsPublicKey,
     ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader,
@@ -61,6 +62,14 @@ pub struct TnBuilder {
     /// node-level task manager, each with its own bounded notification channel of
     /// the given capacity.
     pub exex_fns: Vec<(String, usize, ExExInstallFn)>,
+    /// Observer-only snapshot upload configuration.
+    ///
+    /// When `Some`, the node constructs a
+    /// [`SnapshotUploader`](tn_snapshot::service::SnapshotUploader) at startup and publishes a
+    /// signed state snapshot to this target at every epoch boundary. `None` on validators and
+    /// whenever `--snapshot-upload` was not provided. The CLI enforces the observer-only rule
+    /// before populating this field.
+    pub snapshot_upload: Option<UploadConfig>,
 }
 
 impl TnBuilder {
@@ -112,6 +121,7 @@ impl std::fmt::Debug for TnBuilder {
             .field("metrics", &self.metrics)
             .field("healthcheck", &self.healthcheck)
             .field("exex_count", &self.exex_fns.len())
+            .field("snapshot_upload", &self.snapshot_upload)
             .finish_non_exhaustive()
     }
 }

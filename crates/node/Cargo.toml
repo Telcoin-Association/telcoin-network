@@ -28,6 +28,7 @@ eyre = { workspace = true }
 tn-metrics = { workspace = true }
 tn-network-libp2p = { workspace = true }
 tn-reth = { workspace = true }
+tn-snapshot = { workspace = true }
 tn-exex = { workspace = true }
 state-sync = { workspace = true }
 tn-engine = { workspace = true }

@@ -175,6 +175,7 @@ pub mod error;
 mod evm;
 pub mod forward;
 pub mod rpc_server_args;
+mod snapshot;
 pub mod system_calls;
 pub mod worker;
 #[cfg(feature = "faucet")]
@@ -187,6 +188,10 @@ pub use evm::{
     BLS_G1_PRECOMPILE_ADDRESS, TELCOIN_PRECOMPILE_ADDRESS,
 };
 pub use forward::WorkerRpcForwarder;
+pub use snapshot::{
+    is_worker_batch_block, worker_id_from_header, PinnedStateView, SnapshotRestorer,
+    StateExportStats,
+};
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
@@ -258,7 +263,11 @@ pub struct TxFeedEntry {
 }
 
 /// Reth specific command line args.
-#[derive(Debug, Parser, Clone)]
+///
+/// `Default` is derived so callers that need a reth config without any operator-supplied flags
+/// (for example the snapshot deep-verify dry-run, which rebuilds state into a throwaway datadir)
+/// can construct one directly. Every flattened member derives `Default` from its reth clap args.
+#[derive(Debug, Parser, Clone, Default)]
 pub struct RethCommand {
     /// All rpc related arguments
     #[clap(flatten)]

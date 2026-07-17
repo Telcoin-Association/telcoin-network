@@ -89,9 +89,17 @@ impl EpochRecord {
         }
     }
 
-    /// Provide a super quorum, this is 2/3 of committee size plus one.
-    /// With this many signers of an epoch record we are safe unless a
-    /// super majority of validators are byzantine.
+    /// The number of committee members whose signatures make an [`EpochCertificate`] valid:
+    /// `2/3` of the committee size plus one.
+    ///
+    /// COUPLING NOTE: this threshold counts committee MEMBERS, while the consensus quorum
+    /// ([`quorum_threshold`](crate::quorum_threshold)) counts VOTING POWER. The two agree only
+    /// because every authority carries [`EQUAL_VOTING_POWER`](crate::EQUAL_VOTING_POWER),
+    /// which is `1`, so total voting power equals member count. If stake-weighted voting is
+    /// ever introduced, [`EpochRecord`] must gain per-member weights and this method must sum
+    /// them; otherwise a certificate could reach a member-count majority while holding a
+    /// minority of voting power. The `super_quorum_matches_consensus_quorum_threshold` test
+    /// pins this equality.
     ///
     /// The quorum base is this record's own committee. When that committee is a
     /// tolerated mid-epoch shrink of the previous record's `next_committee`
@@ -232,7 +240,10 @@ mod test {
     use rand::{rngs::StdRng, CryptoRng, RngCore, SeedableRng as _};
     use roaring::RoaringBitmap;
 
-    use crate::{crypto, decode, encode, BlsKeypair, ConsensusNumHash, Signer as _};
+    use crate::{
+        crypto, decode, encode, quorum_threshold, BlsKeypair, ConsensusNumHash, Signer as _,
+        EQUAL_VOTING_POWER,
+    };
     use alloy::primitives::B256;
 
     use super::*;
@@ -301,6 +312,27 @@ mod test {
             Err(_) => {
                 panic!("failed to aggregate epoch record signatures",);
             }
+        }
+    }
+
+    /// Pin the coupling between the epoch-record super quorum (a member count) and the
+    /// consensus quorum threshold (a voting-power sum). The two formulas only coincide while
+    /// [`EQUAL_VOTING_POWER`] is `1`; if this test fails, stake weighting has arrived and
+    /// [`EpochRecord`] needs per-member weights before certificates are safe again.
+    #[test]
+    fn super_quorum_matches_consensus_quorum_threshold() {
+        // the member-count/voting-power equivalence requires equal voting power of 1
+        assert_eq!(EQUAL_VOTING_POWER, 1);
+
+        let mut rng = StdRng::from_os_rng();
+        let key = TestBlsKeypair::new(&mut rng).public_key();
+        for size in 1..=100usize {
+            let record = EpochRecord { committee: vec![key; size], ..Default::default() };
+            assert_eq!(
+                record.super_quorum() as u64,
+                quorum_threshold(size as u64),
+                "super_quorum diverged from consensus quorum_threshold at committee size {size}"
+            );
         }
     }
 

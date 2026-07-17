@@ -19,8 +19,8 @@ use tn_network_libp2p::types::NetworkEvent;
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     deconstruct_nonce, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round,
-    TnReceiver, TnSender, CHANNEL_CAPACITY,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, EpochVote,
+    Header, Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -699,6 +699,45 @@ impl ConsensusBusApp {
         let epoch = consensus_chain.epochs().number_to_epoch(latest_consensus.number);
         consensus_chain
             .consensus_header_by_digest(epoch, latest_consensus.hash)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Returns the `(number, hash)` of the consensus header that produced the last executed block.
+    ///
+    /// The position analogue of
+    /// [`last_executed_consensus_block`](Self::last_executed_consensus_block): it returns only
+    /// the position (not the full header) so the recorded final consensus hash survives a
+    /// snapshot-restore placeholder pack. The hash is the execution tip's
+    /// `parent_beacon_block_root` (or the epoch record's pinned final for a placeholder pack),
+    /// never a synthesized digest, so callers can safely chain-link the next header against it.
+    pub async fn last_executed_consensus_position(
+        &self,
+        consensus_chain: &ConsensusChain,
+    ) -> Option<ConsensusNumHash> {
+        let block = self.recent_blocks().borrow().latest_execution_block();
+        let header = block.header();
+        let (epoch, _) = deconstruct_nonce(header.nonce.into());
+        let consensus_hash = header.parent_beacon_block_root?;
+        consensus_chain
+            .consensus_position_by_digest(epoch, consensus_hash.into())
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Returns the `(number, hash)` of the last processed consensus header.
+    ///
+    /// The position analogue of [`last_consensus_block`](Self::last_consensus_block), resolving a
+    /// snapshot-restore placeholder pack via the epoch-record chain so the real recorded hash is
+    /// preserved for chain-linking.
+    pub async fn last_consensus_position(
+        &self,
+        consensus_chain: &ConsensusChain,
+    ) -> Option<ConsensusNumHash> {
+        let latest_consensus = self.recent_blocks().borrow().latest_consensus_block_num_hash();
+        let epoch = consensus_chain.epochs().number_to_epoch(latest_consensus.number);
+        consensus_chain
+            .consensus_position_by_digest(epoch, latest_consensus.hash)
             .await
             .unwrap_or_default()
     }

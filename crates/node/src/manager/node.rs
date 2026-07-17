@@ -26,13 +26,14 @@ use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, T
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
+use tn_snapshot::service::SnapshotUploader;
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce,
     gas_accumulator::{GasAccumulator, WorkerFeeConfig},
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier,
-    SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, B256,
+    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, EpochRecord,
+    Notifier, SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, B256,
     DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
 };
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
@@ -145,6 +146,11 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// Prometheus metrics for the epoch lifecycle.
     metrics: EpochMetrics,
+
+    /// Observer-only snapshot uploader that publishes a signed state snapshot at each epoch
+    /// boundary. `None` on validators and whenever no upload target is configured; the epoch
+    /// teardown invokes it only when `Some`.
+    snapshot_uploader: Option<SnapshotUploader>,
 }
 
 /// Restore the [`GasAccumulator`]'s gas stats and leader counts after a mid-epoch restart.
@@ -705,6 +711,22 @@ pub(crate) fn derive_idle_worker_fee_at(
     Ok(fee)
 }
 
+/// Resolve the consensus number for a restored block whose consensus header is absent from every
+/// local pack, using the epoch-record chain as a fallback.
+///
+/// [`EpochManager::try_restore_state`] normally reads the number from
+/// `consensus_header_by_digest`. A snapshot-restored node holds the epoch-record chain but not the
+/// historical consensus packs, so that lookup misses for blocks at or before the snapshot tip.
+/// When `record` is the epoch whose `final_consensus` output is exactly `digest`, its pinned number
+/// is authoritative; any other case (hash mismatch or missing record) falls back to `0`, preserving
+/// the pre-snapshot behavior for an unknown digest.
+fn restore_number_from_record(record: Option<EpochRecord>, digest: ConsensusHeaderDigest) -> u64 {
+    record
+        .filter(|record| record.final_consensus.hash == digest)
+        .map(|record| record.final_consensus.number)
+        .unwrap_or_default()
+}
+
 /// Open the process-lifetime consensus DB, creating its directory if absent.
 ///
 /// The returned handle is meant to be held for the whole process and shared across epochs; it is
@@ -797,6 +819,7 @@ where
             bootstrap_servers,
             version_str,
             metrics: EpochMetrics::default(),
+            snapshot_uploader: None,
         })
     }
 
@@ -1029,6 +1052,31 @@ where
                 &node_task_manager.get_spawner(),
                 self.node_shutdown.subscribe(),
             );
+        }
+
+        // construct the observer-only snapshot uploader when an upload target is configured. its
+        // `new` probes the bucket and re-checks the observer gate, so bad credentials or a
+        // misconfigured target fail node startup here rather than silently at the first boundary.
+        // the epoch teardown invokes `on_epoch_closed` only when this is `Some`.
+        if let Some(config) = self.builder.snapshot_upload.clone() {
+            // the genesis header hash pins every uploaded manifest to this chain. it is chain
+            // config derived from the same genesis reth_env was built from, so read it straight
+            // from tn_config (identical to what a restoring node computes for verification).
+            let genesis_hash = self.builder.tn_config.chain_spec().sealed_genesis_header().hash();
+            let uploader = SnapshotUploader::new(
+                config,
+                node_task_manager.get_spawner(),
+                self.consensus_chain.epochs().clone(),
+                &self.tn_datadir,
+                self.builder.tn_config.genesis().config.chain_id,
+                genesis_hash,
+                self.version_str.to_string(),
+                self.node_shutdown.clone(),
+                self.builder.tn_config.observer,
+            )
+            .await
+            .wrap_err("snapshot uploader construction failed (bucket probe / observer gate)")?;
+            self.snapshot_uploader = Some(uploader);
         }
 
         // Do a sanity check, request any pack files for complete epochs we are missing.
@@ -1281,12 +1329,20 @@ where
             let consensus_hash: ConsensusHeaderDigest =
                 recent_block.parent_beacon_block_root.unwrap_or_default().into();
             let (epoch, round) = deconstruct_nonce(recent_block.nonce.into());
-            let consensus_number = self
-                .consensus_chain
-                .consensus_header_by_digest(epoch, consensus_hash)
-                .await?
-                .map(|h| h.number)
-                .unwrap_or_default();
+            let consensus_number =
+                match self.consensus_chain.consensus_header_by_digest(epoch, consensus_hash).await?
+                {
+                    Some(header) => header.number,
+                    // a snapshot-restored node ships the epoch-record chain but not the historical
+                    // consensus packs, so this lookup misses for blocks at or before the snapshot
+                    // tip. when the missing digest is an epoch's final consensus output, that
+                    // epoch's record pins the number; anything else falls back
+                    // to 0 as before.
+                    None => restore_number_from_record(
+                        self.consensus_chain.epochs().record_by_epoch(epoch).await,
+                        consensus_hash,
+                    ),
+                };
             let consensus_num_hash = ConsensusNumHash::new(consensus_number, consensus_hash);
             self.consensus_bus.recent_blocks().send_modify(|blocks| {
                 blocks.push_latest(round, consensus_num_hash, Some(recent_block))
@@ -1533,5 +1589,33 @@ mod tests {
                 0,
             ),
         );
+    }
+
+    #[tokio::test]
+    async fn restore_number_falls_back_to_epoch_record_on_pack_miss() {
+        use tn_storage::epoch_records::EpochRecordDb;
+        use tn_types::{BlockNumHash, EpochDigest};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = EpochRecordDb::open(dir.path().join("epochs")).unwrap();
+
+        // a restored node's epoch-0 record, whose final consensus output is pinned at number 42
+        let final_hash: ConsensusHeaderDigest = B256::repeat_byte(9).into();
+        let record = EpochRecord {
+            epoch: 0,
+            final_state: BlockNumHash::new(10, B256::repeat_byte(2)),
+            final_consensus: ConsensusNumHash::new(42, final_hash),
+            parent_hash: EpochDigest::default(),
+            ..Default::default()
+        };
+        db.save_record(record).await.unwrap();
+
+        // the digest matches the record's final consensus output: resolve to its pinned number
+        assert_eq!(restore_number_from_record(db.record_by_epoch(0).await, final_hash), 42);
+        // a digest that is not this epoch's final output falls back to 0 (pre-snapshot behavior)
+        let other: ConsensusHeaderDigest = B256::repeat_byte(7).into();
+        assert_eq!(restore_number_from_record(db.record_by_epoch(0).await, other), 0);
+        // no record for the looked-up epoch also falls back to 0
+        assert_eq!(restore_number_from_record(db.record_by_epoch(5).await, final_hash), 0);
     }
 }

@@ -1,0 +1,64 @@
+[package]
+name = "tn-snapshot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+# workspace crates
+tn-types = { workspace = true }
+tn-config = { workspace = true }
+tn-storage = { workspace = true }
+tn-reth = { workspace = true }
+
+# remote object storage (rustls only; see native-tls guard in root Cargo.toml notes)
+object_store = { workspace = true }
+
+# hashing and compression
+sha2 = { workspace = true }
+zstd = { workspace = true }
+
+# serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# async runtime
+tokio = { workspace = true, features = [
+    "rt",
+    "sync",
+    "time",
+    "io-util",
+    "fs",
+    "macros",
+] }
+futures = { workspace = true }
+
+# misc
+tracing = { workspace = true }
+thiserror = { workspace = true }
+eyre = { workspace = true }
+url = { workspace = true }
+# free-disk budget check before download (unix statvfs)
+rustix = { workspace = true }
+
+# metrics
+metrics = { workspace = true }
+reth-metrics = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+rand = { workspace = true }
+metrics-util = { workspace = true }
+# the ObjectStore test double (LyingStore) needs the async_trait macro to implement the
+# #[async_trait] ObjectStore trait and Bytes to build its payload stream.
+async-trait = { workspace = true }
+bytes = { workspace = true }
+
+[lints]
+workspace = true

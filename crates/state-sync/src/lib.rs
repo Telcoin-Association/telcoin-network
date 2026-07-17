@@ -15,8 +15,8 @@ use tn_config::ConsensusConfig;
 use tn_primary::{ConsensusBusApp, NodeMode, PrimaryMetrics};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusCache};
 use tn_types::{
-    ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch, TaskError,
-    TaskSpawner, TnSender,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Database, Epoch,
+    TaskError, TaskSpawner, TnSender,
 };
 use tracing::{debug, error, info, warn};
 
@@ -133,22 +133,38 @@ pub async fn last_executed_consensus_block(
     last
 }
 
+/// The genesis consensus position: number `0` paired with the default header's digest.
+///
+/// This is the parent the first real `ConsensusHeader` links to; it is distinct from the zero
+/// digest ([`ConsensusHeaderDigest::default`]), so it must be produced from the default header
+/// rather than from `ConsensusNumHash::default`.
+fn genesis_consensus_position() -> ConsensusNumHash {
+    let genesis = ConsensusHeader::default();
+    ConsensusNumHash::new(genesis.number, genesis.digest())
+}
+
 /// Return the (hash, number) to use as parent for the next ConsensusHeader.
 /// Accounts for outputs committed to DB but not yet executed (which
 /// replay_missed_consensus handles before the subscriber starts).
+///
+/// Resolves positions (not full headers) so the real recorded consensus hash survives a
+/// snapshot-restore placeholder pack: fabricating a header whose `digest()` differs from the
+/// recorded `final_consensus.hash` would break chain-linking for the next header.
 pub async fn last_consensus_parent(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
 ) -> (ConsensusHeaderDigest, u64) {
-    let last_executed =
-        last_executed_consensus_block(consensus_bus, consensus_chain).await.unwrap_or_default();
+    let last_executed = consensus_bus
+        .last_executed_consensus_position(consensus_chain)
+        .await
+        .unwrap_or_else(genesis_consensus_position);
     let last_db = consensus_chain
-        .consensus_header_latest()
+        .consensus_position_latest()
         .await
         .unwrap_or_default()
-        .unwrap_or_else(|| last_executed.clone());
+        .unwrap_or(last_executed);
     let parent = if last_db.number > last_executed.number { last_db } else { last_executed };
-    (parent.digest(), parent.number)
+    (parent.hash, parent.number)
 }
 
 /// Collect and return any consensus headers that were not executed before last shutdown.
@@ -158,19 +174,24 @@ pub async fn get_missing_consensus(
     consensus_chain: &ConsensusChain,
 ) -> eyre::Result<Vec<ConsensusHeader>> {
     let mut result = Vec::new();
-    // Get the DB and load our last executed consensus block.
-    let last_executed_block =
-        last_executed_consensus_block(consensus_bus, consensus_chain).await.unwrap_or_default();
+    // Get the DB and load our last executed consensus position. Positions (not full headers) keep
+    // the resolution correct across a snapshot-restore placeholder pack; only the numbers are used
+    // here, but they must be resolved consistently with `last_consensus_parent` to avoid replaying
+    // (double-executing) headers already applied to the restored EVM.
+    let last_executed_block = consensus_bus
+        .last_executed_consensus_position(consensus_chain)
+        .await
+        .unwrap_or_else(genesis_consensus_position);
 
     // Edge case, in case we don't hear from peers but have un-executed blocks...
     // Not sure we should handle this, but it hurts nothing.
     let last_db_block = consensus_chain
-        .consensus_header_latest()
+        .consensus_position_latest()
         .await
         .unwrap_or_default()
-        .unwrap_or_else(|| last_executed_block.clone());
+        .unwrap_or(last_executed_block);
 
-    info!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
+    info!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed and last recorded consensus positions");
 
     // if the last recorded consensus block is larger than the last executed block,
     // forward the stored consensus block to engine for execution
@@ -200,9 +221,16 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let rx_shutdown = config.shutdown().subscribe();
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
-    let mut last_consensus_header =
-        consensus_bus.last_consensus_block(&consensus_chain).await.unwrap_or_default();
-    let mut last_consensus_height = last_consensus_header.number;
+    // Seed the catch-up parent from the last processed consensus *position*. A snapshot-restored
+    // node's placeholder pack has no header to return, so a header-based seed would default to
+    // genesis (number 0, genesis digest) and the stream would restart from height 0, conflicting
+    // with the already-restored EVM. The position seed carries the real recorded `(number, hash)`
+    // so catch-up resumes at the boundary and chain-links the next header truthfully.
+    let mut last_position = consensus_bus
+        .last_consensus_position(&consensus_chain)
+        .await
+        .unwrap_or_else(genesis_consensus_position);
+    let mut last_consensus_height = last_position.number;
     let epoch = config.committee().epoch();
 
     // Read and consume the current watch value immediately. This handles a race where a pack
@@ -227,19 +255,21 @@ async fn spawn_stream_consensus_headers<DB: Database>(
             const MAX_NO_PROGRESS: u32 = 600; // 600 * 100ms = 60 seconds max wait
             loop {
                 let prev_height = last_consensus_height;
-                last_consensus_header = catch_up_consensus_from_to(
+                let progress = catch_up_consensus_from_to(
                     &consensus_bus,
-                    last_consensus_header,
-                    pending_header.clone(),
+                    last_position,
+                    pending_header.number,
                     config.node_storage(),
                     &consensus_chain,
                     epoch,
                 )
                 .await?;
-                if last_consensus_header.sub_dag.leader_epoch() > epoch {
+                if progress.reached_next_epoch {
+                    // catch-up crossed into a later epoch; this epoch's stream task is done.
                     return Ok(());
                 }
-                last_consensus_height = last_consensus_header.number;
+                last_position = progress.last;
+                last_consensus_height = last_position.number;
                 STATE_SYNC_METRICS
                     .headers_fetched_total
                     .increment(last_consensus_height.saturating_sub(prev_height));
@@ -283,27 +313,39 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     }
 }
 
+/// Outcome of one [`catch_up_consensus_from_to`] pass.
+struct CatchUp {
+    /// Position of the last consensus header applied (or the starting position if none was).
+    last: ConsensusNumHash,
+    /// True when catch-up stopped because it reached output from a later epoch: this epoch's
+    /// stream is complete and its task should exit.
+    reached_next_epoch: bool,
+}
+
 /// Applies consensus output "from" (exclusive) to height "max_consensus_height" (inclusive).
 /// Queries peers for latest height and downloads and executes any missing consensus output.
-/// Returns the last ConsensusHeader that was applied on success.
+///
+/// Takes and returns positions (`ConsensusNumHash`) rather than full headers so the parent used for
+/// chain-linking carries the real recorded hash even when the starting point is an epoch boundary a
+/// snapshot-restored node has no header for. Returns the last applied position and whether the pass
+/// crossed into a later epoch.
 async fn catch_up_consensus_from_to<DB: Database>(
     consensus_bus: &ConsensusBusApp,
-    from: ConsensusHeader,
-    max_consensus: ConsensusHeader,
+    from: ConsensusNumHash,
+    max_consensus_height: u64,
     db: &DB,
     consensus_chain: &ConsensusChain,
     epoch: Epoch,
-) -> eyre::Result<ConsensusHeader> {
-    let mut last_parent = from.digest();
+) -> eyre::Result<CatchUp> {
+    let mut last_parent = from.hash;
 
     // Catch up to the current chain state if we need to.
     let last_consensus_height = from.number;
-    let max_consensus_height = max_consensus.number;
     let catchup_distance = max_consensus_height.saturating_sub(last_consensus_height);
     if last_consensus_height >= max_consensus_height {
-        return Ok(from);
+        return Ok(CatchUp { last: from, reached_next_epoch: false });
     }
-    let mut result_header = from;
+    let mut last = from;
     for number in last_consensus_height + 1..=max_consensus_height {
         debug!(target: "state-sync", "trying to get consensus block {number}");
         // Resolve the full, verified ConsensusOutput for this number: from the sync cache (pulled
@@ -326,12 +368,12 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 );
             }
             // We should have the required outputs in local storage by now...
-            return Ok(result_header);
+            return Ok(CatchUp { last, reached_next_epoch: false });
         };
         let consensus_header = output.consensus_header();
         if consensus_header.sub_dag.leader_epoch() > epoch {
             // Don't outrun the epoch and produce next epochs output.
-            return Ok(consensus_header);
+            return Ok(CatchUp { last, reached_next_epoch: true });
         }
         if from_cache {
             let _ = db.remove::<ConsensusCache>(&number); // Done with this cache entry.
@@ -357,10 +399,12 @@ async fn catch_up_consensus_from_to<DB: Database>(
             );
             return Err(eyre::eyre!("consensus header digest mismatch!"));
         }
+        // `last_parent` was just verified equal to `consensus_header.digest()`, so it is the real
+        // header digest — a truthful position for the next iteration's parent.
         if consensus_header.number <= consensus_chain.latest_consensus_number() {
             // We have already processed this consensus so ignore it (advance the parent chain
             // only).
-            result_header = consensus_header;
+            last = ConsensusNumHash::new(consensus_header.number, last_parent);
             continue;
         }
 
@@ -384,8 +428,8 @@ async fn catch_up_consensus_from_to<DB: Database>(
             ));
         }
         // Deliver the full, verified output (with batches) for execution.
-        result_header = consensus_header;
+        last = ConsensusNumHash::new(consensus_header.number, last_parent);
         consensus_bus.sync_output().send(output).await?;
     }
-    Ok(result_header)
+    Ok(CatchUp { last, reached_next_epoch: false })
 }
