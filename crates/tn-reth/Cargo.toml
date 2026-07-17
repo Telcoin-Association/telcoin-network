@@ -77,6 +77,11 @@ default = []
 faucet = []
 test-utils = ["dep:secp256k1"]
 adiri = ["faucet", "tn-types/adiri"]
+# Opt back in to reth's RocksDB storage backend (librocksdb-sys, the RocksDB C++ engine).
+# Off by default: storage is MDBX-only today, so `RocksDBProvider` resolves to reth's
+# zero-size stub and the 332-translation-unit native compile is skipped entirely.
+# Required before any storage-v2 / `StorageSettings` experimentation.
+rocksdb = ["reth/rocksdb"]
 
 [lints]
 workspace = true
