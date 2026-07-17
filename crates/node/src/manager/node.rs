@@ -878,14 +878,12 @@ where
         self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();
-        primary_network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::epoch_vote_topic(network_config.chain_id()))
-            .await?;
-        primary_network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::consensus_output_topic(network_config.chain_id()))
-            .await?;
+        // `epoch_vote_topic` and `consensus_output_topic` are committee-only publish topics, so
+        // they are subscribed per-epoch in `spawn_primary_network_for_epoch` restricted to the
+        // current committee's publishers (like `primary_topic`). That makes the network layer
+        // drop non-committee messages before re-propagation and refreshes the authorized set on
+        // every committee rotation, rather than accepting any publisher once at node start. See
+        // issue #898.
         state_sync::spawn_epoch_record_collector(
             self.consensus_chain.clone(),
             primary_network_handle.clone(),

@@ -92,13 +92,22 @@ pub const MAX_CONCURRENT_EPOCH_RECORD_REQUESTS: usize = 5;
 /// `PrimaryGossip::Consensus` handler and GHSA-2r5c-c4h7-gp5h.
 pub(crate) const MAX_CONSENSUS_CERTS: usize = 20;
 
+/// Hard cap on the number of distinct epoch votes deduplicated at ingress.
+///
+/// The handler's `epoch_votes_seen` map records one entry per `(author, epoch, epoch-record
+/// hash)` once a vote's signature has verified, so a replayed or flooded vote is dropped before the
+/// next (expensive) BLS verify. Sized well above a single committee's worth of votes across a
+/// few candidate epoch records. Eviction is least-recently-seen, so an over-flood only costs
+/// redundant verifies (never a dropped honest vote — the collector dedups per signer). See the
+/// `PrimaryGossip::EpochVote` handler and issue #898.
+pub(crate) const MAX_EPOCH_VOTES: usize = 1024;
+
 /// Maximum number of distinct in-flight `consensus_certs` tallies any single committee member
 /// may be a signer of for one consensus number at a time. An honest validator signs exactly one
 /// hash per consensus number, so a signer present in this many distinct live tallies for the same
 /// number is equivocating; its further fresh digests for that number are dropped. Per
 /// `(signer, number)`, not per signer. See the handler and GHSA-pvhw-9pmg-q2hg.
 pub(crate) const MAX_TALLIES_PER_SIGNER_PER_NUMBER: usize = 2;
-
 /// Maximum number of concurrent pending batch requests from a single peer.
 ///
 /// Prevents a single malicious peer from filling all global slots.

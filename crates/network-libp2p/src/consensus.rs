@@ -1511,13 +1511,15 @@ where
 
         let GossipMessage { topic, .. } = gossip;
 
-        // ensure publisher is authorized
+        // Ensure the publisher is authorized. Semantics per topic entry:
+        //   - absent  => topic not subscribed here: reject.
+        //   - `None`  => subscribed, any publisher allowed (open topic): accept.
+        //   - `Some`  => subscribed, committee-restricted: accept only a resolved BLS key that is
+        //     in the allowlist.
         if gossip.source.is_some_and(|id| {
             let bls_key = self.swarm.behaviour().peer_manager.peer_to_bls(&id);
             self.authorized_publishers.get(topic.as_str()).is_some_and(|auth| {
-                auth.is_none()
-                    || (bls_key.is_some()
-                        && auth.as_ref().expect("is some").contains(&bls_key.expect("is some")))
+                auth.as_ref().is_none_or(|set| bls_key.is_some_and(|key| set.contains(&key)))
             })
         }) {
             GossipAcceptance::Accept
