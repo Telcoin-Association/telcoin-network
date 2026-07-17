@@ -437,6 +437,10 @@ mod tests {
             committee: shrunken.clone(),
             next_committee: shrunken.clone(),
             parent_hash: rec0.digest(),
+            // final_consensus must strictly increase across epochs (see
+            // `EpochRecordDb::update_finals`); rec0 left it at the zero default, so rec1 needs a
+            // higher number even though this test isn't exercising consensus-number tracking.
+            final_consensus: ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
             ..Default::default()
         };
         let cert1 = make_cert(&rec1, &shrunken_signers, &[0, 1, 2]);
@@ -446,6 +450,7 @@ mod tests {
             committee: shrunken.clone(),
             next_committee: shrunken.clone(),
             parent_hash: rec1.digest(),
+            final_consensus: ConsensusNumHash::new(2, ConsensusHeaderDigest::default()),
             ..Default::default()
         };
         let cert2 = make_cert(&rec2, &shrunken_signers, &[0, 1, 3]);
