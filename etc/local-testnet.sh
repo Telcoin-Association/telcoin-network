@@ -54,6 +54,18 @@ ADDRESSES=(
     "0x4444444444444444444444444444444444444444"
 )
 
+# Non-genesis stakeable validators used to exercise the ConsensusRegistry fork.
+# They are generated as regular validators (their node-info is deliberately NOT copied into the
+# shared genesis dir, so they are NOT in the genesis committee) and started WITHOUT --observer.
+# Each boots in Observer *mode* (follows consensus) and auto-promotes to CvvActive at the epoch
+# boundary where the registry rotates its key into the committee -- no restart needed.
+# The "observer*" names preserve port/metrics continuity with the previous single-observer layout.
+#   observer1 -> instance 5, RPC http://localhost:8541, metrics 127.0.0.1:9104 (staked pre-fork)
+#   observer2 -> instance 6, RPC http://localhost:8540, metrics 127.0.0.1:9105 (staked post-fork)
+STAKEABLE=("observer1" "observer2")
+STAKEABLE_INSTANCES=(5 6)
+STAKEABLE_METRICS=("127.0.0.1:9104" "127.0.0.1:9105")
+
 # variables for pulling
 LOCAL_PATH="./genesis/validators/"
 REMOTE_PATH="/home/share/validators/*"
@@ -71,9 +83,32 @@ LENGTH="${#VALIDATORS[@]}"
 
 # Use RELEASE="debug" below and remove the --release to use a debug build
 RELEASE="release"
-cargo build -p telcoin-network --bin telcoin-network --release
+
+# This fork-test harness patches genesis with Python (ruamel.yaml) and drives staking with Foundry
+# `cast`. Check those up front -- only when generating fresh config -- so a missing dep fails BEFORE
+# the (slow) adiri release build rather than after it.
+if [ ! -d "${ROOTDIR}" ]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "python3 is required."; exit 1
+    fi
+    if ! python3 -c 'import ruamel.yaml' >/dev/null 2>&1; then
+        echo "python3 module 'ruamel.yaml' is required: pip install ruamel.yaml"; exit 1
+    fi
+    if ! command -v cast >/dev/null 2>&1; then
+        echo "Foundry 'cast' is required: https://book.getfoundry.sh/getting-started/installation"; exit 1
+    fi
+fi
+
+# Build with the `adiri` feature so the ConsensusRegistry fork machinery (and the
+# CONSENSUS_REGISTRY_FORK_EPOCH set in crates/types/src/forks.rs) is compiled in. The adiri
+# binary also requires the loaded genesis to report chainId == 2017 (0x7e1), enforced below.
+cargo build -p telcoin-network --bin telcoin-network --features adiri --release
 # Example of using redb for the consensus DB
 #cargo build -p telcoin-network --bin telcoin-network --features redb --release
+
+# Set to true only when config is freshly generated below, so pre-fork auto-staking runs once
+# (on the first --start) and NOT on subsequent restarts against an already-staked registry.
+CONFIG_GENERATED=false
 
 if [ -d "${ROOTDIR}" ]; then
     echo "The directory ${ROOTDIR} already exists -- skipping configuration"
@@ -87,6 +122,9 @@ else
         echo "This sould be an account you have the private key to allow access to TEL on the test network"
         exit 1
     fi
+
+    # Prereqs (python3/ruamel.yaml/cast) were verified before the build above.
+    CONFIG_GENERATED=true
 
     # make local directory for all validators
     mkdir -p $SHARED_GENESISDIR
@@ -113,8 +151,8 @@ else
     if [ "$BASEFEE_ADDRESS" = "" ]; then
         target/${RELEASE}/telcoin-network genesis \
             --datadir "${ROOTDIR}" \
-            --chain-id 0x1e7 \
-            --epoch-duration-in-secs 86400 \
+            --chain-id 0x7e1 \
+            --epoch-duration-in-secs 15 \
             --dev-funded-account $DEV_FUNDS \
             --max-header-delay-ms 1000 \
             --min-header-delay-ms 1000 \
@@ -122,14 +160,27 @@ else
     else
         target/${RELEASE}/telcoin-network genesis \
             --datadir "${ROOTDIR}" \
-            --chain-id 0x1e7 \
-            --epoch-duration-in-secs 86400 \
+            --chain-id 0x7e1 \
+            --epoch-duration-in-secs 15 \
             --dev-funded-account $DEV_FUNDS \
             --basefee-address $BASEFEE_ADDRESS \
             --max-header-delay-ms 1000 \
             --min-header-delay-ms 1000 \
             --consensus-registry-owner $GOVERNANCE
     fi
+
+    # Patch the freshly-generated genesis so the ConsensusRegistry fork can actually fire.
+    #
+    # A fresh genesis deploys the CURRENT (post-fork) registry bytecode and snapshots its storage,
+    # so the fork's fail-closed swap gate (which requires the pinned pre-fork code hash) would abort.
+    # This splices the pinned pre-fork registry `code` (and the BlsG1 library the pre-fork registry
+    # DELEGATECALLs for proof-of-possession) from the committed testnet genesis into the local one,
+    # keeping the freshly-generated storage. Every node is fed this one patched copy below, so all
+    # nodes compute an identical genesis hash and consensus holds.
+    echo "patching genesis with pre-fork ConsensusRegistry code + BlsG1 library"
+    python3 etc/fork-test/patch-genesis.py \
+        chain-configs/testnet/genesis.yaml \
+        "${ROOTDIR}/${GENESISDIR}/genesis.yaml"
 
     # Copy the generated genesis, committee and parameters to each validator.
     for ((i=0; i<$LENGTH; i++)); do
@@ -145,17 +196,43 @@ else
         echo ""
     done
 
-    echo "creating datadir for observer"
-    DATADIR="${ROOTDIR}/observer"
-    mkdir -p "${DATADIR}/genesis"
-    # Generate an observers "validator info"- still needs this for it's p2p netork settings and keys.
-    target/${RELEASE}/telcoin-network keytool generate observer \
-        --datadir "${DATADIR}" \
-        --address 0x4444444444444444444444444444444444444444
-        # Copy the chain config files over to the new observer config directories.
-    cp "${ROOTDIR}/${GENESISDIR}/genesis.yaml" "${DATADIR}/genesis"
-    cp "${ROOTDIR}/${GENESISDIR}/committee.yaml" "${DATADIR}/genesis"
-    cp "${ROOTDIR}/parameters.yaml" "${DATADIR}/"
+    # Generate the two non-genesis stakeable validators (observer1, observer2).
+    # For each: mint a fresh operator EOA (funded from the dev account at stake time and used to
+    # send stake()/activate()), then generate validator keys bound to that EOA. Their node-info is
+    # deliberately NOT copied into the shared genesis dir, so they stay OUT of the genesis committee
+    # and instead rotate in via on-chain staking.
+    for ((s=0; s<${#STAKEABLE[@]}; s++)); do
+        NODE="${STAKEABLE[$s]}"
+        DATADIR="${ROOTDIR}/${NODE}"
+        echo "creating operator EOA + validator keys for ${NODE}"
+
+        # Fresh operator EOA (the execution key the operator controls). `cast wallet new` prints
+        # "Address: 0x.." and "Private key: 0x..". Persist both for the staking script to consume.
+        EOA_OUT=$(cast wallet new)
+        EOA_ADDR=$(echo "$EOA_OUT" | grep -i 'Address:' | awk '{print $NF}')
+        EOA_PK=$(echo "$EOA_OUT" | grep -i 'Private key:' | awk '{print $NF}')
+        if [ -z "$EOA_ADDR" ] || [ -z "$EOA_PK" ]; then
+            echo "failed to generate operator EOA for ${NODE}"
+            exit 1
+        fi
+        {
+            echo "EOA_ADDR=${EOA_ADDR}"
+            echo "EOA_PK=${EOA_PK}"
+        } > "${ROOTDIR}/${NODE}.eoa"
+
+        # Validator keygen bound to the operator EOA (runs as a plain validator, not an observer).
+        target/${RELEASE}/telcoin-network keytool generate validator \
+            --datadir "${DATADIR}" \
+            --address "${EOA_ADDR}"
+
+        # Copy chain config (patched genesis + committee + parameters). NOTE: no node-info.yaml copy
+        # into the shared genesis dir -- that is what keeps these two out of the genesis committee.
+        mkdir -p "${DATADIR}/genesis"
+        cp "${ROOTDIR}/${GENESISDIR}/genesis.yaml" "${DATADIR}/genesis"
+        cp "${ROOTDIR}/${GENESISDIR}/committee.yaml" "${DATADIR}/genesis"
+        cp "${ROOTDIR}/parameters.yaml" "${DATADIR}/"
+        echo ""
+    done
 fi
 
 if [ "$START" = true ]; then
@@ -177,17 +254,40 @@ if [ "$START" = true ]; then
            --http > "${ROOTDIR}/${VALIDATOR}.log" &
     done
 
-    DATADIR="${ROOTDIR}/observer"
-    CONSENSUS_METRICS="127.0.0.1:9104"
-    echo "Starting Observer in background, rpc endpoint http://localhost:8541"
-    target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
-       --observer \
-       --instance 5 \
-       --metrics "${CONSENSUS_METRICS}" \
-       --log.stdout.format log-fmt \
-       -vvv \
-       --http > "${ROOTDIR}/observer.log" &
+    # Start the two non-genesis stakeable validators WITHOUT --observer, so they can auto-promote
+    # into the committee once the registry rotates their key in. RPC port = 8546 - instance
+    # (instance 5 -> 8541, instance 6 -> 8540), matching the validator port scheme.
+    for ((s=0; s<${#STAKEABLE[@]}; s++)); do
+        NODE="${STAKEABLE[$s]}"
+        DATADIR="${ROOTDIR}/${NODE}"
+        INSTANCE="${STAKEABLE_INSTANCES[$s]}"
+        CONSENSUS_METRICS="${STAKEABLE_METRICS[$s]}"
+        RPC_PORT=$((8546-INSTANCE))
 
-    echo "$LENGTH validators started in background, \
+        echo "Starting ${NODE} (plain validator) in background, rpc endpoint http://localhost:${RPC_PORT}"
+        target/${RELEASE}/telcoin-network node --datadir "${DATADIR}" \
+           --instance "${INSTANCE}" \
+           --metrics "${CONSENSUS_METRICS}" \
+           --log.stdout.format log-fmt \
+           -vvv \
+           --http > "${ROOTDIR}/${NODE}.log" &
+    done
+
+    echo "$LENGTH genesis validators + ${#STAKEABLE[@]} stakeable validators started in background, \
     use 'killall telcoin-network' to bring the test network down"
+
+    # Auto pre-fork staking: only on a fresh config (never re-stake an already-staked registry on
+    # restart). Wait for the network to produce blocks, then stake observer1 (node 5) under the
+    # PRE-fork bytecode so it rotates into the committee before the fork fires at epoch 5.
+    if [ "$CONFIG_GENERATED" = true ]; then
+        echo "waiting for the network to come up on http://localhost:8545 ..."
+        for _ in $(seq 1 60); do
+            if cast block-number --rpc-url http://localhost:8545 >/dev/null 2>&1; then
+                echo "network is live -- submitting pre-fork staking for observer1 (node 5)"
+                ./etc/fork-test/stake-validator.sh 5 || echo "pre-fork staking returned non-zero (see output above)"
+                break
+            fi
+            sleep 2
+        done
+    fi
 fi
