@@ -54,6 +54,10 @@ adiri = [
 # Opt back in to reth's RocksDB storage backend; tn-node has no rocksdb code of its own.
 rocksdb = ["tn-reth/rocksdb"]
 
+# Propagate the faucet feature to tn-reth, the only crate with faucet-gated code (the
+# devnet/testnet unrestricted `mint` precompile). tn-node has no faucet code of its own.
+faucet = ["tn-reth/faucet"]
+
 [dev-dependencies]
 metrics-util = { workspace = true }
 rand = { workspace = true }
