@@ -509,8 +509,11 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
     // execute output to trigger canonical update
     let args = BuildArguments::new(reth_env.clone(), output, chain.sealed_genesis_header());
     let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
-    let _final_header = execute_consensus_output(args, GasAccumulator::default(), engine_update_tx)
-        .expect("output executed");
+    // spawn blocking for payload_builder::blocking_recv
+    let _final_header = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, GasAccumulator::default(), engine_update_tx)
+            .expect("output executed")
+    });
 
     // wait for canonical update to settle the pool before ack
     wait_until(Duration::from_secs(5), "pool pending reaches 1 after canonical update", || async {

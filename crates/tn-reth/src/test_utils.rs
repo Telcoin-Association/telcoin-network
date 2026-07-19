@@ -3,9 +3,10 @@
 use crate::{
     error::TnRethResult,
     evm::TNEvm,
+    payload::TNPayload,
     recover_raw_transaction,
-    system_calls::{ConsensusRegistry, EpochState},
-    RethEnv, WorkerTxPool,
+    system_calls::{ConsensusRegistry, EpochState, CONSENSUS_REGISTRY_ADDRESS},
+    ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool,
 };
 use alloy::{
     consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant, TxLegacy},
@@ -690,6 +691,54 @@ pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Resul
     Ok(committee)
 }
 
+/// The deterministic governance owner wallet (seed 33) that owns the `ConsensusRegistry` in
+/// test genesis fixtures (see [`test_genesis_with_consensus_registry`] and the close-epoch
+/// tests), funded there to sign owner-gated transactions like `mint` and `burn`.
+pub fn governance_owner_factory() -> TransactionFactory {
+    TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33))
+}
+
+/// Create a signed, encoded governance `ConsensusRegistry::burn(validator)` transaction.
+///
+/// Burning a validator's ConsensusNFT forcibly ejects it from the current and both future
+/// committees. The caller supplies the governance factory (see [`governance_owner_factory`])
+/// so nonces stay sequential across multiple governance transactions.
+pub fn governance_burn_tx(
+    governance: &mut TransactionFactory,
+    chain: Arc<RethChainSpec>,
+    validator: Address,
+) -> Vec<u8> {
+    let calldata = ConsensusRegistry::burnCall { validatorAddress: validator }.abi_encode().into();
+    governance.create_eip1559_encoded(
+        chain,
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    )
+}
+
+/// Build a block from a [`TNPayload`] and transactions, then commit it as the new canonical
+/// tip (chain-state update + finalization normally handled by `tn_engine`'s payload builder).
+pub fn execute_payload_and_update_canonical_chain(
+    reth_env: &RethEnv,
+    payload: TNPayload,
+    transactions: Vec<Vec<u8>>,
+) -> eyre::Result<ExecutedBlock> {
+    let anchor_hash = payload.parent_header.hash();
+    let block =
+        reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
+    // update chain state - normally handled by tn_engine::payload_builder
+    let canonical_header = block.recovered_block.clone_sealed_header();
+    let canonical_in_memory_state = reth_env.inner.blockchain_provider.canonical_in_memory_state();
+    canonical_in_memory_state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
+    canonical_in_memory_state.set_canonical_head(canonical_header.clone());
+    reth_env.finish_executing_output(vec![block.clone()], None)?;
+    reth_env.finalize_block(canonical_header.clone())?;
+    Ok(block)
+}
+
 /// Build a test genesis whose `ConsensusRegistry` is freshly deployed from the current artifact
 /// (so the new ABI surface like `getValidatorsInfo` exists) and seeded with `num_validators`
 /// active validators forming the genesis committee.
@@ -765,8 +814,7 @@ pub fn try_test_genesis_with_consensus_registry_and_workers(
     };
 
     // deterministic, funded governance owner
-    let governance_multisig =
-        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let governance_multisig = governance_owner_factory();
     let governance = governance_multisig.address();
     let base_genesis = test_genesis().extend_accounts([(
         governance,
