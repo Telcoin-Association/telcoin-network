@@ -47,18 +47,40 @@ pub(crate) struct PeerManager {
     heartbeat: tokio::time::Interval,
     /// All peers for the manager.
     peers: AllPeers,
-    /// The collection of bls public keys to known peers.
-    /// This should incude the current and next couple of committee members network info.
-    /// This is used for bootstrapping and to make sure we know the network settings of committee
-    /// members.
+    /// The validated read-model of kad discovery: resolves a committee member's
+    /// [`BlsPublicKey`] to its [`NetworkInfo`] on the hot send path. [`Self::auth_to_peer`] is
+    /// a synchronous map probe on the swarm loop for every outbound BLS-addressed request;
+    /// resolving through the kad store instead would cost a key hash, a db get, and a decode
+    /// per call.
+    ///
+    /// The kad store is NOT a superset of this map: `get_record` query results are promoted
+    /// straight into this cache (`close_kad_query` in consensus.rs) and are deliberately never
+    /// written back to the store, so replacing this map with store reads would lose data.
+    ///
+    /// The lifecycles also differ. Store records lazily expire (the configured kad record TTL)
+    /// and can be evicted (max-records cap, ban-triggered removal); entries here have NO TTL by
+    /// design, because a committee member must stay resolvable for its whole committee window —
+    /// an expiry-driven resolution failure would be a consensus liveness bug.
+    ///
+    /// Values are post-validation — BLS signature verified and publisher-checked
+    /// (`peer_record_valid` in consensus.rs), committee-gated per issue #827, malformed
+    /// advertised RPC info stripped in [`Self::cache_known_peer`] — while the store holds raw
+    /// signed record bytes.
+    ///
+    /// Bounded to pinned operator peers plus the tracked committee slots
+    /// ([`Self::prune_known_peers`]); kad-sourced updates are timestamp-monotonic
+    /// ([`Self::kad_record_is_stale`]), mirroring the store-side `is_newer_record` rule.
     known_peers: HashMap<BlsPublicKey, NetworkInfo>,
     /// BLS keys whose `known_peers` entry is pinned and never evicted by committee rotation.
     ///
-    /// Populated by the locally provisioned insertion paths — trusted/bootstrap/explicit peers and
-    /// records restored from persistence at startup — whose count is bounded by node
-    /// configuration. Every other `known_peers` entry is a kad-discovered committee record kept
-    /// only while its key sits in a tracked committee slot, so [`Self::prune_known_peers`] can
-    /// drop rotated-out members without touching operator-provisioned peers.
+    /// Populated only by the operator-provisioned insertion paths — trusted/bootstrap/explicit
+    /// peers — whose count is bounded by node configuration. Records restored from persistence
+    /// at startup are NOT pinned: the persisted kad store holds peer-fillable third-party records
+    /// (stored as the node's DHT storage duty), so restored entries stay subject to
+    /// committee-rotation pruning. Every other `known_peers` entry is a kad-discovered committee
+    /// record kept only while its key sits in a tracked committee slot, so
+    /// [`Self::prune_known_peers`] can drop rotated-out members without touching
+    /// operator-provisioned peers.
     pinned_peers: HashSet<BlsPublicKey>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
@@ -763,14 +785,45 @@ impl PeerManager {
 
     /// Add a locally provisioned known peer and pin it against eviction.
     ///
-    /// Used for operator-driven entries — bootstrap and explicit peers, and records restored from
-    /// local persistence at startup — whose count is bounded by node configuration. Pinned entries
-    /// survive committee rotation (see [`Self::prune_known_peers`]). The attacker-reachable kad
-    /// discovery path must instead use [`Self::add_discovered_peer`], which is bounded to committee
+    /// Used for operator-driven entries only — trusted/explicit peers (bootstrap peers go through
+    /// [`Self::add_bootstrap_peer`]) — whose count is bounded by node configuration. Pinned
+    /// entries survive committee rotation (see [`Self::prune_known_peers`]). Records restored
+    /// from local persistence at startup do NOT use this method precisely because they must not
+    /// pin — they go through [`Self::add_restored_peer`]. The attacker-reachable kad discovery
+    /// path must instead use [`Self::add_discovered_peer`], which is bounded to committee
     /// membership.
     pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.pinned_peers.insert(bls_key);
         self.cache_known_peer(bls_key, info);
+    }
+
+    /// Add a peer record restored from the persisted kad store at startup, WITHOUT pinning it.
+    ///
+    /// Restored records are kad-discovered cache, not operator-provisioned peers: the persisted
+    /// store's contents are peer-fillable because the node stores arbitrary signature-valid
+    /// third-party records as its DHT storage duty. Pinning them would let a restart convert
+    /// attacker-fillable store entries into permanently pinned `known_peers` entries, so restored
+    /// entries are deliberately NOT pinned — they survive only until the first
+    /// [`Self::update_committees`] prunes non-members, restoring the issue #827 committee bound.
+    pub(crate) fn add_restored_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.cache_known_peer(bls_key, info);
+    }
+
+    /// Add an operator-configured bootstrap peer: always pin it, but never overwrite an existing
+    /// `known_peers` record.
+    ///
+    /// Bootstrap peers are operator-provisioned and bounded by node configuration, so they must
+    /// always be pinned — under unpinned restore, skipping keys that already resolve (the old
+    /// handler pattern) would leave a bootstrap peer with a restored record unpinned, and it
+    /// would be pruned at the first committee rotation. An existing `known_peers` entry (e.g. a
+    /// richer record restored from persistence, which may carry fresher multiaddrs/rpc info) is
+    /// not overwritten by the config-derived stub, preserving the don't-overwrite contract of
+    /// the [`AddBootstrapPeers`](crate::types::NetworkCommand) command.
+    pub(crate) fn add_bootstrap_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.pinned_peers.insert(bls_key);
+        if !self.known_peers.contains_key(&bls_key) {
+            self.cache_known_peer(bls_key, info);
+        }
     }
 
     /// Add a peer learned from the kad discovery DHT, but only if it is a tracked committee member.
@@ -790,6 +843,14 @@ impl PeerManager {
                 target: "peer-manager",
                 ?bls_key,
                 "dropping discovered peer record for non-committee key"
+            );
+            return;
+        }
+        if self.kad_record_is_stale(&bls_key, &info) {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                "dropping stale discovered peer record"
             );
             return;
         }
@@ -818,6 +879,15 @@ impl PeerManager {
     ) {
         let advertised: PeerId = info.pubkey.clone().into();
         if self.peers.is_committee_member(&bls_key) {
+            if self.kad_record_is_stale(&bls_key, &info) {
+                trace!(
+                    target: "peer-manager",
+                    ?bls_key,
+                    ?source,
+                    "dropping stale self-advertised record for committee member"
+                );
+                return;
+            }
             self.cache_known_peer(bls_key, info);
         } else if source == advertised {
             trace!(
@@ -843,11 +913,36 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
     }
 
+    /// Check whether a kad-sourced record's timestamp fails to advance the cached entry.
+    ///
+    /// Mirrors the store-side `is_newer_record` monotonicity check (consensus.rs) so kad-sourced
+    /// updates can never regress a fresher `known_peers` entry — `get_record` query results reach
+    /// the cache without passing through the store, so the store-side check alone cannot protect
+    /// it. EQUAL timestamps keep the existing entry (benign replay churn — the same rule as the
+    /// store side). Operator-provisioned paths bypass this guard structurally: they all stamp
+    /// `timestamp: now()` when building the [`NetworkInfo`] (the `AddTrustedPeerAndDial` /
+    /// `AddExplicitPeer` / `AddBootstrapPeers` handlers in consensus.rs), and
+    /// [`Self::add_bootstrap_peer`] never overwrites an existing entry at all.
+    ///
+    /// Pinned (operator-provisioned) entries are exempt from the comparison in the other
+    /// direction too: their timestamp is a local provisioning stamp, not a peer-signed record
+    /// timestamp, and node records are signed once at peer startup — so an operator stub stamped
+    /// after the peer started would otherwise block the peer's real record (fresh multiaddrs,
+    /// advertised rpc) forever. A signed record may therefore always refresh a pinned entry,
+    /// which is the pre-existing upgrade flow for trusted/explicit peers.
+    fn kad_record_is_stale(&self, bls_key: &BlsPublicKey, info: &NetworkInfo) -> bool {
+        !self.pinned_peers.contains(bls_key)
+            && self
+                .known_peers
+                .get(bls_key)
+                .is_some_and(|existing| existing.timestamp >= info.timestamp)
+    }
+
     /// Validate the advertised endpoint, register the peer's network identity, cache its info, and
     /// close the committee trust window if it belongs to a tracked slot.
     ///
-    /// Shared body of [`Self::add_known_peer`] and [`Self::add_discovered_peer`]; the caller
-    /// decides whether the entry is pinned or admitted at all.
+    /// Shared body of the known-peer insertion paths; the caller decides whether the entry is
+    /// pinned or admitted at all.
     fn cache_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
         // signature verification proves authenticity but not scheme correctness; drop a
         // malformed advertised endpoint so only well-formed RPC info is ever cached in

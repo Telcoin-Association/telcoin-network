@@ -14,14 +14,16 @@
 
 use std::{future::Future, net::SocketAddr, time::Duration};
 
+use futures::{Stream, StreamExt};
 use serde::Serialize;
 use tn_types::{TaskSpawner, WorkerId, DEFAULT_WORKER_ID};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     time::timeout,
 };
-use tracing::info;
+use tokio_stream::wrappers::TcpListenerStream;
+use tracing::{debug, info};
 
 /// Request path that serves the per-worker readiness envelope.
 const WORKERS_PATH: &str = "/health/workers";
@@ -157,9 +159,43 @@ impl HealthcheckServer {
         let listen_on = listener.local_addr()?;
         info!(target: "epoch-manager", ?listen_on, "healthcheck listening");
 
+        // wrap the listener in a stream so the accept loop is a testable seam
+        // (`serve` below): production feeds it the real `TcpListenerStream`, and
+        // tests feed it a stream that injects a failing accept.
         task_spawner.spawn_critical_task("healthcheck", async move {
-            // accept loop - no connection limits; bounded read timeout per conn
-            while let Ok((mut socket, _)) = listener.accept().await {
+            serve(TcpListenerStream::new(listener), worker_ready).await;
+            Ok(())
+        });
+
+        Ok(listen_on)
+    }
+}
+
+/// Drive the accept loop over a stream of accepted connections.
+///
+/// Serves each connection synchronously (bounded per-connection read timeout),
+/// routing the workers path to readiness and everything else to liveness.
+///
+/// A transient `accept()` error (fd exhaustion `EMFILE`/`ENFILE`,
+/// `ECONNABORTED`, `EINTR`, `ENOBUFS`) is logged and skipped: the loop must
+/// keep serving. The caller spawns this as a *critical* task, so ending the
+/// loop would resolve the task `Ok` and notify a whole-node shutdown - exactly
+/// the outage this endpoint is supposed to warn about. This mirrors the metrics
+/// server (`tn_metrics::server`), whose accept loop swallows the same errors.
+async fn serve<S, F, Fut>(mut incoming: S, worker_ready: F)
+where
+    S: Stream<Item = std::io::Result<TcpStream>> + Unpin,
+    F: Fn() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    // the loop survives a transient accept error because the `Some(Err(..))`
+    // arm below logs and skips instead of breaking. `worker_ready` is called
+    // inline in the loop body (rather than from a per-connection `for_each`
+    // closure) for a separate reason: it keeps a `Sync` bound off the public
+    // `spawn` signature.
+    loop {
+        match incoming.next().await {
+            Some(Ok(mut socket)) => {
                 // read the request with a bounded timeout so a slow or idle
                 // client cannot stall the loop; treat a timeout/error/empty
                 // read as "no path" and fall through to the liveness response.
@@ -190,10 +226,12 @@ impl HealthcheckServer {
                     let _ = socket.write_all(LIVENESS_RESPONSE).await;
                 }
             }
-            Ok(())
-        });
-
-        Ok(listen_on)
+            // transient accept errors (e.g. fd exhaustion) must not kill the node
+            Some(Err(e)) => debug!(target: "epoch-manager", ?e, "healthcheck accept error"),
+            // the production `TcpListenerStream` is infinite; a finite test
+            // stream ends here once drained.
+            None => break,
+        }
     }
 }
 
@@ -216,7 +254,8 @@ mod tests {
         net::TcpStream,
     };
 
-    use super::{readiness_json, request_path, HealthcheckServer};
+    use super::{readiness_json, request_path, serve, HealthcheckServer};
+    use futures::StreamExt;
     use tn_types::{get_available_tcp_port, TaskManager};
 
     /// Send `request` to the spawned server at `addr` and return the response.
@@ -297,6 +336,42 @@ mod tests {
             body,
             r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true}]}"#
         );
+
+        Ok(())
+    }
+
+    /// Regression for #943: a failed `accept()` must not end the loop.
+    ///
+    /// Before the fix the accept loop was `while let Ok(..) = accept()`, so the
+    /// first `Err` fell out of the loop, the critical task resolved `Ok`, and
+    /// the whole node was shut down. Inject a failing accept ahead of a real
+    /// listener and assert the endpoint still serves the next connection.
+    #[tokio::test]
+    async fn test_accept_error_does_not_end_loop() -> eyre::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        // a transient accept() error (fd exhaustion, ECONNABORTED, ...) followed
+        // by the real listener stream. `Box::pin` makes the chained stream Unpin.
+        let incoming = Box::pin(
+            futures::stream::once(async {
+                Err::<tokio::net::TcpStream, _>(std::io::Error::other("simulated accept error"))
+            })
+            .chain(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let handle = tokio::spawn(async move { serve(incoming, || async { false }).await });
+
+        // the loop logged+skipped the injected error and kept serving
+        let response = roundtrip(addr, b"GET / HTTP/1.1\r\n\r\n").await?;
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "endpoint should still serve after a failed accept, got: {response}"
+        );
+        assert!(response.ends_with("OK"), "expected liveness body 'OK', got: {response}");
+
+        // the serve loop is still running (it did not resolve on the error)
+        assert!(!handle.is_finished(), "accept error must not end the serve loop");
+        handle.abort();
 
         Ok(())
     }

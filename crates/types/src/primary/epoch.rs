@@ -14,6 +14,7 @@ use crate::{
 use alloy::eips::BlockNumHash;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
+use std::collections::BTreeSet;
 
 /// Record of an Epoch.  Will be created at epoch start for the previous epoch
 /// and signed by that epochs committee members.
@@ -91,8 +92,73 @@ impl EpochRecord {
     /// Provide a super quorum, this is 2/3 of committee size plus one.
     /// With this many signers of an epoch record we are safe unless a
     /// super majority of validators are byzantine.
+    ///
+    /// The quorum base is this record's own committee. When that committee is a
+    /// tolerated mid-epoch shrink of the previous record's `next_committee`
+    /// (see [`Self::committee_compatible`]), the margin thins at the floor:
+    /// with `e` expected members shrunk to `n = ceil(2e/3)`, the
+    /// certificate-overlap margin `2 * super_quorum(n) - n` only meets — no
+    /// longer exceeds — the expected committee's fault bound `f = (e - 1) / 3`
+    /// (e.g. e = 10, n = 7: quorum 5, overlap 3 = f). Safety still holds for a
+    /// single step: honest nodes derive the record deterministically (they
+    /// never sign two digests for one epoch), and a shrunken committee must be
+    /// a subset of `expected` with at least `ceil(2e/3)` members, so any
+    /// quorum over it contains more than `f` members of the expected set. This
+    /// argument is per-step only; see the cumulative-shrink caveat on
+    /// [`Self::committee_compatible`].
     pub fn super_quorum(&self) -> usize {
         ((self.committee.len() * 2) / 3) + 1
+    }
+
+    /// Return true if this record's committee is an acceptable committee given
+    /// `expected` (normally the previous epoch record's `next_committee`).
+    ///
+    /// This is the shared predicate used by both the epoch record producer and
+    /// the sync-time verifier so they accept exactly the same shapes. The
+    /// committees will usually be equal, but governance can forcibly eject a
+    /// validator on-chain *after* the previous record sealed its
+    /// `next_committee`, leaving this record's committee a strict subset of
+    /// `expected`.
+    ///
+    /// Rules (`n = self.committee.len()`, `e = expected.len()`):
+    /// - a committee with duplicate members is always invalid (duplicates would mask the real
+    ///   signer count behind the certificate quorum)
+    /// - `n > e`: invalid - a committee can never grow mid-epoch
+    /// - `n == e`: the committees must be equal as sets
+    /// - `n < e`: valid only if the shrunken committee keeps at least 4 members, keeps a BFT-safe
+    ///   super majority of the expected committee (`n * 3 >= e * 2`, an integer-safe `n >=
+    ///   ceil(2e/3)`), and every member was part of `expected`
+    ///
+    /// # Cumulative-shrink caveat
+    ///
+    /// The `n * 3 >= e * 2` bound is applied per record-chain step, against the
+    /// immediately-previous record only. Consecutive tolerated shrinks
+    /// compound: k shrinking epochs can retain as little as `(2/3)^k` of the
+    /// last full-strength committee (10 -> 7 -> 5 -> 4 in three epochs, each
+    /// step individually valid). A compounded committee's `super_quorum` can
+    /// fall to the fault bound of the original committee (`super_quorum(4) ==
+    /// 3 == (10 - 1) / 3`), so the guarantee that a record quorum always
+    /// exceeds the original committee's byzantine bound holds per step but NOT
+    /// cumulatively. This is a deliberate trade-off to keep the record chain
+    /// live under honest governance ejections; a rolling-baseline bound and an
+    /// on-chain committee floor are tracked as follow-up work.
+    pub fn committee_compatible(&self, expected: &BTreeSet<BlsPublicKey>) -> bool {
+        let committee: BTreeSet<BlsPublicKey> = self.committee.iter().copied().collect();
+        if committee.len() != self.committee.len() {
+            // Duplicate keys in a committee are always malformed.
+            return false;
+        }
+        match self.committee.len().cmp(&expected.len()) {
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => &committee == expected,
+            std::cmp::Ordering::Less => {
+                // Make sure we still have a reasonable committee size, i.e. don't
+                // let a bogus record with one signer through, etc.
+                self.committee.len() >= 4
+                    && self.committee.len() * 3 >= expected.len() * 2
+                    && committee.is_subset(expected)
+            }
+        }
     }
 }
 
@@ -236,6 +302,95 @@ mod test {
                 panic!("failed to aggregate epoch record signatures",);
             }
         }
+    }
+
+    /// Deterministic BLS public key for committee-shape tests.
+    fn test_bls_key(seed: u64) -> BlsPublicKey {
+        let mut rng = StdRng::seed_from_u64(seed);
+        *BlsKeypair::generate(&mut rng).public()
+    }
+
+    /// Build a record with `committee` and check compatibility against `expected`.
+    fn compatible(expected: &[BlsPublicKey], committee: &[BlsPublicKey]) -> bool {
+        let record = EpochRecord { committee: committee.to_vec(), ..Default::default() };
+        let expected: BTreeSet<BlsPublicKey> = expected.iter().copied().collect();
+        record.committee_compatible(&expected)
+    }
+
+    #[test]
+    fn test_committee_compatible_equal_and_reordered() {
+        let keys: Vec<_> = (0..5).map(test_bls_key).collect();
+        // Same set, same order.
+        assert!(compatible(&keys, &keys));
+        // Same set, different order - compatibility is order-insensitive.
+        let rotated = [keys[4], keys[2], keys[0], keys[3], keys[1]];
+        assert!(compatible(&keys, &rotated));
+    }
+
+    #[test]
+    fn test_committee_compatible_one_ejected_from_five() {
+        let keys: Vec<_> = (0..5).map(test_bls_key).collect();
+        // Swap-and-pop ejection of keys[2]: the last member moves into its slot.
+        let ejected = [keys[0], keys[1], keys[4], keys[3]];
+        assert!(compatible(&keys, &ejected));
+        // Same size as the ejected shape but one member substituted with a
+        // non-member: invalid.
+        let substituted = [keys[0], keys[1], test_bls_key(9), keys[3]];
+        assert!(!compatible(&keys, &substituted));
+        // A duplicated member masking the true signer count: invalid.
+        let duplicated = [keys[0], keys[1], keys[1], keys[3]];
+        assert!(!compatible(&keys, &duplicated));
+    }
+
+    #[test]
+    fn test_committee_compatible_floor_and_bound_table() {
+        let keys: Vec<_> = (0..9).map(test_bls_key).collect();
+        // (expected size, record size, compatible?)
+        let table = [
+            (4, 3, false), // below the 4-member floor
+            (5, 4, true),
+            (7, 5, true),
+            (7, 4, false), // 4*3 < 7*2: below ceil(2/3) of expected
+            (8, 6, true),
+            (8, 5, false), // 5*3 < 8*2: below ceil(2/3) of expected
+            (4, 5, false), // a record committee larger than expected is never valid
+        ];
+        for (expected_len, record_len, valid) in table {
+            assert_eq!(
+                compatible(&keys[..expected_len], &keys[..record_len]),
+                valid,
+                "expected len {expected_len}, record len {record_len}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_with_cert_quorum_on_shrunken_committee() {
+        // A 5-member committee that lost one member mid-epoch leaves a 4-member
+        // record: the certificate quorum is 2/3+1 of the *shrunken* committee.
+        let signers: Vec<_> =
+            (0..4).map(|i| TestBlsKeypair::new(&mut StdRng::seed_from_u64(i))).collect();
+        let committee: Vec<_> = signers.iter().map(|s| s.public_key()).collect();
+        let record = EpochRecord { committee, ..Default::default() };
+        assert_eq!(record.super_quorum(), 3);
+
+        let cert = |count: usize| {
+            let sigs: Vec<_> =
+                signers.iter().take(count).map(|s| record.sign_vote(s).signature).collect();
+            let signature = BlsAggregateSignature::aggregate(&sigs[..], true)
+                .expect("aggregate")
+                .to_signature();
+            let mut signed_authorities = RoaringBitmap::new();
+            for i in 0..count as u32 {
+                signed_authorities.push(i);
+            }
+            EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities }
+        };
+
+        // 3 of 4 committee votes: quorum met.
+        assert!(record.verify_with_cert(&cert(3)));
+        // 2 of 4 committee votes: below quorum.
+        assert!(!record.verify_with_cert(&cert(2)));
     }
 
     /// Verify that EpochDigest encodes/decodes to the same bytes as a B256/BlockHash.

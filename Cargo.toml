@@ -96,7 +96,24 @@ secp256k1 = { version = "0.31", default-features = false, features = [
 rpassword = "7.4.0"
 
 # execution
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+#
+# Default features minus `rocksdb`: librocksdb-sys (the entire RocksDB C++ engine, 332
+# translation units, the single largest native compile in the tree) enters the graph only
+# through reth's default set, and our storage is MDBX-only (`RocksDBProvider` resolves to
+# reth's zero-size stub with the feature off). Re-enable explicitly via the off-by-default
+# `rocksdb` feature on tn-reth / tn-node / telcoin-network-cli / telcoin-network.
+# `reth-revm/portable` (a dependency-feature, not nameable in this list) is re-enabled on
+# the `reth-revm` entry below and reaches reth's copy through feature unification.
+# NOTE: reth's `edge` feature implies `rocksdb`; do not enable it while this gate is off.
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false, features = [
+    "jemalloc",
+    "otlp",
+    "otlp-logs",
+    "js-tracer",
+    "keccak-cache-global",
+    "asm-keccak",
+    "min-debug-logs",
+] }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
@@ -115,7 +132,10 @@ reth-network-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3
 reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+# `portable` replaces the `reth-revm/portable` entry dropped from the curated `reth`
+# feature list above (dependency-features cannot appear in a dependency's `features` key);
+# tn-reth depends on reth-revm directly, so unification applies it to reth's copy too.
+reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", features = ["portable"] }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }

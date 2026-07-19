@@ -25,11 +25,15 @@ use tn_network_libp2p::{
     StreamError, SyncFrame, SyncFrameError,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
-use tn_storage::{consensus::ConsensusChain, PayloadStore};
+use tn_storage::{
+    consensus::{ConsensusChain, ConsensusChainError},
+    consensus_pack::PackError,
+    PayloadStore,
+};
 use tn_types::{
-    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest, ConsensusResult,
-    Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest,
-    Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote,
+    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest, ConsensusOutput,
+    ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
+    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
@@ -75,24 +79,26 @@ pub const MAX_CONCURRENT_EPOCH_RECORD_REQUESTS: usize = 5;
 /// `PrimaryGossip::Consensus` handler and GHSA-2r5c-c4h7-gp5h.
 pub(crate) const MAX_CONSENSUS_CERTS: usize = 20;
 
+/// Hard cap on the number of distinct epoch votes deduplicated at ingress.
+///
+/// The handler's `epoch_votes_seen` map records one entry per `(author, epoch, epoch-record
+/// hash)` once a vote's signature has verified, so a replayed or flooded vote is dropped before the
+/// next (expensive) BLS verify. Sized well above a single committee's worth of votes across a
+/// few candidate epoch records. Eviction is least-recently-seen, so an over-flood only costs
+/// redundant verifies (never a dropped honest vote — the collector dedups per signer). See the
+/// `PrimaryGossip::EpochVote` handler and issue #898.
+pub(crate) const MAX_EPOCH_VOTES: usize = 1024;
+
 /// Maximum number of distinct in-flight `consensus_certs` tallies any single committee member
 /// may be a signer of for one consensus number at a time. An honest validator signs exactly one
 /// hash per consensus number, so a signer present in this many distinct live tallies for the same
 /// number is equivocating; its further fresh digests for that number are dropped. Per
 /// `(signer, number)`, not per signer. See the handler and GHSA-pvhw-9pmg-q2hg.
 pub(crate) const MAX_TALLIES_PER_SIGNER_PER_NUMBER: usize = 2;
-
 /// Maximum number of concurrent pending batch requests from a single peer.
 ///
 /// Prevents a single malicious peer from filling all global slots.
 pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
-
-/// Maximum bytes the client will read from a single consensus-output stream.
-///
-/// Generous upper bound: comfortably above any realistic single output, but caps an
-/// unbounded or malicious stream.
-/// TODO- replace with a size from consensus.  See Issue 782.
-const MAX_CONSENSUS_OUTPUT_STREAM_BYTES: usize = 512 * 1024 * 1024;
 
 /// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the epoch-pack
 /// request frame is written. A peer that negotiated the sync protocol but does not
@@ -153,12 +159,14 @@ enum EpochPackAttempt {
 /// The outcome of a single-consensus-output fetch attempt over the typed sync
 /// protocol.
 ///
-/// Mirrors [`EpochPackAttempt`] but carries the fetched bytes on success (an output
-/// is reassembled into a `Vec<u8>` for the caller to decode and verify, not imported
-/// into the chain).
+/// Mirrors [`EpochPackAttempt`] but carries the fully decoded, header-hash-verified
+/// output on success: the exchange stream-decodes the reassembled pack bytes and
+/// verifies the header digest against the requested hash BEFORE buffering batches, so
+/// only a verified output ever reaches the caller (a wrong-hash peer becomes `Failed`
+/// and the probe falls through to the next peer instead of wedging the walk).
 enum ConsensusOutputAttempt {
-    /// The peer served the output's bytes.
-    Fetched(Vec<u8>),
+    /// The peer served a header-hash-verified output.
+    Fetched(ConsensusOutput),
     /// The peer did not answer the sync exchange. Unlike a full-pack `Unsupported`
     /// this is NOT cached unsyncable, because a peer that speaks `/tn-primary-sync`
     /// but cannot decode this newer `ConsensusOutput` variant still serves full epoch
@@ -187,6 +195,25 @@ struct EpochPackSyncRequest<'a> {
     consensus_chain: &'a ConsensusChain,
     /// Timeout applied when importing the streamed records.
     record_timeout: Duration,
+}
+
+/// One single-consensus-output fetch over the typed sync protocol, threaded through
+/// each per-peer probe (`request_consensus_output` down to the stream exchange).
+/// Bundles what the exchange needs — the destination chain (for the epoch committee)
+/// and the already-verified header hash — so the reassembled bytes are stream-decoded
+/// and header-hash-verified in place instead of round-tripping an unverified `Vec<u8>`
+/// back to the caller.
+#[derive(Clone, Copy)]
+struct ConsensusOutputSyncRequest<'a> {
+    /// Consensus number requested.
+    number: u64,
+    /// Epoch that `number` falls in; selects the committee for decoding.
+    epoch: Epoch,
+    /// The already-verified header digest for `number` (from validated gossip or a
+    /// verified descendant's `parent_hash`). The decoded header MUST hash to this.
+    expected_hash: ConsensusHeaderDigest,
+    /// Chain holding the epoch's committee, used to stream-decode and verify.
+    consensus_chain: &'a ConsensusChain,
 }
 
 /// RAII guard for one admitted in-flight request holding a global concurrency permit
@@ -325,6 +352,7 @@ impl PrimaryNetworkHandle {
     }
 
     /// Publish a consensus block number and hash of the header.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_consensus(
         &self,
         epoch: Epoch,
@@ -498,27 +526,47 @@ impl PrimaryNetworkHandle {
         }
     }
 
-    /// Request the raw (serialized) consensus output bytes for `number` from any
+    /// Fetch, decode, and header-hash-verify the consensus output for `number` from any
     /// connected peer over the typed `/tn-primary-sync` protocol.
     ///
-    /// Item 9b (#739) cut this path fully over to sync: there is no legacy `/tn-stream`
-    /// fallback. Probes up to `MAX_EPOCH_SYNC_PROBES` connected peers that are not
-    /// cached unsyncable, opening a stream whose opening frame carries
-    /// [`PrimarySyncRequest::ConsensusOutput`]; returns the reassembled bytes from the
-    /// first peer that serves, otherwise `Err` (the caller retries). Returns the
-    /// pack-file encoded output (batches + consensus header); the caller deserializes it
-    /// with the epoch committee and verifies the decoded header digest. A peer that
-    /// serves proves it speaks the sync protocol (cached `true`); a peer that does not
-    /// answer is NOT cached (an ambiguous `Unsupported`; see `ConsensusOutputAttempt`).
-    /// The probe is penalty-exempt.
-    pub async fn request_consensus_output(&self, number: u64) -> NetworkResult<Vec<u8>> {
+    /// `expected_hash` is the already-verified header digest for `number` (from validated
+    /// gossip or a verified descendant's `parent_hash`); `consensus_chain` supplies the epoch
+    /// committee. The v1 pack is header-first, so each per-peer exchange stream-decodes the
+    /// reassembled bytes and checks the header digest against `expected_hash` BEFORE buffering
+    /// any batch — bounding the unverified buffer to a single header record and returning only
+    /// a verified [`ConsensusOutput`]. Probes up to `MAX_EPOCH_SYNC_PROBES` peers not cached
+    /// unsyncable and returns the first VERIFIED output, otherwise `Err` (the caller retries).
+    /// A peer that serves proves it speaks the sync protocol (cached `true`); a peer that does
+    /// not answer is NOT cached (an ambiguous `Unsupported`; see `ConsensusOutputAttempt`). A
+    /// peer that streams a well-formed but wrong-hash output is penalized (Severe) and skipped,
+    /// so the probe falls through to the next peer instead of wedging the caller's retry loop.
+    pub async fn request_consensus_output(
+        &self,
+        number: u64,
+        consensus_chain: &ConsensusChain,
+        expected_hash: ConsensusHeaderDigest,
+    ) -> NetworkResult<ConsensusOutput> {
         let peers = self.handle.connected_peers().await?;
+        let epoch = consensus_chain.epochs().number_to_epoch(number);
+        if !consensus_chain.contains_decode_epoch(epoch).await {
+            // We do not have a pack file for epoch and will not be able to decode so bail now.
+            // This should never happen, normally we would downloading consensus for the current
+            // pack file, anything else will not be savable and would not make sense.
+            // This check will just short circuit early if in an invalid state vs loop
+            // over peers continually.
+            return Err(NetworkError::RPCError(
+                "we do not contain a pack file to decode this consensus output".to_string(),
+            ));
+        }
+        // Resolve the committee-selecting epoch once and bundle the request so every probe hop
+        // carries the chain and the verified hash needed to stream-decode + verify in place.
+        let request = ConsensusOutputSyncRequest { number, epoch, expected_hash, consensus_chain };
 
         // Probe candidate peers one at a time (the async analog of a short-circuiting
         // fold): `filter` drops peers cached unsyncable for free, `take` bounds the
         // network probes, `then` runs each exchange and records its verdict, and
-        // `filter_map` + `next` stop at the first peer that serves (so no peer past the
-        // first success is probed).
+        // `filter_map` + `next` stop at the first peer that serves a VERIFIED output (so no
+        // peer past the first success is probed, and a wrong-hash peer is skipped).
         let probes = futures::stream::iter(peers)
             .filter(move |peer| {
                 let known_unsyncable = self.sync_capability.lock().get(peer) == Some(&false);
@@ -526,16 +574,16 @@ impl PrimaryNetworkHandle {
             })
             .take(MAX_EPOCH_SYNC_PROBES)
             .then(move |peer| async move {
-                match self.sync_consensus_output_from_peer(peer, number).await {
-                    ConsensusOutputAttempt::Fetched(bytes) => {
+                match self.sync_consensus_output_from_peer(peer, request).await {
+                    ConsensusOutputAttempt::Fetched(output) => {
                         self.sync_capability.lock().insert(peer, true);
                         debug!(
                             target: "primary::network",
                             %peer,
                             number,
-                            "fetched consensus output over sync protocol"
+                            "fetched verified consensus output over sync protocol"
                         );
-                        Some(bytes)
+                        Some(output)
                     }
                     ConsensusOutputAttempt::Unsupported => {
                         // Ambiguous: the peer may serve full epoch packs but not decode
@@ -582,28 +630,29 @@ impl PrimaryNetworkHandle {
     async fn sync_consensus_output_from_peer(
         &self,
         peer: BlsPublicKey,
-        number: u64,
+        request: ConsensusOutputSyncRequest<'_>,
     ) -> ConsensusOutputAttempt {
-        self.try_sync_consensus_output_exchange(peer, number)
+        self.try_sync_consensus_output_exchange(peer, request)
             .await
             .map_or_else(|attempt| attempt, ConsensusOutputAttempt::Fetched)
     }
 
     /// Open a `/tn-primary-sync` stream, write the consensus-output request in the
-    /// opening frame, read the `Ack`, and reassemble the streamed output bytes.
+    /// opening frame, read the `Ack`, then stream-decode and header-hash-verify the output.
     ///
     /// `Err(ConsensusOutputAttempt::Unsupported)` means the peer did not answer the
     /// protocol (negotiation failed, or it negotiated but never `Ack`ed - e.g. a peer
     /// that speaks `/tn-primary-sync` but cannot decode the newer `ConsensusOutput`
     /// variant and shut the stream). `Err(ConsensusOutputAttempt::Failed(_))` means a
-    /// transient or exchange-level error once the peer has proved sync-capable. A
-    /// transport I/O error during the open (`UpgradeIo`) is transient rather than a
-    /// protocol mismatch, so it maps to `Failed`.
+    /// transient or exchange-level error (including a decode/verification failure, which
+    /// is also penalized) once the peer has proved sync-capable. A transport I/O error
+    /// during the open (`UpgradeIo`) is transient rather than a protocol mismatch, so it
+    /// maps to `Failed`. `Ok` is always a header-hash-verified output.
     async fn try_sync_consensus_output_exchange(
         &self,
         peer: BlsPublicKey,
-        number: u64,
-    ) -> Result<Vec<u8>, ConsensusOutputAttempt> {
+        request: ConsensusOutputSyncRequest<'_>,
+    ) -> Result<ConsensusOutput, ConsensusOutputAttempt> {
         // open the sync stream, flattening the command-channel and stream-open results.
         // Only a genuine negotiation failure (`UpgradeFailed`) is a peer that does not
         // advertise the protocol -> Unsupported; a transient upgrade I/O error or any
@@ -619,9 +668,10 @@ impl PrimaryNetworkHandle {
         // write the request in the opening frame. Negotiation already succeeded, so a
         // write failure is transient -> try next.
         let max_frame = sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
-        let request = SyncFrame::Req(PrimarySyncRequest::ConsensusOutput { number });
+        let req_frame =
+            SyncFrame::Req(PrimarySyncRequest::ConsensusOutput { number: request.number });
         let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
-        write_frame(&mut stream, &request, &mut encode_buffer, &mut compressed_buffer, max_frame)
+        write_frame(&mut stream, &req_frame, &mut encode_buffer, &mut compressed_buffer, max_frame)
             .await
             .and(stream.flush().await)
             .map_err(|e| {
@@ -662,26 +712,32 @@ impl PrimaryNetworkHandle {
         })?;
 
         match first {
-            // accepted: reassemble the `Data`/`End` frames into the output bytes, bounded
-            // by the legacy size cap and the per-frame timeout inside the reader. An empty
-            // output is a miss (the responder `Ack`ed but holds nothing): try the next
-            // peer.
+            // accepted: stream-decode the reassembled `Data`/`End` frames straight into the
+            // pack decoder, verifying the header digest against the requested (already-
+            // verified) hash the instant the header record is read — before any batch is
+            // buffered. A wrong-hash or malformed output fails here (and is penalized below),
+            // so the probe falls through to the next peer instead of returning unverified
+            // bytes. An empty stream yields `NotConsensus`, i.e. a miss -> next peer.
             SyncFrame::Ack => {
-                let bytes = sync_codec::read_sync_consensus_output(
-                    stream,
-                    MAX_CONSENSUS_OUTPUT_STREAM_BYTES,
-                )
-                .await
-                .map_err(|e| {
-                    ConsensusOutputAttempt::Failed(NetworkError::RPCError(format!(
-                        "failed to read consensus output over sync stream: {e}"
-                    )))
-                })?;
-                (!bytes.is_empty()).then_some(bytes).ok_or_else(|| {
-                    ConsensusOutputAttempt::Failed(NetworkError::RPCError(
-                        "peer streamed an empty consensus output".to_string(),
-                    ))
-                })
+                let reader = sync_codec::sync_pack_reader(stream);
+                match request
+                    .consensus_chain
+                    .stream_decode_consensus_output(request.epoch, reader, request.expected_hash)
+                    .await
+                {
+                    Ok(output) => Ok(output),
+                    Err(e) => {
+                        // A classified protocol/verification violation (a header-digest
+                        // mismatch -> Severe) scores the peer down; transient decode/IO errors
+                        // carry no penalty. Either way, drop this peer and try the next.
+                        if let Some(penalty) = Self::consensus_chain_error_to_penalty(&e) {
+                            self.report_penalty(peer, penalty).await;
+                        }
+                        Err(ConsensusOutputAttempt::Failed(NetworkError::RPCError(format!(
+                            "failed to decode/verify consensus output over sync stream: {e}"
+                        ))))
+                    }
+                }
             }
             // sync-capable, but shedding load or lacking the output: try next peer
             SyncFrame::Deny(reason) => {
@@ -1051,6 +1107,57 @@ impl PrimaryNetworkHandle {
                     "unexpected opening sync frame from peer".to_string(),
                 )))
             }
+        }
+    }
+
+    /// Helper to convert a consensus chain error to penalty.
+    /// This error does not have network knowledge so do it here for the
+    /// streaming case vs with the error.
+    fn consensus_chain_error_to_penalty(error: &ConsensusChainError) -> Option<Penalty> {
+        match error {
+            ConsensusChainError::PackError(pack_error) => match pack_error {
+                PackError::MissingBatch
+                | PackError::NotConsensus
+                | PackError::NotBatch
+                | PackError::NotEpoch => Some(Penalty::Medium),
+                PackError::InvalidConsensusChain
+                | PackError::ExtraBatches
+                | PackError::MissingBatches
+                | PackError::TooManyBatches(_)
+                | PackError::CorruptPack
+                | PackError::UnexpectedConsensusDigest { .. }
+                | PackError::InvalidEpoch(_, _) => Some(Penalty::Severe),
+                PackError::IO(_)
+                | PackError::BatchLoad(_)
+                | PackError::EpochLoad(_)
+                | PackError::Append(_)
+                | PackError::IndexAppend(_)
+                | PackError::Fetch(_)
+                | PackError::Open(_)
+                | PackError::ReadOnly
+                | PackError::ReadError(_)
+                | PackError::MissingAuthority
+                | PackError::SendFailed
+                | PackError::ReceiveFailed
+                | PackError::PersistError(_)
+                | PackError::InvalidConsensusNumber(_, _)
+                | PackError::ConsensusNumberAlreadyAdded
+                | PackError::ConsensusNumberTooLow
+                | PackError::InvalidVersion(_, _)
+                | PackError::ConsensusNumberTooHigh => None,
+            },
+            ConsensusChainError::EpochMismatch
+            | ConsensusChainError::PrevCommitteeEpochMismatch
+            | ConsensusChainError::CrcError => Some(Penalty::Mild),
+            ConsensusChainError::EmptyImport | ConsensusChainError::InvalidImport => {
+                Some(Penalty::Severe)
+            }
+            ConsensusChainError::StreamUnavailable
+            | ConsensusChainError::NoCurrentEpoch
+            | ConsensusChainError::EpochDbError(_)
+            | ConsensusChainError::InvalidPackEpoch(_, _)
+            | ConsensusChainError::CantSaveAndNotAvailable(_)
+            | ConsensusChainError::IO(_) => None,
         }
     }
 }

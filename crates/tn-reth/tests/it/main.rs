@@ -5,6 +5,7 @@
 mod bls_precompile_props;
 mod economics_props;
 mod pipeline_helpers;
+mod recover_drop_props;
 
 // testnet
 #[cfg(feature = "faucet")]

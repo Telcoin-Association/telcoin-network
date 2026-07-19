@@ -7,9 +7,12 @@ use tn_network_libp2p::{
     types::{NetworkCommand, NetworkHandle},
     GossipMessage, Penalty, TopicHash,
 };
-use tn_storage::mem_db::MemDatabase;
+use tn_storage::{mem_db::MemDatabase, tables::NodeBatchesCache};
 use tn_test_utils::CommitteeFixture;
-use tn_types::{BcsError, BlsPublicKey, SealedBatch, TaskManager, B256};
+use tn_types::{
+    Batch, BatchValidation, BatchValidationError, BcsError, BlsPublicKey, Database, SealedBatch,
+    TaskManager, B256,
+};
 use tn_worker::{
     RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle, WorkerRequest,
     WorkerResponse, MAX_CONCURRENT_BATCH_STREAMS,
@@ -54,6 +57,38 @@ fn create_test_types_with_chain_id(chain_id: u64) -> TestTypes {
         WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, chain_id);
     let handler = RequestHandler::new(worker_id, batch_validator, config, network_handle);
     TestTypes { committee, handler, task_manager, network_commands_rx }
+}
+
+/// Like [`create_test_types`], but injects a custom batch validator and also returns a handle to
+/// the shared node store, so a test can assert exactly what the handler chose to cache.
+fn create_test_types_with_validator(
+    validator: Arc<dyn BatchValidation>,
+) -> (TestTypes, MemDatabase) {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let authority = committee.first_authority();
+    let config = authority.consensus_config();
+    // clone shares the same in-memory backing, so reads see the handler's writes
+    let store = config.node_storage().clone();
+    let task_manager = TaskManager::default();
+    let worker_id = 0;
+    let (tx, network_commands_rx) = mpsc::channel(10);
+    let network_handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
+    let handler = RequestHandler::new(worker_id, validator, config, network_handle);
+    (TestTypes { committee, handler, task_manager, network_commands_rx }, store)
+}
+
+/// A [`BatchValidation`] that rejects every batch. Used to prove the gossip-prefetch path
+/// validates a fetched body before caching it.
+#[derive(Debug)]
+struct RejectingBatchValidator;
+
+impl BatchValidation for RejectingBatchValidator {
+    fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
+        Err(BatchValidationError::EmptyBatch)
+    }
+
+    fn submit_txn_if_mine(&self, _tx_bytes: &[u8], _committee_size: u64, _committee_slot: u64) {}
 }
 
 // ============================================================================
@@ -177,6 +212,52 @@ async fn test_batch_gossip_prefetch_deduplicates_in_flight_digest() {
         network_commands_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty),
         "duplicate gossip must not trigger a second batch fetch"
+    );
+}
+
+/// A batch fetched by the gossip prefetch is validated before it is cached: a body that fails
+/// validation is dropped, never written to `NodeBatchesCache`.
+///
+/// This is the fix for issue #933. The vote-path sync (`PrimaryReceiverHandler::synchronize`)
+/// treats a digest already present in `NodeBatchesCache` as validated-and-available and skips
+/// `validate_batch` for it, so an unvalidated prefetched body reaching that cache would let a
+/// Byzantine committee member get a semantically-invalid batch voted on and certified.
+#[tokio::test]
+async fn test_gossip_prefetch_rejects_invalid_batch() {
+    let (TestTypes { handler, .. }, store) =
+        create_test_types_with_validator(Arc::new(RejectingBatchValidator));
+    // current-epoch batch (fixture epoch is 0), so only validation can reject it
+    let batch = Batch::default();
+    let digest = batch.digest();
+
+    // dropping an invalid body is not an error (it is a peer content fault, not a local one)
+    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch);
+    assert_matches!(res, Ok(()));
+
+    // the security property: an unvalidated body never reaches the cache the vote path trusts
+    assert!(
+        store.get::<NodeBatchesCache>(&digest).expect("read store").is_none(),
+        "an invalid gossip-prefetched batch must not be cached"
+    );
+}
+
+/// The counterpart to [`test_gossip_prefetch_rejects_invalid_batch`]: an identical current-epoch
+/// batch that passes validation *is* cached, so presence in `NodeBatchesCache` faithfully means
+/// "validated" for the vote path. This isolates validation (not the epoch check) as the reason the
+/// rejected batch above was dropped.
+#[tokio::test]
+async fn test_gossip_prefetch_caches_valid_batch() {
+    let (TestTypes { handler, .. }, store) =
+        create_test_types_with_validator(Arc::new(NoopBatchValidator));
+    let batch = Batch::default();
+    let digest = batch.digest();
+
+    let res = handler.pub_validate_and_cache_prefetched_batch(&digest, &batch);
+    assert_matches!(res, Ok(()));
+
+    assert!(
+        store.get::<NodeBatchesCache>(&digest).expect("read store").is_some(),
+        "a validated gossip-prefetched batch must be cached"
     );
 }
 

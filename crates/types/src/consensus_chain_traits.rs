@@ -151,7 +151,7 @@ pub trait ConsensusChainWriter: ConsensusChainReader {
     fn save_consensus_output(
         &self,
         consensus: ConsensusOutput,
-    ) -> impl Future<Output = eyre::Result<()>> + Send;
+    ) -> impl Future<Output = eyre::Result<u64>> + Send;
 
     /// Rotate the current pack file to a new epoch.  The previous pack is
     /// persisted and moved into the recent-packs cache before the new pack
