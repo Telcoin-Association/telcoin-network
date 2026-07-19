@@ -190,6 +190,8 @@ sol!(
         function getValidator(address validatorAddress) external view returns (ValidatorInfo memory);
         /// Mint an NFT for validator to stake.
         function mint(address validatorAddress) external override onlyOwner;
+        /// Burn a validator's NFT, forcibly ejecting it from current and future committees.
+        function burn(address validatorAddress) external override onlyOwner;
         /// Stake to the consensus registry.
         function stake(bytes calldata blsPubkey, ProofOfPossession calldata proofOfPossession) external override;
         /// Activate node for committee selection.

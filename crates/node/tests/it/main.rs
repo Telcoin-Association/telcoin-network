@@ -5,7 +5,7 @@
 
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -16,8 +16,8 @@ use tn_executor::subscriber::spawn_subscriber;
 use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
 use tn_node::{
-    catchup_accumulator, derive_base_fees_for_entered_epoch, derive_idle_worker_fee,
-    sync_num_workers_from_chain,
+    build_epoch_record, catchup_accumulator, derive_base_fees_for_entered_epoch,
+    derive_idle_worker_fee, sync_num_workers_from_chain,
 };
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
@@ -27,7 +27,8 @@ use tn_primary::{
 use tn_reth::{
     payload::TNPayload,
     test_utils::{
-        create_committee_from_state, seeded_genesis_from_random_batches,
+        create_committee_from_state, execute_payload_and_update_canonical_chain,
+        governance_burn_tx, governance_owner_factory, seeded_genesis_from_random_batches,
         test_genesis_with_consensus_registry, test_genesis_with_consensus_registry_and_workers,
         TransactionFactory,
     },
@@ -41,11 +42,11 @@ use tn_test_utils::{
 use tn_types::{
     adiri_genesis,
     gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator},
-    Address, Batch, BlsSignature, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochCertificate, EpochDigest,
-    EpochRecord, ExecHeader, GenesisAccount, Notifier, ReputationScores, SealedHeader,
-    SignatureVerificationState, TaskManager, TnReceiver as _, TnSender as _, WorkerId, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE, U256,
+    Address, Batch, BlockNumHash, BlsPublicKey, BlsSignature, Certificate, CommittedSubDag,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
+    EpochCertificate, EpochDigest, EpochRecord, ExecHeader, GenesisAccount, Notifier,
+    ReputationScores, SealedHeader, SignatureVerificationState, TaskManager, TnReceiver as _,
+    TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::{
@@ -2166,6 +2167,151 @@ async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
         (1 + HAMMER_BLOCKS, 42_000 + HAMMER_BLOCKS * 10_000, 60_000 + HAMMER_BLOCKS * 30_000_000),
         "worker 1's live gas totals must survive the re-entry",
     );
+
+    Ok(())
+}
+
+/// IT-3: the epoch-record chain survives a mid-epoch governance ejection end-to-end.
+///
+/// A 5-validator registry chain closes epoch 0 normally (rec0), then governance burns a
+/// current-committee validator mid-epoch-1 before the epoch-1 close. The producer's inputs
+/// are REAL post-ejection chain reads (the same `getCommitteeBlsPubkeys` path the node's
+/// `write_epoch_record` uses), so rec1's committee is the shrunken, swap-and-popped 4-member
+/// array while rec0's `next_committee` promised 5 — the exact shape that made
+/// `build_epoch_record`'s strict comparison halt every node at the boundary before it
+/// tolerated compatible shrinks via [`EpochRecord::committee_compatible`]. Epoch 2 then
+/// closes with an exact 4-member handoff (rec2), and all three records round-trip the
+/// epoch-record db in order.
+#[tokio::test]
+async fn test_epoch_record_chain_across_mid_epoch_ejection() -> eyre::Result<()> {
+    let record_dir = TempDir::with_prefix("epoch_record_ejection_records")?;
+    let reth_dir = TempDir::with_prefix("epoch_record_ejection_reth")?;
+    // the committee fixture only backs the consensus-chain handle holding the record store
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let consensus_chain =
+        ConsensusChain::new_for_test(record_dir.path().to_owned(), fixture.committee()).await?;
+    let records = consensus_chain.epochs();
+
+    // 5-validator registry genesis so one ejection leaves a 4-member committee (the sync
+    // tolerance floor)
+    let genesis = test_genesis_with_consensus_registry(5);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let task_manager = TaskManager::new("epoch record ejection test");
+    let reth_env =
+        RethEnv::new_for_temp_chain(chain.clone(), reth_dir.path(), &task_manager, None)?;
+
+    // committee reads exactly as the node's engine performs them for `write_epoch_record`
+    let keys_for_epoch = |e: u32| -> eyre::Result<Vec<BlsPublicKey>> {
+        Ok(reth_env
+            .bls_pubkeys_for_epoch(e)?
+            .iter()
+            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
+            .collect())
+    };
+
+    // block 1: close epoch 0 normally
+    let worker_id: WorkerId = 0;
+    let output1 = manual_consensus_output(1, 0, 1, true);
+    let payload1 = payload_with_base_fee(
+        chain.sealed_genesis_header(),
+        &output1,
+        MIN_PROTOCOL_BASE_FEE,
+        worker_id,
+    );
+    let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload1, vec![])?;
+    let header1 = block1.recovered_block.clone_sealed_header();
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1);
+
+    // rec0 from real post-close reads: a full 5-member handoff
+    let committee0 = keys_for_epoch(0)?;
+    assert_eq!(committee0.len(), 5);
+    let rec0 = build_epoch_record(
+        0,
+        committee0,
+        keys_for_epoch(1)?,
+        None,
+        BlockNumHash::new(header1.number, header1.hash()),
+        ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+    )?;
+    records.save_record(rec0.clone()).await?;
+
+    // mid-epoch 1: governance burns a seated validator (a middle slot so swap-and-pop
+    // visibly reorders the survivors)
+    let epoch1_pre_burn = keys_for_epoch(1)?;
+    assert_eq!(epoch1_pre_burn, rec0.next_committee, "epoch 1 starts on the promised committee");
+    let target_bls = epoch1_pre_burn[1];
+    let target_addr = reth_env.epoch_state_from_canonical_tip()?.validators[1].validatorAddress;
+    let mut governance = governance_owner_factory();
+    let burn_tx = governance_burn_tx(&mut governance, chain.clone(), target_addr);
+    let output2 = manual_consensus_output(1, 1, 2, false);
+    let payload2 = payload_with_base_fee(header1, &output2, MIN_PROTOCOL_BASE_FEE, worker_id);
+    let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload2, vec![burn_tx])?;
+    let header2 = block2.recovered_block.clone_sealed_header();
+
+    // block 3: close epoch 1 over the shrunken committee
+    let output3 = manual_consensus_output(2, 1, 3, true);
+    let payload3 = payload_with_base_fee(header2, &output3, MIN_PROTOCOL_BASE_FEE, worker_id);
+    let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload3, vec![])?;
+    let header3 = block3.recovered_block.clone_sealed_header();
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 2);
+
+    // rec1 from real post-ejection reads, chained to the db round-tripped rec0: the exact
+    // producer shape that halted the network before the tolerance fix
+    let committee1 = keys_for_epoch(1)?;
+    assert_eq!(committee1.len(), 4, "on-chain committee shrank mid-epoch");
+    assert!(!committee1.contains(&target_bls));
+    let prev0 = records.record_by_epoch(0).await.expect("rec0 round-trips the record db");
+    assert_eq!(prev0, rec0);
+    let rec1 = build_epoch_record(
+        1,
+        committee1.clone(),
+        keys_for_epoch(2)?,
+        Some(&prev0),
+        BlockNumHash::new(header3.number, header3.hash()),
+        ConsensusNumHash::new(3, ConsensusHeaderDigest::default()),
+    )
+    .expect("mid-epoch ejection must not prevent the epoch record from building");
+    assert_eq!(rec1.committee, committee1, "the record carries the shrunken on-chain read");
+    assert_eq!(rec1.parent_hash, prev0.digest(), "rec1 chains to rec0");
+
+    // the producer built exactly the shape the sync verifier's tolerance accepts
+    let promised: BTreeSet<BlsPublicKey> = prev0.next_committee.iter().copied().collect();
+    assert!(rec1.committee_compatible(&promised));
+    let recorded: BTreeSet<BlsPublicKey> = rec1.committee.iter().copied().collect();
+    assert!(recorded.is_subset(&promised));
+    let ejected: Vec<_> = promised.difference(&recorded).collect();
+    assert_eq!(ejected, vec![&target_bls], "exactly the burned key left the committee");
+    records.save_record(rec1.clone()).await?;
+
+    // block 4: close epoch 2 — the chain continues normally after the ejection epoch
+    let output4 = manual_consensus_output(1, 2, 4, true);
+    let payload4 = payload_with_base_fee(header3, &output4, MIN_PROTOCOL_BASE_FEE, worker_id);
+    let block4 = execute_payload_and_update_canonical_chain(&reth_env, payload4, vec![])?;
+    let header4 = block4.recovered_block.clone_sealed_header();
+
+    let committee2 = keys_for_epoch(2)?;
+    let prev1 = records.record_by_epoch(1).await.expect("rec1 round-trips the record db");
+    assert_eq!(prev1, rec1);
+    assert_eq!(committee2, prev1.next_committee, "the post-ejection handoff is exact again");
+    let rec2 = build_epoch_record(
+        2,
+        committee2,
+        keys_for_epoch(3)?,
+        Some(&prev1),
+        BlockNumHash::new(header4.number, header4.hash()),
+        ConsensusNumHash::new(4, ConsensusHeaderDigest::default()),
+    )?;
+    assert_eq!(rec2.parent_hash, prev1.digest(), "rec2 chains through the ejection epoch");
+    records.save_record(rec2.clone()).await?;
+
+    // the full record chain reads back in order
+    for expected in [&rec0, &rec1, &rec2] {
+        let stored =
+            records.record_by_epoch(expected.epoch).await.expect("saved record is readable");
+        assert_eq!(&stored, expected);
+    }
 
     Ok(())
 }

@@ -763,21 +763,31 @@ impl RethEnv {
         // Phase 1: Recover all transactions (ECDSA ecrecover) in parallel via rayon.
         // Always use par_iter — the slight overhead on small batches is negligible
         // compared to the savings on large ones, and avoids an extra code path.
+        //
+        // A transaction whose signer cannot be recovered cannot be executed, but a
+        // certified sub-DAG is fixed and identical on every honest node, so returning
+        // an error here would deterministically halt (and, on restart-replay,
+        // crash-loop) the whole network on a single undecodable transaction. Instead
+        // drop the unrecoverable transactions and continue, mirroring the `InvalidTx`
+        // tolerance of the execute phase below: every node drops the same
+        // transactions from the same certified bytes, so the resulting block stays
+        // deterministic (issue #933). The primary defense is validating batches before
+        // they can be certified; this only bounds the blast radius if one ever is.
         let recovered_txs = transactions
             .par_iter()
-            .map(|tx_bytes| {
+            .filter_map(|tx_bytes| {
                 reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
                     .inspect_err(|e| {
                         error!(
                             target: "engine",
                             batch=?batch_digest,
                             ?tx_bytes,
-                            "failed to recover signer: {e}"
+                            "failed to recover signer, dropping transaction: {e}"
                         )
                     })
-                    .map_err(TnRethError::from)
+                    .ok()
             })
-            .collect::<TnRethResult<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
         // Phase 2: Execute recovered transactions sequentially.
         for recovered in recovered_txs {
@@ -961,7 +971,7 @@ impl RethEnv {
 
         if let Some((leader_round, consensus_num_hash, engine_update_tx)) = engine_update {
             engine_update_tx
-                .try_send((
+                .blocking_send((
                     leader_round,
                     consensus_num_hash,
                     Some(canonical_head.clone_sealed_header()),
@@ -2279,7 +2289,13 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::{system_calls::ConsensusRegistry::ValidatorStatus, test_utils::TransactionFactory};
+    use crate::{
+        system_calls::ConsensusRegistry::ValidatorStatus,
+        test_utils::{
+            execute_payload_and_update_canonical_chain, governance_burn_tx,
+            governance_owner_factory, test_genesis_with_consensus_registry, TransactionFactory,
+        },
+    };
     use alloy::primitives::utils::parse_ether;
     use rand::{rngs::StdRng, SeedableRng as _};
     use tempfile::TempDir;
@@ -2321,27 +2337,6 @@ mod tests {
             VecDeque::new(),
             Vec::new(),
         )
-    }
-
-    /// Build a block from TNPayload and transactions.
-    fn execute_payload_and_update_canonical_chain(
-        reth_env: &RethEnv,
-        payload: TNPayload,
-        transactions: Vec<Vec<u8>>,
-    ) -> eyre::Result<ExecutedBlock> {
-        let anchor_hash = payload.parent_header.hash();
-        let block =
-            reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
-        // update chain state - normally handled by tn_engine::payload_builder
-        let canonical_header = block.recovered_block.clone_sealed_header();
-        let canonical_in_memory_state =
-            reth_env.inner.blockchain_provider.canonical_in_memory_state();
-        canonical_in_memory_state
-            .update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
-        canonical_in_memory_state.set_canonical_head(canonical_header.clone());
-        reth_env.finish_executing_output(vec![block.clone()], None)?;
-        reth_env.finalize_block(canonical_header.clone())?;
-        Ok(block)
     }
 
     /// Exercise the tx/receipt/feed read API against a persisted three-block chain:
@@ -3416,6 +3411,362 @@ mod tests {
                 ConsensusRegistry::ValidatorStatus::PendingExit,
                 "backfilled validator stays PendingExit"
             );
+        }
+
+        Ok(())
+    }
+
+    /// Governance `burn` forcibly ejects a current-committee validator mid-epoch.
+    ///
+    /// Pins the on-chain behavior the node's epoch-record layer must tolerate: the stored
+    /// committee arrays for the current and both future epochs shrink via swap-and-pop (the
+    /// last element moves into the ejected slot — order is NOT preserved), the next committee
+    /// size auto-decrements to the eligible count, the validator is permanently retired with
+    /// its stake confiscated, and the epoch still closes cleanly on-chain (`concludeEpoch` +
+    /// `applyIncentives` system calls succeed over the shrunken committee). A direct
+    /// `applyIncentives` call afterwards exercises the `isRetired` skip branch: the burned
+    /// validator earns nothing while a surviving validator accrues rewards.
+    #[tokio::test]
+    async fn test_burn_ejects_current_committee_validator_mid_epoch() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Burn Eject Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // genesis committee of 5 for epoch 0
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 0);
+        assert_eq!(committee.len(), 5);
+
+        // capture pre-burn committee pubkeys for the current and both future epochs
+        let pre_burn = (0u32..=2)
+            .map(|e| reth_env.bls_pubkeys_for_epoch(e))
+            .collect::<eyre::Result<Vec<_>>>()?;
+
+        // eject a middle slot so the swap-and-pop reorder is visible
+        let target = committee[1].validatorAddress;
+        let target_bls = pre_burn[0][1].clone();
+
+        // pre-burn: full stake outstanding, no rewards
+        let (outstanding, initial_stake, rewards) = reth_env
+            .read_consensus_registry::<(U256, U256, U256)>(
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: target }
+                    .abi_encode()
+                    .into(),
+            )?;
+        assert_eq!(outstanding, initial_stake);
+        assert!(rewards.is_zero());
+
+        // block 1: governance burns the validator mid-epoch
+        let mut governance = governance_owner_factory();
+        let burn_tx = governance_burn_tx(&mut governance, chain.clone(), target);
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![burn_tx])?;
+        let canonical_header = block1.recovered_block.clone_sealed_header();
+
+        // the validator is permanently retired with its stake confiscated
+        let retired = reth_env.read_consensus_registry::<bool>(
+            ConsensusRegistry::isRetiredCall { validatorAddress: target }.abi_encode().into(),
+        )?;
+        assert!(retired, "burned validator is permanently retired");
+        let (outstanding, _initial, rewards) = reth_env
+            .read_consensus_registry::<(U256, U256, U256)>(
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: target }
+                    .abi_encode()
+                    .into(),
+            )?;
+        assert!(outstanding.is_zero(), "outstanding stake confiscated to issuance");
+        assert!(rewards.is_zero());
+
+        // current + both future committees shrink with EXACT swap-and-pop order: the last
+        // element moves into the burned slot and the array truncates by one
+        for e in 0u32..=2 {
+            let post = reth_env.bls_pubkeys_for_epoch(e)?;
+            let mut expected = pre_burn[e as usize].clone();
+            let idx = expected
+                .iter()
+                .position(|k| k == &target_bls)
+                .expect("burned validator in every pre-burn committee");
+            let last = expected.len() - 1;
+            expected.swap(idx, last);
+            expected.truncate(last);
+            assert_eq!(post.len(), 4);
+            assert!(!post.contains(&target_bls));
+            assert_eq!(post, expected, "swap-and-pop order for epoch {e}");
+        }
+
+        // positional zip pin: the address committee and pubkey committee stay index-aligned
+        // (the node zips these arrays by position to build its committee)
+        for e in 0u32..=2 {
+            let infos = reth_env.validators_for_epoch(e)?;
+            let keys = reth_env.bls_pubkeys_for_epoch(e)?;
+            assert_eq!(infos.len(), keys.len());
+            for (info, key) in infos.iter().zip(keys.iter()) {
+                let direct =
+                    reth_env.get_bls_pubkey(canonical_header.hash(), info.validatorAddress)?;
+                assert_eq!(&direct, key, "epoch {e} committee arrays zip positionally");
+            }
+        }
+
+        // committee size auto-decrements to the eligible count
+        let next_size = reth_env.read_consensus_registry::<u16>(
+            ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(next_size, 4);
+        let eligible = reth_env.read_consensus_registry::<U256>(
+            ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(eligible, U256::from(4));
+
+        // block 2: close the epoch — the concludeEpoch + applyIncentives system calls must
+        // succeed over the shrunken committee (on-chain close survives mid-epoch ejection)
+        let consensus_output = consensus_output_for_tests(2, 1, 2, true);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block2.recovered_block.clone_sealed_header();
+
+        // post-close: epoch 1 runs the 4-member committee; the newly shuffled committee
+        // (two epochs ahead) is also 4 members and excludes the burned validator
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 1);
+        assert_eq!(committee.len(), 4);
+        assert!(committee.iter().all(|v| v.validatorAddress != target));
+        let shuffled = reth_env.bls_pubkeys_for_epoch(3)?;
+        assert_eq!(shuffled.len(), 4);
+        assert!(!shuffled.contains(&target_bls));
+
+        // direct applyIncentives with rewards for the burned + a surviving validator: the
+        // isRetired branch skips the burned validator while the survivor accrues rewards
+        let alive = committee[0].validatorAddress;
+        let mut tn_evm = reth_env.tn_evm(canonical_header.hash())?;
+        let calldata = ConsensusRegistry::applyIncentivesCall {
+            rewardInfos: vec![
+                ConsensusRegistry::RewardInfo {
+                    validatorAddress: target,
+                    consensusHeaderCount: U256::from(5),
+                },
+                ConsensusRegistry::RewardInfo {
+                    validatorAddress: alive,
+                    consensusHeaderCount: U256::from(5),
+                },
+            ],
+        }
+        .abi_encode()
+        .into();
+        let mut res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        assert!(res.result.is_success(), "applyIncentives succeeds: {:?}", res.result);
+        res.state.remove(&SYSTEM_ADDRESS);
+        tn_evm.db_mut().commit(res.state);
+        let burned_rewards = reth_env.call_consensus_registry::<_, U256>(
+            &mut tn_evm,
+            ConsensusRegistry::getRewardsCall { validatorAddress: target }.abi_encode().into(),
+        )?;
+        let alive_rewards = reth_env.call_consensus_registry::<_, U256>(
+            &mut tn_evm,
+            ConsensusRegistry::getRewardsCall { validatorAddress: alive }.abi_encode().into(),
+        )?;
+        assert!(burned_rewards.is_zero(), "retired validator skipped by applyIncentives");
+        assert!(alive_rewards > U256::ZERO, "surviving validator accrues rewards");
+
+        Ok(())
+    }
+
+    /// Governance `burn` of a validator seated only in FUTURE committees leaves the current
+    /// committee untouched.
+    ///
+    /// A sixth validator stakes and activates, so committees shuffled after its activation may
+    /// seat it while the current committee predates it. Burning it mid-epoch mutates only the
+    /// future committee arrays it occupies (swap-and-pop), leaves the running committee
+    /// byte-identical (so the node's epoch-record comparison cannot diverge for future-only
+    /// ejection, even without the mid-epoch-ejection tolerance fix), keeps
+    /// `nextCommitteeSize` at 5 (eligible count drops 6 -> 5, so no auto-decrement fires),
+    /// and the following epochs close cleanly.
+    #[tokio::test]
+    async fn test_burn_future_only_validator() -> eyre::Result<()> {
+        // the sixth validator's EOA signs its own stake + activate txs
+        let mut newval_eoa =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
+        let newval_addr = newval_eoa.address();
+        // BLS seeds 0..=4 are taken by the 5 genesis validators
+        let newval_bls = BlsKeypair::generate(&mut StdRng::seed_from_u64(5));
+        let newval_pop = generate_proof_of_possession_bls_for_test(&newval_bls, &newval_addr)
+            .expect("pop generation failed");
+
+        let stake_amount = U256::from(parse_ether("1_000_000")?);
+        let genesis = test_genesis_with_consensus_registry(5).extend_accounts([(
+            newval_addr,
+            GenesisAccount::default().with_balance(stake_amount.saturating_mul(U256::from(2))),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Future Only Burn Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // block 1 (epoch 0): governance mints the NFT, the new validator stakes and activates
+        let mut governance = governance_owner_factory();
+        let mint_tx = governance.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            U256::ZERO,
+            ConsensusRegistry::mintCall { validatorAddress: newval_addr }.abi_encode().into(),
+        );
+        let stake_tx = newval_eoa.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            stake_amount,
+            ConsensusRegistry::stakeCall {
+                blsPubkey: newval_bls.public().to_bytes().into(),
+                proofOfPossession: ConsensusRegistry::ProofOfPossession {
+                    signature: newval_pop.to_bytes().into(),
+                },
+            }
+            .abi_encode()
+            .into(),
+        );
+        let activate_tx = newval_eoa.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            U256::ZERO,
+            ConsensusRegistry::activateCall {}.abi_encode().into(),
+        );
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(
+            &reth_env,
+            payload,
+            vec![mint_tx, stake_tx, activate_tx],
+        )?;
+        let mut canonical_header = block1.recovered_block.clone_sealed_header();
+
+        // six validators are now committee-eligible (5 active + 1 pending activation)
+        let eligible = reth_env.read_consensus_registry::<U256>(
+            ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(eligible, U256::from(6));
+
+        // close epochs until some validator sits in a future committee but not the current
+        // one (with 6 eligible validators and 5 seats every shuffled committee excludes
+        // exactly one; the shuffle is seed-deterministic so the arrangement is stable)
+        let committee_addrs = |e: u32| -> eyre::Result<Vec<Address>> {
+            Ok(reth_env.validators_for_epoch(e)?.into_iter().map(|v| v.validatorAddress).collect())
+        };
+        let mut current_epoch = 0u32;
+        let mut subdag_index = 2u64;
+        let mut arrangement = None;
+        while arrangement.is_none() && current_epoch < 6 {
+            current_epoch += 1;
+            let consensus_output = consensus_output_for_tests(2, current_epoch, subdag_index, true);
+            subdag_index += 1;
+            let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+            let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+            canonical_header = block.recovered_block.clone_sealed_header();
+
+            let current = committee_addrs(current_epoch)?;
+            let future: Vec<Address> = committee_addrs(current_epoch + 1)?
+                .into_iter()
+                .chain(committee_addrs(current_epoch + 2)?)
+                .collect();
+            // prefer the never-seated new validator; any future-only member proves the property
+            arrangement = if !current.contains(&newval_addr) && future.contains(&newval_addr) {
+                Some(newval_addr)
+            } else {
+                future.iter().copied().find(|v| !current.contains(v))
+            };
+        }
+        let target = arrangement
+            .expect("deterministic shuffle seats a validator in a future committee only");
+        let w = current_epoch;
+        let target_bls = reth_env.get_bls_pubkey(canonical_header.hash(), target)?;
+
+        // pre-burn snapshots of the running + both future committees
+        let pre_current = reth_env.bls_pubkeys_for_epoch(w)?;
+        let pre_next = reth_env.bls_pubkeys_for_epoch(w + 1)?;
+        let pre_subsequent = reth_env.bls_pubkeys_for_epoch(w + 2)?;
+        assert!(!pre_current.contains(&target_bls));
+        assert!(
+            pre_next.contains(&target_bls) || pre_subsequent.contains(&target_bls),
+            "target seated in a future committee"
+        );
+        let pre_next_size = reth_env.read_consensus_registry::<u16>(
+            ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(pre_next_size, 5);
+
+        // burn the future-only validator mid-epoch W
+        let burn_tx = governance_burn_tx(&mut governance, chain.clone(), target);
+        let consensus_output = consensus_output_for_tests(2, w, subdag_index, false);
+        subdag_index += 1;
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![burn_tx])?;
+        canonical_header = block.recovered_block.clone_sealed_header();
+
+        // the running committee is byte-identical: future-only ejection cannot perturb the
+        // current epoch (so on-chain reads for epoch W match any pre-burn snapshot exactly)
+        assert_eq!(reth_env.bls_pubkeys_for_epoch(w)?, pre_current);
+
+        // future committees shrink via swap-and-pop exactly where the target was seated
+        for (e, pre) in [(w + 1, &pre_next), (w + 2, &pre_subsequent)] {
+            let post = reth_env.bls_pubkeys_for_epoch(e)?;
+            if let Some(idx) = pre.iter().position(|k| k == &target_bls) {
+                let mut expected = pre.to_vec();
+                let last = expected.len() - 1;
+                expected.swap(idx, last);
+                expected.truncate(last);
+                assert_eq!(post, expected, "swap-and-pop order for future epoch {e}");
+            } else {
+                assert_eq!(&post, pre, "future committee {e} untouched");
+            }
+            assert!(!post.contains(&target_bls));
+        }
+
+        // no auto-decrement: 5 remaining eligible validators still cover committee size 5
+        let post_next_size = reth_env.read_consensus_registry::<u16>(
+            ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(post_next_size, 5);
+        let eligible = reth_env.read_consensus_registry::<U256>(
+            ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(eligible, U256::from(5));
+        let retired = reth_env.read_consensus_registry::<bool>(
+            ConsensusRegistry::isRetiredCall { validatorAddress: target }.abi_encode().into(),
+        )?;
+        assert!(retired);
+        let (outstanding, _initial, rewards) = reth_env
+            .read_consensus_registry::<(U256, U256, U256)>(
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: target }
+                    .abi_encode()
+                    .into(),
+            )?;
+        assert!(outstanding.is_zero(), "outstanding stake confiscated to issuance");
+        assert!(rewards.is_zero());
+
+        // the epoch closes cleanly and the next two committees seat without the target,
+        // including the (possibly shrunken) subsequent committee going current
+        for close in [w + 1, w + 2] {
+            let consensus_output = consensus_output_for_tests(2, close, subdag_index, true);
+            subdag_index += 1;
+            let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+            let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+            canonical_header = block.recovered_block.clone_sealed_header();
+
+            let EpochState { epoch, validators: committee, .. } =
+                reth_env.epoch_state_from_canonical_tip()?;
+            assert_eq!(epoch, close);
+            assert!(committee.iter().all(|v| v.validatorAddress != target));
         }
 
         Ok(())

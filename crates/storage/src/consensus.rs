@@ -406,6 +406,15 @@ impl ConsensusChain {
             return Err(ConsensusChainError::PrevCommitteeEpochMismatch);
         }
         let old_pack = self.current_pack();
+        // Same-epoch re-entry (mid-epoch restart, or a mode change that re-runs
+        // epoch setup) intentionally reuses the already-open pack, matching on
+        // epoch number alone. The pack's persisted `EpochMeta` — committee
+        // included — is the epoch-START snapshot; chain state can legitimately
+        // diverge from it mid-epoch (a governance burn shrinks the on-chain
+        // committee immediately), so comparing anything beyond the epoch number
+        // here would reject the re-entry and strand the node. Keeping the
+        // original pack is load-bearing: this epoch's consensus output must be
+        // decoded and verified against the committee the epoch started with.
         if old_pack.epoch() == committee.epoch() && !old_pack.is_static() {
             return Ok(());
         }
@@ -879,6 +888,57 @@ impl ConsensusChain {
             }
         } else {
             Err(ConsensusChainError::NoCurrentEpoch)
+        }
+    }
+
+    /// Stream-decode raw v1 (header-first) pack-file bytes for `epoch` from `reader` (e.g. the
+    /// reassembled `request_consensus_output` sync stream) into a verified [`ConsensusOutput`],
+    /// using the committee from the pack we hold for `epoch` (current / static / staging). Verifies
+    /// the header's digest equals `expected_hash` the instant the header record is read — before
+    /// any batch is buffered — so a wrong/forged output is rejected without buffering its
+    /// batches, and the unverified pre-check buffer is bounded to a single header record rather
+    /// than the whole output. Errors with [`ConsensusChainError::NoCurrentEpoch`] if we have no
+    /// pack for `epoch` (so cannot resolve its committee) — the caller should treat that as
+    /// "not yet decodable".
+    pub async fn stream_decode_consensus_output<R: AsyncRead + Unpin>(
+        &self,
+        epoch: Epoch,
+        reader: R,
+        expected_hash: ConsensusHeaderDigest,
+    ) -> Result<ConsensusOutput, ConsensusChainError> {
+        let pack = self.current_pack();
+        if epoch == pack.epoch() {
+            return Ok(pack.decode_output_stream(reader, expected_hash).await?);
+        }
+        if let Ok(pack) = self.get_static(epoch).await {
+            Ok(pack.decode_output_stream(reader, expected_hash).await?)
+        } else if let Some(staging) = self.staging() {
+            if epoch == staging.pack.epoch() {
+                Ok(staging.pack.decode_output_stream(reader, expected_hash).await?)
+            } else {
+                Err(ConsensusChainError::NoCurrentEpoch)
+            }
+        } else {
+            Err(ConsensusChainError::NoCurrentEpoch)
+        }
+    }
+
+    /// True if the consensus chain contains a pack or partial pack for epoch.
+    ///
+    /// Useful to determine if calls will find a pack file to work with (like
+    /// stream_decode_consenus_output()). This will also warm the pack cache if this is not the
+    /// current epochs pack.
+    pub async fn contains_decode_epoch(&self, epoch: Epoch) -> bool {
+        let pack = self.current_pack();
+        if epoch == pack.epoch() {
+            return true;
+        }
+        if let Ok(_pack) = self.get_static(epoch).await {
+            true
+        } else if let Some(staging) = self.staging() {
+            epoch == staging.pack.epoch()
+        } else {
+            false
         }
     }
 
@@ -2009,6 +2069,74 @@ mod test {
             empty_chain.consensus_output_bytes_by_number(1).await.is_err(),
             "empty chain will should return a too high error"
         );
+    }
+
+    /// `stream_decode_consensus_output` resolves the epoch's committee (here the current pack),
+    /// stream-decodes the reassembled bytes, and verifies the header digest against the expected
+    /// hash: a matching hash returns the equal output, a wrong hash is rejected with
+    /// `UnexpectedConsensusDigest` (the wrapper for the requested-output receive path).
+    #[tokio::test]
+    async fn test_stream_decode_consensus_output() {
+        use crate::consensus_pack::PackError;
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_stream_decode").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        let mut parent = ConsensusHeader::default().digest();
+        let mut outputs = Vec::new();
+        for i in 0..5u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+
+        for (i, original) in outputs.iter().enumerate() {
+            let number = i as u64 + 1;
+            let bytes = consensus_chain
+                .consensus_output_bytes_by_number(number)
+                .await
+                .expect("query ok")
+                .expect("bytes present");
+
+            // Correct hash: resolves the current pack's committee, decodes, and verifies.
+            let decoded = consensus_chain
+                .stream_decode_consensus_output(0, Cursor::new(bytes.clone()), original.digest())
+                .await
+                .expect("verified stream decode");
+            compare_outputs(&decoded, original);
+
+            // Wrong hash: rejected with UnexpectedConsensusDigest through the ConsensusChainError.
+            let res = consensus_chain
+                .stream_decode_consensus_output(
+                    0,
+                    Cursor::new(bytes),
+                    ConsensusHeader::default().digest(),
+                )
+                .await;
+            assert!(
+                matches!(
+                    res,
+                    Err(ConsensusChainError::PackError(
+                        PackError::UnexpectedConsensusDigest { .. }
+                    ))
+                ),
+                "wrong hash must be rejected, got {res:?}"
+            );
+        }
     }
 
     /// Regression test for the `pack_install` lock.

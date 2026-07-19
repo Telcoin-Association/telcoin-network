@@ -20,7 +20,7 @@ use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, BlockNumHash,
     BlsPublicKey, CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader,
     ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Hash as _, Round,
-    B256,
+    B256, MAX_GC_DEPTH, MAX_HEADER_NUM_OF_BATCHES,
 };
 use tokio::{
     io::{AsyncRead, BufReader},
@@ -389,6 +389,27 @@ impl ConsensusPack {
         let cursor = Cursor::new(bytes);
         let reader = BufReader::new(cursor);
         bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee).await
+    }
+
+    /// Stream-decode a v1 (header-first) pack-encoded [`ConsensusOutput`] from `reader`, verifying
+    /// the header's digest equals `expected_digest` the instant the header record is read — BEFORE
+    /// any batch record is buffered. Used on the requested-output receive path so an unverified
+    /// peer stream cannot force buffering/decoding more than a single ≤`MAX_RECORD_SIZE` header
+    /// record before the known hash is checked. Uses this pack's committee (author -> execution
+    /// address) and compression, so the pack must be for the same epoch as the stream.
+    pub async fn decode_output_stream<R: AsyncRead + Unpin>(
+        &self,
+        reader: R,
+        expected_digest: ConsensusHeaderDigest,
+    ) -> Result<ConsensusOutput, PackError> {
+        bytes_to_verified_output(
+            reader,
+            self.compression,
+            Duration::from_secs(5),
+            &self.committee,
+            expected_digest,
+        )
+        .await
     }
 
     /// Load and return the pack file bytes for consensus output form this epoch.
@@ -925,24 +946,37 @@ impl Inner {
         let mut pack =
             Self { data, consensus_pos_idx, consensus_digests, batch_digests, epoch_meta };
         loop {
+            // The header's parent link is verified INSIDE the decoder via
+            // `HeaderExpectation::Parent` — early (before batches) on the v1 header-first path — so
+            // a forked/forged output is rejected before its batches are buffered. `parent_digest`
+            // advances to this output's digest for the next iteration below.
             let output = if stream_iter.version() == 0 {
-                match iter_to_output_legacy(&mut stream_iter, timeout, &pack.epoch_meta.committee)
-                    .await
+                match iter_to_output_legacy(
+                    &mut stream_iter,
+                    timeout,
+                    &pack.epoch_meta.committee,
+                    HeaderExpectation::Parent(parent_digest),
+                )
+                .await
                 {
                     Ok(output) => output,
                     Err(PackError::NotConsensus) => break,
                     Err(e) => return Err(e),
                 }
             } else {
-                match iter_to_output(&mut stream_iter, timeout, &pack.epoch_meta.committee).await {
+                match iter_to_output(
+                    &mut stream_iter,
+                    timeout,
+                    &pack.epoch_meta.committee,
+                    HeaderExpectation::Parent(parent_digest),
+                )
+                .await
+                {
                     Ok(output) => output,
                     Err(PackError::NotConsensus) => break,
                     Err(e) => return Err(e),
                 }
             };
-            if output.parent_hash() != parent_digest {
-                return Err(PackError::InvalidConsensusChain);
-            }
             let consensus_number = output.number();
             if consensus_number > final_consensus_number {
                 return Err(PackError::InvalidConsensusNumber(
@@ -1336,15 +1370,65 @@ pub(crate) fn verify_epoch_meta(
     Ok(())
 }
 
-/// Upper bound on how many `Batch` records `iter_to_output` will buffer before the
-/// terminating `Consensus` record.  This caps memory use when reading a (possibly hostile)
-/// peer stream; a legitimate ConsensusOutput references far fewer batches than this.
-#[cfg(not(test))]
-const MAX_BATCHES_PER_OUTPUT: usize = 1_000;
-/// Lowered in tests so the cap can be exercised cheaply; legitimate test outputs use only a
-/// handful of batches, well under this.
-#[cfg(test)]
-const MAX_BATCHES_PER_OUTPUT: usize = 50;
+/// Upper bound on how many `Batch` records `iter_to_output` will buffer before the terminating
+/// `Consensus` record, derived from the committee that produced the output.
+///
+/// [`MAX_GC_DEPTH`] is the garbage-collection horizon, not the depth a commit actually reaches.
+/// `order_dag` descends only to `gc_round + 1` and additionally skips any round already committed
+/// per authority, so in practice a sub-DAG is only a handful of rounds deep (a leader commits every
+/// couple of rounds).  It serves purely as a safe ceiling: because no certificate at or below
+/// `gc_round` can ever be linked into a commit, a single `CommittedSubDag` references certificates
+/// from at most [`MAX_GC_DEPTH`] distinct rounds, a deliberately loose over-estimate that holds
+/// regardless of commit cadence.  With at most one certificate per authority per round and at most
+/// [`MAX_HEADER_NUM_OF_BATCHES`] batches per header (the proposer self-limits and
+/// `Header::validate` rejects oversized inbound headers), a legitimately committed output therefore
+/// references at most `committee.size() * MAX_GC_DEPTH * MAX_HEADER_NUM_OF_BATCHES` unique batches.
+/// Bounding the reader at exactly that maximum keeps the writer and reader in agreement by
+/// construction (every executed output can be reconstructed) while still capping an unauthenticated
+/// peer flood of `Batch` records (the sub-DAG is only authenticated *after* decode, and the
+/// per-record size cap does not bound their count).
+fn max_batches_per_output(committee: &Committee) -> usize {
+    committee.size().saturating_mul(MAX_GC_DEPTH as usize).saturating_mul(MAX_HEADER_NUM_OF_BATCHES)
+}
+
+/// What the caller already knows about the consensus header of the output being decoded, used to
+/// reject a bad or forged header the instant it is read — before any `Batch` record is buffered.
+///
+/// The header-first (v1) pack ordering makes this early check possible: the `ConsensusHeader` is
+/// the first record, so an authenticated header (or a verified parent link) bounds everything that
+/// follows to the batches it declares.
+#[derive(Debug, Clone, Copy)]
+pub enum HeaderExpectation {
+    /// Nothing is known up front (local reads / full-pack replay): no early check.
+    None,
+    /// The header's OWN digest is known (single-output fetch against an already-verified hash). A
+    /// mismatch is [`PackError::UnexpectedConsensusDigest`].
+    Digest(ConsensusHeaderDigest),
+    /// The header's PARENT digest is known (epoch-pack forward chain link). A mismatch is
+    /// [`PackError::InvalidConsensusChain`].
+    Parent(ConsensusHeaderDigest),
+}
+
+/// Verify a freshly read `header` against what the caller already knows ([`HeaderExpectation`]).
+/// Called the instant the header record is decoded — before reading batches on the v1 path — so a
+/// wrong/forged header is rejected without buffering the batches it declares.
+fn check_header_expectation(
+    header: &ConsensusHeader,
+    expectation: HeaderExpectation,
+) -> Result<(), PackError> {
+    match expectation {
+        HeaderExpectation::None => Ok(()),
+        HeaderExpectation::Digest(expected) => {
+            let got = header.digest();
+            (got == expected)
+                .then_some(())
+                .ok_or(PackError::UnexpectedConsensusDigest { expected, got })
+        }
+        HeaderExpectation::Parent(expected) => {
+            (header.parent_hash == expected).then_some(()).ok_or(PackError::InvalidConsensusChain)
+        }
+    }
+}
 
 /// Take an async stream of bytes that in pack file representation of ConsensusOutput and return the
 /// ConsensusOutput.
@@ -1358,7 +1442,27 @@ pub async fn bytes_to_output<R: AsyncRead + Unpin>(
         AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, PACK_VERSION)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
-    iter_to_output(&mut stream_iter, timeout, committee).await
+    iter_to_output(&mut stream_iter, timeout, committee, HeaderExpectation::None).await
+}
+
+/// Take an async (v1, header-first) stream of pack-encoded ConsensusOutput bytes and return the
+/// ConsensusOutput, verifying the header's digest equals `expected_digest` the instant it is read —
+/// BEFORE any batch record is buffered. Used on the requested-output receive path, where the
+/// expected header hash is already known (from verified gossip / a verified descendant's parent).
+/// A mismatch is [`PackError::UnexpectedConsensusDigest`] and no batch bytes are read.
+pub async fn bytes_to_verified_output<R: AsyncRead + Unpin>(
+    stream: R,
+    compression: PackCompression,
+    timeout: Duration,
+    committee: &Committee,
+    expected_digest: ConsensusHeaderDigest,
+) -> Result<ConsensusOutput, PackError> {
+    let mut stream_iter =
+        AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, PACK_VERSION)
+            .await
+            .map_err(|e| PackError::ReadError(e.to_string()))?;
+    iter_to_output(&mut stream_iter, timeout, committee, HeaderExpectation::Digest(expected_digest))
+        .await
 }
 
 /// Take an async stream of bytes that in pack file representation of ConsensusOutput and return the
@@ -1372,7 +1476,7 @@ pub async fn bytes_to_output_legacy<R: AsyncRead + Unpin>(
     let mut stream_iter = AsyncPackIter::<PackRecord, R>::open_partial(stream, compression, 0)
         .await
         .map_err(|e| PackError::ReadError(e.to_string()))?;
-    iter_to_output_legacy(&mut stream_iter, timeout, committee).await
+    iter_to_output_legacy(&mut stream_iter, timeout, committee, HeaderExpectation::None).await
 }
 
 /// Private helper to read the next record from a pack iterator or timeout if it takes
@@ -1394,6 +1498,7 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     stream_iter: &mut AsyncPackIter<PackRecord, R>,
     timeout: Duration,
     committee: &Committee,
+    expectation: HeaderExpectation,
 ) -> Result<ConsensusOutput, PackError> {
     let mut referenced_batches = HashSet::new();
     let consensus_header = if let Some(record) = next_output_record(stream_iter, timeout).await? {
@@ -1409,6 +1514,10 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     } else {
         return Err(PackError::NotConsensus);
     };
+    // Header-first (v1): verify what the caller already knows BEFORE reading/buffering any batches.
+    // An authenticated header (Digest) or a verified parent link (Parent) bounds everything that
+    // follows to the batches the header declares; a wrong/forged header is rejected here.
+    check_header_expectation(&consensus_header, expectation)?;
     let parent_hash = consensus_header.parent_hash;
     let deliver = consensus_header.sub_dag;
     let num_blocks = deliver.num_primary_batches();
@@ -1434,8 +1543,9 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     // still declare a huge number of payload digests.  Reject early — before reading/buffering
     // any batches — like the legacy path does.  A legitimate ConsensusOutput references far
     // fewer batches than this.
-    if expected_digest_count > MAX_BATCHES_PER_OUTPUT {
-        return Err(PackError::TooManyBatches(MAX_BATCHES_PER_OUTPUT));
+    let max_batches = max_batches_per_output(committee);
+    if expected_digest_count > max_batches {
+        return Err(PackError::TooManyBatches(max_batches));
     }
     let mut expected_batch_digests = expected_batch_digests.into_iter();
 
@@ -1539,11 +1649,13 @@ async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
     stream_iter: &mut AsyncPackIter<PackRecord, R>,
     timeout: Duration,
     committee: &Committee,
+    expectation: HeaderExpectation,
 ) -> Result<ConsensusOutput, PackError> {
     let mut header = None;
     let mut available_batches = HashMap::new();
     let mut referenced_batches = HashSet::new();
     let mut batch_records = 0_usize;
+    let max_batches = max_batches_per_output(committee);
     while let Some(record) = next_output_record(stream_iter, timeout).await? {
         match record {
             PackRecord::EpochMeta(_epoch_meta) => {
@@ -1553,16 +1665,22 @@ async fn iter_to_output_legacy<R: AsyncRead + Unpin>(
                 // Bound how many batch records a (possibly hostile) stream can deliver before the
                 // terminating Consensus record arrives.  Without this an `EpochMeta`/`Consensus`
                 // -less flood of Batch records would grow `available_batches` until OOM; the
-                // per-record size cap (MAX_RECORD_SIZE) only bounds individual records.  A
-                // legitimate ConsensusOutput references far fewer batches than this.
+                // per-record size cap (MAX_RECORD_SIZE) only bounds individual records.  The bound
+                // is the maximum a legitimately committed output for this committee
+                // can reference (see `max_batches_per_output`), so an honest deep
+                // sub-DAG is never rejected.
                 batch_records += 1;
-                if batch_records > MAX_BATCHES_PER_OUTPUT {
-                    return Err(PackError::TooManyBatches(MAX_BATCHES_PER_OUTPUT));
+                if batch_records > max_batches {
+                    return Err(PackError::TooManyBatches(max_batches));
                 }
                 let batch_digest = batch.digest();
                 available_batches.insert(batch_digest, batch);
             }
             PackRecord::Consensus(consensus_header) => {
+                // v0 is header-last, so this is as early as the check can run (batches are already
+                // buffered); it keeps the parent-link/digest invariant co-located with the header
+                // read so `stream_import` need not re-check after decode.
+                check_header_expectation(&consensus_header, expectation)?;
                 for header in consensus_header.sub_dag.headers() {
                     for (digest, _) in header.payload().iter() {
                         if !available_batches.contains_key(digest) {
@@ -1763,6 +1881,12 @@ pub enum PackError {
     TooManyBatches(usize),
     /// Data pack file version is too new.
     InvalidVersion(u16, u16),
+    /// A streamed consensus header's digest did not match the expected (already-verified) digest.
+    /// Signals an unambiguous fork or peer misbehavior on the requested-output receive path.
+    UnexpectedConsensusDigest {
+        expected: ConsensusHeaderDigest,
+        got: ConsensusHeaderDigest,
+    },
 }
 
 impl Error for PackError {}
@@ -1812,6 +1936,9 @@ impl Display for PackError {
             PackError::InvalidVersion(expected, got) => {
                 write!(f, "Pack file version too new: got {got}, expected {expected}")
             }
+            PackError::UnexpectedConsensusDigest { expected, got } => {
+                write!(f, "Consensus header digest mismatch: expected {expected}, got {got}")
+            }
         }
     }
 }
@@ -1848,16 +1975,70 @@ pub(crate) mod test {
     use tn_reth::RethChainSpec;
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
-        test_genesis, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-        ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, EpochRecord, Hash, HeaderBuilder,
-        ReputationScores,
+        test_genesis, Batch, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
+        ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, EpochRecord, ExecHeader, Hash,
+        HeaderBuilder, ReputationScores,
     };
 
     use crate::{
         archive::pack::PackCompression,
-        consensus_pack::{ConsensusPack, Inner, PACK_VERSION},
+        consensus_pack::{max_batches_per_output, ConsensusPack, Inner, PACK_VERSION},
         mem_db::MemDatabase,
     };
+
+    /// Build a [`ConsensusOutput`] whose single leader header references `num_batches` unique
+    /// batches, standing in for a deep sub-DAG that exceeds the old fixed reconstruction cap
+    /// but stays within the committee-derived bound.
+    fn make_wide_test_output(
+        committee: &Committee,
+        chain: Arc<RethChainSpec>,
+        number: u64,
+        parent: ConsensusHeaderDigest,
+        num_batches: usize,
+    ) -> ConsensusOutput {
+        // Reuse one transaction across many cheaply-distinct batches (each batch differs only by
+        // its `epoch` field, which is enough to give it a unique digest) so a wide output
+        // does not generate O(n^2) transactions.
+        let txs =
+            tn_reth::test_utils::batches(chain, 1).pop().expect("one batch").transactions().clone();
+        let batches: Vec<Batch> = (0..num_batches as u32)
+            .map(|epoch| Batch::new_for_test(txs.clone(), ExecHeader::default(), 0, epoch))
+            .collect();
+        let authorities = committee.authorities();
+        let authority = authorities.first().expect("committee has authorities");
+        let author_id = authority.id();
+        let producer = authority.execution_address();
+
+        let mut leader = Certificate::default();
+        leader.update_header_author_for_test(author_id);
+        // Accumulate the whole payload on a single builder so the header is only hashed once.
+        let header = batches
+            .iter()
+            .fold(HeaderBuilder::from_header(leader.header()), |builder, batch| {
+                builder.with_payload_batch(batch, 0_u16)
+            })
+            .build();
+        leader.update_header_for_test(header);
+        leader.update_header_round_for_test(1);
+        leader.update_header_epoch_for_test(committee.epoch());
+
+        let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            None,
+        );
+        ConsensusOutput::new(
+            sub_dag,
+            parent,
+            number,
+            false,
+            batch_digests,
+            vec![CertifiedBatch { address: producer, batches }],
+        )
+    }
 
     pub(crate) fn make_test_output(
         committee: &Committee,
@@ -2324,7 +2505,7 @@ pub(crate) mod test {
     async fn test_iter_to_output_caps_buffered_batches() {
         use crate::{
             archive::pack::{Pack, DATA_HEADER_BYTES},
-            consensus_pack::{bytes_to_output, PackError, PackRecord, MAX_BATCHES_PER_OUTPUT},
+            consensus_pack::{bytes_to_output, max_batches_per_output, PackError, PackRecord},
         };
         use std::io::Cursor;
 
@@ -2332,6 +2513,9 @@ pub(crate) mod test {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
+        // The reader bound is derived from this committee, so an unauthenticated flood past it must
+        // still be rejected to guard against OOM.
+        let max_batches = max_batches_per_output(&committee);
 
         // Build a record stream of more batch records than the cap with no Consensus record.
         let path = temp_dir.path().join("batch_only");
@@ -2340,7 +2524,7 @@ pub(crate) mod test {
                 Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
                     .expect("open pack");
             let batch = tn_reth::test_utils::batches(chain.clone(), 1).pop().expect("one batch");
-            for _ in 0..(MAX_BATCHES_PER_OUTPUT + 5) {
+            for _ in 0..(max_batches + 5) {
                 pack.append(&PackRecord::Batch(batch.clone())).expect("append batch");
             }
             pack.commit().expect("commit");
@@ -2360,14 +2544,14 @@ pub(crate) mod test {
         assert!(matches!(res, Err(PackError::BatchLoad(_))), "expected BatchLoad");
     }
 
-    /// CP1b: in the v1 (header-first) format a hostile header whose sub-dag declares more than
-    /// `MAX_BATCHES_PER_OUTPUT` payload digests must be rejected up front — before any batch is
-    /// read — rather than allocating/reading a batch per declared digest.
+    /// CP1b: in the v1 (header-first) format a hostile header whose sub-dag declares more than the
+    /// committee-derived bound (`max_batches_per_output`) of payload digests must be rejected up
+    /// front, before any batch is read, rather than allocating/reading a batch per declared digest.
     #[tokio::test]
     async fn test_iter_to_output_caps_expected_batches() {
         use crate::{
             archive::pack::{Pack, DATA_HEADER_BYTES},
-            consensus_pack::{bytes_to_output, PackError, PackRecord, MAX_BATCHES_PER_OUTPUT},
+            consensus_pack::{bytes_to_output, max_batches_per_output, PackError, PackRecord},
         };
         use std::io::Cursor;
 
@@ -2376,39 +2560,17 @@ pub(crate) mod test {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
 
-        // Craft a single consensus header whose leader references more distinct batch digests
-        // than the cap.
-        let batches = tn_reth::test_utils::batches(chain, MAX_BATCHES_PER_OUTPUT + 5);
-        let authority = committee.authorities().first().expect("authority").id();
-        let mut leader = Certificate::default();
-        leader.update_header_author_for_test(authority);
-        for batch in &batches {
-            let mut builder = HeaderBuilder::from_header(leader.header());
-            builder = builder.with_payload_batch(batch, 0_u16);
-            leader.update_header_for_test(builder.build());
-        }
-        leader.update_header_round_for_test(1);
-        leader.update_header_epoch_for_test(committee.epoch());
-        let sub_dag = CommittedSubDag::new(
-            vec![leader.clone()],
-            leader,
+        // Craft a single consensus header whose leader references more distinct batch digests than
+        // the committee-derived bound, cheaply (one shared tx, header hashed once).
+        let max_batches = max_batches_per_output(&committee);
+        let output = make_wide_test_output(
+            &committee,
+            chain.clone(),
             1,
-            ReputationScores::default(),
-            None,
-        );
-        let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
-        let output = ConsensusOutput::new(
-            sub_dag,
             ConsensusHeader::default().digest(),
-            1,
-            false,
-            batch_digests,
-            vec![],
+            max_batches + 5,
         );
-        assert!(
-            output.sub_dag().num_primary_batches() > MAX_BATCHES_PER_OUTPUT,
-            "test must exceed the cap"
-        );
+        assert!(output.sub_dag().num_primary_batches() > max_batches, "test must exceed the cap");
 
         // Write just the header record (v1: header first) with no batch records to follow.
         let path = temp_dir.path().join("header_only");
@@ -2433,13 +2595,171 @@ pub(crate) mod test {
         assert!(matches!(res, Err(PackError::TooManyBatches(_))), "expected TooManyBatches");
     }
 
+    /// A `ConsensusOutput` that references more than the old fixed 1000-batch cap but stays within
+    /// the committee-derived bound must round-trip through the pack: it is executed live on
+    /// every node, so it must always be reconstructable.  Regression test for the writer/reader
+    /// batch-count asymmetry (#896) — before the fix the write succeeded but the read failed
+    /// with `TooManyBatches`, wedging restart replay and observer sync.
+    #[tokio::test]
+    async fn test_deep_output_round_trips() {
+        let temp_dir = TempDir::with_prefix("test_cp_deep_output").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        let max_batches = max_batches_per_output(&committee);
+        assert!(max_batches > 1_000, "derived bound must exceed the old fixed 1000 cap");
+        // Exceeds the old fixed cap yet stays within the committee-derived bound.
+        let num_batches = 1_100;
+        assert!(num_batches < max_batches, "test output must fit within the derived bound");
+
+        let previous_epoch = test_previous_epoch(&committee);
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("open pack");
+        let parent = ConsensusHeader::default().digest();
+        let output = make_wide_test_output(&committee, chain.clone(), 1, parent, num_batches);
+        pack.save_consensus_output(output.clone()).await.expect("save deep output");
+        let read_back = pack.get_consensus_output(1).await.expect("read back deep output");
+        compare_outputs(&output, &read_back);
+    }
+
+    /// The verified single-output decode ([`bytes_to_verified_output`]) accepts an output whose
+    /// header hashes to the expected digest and returns the equal output, and rejects one that does
+    /// not with [`PackError::UnexpectedConsensusDigest`] carrying the real header digest.
+    #[tokio::test]
+    async fn test_bytes_to_verified_output_accepts_and_rejects() {
+        use crate::consensus_pack::{bytes_to_verified_output, PackError};
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_verified_output").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("open pack");
+        let parent = ConsensusHeader::default().digest();
+        let original = make_test_output(&committee, 0, chain, 1, parent);
+        pack.save_consensus_output(original.clone()).await.unwrap();
+        pack.persist().await.expect("persist");
+        // v1 pack serves header-first record bytes (no data header), exactly what the sync stream
+        // reassembles and what `bytes_to_verified_output` (open_partial) consumes.
+        let bytes = pack.get_consensus_output_bytes(1).await.expect("bytes");
+
+        // Correct digest: accepted and equal to the original.
+        let decoded = bytes_to_verified_output(
+            Cursor::new(bytes.clone()),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+            original.digest(),
+        )
+        .await
+        .expect("verified decode");
+        compare_outputs(&decoded, &original);
+
+        // Wrong digest: rejected with UnexpectedConsensusDigest reporting the real header digest.
+        let wrong = ConsensusHeader::default().digest();
+        assert_ne!(wrong, original.digest(), "wrong digest must differ from the real one");
+        let res = bytes_to_verified_output(
+            Cursor::new(bytes),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+            wrong,
+        )
+        .await;
+        match res {
+            Err(PackError::UnexpectedConsensusDigest { expected, got }) => {
+                assert_eq!(expected, wrong);
+                assert_eq!(got, original.digest());
+            }
+            other => panic!("expected UnexpectedConsensusDigest, got {other:?}"),
+        }
+        drop(pack);
+    }
+
+    /// Load-bearing security assertion: the verified decode rejects a wrong-hash header BEFORE
+    /// reading any batch. Fed a header-only stream (the header declares batches, none follow), a
+    /// wrong expected digest yields [`PackError::UnexpectedConsensusDigest`] — NOT a
+    /// missing/too-many-batches error — proving the header hash is checked before batch records are
+    /// read (so an unverified peer cannot force buffering the declared batches). A zero-batch
+    /// header with the correct digest is accepted (the `num_blocks == 0` short-circuit runs
+    /// only after the header check passes).
+    #[tokio::test]
+    async fn test_bytes_to_verified_output_rejects_before_batches() {
+        use crate::{
+            archive::pack::{Pack, DATA_HEADER_BYTES},
+            consensus_pack::{bytes_to_verified_output, PackError, PackRecord},
+        };
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_verified_early").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+
+        // Serialize a single Consensus header record (v1: header first) with NO batch records.
+        let header_only = |name: &str, header: PackRecord| -> Vec<u8> {
+            let path = temp_dir.path().join(name);
+            {
+                let mut pack: Pack<PackRecord> =
+                    Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                        .expect("open pack");
+                pack.append(&header).expect("append header");
+                pack.commit().expect("commit");
+            }
+            std::fs::read(&path).expect("read file")[DATA_HEADER_BYTES..].to_vec()
+        };
+
+        // A header that declares batches, with none following. A wrong expected digest is caught at
+        // the header — if the check ran after batches this would be a MissingBatch / read error.
+        let output = make_test_output(&committee, 0, chain, 1, ConsensusHeader::default().digest());
+        assert!(output.sub_dag().num_primary_batches() > 0, "header must declare batches");
+        let records =
+            header_only("hdr", PackRecord::Consensus(Box::new(output.consensus_header())));
+        let res = bytes_to_verified_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+            ConsensusHeader::default().digest(),
+        )
+        .await;
+        match res {
+            Err(PackError::UnexpectedConsensusDigest { got, .. }) => {
+                assert_eq!(got, output.digest(), "must report the real header digest");
+            }
+            other => {
+                panic!("expected UnexpectedConsensusDigest before any batch read, got {other:?}")
+            }
+        }
+
+        // A zero-batch header with the CORRECT digest is accepted.
+        let empty = ConsensusHeader::default();
+        let records = header_only("empty", PackRecord::Consensus(Box::new(empty.clone())));
+        let decoded = bytes_to_verified_output(
+            Cursor::new(records),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+            empty.digest(),
+        )
+        .await
+        .expect("zero-batch verified decode");
+        assert_eq!(decoded.consensus_header().digest(), empty.digest());
+    }
+
     /// A v0 (legacy, batches-first) pack must serve its outputs as v1 (header-first) bytes via
     /// `get_consensus_output_bytes`, so all peer-facing bytes are v1 regardless of on-disk format.
     #[tokio::test]
     async fn test_v0_output_served_as_v1_bytes() {
         use crate::{
             archive::pack_iter::AsyncPackIter,
-            consensus_pack::{bytes_to_output, bytes_to_output_legacy, PackRecord},
+            consensus_pack::{
+                bytes_to_output, bytes_to_output_legacy, bytes_to_verified_output, PackError,
+                PackRecord,
+            },
         };
         use std::io::Cursor;
         use tokio::io::BufReader;
@@ -2500,6 +2820,31 @@ pub(crate) mod test {
             .expect("v1 decode");
             compare_outputs(&decoded, original);
 
+            // 2b. The verified single-output decode accepts these served v1 bytes with the real
+            //     header digest and rejects a flipped digest with UnexpectedConsensusDigest.
+            let verified = bytes_to_verified_output(
+                BufReader::new(Cursor::new(bytes.clone())),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+                original.digest(),
+            )
+            .await
+            .expect("verified v1 decode");
+            compare_outputs(&verified, original);
+            let rejected = bytes_to_verified_output(
+                BufReader::new(Cursor::new(bytes.clone())),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+                ConsensusHeader::default().digest(),
+            )
+            .await;
+            assert!(
+                matches!(rejected, Err(PackError::UnexpectedConsensusDigest { .. })),
+                "flipped digest must be rejected, got {rejected:?}"
+            );
+
             // 3. The bytes are truly re-ordered: the legacy (batches-first) decoder rejects them.
             let legacy = bytes_to_output_legacy(
                 BufReader::new(Cursor::new(bytes)),
@@ -2515,6 +2860,77 @@ pub(crate) mod test {
                 &pack.get_consensus_output(number).await.expect("local read"),
                 original,
             );
+        }
+        drop(pack);
+    }
+
+    /// A v0 (batches-first) pack that stores a SHARED batch (one digest referenced by two certs)
+    /// must serve that output as v1 (header-first) bytes that decode back to the identical output,
+    /// with the shared batch reassigned to BOTH certs. Guards the exact mixed-testnet path: a
+    /// pre-upgrade v0 file served as v1 for a duplicate-batch output.
+    #[tokio::test]
+    async fn test_v0_shared_batch_served_as_v1_bytes() {
+        use crate::consensus_pack::{bytes_to_output, bytes_to_verified_output};
+        use std::io::Cursor;
+        use tokio::io::BufReader;
+
+        let temp_dir = TempDir::with_prefix("test_v0_shared_v1").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Genuine v0 (batches-first) pack on disk.
+        let pack = ConsensusPack::open_append_version(
+            temp_dir.path(),
+            previous_epoch,
+            committee.clone(),
+            0,
+        )
+        .expect("open v0 pack");
+        assert_eq!(pack.version, 0, "constructor must produce a v0 pack file");
+
+        // Output 1 shares one batch across two certs; output 2 is a normal output confirming the
+        // pack keeps serving cleanly after a duplicate.
+        let out1 = make_test_output_shared_batch(
+            &committee,
+            chain.clone(),
+            1,
+            ConsensusHeader::default().digest(),
+        );
+        let out2 = make_test_output(&committee, 2, chain.clone(), 2, out1.digest().into());
+        pack.save_consensus_output(out1.clone()).await.unwrap();
+        pack.save_consensus_output(out2.clone()).await.unwrap();
+        pack.persist().await.expect("persist");
+
+        for original in [&out1, &out2] {
+            let number = original.number();
+            // v0 stored -> served as v1 (header-first) bytes.
+            let bytes = pack.get_consensus_output_bytes(number).await.expect("bytes");
+
+            // v1 decode reconstructs the identical output, including the shared batch assigned to
+            // both certs (compare_outputs deep-checks batch_digests incl. the dup and each cert).
+            let decoded = bytes_to_output(
+                BufReader::new(Cursor::new(bytes.clone())),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+            )
+            .await
+            .expect("v1 decode");
+            compare_outputs(&decoded, original);
+
+            // The verified single-output path also round-trips a v0-origin shared-batch output.
+            let verified = bytes_to_verified_output(
+                BufReader::new(Cursor::new(bytes)),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+                original.digest(),
+            )
+            .await
+            .expect("verified v1 decode");
+            compare_outputs(&verified, original);
         }
         drop(pack);
     }
@@ -2593,5 +3009,88 @@ pub(crate) mod test {
         // The healed pack dropped the damaged 5th output; the first four remain readable.
         assert!(pack.get_consensus_output(1).await.is_ok());
         assert!(pack.get_consensus_output(4).await.is_ok());
+    }
+
+    /// `verify_epoch_meta` committee linkage across the shapes a mid-epoch on-chain ejection
+    /// (governance `burn` / slash-to-zero) produces. The committee check is set-based
+    /// (`BTreeSet`), so the stored order of `next_committee` must not matter — only shrinking
+    /// or growing the set does.
+    #[test]
+    fn test_verify_epoch_meta_across_ejection_shapes() {
+        use std::collections::BTreeMap;
+
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::{Address, Authority, BlsKeypair, BlsPublicKey, ConsensusNumHash, Epoch};
+
+        use crate::consensus_pack::{verify_epoch_meta, EpochMeta, PackError};
+
+        let mut rng = StdRng::seed_from_u64(0xE2EC7);
+        let keypairs: Vec<BlsKeypair> = (0..5).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let keys: Vec<BlsPublicKey> = keypairs.iter().map(|kp| *kp.public()).collect();
+
+        let build_committee = |members: &[BlsPublicKey], epoch: Epoch| {
+            let authorities = members
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (*k, Authority::new_for_test(*k, Address::repeat_byte(i as u8 + 1))))
+                .collect::<BTreeMap<_, _>>();
+            Committee::new_for_test(authorities, epoch, BTreeMap::default())
+        };
+
+        let meta_for = |epoch: Epoch, committee: &Committee, prev: &EpochRecord| EpochMeta {
+            epoch,
+            committee: committee.clone(),
+            start_consensus_number: prev.final_consensus.number + 1,
+            genesis_exec_state: prev.final_state,
+            genesis_consensus: prev.final_consensus,
+        };
+
+        // Swap-and-pop ejection of keys[2] out of the five-member committee.
+        let survivors = vec![keys[0], keys[1], keys[4], keys[3]];
+        let committee5 = build_committee(&keys, 1);
+        let committee4 = build_committee(&survivors, 1);
+
+        // rec0: pre-ejection record. `next_committee` is deliberately stored in reversed
+        // order to pin that the comparison is order-insensitive.
+        let mut next0 = keys.clone();
+        next0.reverse();
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: next0,
+            final_consensus: ConsensusNumHash::new(10, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+
+        // Full record committee vs full meta committee (any order) → Ok.
+        verify_epoch_meta(1, &rec0, &meta_for(1, &committee5, &rec0))
+            .expect("full vs full must verify");
+
+        // Full record vs shrunken meta → Err: the meta was rebuilt from a post-ejection
+        // chain read while the record predates the burn.
+        let err = verify_epoch_meta(1, &rec0, &meta_for(1, &committee4, &rec0))
+            .expect_err("full vs shrunken must fail");
+        assert!(matches!(err, PackError::InvalidEpoch(1, _)), "got {err:?}");
+
+        // rec1: the ejection epoch's record — committee and next committee both shrunken.
+        let rec1 = EpochRecord {
+            epoch: 1,
+            committee: survivors.clone(),
+            next_committee: survivors.clone(),
+            parent_hash: rec0.digest(),
+            final_consensus: ConsensusNumHash::new(20, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        let committee4_next = committee4.advance_epoch_for_test(2);
+        let committee5_next = committee5.advance_epoch_for_test(2);
+
+        // Shrunken record vs shrunken meta → Ok: the epoch after the ejection opens cleanly.
+        verify_epoch_meta(2, &rec1, &meta_for(2, &committee4_next, &rec1))
+            .expect("shrunken vs shrunken must verify");
+
+        // Shrunken record vs full meta → Err: a committee cannot silently grow back.
+        let err = verify_epoch_meta(2, &rec1, &meta_for(2, &committee5_next, &rec1))
+            .expect_err("shrunken vs full must fail");
+        assert!(matches!(err, PackError::InvalidEpoch(2, _)), "got {err:?}");
     }
 }

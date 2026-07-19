@@ -16,7 +16,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, State},
     http::StatusCode,
-    middleware::map_response,
+    middleware::{from_fn_with_state, map_response},
     response::{IntoResponse, Response},
     routing::get,
     Extension, Json, Router,
@@ -35,13 +35,20 @@ use tracing::{debug, info, warn};
 
 use crate::{
     error::{error_response, GatewayError},
-    proxy::{proxy, MAX_REQUEST_BYTES},
+    proxy::proxy,
+    ratelimit::{rate_limit, RateLimiters},
     readiness::GatewayReadiness,
 };
 
 /// Pause before re-polling `accept()` after it fails, so a persistent accept
 /// error (e.g. fd exhaustion) cannot spin the loop hot.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Liveness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
+pub(crate) const HEALTH_PATH: &str = "/health";
+
+/// Readiness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
+pub(crate) const READY_PATH: &str = "/ready";
 
 /// Shared state handed to every request handler.
 #[derive(Clone, Debug)]
@@ -65,6 +72,8 @@ pub(crate) struct ServerLimits {
     /// Maximum concurrently-open inbound connections; further connections wait
     /// in the OS accept backlog.
     pub(crate) max_connections: NonZeroUsize,
+    /// Maximum accepted request body size, in bytes.
+    pub(crate) max_request_bytes: usize,
 }
 
 /// JSON body of the gateway's `/ready` response.
@@ -76,20 +85,35 @@ struct ReadyBody {
 
 /// Build the gateway router: health/readiness routes plus the proxy fallback.
 ///
-/// `request_deadline` bounds each whole request (outermost layer); the bare
-/// `408` the timeout layer produces is rewritten into the gateway's JSON-RPC
-/// error envelope so the "always a well-formed JSON-RPC error" contract holds.
-/// Streamed *response* bodies are written after the handler returns and are
-/// bounded by the upstream client's own total timeout instead.
-pub(crate) fn router(state: AppState, request_deadline: Duration) -> Router {
-    Router::new()
-        .route("/health", get(liveness))
-        .route("/ready", get(readiness))
+/// `request_deadline` bounds each whole request; the bare `408` the timeout
+/// layer produces is rewritten into the gateway's JSON-RPC error envelope so
+/// the "always a well-formed JSON-RPC error" contract holds. Streamed
+/// *response* bodies are written after the handler returns and are bounded by
+/// the upstream client's own total timeout instead. `max_request_bytes` caps
+/// the buffered request body.
+///
+/// When `rate_limiters` is present it is installed as the outermost layer, so
+/// an over-limit request is shed with a JSON-RPC `429` before its body is
+/// buffered or forwarded.
+pub(crate) fn router(
+    state: AppState,
+    request_deadline: Duration,
+    max_request_bytes: usize,
+    rate_limiters: Option<Arc<RateLimiters>>,
+) -> Router {
+    let router = Router::new()
+        .route(HEALTH_PATH, get(liveness))
+        .route(READY_PATH, get(readiness))
         .fallback(proxy)
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, request_deadline))
-        .layer(map_response(envelope_request_timeout))
-        .with_state(state)
+        .layer(map_response(envelope_request_timeout));
+    // Add the rate-limit layer last so it runs first, ahead of the body read.
+    let router = match rate_limiters {
+        Some(limiters) => router.layer(from_fn_with_state(limiters, rate_limit)),
+        None => router,
+    };
+    router.with_state(state)
 }
 
 /// Rewrite the timeout layer's bare `408` into the gateway's JSON-RPC error
@@ -123,6 +147,7 @@ pub(crate) async fn serve(
     listen_addr: SocketAddr,
     state: AppState,
     limits: ServerLimits,
+    rate_limiters: Option<Arc<RateLimiters>>,
     graceful_timeout: Duration,
     shutdown: Noticer,
 ) -> Result<(), TaskError> {
@@ -130,7 +155,7 @@ pub(crate) async fn serve(
     let local_addr = listener.local_addr()?;
     info!(target: "gateway::server", %local_addr, "worker gateway listening");
 
-    let app = router(state, limits.request_deadline);
+    let app = router(state, limits.request_deadline, limits.max_request_bytes, rate_limiters);
     accept_loop(listener, app, limits, graceful_timeout, shutdown).await
 }
 
@@ -219,8 +244,9 @@ async fn accept_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::UpstreamWorker;
+    use crate::{config::UpstreamWorker, proxy::MAX_REQUEST_BYTES, ratelimit::RateLimit};
     use axum::{http::HeaderMap, routing::post};
+    use std::num::NonZeroU32;
     use tn_types::Notifier;
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -234,6 +260,7 @@ mod tests {
             header_read_timeout: Duration::from_secs(5),
             request_deadline: Duration::from_secs(5),
             max_connections: NonZeroUsize::new(64).expect("nonzero"),
+            max_request_bytes: MAX_REQUEST_BYTES,
         }
     }
 
@@ -272,7 +299,11 @@ mod tests {
     }
 
     fn test_router(state: AppState) -> Router {
-        router(state, Duration::from_secs(5))
+        router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, None)
+    }
+
+    fn nz(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).expect("nonzero")
     }
 
     #[tokio::test]
@@ -450,9 +481,9 @@ mod tests {
     #[tokio::test]
     async fn oversized_body_gets_jsonrpc_error() {
         let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
-        // Tiny body limit so a small request trips the DefaultBodyLimit path.
-        let app = Router::new().fallback(proxy).layer(DefaultBodyLimit::max(8)).with_state(state);
-        let (addr, _shutdown) = spawn(app).await;
+        // A tiny configured body limit so a small request trips the size guard
+        // through the real router path (`--max-request-bytes` is configurable).
+        let (addr, _shutdown) = spawn(router(state, Duration::from_secs(5), 8, None)).await;
 
         let response = Client::new()
             .post(format!("http://{addr}/"))
@@ -464,6 +495,59 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body: serde_json::Value = response.json().await.expect("json");
         assert_eq!(body["error"]["code"], -32003);
+    }
+
+    #[tokio::test]
+    async fn over_limit_request_gets_jsonrpc_429() {
+        let mock = Router::new()
+            .route("/", post(|| async { r#"{"jsonrpc":"2.0","result":"0x1","id":1}"# }));
+        let (upstream_addr, _mock) = spawn(mock).await;
+
+        let state = test_state(&[upstream(upstream_addr)]);
+        state.readiness.set_ready(0, true);
+        // Global limit of one request with no burst headroom: the first request
+        // passes, the second (same instant, no refill) is rejected with 429.
+        let limiters =
+            RateLimiters::new(None, Some(RateLimit::new(nz(1), nz(1))), 16).expect("limiters");
+        let (addr, _shutdown) =
+            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+
+        let client = Client::new();
+        let first = client
+            .post(format!("http://{addr}/"))
+            .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":1}"#)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = client
+            .post(format!("http://{addr}/"))
+            .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":2}"#)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body: serde_json::Value = second.json().await.expect("json");
+        assert_eq!(body["error"]["code"], -32006);
+    }
+
+    #[tokio::test]
+    async fn health_probe_bypasses_rate_limit() {
+        let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+        // A maximally strict global limit (burst 1). If probes were rate-limited,
+        // the second `/health` hit would be 429; they must stay 200 so an
+        // orchestrator does not kill the pod under load.
+        let limiters =
+            RateLimiters::new(None, Some(RateLimit::new(nz(1), nz(1))), 16).expect("limiters");
+        let (addr, _shutdown) =
+            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+
+        let client = Client::new();
+        for _ in 0..5 {
+            let response = client.get(format!("http://{addr}/health")).send().await.expect("send");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 
     #[tokio::test]
@@ -491,8 +575,11 @@ mod tests {
         state.readiness.set_ready(0, true);
         // Short whole-request deadline; generous header timeout so only the
         // body trickle trips.
-        let (addr, _shutdown) =
-            spawn_with_limits(router(state, Duration::from_millis(300)), test_limits()).await;
+        let (addr, _shutdown) = spawn_with_limits(
+            router(state, Duration::from_millis(300), MAX_REQUEST_BYTES, None),
+            test_limits(),
+        )
+        .await;
 
         // Complete headers, then stall mid-body below the size limit.
         let mut stream = TcpStream::connect(addr).await.expect("connect");
