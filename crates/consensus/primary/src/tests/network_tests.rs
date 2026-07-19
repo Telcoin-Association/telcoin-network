@@ -1129,6 +1129,53 @@ async fn test_vote_different_digest_same_round_rejected() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A recast with a different digest at the same (author, epoch, round) must fail closed
+/// after a crash: even when no certificate is found in storage, the node must refuse to
+/// sign a second, different vote, because a crash could have lost a certificate formed
+/// from the earlier vote (issue #963). This exercises `vote_inner`'s storage-backed guard
+/// directly, with the in-memory `auth_last_vote` guard empty as it would be after restart.
+#[tokio::test]
+async fn test_vote_recast_different_digest_fails_closed() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // Simulate crash recovery: a durable vote_info for this author at the current
+    // (epoch, round) survives on disk, but the in-memory `auth_last_vote` guard is empty
+    // (fresh handler). The placeholder vote_digest will not match the fresh vote computed
+    // below, so `vote_inner` reaches the recast guard.
+    let author_id = committee.last_authority().id();
+    let seeded = VoteInfo {
+        epoch: committee.committee().epoch(),
+        round: 1,
+        vote_digest: VoteDigest::default(),
+    };
+    committee
+        .first_authority()
+        .consensus_config()
+        .node_storage()
+        .insert::<Votes>(&author_id, &seeded)?;
+
+    // A different header at the same (author, epoch, round) => a different vote digest.
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    // No certificate exists in storage, but the node must still refuse: a crash could have
+    // lost a certificate formed from the earlier vote, so re-voting could equivocate.
+    let res = handler.vote(peer, header, vec![]).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::AlreadyVoted(_, _))),
+        "recast with a different digest at the same round must fail closed"
+    );
+
+    Ok(())
+}
+
 /// Test that voting for older round after voting for newer round is rejected.
 #[tokio::test]
 async fn test_vote_older_round_rejected() -> eyre::Result<()> {

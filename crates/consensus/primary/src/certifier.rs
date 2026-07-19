@@ -444,6 +444,18 @@ impl<DB: Database> Certifier<DB> {
                             error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate: {e}");
                             return Err(TaskError::from_message(e.to_string()));
                         }
+
+                        // Wait for the `ProposedCertificates` record to be durable before
+                        // externalizing. The epoch DB persists asynchronously, so the insert above
+                        // returns before the record hits disk; `process_own_certificate` below already
+                        // externalizes (it forwards the certificate on the parents bus and triggers
+                        // fetching), and the gossip publish follows. A crash in that window loses the
+                        // record, so on restart the guard at the top of this method misses and the
+                        // certifier re-proposes the same header, re-collecting votes over an unordered
+                        // channel, which can aggregate a different 2f+1 subset into a distinct aggregate
+                        // signature and thereby perturb the leader-signature randomness. See #934, #963.
+                        self.config.node_storage().persist_durable::<ProposedCertificates>().await;
+
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
