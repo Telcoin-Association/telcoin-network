@@ -50,6 +50,8 @@ adiri = [
     "tn-storage/adiri",
     "tn-types/adiri",
 ]
+# Opt back in to reth's RocksDB storage backend; tn-node has no rocksdb code of its own.
+rocksdb = ["tn-reth/rocksdb"]
 
 [dev-dependencies]
 metrics-util = { workspace = true }
