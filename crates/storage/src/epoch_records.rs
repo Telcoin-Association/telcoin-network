@@ -185,31 +185,18 @@ impl EpochRecordValidation {
     }
 }
 
-/// Return true if `committee` (the locally-trusted committee) is compatible with the record's
-/// embedded committee.
+/// Return true if the record's committee is compatible with `committee` (the locally-trusted
+/// committee, normally the previous epoch record's `next_committee`).
 ///
-/// These are usually equal, but a validator can be booted and still be in the trusted committee
-/// while absent from `epoch_rec.committee`, so the trusted committee is allowed to be a strict
-/// superset as long as it is a sane size and fully contains the record's committee.
+/// Delegates to the shared [`EpochRecord::committee_compatible`] predicate so this verifier and
+/// the epoch record producer accept exactly the same committee shapes. The committees are usually
+/// equal, but a validator can be ejected on-chain mid-epoch, leaving the record's committee a
+/// sane-sized subset of the trusted committee.
 fn epoch_committee_valid(
     epoch_rec: &EpochRecord,
     committee: &std::collections::BTreeSet<BlsPublicKey>,
 ) -> bool {
-    let epoch_len = epoch_rec.committee.len();
-    let committee_len = committee.len();
-    let epoch_committee: std::collections::BTreeSet<BlsPublicKey> =
-        epoch_rec.committee.iter().copied().collect();
-    match committee_len.cmp(&epoch_len) {
-        std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => committee == &epoch_committee,
-        std::cmp::Ordering::Greater => {
-            // Require a reasonable committee size (don't let a bogus record with one signer
-            // through) and that the trusted committee fully contains the record's committee.
-            epoch_len >= 4
-                && epoch_len >= ((committee_len / 3) * 2)
-                && epoch_rec.committee.iter().all(|k| committee.contains(k))
-        }
-    }
+    epoch_rec.committee_compatible(committee)
 }
 
 impl EpochRecordDb {
@@ -906,11 +893,23 @@ mod test {
         signers: &[TestSigner],
         parent_hash: EpochDigest,
     ) -> (EpochRecord, EpochCertificate) {
+        let next_committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
+        make_test_pair_with_next(epoch, signers, next_committee, parent_hash)
+    }
+
+    /// Like [`make_test_pair`], but with a `next_committee` that differs from the serving
+    /// committee — the shape an epoch record takes when the validator set changes.
+    fn make_test_pair_with_next(
+        epoch: Epoch,
+        signers: &[TestSigner],
+        next_committee: Vec<BlsPublicKey>,
+        parent_hash: EpochDigest,
+    ) -> (EpochRecord, EpochCertificate) {
         let committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
         let record = EpochRecord {
             epoch,
-            committee: committee.clone(),
-            next_committee: committee,
+            committee,
+            next_committee,
             parent_hash,
             final_consensus: ConsensusNumHash::new(
                 (epoch as u64 + 1) * 10,
@@ -1339,5 +1338,55 @@ mod test {
                 cert_valid: true,
             }
         );
+    }
+
+    /// Committee-key lookups across an epoch whose committee shrank mid-epoch because a
+    /// validator was ejected on-chain (governance `burn` / slash-to-zero). The ejection
+    /// epoch's record carries the shrunken, swap-and-popped committee; the epoch after it
+    /// has no record yet and must be served from the ejection record's `next_committee`.
+    #[tokio::test]
+    async fn test_get_committee_keys_across_ejection_epoch() {
+        let temp_dir = TempDir::with_prefix("test_get_committee_keys_across_ejection_epoch")
+            .expect("temp dir");
+        let mut rng = StdRng::seed_from_u64(0xE1EC7);
+        let signers: Vec<TestSigner> = (0..6).map(|_| TestSigner::new(&mut rng)).collect();
+        let five = &signers[..5];
+        // A new validator activates during epoch 1 and joins the next committee.
+        let incoming = signers[5].public_key();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+
+        // Epoch 0: the full five-member committee.
+        let (rec0, cert0) = make_test_pair(0, five, EpochDigest::default());
+        db.save(rec0.clone(), cert0).await.expect("save rec0");
+
+        // Epoch 1: signers[2] was ejected mid-epoch. Its record carries the shrunken
+        // committee in the on-chain swap-and-pop order, and a next committee that differs
+        // from the serving one (survivors + the incoming validator).
+        let ejected = signers[2].public_key();
+        let survivors =
+            vec![signers[0].clone(), signers[1].clone(), signers[4].clone(), signers[3].clone()];
+        let mut next1: Vec<BlsPublicKey> = survivors.iter().map(|s| s.public_key()).collect();
+        next1.push(incoming);
+        let (rec1, cert1) = make_test_pair_with_next(1, &survivors, next1.clone(), rec0.digest());
+        db.save(rec1, cert1).await.expect("save rec1");
+
+        // Pre-ejection epoch reads the full committee.
+        let keys0 = db.get_committee_keys(0).await.expect("keys for epoch 0");
+        assert_eq!(keys0, five.iter().map(|s| s.public_key()).collect::<BTreeSet<_>>());
+
+        // The ejection epoch reads exactly the shrunken set; the ejected key is gone.
+        let keys1 = db.get_committee_keys(1).await.expect("keys for epoch 1");
+        assert_eq!(keys1, survivors.iter().map(|s| s.public_key()).collect::<BTreeSet<_>>());
+        assert!(!keys1.contains(&ejected));
+
+        // Epoch 2 has no record yet: served from rec1.next_committee (not rec1.committee).
+        let keys2 = db.get_committee_keys(2).await.expect("keys for epoch 2 fallback");
+        assert_eq!(keys2, next1.iter().copied().collect::<BTreeSet<_>>());
+        assert!(keys2.contains(&incoming));
+        assert!(!keys2.contains(&ejected));
+
+        // Beyond the one-epoch fallback horizon there is nothing to serve.
+        assert!(db.get_committee_keys(3).await.is_none());
     }
 }

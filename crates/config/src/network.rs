@@ -32,6 +32,11 @@ impl NetworkConfig {
         &self.sync_config
     }
 
+    /// Return a mutable reference to the [SyncConfig].
+    pub fn sync_config_mut(&mut self) -> &mut SyncConfig {
+        &mut self.sync_config
+    }
+
     /// Return a reference to the [LibP2pConfig].
     pub fn libp2p_config(&self) -> &LibP2pConfig {
         &self.libp2p_config
@@ -252,6 +257,19 @@ pub struct SyncConfig {
     ///
     /// This value is used by `CertificateValidator::requires_direct_verification`
     pub certificate_verification_chunk_size: usize,
+    /// How long the observer's consensus-header catch-up loop waits between polls of local
+    /// storage while a missing range is being fetched.
+    ///
+    /// Used by `state_sync::spawn_stream_consensus_headers`. Only affects nodes that follow
+    /// consensus (CVV-inactive / observer), not active CVVs.
+    pub consensus_header_catch_up_poll_interval: Duration,
+    /// Number of consecutive no-progress catch-up polls the observer tolerates before it
+    /// re-drives a state-sync request for the missing consensus-header range.
+    ///
+    /// At the default poll interval this bounds a single passive wait to roughly
+    /// `consensus_header_catch_up_poll_interval * consensus_header_catch_up_max_no_progress`
+    /// before the observer actively re-requests the range instead of waiting for gossip.
+    pub consensus_header_catch_up_max_no_progress: u32,
 }
 
 impl Default for SyncConfig {
@@ -266,6 +284,9 @@ impl Default for SyncConfig {
             max_num_missing_certs_within_gc_round: 50,
             certificate_verification_round_interval: 50,
             certificate_verification_chunk_size: 50,
+            // 600 * 100ms = 60 seconds of passive polling before actively re-driving a request.
+            consensus_header_catch_up_poll_interval: Duration::from_millis(100),
+            consensus_header_catch_up_max_no_progress: 600,
         }
     }
 }

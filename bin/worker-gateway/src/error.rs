@@ -32,6 +32,13 @@ mod code {
     pub(super) const LOOP_DETECTED: i32 = -32004;
     /// The request did not complete within the gateway's request deadline.
     pub(super) const REQUEST_TIMEOUT: i32 = -32005;
+    /// The client exceeded the gateway's rate limit.
+    pub(super) const RATE_LIMITED: i32 = -32006;
+    /// An `eth_sendRawTransaction` payload could not be decoded as a transaction.
+    pub(super) const INVALID_TRANSACTION: i32 = -32007;
+    /// An `eth_sendRawTransaction` payload decoded to a transaction type the
+    /// network does not accept (an EIP-4844 blob transaction).
+    pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
     /// The request body could not be read. This is the spec-defined
     /// "Invalid Request" code, not a gateway-range code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
@@ -52,6 +59,14 @@ pub(crate) enum GatewayError {
     LoopDetected,
     /// The request did not complete within the gateway's request deadline.
     RequestTimeout,
+    /// The client exceeded the gateway's per-IP or global rate limit.
+    RateLimited,
+    /// An `eth_sendRawTransaction` payload could not be decoded as a
+    /// transaction (malformed hex or RLP).
+    InvalidTransaction,
+    /// An `eth_sendRawTransaction` payload decoded to a transaction type the
+    /// network does not accept (an EIP-4844 blob transaction).
+    UnsupportedTransactionType,
     /// The request body could not be read (e.g. the client aborted mid-body).
     UnreadableBody,
 }
@@ -66,6 +81,8 @@ impl GatewayError {
             Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::LoopDetected => StatusCode::LOOP_DETECTED,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
+            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::InvalidTransaction | Self::UnsupportedTransactionType => StatusCode::BAD_REQUEST,
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
         }
     }
@@ -79,6 +96,9 @@ impl GatewayError {
             Self::RequestTooLarge => code::REQUEST_TOO_LARGE,
             Self::LoopDetected => code::LOOP_DETECTED,
             Self::RequestTimeout => code::REQUEST_TIMEOUT,
+            Self::RateLimited => code::RATE_LIMITED,
+            Self::InvalidTransaction => code::INVALID_TRANSACTION,
+            Self::UnsupportedTransactionType => code::UNSUPPORTED_TRANSACTION_TYPE,
             Self::UnreadableBody => code::INVALID_REQUEST,
         }
     }
@@ -94,6 +114,11 @@ impl GatewayError {
                 "proxy loop detected: request already passed through a worker gateway"
             }
             Self::RequestTimeout => "request did not complete within the gateway's deadline",
+            Self::RateLimited => "rate limit exceeded; slow down and retry",
+            Self::InvalidTransaction => "raw transaction could not be decoded",
+            Self::UnsupportedTransactionType => {
+                "unsupported transaction type: EIP-4844 blob transactions are not accepted"
+            }
             Self::UnreadableBody => "request body could not be read",
         }
     }
@@ -187,5 +212,26 @@ mod tests {
             error_response(&GatewayError::UnreadableBody, b"{}").status(),
             StatusCode::BAD_REQUEST
         );
+        assert_eq!(
+            error_response(&GatewayError::RateLimited, b"{}").status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            error_response(&GatewayError::InvalidTransaction, b"{}").status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            error_response(&GatewayError::UnsupportedTransactionType, b"{}").status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn new_edge_protection_codes_are_stable() {
+        // The codes are part of the client contract; pin them so a reorder or
+        // renumber is caught.
+        assert_eq!(GatewayError::RateLimited.code(), -32006);
+        assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
+        assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
     }
 }

@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::{
     cli::Settings,
+    ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
     server::{serve, AppState, ServerLimits},
 };
@@ -28,6 +29,9 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         upstream_request_timeout,
         header_read_timeout,
         max_connections,
+        max_request_bytes,
+        rate_limit_per_ip,
+        rate_limit_global,
         graceful_shutdown_timeout,
     } = settings;
 
@@ -39,6 +43,17 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     );
 
     let readiness = Arc::new(GatewayReadiness::new(&upstreams));
+
+    // Edge rate limiters (per-IP and/or global), or `None` when both are
+    // disabled; in that case no rate-limit layer or sweep task is installed.
+    let rate_limiters =
+        RateLimiters::new(rate_limit_per_ip, rate_limit_global, DEFAULT_MAX_PER_IP_ENTRIES);
+    info!(
+        target: "gateway",
+        rate_limiting = rate_limiters.is_some(),
+        max_request_bytes,
+        "edge protections configured"
+    );
 
     // Dedicated clients: the proxy enforces connect + per-request deadlines; the
     // poller bounds each probe with its own tokio timeout.
@@ -79,11 +94,28 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         // cannot hold a request slot indefinitely.
         request_deadline: upstream_request_timeout.saturating_add(header_read_timeout),
         max_connections,
+        max_request_bytes,
     };
+
+    // Sweep idle per-IP buckets while the gateway runs (only when a limiter is
+    // active).
+    if let Some(limiters) = &rate_limiters {
+        spawner.spawn_critical_task(
+            "rate-limit-gc",
+            run_gc(Arc::clone(limiters), shutdown.subscribe()),
+        );
+    }
 
     spawner.spawn_critical_task(
         "gateway-server",
-        serve(listen_addr, state, limits, graceful_shutdown_timeout, shutdown.subscribe()),
+        serve(
+            listen_addr,
+            state,
+            limits,
+            rate_limiters,
+            graceful_shutdown_timeout,
+            shutdown.subscribe(),
+        ),
     );
 
     task_manager.join_until_exit(shutdown).await?;

@@ -2,7 +2,7 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
     path::PathBuf,
     time::Duration,
 };
@@ -10,7 +10,10 @@ use std::{
 use clap::Parser;
 use url::Url;
 
-use crate::config::{GatewayConfig, UpstreamWorker};
+use crate::{
+    config::{GatewayConfig, UpstreamWorker},
+    ratelimit::RateLimit,
+};
 
 /// Stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
 #[derive(Debug, Parser)]
@@ -96,6 +99,38 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_MAX_CONNECTIONS", default_value = "500")]
     pub(crate) max_connections: NonZeroUsize,
 
+    /// Maximum request body the gateway will accept, in bytes. Requests whose
+    /// body exceeds this are rejected with a JSON-RPC "request too large" error
+    /// before being forwarded.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_MAX_REQUEST_BYTES",
+        default_value_t = crate::proxy::MAX_REQUEST_BYTES
+    )]
+    pub(crate) max_request_bytes: usize,
+
+    /// Sustained per-client-IP request rate, in requests per second (`0`
+    /// disables per-IP rate limiting). The client IP is the immediate TCP peer;
+    /// run the gateway directly edge-facing, not behind an untrusted proxy that
+    /// hides it (see the README).
+    #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP", default_value_t = 100)]
+    pub(crate) rate_limit_per_ip: u32,
+
+    /// Burst allowance for the per-IP rate limit, in requests (`0` derives twice
+    /// the sustained rate). Ignored when per-IP rate limiting is disabled.
+    #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST", default_value_t = 0)]
+    pub(crate) rate_limit_per_ip_burst: u32,
+
+    /// Sustained gateway-wide request rate across all clients, in requests per
+    /// second (`0` disables the global rate limit).
+    #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_GLOBAL", default_value_t = 3_000)]
+    pub(crate) rate_limit_global: u32,
+
+    /// Burst allowance for the global rate limit, in requests (`0` derives twice
+    /// the sustained rate). Ignored when the global rate limit is disabled.
+    #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST", default_value_t = 0)]
+    pub(crate) rate_limit_global_burst: u32,
+
     /// How long to drain in-flight requests on SIGTERM before forcing close.
     #[arg(
         long,
@@ -129,6 +164,12 @@ pub(crate) struct Settings {
     pub(crate) header_read_timeout: Duration,
     /// Maximum concurrently-open inbound connections.
     pub(crate) max_connections: NonZeroUsize,
+    /// Maximum accepted request body size, in bytes.
+    pub(crate) max_request_bytes: usize,
+    /// Per-client-IP rate limit, or `None` when disabled.
+    pub(crate) rate_limit_per_ip: Option<RateLimit>,
+    /// Gateway-wide rate limit, or `None` when disabled.
+    pub(crate) rate_limit_global: Option<RateLimit>,
     /// Graceful-shutdown drain deadline.
     pub(crate) graceful_shutdown_timeout: Duration,
 }
@@ -154,6 +195,15 @@ impl Cli {
             upstream_request_timeout: self.upstream_request_timeout,
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
+            max_request_bytes: self.max_request_bytes,
+            rate_limit_per_ip: resolve_rate_limit(
+                self.rate_limit_per_ip,
+                self.rate_limit_per_ip_burst,
+            ),
+            rate_limit_global: resolve_rate_limit(
+                self.rate_limit_global,
+                self.rate_limit_global_burst,
+            ),
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
         })
     }
@@ -181,6 +231,18 @@ impl Cli {
             }
         }
     }
+}
+
+/// Turn a `(rate, burst)` flag pair into a [`RateLimit`], or `None` when the
+/// rate is `0` (limiter disabled). A `0` burst derives twice the sustained rate
+/// so a modest headroom is the default without a second flag.
+fn resolve_rate_limit(rate: u32, burst: u32) -> Option<RateLimit> {
+    NonZeroU32::new(rate).map(|rate| {
+        let burst = if burst == 0 { rate.get().saturating_mul(2) } else { burst };
+        // `burst` is now >= `rate.get()` >= 1, so it is non-zero; fall back to
+        // the (non-zero) rate rather than panic if that ever fails to hold.
+        RateLimit::new(rate, NonZeroU32::new(burst).unwrap_or(rate))
+    })
 }
 
 /// Reject non-`http` upstream URLs at startup. The gateway is HTTP-only (the
@@ -311,5 +373,57 @@ mod tests {
         )
         .into_settings();
         assert!(result.is_err());
+    }
+
+    /// An inline-upstream CLI on another host (so the self-pointing guard does
+    /// not trip) plus whatever extra flags a test needs.
+    fn cli_with_flags(extra: &[&str]) -> Cli {
+        let mut argv = vec![
+            "worker-gateway".to_string(),
+            "--upstream-rpc-url=http://10.0.0.7:8545".to_string(),
+            "--upstream-readiness-url=http://10.0.0.7:8551/health/workers".to_string(),
+        ];
+        argv.extend(extra.iter().map(|flag| (*flag).to_string()));
+        Cli::parse_from(argv)
+    }
+
+    #[test]
+    fn edge_protection_defaults() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[]).into_settings()?;
+        assert_eq!(settings.max_request_bytes, 26_214_400);
+        let per_ip = settings.rate_limit_per_ip.expect("per-ip limit on by default");
+        assert_eq!(per_ip.rate().get(), 100);
+        // A zero burst flag derives twice the sustained rate.
+        assert_eq!(per_ip.burst().get(), 200);
+        let global = settings.rate_limit_global.expect("global limit on by default");
+        assert_eq!(global.rate().get(), 3_000);
+        assert_eq!(global.burst().get(), 6_000);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_rate_disables_the_limiter() -> eyre::Result<()> {
+        let settings =
+            cli_with_flags(&["--rate-limit-per-ip=0", "--rate-limit-global=0"]).into_settings()?;
+        assert!(settings.rate_limit_per_ip.is_none());
+        assert!(settings.rate_limit_global.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_burst_is_honored() -> eyre::Result<()> {
+        let settings = cli_with_flags(&["--rate-limit-per-ip=40", "--rate-limit-per-ip-burst=50"])
+            .into_settings()?;
+        let per_ip = settings.rate_limit_per_ip.expect("per-ip limit on");
+        assert_eq!(per_ip.rate().get(), 40);
+        assert_eq!(per_ip.burst().get(), 50);
+        Ok(())
+    }
+
+    #[test]
+    fn max_request_bytes_is_configurable() -> eyre::Result<()> {
+        let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
+        assert_eq!(settings.max_request_bytes, 1_024);
+        Ok(())
     }
 }

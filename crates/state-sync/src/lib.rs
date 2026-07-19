@@ -10,9 +10,8 @@ use tn_test_utils as _;
 #[cfg(test)]
 use tn_test_utils_committee as _;
 
-use std::time::Duration;
 use tn_config::ConsensusConfig;
-use tn_primary::{ConsensusBusApp, NodeMode};
+use tn_primary::{ConsensusBusApp, NodeMode, PrimaryMetrics};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusCache};
 use tn_types::{
     ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch, TaskError,
@@ -102,15 +101,23 @@ pub fn spawn_state_sync<DB: Database>(
 ///
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
+/// Returns the number of bytes the encoded Output takes on disk IF this is written to the current
+/// pack or 0 otherwise (old consensus).
 pub async fn save_consensus(
     consensus_output: ConsensusOutput,
     consensus_chain: &mut ConsensusChain,
-) -> eyre::Result<()> {
-    consensus_chain.save_consensus_output(consensus_output).await?;
+    metrics: &PrimaryMetrics,
+) -> eyre::Result<u64> {
+    let output_bytes = consensus_chain.save_consensus_output(consensus_output).await?;
     // Note it is ok to leave batches in NodeBatchesCache until the epoch ends (when the table is
     // cleared). Make sure we have persisted the consensus output before we execute.
     consensus_chain.persist_current().await?;
-    Ok(())
+    // A zero byte count means this output was old consensus not written to the current pack;
+    // recording it as the "most recent" output size would be misleading.
+    if output_bytes > 0 {
+        metrics.record_consensus_output_bytes(output_bytes);
+    }
+    Ok(output_bytes)
 }
 
 /// Returns the ConsensusHeader that created the last executed block if can be found.
@@ -197,6 +204,21 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let mut last_consensus_height = last_consensus_header.number;
     let epoch = config.committee().epoch();
 
+    // Catch-up tuning (observer-only): how long to poll local storage between catch-up attempts
+    // and how many no-progress polls to tolerate before asking the fetch task to backfill. Copied
+    // out (both are `Copy`) so the borrow of `config` does not outlive this line.
+    let sync_config = config.network_config().sync_config();
+    let catch_up_poll_interval = sync_config.consensus_header_catch_up_poll_interval;
+    // Clamp to at least one poll: a misconfigured `= 0` would otherwise make `stall_recheck` zero
+    // and busy-spin the bottom select (and signal a gap before any poll elapses).
+    let max_no_progress = sync_config.consensus_header_catch_up_max_no_progress.max(1);
+    // After a stall we hand the fill off to the fetch task and park on the bottom select. Because
+    // that fill lands in the cache silently (it never advances the `last_consensus_header` watch
+    // for heights at or below the target, so `changed()` does not fire), we also wake on this
+    // interval to re-drain the cache. One stall budget: the same passive window the loop already
+    // tolerated. Saturates on overflow.
+    let stall_recheck = catch_up_poll_interval.saturating_mul(max_no_progress);
+
     // Read and consume the current watch value immediately. This handles a race where a pack
     // file was downloaded and last_consensus_header() was updated before this task subscribed
     // (e.g., epoch N's pack arrives before epoch N's spawn_stream_consensus_headers starts).
@@ -210,13 +232,12 @@ async fn spawn_stream_consensus_headers<DB: Database>(
         if pending_header.number > last_consensus_height {
             debug!(target: "state-sync", rx_last_consensus_header=?pending_header.number, ?last_consensus_height, "streaming consensus headers detected change");
             // Retry loop: the concurrent backward traversal in
-            // spawn_track_recent_consensus fills ConsensusHeaderCache asynchronously.
+            // spawn_track_recent_consensus fills the ConsensusCache asynchronously.
             // catch_up_consensus_from_to may return early on a cache miss before the
             // backward traversal has fetched an intermediate block. Retry with a short
             // delay to let the traversal finish rather than waiting for the next gossip
             // update (which may never come for an older epoch's blocks).
             let mut no_progress_count = 0u32;
-            const MAX_NO_PROGRESS: u32 = 600; // 600 * 100ms = 60 seconds max wait
             loop {
                 let prev_height = last_consensus_height;
                 last_consensus_header = catch_up_consensus_from_to(
@@ -243,13 +264,31 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                     // No progress: the backward traversal hasn't yet cached this block.
                     no_progress_count += 1;
                     STATE_SYNC_METRICS.no_progress_total.increment(1);
-                    if no_progress_count >= MAX_NO_PROGRESS {
+                    if no_progress_count >= max_no_progress {
+                        // The gossip-driven backward traversal (spawn_track_recent_consensus ->
+                        // spawn_fetch_recent_consensus) only runs when a gossip update arrives, and
+                        // even then floors its walk at a watermark that only ever rises, so it
+                        // cannot recover a gap at the bottom of the catch-up range. Rather than
+                        // spinning here (or parking on the next gossip update, which may never
+                        // arrive for an older epoch's blocks or on an independently running node),
+                        // hand that exact range to the fetch task, which owns the in-flight
+                        // accounting, then break to the bottom select. That select re-drains the
+                        // cache on `stall_recheck` even though the fill lands silently (it never
+                        // advances last_consensus_header for heights <= the target), and reacts to
+                        // a fresh gossip target if one arrives.
                         warn!(target: "state-sync", ?epoch, last_consensus_height, target=pending_header.number,
-                            "could not catch up to consensus target after retries, waiting for next gossip update");
+                            "catch-up stalled after retries, requesting the missing consensus range from the fetch task");
+                        STATE_SYNC_METRICS.catch_up_redrives_total.increment(1);
+                        consensus_bus.consensus_gap_request().send_replace(Some((
+                            epoch,
+                            pending_header.number,
+                            pending_header.digest(),
+                            last_consensus_height.saturating_add(1),
+                        )));
                         break;
                     }
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        _ = tokio::time::sleep(catch_up_poll_interval) => {}
                         _ = &rx_shutdown => return Ok(()),
                     }
                 } else {
@@ -268,6 +307,11 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                 // updates during the retry loop above will re-arm changed() correctly.
                 pending_header = rx_last_consensus_header.borrow_and_update().clone().unwrap_or_default();
             }
+            // Re-drain the cache after a stall: the fetch task fills the missing range silently
+            // (it never advances last_consensus_header for heights <= the target, so changed()
+            // above does not fire), so we re-enter the catch-up loop on this interval and drain
+            // whatever has landed. When already caught up this is a cheap periodic no-op.
+            _ = tokio::time::sleep(stall_recheck) => {}
             _ = &rx_shutdown => {
                 return Ok(())
             }
@@ -275,8 +319,14 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     }
 }
 
-/// Applies consensus output "from" (exclusive) to height "max_consensus_height" (inclusive).
-/// Queries peers for latest height and downloads and executes any missing consensus output.
+/// Applies consensus output "from" (exclusive) up to "max_consensus" (inclusive) by reading
+/// consensus outputs from local storage — first the `ConsensusCache`, then the `ConsensusChain`.
+///
+/// This function does not itself query peers: the backward traversal spawned by
+/// `spawn_track_recent_consensus` / `spawn_fetch_recent_consensus` is what fetches missing outputs
+/// into the cache. On a cache miss for an output that has not been fetched yet, it returns the last
+/// applied header early, leaving the caller (`spawn_stream_consensus_headers`) to re-drive a
+/// request for the missing range.
 /// Returns the last ConsensusHeader that was applied on success.
 async fn catch_up_consensus_from_to<DB: Database>(
     consensus_bus: &ConsensusBusApp,
@@ -380,4 +430,77 @@ async fn catch_up_consensus_from_to<DB: Database>(
         consensus_bus.sync_output().send(output).await?;
     }
     Ok(result_header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tn_config::NetworkConfig;
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils_committee::CommitteeFixture;
+
+    /// Issue #836: when the observer catch-up loop makes no progress within its budget, it must
+    /// hand the missing range to the fetch task (rather than parking on the next gossip update)
+    /// by publishing a gap request on the bus. With an empty cache and chain, catch-up can never
+    /// make progress, so the stall branch must publish `Some((epoch, target, hash, floor))` within
+    /// the (tiny, test-tuned) budget.
+    #[tokio::test]
+    async fn signals_gap_request_on_catch_up_timeout() -> eyre::Result<()> {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+
+        // Borrow one authority's base config/storage/keys, then build a config with a fast,
+        // deterministic catch-up budget (signal after a single no-progress poll).
+        let (base_config, node_storage, key_config) = {
+            let authority = fixture.authorities().next().expect("fixture yields an authority");
+            let cc = authority.consensus_config();
+            (cc.config().clone(), cc.node_storage().clone(), cc.key_config().clone())
+        };
+        let mut network_config = NetworkConfig::default();
+        let sync = network_config.sync_config_mut();
+        // Signal after a single no-progress poll and keep the poll interval short so the test does
+        // not wait on the (interval * max_no_progress) recheck window.
+        sync.consensus_header_catch_up_poll_interval = Duration::from_millis(50);
+        sync.consensus_header_catch_up_max_no_progress = 1;
+
+        let committee = fixture.committee();
+        let config = ConsensusConfig::new_with_committee_for_test(
+            base_config,
+            node_storage,
+            key_config,
+            committee.clone(),
+            network_config,
+        )?;
+        let consensus_bus = ConsensusBusApp::new();
+        let temp_dir = TempDir::new()?;
+        let consensus_chain = ConsensusChain::new(temp_dir.path().to_owned(), committee)?;
+
+        // Publish a pending header ahead of local height. The chain and cache are empty, so
+        // catch-up returns early on the first missing output and makes no progress, forcing the
+        // stall branch.
+        let target = ConsensusHeader { number: 5, ..Default::default() };
+        consensus_bus.last_consensus_header().send_replace(Some(target.clone()));
+
+        // Subscribe before spawning so we cannot miss the coalescing gap request.
+        let mut rx_gap = consensus_bus.consensus_gap_request().subscribe();
+
+        let handle =
+            tokio::spawn(spawn_stream_consensus_headers(config, consensus_bus, consensus_chain));
+
+        // The stall must publish a gap request for the missing range within the budget.
+        tokio::time::timeout(Duration::from_secs(5), rx_gap.changed())
+            .await
+            .expect("catch-up stall did not signal a gap request in time")
+            .expect("gap request watch closed unexpectedly");
+
+        let request = *rx_gap.borrow_and_update();
+        let (_epoch, number, _hash, floor) =
+            request.expect("gap request should be Some after a stall");
+        assert_eq!(number, target.number, "gap target is the pending header number");
+        assert_eq!(floor, 1, "floor is last_consensus_height + 1 (0 + 1) for an empty chain");
+
+        handle.abort();
+        Ok(())
+    }
 }

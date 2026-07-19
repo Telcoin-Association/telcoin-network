@@ -313,7 +313,7 @@ where
 /// writes [`SyncFrame::Ack`], streams the bytes as [`SyncFrame::Data`] frames, and
 /// ends with [`SyncFrame::End`]. Reuses the epoch-pack chunk framing
 /// ([`write_pack_data_frames`]) and its [`MAX_SYNC_PACK_FRAME_SIZE`] bound, so the
-/// requester reassembles it with [`read_sync_consensus_output`]. Each frame write
+/// requester reassembles it with [`sync_pack_reader`]. Each frame write
 /// is bounded by `buffer_timeout` so a peer that stops reading cannot pin the
 /// responder task. The caller has already admitted the exchange against the
 /// concurrency caps and read the opening request frame.
@@ -359,35 +359,6 @@ where
     .await?;
     write_pack_data_frames(&mut std::io::Cursor::new(bytes), stream, buffer_timeout).await?;
     Ok(())
-}
-
-/// Reassemble the `Data`/`End` frames of an accepted consensus-output sync
-/// exchange into a contiguous byte vector, bounded to `max_bytes`.
-///
-/// The caller has already read the opening [`SyncFrame::Ack`]; this reads the
-/// `Data`/`End` stream through [`sync_pack_reader`] (so an [`SyncFrame::Err`] or an
-/// out-of-place frame surfaces as a read error). Each frame is bounded by the
-/// per-frame [`EPOCH_PACK_FRAME_TIMEOUT`] inside the reader (the analog of the
-/// legacy per-read timeout), and a stream exceeding `max_bytes` is rejected with
-/// [`std::io::ErrorKind::InvalidData`] rather than silently truncated, matching the
-/// legacy size guard.
-pub(crate) async fn read_sync_consensus_output<S>(
-    stream: S,
-    max_bytes: usize,
-) -> std::io::Result<Vec<u8>>
-where
-    S: FuturesAsyncRead + Unpin + Send + 'static,
-{
-    let mut out = Vec::new();
-    // read one byte past the cap so an over-cap stream is detected here rather than
-    // silently truncated by `take`.
-    sync_pack_reader(stream).take(max_bytes as u64 + 1).read_to_end(&mut out).await?;
-    (out.len() <= max_bytes).then_some(out).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "consensus output stream exceeded maximum size",
-        )
-    })
 }
 
 /// Serve an accepted missing-certificates sync exchange over `stream`.
@@ -768,9 +739,8 @@ mod tests {
         .await
         .expect("read ack");
         assert!(matches!(ack, SyncFrame::Ack), "first frame must be Ack");
-        let received = read_sync_consensus_output(cursor, SYNC_PACK_CHUNK_SIZE * 8)
-            .await
-            .expect("reassemble output");
+        let mut received = Vec::new();
+        sync_pack_reader(cursor).read_to_end(&mut received).await.expect("reassemble output");
         assert_eq!(received, original, "reassembled bytes must equal the served output");
     }
 
@@ -799,9 +769,8 @@ mod tests {
         .await
         .expect("read ack");
         assert!(matches!(ack, SyncFrame::Ack), "first frame must be Ack");
-        let received = read_sync_consensus_output(cursor, SYNC_PACK_CHUNK_SIZE * 8)
-            .await
-            .expect("reassemble output");
+        let mut received = Vec::new();
+        sync_pack_reader(cursor).read_to_end(&mut received).await.expect("reassemble output");
         assert!(received.is_empty(), "an empty served output reassembles to zero bytes");
     }
 
@@ -831,38 +800,6 @@ mod tests {
         assert!(
             matches!(frame, SyncFrame::Deny(DenyReason::Unavailable)),
             "an unavailable output must deny"
-        );
-    }
-
-    /// A served stream exceeding `max_bytes` is rejected rather than silently
-    /// truncated, mirroring the legacy size guard.
-    #[tokio::test]
-    async fn read_sync_consensus_output_rejects_oversize() {
-        let original: Vec<u8> = (0..(SYNC_PACK_CHUNK_SIZE + 10)).map(|i| (i % 251) as u8).collect();
-        let mut wire = Vec::new();
-        send_sync_consensus_output_over_stream(
-            &mut wire,
-            Some(original),
-            Duration::from_secs(5),
-            BlsPublicKey::default(),
-            7,
-        )
-        .await
-        .expect("serve consensus output");
-        let mut cursor = futures::io::Cursor::new(wire);
-        let (mut dec, mut comp) = (Vec::new(), Vec::new());
-        read_frame::<_, PrimarySyncRequest>(
-            &mut cursor,
-            &mut dec,
-            &mut comp,
-            MAX_SYNC_PACK_FRAME_SIZE,
-        )
-        .await
-        .expect("read ack");
-        // cap below the served size: reassembly must error, not truncate
-        assert!(
-            read_sync_consensus_output(cursor, SYNC_PACK_CHUNK_SIZE).await.is_err(),
-            "an over-cap stream must be rejected"
         );
     }
 

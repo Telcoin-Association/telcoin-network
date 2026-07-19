@@ -434,9 +434,22 @@ where
             stream_protocols,
         );
 
-        // Promote the surviving records into the local peer cache.
+        // Promote the surviving records into the local peer cache. The store's contents are
+        // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
+        // duty), so entries are restored UNPINNED and stay prunable at the first committee
+        // rotation. Our own record is skipped: both primary and worker key their record by
+        // the primary BLS key, and there is no point caching ourselves as a known peer.
+        let own_key = key_config.primary_public_key();
+        let mut restored: usize = 0;
         for (key, info) in known {
-            behavior.peer_manager.add_known_peer(key, info);
+            if key == own_key {
+                continue;
+            }
+            behavior.peer_manager.add_restored_peer(key, info);
+            restored += 1;
+        }
+        if restored > 0 {
+            info!(target: "network-kad", restored, "restored persisted kad records into the local peer cache");
         }
 
         let network_pubkey = keypair.public().into();
@@ -737,20 +750,20 @@ where
                 let _ = reply.send(Ok(()));
             }
             NetworkCommand::AddBootstrapPeers { peers, reply } => {
-                // update peer manager
+                // update peer manager: always pin bootstrap peers (even when a record already
+                // exists, e.g. restored unpinned from persistence), but never overwrite an
+                // existing record with the config-derived stub
                 let peer = &mut self.swarm.behaviour_mut().peer_manager;
                 for (bls, info) in peers {
-                    if peer.auth_to_peer(bls).is_none() {
-                        peer.add_known_peer(
-                            bls,
-                            NetworkInfo {
-                                pubkey: info.network_key,
-                                multiaddrs: vec![info.network_address],
-                                timestamp: now(),
-                                rpc: None,
-                            },
-                        );
-                    }
+                    peer.add_bootstrap_peer(
+                        bls,
+                        NetworkInfo {
+                            pubkey: info.network_key,
+                            multiaddrs: vec![info.network_address],
+                            timestamp: now(),
+                            rpc: None,
+                        },
+                    );
                 }
                 let _ = reply.send(Ok(()));
             }
@@ -1498,13 +1511,15 @@ where
 
         let GossipMessage { topic, .. } = gossip;
 
-        // ensure publisher is authorized
+        // Ensure the publisher is authorized. Semantics per topic entry:
+        //   - absent  => topic not subscribed here: reject.
+        //   - `None`  => subscribed, any publisher allowed (open topic): accept.
+        //   - `Some`  => subscribed, committee-restricted: accept only a resolved BLS key that is
+        //     in the allowlist.
         if gossip.source.is_some_and(|id| {
             let bls_key = self.swarm.behaviour().peer_manager.peer_to_bls(&id);
             self.authorized_publishers.get(topic.as_str()).is_some_and(|auth| {
-                auth.is_none()
-                    || (bls_key.is_some()
-                        && auth.as_ref().expect("is some").contains(&bls_key.expect("is some")))
+                auth.as_ref().is_none_or(|set| bls_key.is_some_and(|key| set.contains(&key)))
             })
         }) {
             GossipAcceptance::Accept
@@ -2012,6 +2027,16 @@ where
     }
 
     /// Cleanup kad record queries (called on last step).
+    ///
+    /// The winning record is promoted ONLY into the peer manager's `known_peers` cache (via
+    /// `add_discovered_peer`) and deliberately NOT written to the kad store: `known_peers` is
+    /// the read model of discovery, and the node needs the resolution, not the record.
+    /// Persisting merely-queried third-party records would enlist libp2p's `PutRecordJob` to
+    /// republish them on every replication run (hourly by libp2p default), making this node an
+    /// hourly replicator of records it never needed to serve, and would erode the store's
+    /// max-records cap — the node's DHT storage-duty budget — with query traffic. Nothing is
+    /// lost: peers push their own records on first connect (an inbound kad put handled by
+    /// [`Self::process_kad_put_request`]), which is the path that legitimately feeds the store.
     fn close_kad_query(&mut self, query_id: &QueryId) {
         if let Some(query) = self.kad_record_queries.remove(query_id) {
             if let Some(node_record) = query.result {

@@ -35,6 +35,8 @@ async fn collect_epoch_records(
 
             let number = rec.final_consensus.number;
             let hash = rec.final_consensus.hash;
+            // Don't know the output bytes so use 0.  If we could get them (already have the output)
+            // we won't need them...
             if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash) {
                 debug!(
                     target: "epoch-manager",
@@ -130,6 +132,8 @@ async fn collect_epoch_records(
     // gap (e.g. gossip arrived before the epoch record was available). We do this once
     // at the end rather than per-epoch to avoid flooding peers with concurrent requests.
     if let Some((epoch, number, hash)) = best_final_consensus {
+        // Don't know the output bytes so use 0.  If we could get them (already have the output) we
+        // won't need them...
         if consensus_bus.publish_consensus_num_hash_if_newer(epoch, number, hash) {
             info!(
                 target: "epoch-manager",
@@ -183,4 +187,191 @@ pub async fn spawn_epoch_record_collector(
         }
     });
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roaring::RoaringBitmap;
+    use std::{collections::HashMap, num::NonZeroUsize};
+    use tn_network_libp2p::types::{NetworkCommand, NetworkResponseMessage};
+    use tn_primary::{
+        network::{PrimaryRequest, PrimaryResponse},
+        ConsensusBus,
+    };
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils_committee::CommitteeFixture;
+    use tn_types::{
+        encode, BlsAggregateSignature, BlsKeypair, BlsPublicKey, BlsSignature, EpochCertificate,
+        EpochRecord, Intent, IntentMessage, IntentScope, Signer as _,
+    };
+    use tokio::sync::mpsc;
+
+    /// Aggregate an [EpochCertificate] for `record` signed by the committee
+    /// members at `signer_idx` (positions into `signers`, which parallels
+    /// `record.committee`).
+    fn make_cert(
+        record: &EpochRecord,
+        signers: &[&BlsKeypair],
+        signer_idx: &[u32],
+    ) -> EpochCertificate {
+        let epoch_hash = record.digest();
+        let intent =
+            encode(&IntentMessage::new(Intent::consensus(IntentScope::EpochBoundary), epoch_hash));
+        let sigs: Vec<BlsSignature> =
+            signer_idx.iter().map(|i| signers[*i as usize].sign(&intent)).collect();
+        let signature =
+            BlsAggregateSignature::aggregate(&sigs[..], true).expect("aggregate").to_signature();
+        let mut signed_authorities = RoaringBitmap::new();
+        for i in signer_idx {
+            signed_authorities.push(*i);
+        }
+        EpochCertificate { epoch_hash, signature, signed_authorities }
+    }
+
+    /// Spawn a mock peer network serving `(record, cert)` pairs by epoch.
+    /// Requests for epochs not in `served` drop the reply channel so the
+    /// collector sees the request fail (as when no peer has the record).
+    fn mock_epoch_record_network(
+        served: HashMap<Epoch, (EpochRecord, EpochCertificate)>,
+        peer: BlsPublicKey,
+    ) -> PrimaryNetworkHandle {
+        let (tx, mut rx) = mpsc::channel(100);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let NetworkCommand::SendRequestAny { request, reply } = cmd {
+                    let PrimaryRequest::EpochRecord { epoch: Some(epoch), .. } = request else {
+                        continue;
+                    };
+                    if let Some((record, certificate)) = served.get(&epoch) {
+                        let _ = reply.send(Ok(NetworkResponseMessage {
+                            peer,
+                            result: PrimaryResponse::EpochRecord {
+                                record: record.clone(),
+                                certificate: certificate.clone(),
+                            },
+                        }));
+                    }
+                }
+            }
+        });
+        PrimaryNetworkHandle::new_for_test(tx)
+    }
+
+    #[tokio::test]
+    async fn test_collect_epoch_records_across_ejection_epoch() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(5).expect("5 > 0"))
+            .build();
+        let auths: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<BlsPublicKey> = auths.iter().map(|a| a.primary_public_key()).collect();
+        let signers: Vec<&BlsKeypair> = auths.iter().map(|a| a.keypair()).collect();
+
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .expect("consensus chain");
+
+        // The local node already holds the sealed genesis record + cert.
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            ..Default::default()
+        };
+        let cert0 = make_cert(&rec0, &signers, &[0, 1, 2, 3]);
+        assert!(rec0.verify_with_cert(&cert0), "genesis cert must verify");
+        consensus_chain.epochs().save(rec0.clone(), cert0).await.expect("save rec0");
+
+        // Epoch 1 lost member 2 to a mid-epoch on-chain ejection (swap-and-pop),
+        // so its record carries the shrunken committee and a 3-of-4 quorum cert.
+        let shrunken = vec![keys[0], keys[1], keys[4], keys[3]];
+        let shrunken_signers = vec![signers[0], signers[1], signers[4], signers[3]];
+        let rec1 = EpochRecord {
+            epoch: 1,
+            committee: shrunken.clone(),
+            next_committee: shrunken.clone(),
+            parent_hash: rec0.digest(),
+            ..Default::default()
+        };
+        let cert1 = make_cert(&rec1, &shrunken_signers, &[0, 1, 2]);
+        assert!(rec1.verify_with_cert(&cert1), "3-of-4 cert must verify");
+        let rec2 = EpochRecord {
+            epoch: 2,
+            committee: shrunken.clone(),
+            next_committee: shrunken.clone(),
+            parent_hash: rec1.digest(),
+            ..Default::default()
+        };
+        let cert2 = make_cert(&rec2, &shrunken_signers, &[0, 1, 3]);
+
+        let served =
+            HashMap::from([(1, (rec1.clone(), cert1.clone())), (2, (rec2.clone(), cert2.clone()))]);
+        let handle = mock_epoch_record_network(served, keys[0]);
+        let consensus_bus = ConsensusBus::new();
+
+        let collected =
+            collect_epoch_records(0, &consensus_chain, &handle, consensus_bus.app()).await;
+        assert_eq!(collected, 2, "collector should fetch through the ejection epoch");
+
+        // Both records validated (parent link + ejection tolerance + shrunken
+        // quorum together) and were saved with their certs.
+        let (saved1, saved_cert1) =
+            consensus_chain.epochs().get_epoch_by_number(1).await.expect("epoch 1 saved");
+        assert_eq!(saved1, rec1);
+        assert_eq!(saved_cert1.expect("cert 1 saved"), cert1);
+        let (saved2, saved_cert2) =
+            consensus_chain.epochs().get_epoch_by_number(2).await.expect("epoch 2 saved");
+        assert_eq!(saved2, rec2);
+        assert_eq!(saved_cert2.expect("cert 2 saved"), cert2);
+    }
+
+    #[tokio::test]
+    async fn test_collect_epoch_records_rejects_below_tolerance() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(5).expect("5 > 0"))
+            .build();
+        let auths: Vec<_> = fixture.authorities().collect();
+        let keys: Vec<BlsPublicKey> = auths.iter().map(|a| a.primary_public_key()).collect();
+        let signers: Vec<&BlsKeypair> = auths.iter().map(|a| a.keypair()).collect();
+
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .expect("consensus chain");
+
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            ..Default::default()
+        };
+        let cert0 = make_cert(&rec0, &signers, &[0, 1, 2, 3]);
+        consensus_chain.epochs().save(rec0.clone(), cert0).await.expect("save rec0");
+
+        // A record claiming 3 of the 5 expected members were ejected at once:
+        // its own 2-of-2 cert verifies, but the committee is below the
+        // 4-member tolerance floor so the record must be rejected.
+        let rec1_bad = EpochRecord {
+            epoch: 1,
+            committee: vec![keys[0], keys[1]],
+            next_committee: vec![keys[0], keys[1]],
+            parent_hash: rec0.digest(),
+            ..Default::default()
+        };
+        let cert1_bad = make_cert(&rec1_bad, &[signers[0], signers[1]], &[0, 1]);
+        assert!(rec1_bad.verify_with_cert(&cert1_bad), "cert alone verifies");
+
+        let served = HashMap::from([(1, (rec1_bad.clone(), cert1_bad))]);
+        let handle = mock_epoch_record_network(served, keys[0]);
+        let consensus_bus = ConsensusBus::new();
+
+        let collected =
+            collect_epoch_records(0, &consensus_chain, &handle, consensus_bus.app()).await;
+        assert_eq!(collected, 0, "collector must stop at the invalid record");
+
+        // The rejected record was never saved.
+        assert!(consensus_chain.epochs().get_epoch_by_number(1).await.is_none());
+    }
 }

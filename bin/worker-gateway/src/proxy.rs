@@ -23,6 +23,8 @@ use axum::{
     response::Response,
 };
 use reqwest::Client;
+use serde_json::Value;
+use tn_types::{Decodable2718, PooledTransaction};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -31,11 +33,15 @@ use crate::{
     server::AppState,
 };
 
-/// Maximum request body the gateway will buffer before forwarding.
+/// Default maximum request body the gateway will buffer before forwarding.
 ///
-/// A coarse guard against unbounded memory use; PR3 (edge protections) replaces
-/// this with a configurable, metric-backed request-size limit.
+/// A guard against unbounded memory use; the effective limit is configurable
+/// via `--max-request-bytes` (this value is that flag's default).
 pub(crate) const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
+
+/// The one JSON-RPC method whose payload the gateway inspects before
+/// forwarding (a raw-transaction submission).
+const SEND_RAW_TRANSACTION: &str = "eth_sendRawTransaction";
 
 /// Marker header stamped on every forwarded request. An inbound request that
 /// already carries it has looped back through a gateway (an upstream URL or
@@ -75,6 +81,14 @@ pub(crate) async fn proxy(
              check that upstream URLs point at workers, not gateways"
         );
         return error_response(&GatewayError::LoopDetected, body.as_ref());
+    }
+
+    // Shallow pre-flight for raw-transaction submissions: reject a payload the
+    // worker would also reject (undecodable, or an EIP-4844 blob) before paying
+    // for an upstream round-trip.
+    if let Some(err) = screen_raw_transaction(body.as_ref()) {
+        warn!(target: "gateway::proxy", ?err, "rejecting eth_sendRawTransaction before forwarding");
+        return error_response(&err, body.as_ref());
     }
 
     let Some(rpc_url) = state.readiness.first_ready_rpc_url() else {
@@ -170,5 +184,132 @@ fn classify_error(err: reqwest::Error) -> GatewayError {
         GatewayError::UpstreamTimeout
     } else {
         GatewayError::UpstreamUnreachable
+    }
+}
+
+/// Shallow pre-flight for `eth_sendRawTransaction`.
+///
+/// Returns `Some(error)` only when `body` is a single `eth_sendRawTransaction`
+/// call whose raw transaction cannot be decoded, or decodes to an EIP-4844 blob
+/// transaction (which the network does not accept). Every other request —
+/// including batches, other methods, and any structurally-off submission —
+/// returns `None` and is forwarded unchanged.
+///
+/// The decode uses the same pooled wire format the worker's RPC accepts and
+/// never recovers the signer, so it cannot reject a transaction the worker
+/// would have accepted (no false rejections); it only front-runs a rejection
+/// the worker would issue anyway.
+fn screen_raw_transaction(body: &[u8]) -> Option<GatewayError> {
+    // Fast path: skip JSON parsing entirely unless the method name is present.
+    if !mentions_send_raw_transaction(body) {
+        return None;
+    }
+    let request: Value = serde_json::from_slice(body).ok()?;
+    // Single-call objects only; a batch (a JSON array) is forwarded and left to
+    // the worker to validate per element.
+    if request.get("method").and_then(Value::as_str) != Some(SEND_RAW_TRANSACTION) {
+        return None;
+    }
+    // A submission whose params are structurally off (missing / not a string)
+    // is forwarded so the worker returns its own canonical parameter error.
+    let raw_hex = request.get("params").and_then(|params| params.get(0)).and_then(Value::as_str)?;
+
+    // From here the payload is unambiguously a raw transaction, so a decode
+    // failure is a real rejection rather than a reason to forward.
+    let Some(raw) = decode_hex(raw_hex) else {
+        return Some(GatewayError::InvalidTransaction);
+    };
+    let mut buf = raw.as_slice();
+    match PooledTransaction::decode_2718(&mut buf) {
+        Err(_) => Some(GatewayError::InvalidTransaction),
+        Ok(tx) if tx.is_eip4844() => Some(GatewayError::UnsupportedTransactionType),
+        Ok(_) => None,
+    }
+}
+
+/// Whether `body` is valid UTF-8 mentioning the raw-transaction method. JSON is
+/// UTF-8 by definition, so a non-UTF-8 body is not a JSON-RPC call we inspect.
+fn mentions_send_raw_transaction(body: &[u8]) -> bool {
+    std::str::from_utf8(body).is_ok_and(|text| text.contains(SEND_RAW_TRANSACTION))
+}
+
+/// Decode a `0x`-prefixed (or bare) hex string into bytes, or `None` if it is
+/// not valid hex.
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    let trimmed = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
+    tn_types::hex::decode(trimmed).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The canonical EIP-155 example transaction (a signed legacy transfer): a
+    /// well-formed, non-blob raw transaction that must be forwarded untouched.
+    const EIP155_LEGACY_TX: &str = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
+
+    fn send_raw(params: &str) -> Vec<u8> {
+        format!(r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":{params},"id":1}}"#)
+            .into_bytes()
+    }
+
+    #[test]
+    fn valid_legacy_transaction_is_forwarded() {
+        assert!(screen_raw_transaction(&send_raw(&format!("[\"{EIP155_LEGACY_TX}\"]"))).is_none());
+    }
+
+    #[test]
+    fn undecodable_transaction_is_rejected() {
+        // Valid hex, but not a decodable transaction envelope.
+        let err = screen_raw_transaction(&send_raw(r#"["0xdeadbeef"]"#));
+        assert!(matches!(err, Some(GatewayError::InvalidTransaction)));
+    }
+
+    #[test]
+    fn blob_typed_payload_is_not_forwarded() {
+        // A type-`0x03` (EIP-4844) prefix with a truncated body cannot decode as
+        // a pooled transaction, so it is rejected rather than forwarded. Real
+        // blob submissions decode and hit the `is_eip4844` reject; either way a
+        // blob-typed payload never reaches an upstream.
+        let err = screen_raw_transaction(&send_raw(r#"["0x03c0"]"#));
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn non_hex_param_is_rejected() {
+        let err = screen_raw_transaction(&send_raw(r#"["not-hex"]"#));
+        assert!(matches!(err, Some(GatewayError::InvalidTransaction)));
+    }
+
+    #[test]
+    fn other_methods_are_forwarded() {
+        let body = br#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#;
+        assert!(screen_raw_transaction(body).is_none());
+    }
+
+    #[test]
+    fn batched_send_raw_is_forwarded() {
+        // A batch is a JSON array with no top-level "method"; it is forwarded and
+        // validated per element by the worker.
+        let body = format!(
+            r#"[{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{EIP155_LEGACY_TX}"],"id":1}}]"#
+        );
+        assert!(screen_raw_transaction(body.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn missing_params_are_forwarded() {
+        assert!(screen_raw_transaction(&send_raw("[]")).is_none());
+    }
+
+    #[test]
+    fn non_json_body_is_forwarded() {
+        // Mentions the method name but is not JSON: nothing to inspect, forward.
+        assert!(screen_raw_transaction(b"garbage eth_sendRawTransaction garbage").is_none());
+    }
+
+    #[test]
+    fn unrelated_body_skips_parsing() {
+        assert!(screen_raw_transaction(br#"{"method":"net_version","id":1}"#).is_none());
     }
 }

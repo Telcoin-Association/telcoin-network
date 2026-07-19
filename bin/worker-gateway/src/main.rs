@@ -12,6 +12,7 @@ mod cli;
 mod config;
 mod error;
 mod proxy;
+mod ratelimit;
 mod readiness;
 mod server;
 
