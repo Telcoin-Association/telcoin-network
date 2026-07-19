@@ -5,6 +5,7 @@
 
 mod basefee;
 mod common;
+mod eject;
 mod epochs;
 #[cfg(feature = "faucet")]
 mod faucet;

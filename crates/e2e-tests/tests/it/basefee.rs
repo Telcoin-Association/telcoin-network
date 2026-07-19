@@ -28,12 +28,9 @@
 //! The deterministic assertion every test makes is therefore: *a transaction that confirms inside
 //! epoch ≥ 1 produces a block whose `base_fee_per_gas` equals the configured fee.*
 
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 use alloy::providers::{Provider, ProviderBuilder};
-use jsonrpsee::rpc_params;
-use serde_json::Value;
-use tn_reth::system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS};
 use tn_types::{
     gas_accumulator::compute_next_base_fee_eip1559, get_available_tcp_port, Address,
     MIN_PROTOCOL_BASE_FEE,
@@ -42,14 +39,20 @@ use tokio::time::Instant;
 use tracing::info;
 
 use crate::common::{
-    address_from_word, call_rpc, get_balance, get_block, get_block_number, get_key, kill_child,
-    network_advancing, send_tel, start_validator, ProcessGuard,
+    address_from_word, get_balance, get_block, get_block_number, get_key,
+    get_latest_consensus_header_number, get_tx_receipt_block, kill_child, network_advancing,
+    parse_hex_u64, send_tel, start_validator, wait_for_epoch_at_least, wait_for_mid_epoch,
+    wait_for_rpc, ProcessGuard,
 };
 
-/// Epoch duration (seconds) for base-fee tests. Held at 10s independently of
-/// `epochs.rs::EPOCH_DURATION` (which #897 cut to 5s): these base-fee tests are outside that
-/// four-test scope, and 10s keeps ample margin for their epoch-boundary assertions.
-const EPOCH_DURATION: u64 = 10;
+/// Epoch duration (seconds) for the base-fee tests. 5s is the consensus minimum epoch duration;
+/// halving it from 10s (the same decoupled cut #897 applied to `epochs.rs`) roughly halves the
+/// epoch-boundary portion of each test without changing any assertion or epoch/iteration count.
+/// Every per-epoch wait scales with this value, but the restarted-node catch-up deadlines in
+/// [`test_mid_epoch_restart_recovers_static_fee`] are floored to an absolute minimum (`.max(..)`)
+/// rather than shrinking with it, because state-sync catch-up is a fixed cost independent of the
+/// epoch cadence.
+const EPOCH_DURATION: u64 = 5;
 
 /// Static fee used by the deterministic tests. A clearly non-`MIN` value so any block produced
 /// under the static strategy is unmistakable.
@@ -206,7 +209,7 @@ async fn test_eip1559_fee_rises_at_epoch_boundaries() -> eyre::Result<()> {
         let nonce = i as u128;
         // Cheap gas price is fine: the EIP-1559 fee stays tiny (single/low double digits) across
         // these few epochs. A tx that misses its deadline is FATAL: skipping an epoch lets empty
-        // 10s epochs pass (each *decreasing* the fee against `target_gas = 1`), which would
+        // 5s epochs pass (each *decreasing* the fee against `target_gas = 1`), which would
         // poison the monotonic assertion below. Every recorded epoch must land exactly one tx.
         let (block, fee) = land_cheap_tx_mid_epoch(&client_urls[0], &funded_key, to, nonce)
             .await
@@ -350,8 +353,10 @@ async fn test_mid_epoch_restart_recovers_static_fee() -> eyre::Result<()> {
         kill_idx + 1
     );
 
-    // Let the rest of the network advance while the node is down.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Let the rest of the network advance while the node is down. Event-driven (see
+    // `wait_out_downtime`) instead of a fixed 2s sleep: hold a 2s downtime floor so the restart
+    // genuinely exercises catch-up, then proceed as soon as a live peer's consensus chain moves.
+    wait_out_downtime(&client_urls, kill_idx, 2).await?;
 
     // Restart the killed node on a fresh RPC port and re-register it.
     let new_rpc_port =
@@ -364,14 +369,17 @@ async fn test_mid_epoch_restart_recovers_static_fee() -> eyre::Result<()> {
 
     // 1) The restarted node must serve the historical static-fee block with the correct fee,
     //    proving it caught up and stored the on-chain value (not MIN).
-    let recovered_fee = wait_for_block_fee(&client_urls[kill_idx], static_block, EPOCH_DURATION * 6)?
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "restarted validator-{} did not catch up to block {static_block} within {}s. Check test_logs/basefee_restart/",
-                kill_idx + 1,
-                EPOCH_DURATION * 6
-            )
-        })?;
+    // Catch-up is a fixed state-sync cost (the node was down only ~2s), so floor this deadline at
+    // 60s rather than letting it shrink with EPOCH_DURATION.
+    let recovered_fee =
+        wait_for_block_fee(&client_urls[kill_idx], static_block, (EPOCH_DURATION * 6).max(60))?
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "restarted validator-{} did not catch up to block {static_block} within {}s. Check test_logs/basefee_restart/",
+                    kill_idx + 1,
+                    (EPOCH_DURATION * 6).max(60)
+                )
+            })?;
     assert_eq!(
         recovered_fee, STATIC_FEE,
         "restarted validator-{} serves block {static_block} with fee {recovered_fee}, expected static {STATIC_FEE}",
@@ -391,12 +399,13 @@ async fn test_mid_epoch_restart_recovers_static_fee() -> eyre::Result<()> {
     // The restarted node must also serve that post-restart block at the same fee. Not reaching
     // the block within the budget is a hard failure — silently skipping the assert would let a
     // restarted node that never catches up pass the test.
-    let f = wait_for_block_fee(&client_urls[kill_idx], after_block, EPOCH_DURATION * 4)?
+    // Same fixed catch-up cost as above: floor at 40s instead of scaling with EPOCH_DURATION.
+    let f = wait_for_block_fee(&client_urls[kill_idx], after_block, (EPOCH_DURATION * 4).max(40))?
         .ok_or_else(|| {
             eyre::eyre!(
                 "restarted validator-{} did not reach post-restart block {after_block} within {}s. Check test_logs/basefee_restart/",
                 kill_idx + 1,
-                EPOCH_DURATION * 4
+                (EPOCH_DURATION * 4).max(40)
             )
         })?;
     assert_eq!(
@@ -432,18 +441,6 @@ async fn test_mid_epoch_restart_recovers_static_fee() -> eyre::Result<()> {
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-/// Minimal snapshot of an epoch's identity, its first EL block, and its duration.
-#[derive(Debug, Clone, Copy)]
-struct EpochSnapshot {
-    epoch_id: u32,
-    /// First EL block of the epoch (the block at which the committee became active). Under
-    /// skip-empty-execution this block may not exist yet; the block BEFORE it is the previous
-    /// epoch's closing block, produced exactly at the boundary.
-    block_height: u64,
-    /// The epoch's configured duration in seconds.
-    epoch_duration: u64,
-}
-
 /// Start `NUM_VALIDATORS` validators against the genesis already written under `temp_path`.
 /// Returns the guard owning the children and the per-node HTTP RPC URLs.
 fn start_testnet(temp_path: &Path, test: &str) -> (ProcessGuard, [String; NUM_VALIDATORS]) {
@@ -463,121 +460,73 @@ fn start_testnet(temp_path: &Path, test: &str) -> (ProcessGuard, [String; NUM_VA
     (guard, client_urls)
 }
 
-/// Poll a provider until its RPC answers `eth_chainId`.
-async fn wait_for_rpc<P: Provider>(provider: &P) -> eyre::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match provider.get_chain_id().await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(e) => return Err(eyre::eyre!("provider RPC never became available: {e}")),
-        }
-    }
-}
-
-/// Read the current epoch snapshot from the `ConsensusRegistry`.
-async fn current_epoch<P: Provider>(provider: &P) -> eyre::Result<EpochSnapshot> {
-    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider);
-    let info = registry.getCurrentEpochInfo().call().await?;
-    Ok(EpochSnapshot {
-        epoch_id: info.epochId,
-        block_height: info.blockHeight,
-        epoch_duration: u64::from(info.epochDuration),
-    })
-}
-
-/// Poll the `ConsensusRegistry` until the current epoch id is at least `target`, returning the
-/// snapshot of that epoch.
-async fn wait_for_epoch_at_least<P: Provider>(
-    provider: &P,
-    target: u32,
-) -> eyre::Result<EpochSnapshot> {
-    // A boundary every `EPOCH_DURATION`s; allow generous slack for CI load.
-    let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 4 * (target as u64 + 1));
-    loop {
-        let snap = current_epoch(provider).await?;
-        if snap.epoch_id >= target {
-            return Ok(snap);
-        }
-        if Instant::now() >= deadline {
-            return Err(eyre::eyre!(
-                "epoch did not reach {target} within timeout (stuck at {})",
-                snap.epoch_id
-            ));
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
-/// Wait until the host clock sits inside a measured mid-epoch window and return that epoch's
-/// snapshot.
+/// Wait out a killed node's downtime, then proceed once a live peer's consensus chain has advanced.
 ///
-/// `EpochInfo` exposes no epoch-start timestamp, but the previous epoch's closing block
-/// (`block_height - 1`) is produced exactly at the boundary, so its timestamp measures when the
-/// current epoch started (the registry records `block.number + 1` at `concludeEpoch`). All
-/// testnet nodes run on this host, which makes host-clock vs block-timestamp comparison sound.
-/// Re-checks on a bounded 1s cadence — instead of a blind sleep followed by a hard assert —
-/// until the measured phase is at least `MIN_PHASE` seconds into the epoch and at least
-/// `END_MARGIN` seconds before the next boundary.
-async fn wait_for_mid_epoch<P: Provider>(provider: &P, node: &str) -> eyre::Result<EpochSnapshot> {
-    /// Seconds past the boundary before the mid-epoch window opens.
-    const MIN_PHASE: u64 = 2;
-    /// Seconds of margin demanded before the next boundary.
-    const END_MARGIN: u64 = 4;
-
-    let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 4);
+/// Mirrors `restarts.rs::wait_for_downtime` (#897): `min_secs` is a hard floor (so the restart
+/// genuinely exercises catch-up) and the live-peer advance is only a stall-guard against the
+/// network wedging, not a substitute for the floor. The CONSENSUS header is the liveness signal
+/// because it advances every round even under skip-empty-execution, unlike EL block height, which
+/// moves only when a tx lands or an epoch closes. A fail-safe cap keeps a wedged network from
+/// hanging here rather than surfacing the stall downstream.
+async fn wait_out_downtime(
+    client_urls: &[String; NUM_VALIDATORS],
+    killed_idx: usize,
+    min_secs: u64,
+) -> eyre::Result<()> {
+    let peer_header = || {
+        client_urls
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != killed_idx)
+            .filter_map(|(_, url)| get_latest_consensus_header_number(url).ok())
+            .max()
+    };
+    let start_header = peer_header();
+    let start = Instant::now();
+    let floor = Duration::from_secs(min_secs);
+    // Fail-safe cap so a genuinely stalled network surfaces downstream instead of hanging here.
+    let cap = Duration::from_secs(min_secs * 2 + 30);
     loop {
-        let snap = current_epoch(provider).await?;
-        let boundary_block = snap.block_height.saturating_sub(1);
-        let epoch_start = read_block_timestamp(node, boundary_block)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("host clock is after the unix epoch")
-            .as_secs();
-        let phase = now.saturating_sub(epoch_start);
-        if phase >= MIN_PHASE && phase + END_MARGIN <= snap.epoch_duration {
-            info!(
-                target: "basefee-test",
-                epoch = snap.epoch_id, phase, duration = snap.epoch_duration,
-                "measured mid-epoch phase"
-            );
-            return Ok(snap);
+        let elapsed = start.elapsed();
+        let advanced = start_header.zip(peer_header()).is_some_and(|(s, now)| now > s);
+        if elapsed >= floor && advanced {
+            return Ok(());
         }
-        if Instant::now() >= deadline {
-            return Err(eyre::eyre!(
-                "no mid-epoch window observed within {}s: epoch {} at phase {phase}s of {}s",
-                EPOCH_DURATION * 4,
-                snap.epoch_id,
-                snap.epoch_duration
-            ));
+        if elapsed >= cap {
+            info!(target: "basefee-test", ?elapsed, "downtime wait hit fail-safe cap; proceeding");
+            return Ok(());
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
 /// Land a transaction priced above the static fee, mid-epoch, and return the produced block's
-/// `(number, base_fee)`. Sleeps briefly first so the tx lands mid-epoch rather than at a boundary.
+/// `(number, base_fee)`. Waits for a MEASURED mid-epoch window first (via [`wait_for_mid_epoch`],
+/// the same phase check that positions the restart kill) instead of a fixed 3s sleep, so the tx
+/// lands clear of a boundary at any epoch duration.
 async fn land_priced_tx_mid_epoch(
     node: &str,
     funded_key: &str,
     to: Address,
     nonce: u128,
 ) -> eyre::Result<(u64, u64)> {
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let provider = ProviderBuilder::new().connect_http(node.parse()?);
+    wait_for_mid_epoch(&provider, node).await?;
     land_tx_and_read_fee(node, funded_key, to, nonce, HIGH_GAS_PRICE).await
 }
 
 /// Land a cheap-gas-price transaction mid-epoch (fine while the EIP-1559 fee is tiny) and return
-/// the produced block's `(number, base_fee)`.
+/// the produced block's `(number, base_fee)`. Waits for a MEASURED mid-epoch window first (the same
+/// [`wait_for_mid_epoch`] phase check) instead of a fixed 3s sleep, so the tx lands clear of a
+/// boundary at any epoch duration.
 async fn land_cheap_tx_mid_epoch(
     node: &str,
     funded_key: &str,
     to: Address,
     nonce: u128,
 ) -> eyre::Result<(u64, u64)> {
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let provider = ProviderBuilder::new().connect_http(node.parse()?);
+    wait_for_mid_epoch(&provider, node).await?;
     land_tx_and_read_fee(node, funded_key, to, nonce, 250).await
 }
 
@@ -597,7 +546,7 @@ async fn land_tx_and_read_fee(
     // Wait for the transfer to confirm. Two epoch durations covers a tx that gets orphaned at a
     // boundary and re-injected into the next epoch. The rising balance is only the LANDING
     // signal: attribution comes from the receipt below, because the tip can move (e.g. an
-    // epoch-close block) between the 1s-granularity balance poll and a tip read, and a
+    // epoch-close block) between the sub-second-granularity balance poll and a tip read, and a
     // late-landing stale tx could satisfy the balance check.
     let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 2 + 5);
     loop {
@@ -611,50 +560,14 @@ async fn land_tx_and_read_fee(
                 EPOCH_DURATION * 2 + 5
             ));
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Poll ~4x/sec: at a 5s epoch a 1s cadence is coarse relative to block confirmation.
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
     // Exact attribution: the receipt names the block that included THIS tx.
     let block = get_tx_receipt_block(node, &tx_hash)?;
     let fee = read_base_fee(node, block)?;
     Ok((block, fee))
-}
-
-/// Fetch the receipt for `tx_hash` from `node` via `eth_getTransactionReceipt` and return the
-/// `blockNumber` it landed in.
-///
-/// Retries briefly: the balance-based landing signal and receipt indexing can race by a moment.
-fn get_tx_receipt_block(node: &str, tx_hash: &str) -> eyre::Result<u64> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let receipt: Option<HashMap<String, Value>> =
-            call_rpc(node, "eth_getTransactionReceipt", rpc_params!(tx_hash), 3, tx_hash)?;
-        if let Some(receipt) = receipt {
-            let raw = receipt.get("blockNumber").ok_or_else(|| {
-                eyre::eyre!("receipt for tx {tx_hash} on {node} has no blockNumber field")
-            })?;
-            return parse_hex_u64(raw).ok_or_else(|| {
-                eyre::eyre!(
-                    "receipt for tx {tx_hash} on {node} blockNumber is not a hex u64: {raw:?}"
-                )
-            });
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(eyre::eyre!("no receipt for confirmed tx {tx_hash} on {node} within 10s"));
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
-/// Read the `timestamp` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
-fn read_block_timestamp(node: &str, block_number: u64) -> eyre::Result<u64> {
-    let block = get_block(node, Some(block_number))?;
-    let raw = block
-        .get("timestamp")
-        .ok_or_else(|| eyre::eyre!("block {block_number} on {node} has no timestamp field"))?;
-    parse_hex_u64(raw).ok_or_else(|| {
-        eyre::eyre!("block {block_number} on {node} timestamp is not a hex u64: {raw:?}")
-    })
 }
 
 /// Read the `baseFeePerGas` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
@@ -685,11 +598,4 @@ fn wait_for_block_fee(node: &str, block_number: u64, max_secs: u64) -> eyre::Res
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-}
-
-/// Parse a JSON value that is expected to be a `0x`-prefixed hex string into a `u64`.
-fn parse_hex_u64(value: &Value) -> Option<u64> {
-    let s = value.as_str()?;
-    let hex = s.strip_prefix("0x").unwrap_or(s);
-    u64::from_str_radix(hex, 16).ok()
 }

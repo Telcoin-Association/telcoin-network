@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 mod close_epoch;
 mod run_epoch;
 mod start_epoch;
+pub use close_epoch::build_epoch_record;
 pub(crate) use run_epoch::RunEpochMode;
 
 /// Name of the process-lifetime [`TaskManager`] that owns tasks outliving any single epoch
@@ -876,10 +877,13 @@ where
         self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();
-        // The epoch-vote and consensus-output gossip topics are subscribed per epoch in
-        // `spawn_primary_network_for_epoch` with a committee-restricted publisher set (issue
-        // #912), alongside `primary_topic`, so their authorized publishers track committee
-        // rotation. They are intentionally not subscribed here in the process-lifetime path.
+        // `epoch_vote_topic` and `consensus_output_topic` are committee-only publish topics, so
+        // they are subscribed per-epoch in `spawn_primary_network_for_epoch` against a
+        // committee-restricted publisher set (alongside `primary_topic`), and intentionally not
+        // once here in the process-lifetime path. That makes the network layer drop non-committee
+        // messages before re-propagation and refreshes the authorized set on every committee
+        // rotation, rather than accepting any publisher once at node start. See issues #898 and
+        // #912.
         state_sync::spawn_epoch_record_collector(
             self.consensus_chain.clone(),
             primary_network_handle.clone(),

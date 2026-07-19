@@ -57,10 +57,24 @@ type AuthEquivocationMap = HashMap<
     TokioMutex<Option<(Epoch, Round, HeaderDigest, Option<PrimaryResponse>)>>,
 >;
 
-/// A pending consensus-result signature tally: a monotonic recency sequence (bumped every time a
-/// new distinct signer is added, used for LRU eviction) paired with the set of committee members
-/// that have signed this result. See the `consensus_certs` field and GHSA-2r5c-c4h7-gp5h.
-type ConsensusCertTally = (u64, HashSet<BlsPublicKey>);
+/// A pending consensus-result signature tally.
+///
+/// See the `consensus_certs` field, GHSA-2r5c-c4h7-gp5h, and GHSA-pvhw-9pmg-q2hg.
+#[derive(Default, Debug)]
+struct ConsensusCertTally {
+    /// Monotonic recency sequence, bumped every time a new distinct signer is added. Used for
+    /// least-recently-updated (LRU) eviction.
+    seq: u64,
+    /// The consensus number this tally is for. Used to rate-limit equivocation per
+    /// `(signer, number)`: an honest validator signs exactly one result per consensus number.
+    number: u64,
+    /// The committee members that have signed this result.
+    signers: HashSet<BlsPublicKey>,
+}
+
+/// Dedup key for an epoch vote at ingress: `(author, epoch, epoch-record hash)`. See the
+/// `epoch_votes_seen` field and issue #898.
+type EpochVoteKey = (BlsPublicKey, Epoch, EpochDigest);
 
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
@@ -83,6 +97,17 @@ pub(crate) struct RequestHandler<DB> {
     auth_last_vote: Arc<AuthEquivocationMap>,
     /// Track consensus headers until we hit a simple quorum then send on.
     consensus_certs: Arc<Mutex<HashMap<ConsensusResultDigest, ConsensusCertTally>>>,
+    /// Deduplicate epoch votes at ingress, keyed on `(author, epoch, epoch-record hash)`.
+    ///
+    /// The value is a monotonic recency sequence used to evict the least-recently-seen entry
+    /// once the map reaches [`MAX_EPOCH_VOTES`](super::MAX_EPOCH_VOTES), bounding memory
+    /// against a vote flood. A key is inserted only after its signature verifies, so this gate
+    /// skips repeated verifies of an already-accepted vote without letting a bad-signature vote
+    /// poison the slot of the real author. The `epoch` field is part of the key even though it is
+    /// not covered by the vote signature: this ensures a replay that tampers with `vote.epoch`
+    /// lands on a different key and cannot evict/pre-empt the real vote's slot. See the
+    /// `PrimaryGossip::EpochVote` handler and issue #898.
+    epoch_votes_seen: Arc<Mutex<HashMap<EpochVoteKey, u64>>>,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
 }
@@ -111,6 +136,7 @@ where
             requested_parents: Default::default(),
             auth_last_vote: Arc::new(auth_last_vote),
             consensus_certs: Default::default(),
+            epoch_votes_seen: Default::default(),
             consensus_chain,
         }
     }
@@ -210,6 +236,38 @@ where
         } else {
             self.consensus_chain.epochs().get_committee_keys(epoch).await
         }
+    }
+
+    /// True if a vote for this `(author, epoch, epoch-record)` has already been verified and
+    /// forwarded.
+    ///
+    /// Cheap read used as a pre-verify gate: an accepted vote is re-gossiped by its author on a
+    /// timer and duplicated by the gossip mesh, so this caps repeated BLS verifies of the same
+    /// valid vote. See [`RequestHandler::record_epoch_vote`] and issue #898.
+    fn epoch_vote_seen(&self, author: BlsPublicKey, epoch: Epoch, epoch_hash: EpochDigest) -> bool {
+        self.epoch_votes_seen.lock().contains_key(&(author, epoch, epoch_hash))
+    }
+
+    /// Record a verified `(author, epoch, epoch-record)` vote so later replays are dropped before
+    /// the signature check.
+    ///
+    /// Callers MUST invoke this only after [`EpochVote::check_signature`] succeeds: recording a
+    /// bad-signature vote would let a Byzantine committee publisher poison the slot of the real
+    /// author and suppress their vote. Eviction is least-recently-seen once the map reaches
+    /// [`MAX_EPOCH_VOTES`](super::MAX_EPOCH_VOTES), so a flood of distinct keys cannot grow it
+    /// without bound; a false negative after eviction only costs one extra verify (the collector
+    /// dedups per signer downstream), never a dropped honest vote.
+    fn record_epoch_vote(&self, author: BlsPublicKey, epoch: Epoch, epoch_hash: EpochDigest) {
+        let key = (author, epoch, epoch_hash);
+        let mut guard = self.epoch_votes_seen.lock();
+        let next_seq = guard.values().copied().max().unwrap_or(0) + 1;
+        if guard.len() >= super::MAX_EPOCH_VOTES && !guard.contains_key(&key) {
+            let evict = guard.iter().min_by_key(|entry| *entry.1).map(|entry| *entry.0);
+            if let Some(evict) = evict {
+                guard.remove(&evict);
+            }
+        }
+        guard.insert(key, next_seq);
     }
 
     /// Process gossip from the committee.
@@ -312,7 +370,7 @@ where
                         let guard = self.consensus_certs.lock();
                         if guard
                             .get(&consensus_result_hash)
-                            .and_then(|(_, signers)| signers.get(&key))
+                            .and_then(|tally| tally.signers.get(&key))
                             .is_some()
                         {
                             // We have already counted this signature so ignore.
@@ -329,38 +387,73 @@ where
                         // Once we have seen 1/3 + 1 committe members have signed this it should be
                         // valid.
                         enough_sigs = (committee.len() / 3) + 1;
+                        // The tally map is hard-capped so a flood of validly-signed but non-quorum
+                        // results cannot grow it without bound. The cap SCALES with committee size
+                        // (with `MAX_CONSENSUS_CERTS` as a floor): the number of Byzantine members
+                        // `f` grows with `n`, and the per-number equivocation limit below lets
+                        // those `f` members occupy at most `f *
+                        // MAX_TALLIES_PER_SIGNER_PER_NUMBER` tallies
+                        // for any one consensus number, which stays below `max_certs` for every
+                        // committee size. A fixed cap would be exceeded once `f` passed
+                        // `cap / MAX_TALLIES_PER_SIGNER_PER_NUMBER`, reactivating eviction and
+                        // reopening the GHSA-pvhw liveness residual.
+                        let max_certs = committee.len().max(super::MAX_CONSENSUS_CERTS);
                         let mut guard = self.consensus_certs.lock();
-                        // Hard-cap the tally map so a flood of validly-signed but non-quorum
-                        // results cannot grow it without bound. `consensus_certs` is cleared
-                        // wholesale on every quorum (below), so under honest operation only a few
-                        // entries are ever live (typically one, for the next consensus number).
+                        // Per-publisher equivocation limit (GHSA-pvhw-9pmg-q2hg). The cap above
+                        // bounds the map's memory; it does not protect liveness. A Byzantine member
+                        // can sign many distinct hashes for the SAME consensus number, and a flood
+                        // of those fresh digests can evict an honest tally still climbing to
+                        // quorum; honest validators gossip each result only
+                        // once, so an evicted honest signature is lost for
+                        // good and that result can never reach quorum.
                         //
+                        // An honest validator signs exactly ONE result (one hash) per consensus
+                        // number. A signer already present in `MAX_TALLIES_PER_SIGNER_PER_NUMBER`
+                        // distinct live tallies for THIS number is equivocating; drop its further
+                        // fresh digests for the number. The limit is per `(signer, number)`, NOT
+                        // per signer, so an honest validator that is the
+                        // first to gossip several consecutive un-quorumed
+                        // numbers is never throttled. Joining an existing
+                        // tally is always allowed (it never grows the map).
+                        //
+                        // Residual (documented follow-up): a single member fabricating one hash
+                        // each for many distinct FUTURE numbers is not
+                        // bounded here and is indistinguishable from an
+                        // honest validator racing ahead. See
+                        // GHSA-pvhw-9pmg-q2hg.
+                        if !guard.contains_key(&consensus_result_hash) {
+                            let signer_tallies_for_number = guard
+                                .values()
+                                .filter(|tally| {
+                                    tally.number == number && tally.signers.contains(&key)
+                                })
+                                .count();
+                            if signer_tallies_for_number >= super::MAX_TALLIES_PER_SIGNER_PER_NUMBER
+                            {
+                                return Ok(());
+                            }
+                        }
                         // Eviction is by least-recently-updated (LRU), NOT by signer count. A real
                         // consensus result is signed once by each honest validator in a burst as
                         // the network commits it, so its tally is bumped to most-recently-used on
                         // every distinct signer and is never the eviction victim while it climbs to
-                        // quorum. Evicting by fewest-signers instead would be steerable: colluding
-                        // members can co-sign fakes that carry more signers than an honest tally
-                        // still gathering its first signatures, and so evict genuine progress.
-                        // Honest validators gossip each result only once, so an evicted honest
-                        // signature is lost for good; LRU keeps the actively-updated honest tally
-                        // and evicts the stale, frozen fakes instead. See GHSA-2r5c-c4h7-gp5h.
-                        let next_seq = guard.values().map(|(seq, _)| *seq).max().unwrap_or(0) + 1;
-                        if guard.len() >= super::MAX_CONSENSUS_CERTS
-                            && !guard.contains_key(&consensus_result_hash)
-                        {
+                        // quorum. Evicting by fewest-signers instead would be steerable. See
+                        // GHSA-2r5c-c4h7-gp5h.
+                        let next_seq = guard.values().map(|tally| tally.seq).max().unwrap_or(0) + 1;
+                        if guard.len() >= max_certs && !guard.contains_key(&consensus_result_hash) {
                             let evict = guard
                                 .iter()
-                                .min_by_key(|(_, (seq, _))| *seq)
+                                .min_by_key(|(_, tally)| tally.seq)
                                 .map(|(digest, _)| *digest);
                             if let Some(evict) = evict {
                                 guard.remove(&evict);
                             }
                         }
-                        let (seq, set) = guard.entry(consensus_result_hash).or_default();
-                        *seq = next_seq;
-                        set.insert(key);
-                        sigs = set.len();
+                        let tally = guard.entry(consensus_result_hash).or_default();
+                        tally.seq = next_seq;
+                        tally.number = number;
+                        tally.signers.insert(key);
+                        sigs = tally.signers.len();
                     }
                     if sigs >= enough_sigs {
                         if self.behind_consensus(epoch, round, Some(number)).await {
@@ -385,31 +478,57 @@ where
                 }
             }
             PrimaryGossip::EpochVote(vote) => {
+                // Uniform gate ordering (issue #898): run the cheap, attacker-independent checks
+                // before the expensive BLS verify so unauthorized or duplicate votes are dropped
+                // without consuming verification resources.
+
+                // 1. Topic must match.
                 ensure!(
                     topic.to_string().eq(&tn_config::LibP2pConfig::epoch_vote_topic(
                         self.consensus_config.chain_id()
                     )),
                     PrimaryNetworkError::InvalidTopic
                 );
-                // Verify the BLS signature
-                ensure!(
-                    vote.check_signature(),
-                    PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
-                );
-                // Verify committee membership if the epoch record is available
-                if let Some((epoch_rec, _)) =
-                    self.consensus_chain.epochs().get_epoch_by_hash(vote.epoch_hash).await
-                {
+                // 2. Committee membership BEFORE crypto. An epoch vote is signed by a member of the
+                //    committee for `vote.epoch` (see `EpochVote` and `manage_epoch_votes`), so a
+                //    non-member is rejected without a signature check. `get_committee` resolves the
+                //    current/next committee synchronously (the live-voting window) and falls back
+                //    to stored epoch records for older epochs. Membership is by epoch *number*, not
+                //    `epoch_hash`, so a member's vote for a forked/alternative record is still
+                //    admitted (the collector's equivocation path needs it). A non-member yields the
+                //    benign, non-penalizing `PeerNotInCommittee` rather than the `Fatal`
+                //    `PeerNotAuthor`, which on the gossip path is charged to the honest relayer
+                //    rather than the author (GHSA-j2g4-553f-875r). Mirrors the `Consensus` arm.
+                if let Some(committee) = self.get_committee(vote.epoch).await {
                     ensure!(
-                        epoch_rec.committee.contains(&vote.public_key),
-                        PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(format!(
-                            "{} not in committee for epoch {}",
-                            vote.public_key, vote.epoch_hash
-                        )))
+                        committee.contains(&vote.public_key),
+                        PrimaryNetworkError::PeerNotInCommittee(Box::new(vote.public_key))
+                    );
+                    // 3. Drop votes already verified and forwarded for this (author, record).
+                    if !self.epoch_vote_seen(vote.public_key, vote.epoch, vote.epoch_hash) {
+                        // 4. Signature check LAST — the most expensive gate.
+                        ensure!(
+                            vote.check_signature(),
+                            PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+                        );
+                        // Record only AFTER a valid signature so a bad-signature vote cannot
+                        // poison the dedup slot for the real author.
+                        self.record_epoch_vote(vote.public_key, vote.epoch, vote.epoch_hash);
+                        // Fire-and-forget: no oneshot, no blocking.
+                        let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
+                    }
+                } else {
+                    // Committee for this epoch is not known yet (we are behind, or the epoch is
+                    // bogus). Drop without penalty and without writing request state from an
+                    // unverified, attacker-controlled epoch number; the author re-gossips its
+                    // vote and the epoch is learned via consensus / epoch-record sync.
+                    debug!(
+                        target: "primary",
+                        epoch = vote.epoch,
+                        author = ?vote.public_key,
+                        "dropping epoch vote for unknown committee epoch"
                     );
                 }
-                // Fire-and-forget: no oneshot, no blocking
-                let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
             }
         }
 
@@ -998,6 +1117,13 @@ where
     #[cfg(test)]
     pub(crate) fn consensus_certs_len(&self) -> usize {
         self.consensus_certs.lock().len()
+    }
+
+    /// Whether a tally for the given consensus-result digest is currently live. Test-only
+    /// accessor used to assert per-(signer, number) equivocation behaviour and eviction.
+    #[cfg(test)]
+    pub(crate) fn consensus_certs_has(&self, digest: &ConsensusResultDigest) -> bool {
+        self.consensus_certs.lock().contains_key(digest)
     }
 
     /// Send an epoch pack file over a stream.

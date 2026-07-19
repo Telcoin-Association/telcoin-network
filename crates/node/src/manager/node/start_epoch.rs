@@ -497,12 +497,19 @@ where
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
-        // Consensus-output and epoch-vote gossip crosses epoch boundaries: a validator rotating
-        // out (now in the previous committee) may emit late gossip, and one rotating in (in the
-        // next committee) may start early. Their authorized-publisher set is therefore the
-        // previous/current/next committee window, the same window the peer manager exempts from
-        // penalties via `update_committees`. Build it here, before the committee sets are moved
-        // into `init_network_for_epoch`.
+        // Publishers authorized for the epoch-boundary topics (`epoch_vote_topic`,
+        // `consensus_output_topic`): the previous/current/next committee window. This gossip is
+        // exactly the traffic that crosses an epoch boundary. Epoch-close votes and an epoch's
+        // final consensus output are authored by the OUTGOING committee and gossipped into the
+        // next epoch, so a current-committee-only allowlist would reject those in-flight boundary
+        // messages during rotation (and stop re-propagating them), stalling certification of the
+        // just-closed epoch; a validator rotating in may likewise start publishing early. This is
+        // the same window the peer manager already derives validator penalty-exemption from via
+        // `update_committees` (the previous/current/next slots, issue #715), so the
+        // propagation-authorization window and the penalty-exemption window agree rather than
+        // dropping gossip from a peer the scoring layer already trusts. Never-committee peers are
+        // still excluded. Built here, before the committee sets are moved into
+        // `init_network_for_epoch`. See issues #898 and #912.
         let boundary_publishers: HashSet<BlsPublicKey> = previous_committee_keys
             .iter()
             .chain(committee_keys.iter())
@@ -530,30 +537,33 @@ where
             network_handle.inner_handle().start_listening(primary_address).await?;
         }
 
-        // update the authorized publishers for gossip every epoch
+        // Update the authorized publishers for gossip every epoch. `primary_topic`,
+        // `epoch_vote_topic` and `consensus_output_topic` are all committee-only publish topics:
+        // restricting the publisher set makes the network layer (`verify_gossip`) drop messages
+        // from non-committee sources before re-propagation, and re-subscribing here every epoch
+        // refreshes the allowlist across committee rotation (the swarm overwrites the previous
+        // set). `primary_topic` uses the current committee; the two boundary topics use the wider
+        // previous/current/next window (see `boundary_publishers` above) so late gossip from a
+        // rotated-out validator and early gossip from a rotating-in one are still relayed. See
+        // issues #898 and #912.
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
                 tn_config::LibP2pConfig::primary_topic(consensus_config.chain_id()),
-                committee_keys.into_iter().collect(),
-            )
-            .await?;
-        // Restrict consensus-output and epoch-vote gossip to committee publishers (issue #912),
-        // mirroring `primary_topic` above, so a non-committee node's gossip on these topics is
-        // rejected by `verify_gossip` and never propagated. Re-subscribing every epoch keeps the
-        // publisher set tracking committee rotation. Both use the wider boundary window so late
-        // gossip from a rotated-out validator and early gossip from a rotating-in one still relay.
-        network_handle
-            .inner_handle()
-            .subscribe_with_publishers(
-                tn_config::LibP2pConfig::consensus_output_topic(consensus_config.chain_id()),
-                boundary_publishers.clone(),
+                committee_keys,
             )
             .await?;
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
                 tn_config::LibP2pConfig::epoch_vote_topic(consensus_config.chain_id()),
+                boundary_publishers.clone(),
+            )
+            .await?;
+        network_handle
+            .inner_handle()
+            .subscribe_with_publishers(
+                tn_config::LibP2pConfig::consensus_output_topic(consensus_config.chain_id()),
                 boundary_publishers,
             )
             .await?;

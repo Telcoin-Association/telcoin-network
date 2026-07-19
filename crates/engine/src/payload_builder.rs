@@ -89,10 +89,12 @@ pub fn execute_consensus_output(
             crate::metrics::ENGINE_METRICS.empty_outputs_skipped_total.increment(1);
             span.record("executed_blocks", "0");
             // Notify consensus that this round was processed (no block produced)
-            engine_update_tx.try_send((leader_round, consensus_num_hash, None)).map_err(|e| {
-                error!(target: "engine", ?e, "engine update channel send failed");
-                TnEngineError::ChannelClosed
-            })?;
+            engine_update_tx.blocking_send((leader_round, consensus_num_hash, None)).map_err(
+                |e| {
+                    error!(target: "engine", ?e, "engine update channel send failed");
+                    TnEngineError::ChannelClosed
+                },
+            )?;
             return Ok(canonical_header);
         }
 

@@ -924,6 +924,329 @@ async fn test_known_peers_pruned_on_rotation_but_pinned_survive() {
 }
 
 #[tokio::test]
+async fn test_restored_records_not_pinned_and_pruned_at_rotation() {
+    // Records restored from the persisted kad store at startup are peer-fillable third-party
+    // records (DHT storage duty), so they must NOT be pinned: the first committee rotation prunes
+    // every restored key that does not sit in a tracked slot, restoring the issue #827 bound that
+    // a pinning restore would bypass.
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([17; 32]);
+
+    let restored_a = *BlsKeypair::generate(&mut rng).public();
+    let restored_b = *BlsKeypair::generate(&mut rng).public();
+    peer_manager.add_restored_peer(restored_a, random_network_info());
+    peer_manager.add_restored_peer(restored_b, random_network_info());
+    assert!(peer_manager.auth_to_peer(restored_a).is_some(), "restored record a resolvable");
+    assert!(peer_manager.auth_to_peer(restored_b).is_some(), "restored record b resolvable");
+
+    // first rotation: only `restored_b` occupies a tracked committee slot
+    peer_manager.update_committees(HashSet::new(), HashSet::from([restored_b]), HashSet::new());
+
+    assert!(
+        peer_manager.auth_to_peer(restored_a).is_none(),
+        "restored non-member must be pruned at the first rotation"
+    );
+    assert!(
+        peer_manager.auth_to_peer(restored_b).is_some(),
+        "restored committee member must be retained"
+    );
+}
+
+#[tokio::test]
+async fn test_bootstrap_peer_pins_existing_entry_without_overwrite() {
+    // A bootstrap peer whose record was already restored (unpinned) from persistence must still
+    // be pinned — otherwise the first rotation would prune it — while the existing, possibly
+    // richer record is not overwritten by the config-derived stub.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([23; 32])).public();
+
+    // restored (unpinned) record with distinctive multiaddrs
+    let restored_info = random_network_info();
+    let restored_addrs = restored_info.multiaddrs.clone();
+    peer_manager.add_restored_peer(bls, restored_info);
+
+    // the operator's bootstrap config carries a different (stub) address for the same key
+    let bootstrap_info = random_network_info();
+    assert_ne!(restored_addrs, bootstrap_info.multiaddrs, "addresses must differ for this test");
+    peer_manager.add_bootstrap_peer(bls, bootstrap_info);
+
+    // the restored record won: no overwrite
+    let (_, multiaddrs) = peer_manager.auth_to_peer(bls).expect("bootstrap peer resolvable");
+    assert_eq!(multiaddrs, restored_addrs, "existing record must not be overwritten");
+
+    // rotate to a committee that does NOT include the bootstrap peer: it survives, pinned
+    let new_member = *BlsKeypair::generate(&mut StdRng::from_seed([99; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([new_member]), HashSet::new());
+    let (_, multiaddrs) =
+        peer_manager.auth_to_peer(bls).expect("bootstrap peer must survive rotation");
+    assert_eq!(multiaddrs, restored_addrs, "pinned entry keeps the restored record");
+}
+
+#[tokio::test]
+async fn test_discovered_peer_stale_record_ignored() {
+    // Timestamp monotonicity (defect D2): `get_record` query results bypass the store-side
+    // `is_newer_record` check entirely (close_kad_query -> add_discovered_peer), so without a
+    // cache-side guard a stale-but-valid record served as the only query response would regress
+    // a fresher `known_peers` entry.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([31; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // cache the committee member's record at timestamp T
+    let mut fresh = random_network_info();
+    fresh.timestamp = 1_000;
+    let fresh_addrs = fresh.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, fresh);
+
+    // an older record arriving via the same discovery path is dropped
+    let mut stale = random_network_info();
+    stale.timestamp = 999;
+    assert_ne!(stale.multiaddrs, fresh_addrs, "addresses must differ for this test");
+    peer_manager.add_discovered_peer(bls, stale);
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, fresh_addrs, "stale record must not regress the cached entry");
+    assert_eq!(cached.timestamp, 1_000, "cached timestamp unchanged");
+
+    // a strictly newer record applies
+    let mut newer = random_network_info();
+    newer.timestamp = 1_001;
+    let newer_addrs = newer.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, newer);
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, newer_addrs, "newer record must replace the cached entry");
+    assert_eq!(cached.timestamp, 1_001, "cached timestamp advanced");
+}
+
+#[tokio::test]
+async fn test_discovered_peer_equal_timestamp_keeps_existing() {
+    // EQUAL timestamps keep the existing entry (benign replay churn) — the same rule as the
+    // store-side `is_newer_record` check.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([37; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    let mut original = random_network_info();
+    original.timestamp = 1_000;
+    let original_addrs = original.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, original);
+
+    // a same-timestamp record with different addresses must not displace the cached entry
+    let mut replay = random_network_info();
+    replay.timestamp = 1_000;
+    assert_ne!(replay.multiaddrs, original_addrs, "addresses must differ for this test");
+    peer_manager.add_discovered_peer(bls, replay);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(
+        cached.multiaddrs, original_addrs,
+        "equal-timestamp record must keep the existing entry"
+    );
+}
+
+#[tokio::test]
+async fn test_self_advertised_stale_record_ignored() {
+    // A pushed record can pass the store-side `is_newer_record` check yet still be older than the
+    // cached entry (the cache learned a fresher record via a query result the store never saw).
+    // The committee branch of `add_self_advertised_peer` must not regress the cache.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([41; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // cache the committee member's record at timestamp T via kad discovery
+    let mut fresh = random_network_info();
+    fresh.timestamp = 1_000;
+    let fresh_addrs = fresh.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, fresh);
+
+    // a stale record pushed over the peer's own authenticated connection (source == advertised)
+    let mut stale = random_network_info();
+    stale.timestamp = 999;
+    let source: PeerId = stale.pubkey.clone().into();
+    assert_ne!(stale.multiaddrs, fresh_addrs, "addresses must differ for this test");
+    peer_manager.add_self_advertised_peer(source, bls, stale);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(
+        cached.multiaddrs, fresh_addrs,
+        "stale self-advertised record must not regress the cache"
+    );
+    assert_eq!(cached.timestamp, 1_000, "cached timestamp unchanged");
+}
+
+#[tokio::test]
+async fn test_operator_add_overwrites_newer_kad_record() {
+    // Operator-provisioned paths deliberately bypass the staleness guard: `add_known_peer`
+    // (the AddExplicitPeer handler) inserts unconditionally, so an operator can always repair a
+    // bad cached record regardless of its timestamp. In production these handlers stamp now().
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([43; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // a kad-discovered record with a high timestamp
+    let mut discovered = random_network_info();
+    discovered.timestamp = 10_000;
+    let discovered_addrs = discovered.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, discovered);
+
+    // the operator provisions the peer with a LOWER timestamp and different addresses: it wins
+    let mut operator = random_network_info();
+    operator.timestamp = 5_000;
+    let operator_addrs = operator.multiaddrs.clone();
+    assert_ne!(operator_addrs, discovered_addrs, "addresses must differ for this test");
+    peer_manager.add_known_peer(bls, operator);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, operator_addrs, "operator record must overwrite the kad record");
+    assert_eq!(cached.timestamp, 5_000, "operator record timestamp wins");
+}
+
+#[tokio::test]
+async fn test_pinned_peer_kad_record_bypasses_staleness_guard() {
+    // An operator-provisioned (pinned) entry's timestamp is a local now() provisioning stamp,
+    // not a peer-signed record timestamp, and node records are signed once at peer startup. The
+    // staleness guard must therefore not apply to pinned entries: the peer's real signed record
+    // (older stamp, but carrying rpc info and real multiaddrs) must still replace the operator
+    // stub — the flow exercised end-to-end by `test_advertise_rpc_via_kad`.
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([47; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    // the operator stub: pinned, rpc-less, stamped AFTER the peer signed its own record
+    let mut stub = random_network_info();
+    stub.timestamp = 10_000;
+    peer_manager.add_known_peer(bls, stub);
+
+    // the peer's real record arrives via kad with its startup-signed (older) timestamp
+    let (mut real, rpc) = random_network_info_with_rpc();
+    real.timestamp = 5_000;
+    let real_addrs = real.multiaddrs.clone();
+    peer_manager.add_discovered_peer(bls, real);
+
+    let cached = peer_manager.known_peers.get(&bls).expect("member record cached");
+    assert_eq!(cached.multiaddrs, real_addrs, "signed record must refresh the pinned stub");
+    assert_eq!(cached.rpc, Some(rpc), "advertised rpc must reach the cache despite older stamp");
+}
+
+/// Build a [`NetworkInfo`] like [`random_network_info`], but advertising a valid [`RpcInfo`].
+fn random_network_info_with_rpc() -> (NetworkInfo, RpcInfo) {
+    let rpc = RpcInfo {
+        http: "https://validator.example.com:8545/".parse().expect("http url"),
+        ws: Some("wss://validator.example.com:8546/".parse().expect("ws url")),
+    };
+    let mut info = random_network_info();
+    info.rpc = Some(rpc.clone());
+    (info, rpc)
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_scoped_to_current_committee() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a pinned rpc-advertising peer; pinning keeps its record through committee rotation
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([21; 32])).public();
+    let (info, rpc) = random_network_info_with_rpc();
+    peer_manager.add_known_peer(bls, info);
+
+    // known and advertising, but not a current-committee member: excluded
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "pinned non-committee peer must not appear in the snapshot"
+    );
+
+    // once the peer joins the current committee its advertised rpc is returned
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    assert_eq!(
+        peer_manager.current_committee_rpcs(),
+        vec![(bls, rpc)],
+        "current-committee member's advertised rpc must be returned"
+    );
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_excludes_previous_and_next_only_members() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let mut rng = StdRng::from_seed([22; 32]);
+
+    // rpc-advertising peers with known records, seeded only into previous and next
+    let previous_bls = *BlsKeypair::generate(&mut rng).public();
+    let next_bls = *BlsKeypair::generate(&mut rng).public();
+    let (previous_info, _) = random_network_info_with_rpc();
+    let (next_info, _) = random_network_info_with_rpc();
+    peer_manager.add_known_peer(previous_bls, previous_info);
+    peer_manager.add_known_peer(next_bls, next_info);
+    peer_manager.update_committees(
+        HashSet::from([previous_bls]),
+        HashSet::new(),
+        HashSet::from([next_bls]),
+    );
+    // isolate the call under test from anything update_committees emitted
+    collect_all_events(&mut peer_manager);
+
+    // neither the outgoing nor the incoming member appears in the snapshot
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "previous/next-only members must not appear in the snapshot"
+    );
+    // and no discovery is triggered: the current committee has no missing records
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "previous/next-only members must not trigger discovery from the snapshot call"
+    );
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_ignores_members_without_advertised_rpc() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a current-committee member with a known record that advertises no rpc
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([23; 32])).public();
+    peer_manager.add_known_peer(bls, random_network_info());
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    // isolate the call under test from anything update_committees emitted
+    collect_all_events(&mut peer_manager);
+
+    // the member advertised nothing, so it is excluded from the snapshot ...
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "member without advertised rpc must be excluded"
+    );
+    // ... and its record is known, so no futile re-discovery is triggered
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(
+        missing_events.is_empty(),
+        "a known record without rpc must not trigger discovery from the snapshot call"
+    );
+}
+
+#[tokio::test]
+async fn test_current_committee_rpcs_triggers_discovery_for_missing_records() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // a current-committee member whose node record was never discovered
+    let unknown_bls = *BlsKeypair::generate(&mut StdRng::from_seed([24; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([unknown_bls]), HashSet::new());
+    // drain the MissingAuthorities that update_committees itself emitted so the assertions
+    // below observe only what the snapshot call emits
+    collect_all_events(&mut peer_manager);
+
+    // no record means no rpc entry, but the call re-triggers kad discovery for the member
+    assert!(
+        peer_manager.current_committee_rpcs().is_empty(),
+        "member without a record has no rpc to report"
+    );
+    let events = collect_all_events(&mut peer_manager);
+    let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
+    assert!(missing_events.len() == 1, "expect one fresh missing authorities event");
+    assert_matches!(
+        missing_events.first().unwrap(),
+        PeerEvent::MissingAuthorities(missing) if *missing == [unknown_bls]
+    );
+}
+
+#[tokio::test]
 async fn test_register_outgoing_connection() {
     let mut peer_manager = create_test_peer_manager(None);
     let peer_id = PeerId::random();
