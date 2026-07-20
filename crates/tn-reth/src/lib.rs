@@ -175,6 +175,7 @@ pub mod error;
 mod evm;
 pub mod forward;
 pub mod rpc_server_args;
+pub mod snapshot;
 pub mod system_calls;
 pub mod worker;
 #[cfg(feature = "faucet")]
