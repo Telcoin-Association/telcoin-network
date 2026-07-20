@@ -455,8 +455,12 @@ where
     ///
     /// This operates on the per-epoch interface, not the swarm itself. Every epoch refreshes
     /// the previous/current/next committee membership (via [`init_network_for_epoch`]) and the
-    /// gossip publisher set so the network bans and routes against the current committee. The
-    /// listener is bound only on the initial epoch.
+    /// gossip publisher sets so the network bans and routes against the current committee. The
+    /// `primary_topic` (certificates) is restricted to the current committee, while the
+    /// `consensus_output_topic` and `epoch_vote_topic` are restricted to the previous/current/next
+    /// committee window (issue #912): both carry epoch-boundary traffic from validators rotating
+    /// out or in, so their publisher set must span the same window the peer manager exempts from
+    /// penalties. The listener is bound only on the initial epoch.
     ///
     /// Peers are dialed when this node is a CVV (it must reach the other CVVs) or when it has no
     /// connected peers; a non-committee node that already has peers does not pester the
@@ -494,14 +498,24 @@ where
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
         // Publishers authorized for the epoch-boundary topics (`epoch_vote_topic`,
-        // `consensus_output_topic`): the current committee UNION the previous one. Epoch-close
-        // votes and an epoch's final consensus output are authored by the OUTGOING committee and
-        // gossipped into the next epoch, so a current-committee-only allowlist would reject those
-        // in-flight boundary messages during rotation (and stop re-propagating them), stalling
-        // certification of the just-closed epoch. Built before `previous_committee_keys` is moved
-        // into `init_network_for_epoch` below. Never-committee peers are still excluded.
-        let boundary_publishers: HashSet<BlsPublicKey> =
-            committee_keys.iter().chain(previous_committee_keys.iter()).copied().collect();
+        // `consensus_output_topic`): the previous/current/next committee window. This gossip is
+        // exactly the traffic that crosses an epoch boundary. Epoch-close votes and an epoch's
+        // final consensus output are authored by the OUTGOING committee and gossipped into the
+        // next epoch, so a current-committee-only allowlist would reject those in-flight boundary
+        // messages during rotation (and stop re-propagating them), stalling certification of the
+        // just-closed epoch; a validator rotating in may likewise start publishing early. This is
+        // the same window the peer manager already derives validator penalty-exemption from via
+        // `update_committees` (the previous/current/next slots, issue #715), so the
+        // propagation-authorization window and the penalty-exemption window agree rather than
+        // dropping gossip from a peer the scoring layer already trusts. Never-committee peers are
+        // still excluded. Built here, before the committee sets are moved into
+        // `init_network_for_epoch`. See issues #898 and #912.
+        let boundary_publishers: HashSet<BlsPublicKey> = previous_committee_keys
+            .iter()
+            .chain(committee_keys.iter())
+            .chain(next_committee_keys.iter())
+            .copied()
+            .collect();
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
             bootstrap_peers,
@@ -528,8 +542,10 @@ where
         // restricting the publisher set makes the network layer (`verify_gossip`) drop messages
         // from non-committee sources before re-propagation, and re-subscribing here every epoch
         // refreshes the allowlist across committee rotation (the swarm overwrites the previous
-        // set). `primary_topic` uses the current committee; the two boundary topics use the
-        // current-union-previous set (see `boundary_publishers` above). See issue #898.
+        // set). `primary_topic` uses the current committee; the two boundary topics use the wider
+        // previous/current/next window (see `boundary_publishers` above) so late gossip from a
+        // rotated-out validator and early gossip from a rotating-in one are still relayed. See
+        // issues #898 and #912.
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
