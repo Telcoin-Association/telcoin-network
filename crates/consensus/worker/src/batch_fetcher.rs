@@ -10,11 +10,26 @@ use crate::{
 };
 use std::{
     collections::{BTreeSet, HashMap},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
 use tn_types::{now, Batch, BlockHash, Database, DbTxMut, Epoch, B256};
 use tracing::{debug, error, instrument};
+
+/// Minimum delay before retrying a [`BatchFetcher::fetch_for_primary`] pass that
+/// recovered no batches (locally or from a peer).
+///
+/// The retry loop is otherwise unpaced: `request_batches` returns immediately,
+/// without applying its own retry backoff, when the worker has no connected
+/// peers, so an explicit floor here keeps a no-peer (or all-peers-failed)
+/// condition from re-looping at the scheduler's full rate (see issue #865).
+const FETCH_RETRY_MIN_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Upper bound for the exponential backoff between no-progress retry passes.
+///
+/// Caps how long a persistent no-peer condition waits before re-checking, so a
+/// worker peer that (re)connects is still picked up promptly.
+const FETCH_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 /// The type to fetch batches for the primary.
@@ -151,12 +166,19 @@ impl<DB: Database> BatchFetcher<DB> {
         // preallocate hashmap
         let mut fetched_batches = HashMap::with_capacity(missing_digests.len());
 
+        // delay before re-looping after a pass that recovers nothing, so a no-peer /
+        // all-peers-failed condition backs off instead of spinning (see issue #865)
+        let mut backoff = FETCH_RETRY_MIN_BACKOFF;
+
         // loop until `missing_digests` empty
         loop {
             debug!(target: "batch_fetcher", "loop start");
             if missing_digests.is_empty() {
                 return Ok(fetched_batches);
             }
+
+            // snapshot remaining digests so a pass that recovers none can back off
+            let missing_before = missing_digests.len();
 
             // 1) fetch from local storage
             let local_before = fetched_batches.len();
@@ -177,35 +199,53 @@ impl<DB: Database> BatchFetcher<DB> {
             if let Ok(mut new_batches) = self.request_batches_from_peers(&mut missing_digests).await
             {
                 self.metrics.record_batches_fetched("remote", new_batches.len());
-                // set received_at timestamp for remote batches
-                let mut updated_new_batches = HashMap::new();
-                let mut txn = self.batch_store.write_txn().map_err(|e| {
-                    WorkerNetworkError::DBCommit(format!("Failed to retrieve write txn: {e}"))
-                })?;
 
-                // update batch timestamps and insert to db
-                //
-                // NOTE: `request_batches` already removed successful digests from
-                // `missing_digests`, so all returned batches are valid and should be stored.
-                for (digest, batch) in new_batches.iter_mut() {
-                    batch.set_received_at(now());
-                    updated_new_batches.insert(*digest, batch.clone());
-                    // also persist the batches, so they are available after restarts
-                    txn.insert::<NodeBatchesCache>(digest, batch)
-                        .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to insert batch! Node shutting down...")).map_err(|e| WorkerNetworkError::DBInsert(format!("Failed to insert: {e}")))?;
+                // Only touch the batch store when peers actually returned something. An empty
+                // response (no connected peers, or every peer failed) must not open and commit
+                // an empty write transaction on every pass (see issue #865).
+                if !new_batches.is_empty() {
+                    // set received_at timestamp for remote batches
+                    let mut updated_new_batches = HashMap::new();
+                    let mut txn = self.batch_store.write_txn().map_err(|e| {
+                        WorkerNetworkError::DBCommit(format!("Failed to retrieve write txn: {e}"))
+                    })?;
+
+                    // update batch timestamps and insert to db
+                    //
+                    // NOTE: `request_batches` already removed successful digests from
+                    // `missing_digests`, so all returned batches are valid and should be stored.
+                    for (digest, batch) in new_batches.iter_mut() {
+                        batch.set_received_at(now());
+                        updated_new_batches.insert(*digest, batch.clone());
+                        // also persist the batches, so they are available after restarts
+                        txn.insert::<NodeBatchesCache>(digest, batch)
+                            .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to insert batch! Node shutting down...")).map_err(|e| WorkerNetworkError::DBInsert(format!("Failed to insert: {e}")))?;
+                    }
+
+                    // commit db after all inserts
+                    txn.commit()
+                        .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to commit batch! Node shutting down...")).map_err(|e| WorkerNetworkError::DBCommit(format!("Failed to commit: {e}")))?;
+
+                    // add recovered batches to final collection
+                    fetched_batches
+                        .extend(updated_new_batches.iter().map(|(d, b)| (*d, (*b).clone())));
+
+                    // return if done, otherwise try again
+                    if missing_digests.is_empty() {
+                        return Ok(fetched_batches);
+                    }
                 }
+            }
 
-                // commit db after all inserts
-                txn.commit()
-                    .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to commit batch! Node shutting down...")).map_err(|e| WorkerNetworkError::DBCommit(format!("Failed to commit: {e}")))?;
-
-                // add recovered batches to final collection
-                fetched_batches.extend(updated_new_batches.iter().map(|(d, b)| (*d, (*b).clone())));
-
-                // return if done, otherwise try again
-                if missing_digests.is_empty() {
-                    return Ok(fetched_batches);
-                }
+            // Pace the retry loop: reset the backoff to the floor when this pass made progress
+            // (some digests resolved), otherwise sleep for the current backoff and grow it toward
+            // the cap. This keeps a persistent no-peer or all-peers-failed condition from spinning
+            // without delaying a pass that is still fetching batches (see issue #865).
+            if missing_digests.len() < missing_before {
+                backoff = FETCH_RETRY_MIN_BACKOFF;
+            } else {
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(FETCH_RETRY_MAX_BACKOFF);
             }
         }
     }
@@ -264,10 +304,19 @@ mod tests {
         network::WorkerNetworkHandle,
         test_utils::{create_test_batches, setup_batch_db},
     };
-    use std::collections::BTreeSet;
+    use std::{
+        collections::BTreeSet,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
     use tempfile::TempDir;
+    use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
     use tn_storage::consensus::ConsensusChain;
     use tn_types::{BlockHash, Committee, TaskManager};
+    use tokio::sync::mpsc;
 
     // ============================================================================
     // BatchFetcher Local-Only Tests
@@ -322,6 +371,65 @@ mod tests {
     }
 
     // ============================================================================
-    // BatchFetcher Partial Local + Stream Tests
+    // BatchFetcher No-Peer Backoff Test
     // ============================================================================
+
+    /// Regression test for issue #865: with batches to fetch and no connected
+    /// worker peers, `fetch_for_primary` must back off between attempts instead of
+    /// spinning at the scheduler's full rate.
+    ///
+    /// A network handle answers every `ConnectedPeers` query with an empty peer
+    /// set (the production no-peer path, where `request_batches` returns
+    /// `Ok(empty)` without applying its own retry backoff) and counts the queries.
+    /// The fetch never completes (the digests are never in the local db and no
+    /// peer ever connects), so it runs in the background and is stopped after a
+    /// fixed window; the number of `connected_peers` polls over that window must
+    /// stay small. Without the per-pass backoff this loop polls thousands of times.
+    #[tokio::test]
+    async fn test_fetch_for_primary_backs_off_without_peers() {
+        // digests that are never in the local db, so `fetch_local` cannot satisfy them
+        let batches = create_test_batches(2);
+        let digests: BTreeSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let db = setup_batch_db(&[]);
+        let temp_dir = TempDir::new().expect("temp dir");
+
+        // network handle whose `connected_peers` always reports "no peers" and counts calls
+        let (tx, mut rx) = mpsc::channel(10);
+        let task_manager = TaskManager::default();
+        let handle =
+            WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
+
+        let connected_peers_calls = Arc::new(AtomicUsize::new(0));
+        let calls = connected_peers_calls.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let NetworkCommand::ConnectedPeers { reply } = cmd {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    // no connected worker peers
+                    let _ = reply.send(vec![]);
+                }
+            }
+        });
+
+        let fetcher = BatchFetcher::new(
+            handle,
+            db,
+            ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
+                .expect("consensus chain"),
+            crate::metrics::WorkerMetrics::new_for_worker(0),
+        );
+
+        // `fetch_for_primary` retries forever while digests are missing and no peer
+        // connects, so drive it in the background and stop it after a fixed window.
+        let fetch = tokio::spawn(async move { fetcher.fetch_for_primary(digests).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        fetch.abort();
+
+        let polls = connected_peers_calls.load(Ordering::Relaxed);
+        assert!(polls > 0, "fetch loop should have attempted at least once");
+        assert!(
+            polls < 50,
+            "no-peer fetch loop should back off, but polled connected_peers {polls} times in 500ms"
+        );
+    }
 }
