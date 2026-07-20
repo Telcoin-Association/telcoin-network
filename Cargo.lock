@@ -11954,6 +11954,7 @@ dependencies = [
 name = "tn-storage"
 version = "0.1.0"
 dependencies = [
+ "alloy-rlp",
  "cfg-if",
  "crc32fast",
  "dashmap",
