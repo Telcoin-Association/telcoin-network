@@ -768,10 +768,12 @@ async fn test_network_halts_when_ejections_shrink_committee_below_tolerance() ->
     //
     // All 5 must exit — the epoch cannot close for anyone. Known residual risk: a validator
     // lagging at the boundary could in principle miss the closing commit once its peers exit
-    // first; the 4-epoch-duration bound per node absorbs realistic same-host lag, and a genuine
+    // first; the single shared 4-epoch-duration deadline (bounding all validators at once, so the
+    // total wait is independent of node count) absorbs realistic same-host lag, and a genuine
     // stall should fail the test rather than be tolerated.
-    for idx in 0..nodes.len() {
-        let status = guard.wait_for_natural_exit(idx, Duration::from_secs(EPOCH_DURATION * 4))?;
+    let exits =
+        guard.wait_for_natural_exits(0..nodes.len(), Duration::from_secs(EPOCH_DURATION * 4))?;
+    for (idx, status) in exits {
         eyre::ensure!(
             status.code() == Some(1),
             "validator index {idx} exited with {status:?}; expected the designed error exit \

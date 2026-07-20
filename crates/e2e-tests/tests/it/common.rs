@@ -23,7 +23,7 @@ use nix::{
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     fmt::Debug,
     ops::RangeInclusive,
@@ -169,44 +169,61 @@ impl ProcessGuard {
         }
     }
 
-    /// Wait (bounded) for the child at `idx` to exit on its own, without signaling it.
+    /// Wait (bounded) for every child at `indices` to exit on its own, without signaling any of
+    /// them. All not-yet-exited children are polled together each round against ONE shared
+    /// `timeout`, so the whole wait is bounded by `timeout` — not `timeout * indices.len()`, as a
+    /// sequence of per-child waits would be.
     ///
-    /// On success the child has been reaped, so its slot is cleared: `kill_all`/`Drop` signal
-    /// raw pids, and the OS may reuse a reaped child's pid, so the guard must never signal it
-    /// again. On timeout (or a `try_wait` error) the child stays guarded so `Drop` still cleans
-    /// it up, and a named-timeout error is returned.
-    pub(crate) fn wait_for_natural_exit(
+    /// On success every named child has been reaped, so its slot is cleared: `kill_all`/`Drop`
+    /// signal raw pids, and the OS may reuse a reaped child's pid, so the guard must never signal
+    /// it again. The returned `(index, status)` pairs are ordered by index. On timeout the
+    /// still-running children stay guarded so `Drop` still cleans them up, and a named-timeout
+    /// error (naming the pending children) is returned.
+    pub(crate) fn wait_for_natural_exits(
         &mut self,
-        idx: usize,
+        indices: impl IntoIterator<Item = usize>,
         timeout: Duration,
-    ) -> eyre::Result<ExitStatus> {
-        let child = self
-            .children
-            .get_mut(idx)
-            .and_then(|slot| slot.as_mut())
-            .ok_or_else(|| eyre::eyre!("no child process at index {idx}"))?;
-
-        // `wait_until_blocking` takes an `Fn` closure, but `try_wait` needs `&mut Child`, so
-        // thread the borrow through a `RefCell` (the poll loop is single-threaded).
-        let child = RefCell::new(child);
-        let status = Cell::new(None);
-        wait_until_blocking(timeout, &format!("child {idx} to exit on its own"), || {
-            match child.borrow_mut().try_wait()? {
-                Some(exit) => {
-                    status.set(Some(exit));
-                    Ok(true)
-                }
-                None => Ok(false),
+    ) -> eyre::Result<Vec<(usize, ExitStatus)>> {
+        let want: Vec<usize> = indices.into_iter().collect();
+        for &idx in &want {
+            if self.children.get(idx).and_then(|slot| slot.as_ref()).is_none() {
+                return Err(eyre::eyre!("no child process at index {idx}"));
             }
+        }
+
+        // `wait_until_blocking` takes an `Fn` closure, but `try_wait` needs `&mut Child`, so thread
+        // the children and the collected exit statuses through `RefCell`s (the poll loop is
+        // single-threaded). Polling every not-yet-exited child on each round lets one shared
+        // deadline cover them all.
+        let children = RefCell::new(&mut self.children);
+        let exits: RefCell<HashMap<usize, ExitStatus>> = RefCell::new(HashMap::new());
+        let description = format!("children {want:?} to exit on their own");
+        wait_until_blocking(timeout, &description, || {
+            let mut children = children.borrow_mut();
+            let mut exits = exits.borrow_mut();
+            for &idx in &want {
+                if exits.contains_key(&idx) {
+                    continue;
+                }
+                if let Some(child) = children[idx].as_mut() {
+                    if let Some(status) = child.try_wait()? {
+                        exits.insert(idx, status);
+                    }
+                }
+            }
+            Ok(exits.len() == want.len())
         })?;
 
-        // The child is reaped; clear its slot so `kill_all`/`Drop` never signal a
-        // possibly-reused pid.
-        self.children[idx] = None;
-
-        status.get().ok_or_else(|| {
-            eyre::eyre!("child {idx} exit status not captured despite exit condition holding")
-        })
+        // Every requested child is reaped; clear its slot so `kill_all`/`Drop` never signal a
+        // possibly-reused pid. The `children` borrow of `self.children` has already ended here —
+        // its last use was inside the poll closure above — so the Vec can be mutated directly.
+        let exits = exits.into_inner();
+        for &idx in exits.keys() {
+            self.children[idx] = None;
+        }
+        let mut statuses: Vec<(usize, ExitStatus)> = exits.into_iter().collect();
+        statuses.sort_by_key(|&(idx, _)| idx);
+        Ok(statuses)
     }
 }
 
@@ -900,16 +917,25 @@ pub(crate) async fn loop_epochs(
 
     let mut last_epoch_block_height = current_epoch_info.blockHeight;
     for i in start..start + iterations {
-        // poll until the epoch changes, with a generous timeout for parallel test load
+        // Poll until the epoch changes, with a generous timeout for parallel test load. Capture
+        // the changed `EpochInfo` from inside the poll (via `RefCell`, since `wait_until` takes
+        // an `Fn` closure) so the boundary is read exactly once instead of fetched again after.
+        let observed: RefCell<Option<ConsensusRegistry::EpochInfo>> = RefCell::new(None);
         wait_until(
             Duration::from_secs(epoch_duration * 4),
             &format!("epoch to change on iteration {i}"),
             || async {
-                Ok(consensus_registry.getCurrentEpochInfo().call().await? != current_epoch_info)
+                let info = consensus_registry.getCurrentEpochInfo().call().await?;
+                let changed = info != current_epoch_info;
+                if changed {
+                    *observed.borrow_mut() = Some(info);
+                }
+                Ok(changed)
             },
         )
         .await?;
-        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
+        let new_epoch_info =
+            observed.into_inner().expect("wait_until returned Ok, so a changed epoch was observed");
 
         assert!(new_epoch_info.blockHeight > last_epoch_block_height);
         assert_eq!(new_epoch_info.epochDuration as u64, epoch_duration);
