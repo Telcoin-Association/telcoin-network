@@ -810,9 +810,11 @@ pub(crate) fn config_committee(
         "--dev-funded-account",
         "test-source",
         "--max-header-delay-ms",
-        "1000",
-        "--min-header-delay-ms",
         "500",
+        "--min-header-delay-ms",
+        "250",
+        "--max-batch-delay-ms",
+        "250",
     ]);
     create_committee_command.args.execute(shared_genesis_dir.to_path_buf())?;
 
