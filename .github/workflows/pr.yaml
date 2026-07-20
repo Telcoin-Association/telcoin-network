@@ -147,18 +147,57 @@ jobs:
           fi
           echo "rocksdb absent from the default feature graph"
 
+  # Compile the exact feature shapes shipped in release images (see Makefile and
+  # etc/Dockerfile: mainnet = no features, devnet = faucet only, testnet = adiri only).
+  # Clippy's --all-features never compiles these shapes individually, so cfg-gated
+  # code can break a shipped build without failing CI.
+  feature-matrix:
+    needs: skip-maintainers
+    if: >-
+      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
+      github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: mainnet
+            features: ""
+          - name: faucet
+            features: "--features faucet"
+          - name: adiri
+            features: "--features adiri"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          shared-key: feature-${{ matrix.name }}-cache
+          cache-on-failure: "true"
+
+      - name: Check ${{ matrix.name }} feature shape
+        run: cargo check --locked -p telcoin-network --bin telcoin-network ${{ matrix.features }}
+
   # Gate job for branch protection - depends on all checks
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, clippy, test, rocksdb-gate]
+    needs: [fmt, clippy, test, feature-matrix, rocksdb-gate]
     steps:
       - name: Check all jobs passed
         run: |
           if [[ "${{ needs.fmt.result }}" == "failure" || \
                 "${{ needs.clippy.result }}" == "failure" || \
                 "${{ needs.test.result }}" == "failure" || \
+                "${{ needs.feature-matrix.result }}" == "failure" || \
                 "${{ needs.rocksdb-gate.result }}" == "failure" ]]; then
             echo "One or more checks failed"
             exit 1

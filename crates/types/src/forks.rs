@@ -6,20 +6,23 @@ use alloy::primitives::{b256, B256};
 
 /// Keccak-256 hash of the pre-fork `ConsensusRegistry` runtime bytecode deployed on the live
 /// adiri testnet (the registry account's `code` in the committed
-/// `chain-configs/testnet/genesis.yaml`).
+/// `chain-configs/testnet/genesis.yaml`); the devnet genesis deploys this same bytecode.
 ///
 /// This constant pins the code the [`CONSENSUS_REGISTRY_FORK_EPOCH`] upgrade expects to find
 /// on-chain, and is load-bearing in two places (both in `tn-reth::evm::block`):
-/// - **Legacy-read routing:** while the deployed registry still carries this code, the
-///   epoch-conclusion path reads the committee-eligible pool via the pre-fork `getValidators(uint8)
-///   -> ValidatorInfo[]` ABI instead of the post-fork `getValidatorsInfo` queries, so pre-fork
-///   epoch closes (fresh-node onboarding, full resync) execute byte-identically to the historical
-///   chain.
-/// - **Fail-closed swap gate:** the in-place code swap at the fork boundary refuses to run over any
-///   deployment whose code hash differs from this value, rather than migrating over an unknown
-///   storage layout.
+/// - **Legacy-read routing** (every build, all feature sets): while the deployed registry still
+///   carries this code, the epoch-conclusion path reads the committee-eligible pool via the
+///   pre-fork `getValidators(uint8) -> ValidatorInfo[]` ABI instead of the post-fork
+///   `getValidatorsInfo` queries, so pre-fork epoch closes (fresh-node onboarding, full resync,
+///   every devnet epoch close) execute byte-identically to the historical chain. The routing is a
+///   pure function of the deployed code hash and must never be feature-gated: devnet runs this
+///   registry on a non-adiri build.
+/// - **Fail-closed swap gate** (`adiri` builds only): the in-place code swap at the fork boundary
+///   refuses to run over any deployment whose code hash differs from this value, rather than
+///   migrating over an unknown storage layout.
 ///
-/// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
+/// Unconditional (not `adiri`-gated) — like the legacy-read routing it drives — so the pin test
+/// guarding it runs in default-feature CI.
 pub const CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH: B256 =
     b256!("0x5318ebc5cd8123cfb0808fac0f3c0b95ed6f45f67c0853fea0766b52035fea53");
 

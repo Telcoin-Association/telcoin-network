@@ -25,9 +25,6 @@ pub use manager::{
     DerivedBaseFees,
 };
 
-#[cfg(test)]
-use tempfile as _;
-
 /// Launch all components for the node.
 ///
 /// Worker, Primary, and Execution.
@@ -131,7 +128,9 @@ impl EngineToPrimary for EngineToPrimaryRpc {
 
 #[cfg(test)]
 mod clippy {
+    use clap as _;
     use rand as _;
+    use tempfile as _;
     use tn_network_types as _;
     use tn_test_utils as _;
 }

@@ -493,13 +493,15 @@ where
     fn read_committee_eligible_pool(
         &mut self,
     ) -> TnRethResult<Vec<ConsensusRegistry::ValidatorInfo>> {
-        // While the deployed registry still carries the pre-fork adiri code, `getValidatorsInfo`
-        // does not exist on-chain — speak the legacy ABI instead. This keeps every pre-fork epoch
-        // close (fresh-node onboarding, full resync, a fork-capable build deployed before
-        // `CONSENSUS_REGISTRY_FORK_EPOCH`) executing byte-identically to the historical chain. At
-        // the fork boundary `apply_consensus_registry_fork` swaps the code first, so this gate
-        // already sees the upgraded hash and takes the post-fork read below.
-        #[cfg(feature = "adiri")]
+        // While the deployed registry still carries the pre-fork code, `getValidatorsInfo` does
+        // not exist on-chain — speak the legacy ABI instead. This keeps every pre-fork epoch
+        // close (fresh-node onboarding, full resync, a build deployed before
+        // `CONSENSUS_REGISTRY_FORK_EPOCH`) executing byte-identically to the historical chain.
+        // The routing is a pure function of the deployed registry's code hash, not of the build:
+        // every build must speak the legacy ABI against a pre-fork registry (devnet runs one on a
+        // non-adiri binary), so this gate must never be feature-gated. On adiri builds the fork
+        // boundary's `apply_consensus_registry_fork` swaps the code first, so this gate already
+        // sees the upgraded hash and takes the post-fork read below.
         if self.registry_code_is_pre_fork()? {
             return self.read_committee_eligible_pool_legacy();
         }
@@ -524,7 +526,7 @@ where
         Ok(all_active_validators)
     }
 
-    /// Whether the deployed `ConsensusRegistry` still carries the pre-fork adiri runtime code.
+    /// Whether the deployed `ConsensusRegistry` still carries the pre-fork runtime code.
     ///
     /// Compares the registry account's code hash against the pinned
     /// [`tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]. A pure `basic()` read: the
@@ -535,7 +537,6 @@ where
     /// A DB error propagates as an error; only a genuinely absent account (impossible on any real
     /// TN chain) falls through to the default (non-pre-fork) hash. An infra failure must never be
     /// silently read as "not V1".
-    #[cfg(feature = "adiri")]
     fn registry_code_is_pre_fork(&mut self) -> TnRethResult<bool> {
         // revm `Database` trait provides `basic`; imported anonymously to avoid clashing with the
         // `alloy_evm::Database` already in module scope.
@@ -566,7 +567,6 @@ where
     /// same calldata bytes the pre-fork node sent; the pre-fork `ValidatorInfo[]` return payload
     /// is decoded directly via `SolValue` (the struct layout is byte-identical across the fork),
     /// bypassing the binding's post-fork `address[]` return type.
-    #[cfg(feature = "adiri")]
     fn read_committee_eligible_pool_legacy(
         &mut self,
     ) -> TnRethResult<Vec<ConsensusRegistry::ValidatorInfo>> {

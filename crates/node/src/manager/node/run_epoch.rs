@@ -25,7 +25,7 @@ use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
     gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator, WorkerFeeConfig},
-    BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase,
+    BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
     EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::sync::mpsc;
@@ -224,8 +224,14 @@ where
             let mut replay = self.replay_missed_consensus(committee, to_engine).await?;
             if let Some(target_hash) = replay.take_epoch_close_hash() {
                 // If things go down at exactly the wrong time we might have to replay the epoch end
-                // so account for that.
+                // so account for that. The record write matches the live boundary arm below and
+                // covers the persisted-but-unexecuted crash window (the closing output is
+                // replayed on restart). A crash AFTER the closing block executed but BEFORE the
+                // record write leaves nothing to replay — that residual window is not healed
+                // here and relies on the peer fetch in `open_epoch_pack` (see its missing-record
+                // branch).
                 self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
+                self.write_epoch_record(entered, engine).await?;
                 self.clear_consensus_db_for_next_epoch()?;
                 return Ok(RunEpochMode::NewEpoch);
             }
@@ -361,7 +367,7 @@ where
                 .await?;
 
                 // Write the epoch record to DB and save in manager for next epoch.
-                self.write_epoch_record(&primary, engine).await?;
+                self.write_epoch_record(current_epoch, engine).await?;
 
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
                 epoch_boundary_reached = true;
@@ -414,8 +420,13 @@ where
             self.send_leftover_consensus_output_to_engine(&mut consensus_output, to_engine).await
         {
             // If things go down at exactly the wrong time we might have reached the epoch end
-            // so account for that.
+            // so account for that. The record write matches the live boundary arm above (the
+            // drain stashed the closing header) and covers the persisted-but-unexecuted crash
+            // window. A crash AFTER the closing block executed but BEFORE the record write
+            // leaves nothing to drain — that residual window is not healed here and relies on
+            // the peer fetch in `open_epoch_pack` (see its missing-record branch).
             self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
+            self.write_epoch_record(entered, engine).await?;
             res = RunEpochMode::NewEpoch;
             clear_tables_for_next_epoch = true;
         } else {
@@ -449,8 +460,8 @@ where
         let current_epoch = committee.epoch();
         let previous_epoch = current_epoch.saturating_sub(1);
         let previous_epoch_rec =
-            self.consensus_chain.epochs().record_by_epoch(previous_epoch).await;
-        let previous_epoch_rec = if let Some(rec) = previous_epoch_rec {
+            self.consensus_chain.epochs().get_epoch_by_number(previous_epoch).await;
+        let previous_epoch_rec = if let Some((rec, cert)) = previous_epoch_rec {
             // Even when the record is found, proactively trigger the epoch record
             // collector so it backfills any epoch certs that are missing (e.g. when
             // quorum failed AND the peer-fetch in manage_epoch_votes also failed because
@@ -460,6 +471,15 @@ where
             // keep the higher value so the collector retries that epoch too.
             let current = *self.consensus_bus.requested_missing_epoch().borrow();
             self.consensus_bus.requested_missing_epoch().send_replace(current.max(previous_epoch));
+            if previous_epoch > 0 && cert.is_none() {
+                // The record exists but its certificate never formed (e.g. the whole committee
+                // closed the epoch through a restart-recovery path, so the original vote window
+                // was missed). Re-publish the record so the node-lifetime vote collector votes
+                // and collects again — idempotent within a process, and makes retro cert
+                // formation retryable by restarting the node. Epoch 0's unsigned dummy record is
+                // excluded: it is never certified.
+                self.consensus_bus.epoch_record_watch().send_replace(Some(rec.clone()));
+            }
             rec
         } else if previous_epoch == 0 {
             EpochRecord {
@@ -600,6 +620,26 @@ where
                     epoch_boundary=?self.epoch_boundary,
                     "epoch boundary detected",
                 );
+                // TEST-ONLY HOOK: when `TN_TEST_EXIT_AFTER_BOUNDARY_PERSIST` is set to an epoch
+                // number and this boundary closes an epoch at or past it, exit immediately.
+                // Exiting here leaves the boundary output persisted in the consensus DB (the
+                // subscriber saves before broadcasting) but never forwarded to the engine — the
+                // exact persisted-but-unexecuted crash shape the replay arm recovers;
+                // `process::exit` skips Drop flushes to mimic SIGKILL. Deliberately a runtime
+                // env check read inline (cold path, once per epoch) with NO cfg/feature gate, so
+                // the hook compiles identically in every build shape and unset means
+                // byte-identical default behavior.
+                let test_exit_at_boundary = std::env::var("TN_TEST_EXIT_AFTER_BOUNDARY_PERSIST")
+                    .ok()
+                    .and_then(|min_epoch| min_epoch.parse::<Epoch>().ok())
+                    .is_some_and(|min_epoch| output.leader().epoch() >= min_epoch);
+                if test_exit_at_boundary {
+                    warn!(
+                        target: "epoch-manager",
+                        "TN_TEST_EXIT_AFTER_BOUNDARY_PERSIST set - exiting before forwarding epoch boundary output (test hook)"
+                    );
+                    std::process::exit(0);
+                }
                 // update output so engine closes epoch
                 output.set_epoch_close();
 
@@ -1130,5 +1170,400 @@ mod tests {
         assert_eq!(check_output_continuity(5, u64::MAX), OutputContinuity::Gap);
         // overflow safety at the top of the range
         assert_eq!(check_output_continuity(u64::MAX, u64::MAX), OutputContinuity::Stale);
+    }
+}
+
+/// Regression tests for the crash-at-boundary recovery paths.
+///
+/// Every `close_epoch(None, ..)` recovery shape (replay-and-close, leftover-drain) must leave
+/// the closed epoch's finalized [`EpochRecord`] behind, exactly as the live boundary arm does.
+/// Skipping the record write — or skipping the `last_consensus_header` stash the write depends
+/// on — leaves every recovering node recordless, and the NEXT epoch's `open_epoch_pack` then
+/// wedges on "Missing previous epoch record" (fatally fleet-wide when the whole committee
+/// crashes at the boundary at once).
+#[cfg(test)]
+mod recovery_tests {
+    use super::RunEpochMode;
+    use crate::{
+        engine::{ExecutionNode, TnBuilder},
+        manager::{build_epoch_record, EpochManager},
+        metrics::EpochMetrics,
+    };
+    use clap::Parser as _;
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        path::PathBuf,
+        sync::Arc,
+        time::Duration,
+    };
+    use tempfile::TempDir;
+    use tn_config::{
+        Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs as _,
+    };
+    use tn_engine::ExecutorEngine;
+    use tn_primary::{ConsensusBusApp, QueChannel};
+    use tn_reth::{
+        test_utils::{create_committee_from_state, test_genesis_with_consensus_registry},
+        RethChainSpec, RethCommand, RethConfig, RethEnv,
+    };
+    use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
+    use tn_types::{
+        gas_accumulator::GasAccumulator, AuthorityIdentifier, BlsKeypair, BlsSignature,
+        Certificate, CommittedSubDag, Committee, ConsensusHeaderDigest, ConsensusNumHash,
+        ConsensusOutput, Notifier, ReputationScores, SignatureVerificationState, TaskManager,
+        TimestampSec, TnSender as _,
+    };
+    use tokio::{sync::mpsc, time::timeout};
+
+    /// Everything the recovery regression tests need: a registry-backed chain, a real
+    /// [`ExecutionNode`] over it, the chain-derived epoch-0 committee (also written to the
+    /// datadir so `run_epoch`'s epoch-0 committee load finds it), and an [`EpochManager`]
+    /// wired to that state.
+    struct RecoveryHarness {
+        /// Keeps the temp datadir alive for the test's lifetime.
+        _tmp: TempDir,
+        /// Keeps reth-env and engine background tasks alive for the test's lifetime.
+        task_manager: TaskManager,
+        chain: Arc<RethChainSpec>,
+        reth_env: RethEnv,
+        engine: ExecutionNode,
+        committee: Committee,
+        gas_accumulator: GasAccumulator,
+        manager: EpochManager<PathBuf, MemDatabase>,
+    }
+
+    async fn recovery_harness(prefix: &str) -> eyre::Result<RecoveryHarness> {
+        let tmp = TempDir::with_prefix(prefix)?;
+        let datadir = tmp.path().to_path_buf();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
+
+        let task_manager = TaskManager::new("epoch record recovery test");
+        let gas_accumulator = GasAccumulator::new(1);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp.path().join("reth"),
+            &task_manager,
+            Some(gas_accumulator.rewards_counter()),
+        )?;
+
+        // chain-derived epoch-0 committee, written where run_epoch's epoch-0 FS load reads it
+        let committee =
+            create_committee_from_state(reth_env.epoch_state_from_canonical_tip()?).await?;
+        Config::write_to_path(datadir.committee_path(), &committee, ConfigFmt::YAML)?;
+
+        // Minimal TnBuilder: the recovery paths under test never read `node_config` or
+        // `reth_db`, but the manager struct requires them. The clap-default RethCommand
+        // mirrors how tn-test-utils builds its test config.
+        let node_config = RethConfig::new(
+            RethCommand::try_parse_from(["reth-args"])?,
+            None,
+            tmp.path().join("unused-datadir"),
+            true,
+            chain.clone(),
+        );
+        let reth_db = RethEnv::new_database(&node_config, tmp.path().join("unused-db"))?;
+        let tn_config = Config::default_for_test_with_genesis(chain.genesis().clone());
+        let gc_depth = tn_config.parameters.gc_depth;
+        let builder = TnBuilder {
+            node_config,
+            tn_config,
+            metrics: None,
+            healthcheck: None,
+            reth_db: reth_db.clone(),
+            exex_fns: vec![],
+        };
+        let engine = ExecutionNode::new(&builder, reth_env.clone())?;
+
+        let records_dir = tmp.path().join("records");
+        std::fs::create_dir_all(&records_dir)?;
+        let consensus_chain = ConsensusChain::new_for_test(records_dir, committee.clone()).await?;
+
+        let manager = EpochManager {
+            builder,
+            tn_datadir: datadir,
+            primary_network_handle: None,
+            worker_network_handle: None,
+            key_config: KeyConfig::new_with_testing_key(BlsKeypair::generate(
+                &mut StdRng::seed_from_u64(0),
+            )),
+            node_shutdown: Notifier::new(),
+            epoch_boundary: 0,
+            network_initialized: false,
+            reth_db,
+            consensus_db: MemDatabase::default(),
+            consensus_bus: ConsensusBusApp::new_with_recent_blocks(gc_depth),
+            worker_event_stream: QueChannel::new(),
+            last_consensus_header: None,
+            last_forwarded_consensus_number: 0,
+            consensus_chain,
+            bootstrap_servers: BTreeMap::new(),
+            version_str: "recovery-test",
+            metrics: EpochMetrics::default(),
+        };
+
+        Ok(RecoveryHarness {
+            _tmp: tmp,
+            task_manager,
+            chain,
+            reth_env,
+            engine,
+            committee,
+            gas_accumulator,
+            manager,
+        })
+    }
+
+    /// A committed epoch-0 consensus output with a controllable commit timestamp.
+    ///
+    /// Mirrors the IT harness's `manual_consensus_output`: a single-cert subdag whose leader
+    /// carries a verified (default) BLS signature so the engine can derive randomness, plus an
+    /// explicit author so the empty-close synthetic block can resolve the leader's execution
+    /// address through the rewards counter's committee.
+    fn committed_output(
+        leader_id: &AuthorityIdentifier,
+        number: u64,
+        created_at: TimestampSec,
+    ) -> ConsensusOutput {
+        let mut leader = Certificate::default();
+        leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+            BlsSignature::default(),
+        ));
+        leader.update_header_round_for_test(number as u32);
+        leader.update_header_epoch_for_test(0);
+        leader.update_header_created_at_for_test(created_at);
+        leader.update_header_author_for_test(leader_id.clone());
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            number,
+            ReputationScores::default(),
+            None,
+        );
+        ConsensusOutput::new(
+            sub_dag,
+            ConsensusHeaderDigest::default(),
+            number,
+            false,
+            VecDeque::new(),
+            vec![],
+        )
+    }
+
+    /// R1 + R2: the `run_epoch` replay-and-close arm writes the closed epoch's record, and
+    /// that record is identical (digest included) to what the live boundary path would build
+    /// from the same state.
+    ///
+    /// Crash shape: consensus committed the epoch-closing output to the consensus chain but
+    /// the engine never executed it. On restart, `run_epoch` (`Initial`) replays it, detects
+    /// the boundary, closes the epoch, and — the fix under test — writes the [`EpochRecord`].
+    ///
+    /// Fails if reverted:
+    /// - run_epoch.rs replay-and-close arm's `self.write_epoch_record(entered, engine)` call: only
+    ///   the unsigned epoch-0 dummy record remains, so the `final_consensus` assertion fails.
+    /// - start_epoch.rs `replay_missed_consensus` stash of `self.last_consensus_header` on the
+    ///   epoch-close output: `write_epoch_record` panics on "epoch was finished with last consensus
+    ///   header".
+    /// - close_epoch.rs `write_epoch_record(epoch: Epoch, ..)` signature back to
+    ///   `&PrimaryNode<DB>`: the recovery arm has no primary, so the record write cannot exist on
+    ///   this path (compile failure).
+    #[tokio::test]
+    async fn replay_and_close_recovery_writes_boundary_epoch_record() -> eyre::Result<()> {
+        let mut h = recovery_harness("replay_close_record").await?;
+
+        // the exact boundary run_epoch derives: epoch_start + epochDuration
+        let state = h.reth_env.epoch_state_from_canonical_tip()?;
+        let boundary = state.epoch_start + state.epoch_info.epochDuration as u64;
+
+        // consensus committed the epoch-closing output; execution never ran (the crash window)
+        let leader_id = h.committee.authorities().first().expect("committee authority").id();
+        let closing_output = committed_output(&leader_id, 1, boundary + 1);
+        let closing_hash = closing_output.consensus_header_hash();
+        h.manager.consensus_chain.save_consensus_output(closing_output).await?;
+        assert!(
+            h.manager.consensus_chain.epochs().record_by_epoch(0).await.is_none(),
+            "precondition: no epoch-0 record before recovery",
+        );
+
+        // live engine wiring: replay forwards the stored output to a real ExecutorEngine whose
+        // updates feed wait_for_consensus_execution (mirrors EpochManager::run's setup)
+        let (to_engine, from_consensus) = mpsc::channel(10);
+        let (engine_update_tx, engine_update_rx) = mpsc::channel(64);
+        let engine_shutdown = Notifier::default();
+        let executor = ExecutorEngine::new(
+            h.reth_env.clone(),
+            None,
+            from_consensus,
+            h.chain.sealed_genesis_header(),
+            engine_shutdown.subscribe(),
+            h.task_manager.get_spawner(),
+            h.gas_accumulator.clone(),
+            engine_update_tx,
+        );
+        h.task_manager.spawn_task("recovery engine", async move {
+            let _ = executor.run().await;
+            Ok(())
+        });
+        h.manager.spawn_engine_update_task(engine_update_rx, &h.task_manager);
+
+        // drive the replay-and-close arm end to end
+        let mode = timeout(
+            Duration::from_secs(60),
+            h.manager.run_epoch(
+                &h.engine,
+                &NetworkConfig::default(),
+                &to_engine,
+                RunEpochMode::Initial,
+                h.gas_accumulator.clone(),
+            ),
+        )
+        .await??;
+        assert!(matches!(mode, RunEpochMode::NewEpoch), "replay-and-close crosses the boundary");
+
+        // R1: the closed epoch's record exists and its final_consensus pins the closing output
+        let (record, _cert) = h
+            .manager
+            .consensus_chain
+            .epochs()
+            .get_epoch_by_number(0)
+            .await
+            .expect("replay-and-close recovery must leave epoch 0's record");
+        assert_eq!(record.epoch, 0);
+        assert_eq!(
+            record.final_consensus,
+            ConsensusNumHash::new(1, closing_hash),
+            "record's final_consensus must be the closing output's number/digest (proves the \
+             replay stashed last_consensus_header)",
+        );
+        assert!(record.final_state.number >= 1, "record pins the executed closing block");
+
+        // R2: identical (digest included) to the record the live boundary path would build
+        // from the same state
+        let expected = build_epoch_record(
+            0,
+            h.engine.validators_for_epoch(0).await?,
+            h.engine.validators_for_epoch(1).await?,
+            None,
+            h.manager.consensus_bus.latest_execution_block_num_hash(),
+            ConsensusNumHash::new(1, closing_hash),
+        )?;
+        assert_eq!(record, expected, "recovery record must equal the live-boundary-built record");
+        assert_eq!(record.digest(), expected.digest(), "replay-vs-live record digest identity");
+        assert_eq!(
+            *h.manager.consensus_bus.epoch_record_watch().borrow(),
+            Some(expected),
+            "record published on epoch_record_watch for signing/collection",
+        );
+
+        Ok(())
+    }
+
+    /// R3 (phase 1): the leftover-drain's broadcast-channel phase stashes the boundary header,
+    /// enabling the follow-up `write_epoch_record` exactly like the live boundary path.
+    ///
+    /// Fails if reverted: close_epoch.rs `send_leftover_consensus_output_to_engine` phase 1's
+    /// `self.last_consensus_header = Some(output.clone().into())` — the drain still returns
+    /// `Some(hash)` (pre-fix behavior), but `write_epoch_record` panics on "epoch was finished
+    /// with last consensus header".
+    #[tokio::test]
+    async fn leftover_drain_channel_stash_enables_epoch_record_write() -> eyre::Result<()> {
+        let mut h = recovery_harness("leftover_drain_phase1").await?;
+        let boundary = tn_types::now();
+        h.manager.epoch_boundary = boundary;
+
+        let leader_id = h.committee.authorities().first().expect("committee authority").id();
+        let pre_boundary = committed_output(&leader_id, 1, boundary - 100);
+        let closing = committed_output(&leader_id, 2, boundary + 100);
+        let closing_hash = closing.consensus_header_hash();
+
+        // both outputs are stuck in the broadcast channel when the epoch exits early (phase 1)
+        let mut rx = h.manager.consensus_bus.subscribe_consensus_output();
+        h.manager.consensus_bus.consensus_output().send(pre_boundary).await?;
+        h.manager.consensus_bus.consensus_output().send(closing).await?;
+
+        let (to_engine, mut forwarded) = mpsc::channel(10);
+        let target = h.manager.send_leftover_consensus_output_to_engine(&mut rx, &to_engine).await;
+        assert_eq!(target, Some(closing_hash), "drain reports the boundary output's digest");
+        assert_eq!(h.manager.last_forwarded_consensus_number, 2, "both leftovers forwarded");
+
+        // both outputs reached the engine, and only the boundary one was flagged as the close
+        let first = forwarded.recv().await.expect("pre-boundary output forwarded");
+        assert_eq!(first.number(), 1);
+        assert!(!first.close_epoch());
+        let second = forwarded.recv().await.expect("boundary output forwarded");
+        assert_eq!(second.number(), 2);
+        assert!(second.close_epoch(), "boundary output flagged as the epoch close");
+
+        // the stash is what makes the record write possible without a live primary
+        h.manager.write_epoch_record(0, &h.engine).await?;
+        let (record, _cert) = h
+            .manager
+            .consensus_chain
+            .epochs()
+            .get_epoch_by_number(0)
+            .await
+            .expect("leftover-drain recovery must leave epoch 0's record");
+        assert_eq!(
+            record.final_consensus,
+            ConsensusNumHash::new(2, closing_hash),
+            "record's final_consensus must be the drained boundary output's number/digest",
+        );
+
+        Ok(())
+    }
+
+    /// R3 (phase 2): the leftover-drain's DB-gap phase — outputs the subscriber persisted
+    /// during shutdown but never broadcast — also stashes the boundary header for the record
+    /// write.
+    ///
+    /// Fails if reverted: close_epoch.rs `send_leftover_consensus_output_to_engine` phase 2's
+    /// `self.last_consensus_header = Some(output.clone().into())` — the drain still returns
+    /// `Some(hash)`, but `write_epoch_record` panics on "epoch was finished with last
+    /// consensus header".
+    #[tokio::test]
+    async fn leftover_drain_db_gap_stash_enables_epoch_record_write() -> eyre::Result<()> {
+        let mut h = recovery_harness("leftover_drain_phase2").await?;
+        let boundary = tn_types::now();
+        h.manager.epoch_boundary = boundary;
+
+        let leader_id = h.committee.authorities().first().expect("committee authority").id();
+        let pre_boundary = committed_output(&leader_id, 1, boundary - 100);
+        let closing = committed_output(&leader_id, 2, boundary + 100);
+        let closing_hash = closing.consensus_header_hash();
+
+        // subscriber-shutdown shape: outputs persisted to the pack DB, never broadcast
+        h.manager.consensus_chain.save_consensus_output(pre_boundary).await?;
+        h.manager.consensus_chain.save_consensus_output(closing).await?;
+        assert_eq!(h.manager.consensus_chain.latest_consensus_number(), 2);
+
+        // the broadcast channel is empty: phase 1 finds nothing, phase 2 scans the DB gap
+        let mut rx = h.manager.consensus_bus.subscribe_consensus_output();
+        let (to_engine, mut forwarded) = mpsc::channel(10);
+        let target = h.manager.send_leftover_consensus_output_to_engine(&mut rx, &to_engine).await;
+        assert_eq!(target, Some(closing_hash), "DB-gap drain reports the boundary digest");
+        assert_eq!(h.manager.last_forwarded_consensus_number, 2, "gap outputs forwarded");
+
+        let first = forwarded.recv().await.expect("pre-boundary gap output forwarded");
+        assert_eq!(first.number(), 1);
+        assert!(!first.close_epoch());
+        let second = forwarded.recv().await.expect("boundary gap output forwarded");
+        assert_eq!(second.number(), 2);
+        assert!(second.close_epoch(), "boundary output flagged as the epoch close");
+
+        h.manager.write_epoch_record(0, &h.engine).await?;
+        let (record, _cert) = h
+            .manager
+            .consensus_chain
+            .epochs()
+            .get_epoch_by_number(0)
+            .await
+            .expect("leftover-drain recovery must leave epoch 0's record");
+        assert_eq!(
+            record.final_consensus,
+            ConsensusNumHash::new(2, closing_hash),
+            "record's final_consensus must be the drained boundary output's number/digest",
+        );
+
+        Ok(())
     }
 }

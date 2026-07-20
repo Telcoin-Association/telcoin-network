@@ -90,6 +90,11 @@ where
                 self.consensus_chain.get_consensus_output_current(consensus_header.number).await?;
             let is_epoch_close = consensus_output.committed_at() >= self.epoch_boundary;
             let output_hash = consensus_output.consensus_header_hash();
+            if is_epoch_close {
+                // Stash the closing header for the replay-and-close arm's `write_epoch_record`,
+                // mirroring the live boundary path (`wait_for_epoch_boundary`).
+                self.last_consensus_header = Some(consensus_output.clone().into());
+            }
             if let Err(e) = self.process_output(to_engine, consensus_output).await {
                 error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);
                 return Err(e);

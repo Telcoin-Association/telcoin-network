@@ -2,18 +2,23 @@
 
 use super::common::{kill_child, ProcessGuard};
 use crate::common::{
-    address_from_word, advertise_worker_rpc, get_balance, get_balance_above_with_retry, get_block,
-    get_block_number, get_key, get_latest_consensus_header_number, get_node_info,
-    get_positive_balance_with_retry, network_advancing, send_and_confirm, send_tel, start_observer,
-    start_validator, WEI_PER_TEL,
+    address_from_word, advertise_worker_rpc, call_rpc, fetch_verified_epoch_record, get_balance,
+    get_balance_above_with_retry, get_block, get_block_number, get_key,
+    get_latest_consensus_header_number, get_node_info, get_positive_balance_with_retry,
+    network_advancing, send_and_confirm, send_tel, start_observer, start_validator,
+    start_validator_with_env, wait_for_epoch_at_least, wait_for_mid_epoch, wait_for_rpc,
+    EPOCH_DURATION, WEI_PER_TEL,
 };
+use alloy::providers::ProviderBuilder;
 use e2e_tests::{config_local_testnet, TestBinary};
 use eyre::Report;
+use jsonrpsee::rpc_params;
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
 use std::{
+    io::BufRead as _,
     path::Path,
     process::Child,
     time::{Duration, Instant},
@@ -649,4 +654,328 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
         },
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fleet-wide crash at the epoch boundary (replay-and-close recovery)
+// ---------------------------------------------------------------------------------------------
+
+/// Log-dir name (under `test_logs/`) for [`test_restarts_fleet_crash_at_epoch_boundary`].
+const BOUNDARY_CRASH_TEST: &str = "restart_boundary_replay";
+
+/// Env var (read inline by `EpochManager::wait_for_epoch_boundary`) carrying the boundary-crash
+/// test hook's epoch threshold: a node started with this set self-exits with status 0 the moment
+/// it detects the boundary output of the first epoch at or past the value — after the subscriber
+/// persisted that output to the consensus DB, before it is forwarded to the engine. Threshold `1`
+/// skips epoch 0 (its record handling is special-cased with an unsigned dummy) and fires at
+/// epoch 1's close.
+const EXIT_AFTER_BOUNDARY_PERSIST_ENV: &str = "TN_TEST_EXIT_AFTER_BOUNDARY_PERSIST";
+
+/// The hook's warn line (grepped in run-0 logs): its presence pins a node's exit to the hook
+/// rather than some unrelated death that happened to report status 0.
+const HOOK_WARN_LINE: &str =
+    "TN_TEST_EXIT_AFTER_BOUNDARY_PERSIST set - exiting before forwarding epoch boundary output";
+
+/// Total budget for the restarted fleet to recover the killed epoch and cross two boundaries.
+///
+/// Recovery is dominated by fixed costs (process startup, consensus replay, network re-init,
+/// peer discovery, and the catch-up epoch closes) rather than the epoch cadence, so this is an
+/// absolute bound instead of a multiple of [`EPOCH_DURATION`].
+const FLEET_RECOVERY_TIMEOUT_SECS: u64 = 300;
+
+/// Regression test for the devnet incident (epoch 691) where all validators crashed at an epoch
+/// boundary AFTER the epoch-closing consensus output was persisted to the consensus DB but
+/// BEFORE the engine executed it.
+///
+/// On restart every node replays the persisted boundary output and closes the epoch through the
+/// replay-and-close arm of `EpochManager::run_epoch` (the `replay.take_epoch_close_hash()`
+/// branch). That arm previously never wrote the closed epoch's `EpochRecord`, and the next
+/// epoch's `open_epoch_pack` hard-requires the previous record — with EVERY node recordless at
+/// once there was no peer to fetch it from, so the whole fleet wedged on "Missing previous epoch
+/// record for epoch N after waiting". The fix writes the record in the replay-and-close and
+/// leftover-drain arms and re-publishes cert-less records so the epoch certificate still forms
+/// retroactively.
+///
+/// Producing the crash window deterministically: every run-0 node is spawned with
+/// [`EXIT_AFTER_BOUNDARY_PERSIST_ENV`]` = 1`, a runtime hook in
+/// `EpochManager::wait_for_epoch_boundary` that self-exits the process the moment it detects
+/// the boundary output of an epoch at or past that threshold — after the subscriber persisted
+/// the output to the consensus DB, before it is forwarded to the engine. All four nodes
+/// therefore go down inside the persisted-but-unexecuted window (window A — the epoch-691
+/// incident shape) with no external-SIGKILL timing race. The residual post-execution sub-window
+/// (closing block executed, crash before the record write, nothing left to replay) is NOT
+/// exercised here; it is tracked separately and relies on the `open_epoch_pack` peer fetch.
+///
+/// Asserted recovery, with NO pre-existing recovered peer:
+/// (a)/(d) every node enters and moves past the next epoch (reaches `killed_epoch + 2`, proving
+///         the fleet formed consensus again and crossed a fresh boundary),
+/// (b)/(c) every node serves a certified, verifying `EpochRecord` for the killed epoch (and all
+///         earlier epochs) and has executed each record's final block,
+///         plus a post-recovery transfer confirms end-to-end liveness,
+/// at least one restarted node logged the record-publish evidence ("publishing epoch record"),
+/// and no node ever logged the fatal "Missing previous epoch record" wedge. Both log scans are
+/// fail-closed: a missing or empty per-node log file is an error, never a silent pass.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+async fn test_restarts_fleet_crash_at_epoch_boundary() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    info!(target: "restart-test", "test_restarts_fleet_crash_at_epoch_boundary");
+
+    let tmp_guard = tempfile::TempDir::with_prefix("boundary_crash").expect("tempdir is okay");
+    let temp_path = tmp_guard.path();
+    // Short epochs so boundaries arrive within the test budget; passphrase must match the
+    // TN_BLS_PASSPHRASE that `start_validator` exports.
+    e2e_tests::config_local_testnet_with_epoch_duration(
+        temp_path,
+        Some("restart_test".to_string()),
+        None,
+        Some(EPOCH_DURATION as u32),
+    )
+    .expect("failed to config");
+
+    let bin = e2e_tests::get_telcoin_network_binary();
+    let mut guard = ProcessGuard::empty();
+    let mut client_urls: [String; 4] = std::array::from_fn(|_| String::new());
+    let mut rpc_ports = [0u16; 4];
+    for (i, url) in client_urls.iter_mut().enumerate() {
+        let rpc_port =
+            get_available_tcp_port("127.0.0.1").expect("ephemeral rpc port for validator");
+        rpc_ports[i] = rpc_port;
+        *url = format!("http://127.0.0.1:{rpc_port}");
+        // Run-0 nodes carry the boundary-persist exit hook (threshold 1: survive epoch 0's
+        // special-cased close, self-exit at epoch 1's boundary). Run-1 restarts must NOT set
+        // it — they have to survive their own epoch closes to prove recovery.
+        guard.push(start_validator_with_env(
+            i,
+            bin,
+            temp_path,
+            rpc_port,
+            BOUNDARY_CRASH_TEST,
+            0,
+            &[(EXIT_AFTER_BOUNDARY_PERSIST_ENV, "1")],
+        ));
+    }
+
+    network_advancing(&client_urls)?;
+    let provider = ProviderBuilder::new().connect_http(client_urls[0].parse()?);
+    wait_for_rpc(&provider).await?;
+
+    // Confirm the fleet survived epoch 0 (the hook's threshold skips its boundary) and snapshot
+    // the doomed epoch from mid-epoch, while every RPC is still up: its id names the killed
+    // epoch and its duration sizes the self-exit deadline below.
+    wait_for_epoch_at_least(&provider, 1).await?;
+    let snap = wait_for_mid_epoch(&provider, &client_urls[0]).await?;
+    let killed_epoch = snap.epoch_id;
+    info!(
+        target: "restart-test",
+        killed_epoch, "waiting for the boundary-persist hook to self-exit the fleet"
+    );
+
+    // Deterministic crash: each node self-exits (status 0) the moment it detects the epoch's
+    // boundary output — persisted to the consensus DB, never forwarded to the engine. Wait for
+    // all four to exit on their own. A node still alive at the deadline, or one that exited
+    // non-zero, means the hook did NOT produce the crash window: SIGKILL any stragglers and
+    // fail — recovery assertions against the wrong crash shape would prove nothing.
+    let exit_deadline = Instant::now() + Duration::from_secs(snap.epoch_duration * 2 + 10);
+    let mut exited = [false; 4];
+    while !exited.iter().all(|done| *done) {
+        for (i, done) in exited.iter_mut().enumerate() {
+            if !*done {
+                let child = guard.get_mut(i).expect("validator child in guard");
+                if let Some(status) = child.try_wait()? {
+                    if !status.success() {
+                        return Err(Report::msg(format!(
+                            "node{i} exited with {status} instead of the hook's exit(0) at the \
+                             epoch {killed_epoch} boundary. Check \
+                             test_logs/{BOUNDARY_CRASH_TEST}/"
+                        )));
+                    }
+                    *done = true;
+                }
+            }
+        }
+        if Instant::now() >= exit_deadline {
+            let stragglers: Vec<usize> =
+                exited.iter().enumerate().filter(|(_, done)| !**done).map(|(i, _)| i).collect();
+            for i in stragglers.iter() {
+                if let Some(child) = guard.get_mut(*i) {
+                    let _ = signal::kill(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+                    let _ = child.wait();
+                }
+            }
+            return Err(Report::msg(format!(
+                "nodes {stragglers:?} still alive at the deadline: the \
+                 {EXIT_AFTER_BOUNDARY_PERSIST_ENV} hook did not fire for epoch {killed_epoch}'s \
+                 boundary (SIGKILLed them). Check test_logs/{BOUNDARY_CRASH_TEST}/"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    info!(target: "restart-test", killed_epoch, "all validators self-exited at the epoch boundary");
+
+    // Exit alone is not proof the hook fired: require each node's run-0 log to carry the hook's
+    // warn line, pinning every exit to the persisted-but-unexecuted window.
+    for i in 0..4 {
+        if find_in_node_run_logs(BOUNDARY_CRASH_TEST, i, 0, HOOK_WARN_LINE)?.is_none() {
+            return Err(Report::msg(format!(
+                "node{i} exited without logging the boundary-persist hook line in its run-0 \
+                 log - it did not go down in the persisted-but-unexecuted window. Check \
+                 test_logs/{BOUNDARY_CRASH_TEST}/"
+            )));
+        }
+    }
+
+    // The whole fleet must be down: recovery cannot lean on a peer that kept running.
+    let probe = address_from_word("testing").to_string();
+    for url in client_urls.iter() {
+        assert!(
+            get_balance(url, &probe, 0).is_err(),
+            "validator RPC still up after SIGKILL: {url}"
+        );
+    }
+
+    // Restart every node with its existing datadir (and rpc port, so client_urls stay valid).
+    info!(target: "restart-test", "restarting the fleet with existing datadirs");
+    for (i, rpc_port) in rpc_ports.into_iter().enumerate() {
+        guard.replace(i, start_validator(i, bin, temp_path, rpc_port, BOUNDARY_CRASH_TEST, 1));
+    }
+
+    // (a) + (d): every node must reach `killed_epoch + 2`. Getting there requires each node to
+    // recover the killed epoch's close, open the next epoch (impossible without the previous
+    // epoch's record — the incident's wedge), re-form consensus, and cross a fresh boundary.
+    // One shared deadline: the nodes recover in parallel, so the first wait absorbs most of it.
+    let target_epoch = killed_epoch + 2;
+    let recovery_deadline = Instant::now() + Duration::from_secs(FLEET_RECOVERY_TIMEOUT_SECS);
+    for url in client_urls.iter() {
+        let mut last_seen = None;
+        loop {
+            if let Ok(epoch) = call_rpc::<u32, _, _>(
+                url,
+                "tn_getCurrentEpoch",
+                rpc_params![],
+                0,
+                "tn_getCurrentEpoch",
+            ) {
+                last_seen = Some(epoch);
+                if epoch >= target_epoch {
+                    break;
+                }
+            }
+            if Instant::now() >= recovery_deadline {
+                return Err(Report::msg(format!(
+                    "{url} stuck at epoch {last_seen:?} (< {target_epoch}) after the fleet-wide \
+                     boundary crash — the epoch-record wedge? Check test_logs/{BOUNDARY_CRASH_TEST}/"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    info!(target: "restart-test", target_epoch, "all nodes recovered past the killed epoch");
+
+    // (b) + (c): every node serves a certified, verifying record for the killed epoch (and all
+    // epochs before it) and has executed each record's final block. The killed epoch's
+    // certificate can only exist if the fix's cert-less record re-publish let the committee vote
+    // retroactively — no node closed that epoch through the live boundary vote window.
+    // Certificate formation is a fixed async quorum-voting cost, so floor the per-record
+    // deadline at 60s rather than scaling it with EPOCH_DURATION.
+    for url in client_urls.iter() {
+        for epoch in 0..=killed_epoch {
+            let epoch_rec =
+                fetch_verified_epoch_record(url, epoch, (EPOCH_DURATION * 6).max(60)).await?;
+            get_block(url, Some(epoch_rec.final_state.number)).map_err(|e| {
+                Report::msg(format!(
+                    "final block {} for epoch {epoch} missing on {url}: {e}",
+                    epoch_rec.final_state.number
+                ))
+            })?;
+        }
+    }
+
+    // End-to-end liveness after recovery: a transfer submitted to one node confirms on another.
+    let key = get_key("test-source");
+    let to_account = address_from_word("testing");
+    send_and_confirm(&client_urls[0], &client_urls[1], &key, to_account, 0)?;
+
+    // Non-vacuity: at least one restarted node must show the record-publish evidence in its
+    // run-1 logs, proving the record write and republish actually ran post-restart.
+    assert_record_publish_evidence(BOUNDARY_CRASH_TEST)?;
+
+    // No restarted node may ever have hit the fatal missing-record wedge.
+    assert_no_missing_record_wedge(BOUNDARY_CRASH_TEST)?;
+    Ok(())
+}
+
+/// Assert at least one restarted node's (run 1) logs carry the record-publish evidence.
+///
+/// "publishing epoch record" (see `manage_epoch_votes`) fires when `write_epoch_record`
+/// publishes a record on the epoch-record watch — the visible side effect of the recovery
+/// arms' record write. Requiring it on at least one node keeps the recovery assertions
+/// non-vacuous: they cannot pass while no node ever wrote and republished a record.
+fn assert_record_publish_evidence(test: &str) -> eyre::Result<()> {
+    for i in 0..4 {
+        if find_in_node_run_logs(test, i, 1, "publishing epoch record")?.is_some() {
+            return Ok(());
+        }
+    }
+    Err(Report::msg(format!(
+        "no restarted node logged \"publishing epoch record\" in its run-1 logs - the recovery \
+         record write left no evidence. Check test_logs/{test}/"
+    )))
+}
+
+/// Assert no restarted node (run 1) logged the fatal "Missing previous epoch record" wedge.
+///
+/// The epoch-progression assertions already fail when a node wedges; this pins the failure to
+/// the exact incident signature so a regression is unmistakable in CI output. Only this
+/// invocation's run-1 files are scanned (deterministic names, truncated on creation), so stale
+/// logs from other runs cannot leak in. Fail-closed: a missing or empty log file is an error —
+/// an absence-of-wedge conclusion drawn from logs that were never written proves nothing.
+fn assert_no_missing_record_wedge(test: &str) -> eyre::Result<()> {
+    for i in 0..4 {
+        if let Some(hit) = find_in_node_run_logs(test, i, 1, "Missing previous epoch record")? {
+            return Err(Report::msg(format!(
+                "fleet recovery hit the missing-epoch-record wedge: {hit}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Scan a node's per-run log pair for the first line containing `needle`.
+///
+/// Returns `Ok(Some("file: line"))` on the first hit, `Ok(None)` when neither file contains it.
+/// Fail-closed: both `node<node>-run<run>.log` and its `.stderr.log` sibling must exist and be
+/// non-empty (`setup_log_dir` creates them at spawn, and a booted node always writes to both —
+/// tracing to stdout, the weak-KDF keyfile warning to stderr), so a scan can never silently
+/// "pass" against logs that were never written.
+fn find_in_node_run_logs(
+    test: &str,
+    node: usize,
+    run: u32,
+    needle: &str,
+) -> eyre::Result<Option<String>> {
+    let log_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_logs").join(test);
+    let mut found = None;
+    for name in [format!("node{node}-run{run}.log"), format!("node{node}-run{run}.stderr.log")] {
+        let path = log_dir.join(&name);
+        let file = std::fs::File::open(&path).map_err(|e| {
+            Report::msg(format!("expected node log missing: {}: {e}", path.display()))
+        })?;
+        if file.metadata()?.len() == 0 {
+            return Err(Report::msg(format!(
+                "expected node log is empty: {} - nothing was captured to scan",
+                path.display()
+            )));
+        }
+        if found.is_none() {
+            for line in std::io::BufReader::new(file).lines() {
+                let Ok(line) = line else { break };
+                if line.contains(needle) {
+                    found = Some(format!("{name}: {line}"));
+                    break;
+                }
+            }
+        }
+    }
+    Ok(found)
 }

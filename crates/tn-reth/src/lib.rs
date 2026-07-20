@@ -1833,6 +1833,125 @@ impl RethEnv {
             .collect()
     }
 
+    /// Startup guard: prove the deployed [`ConsensusRegistry`] answers the exact read the
+    /// epoch-close routing will issue, so a build/ABI mismatch fails fast at boot with an
+    /// actionable error instead of surfacing hours later as a cryptic
+    /// `Revert { gas_used: 21510, output: 0x }` at the first epoch boundary.
+    ///
+    /// Mirrors the code-hash routing of the epoch-close read (`read_committee_eligible_pool` in
+    /// `evm/block.rs`) against the latest canonical state: if the registry account's code hash
+    /// equals the pinned [`tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`], the probe
+    /// speaks the legacy `getValidators(uint8)` ABI (decoded as `ValidatorInfo[]` via
+    /// `SolValue`); any other hash probes `getValidatorsInfo(uint8)`. Exactly ONE probe runs —
+    /// the one epoch close would use — so a passing probe certifies the close-time read path.
+    ///
+    /// Failures are fatal by design: a missing/codeless registry account or a failing probe
+    /// means the first epoch close is GUARANTEED to revert fatally, so callers must refuse to
+    /// start the node. Pure read — nothing is committed.
+    pub fn assert_consensus_registry_readable(&self) -> TnRethResult<()> {
+        // revm `Database` trait provides `basic`; imported anonymously to avoid clashing with
+        // other traits in scope.
+        use reth_revm::Database as _;
+
+        /// Shared framing so every failure names the consequence and the likely cause.
+        const CONSEQUENCE: &str = "consensus registry unreadable with the ABI epoch close will \
+            use — node build and deployed registry are incompatible (wrong image/features for \
+            this chain?); epoch close would fail fatally at the first epoch boundary";
+
+        let canonical_tip = self.canonical_tip();
+        let tip = canonical_tip.num_hash();
+        let state_provider =
+            self.inner.blockchain_provider.state_by_block_hash(tip.hash).map_err(|e| {
+                TnRethError::EVMCustom(format!(
+                    "registry startup probe: state provider at canonical tip {tip:?}: {e}"
+                ))
+            })?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+
+        // Read the registry account's code hash the same way the epoch-close gate does
+        // (`registry_code_is_pre_fork`): a pure `basic` read.
+        let account = db.basic(CONSENSUS_REGISTRY_ADDRESS).map_err(|e| {
+            TnRethError::EVMCustom(format!(
+                "registry startup probe: account read at {CONSENSUS_REGISTRY_ADDRESS} failed: {e}"
+            ))
+        })?;
+        let code_hash = match account {
+            Some(info) if !info.is_empty_code_hash() && info.code_hash != B256::ZERO => {
+                info.code_hash
+            }
+            Some(_) => {
+                return Err(TnRethError::EVMCustom(format!(
+                    "{CONSEQUENCE}: registry account {CONSENSUS_REGISTRY_ADDRESS} exists but \
+                     has NO code at canonical tip {} (genesis missing the registry deployment?)",
+                    tip.number,
+                )))
+            }
+            None => {
+                return Err(TnRethError::EVMCustom(format!(
+                    "{CONSEQUENCE}: registry account {CONSENSUS_REGISTRY_ADDRESS} is absent at \
+                     canonical tip {} (genesis missing the registry deployment?)",
+                    tip.number,
+                )))
+            }
+        };
+
+        // Route by code hash exactly as the epoch close will: pre-fork code speaks the legacy
+        // ABI, anything else the current one.
+        let is_pre_fork = code_hash == tn_types::forks::CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH;
+        let (selector, calldata): (&str, Bytes) = if is_pre_fork {
+            (
+                "getValidators(uint8) [legacy pre-fork ABI]",
+                ConsensusRegistry::getValidatorsCall {
+                    status: ConsensusRegistry::ValidatorStatus::Active.into(),
+                }
+                .abi_encode()
+                .into(),
+            )
+        } else {
+            (
+                "getValidatorsInfo(uint8)",
+                ConsensusRegistry::getValidatorsInfoCall {
+                    status: ConsensusRegistry::ValidatorStatus::Active.into(),
+                }
+                .abi_encode()
+                .into(),
+            )
+        };
+
+        let evm_env = self.inner.evm_config.evm_env(&canonical_tip).map_err(|e| {
+            TnRethError::EVMCustom(format!(
+                "registry startup probe: evm env at canonical tip {tip:?}: {e}"
+            ))
+        })?;
+        let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
+
+        // The single probe the epoch-close routing would issue. Both ABIs decode to
+        // `ValidatorInfo[]` via `SolValue` (the legacy contract's `getValidators` returns the
+        // full structs; the struct layout is byte-identical across the fork).
+        self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
+            &mut tn_evm,
+            calldata,
+        )
+        .map_err(|e| {
+            TnRethError::EVMCustom(format!(
+                "{CONSEQUENCE}: probe {selector} against registry {CONSENSUS_REGISTRY_ADDRESS} \
+                 failed: {e} (observed code hash {code_hash}; matches pinned pre-fork hash: \
+                 {is_pre_fork})"
+            ))
+        })?;
+
+        debug!(
+            target: "engine",
+            %code_hash,
+            is_pre_fork,
+            selector,
+            "startup consensus registry ABI probe passed"
+        );
+
+        Ok(())
+    }
+
     /// Execute a read-only contract call at the canonical tip and return the raw ABI-encoded
     /// output bytes.
     ///
@@ -2700,7 +2819,10 @@ mod tests {
     /// Asserts: the closing block executes; the registry code hash is untouched (no swap —
     /// epoch 3 is far from the fork boundary); the post-fork-only eligible-count call still
     /// fails; and the block's `state_root` is identical across two independent executions.
-    #[cfg(feature = "adiri")]
+    ///
+    /// Deliberately NOT `adiri`-gated: the legacy-read routing is compiled into every build
+    /// (devnet's faucet-only image closes epochs over this exact registry), so this coverage
+    /// must run in default-feature CI.
     #[tokio::test]
     async fn test_pre_fork_epoch_close_uses_legacy_registry_read() -> eyre::Result<()> {
         // pre-fork fixture: the committed adiri genesis (old registry code + validator storage)
@@ -2805,6 +2927,82 @@ mod tests {
             block2.recovered_block.clone_sealed_header().state_root,
             produced_state_root,
             "pre-fork epoch-close state_root must be identical across independent executions"
+        );
+
+        Ok(())
+    }
+
+    /// Startup probe passes over the committed PRE-fork testnet genesis.
+    ///
+    /// `test_genesis()` embeds the committed testnet `genesis.yaml`, whose registry account
+    /// carries the pinned pre-fork runtime code — the probe must route to the legacy
+    /// `getValidators(uint8)` ABI (the exact read epoch close will use on this chain) and
+    /// succeed. Deliberately NOT feature-gated: devnet closes epochs over this registry on a
+    /// non-adiri build, so the probe's legacy routing must hold in default-feature CI.
+    #[tokio::test]
+    async fn test_assert_consensus_registry_readable_pre_fork() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("registry probe pre-fork");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp.path(), &tm, None)?;
+
+        reth_env
+            .assert_consensus_registry_readable()
+            .expect("probe must pass over the pre-fork registry via the legacy ABI");
+
+        Ok(())
+    }
+
+    /// Startup probe passes over a freshly deployed POST-fork registry.
+    ///
+    /// `test_genesis_with_consensus_registry(4)` deploys the current artifact at test runtime,
+    /// so the code hash differs from the pinned pre-fork hash and the probe must route to
+    /// `getValidatorsInfo(uint8)` and succeed.
+    #[tokio::test]
+    async fn test_assert_consensus_registry_readable_post_fork() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("registry probe post-fork");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp.path(), &tm, None)?;
+
+        reth_env
+            .assert_consensus_registry_readable()
+            .expect("probe must pass over the post-fork registry via getValidatorsInfo");
+
+        Ok(())
+    }
+
+    /// Startup probe fails with the actionable error when the registry account is absent.
+    ///
+    /// Removing the registry allocation from genesis models a chain whose deployed state the
+    /// build cannot serve at all; the probe must refuse with a message naming the registry
+    /// address and the epoch-close consequence rather than letting the node run into a fatal
+    /// revert at the first boundary.
+    #[tokio::test]
+    async fn test_assert_consensus_registry_readable_absent_registry() -> eyre::Result<()> {
+        let mut genesis = tn_types::test_genesis();
+        genesis.alloc.remove(&CONSENSUS_REGISTRY_ADDRESS);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("registry probe absent");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp.path(), &tm, None)?;
+
+        let err = reth_env
+            .assert_consensus_registry_readable()
+            .expect_err("probe must fail when the registry account is absent");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("consensus registry unreadable"),
+            "error must carry the actionable framing: {msg}"
+        );
+        assert!(
+            msg.contains(&CONSENSUS_REGISTRY_ADDRESS.to_string()),
+            "error must name the registry address: {msg}"
+        );
+        assert!(
+            msg.contains("epoch close would fail fatally"),
+            "error must state the epoch-close consequence: {msg}"
         );
 
         Ok(())

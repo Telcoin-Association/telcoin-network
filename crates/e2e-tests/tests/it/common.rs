@@ -401,6 +401,39 @@ pub(crate) fn start_validator_with_args(
     run: u32,
     extra_args: &[&str],
 ) -> Child {
+    let mut command = validator_command(instance, bin, base_dir, rpc_port, test, run);
+    command.args(extra_args);
+    command.spawn().expect("failed to execute")
+}
+
+/// Start a validator node process with extra environment variables (e.g. the
+/// `TN_TEST_EXIT_AFTER_BOUNDARY_PERSIST` boundary-crash test hook).
+pub(crate) fn start_validator_with_env(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_env: &[(&str, &str)],
+) -> Child {
+    let mut command = validator_command(instance, bin, base_dir, rpc_port, test, run);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command.spawn().expect("failed to execute")
+}
+
+/// Build the base [`std::process::Command`] shared by the `start_validator*` helpers, with
+/// stdout/stderr wired to the per-run log files. Callers may add args or env before spawning.
+fn validator_command(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+) -> std::process::Command {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
@@ -423,11 +456,9 @@ pub(crate) fn start_validator_with_args(
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
 
-    command.args(extra_args);
-
     setup_log_dir(&mut command, instance, test, run);
 
-    command.spawn().expect("failed to execute")
+    command
 }
 
 /// Advertise a validator's JSON-RPC endpoint on its worker record.

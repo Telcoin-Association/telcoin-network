@@ -59,6 +59,9 @@ rocksdb = ["tn-reth/rocksdb"]
 faucet = ["tn-reth/faucet"]
 
 [dev-dependencies]
+# unit tests build a throwaway `RethConfig` (clap-parsed `RethCommand` defaults) to construct an
+# `EpochManager` for the epoch-record recovery regression tests in manager/node/run_epoch.rs
+clap = { workspace = true }
 metrics-util = { workspace = true }
 rand = { workspace = true }
 tn-primary = { workspace = true, features = ["test-utils"] }

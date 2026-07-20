@@ -14,7 +14,7 @@
 //! next epoch starts from a clean slate. Historic data survives in the
 //! `ConsensusChain` store; only the per-epoch working tables are cleared.
 
-use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
+use crate::{engine::ExecutionNode, manager::EpochManager};
 use eyre::eyre;
 use std::collections::BTreeSet;
 use tn_config::TelcoinDirs;
@@ -112,7 +112,10 @@ where
     ///
     /// Returns the [`ConsensusHeaderDigest`] of the first output committed at or
     /// past the epoch boundary, signalling that an epoch-boundary output was
-    /// reached; `None` if no such output was found.
+    /// reached; `None` if no such output was found. A boundary output is also
+    /// stashed in `self.last_consensus_header` so the caller's follow-up
+    /// `write_epoch_record` can build the epoch record from it, exactly like the
+    /// live boundary path does in `wait_for_epoch_boundary`.
     pub(super) async fn send_leftover_consensus_output_to_engine(
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
@@ -121,6 +124,7 @@ where
         // Phase 1: Drain broadcast channel (existing behavior)
         while let Ok(output) = consensus_output.try_recv() {
             let result = if output.committed_at() >= self.epoch_boundary {
+                self.last_consensus_header = Some(output.clone().into());
                 Some(output.consensus_header_hash())
             } else {
                 None
@@ -143,6 +147,7 @@ where
                 match self.consensus_chain.get_consensus_output_current(number).await {
                     Ok(output) => {
                         let result = if output.committed_at() >= self.epoch_boundary {
+                            self.last_consensus_header = Some(output.clone().into());
                             Some(output.consensus_header_hash())
                         } else {
                             None
@@ -177,13 +182,17 @@ where
     /// When building a fresh record, the previous epoch's `next_committee` must
     /// match this epoch's committee; a mismatch means the committee handoff is
     /// inconsistent and is treated as an error rather than silently recorded.
+    ///
+    /// `epoch` is the epoch that just closed. It is passed in (rather than read
+    /// from a live primary) so every close shape can write the record: the live
+    /// boundary arm and the restart-recovery arms (replay-and-close,
+    /// leftover-drain), which have no primary. Requires
+    /// `self.last_consensus_header` to hold the epoch's closing header.
     pub(super) async fn write_epoch_record(
         &mut self,
-        primary: &PrimaryNode<DB>,
+        epoch: Epoch,
         engine: &ExecutionNode,
     ) -> eyre::Result<()> {
-        let committee = primary.current_committee().await;
-        let epoch = committee.epoch();
         if epoch == 0 {
             // Epoch 0 will have a "dummy" epoch record to make the initial committee avaliable to
             // code using these records. In this case there will not be a cert so we
@@ -230,6 +239,10 @@ where
         )?;
 
         self.consensus_chain.epochs().save_record(epoch_rec.clone()).await?;
+        // Records must be fsync-durable at close: without this a hard kill before the next
+        // epoch's cert-quorum persist discards the queued record and recreates the
+        // missing-record wedge.
+        self.consensus_chain.epochs().persist().await?;
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
         Ok(())
     }

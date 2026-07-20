@@ -11805,6 +11805,7 @@ dependencies = [
 name = "tn-node"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "eyre",
  "futures",
  "jsonrpsee",

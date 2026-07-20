@@ -862,6 +862,13 @@ where
         // the catchup below pins every chain-derived input to the finalized header.
         let reth_env = engine.get_reth_env().await;
         reth_env.heal_finalized_to_persisted_tip()?;
+        // Defense-in-depth: prove the deployed ConsensusRegistry answers the exact ABI the
+        // epoch-close routing will use BEFORE the epoch loop starts. A build/registry ABI
+        // mismatch otherwise stays invisible until the first epoch boundary, where it surfaces
+        // hours later as a cryptic fatal `Revert { output: 0x }` — failing at boot with an
+        // actionable error is strictly better. Runs once per process (after the finalized-marker
+        // heal so the canonical tip is trustworthy, before any epoch runs).
+        reth_env.assert_consensus_registry_readable()?;
         // retrieve epoch information from canonical tip on startup
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");

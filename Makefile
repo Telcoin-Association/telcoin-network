@@ -156,7 +156,10 @@ docker-adiri:
 	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
 
 # build and push latest devnet image for amd64 and arm64
-# CARGO_FEATURES=faucet compiles in the faucet support only
+# CARGO_FEATURES=faucet — deliberately WITHOUT `adiri`: adiri builds hard-error at boot on any
+# chain but the 2017 testnet (devnet is chain 487) and ADIRI_DUP_BATCH_EPOCH alters replay
+# semantics for epochs <= 160. Devnet's pre-fork ConsensusRegistry reads need no feature: the
+# legacy-ABI routing is compiled into every build (keyed on the deployed registry's code hash).
 docker-devnet:
 	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
 
