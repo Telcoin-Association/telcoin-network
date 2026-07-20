@@ -3,28 +3,15 @@
 #[cfg(test)]
 use tn_test_utils as _;
 
-use std::{collections::BTreeSet, time::Duration};
+use std::time::Duration;
 
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
-use tn_storage::consensus::ConsensusChain;
-use tn_types::{
-    BlsPublicKey, ConsensusHeaderDigest, Epoch, EpochDigest, EpochRecord, Noticer, TaskSpawner,
-};
+use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordValidation};
+use tn_types::{ConsensusHeaderDigest, Epoch, Noticer, TaskSpawner};
 use tracing::{debug, error, info};
 
 /// How long to wait before retrying a failed epoch record collection.
 const EPOCH_COLLECT_RETRY_SECS: u64 = 5;
-
-/// Return true if the record's committee is compatible with `committee` (the
-/// committee expected from the previous epoch record).
-/// These will usually be equal but it is possible for a validator to be
-/// booted (ejected on-chain) mid-epoch and still be in `committee` while
-/// missing from `epoch_rec.committee`.
-/// Delegates to the shared [`EpochRecord::committee_compatible`] predicate so
-/// this verifier and the epoch record producer accept exactly the same shapes.
-fn epoch_committee_valid(epoch_rec: &EpochRecord, committee: &BTreeSet<BlsPublicKey>) -> bool {
-    epoch_rec.committee_compatible(committee)
-}
 
 /// Asks peers for records from last_epoch to requested_epoch.
 /// Returns the Epoch that was last retrieved.
@@ -62,63 +49,63 @@ async fn collect_epoch_records(
         // Try to recover by downloading the epoch record and cert from a peer.
         match primary_handle.request_epoch_cert(Some(epoch), None).await {
             Ok((epoch_rec, cert)) => {
-                let (parent_hash, committee) = if epoch == 0 {
-                    // If we can't find the genesis committee something is very wrong.
-                    let committee = consensus_chain
-                        .epochs()
-                        .get_committee_keys(0)
-                        .await
-                        .expect("always can retrieve epoch 0 committee");
-                    (EpochDigest::default(), committee)
-                } else if let Some(prev) = consensus_chain.epochs().record_by_epoch(epoch - 1).await
+                // Validate the downloaded record against the locally-trusted committee using the
+                // same routine the failed-quorum recovery path uses (see crates/node
+                // epoch_votes.rs), so a record cannot be accepted under weaker rules on one path
+                // than the other.
+                match consensus_chain
+                    .epochs()
+                    .validate_downloaded_record(epoch, &epoch_rec, &cert)
+                    .await
                 {
-                    (prev.digest(), prev.next_committee.iter().copied().collect())
-                } else {
-                    // We are missing epoch records.
-                    // Should not be here but if so just skipping won't really help...
-                    // Reduce last_epoch by one and once this loop finishes skipping we can
-                    // try to get the missing epoch again.
-                    return epoch.saturating_sub(1);
-                };
-                // Verify the epoch has the expected parent and committee and is signed by
-                // that committee.
-                let parents_match = parent_hash == epoch_rec.parent_hash;
-                let epoch_committee_valid = epoch_committee_valid(&epoch_rec, &committee);
-                let epoch_valid = epoch_rec.verify_with_cert(&cert);
-                if parents_match && epoch_committee_valid && epoch_valid {
-                    let epoch_hash = epoch_rec.digest();
-                    // Capture final_consensus before save consumes epoch_rec.
-                    let final_consensus = epoch_rec.final_consensus;
-                    if let Err(e) = consensus_chain.epochs().save(epoch_rec, cert).await {
+                    EpochRecordValidation::Valid => {
+                        let epoch_hash = epoch_rec.digest();
+                        // Capture final_consensus before save consumes epoch_rec.
+                        let final_consensus = epoch_rec.final_consensus;
+                        if let Err(e) = consensus_chain.epochs().save(epoch_rec, cert).await {
+                            error!(
+                                target: "epoch-manager",
+                                ?e,
+                                "failed to save epoch record/cert for epoch {epoch}",
+                            );
+                            return epoch.saturating_sub(1);
+                        }
+                        result_epoch = epoch;
+                        info!(
+                            target: "epoch-manager",
+                            "retrieved cert for epoch {epoch}: {epoch_hash} from a peer",
+                        );
+                        // Track the highest final_consensus across downloaded epochs.
+                        if final_consensus.hash != ConsensusHeaderDigest::default()
+                            && final_consensus.number
+                                > best_final_consensus.map(|(_, n, _)| n).unwrap_or(0)
+                        {
+                            best_final_consensus =
+                                Some((epoch, final_consensus.number, final_consensus.hash));
+                        }
+                    }
+                    EpochRecordValidation::Invalid {
+                        epoch_matches,
+                        parents_match,
+                        committee_valid,
+                        cert_valid,
+                    } => {
                         error!(
                             target: "epoch-manager",
-                            ?e,
-                            "failed to save epoch record/cert for epoch {epoch}",
+                            ?epoch_matches,
+                            ?parents_match,
+                            ?committee_valid,
+                            ?cert_valid,
+                            "got an invalid epoch record, epoch {epoch}",
                         );
                         return epoch.saturating_sub(1);
                     }
-                    result_epoch = epoch;
-                    info!(
-                        target: "epoch-manager",
-                        "retrieved cert for epoch {epoch}: {epoch_hash} from a peer",
-                    );
-                    // Track the highest final_consensus across downloaded epochs.
-                    if final_consensus.hash != ConsensusHeaderDigest::default()
-                        && final_consensus.number
-                            > best_final_consensus.map(|(_, n, _)| n).unwrap_or(0)
-                    {
-                        best_final_consensus =
-                            Some((epoch, final_consensus.number, final_consensus.hash));
+                    EpochRecordValidation::NoAnchor => {
+                        // We are missing the previous epoch record (or the genesis committee), so
+                        // this record cannot be anchored. Reduce last_epoch by one and retry once
+                        // the anchor is available.
+                        return epoch.saturating_sub(1);
                     }
-                } else {
-                    error!(
-                        target: "epoch-manager",
-                        ?parents_match,
-                        ?epoch_committee_valid,
-                        ?epoch_valid,
-                        "got an invalid epoch record, epoch {epoch}",
-                    );
-                    return epoch.saturating_sub(1);
                 }
             }
             Err(err) => {
@@ -201,12 +188,9 @@ pub async fn spawn_epoch_record_collector(
     });
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
-    use rand_chacha::ChaCha8Rng;
     use roaring::RoaringBitmap;
     use std::{collections::HashMap, num::NonZeroUsize};
     use tn_network_libp2p::types::{NetworkCommand, NetworkResponseMessage};
@@ -217,139 +201,10 @@ mod tests {
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils_committee::CommitteeFixture;
     use tn_types::{
-        encode, BlockNumHash, BlsAggregateSignature, BlsKeypair, BlsSignature, ConsensusNumHash,
-        EpochCertificate, Intent, IntentMessage, IntentScope, Signer as _, B256,
+        encode, BlsAggregateSignature, BlsKeypair, BlsPublicKey, BlsSignature, EpochCertificate,
+        EpochRecord, Intent, IntentMessage, IntentScope, Signer as _,
     };
     use tokio::sync::mpsc;
-
-    /// Generate a deterministic test BLS public key from a seed.
-    fn test_bls_key(seed: u8) -> BlsPublicKey {
-        let mut rng = ChaCha8Rng::from_seed([seed; 32]);
-        *BlsKeypair::generate(&mut rng).public()
-    }
-
-    /// Create a test EpochRecord with the given committee.
-    fn test_epoch_record(committee: Vec<BlsPublicKey>) -> EpochRecord {
-        EpochRecord {
-            epoch: 1,
-            committee,
-            next_committee: vec![],
-            parent_hash: B256::ZERO.into(),
-            final_state: BlockNumHash::default(),
-            final_consensus: ConsensusNumHash::default(),
-        }
-    }
-
-    #[test]
-    fn test_epoch_committee_valid_equal_committees() {
-        // When committees are equal in size, they must be exactly equal
-        let keys: Vec<_> = (0..4).map(test_bls_key).collect();
-        let epoch_rec = test_epoch_record(keys.clone());
-        let committee: BTreeSet<_> = keys.into_iter().collect();
-
-        assert!(epoch_committee_valid(&epoch_rec, &committee));
-    }
-
-    #[test]
-    fn test_epoch_committee_valid_equal_but_different() {
-        // Same size but different members should fail
-        let epoch_keys: Vec<_> = (0..4).map(test_bls_key).collect();
-        let other_keys: Vec<_> = (10..14).map(test_bls_key).collect();
-
-        let epoch_rec = test_epoch_record(epoch_keys);
-        let committee: BTreeSet<_> = other_keys.into_iter().collect();
-
-        assert!(!epoch_committee_valid(&epoch_rec, &committee));
-    }
-
-    #[test]
-    fn test_epoch_committee_valid_committee_smaller_than_epoch() {
-        // If committee is smaller than epoch_rec.committee, always invalid
-        let epoch_keys: Vec<_> = (0..4).map(test_bls_key).collect();
-        let smaller_keys: Vec<_> = (0..3).map(test_bls_key).collect();
-
-        let epoch_rec = test_epoch_record(epoch_keys);
-        let committee: BTreeSet<_> = smaller_keys.into_iter().collect();
-
-        assert!(!epoch_committee_valid(&epoch_rec, &committee));
-    }
-
-    #[test]
-    fn test_epoch_committee_valid_committee_larger_valid() {
-        // Committee larger but all epoch members present and epoch >= 4 and >= 2/3
-        let epoch_keys: Vec<_> = (0..4).map(test_bls_key).collect();
-        let mut larger_keys = epoch_keys.clone();
-        larger_keys.push(test_bls_key(10)); // Add one more
-
-        let epoch_rec = test_epoch_record(epoch_keys);
-        let committee: BTreeSet<_> = larger_keys.into_iter().collect();
-
-        // epoch_len=4, committee_len=5, 2/3 of 5 = 3, 4 >= 3 so valid
-        assert!(epoch_committee_valid(&epoch_rec, &committee));
-    }
-
-    #[test]
-    fn test_epoch_committee_valid_epoch_too_small() {
-        // Epoch committee smaller than 4 is invalid (even if all present)
-        let epoch_keys: Vec<_> = (0..3).map(test_bls_key).collect();
-        let mut larger_keys = epoch_keys.clone();
-        larger_keys.push(test_bls_key(10));
-        larger_keys.push(test_bls_key(11));
-
-        let epoch_rec = test_epoch_record(epoch_keys);
-        let committee: BTreeSet<_> = larger_keys.into_iter().collect();
-
-        // epoch_len=3 < 4, so invalid
-        assert!(!epoch_committee_valid(&epoch_rec, &committee));
-    }
-
-    #[test]
-    fn test_epoch_committee_valid_epoch_less_than_two_thirds() {
-        // Epoch committee less than 2/3 of committee is invalid
-        let epoch_keys: Vec<_> = (0..4).map(test_bls_key).collect();
-        // Add many more keys to committee so epoch is < 2/3
-        let mut larger_keys = epoch_keys.clone();
-        for i in 10..20 {
-            larger_keys.push(test_bls_key(i));
-        }
-
-        let epoch_rec = test_epoch_record(epoch_keys);
-        let committee: BTreeSet<_> = larger_keys.into_iter().collect();
-
-        // epoch_len=4, committee_len=14, 2/3 of 14 = 9, 4 < 9 so invalid
-        assert!(!epoch_committee_valid(&epoch_rec, &committee));
-    }
-
-    #[test]
-    fn test_epoch_committee_valid_member_not_in_committee() {
-        // Epoch has a member not in committee - invalid
-        let epoch_keys: Vec<_> = (0..4).map(test_bls_key).collect();
-        let mut committee_keys: Vec<_> = (0..3).map(test_bls_key).collect();
-        committee_keys.push(test_bls_key(10)); // Different key
-        committee_keys.push(test_bls_key(11)); // Extra to make it larger
-
-        let epoch_rec = test_epoch_record(epoch_keys);
-        let committee: BTreeSet<_> = committee_keys.into_iter().collect();
-
-        // epoch key 3 is not in committee
-        assert!(!epoch_committee_valid(&epoch_rec, &committee));
-    }
-
-    #[test]
-    fn test_epoch_committee_valid_boundary_two_thirds() {
-        // Test exactly at 2/3 boundary
-        let epoch_keys: Vec<_> = (0..6).map(test_bls_key).collect();
-        let mut larger_keys = epoch_keys.clone();
-        for i in 10..13 {
-            larger_keys.push(test_bls_key(i));
-        }
-
-        let epoch_rec = test_epoch_record(epoch_keys);
-        let committee: BTreeSet<_> = larger_keys.into_iter().collect();
-
-        // epoch_len=6, committee_len=9, 2/3 of 9 = 6, 6 >= 6 so valid
-        assert!(epoch_committee_valid(&epoch_rec, &committee));
-    }
 
     /// Aggregate an [EpochCertificate] for `record` signed by the committee
     /// members at `signer_idx` (positions into `signers`, which parallels
