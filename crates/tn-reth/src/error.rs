@@ -68,6 +68,9 @@ pub enum TnRethError {
         /// The persisted canonical tip.
         tip: u64,
     },
+    /// Failure exporting or restoring an EVM state snapshot.
+    #[error("snapshot: {0}")]
+    Snapshot(String),
 }
 
 impl From<TnRethError> for EthApiError {
