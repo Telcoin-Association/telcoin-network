@@ -3,7 +3,10 @@
 //! Certificates are validated and sent to the [CertificateManager].
 //! The [CertificateManager] tracks pending certificates and accepts certificates that are complete.
 
-use super::{cert_manager::CertificateManager, cert_validator::CertificateValidator};
+use super::{
+    cert_manager::CertificateManager, cert_validator::CertificateValidator,
+    pending_cert_manager::PendingCertificateManager,
+};
 use crate::{error::CertManagerError, state_sync::HeaderValidator, ConsensusBus};
 use assert_matches::assert_matches;
 use std::{collections::BTreeSet, time::Duration};
@@ -430,6 +433,35 @@ async fn test_filter_unknown_parents() -> eyre::Result<()> {
     let mut expected: Vec<_> = first_round.iter().map(|c| c.digest()).collect();
     expected.sort_by(sort_by_digest);
     assert_eq!(expected, unknown);
+
+    Ok(())
+}
+
+/// Regression test for #887: `insert_pending` keys `missing_for_pending` by the certificate's
+/// parent round. A round-0 certificate must floor that key at round 0 instead of underflowing
+/// `round - 1` (on the release binary `0u32 - 1` wraps to `u32::MAX`, an entry
+/// `next_for_gc_round` can never collect; in debug the subtraction panics). The only current
+/// caller gates on `round > gc_round + 1`, so this exercises the helper's own defense-in-depth
+/// guard rather than a reachable production path.
+#[test]
+fn test_insert_pending_floors_parent_round_at_genesis() -> eyre::Result<()> {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let committee = fixture.committee();
+
+    // round-0 (genesis) certificates: one to insert as pending, another to act as the
+    // missing-parent digest
+    let genesis = Certificate::genesis(&committee);
+    let cert = genesis.first().cloned().ok_or_else(|| eyre::eyre!("no genesis certificates"))?;
+    let parent =
+        genesis.last().map(|c| c.digest()).ok_or_else(|| eyre::eyre!("no parent digest"))?;
+
+    let mut pending = PendingCertificateManager::new();
+    pending.insert_pending(cert, std::iter::once(parent).collect())?;
+
+    // the missing-parent key floors at round 0 and stays reachable for garbage collection
+    // (an underflowed `(u32::MAX, digest)` key would make `next_for_gc_round` return `None`
+    // forever)
+    assert_eq!(pending.next_for_gc_round(0), Some((0, parent)));
 
     Ok(())
 }
