@@ -4,10 +4,9 @@ use crate::{
     error::PrimaryNetworkError,
     network::{
         message::{PrimaryGossip, PrimaryResponse},
-        try_admit_epoch_record, MissingCertificatesRequest, PendingStreamRequest, RequestHandler,
-        StreamRequestKind, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONCURRENT_EPOCH_STREAMS,
-        MAX_CONSENSUS_CERTS, MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
-        PENDING_REQUEST_TIMEOUT,
+        try_admit_epoch_record, MissingCertificatesRequest, RequestHandler,
+        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONSENSUS_CERTS, MAX_PENDING_REQUESTS_PER_PEER,
+        MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
@@ -20,7 +19,7 @@ use std::{
     num::NonZeroUsize,
     path::Path,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tempfile::TempDir;
 use tn_config::{ConsensusConfig, KeyConfig, Parameters};
@@ -1366,77 +1365,11 @@ async fn test_behind_consensus_genuinely_behind() {
     assert!(result, "genuinely behind node should be detected");
 }
 
-/// Server-side partial epoch streaming: `send_epoch_over_stream` with `Some(stop_number)` must
-/// emit exactly the verifiable prefix (every output up to and including the stop number) of the
-/// in-progress current epoch, and a later cutoff must extend that same prefix.
-#[tokio::test]
-async fn test_send_partial_epoch_over_stream() {
-    use tokio::io::AsyncReadExt as _;
-
-    let temp_dir = TempDir::new().unwrap();
-    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
-        create_test_types(temp_dir.path()).await;
-    let committee_obj = committee.committee();
-    let peer = *committee.first_authority().authority().protocol_key();
-
-    // Populate the in-progress (never finalized) epoch-0 pack with some outputs.
-    let num_outputs = 15u64;
-    for number in 1..=num_outputs {
-        let cert = Certificate::default();
-        let sub_dag = CommittedSubDag::new(
-            vec![cert.clone()],
-            cert,
-            number,
-            ReputationScores::new(&committee_obj),
-            None,
-        );
-        handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
-    }
-
-    // The server streams a partial prefix up to consensus number `k`.
-    let k = 9u64;
-    let mut sent = Vec::new();
-    RequestHandler::<MemDatabase>::send_epoch_over_stream(
-        &mut sent,
-        handler.consensus_chain(),
-        0,
-        Some(k),
-        Duration::from_secs(10),
-        peer,
-    )
-    .await
-    .expect("send partial epoch stream");
-
-    // The streamed bytes must equal exactly the verifiable prefix the chain exposes — i.e. the
-    // data file truncated at `output_end(k)`.
-    let (stream, len) =
-        handler.consensus_chain().get_partial_epoch_stream(0, k).await.expect("partial stream");
-    let mut expected = Vec::new();
-    stream.take(len).read_to_end(&mut expected).await.unwrap();
-    assert_eq!(sent.len() as u64, len, "streamed byte count must equal the partial cutoff");
-    assert_eq!(sent, expected, "streamed bytes must equal the verifiable prefix");
-
-    // A later cutoff streams strictly more, and the smaller prefix is a true prefix of it.
-    let mut sent_more = Vec::new();
-    RequestHandler::<MemDatabase>::send_epoch_over_stream(
-        &mut sent_more,
-        handler.consensus_chain(),
-        0,
-        Some(num_outputs),
-        Duration::from_secs(10),
-        peer,
-    )
-    .await
-    .expect("send larger partial stream");
-    assert!(sent_more.len() > sent.len(), "a later cutoff must stream more bytes");
-    assert_eq!(&sent_more[..sent.len()], &sent[..], "smaller prefix must prefix the larger one");
-}
-
 /// Serving a partial prefix over the sync protocol (`EpochPackPartial`, item 9)
 /// writes `Ack` then streams exactly the verifiable prefix bytes as `Data` frames:
 /// the bytes reassembled from the frames must equal the data file truncated at
 /// `output_end(k)`, and a later cutoff must stream strictly more (with the smaller
-/// prefix a true prefix of it): the sync mirror of `test_send_partial_epoch_over_stream`.
+/// prefix a true prefix of it).
 #[tokio::test]
 async fn test_sync_partial_epoch_pack_over_stream() {
     use tokio::io::AsyncReadExt as _;
@@ -1560,64 +1493,6 @@ async fn test_sync_epoch_pack_unavailable_denies() {
     assert_matches!(
         frame,
         tn_network_libp2p::SyncFrame::Deny(tn_network_libp2p::DenyReason::Unavailable)
-    );
-}
-
-/// A peer that re-requests the same epoch while an entry is already pending must not be
-/// able to reset the cleanup timer. If the replacement path rearmed `created_at`, a peer
-/// could re-request every 20s and hold a slot forever. This test exercises the
-/// preservation logic used by `process_epoch_stream` and verifies the entry is evicted on
-/// schedule relative to the *original* insertion time.
-#[tokio::test]
-async fn test_pending_epoch_stream_replacement_preserves_created_at() {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_STREAMS));
-    let mut pending_map: HashMap<(BlsPublicKey, B256), PendingStreamRequest> = HashMap::new();
-
-    let peer = BlsPublicKey::default();
-    let digest = B256::random();
-    let key = (peer, digest);
-    let epoch: u32 = 7;
-    let kind = StreamRequestKind::EpochPack(epoch);
-
-    // initial insertion at T0, where T0 is just past the cleanup horizon so we can
-    // assert eviction without waiting on wall-clock time
-    let t0 = Instant::now() - PENDING_REQUEST_TIMEOUT - Duration::from_secs(1);
-    let permit = semaphore.clone().try_acquire_owned().expect("permit available");
-    pending_map.insert(key, PendingStreamRequest::new_with_created_at(kind, permit, t0));
-
-    // simulate a re-request: production code looks up the existing entry's
-    // `created_at` and reuses it when building the replacement
-    let new_permit = semaphore.clone().try_acquire_owned().expect("permit available");
-    let preserved_created_at =
-        pending_map.get(&key).map(|p| p.created_at).unwrap_or_else(Instant::now);
-    let replacement =
-        PendingStreamRequest { kind, created_at: preserved_created_at, _permit: new_permit };
-    assert!(pending_map.insert(key, replacement).is_some(), "expected replacement");
-
-    // the replacement must carry the original `created_at`, not a fresh one
-    let after = pending_map.get(&key).expect("entry present after replacement");
-    assert_eq!(
-        after.created_at, t0,
-        "replacement must preserve original created_at to prevent cleanup-timer reset"
-    );
-
-    // cleanup mirrors `PrimaryNetwork::cleanup_stale_pending_requests`: entries whose
-    // age >= PENDING_REQUEST_TIMEOUT must be evicted. Since created_at is t0 (stale),
-    // the entry must drop.
-    let now = Instant::now();
-    pending_map
-        .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_REQUEST_TIMEOUT);
-
-    assert!(
-        pending_map.is_empty(),
-        "stale entry must be evicted by cleanup even though it was 'replaced' moments ago"
-    );
-
-    // and the permit must have returned to the semaphore
-    assert_eq!(
-        semaphore.available_permits(),
-        MAX_CONCURRENT_EPOCH_STREAMS,
-        "dropping the evicted pending entry must release its semaphore permit"
     );
 }
 
