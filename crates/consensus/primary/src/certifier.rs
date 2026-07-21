@@ -445,6 +445,23 @@ impl<DB: Database> Certifier<DB> {
                             return Err(TaskError::from_message(e.to_string()));
                         }
 
+                        // Release the proposal lock now that the guard record is written.
+                        //
+                        // The lock exists to make the already-certified check at the top of this
+                        // method atomic with the insert above, and that pair is now complete: the
+                        // insert updates the in-memory layer synchronously, so any later proposal
+                        // reaching that check already observes this certificate. Nothing below
+                        // needs the exclusion.
+                        //
+                        // Holding it across the barrier would be actively harmful, because
+                        // `persist_durable` is a *whole-DB* barrier - the table parameter is unused
+                        // and only selects which of the three DBs to target - so it defers while
+                        // any write txn on the epoch DB is open and drains only at refcount zero,
+                        // with no timeout. Under catch-up or epoch close that is tens to hundreds
+                        // of milliseconds during which every other proposal would queue behind this
+                        // lock. Do not widen this critical section back out.
+                        drop(_guard);
+
                         // Wait for the `ProposedCertificates` record to be durable before
                         // externalizing. The epoch DB persists asynchronously, so the insert above
                         // returns before the record hits disk; `process_own_certificate` below already
