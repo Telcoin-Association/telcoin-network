@@ -15,7 +15,7 @@ use crate::{
     health::HealthcheckServer,
     manager::{
         exex::{run_critical_exex_future, run_isolated_exex_future},
-        spawn_epoch_vote_collector,
+        spawn_epoch_vote_collector, ExecStateExporter,
     },
     metrics::EpochMetrics,
 };
@@ -142,6 +142,10 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// Static version string for the running node, reported by node-info surfaces.
     version_str: &'static str,
+
+    /// Background execution-state exporter. `Some` only when `--enable-state-export` is set;
+    /// exports each epoch's final state at the epoch boundary. Stops on drop.
+    exec_state_exporter: Option<ExecStateExporter>,
 
     /// Prometheus metrics for the epoch lifecycle.
     metrics: EpochMetrics,
@@ -778,6 +782,9 @@ where
             BTreeMap::new()
         };
 
+        // Spawn the state exporter once, only when the feature is enabled.
+        let exec_state_exporter = builder.enable_state_export.then(ExecStateExporter::spawn);
+
         Ok(Self {
             builder,
             tn_datadir,
@@ -796,6 +803,7 @@ where
             consensus_chain,
             bootstrap_servers,
             version_str,
+            exec_state_exporter,
             metrics: EpochMetrics::default(),
         })
     }

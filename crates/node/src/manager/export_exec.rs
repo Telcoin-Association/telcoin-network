@@ -14,8 +14,9 @@
 //! the accounts plus that block's header and recent ancestors into an exec state pack
 //! ([`PinnedStateView::export_state_pack`](tn_reth::snapshot::PinnedStateView::export_state_pack)).
 //!
-//! This is the mechanism only. Wiring the exporter into the node lifecycle (spawning it in
-//! `EpochManager` and connecting a trigger source such as an admin RPC) is a follow-up.
+//! `EpochManager` spawns one exporter when `--enable-state-export` is set and triggers it at each
+//! epoch boundary (see `export_epoch_state` in `close_epoch`); an on-demand trigger source (e.g. an
+//! admin RPC) could reuse the same handle.
 
 use std::{
     path::PathBuf,
@@ -56,8 +57,9 @@ pub struct ExportOutcome {
     pub path: PathBuf,
 }
 
-/// A queued export request: which block, where to write, and where to send the result.
+/// A queued export request: the env + block to export, where to write, and where to reply.
 struct ExportRequest {
+    reth_env: RethEnv,
     block: BlockNumHash,
     out_dir: PathBuf,
     reply: oneshot::Sender<eyre::Result<ExportOutcome>>,
@@ -82,17 +84,19 @@ pub struct ExecStateExporter {
 }
 
 impl ExecStateExporter {
-    /// Spawn the background export worker over a (cheap) clone of `reth_env`.
-    pub fn spawn(reth_env: RethEnv) -> Self {
+    /// Spawn the background export worker. Each export supplies its own [`RethEnv`] (the node's
+    /// execution engine — and its `RethEnv` — is recreated per epoch), so the worker holds none.
+    pub fn spawn() -> Self {
         let (tx, rx) = mpsc::channel(REQUEST_QUEUE);
         let worker = std::thread::Builder::new()
             .name("evm-state-exporter".to_string())
-            .spawn(move || run_worker(reth_env, rx))
+            .spawn(move || run_worker(rx))
             .expect("failed to spawn evm-state-exporter thread");
         Self { tx, worker: Arc::new(Mutex::new(Some(worker))) }
     }
 
-    /// Trigger an export of the execution state at `block` into `out_dir`.
+    /// Trigger an export of the execution state at `block` (read through `reth_env`) into
+    /// `out_dir`.
     ///
     /// `block` is the recent block to snapshot; the export succeeds once it is the persisted
     /// execution tip (the worker waits briefly if it is still catching up to persistence).
@@ -102,18 +106,19 @@ impl ExecStateExporter {
     /// if the worker's queue is full (an export is already in flight/queued) or the worker stopped.
     pub fn trigger_export(
         &self,
+        reth_env: RethEnv,
         block: BlockNumHash,
         out_dir: PathBuf,
     ) -> eyre::Result<oneshot::Receiver<eyre::Result<ExportOutcome>>> {
         let (reply, rx) = oneshot::channel();
-        self.tx.try_send(WorkerMsg::Export(ExportRequest { block, out_dir, reply })).map_err(
-            |e| match e {
+        self.tx
+            .try_send(WorkerMsg::Export(ExportRequest { reth_env, block, out_dir, reply }))
+            .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => {
                     eyre!("state exporter is busy (an export is already queued)")
                 }
                 mpsc::error::TrySendError::Closed(_) => eyre!("state exporter worker has stopped"),
-            },
-        )?;
+            })?;
         Ok(rx)
     }
 
@@ -161,11 +166,11 @@ impl Drop for ExecStateExporter {
 
 /// Background worker: process export requests one at a time until told to stop or the channel
 /// closes.
-fn run_worker(reth_env: RethEnv, mut rx: mpsc::Receiver<WorkerMsg>) {
+fn run_worker(mut rx: mpsc::Receiver<WorkerMsg>) {
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             WorkerMsg::Export(req) => {
-                let result = export_once(&reth_env, req.block, req.out_dir);
+                let result = export_once(&req.reth_env, req.block, req.out_dir);
                 // the receiver may have been dropped (fire-and-forget); that's fine.
                 let _ = req.reply.send(result);
             }
@@ -262,11 +267,11 @@ mod tests {
         let (genesis_root, genesis_block) =
             (genesis.state_root, BlockNumHash::new(0, genesis.hash()));
 
-        let exporter = ExecStateExporter::spawn(reth_env);
+        let exporter = ExecStateExporter::spawn();
 
         // trigger an export of the (genesis) tip on the background thread and await its result
         let out = TempDir::new()?;
-        let rx = exporter.trigger_export(genesis_block, out.path().to_path_buf())?;
+        let rx = exporter.trigger_export(reth_env, genesis_block, out.path().to_path_buf())?;
         let outcome = rx.await.expect("worker replied").expect("export succeeded");
 
         // exported the requested genesis block, with the funded genesis accounts
