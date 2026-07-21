@@ -1267,11 +1267,12 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 /// A pruned peer that does not support the dedicated peer-exchange protocol still
 /// receives the goodbye.
 ///
-/// The raw swarm below advertises only the legacy `/tn-primary-{chain}/0.0.1`
-/// req-res protocol, exactly the wire surface of a not-yet-upgraded node. The
-/// target's goodbye attempt on `/tn-primary-peer-exchange-{chain}/0.0.1` fails
-/// with `UnsupportedProtocols` (penalty-exempt) and must fall back to the
-/// `PeerExchange` variant embedded in the legacy request enum.
+/// The raw swarm below advertises only the `/tn-primary-{chain}/0.0.2` req-res
+/// protocol and not the dedicated peer-exchange protocol, exactly the wire
+/// surface of a peer that has not adopted peer-exchange. The target's goodbye
+/// attempt on `/tn-primary-peer-exchange-{chain}/0.0.1` fails with
+/// `UnsupportedProtocols` (penalty-exempt) and must fall back to the
+/// `PeerExchange` variant embedded in the request enum.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre::Result<()> {
     tn_types::test_utils::init_test_tracing();
