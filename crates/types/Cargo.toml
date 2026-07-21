@@ -54,6 +54,9 @@ tn-storage = { workspace = true, features = ["test-utils"] }
 default = []
 test-utils = ["tracing-subscriber", "clap"]
 adiri = []
+# Fork-const visibility for devnet (`faucet`) builds: `tn-reth/faucet` forwards here so the
+# ConsensusRegistry fork machinery compiles into the devnet image shape (see `forks.rs`).
+faucet = []
 
 [lints]
 workspace = true

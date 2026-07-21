@@ -1,6 +1,6 @@
 //! Code to support various chain forks.
 
-#[cfg(feature = "adiri")]
+#[cfg(any(feature = "adiri", feature = "faucet"))]
 use crate::Epoch;
 use alloy::primitives::{b256, B256};
 
@@ -17,20 +17,32 @@ use alloy::primitives::{b256, B256};
 ///   every devnet epoch close) execute byte-identically to the historical chain. The routing is a
 ///   pure function of the deployed code hash and must never be feature-gated: devnet runs this
 ///   registry on a non-adiri build.
-/// - **Fail-closed swap gate** (`adiri` builds only): the in-place code swap at the fork boundary
-///   refuses to run over any deployment whose code hash differs from this value, rather than
-///   migrating over an unknown storage layout.
+/// - **Fail-closed swap gate** (`adiri`/`faucet` builds): the in-place code swap at the fork
+///   boundary refuses to run over any deployment whose code hash differs from this value, rather
+///   than migrating over an unknown storage layout.
 ///
 /// Unconditional (not `adiri`-gated) — like the legacy-read routing it drives — so the pin test
 /// guarding it runs in default-feature CI.
 pub const CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH: B256 =
     b256!("0x5318ebc5cd8123cfb0808fac0f3c0b95ed6f45f67c0853fea0766b52035fea53");
 
+/// Keccak-256 hash of the upgraded (post-fork) `ConsensusRegistry` runtime bytecode the
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] boundary swaps in — the embedded `ConsensusRegistry.json`
+/// `deployedBytecode.object` artifact (`tn-reth`'s `CONSENSUS_REGISTRY_JSON`).
+///
+/// Once the fork has run live, re-executing the fork block must swap in these exact bytes: a
+/// tn-contracts artifact bump would silently change what re-execution swaps in and break
+/// historical state roots. Unconditional (not fork-gated) so the pin test guarding it in
+/// `tn-reth` (`test_post_fork_consensus_registry_code_hash_pinned`, next to the embedded
+/// artifact) trips on any such drift in default-feature CI.
+pub const CONSENSUS_REGISTRY_POST_FORK_CODE_HASH: B256 =
+    b256!("0xab86d3482b618e6b1d1ba9b610f1f87d1a1a7ec1d935212978908a56f2d9d9b4");
+
 #[cfg(feature = "adiri")]
 /// The epoch below which Adiri testnet may have had duplicate batches.
 pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 
-#[cfg(feature = "adiri")]
+#[cfg(any(feature = "adiri", feature = "faucet"))]
 /// First epoch that runs on the upgraded `ConsensusRegistry` bytecode.
 ///
 /// The epoch-closing block of `CONSENSUS_REGISTRY_FORK_EPOCH - 1` swaps the deployed registry
@@ -40,10 +52,12 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 /// protocol runs on the new code with populated sets. See
 /// `tn-reth::evm::block::apply_consensus_registry_fork`.
 ///
-/// Scope: an Adiri-testnet-only, in-place upgrade of an already-deployed registry (the whole
-/// mechanism is `#[cfg(feature = "adiri")]`, so non-adiri/mainnet builds exclude it) — not a
-/// general registry-upgrade path. The fork only exists in binaries compiled with the `adiri`
-/// feature, so the activation-epoch PR must ship alongside a confirmed fork-capable node build.
+/// Scope: an in-place upgrade of an already-deployed registry on the feature-gated networks
+/// (the whole mechanism is `#[cfg(any(feature = "adiri", feature = "faucet"))]` — the adiri
+/// testnet plus the devnet `faucet` build shape, which rehearses the fork before the testnet
+/// deploy; default/mainnet builds exclude it) — not a general registry-upgrade path. The fork
+/// only exists in binaries compiled with one of those features, so the activation-epoch PR must
+/// ship alongside a confirmed fork-capable node build.
 ///
 /// Accepted, documented behavior across the fork: the new contract keys its
 /// `blsPubkeyHashToValidator` dedup map by a masked-x `_blsKeyId` rather than `keccak(full key)`,
@@ -56,7 +70,8 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 /// epoch-setting PR before deploy.
 ///
 /// Rollout sequence (standard hard-fork rule): every validator must run a fork-capable build
-/// (compiled `--features adiri` — verify the deploy image — and including the epoch-setting PR)
+/// (compiled `--features adiri` on testnet / `--features faucet` on devnet — verify the deploy
+/// image — and including the epoch-setting PR)
 /// **before** the epoch-closing block of `CONSENSUS_REGISTRY_FORK_EPOCH - 1` executes. Nodes
 /// still on older builds never apply the swap at that boundary, reject the fork block, and
 /// diverge from the canonical chain.
@@ -93,7 +108,7 @@ mod tests {
     /// `chain-configs/testnet/genesis.yaml`.
     ///
     /// Unconditional (not `adiri`-gated) so it runs in default-feature CI even though the fork
-    /// machinery consuming the constant is `adiri`-only.
+    /// machinery consuming the constant is `adiri`/`faucet`-gated.
     #[test]
     fn test_pre_fork_consensus_registry_code_hash_pinned() {
         let genesis = crate::adiri_genesis();

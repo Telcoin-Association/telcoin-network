@@ -234,7 +234,7 @@ where
     /// bytes genesis generation decodes, and exercised by the fork unit test), so a decode failure
     /// here is a corrupt build — uniform across the fleet — not a live-node runtime condition;
     /// hence `expect` rather than a fallible return.
-    #[cfg(feature = "adiri")]
+    #[cfg(any(feature = "adiri", feature = "faucet"))]
     fn consensus_registry_runtime_code() -> &'static (reth_revm::bytecode::Bytecode, B256) {
         use reth_revm::bytecode::Bytecode;
         use std::sync::LazyLock;
@@ -276,7 +276,7 @@ where
     /// embedded artifact, so every node re-derives a byte-identical `state_root`.
     ///
     /// Fatal on failure — a partial or failed migration diverges state across the fleet.
-    #[cfg(feature = "adiri")]
+    #[cfg(any(feature = "adiri", feature = "faucet"))]
     fn apply_consensus_registry_fork(&mut self) -> TnRethResult<()> {
         // revm `Database` trait provides `basic`; imported anonymously to avoid clashing with the
         // `alloy_evm::Database` already in module scope.
@@ -812,7 +812,7 @@ where
             //
             // Both the production and replay paths reach this with an identical `ctx`, so the
             // resulting `state_root` is byte-identical across the fleet.
-            #[cfg(feature = "adiri")]
+            #[cfg(any(feature = "adiri", feature = "faucet"))]
             if tn_types::deconstruct_nonce(self.ctx.nonce).0.checked_add(1)
                 == Some(tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH)
             {

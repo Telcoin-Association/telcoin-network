@@ -2700,7 +2700,7 @@ mod tests {
     /// artifact, the `pre.is_err()` probe below fails first — that means the fixture no longer
     /// mirrors the chain this fork targets; reassess the fork plan rather than updating the
     /// probes.
-    #[cfg(feature = "adiri")]
+    #[cfg(any(feature = "adiri", feature = "faucet"))]
     #[tokio::test]
     async fn test_consensus_registry_fork_swaps_code_and_migrates() -> eyre::Result<()> {
         // pre-fork fixture: old registry code + validator storage, no per-status sets
@@ -2792,7 +2792,22 @@ mod tests {
             assert_eq!(bls.len(), 96, "preserved BLS pubkey must remain 96-byte compressed");
         }
 
-        // --- determinism: an independent execution of the identical block yields the same root ---
+        // --- second close: the NEXT epoch boundary must run on the migrated state ---
+        // This output concludes `CONSENSUS_REGISTRY_FORK_EPOCH` itself, so the trigger
+        // arithmetic (concluded + 1 == FORK_EPOCH) does not match and the swap must NOT
+        // re-fire — a re-fire would hit the fail-closed gate (the registry now carries the
+        // post-fork code hash) and abort this block. Success proves the post-fork close path
+        // (`getValidatorsInfo` committee read + `eligibleValidatorCount` guard) works against
+        // the durable migrated sets, not just the same-block state the fork block itself saw.
+        let output2 =
+            consensus_output_for_tests(2, tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH, 2, true);
+        let payload2 = TNPayload::new_for_test(header.clone(), &output2);
+        let second_close =
+            execute_payload_and_update_canonical_chain(&env1, payload2.clone(), vec![])?;
+        let second_state_root = second_close.recovered_block.clone_sealed_header().state_root;
+
+        // --- determinism: independent executions of the identical two-block chain yield the
+        // same roots ---
         let tmp2 = TempDir::new().unwrap();
         let tm2 = TaskManager::new("fork test env2");
         let env2 = RethEnv::new_for_temp_chain(chain.clone(), tmp2.path(), &tm2, None).unwrap();
@@ -2801,6 +2816,12 @@ mod tests {
             block2.recovered_block.clone_sealed_header().state_root,
             produced_state_root,
             "fork block state_root must be identical across independent executions"
+        );
+        let second_close2 = execute_payload_and_update_canonical_chain(&env2, payload2, vec![])?;
+        assert_eq!(
+            second_close2.recovered_block.clone_sealed_header().state_root,
+            second_state_root,
+            "post-fork close state_root must be identical across independent executions"
         );
 
         Ok(())
@@ -3017,7 +3038,7 @@ mod tests {
     /// fork-boundary block must abort with the fail-closed gate error instead of silently
     /// migrating over an unverified layout. (Without the gate this block would execute: the
     /// migration is idempotent on the new code, making this test the discriminating check.)
-    #[cfg(feature = "adiri")]
+    #[cfg(any(feature = "adiri", feature = "faucet"))]
     #[tokio::test]
     async fn test_consensus_registry_fork_fails_closed_on_unexpected_code() -> eyre::Result<()> {
         // overwrite the registry's code (keeping balance + storage) with the post-fork artifact
@@ -3052,6 +3073,30 @@ mod tests {
             "abort must come from the fail-closed code-hash gate, got: {err:#}"
         );
 
+        Ok(())
+    }
+
+    /// Pin `tn_types::forks::CONSENSUS_REGISTRY_POST_FORK_CODE_HASH` to the embedded
+    /// `ConsensusRegistry.json` artifact whose bytes the fork boundary swaps in.
+    ///
+    /// Unconditional (not fork-gated) so it runs in default-feature CI: once the fork has
+    /// executed on a live chain, a tn-contracts artifact bump would change the bytes
+    /// re-execution swaps in and break historical state roots. This test makes that drift loud.
+    #[test]
+    fn test_post_fork_consensus_registry_code_hash_pinned() -> eyre::Result<()> {
+        let value = RethEnv::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let code: Bytes =
+            hex::decode(value.as_str().expect("deployedBytecode.object is a string"))?.into();
+        assert_eq!(
+            keccak256(&code),
+            tn_types::forks::CONSENSUS_REGISTRY_POST_FORK_CODE_HASH,
+            "embedded ConsensusRegistry artifact drifted from the pinned post-fork code hash — \
+             if the fork has already run on a live chain, shipping this artifact would break \
+             historical state roots; reassess the fork plan before updating the pin",
+        );
         Ok(())
     }
 

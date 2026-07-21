@@ -74,7 +74,7 @@ tn-reth = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = []
-faucet = []
+faucet = ["tn-types/faucet"]
 test-utils = ["dep:secp256k1"]
 adiri = ["faucet", "tn-types/adiri"]
 # Opt back in to reth's RocksDB storage backend (librocksdb-sys, the RocksDB C++ engine).
