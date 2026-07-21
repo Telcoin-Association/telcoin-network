@@ -243,17 +243,18 @@ where
         // At the previous epoch's closing header the registry already serves the two future
         // epochs' committees (genesis seeds epochs 0-2; the `concludeEpoch` that seats epoch N
         // writes epoch N+2's committee inside that same closing block), and pinning keeps a
-        // post-burn re-entry prefetching the same sets an on-time entry prefetched — the
-        // prefetch is a best-effort network warm-up either way.
-        let next_committee_keys = engine
-            .validators_for_epoch_at_block(committee.epoch() + 1, epoch_start_header.hash())
-            .await?;
-        prefetches.extend(next_committee_keys.iter());
-        prefetches.extend(
-            engine
-                .validators_for_epoch_at_block(committee.epoch() + 2, epoch_start_header.hash())
-                .await?,
-        );
+        // post-burn re-entry prefetching the same sets an on-time entry prefetched. The
+        // prefetch is a best-effort network warm-up: the next committee's keys are reused from
+        // the config (already read at the pin — no second chain read to fail), and a failed
+        // epoch + 2 read is logged and skipped rather than aborting epoch start.
+        prefetches.extend(consensus_config.next_committee_keys().iter());
+        match engine
+            .validators_for_epoch_at_block(committee.epoch() + 2, epoch_start_header.hash())
+            .await
+        {
+            Ok(keys) => prefetches.extend(keys),
+            Err(e) => warn!(target: "epoch-manager", ?e, "skipping epoch + 2 committee prefetch"),
+        }
         // Attempt to pre-load the next couple of committee's network info.
         let _ = primary_handle
             .inner_handle()
