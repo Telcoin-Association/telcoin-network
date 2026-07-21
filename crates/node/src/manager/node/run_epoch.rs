@@ -29,7 +29,7 @@ use tn_types::{
     EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Name of the per-epoch [`TaskManager`], created fresh and torn down each epoch.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
@@ -138,6 +138,7 @@ where
         let (committee, epoch_info, epoch_start, epoch_start_header) =
             self.get_committee_with_epoch_start_info(engine).await?;
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
+        debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
         self.metrics.current.set(committee.epoch() as f64);
         self.metrics.boundary_timestamp_seconds.set(self.epoch_boundary as f64);
 
@@ -222,7 +223,7 @@ where
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
             gas_accumulator.rewards_counter().set_committee(committee.clone());
-            let mut replay = self.replay_missed_consensus(committee, to_engine).await?;
+            let mut replay = self.replay_missed_consensus(committee.clone(), to_engine).await?;
             if let Some(target_hash) = replay.take_epoch_close_hash() {
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
@@ -243,7 +244,9 @@ where
 
         // subscribe to output early to prevent missed messages
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
-        let consensus_config = self.configure_consensus(engine, network_config).await?;
+        let consensus_config = self
+            .configure_consensus(engine, network_config, committee, &epoch_start_header)
+            .await?;
 
         // The networks need their one-time, per-process setup (start listening, register bootstrap
         // peers) on the first iteration that actually reaches `create_consensus`. This is usually

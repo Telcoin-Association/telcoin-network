@@ -113,8 +113,9 @@ where
     ///
     /// The single atomic `epoch_state_at_epoch_start` read yields the committee, the `EpochInfo`,
     /// the epoch-start timestamp, and the pin header (the previous epoch's closing block; genesis
-    /// for epoch 0), returned together so [`configure_consensus`] can compute the epoch boundary
-    /// and issue further pinned reads without a second system call. The pin is what makes every
+    /// for epoch 0), returned together so the caller (`run_epoch`) can compute the epoch boundary
+    /// and thread the committee and pin into [`configure_consensus`] and [`create_consensus`] for
+    /// further pinned reads without a second system call. The pin is what makes every
     /// entry shape — fresh boundary crossing, crash-restart replay, or ModeChange re-entry, before
     /// or after a mid-epoch governance `burn` — derive the IDENTICAL committee; the
     /// `EpochInfo`/epoch-start scalars are unchanged by the pin, since `concludeEpoch` writes them
@@ -268,25 +269,20 @@ where
     /// Assemble the per-epoch [`ConsensusConfig`] from state pinned to the previous epoch's
     /// closing block.
     ///
-    /// Reads the committee and epoch-start info at that pin (via
-    /// [`Self::get_committee_with_epoch_start_info`]), resets `epoch_boundary` to
-    /// `epoch_start + epochDuration` (the timestamp at which this epoch closes, used elsewhere
-    /// to detect the boundary), and folds in the next committee's keys — read at the same pin —
-    /// so the network can pre-resolve the successor committee. Produces a config scoped to this
-    /// epoch only.
+    /// `committee` and `epoch_start_header` are threaded in from `run_epoch`'s single entry
+    /// read ([`Self::get_committee_with_epoch_start_info`]) — this method issues no epoch-start
+    /// read of its own, so the config cannot derive from a different pin than the rest of the
+    /// entry path. It folds in the next committee's keys — read at the same pin — so the
+    /// network can pre-resolve the successor committee. Produces a config scoped to this epoch
+    /// only.
     pub(super) async fn configure_consensus(
-        &mut self,
+        &self,
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
+        committee: Committee,
+        epoch_start_header: &SealedHeader,
     ) -> eyre::Result<ConsensusConfig<DB>> {
-        // retrieve epoch information pinned to the previous epoch's closing block
-        let (committee, epoch_info, epoch_start, epoch_start_header) =
-            self.get_committee_with_epoch_start_info(engine).await?;
         let validators = committee.bls_keys();
-
-        self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
-        debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
-
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
 
         // Pinned like every other epoch-scoped read in this path: the registry at the pin
