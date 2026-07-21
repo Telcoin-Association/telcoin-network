@@ -37,6 +37,9 @@ hyper-util = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
 tower-http = { workspace = true }
 
+# metrics
+metrics = { workspace = true }
+
 # config + serde
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -45,6 +48,7 @@ humantime = { workspace = true }
 
 # telcoin
 tn-config = { workspace = true }
+tn-metrics = { workspace = true }
 tn-types = { workspace = true }
 
 [dev-dependencies]

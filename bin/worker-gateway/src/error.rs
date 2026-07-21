@@ -122,11 +122,35 @@ impl GatewayError {
             Self::UnreadableBody => "request body could not be read",
         }
     }
+
+    /// A stable, machine-readable reason label for the
+    /// `tn_worker_gateway_rejections_total` metric. It is kept in lockstep with
+    /// the variants; a rename is a metrics-contract change, so the labels are
+    /// pinned by a test.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::NoUpstreamReady => "no_upstream_ready",
+            Self::UpstreamUnreachable => "upstream_unreachable",
+            Self::UpstreamTimeout => "upstream_timeout",
+            Self::RequestTooLarge => "request_too_large",
+            Self::LoopDetected => "loop_detected",
+            Self::RequestTimeout => "request_timeout",
+            Self::RateLimited => "rate_limited",
+            Self::InvalidTransaction => "invalid_transaction",
+            Self::UnsupportedTransactionType => "unsupported_transaction_type",
+            Self::UnreadableBody => "unreadable_body",
+        }
+    }
 }
 
 /// Render `err` as a JSON-RPC 2.0 error response, echoing the request `id`
 /// recovered from `request_body` when possible (otherwise `null`, per spec).
 pub(crate) fn error_response(err: &GatewayError, request_body: &[u8]) -> Response {
+    // Every gateway-side rejection funnels through here, so this is the single
+    // point that records the rejection metric (by reason, plus the `rejected`
+    // arm of the request counter).
+    crate::telemetry::record_rejection(err.reason());
+
     let body = json!({
         "jsonrpc": "2.0",
         "error": { "code": err.code(), "message": err.message() },
@@ -233,5 +257,25 @@ mod tests {
         assert_eq!(GatewayError::RateLimited.code(), -32006);
         assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
         assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
+    }
+
+    #[test]
+    fn reason_labels_are_stable() {
+        // The reason labels are the `tn_worker_gateway_rejections_total{reason}`
+        // metric contract (dashboards and alerts key on them); pin every variant
+        // so a rename or an arm-crossing reorder is caught.
+        assert_eq!(GatewayError::NoUpstreamReady.reason(), "no_upstream_ready");
+        assert_eq!(GatewayError::UpstreamUnreachable.reason(), "upstream_unreachable");
+        assert_eq!(GatewayError::UpstreamTimeout.reason(), "upstream_timeout");
+        assert_eq!(GatewayError::RequestTooLarge.reason(), "request_too_large");
+        assert_eq!(GatewayError::LoopDetected.reason(), "loop_detected");
+        assert_eq!(GatewayError::RequestTimeout.reason(), "request_timeout");
+        assert_eq!(GatewayError::RateLimited.reason(), "rate_limited");
+        assert_eq!(GatewayError::InvalidTransaction.reason(), "invalid_transaction");
+        assert_eq!(
+            GatewayError::UnsupportedTransactionType.reason(),
+            "unsupported_transaction_type"
+        );
+        assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");
     }
 }

@@ -149,6 +149,7 @@ pub(crate) async fn run_poller(
                             )
                             .await;
                             let previous = upstream.ready.swap(ready, Ordering::Relaxed);
+                            crate::telemetry::set_upstream_ready(upstream.worker_id, ready);
                             // Log transitions at an operator-visible level (the
                             // default filter is `info`); per-poll noise stays at
                             // debug. Without this, a 503 `/ready` is
