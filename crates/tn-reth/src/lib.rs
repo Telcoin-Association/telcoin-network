@@ -1961,7 +1961,15 @@ impl RethEnv {
             <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
         >,
     {
-        // create EVM with the state at the pinned header
+        // Create EVM with the state at the pinned header.
+        //
+        // ARCHIVE-MODE ASSUMPTION: this node never constructs a pruner (`PruningArgs` are built
+        // with every field disabled and no `PrunerBuilder` exists in the repo), so
+        // `state_by_block_hash` always resolves fully indexed history. If pruning is ever
+        // enabled, reth's `HistoricalStateProvider` can hit a missing history shard and return
+        // `HistoryInfo::MaybeInPlainState`, silently falling back to TIP state for this
+        // "pinned" read — exactly the nondeterminism pinning exists to prevent. Revisit every
+        // pinned registry read before enabling pruning.
         let state_provider = self
             .inner
             .blockchain_provider

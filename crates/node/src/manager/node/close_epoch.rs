@@ -215,11 +215,14 @@ where
         // epoch-start pin.
         //
         // They ARE pinned, though — to `parent_state`, the epoch-closing block this record
-        // commits as `final_state`. At the only call site (the live boundary arm of
-        // `run_epoch`, after `close_epoch`'s `wait_for_consensus_execution`) the canonical
-        // tip IS that closing block, so the pin is behavior-neutral; it makes the record's
-        // committee reads and its `final_state` derive from the same header by construction
-        // instead of by timing.
+        // commits as `final_state`. `parent_state` is the bus's `recent_blocks` watch value,
+        // not the reth canonical tip: the engine publishes each executed output's last block
+        // and its consensus hash in ONE watch write, so the bus can lag the true tip
+        // mid-execution but never lead it. At the only call site (the live boundary arm of
+        // `run_epoch`, after `close_epoch`'s `wait_for_consensus_execution`) the wait resolved
+        // on the exact write that carries the closing block, so this read IS that block; the
+        // pin makes the record's committee reads and its `final_state` derive from the same
+        // header by construction instead of by timing.
         let parent_state = self.consensus_bus.latest_execution_block_num_hash();
         let committee_keys = engine.validators_for_epoch_at_block(epoch, parent_state.hash).await?;
         let next_committee_keys =
