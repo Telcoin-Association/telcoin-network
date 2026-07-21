@@ -1811,11 +1811,14 @@ impl RethEnv {
         // closing header already reports the entered epoch. This can only fire if the registry's
         // `blockHeight == closing block + 1` convention ever breaks — running a stale committee
         // is a consensus-safety failure, so fail hard instead of returning the mismatched state.
-        debug_assert_eq!(
-            state.epoch, epoch,
-            "epoch state pinned to the closing block reports a different epoch"
-        );
         if state.epoch != epoch {
+            error!(
+                target: "engine",
+                pin_number = pin_header.number,
+                pinned_epoch = state.epoch,
+                tip_epoch = epoch,
+                "epoch-start pin and canonical tip disagree on the current epoch"
+            );
             return Err(eyre::eyre!(
                 "epoch state pinned to block {} reports epoch {} but the canonical tip reports \
                  epoch {epoch}",
