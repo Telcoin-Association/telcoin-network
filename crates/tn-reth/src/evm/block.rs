@@ -499,9 +499,9 @@ where
         // `CONSENSUS_REGISTRY_FORK_EPOCH`) executing byte-identically to the historical chain.
         // The routing is a pure function of the deployed registry's code hash, not of the build:
         // every build must speak the legacy ABI against a pre-fork registry (devnet runs one on a
-        // non-adiri binary), so this gate must never be feature-gated. On adiri builds the fork
-        // boundary's `apply_consensus_registry_fork` swaps the code first, so this gate already
-        // sees the upgraded hash and takes the post-fork read below.
+        // non-adiri binary), so this gate must never be feature-gated. On fork-capable builds
+        // (`adiri`/`faucet`) the fork boundary's `apply_consensus_registry_fork` swaps the code
+        // first, so this gate already sees the upgraded hash and takes the post-fork read below.
         if self.registry_code_is_pre_fork()? {
             return self.read_committee_eligible_pool_legacy();
         }

@@ -28,7 +28,8 @@ pub const CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH: B256 =
 
 /// Keccak-256 hash of the upgraded (post-fork) `ConsensusRegistry` runtime bytecode the
 /// [`CONSENSUS_REGISTRY_FORK_EPOCH`] boundary swaps in — the embedded `ConsensusRegistry.json`
-/// `deployedBytecode.object` artifact (`tn-reth`'s `CONSENSUS_REGISTRY_JSON`).
+/// `deployedBytecode.object` artifact (`tn-config`'s `CONSENSUS_REGISTRY_JSON`, imported by
+/// `tn-reth`).
 ///
 /// Once the fork has run live, re-executing the fork block must swap in these exact bytes: a
 /// tn-contracts artifact bump would silently change what re-execution swaps in and break
