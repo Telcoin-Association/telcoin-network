@@ -11,8 +11,12 @@
 //! Record stream layout (insert order, enforced on read):
 //!
 //! ```text
-//! Meta -> header_count x Header -> N x Account -> End
+//! Meta -> header_count x Header -> N x (Account -> Storage*) -> End
 //! ```
+//!
+//! An account's storage is split into bounded `Storage` chunk records that follow its `Account`
+//! header (sentinel-terminated by the next `Account`/`End`), so an account with arbitrarily large
+//! storage never exceeds the container's per-record limit and can be read one chunk at a time.
 //!
 //! ## Encoding
 //!
@@ -55,6 +59,11 @@ pub const EXEC_STATE_PACK_VERSION: u16 = 1;
 /// Name of the data file inside the pack directory.
 const DATA_NAME: &str = "state_data";
 
+/// Maximum storage slots per [`ExecStateRecord::Storage`] chunk. Each slot is 64 bytes, so 64k
+/// slots is ~4 MiB decompressed — comfortably under the container's per-record limit
+/// (`MAX_RECORD_SIZE` = 16 MiB, [`crate::archive::pack_iter`]), leaving margin for BCS overhead.
+const STORAGE_CHUNK_SLOTS: usize = 64 * 1024;
+
 /// First record in the pack. Minimal and fixed: it carries the authoritative state
 /// root and describes the shape of the stream that follows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,12 +82,8 @@ pub struct ExecStateMeta {
 
 /// A single account plus its storage and code, mirroring the genesis-account shape so
 /// the import side can feed reth's genesis machinery directly. This is the public
-/// account type; on disk it is stored as the BCS-safe [`AccountRecord`].
-///
-/// Note: a single account (with all of its storage) must serialize to under the
-/// container's per-record limit ([`crate::archive::pack_iter::MAX_RECORD_SIZE`]).
-/// Splitting pathologically large accounts across records is the exporter's concern
-/// (a follow-up), not this format's.
+/// account type; on disk it is stored as a BCS-safe [`AccountRecord`] header followed by
+/// [`ExecStateRecord::Storage`] chunks, so storage of any size round-trips.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecStateAccount {
     /// Account address.
@@ -99,39 +104,24 @@ pub struct ExecStateStats {
     pub bytecodes: u64,
 }
 
-/// On-disk wire form of an account: only primitive types that round-trip through the
-/// container's BCS codec (fixed byte arrays, `u64`, `Vec`). Balance is the account's
-/// [`U256`] as 32 big-endian bytes; storage is the slot map flattened to a vector.
+/// On-disk wire form of an account *header* — only primitive types that round-trip through the
+/// container's BCS codec. Balance is the account's [`U256`] as 32 big-endian bytes. Storage is NOT
+/// inline: it follows as zero or more [`ExecStateRecord::Storage`] chunks, so an account with
+/// arbitrarily large storage never exceeds the container's per-record limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AccountRecord {
     address: Address,
     nonce: u64,
     balance: B256,
     code: Option<Vec<u8>>,
-    storage: Vec<(B256, B256)>,
 }
 
 impl AccountRecord {
-    fn from_account(account: &ExecStateAccount) -> Self {
-        let storage = account
-            .account
-            .storage
-            .as_ref()
-            .map(|slots| slots.iter().map(|(k, v)| (*k, *v)).collect())
-            .unwrap_or_default();
-        Self {
-            address: account.address,
-            nonce: account.account.nonce.unwrap_or_default(),
-            balance: B256::from(account.account.balance.to_be_bytes::<32>()),
-            code: account.account.code.as_ref().map(|code| code.to_vec()),
-            storage,
-        }
-    }
-
-    fn into_account(self) -> ExecStateAccount {
+    /// Rebuild a full account from this header plus its collected storage slots.
+    fn into_account_with_storage(self, storage: Vec<(B256, B256)>) -> ExecStateAccount {
         // Empty storage collapses back to `None`, mirroring how the exporter emits it.
-        let storage = (!self.storage.is_empty())
-            .then(|| self.storage.into_iter().collect::<BTreeMap<_, _>>());
+        let storage =
+            (!storage.is_empty()).then(|| storage.into_iter().collect::<BTreeMap<_, _>>());
         ExecStateAccount {
             address: self.address,
             account: GenesisAccount {
@@ -143,6 +133,40 @@ impl AccountRecord {
             },
         }
     }
+
+    /// The account header as public metadata (no storage).
+    fn into_meta(self) -> ExecStateAccountMeta {
+        ExecStateAccountMeta {
+            address: self.address,
+            nonce: self.nonce,
+            balance: U256::from_be_bytes(self.balance.0),
+            code: self.code.map(Bytes::from),
+        }
+    }
+}
+
+/// An account header without storage, yielded by the chunked read API
+/// ([`ExecStatePackReader::next_entry`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecStateAccountMeta {
+    /// Account address.
+    pub address: Address,
+    /// Account nonce.
+    pub nonce: u64,
+    /// Account balance.
+    pub balance: U256,
+    /// Contract code, if any.
+    pub code: Option<Bytes>,
+}
+
+/// One item of the chunked read stream ([`ExecStatePackReader::next_entry`]): an account header, or
+/// a bounded chunk of the most-recently-yielded account's storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateEntry {
+    /// The start of an account.
+    Account(ExecStateAccountMeta),
+    /// A chunk of storage slots belonging to the current account.
+    Storage(Vec<(B256, B256)>),
 }
 
 /// The record types stored, in order, in an exec-state pack.
@@ -152,8 +176,10 @@ enum ExecStateRecord {
     Meta(ExecStateMeta),
     /// An RLP-encoded [`ExecHeader`] (canonical, lossless form).
     Header(Vec<u8>),
-    /// One account with its storage and code.
+    /// An account header (address/nonce/balance/code); storage follows as `Storage` chunks.
     Account(AccountRecord),
+    /// A chunk of the preceding account's storage slots (bounded by [`STORAGE_CHUNK_SLOTS`]).
+    Storage(Vec<(B256, B256)>),
     /// Trailing summary; always the last record.
     End(ExecStateStats),
 }
@@ -228,15 +254,66 @@ impl ExecStatePackWriter {
         Ok(Self { data, stats: ExecStateStats::default() })
     }
 
-    /// Append one account to the pack, updating the running tallies.
+    /// Append one account (header + storage chunks) to the pack, updating the running tallies.
+    ///
+    /// The account's storage is split into [`STORAGE_CHUNK_SLOTS`]-sized
+    /// [`ExecStateRecord::Storage`] records so an account with arbitrarily large storage always
+    /// stays under the container's per-record limit. Callers that must also bound *write*
+    /// memory can drive [`append_account_header`](Self::append_account_header) +
+    /// [`append_storage_chunk`](Self::append_storage_chunk) directly.
     pub fn append_account(&mut self, account: &ExecStateAccount) -> Result<(), ExecStatePackError> {
-        let record = AccountRecord::from_account(account);
+        self.append_account_header(
+            account.address,
+            account.account.nonce.unwrap_or_default(),
+            account.account.balance,
+            account.account.code.clone(),
+        )?;
+        if let Some(storage) = &account.account.storage {
+            // BTreeMap iterates in ascending key order — a stable, deterministic chunk order.
+            let slots: Vec<(B256, B256)> = storage.iter().map(|(k, v)| (*k, *v)).collect();
+            for chunk in slots.chunks(STORAGE_CHUNK_SLOTS) {
+                self.append_storage_chunk(chunk)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Append an account header (no storage) and start its storage run. Follow with zero or more
+    /// [`append_storage_chunk`](Self::append_storage_chunk) calls, then the next account or
+    /// [`finish`](Self::finish). This is the streaming path — the caller never needs to hold an
+    /// account's full storage in memory.
+    pub fn append_account_header(
+        &mut self,
+        address: Address,
+        nonce: u64,
+        balance: U256,
+        code: Option<Bytes>,
+    ) -> Result<(), ExecStatePackError> {
         self.stats.account_count += 1;
-        self.stats.storage_slots += record.storage.len() as u64;
-        if record.code.as_ref().is_some_and(|code| !code.is_empty()) {
+        if code.as_ref().is_some_and(|code| !code.is_empty()) {
             self.stats.bytecodes += 1;
         }
+        let record = AccountRecord {
+            address,
+            nonce,
+            balance: B256::from(balance.to_be_bytes::<32>()),
+            code: code.map(|code| code.to_vec()),
+        };
         Self::append(&mut self.data, &ExecStateRecord::Account(record))
+    }
+
+    /// Append one chunk of storage slots for the current account. Empty chunks are ignored. A chunk
+    /// should hold at most [`STORAGE_CHUNK_SLOTS`] slots to stay under the container's record
+    /// limit.
+    pub fn append_storage_chunk(
+        &mut self,
+        slots: &[(B256, B256)],
+    ) -> Result<(), ExecStatePackError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        self.stats.storage_slots += slots.len() as u64;
+        Self::append(&mut self.data, &ExecStateRecord::Storage(slots.to_vec()))
     }
 
     /// Write the trailing [`ExecStateStats`] footer, commit the pack to disk, and
@@ -265,6 +342,8 @@ pub struct ExecStatePackReader {
     meta: ExecStateMeta,
     headers: Vec<ExecHeader>,
     iter: PackIter<ExecStateRecord, File>,
+    /// One-record lookahead: the record that terminated the previous account's storage run.
+    pending: Option<ExecStateRecord>,
     done: bool,
 }
 
@@ -305,7 +384,7 @@ impl ExecStatePackReader {
             }
         }
 
-        Ok(Self { meta, headers, iter, done: false })
+        Ok(Self { meta, headers, iter, pending: None, done: false })
     }
 
     /// The snapshot metadata.
@@ -325,14 +404,84 @@ impl ExecStatePackReader {
         &self.headers[0]
     }
 
-    /// Pull the next account from the stream, or `None` once the trailing footer is
-    /// reached. A truncated pack (footer missing) yields `Some(Err(MissingFooter))`.
+    /// Pull the next record, honoring the one-record lookahead buffer.
+    fn pull(&mut self) -> Option<Result<ExecStateRecord, ExecStatePackError>> {
+        if let Some(record) = self.pending.take() {
+            return Some(Ok(record));
+        }
+        match self.iter.next() {
+            Some(Ok(record)) => Some(Ok(record)),
+            Some(Err(e)) => Some(Err(e.into())),
+            None => None,
+        }
+    }
+
+    /// Pull the next account — its header plus all of its storage chunks — from the stream, or
+    /// `None` once the trailing footer is reached. A truncated pack yields
+    /// `Some(Err(MissingFooter))`.
+    ///
+    /// This reassembles the account's full storage in memory; consumers that must bound memory for
+    /// pathologically large accounts should use [`next_entry`](Self::next_entry) instead.
     pub fn next_account(&mut self) -> Option<Result<ExecStateAccount, ExecStatePackError>> {
         if self.done {
             return None;
         }
-        match self.iter.next() {
-            Some(Ok(ExecStateRecord::Account(record))) => Some(Ok(record.into_account())),
+        let header = match self.pull() {
+            Some(Ok(ExecStateRecord::Account(record))) => record,
+            Some(Ok(ExecStateRecord::End(_))) => {
+                self.done = true;
+                return None;
+            }
+            Some(Ok(_)) => {
+                self.done = true;
+                return Some(Err(ExecStatePackError::CorruptPack));
+            }
+            Some(Err(e)) => {
+                self.done = true;
+                return Some(Err(e));
+            }
+            None => {
+                self.done = true;
+                return Some(Err(ExecStatePackError::MissingFooter));
+            }
+        };
+
+        // Gather this account's storage chunks up to the next non-Storage record, which is buffered
+        // for the following call.
+        let mut storage: Vec<(B256, B256)> = Vec::new();
+        loop {
+            match self.pull() {
+                Some(Ok(ExecStateRecord::Storage(chunk))) => storage.extend(chunk),
+                Some(Ok(other)) => {
+                    self.pending = Some(other);
+                    break;
+                }
+                Some(Err(e)) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+                None => {
+                    self.done = true;
+                    return Some(Err(ExecStatePackError::MissingFooter));
+                }
+            }
+        }
+        Some(Ok(header.into_account_with_storage(storage)))
+    }
+
+    /// Pull the next entry of the chunked read stream: an account header, or a bounded chunk of the
+    /// current account's storage. Returns `None` at the trailing footer. Unlike
+    /// [`next_account`](Self::next_account) this never materializes a whole account's storage — a
+    /// consumer processes one [`STORAGE_CHUNK_SLOTS`]-bounded chunk at a time.
+    pub fn next_entry(&mut self) -> Option<Result<StateEntry, ExecStatePackError>> {
+        if self.done {
+            return None;
+        }
+        match self.pull() {
+            Some(Ok(ExecStateRecord::Account(record))) => {
+                Some(Ok(StateEntry::Account(record.into_meta())))
+            }
+            Some(Ok(ExecStateRecord::Storage(chunk))) => Some(Ok(StateEntry::Storage(chunk))),
             Some(Ok(ExecStateRecord::End(_))) => {
                 self.done = true;
                 None
@@ -343,7 +492,7 @@ impl ExecStatePackReader {
             }
             Some(Err(e)) => {
                 self.done = true;
-                Some(Err(e.into()))
+                Some(Err(e))
             }
             None => {
                 self.done = true;
@@ -385,14 +534,22 @@ impl ExecStatePackReader {
         }
 
         let mut counted = ExecStateStats::default();
+        let mut saw_account = false;
         let footer = loop {
             match reader.iter.next() {
                 Some(Ok(ExecStateRecord::Account(record))) => {
                     counted.account_count += 1;
-                    counted.storage_slots += record.storage.len() as u64;
                     if record.code.as_ref().is_some_and(|code| !code.is_empty()) {
                         counted.bytecodes += 1;
                     }
+                    saw_account = true;
+                }
+                Some(Ok(ExecStateRecord::Storage(chunk))) => {
+                    // Storage may only follow an account.
+                    if !saw_account {
+                        return Err(ExecStatePackError::CorruptPack);
+                    }
+                    counted.storage_slots += chunk.len() as u64;
                 }
                 Some(Ok(ExecStateRecord::End(stats))) => break stats,
                 Some(Ok(_)) => return Err(ExecStatePackError::CorruptPack),
@@ -595,6 +752,55 @@ mod test {
     }
 
     #[test]
+    fn round_trip_large_account_storage() {
+        let dir = TempDir::with_prefix("exec_state_pack_large").expect("temp dir");
+        let root = B256::from([5u8; 32]);
+        let mut writer =
+            ExecStatePackWriter::create(dir.path(), root, &[header(1, root)]).expect("create");
+
+        // As a single inline record, this account's storage (>262k slots * 64 bytes) would exceed
+        // the container's 16 MiB decompress cap; chunking keeps every record small.
+        let n = 300_000usize;
+        let big: BTreeMap<B256, B256> = (0..n)
+            .map(|i| (B256::from(U256::from(i as u64).to_be_bytes::<32>()), B256::from([1u8; 32])))
+            .collect();
+        let acc = ExecStateAccount {
+            address: Address::from([1u8; 20]),
+            account: GenesisAccount {
+                nonce: Some(1),
+                balance: U256::from(42u64),
+                code: Some(Bytes::from_static(&[0x60, 0x00])),
+                storage: Some(big),
+                private_key: None,
+            },
+        };
+        writer.append_account(&acc).expect("append");
+        let stats = writer.finish().expect("finish");
+        assert_eq!(stats.account_count, 1);
+        assert_eq!(stats.storage_slots, n as u64);
+
+        // Full-assembly read reconstructs the account byte-for-byte.
+        let mut reader = ExecStatePackReader::open(dir.path()).expect("open");
+        let got: Vec<_> = reader.accounts().collect::<Result<_, _>>().expect("accounts");
+        assert_eq!(got, vec![acc]);
+
+        // Chunked read yields one Account header then several bounded Storage chunks.
+        let mut reader = ExecStatePackReader::open(dir.path()).expect("open");
+        let mut account_headers = 0usize;
+        let mut chunks: Vec<Vec<(B256, B256)>> = Vec::new();
+        while let Some(entry) = reader.next_entry() {
+            match entry.expect("entry") {
+                StateEntry::Account(_) => account_headers += 1,
+                StateEntry::Storage(chunk) => chunks.push(chunk),
+            }
+        }
+        assert_eq!(account_headers, 1);
+        assert_eq!(chunks.len(), n.div_ceil(STORAGE_CHUNK_SLOTS));
+        assert!(chunks.iter().all(|c| c.len() <= STORAGE_CHUNK_SLOTS));
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), n);
+    }
+
+    #[test]
     fn create_rejects_state_root_mismatch() {
         let dir = TempDir::with_prefix("exec_state_pack_create_srm").expect("temp dir");
         let headers = vec![header(1, B256::from([2u8; 32]))];
@@ -647,8 +853,13 @@ mod test {
         };
         pack.append(&ExecStateRecord::Meta(meta)).unwrap();
         pack.append(&ExecStateRecord::Header(encode_header(&snapshot))).unwrap();
-        pack.append(&ExecStateRecord::Account(AccountRecord::from_account(&account(1, 1, true))))
-            .unwrap();
+        pack.append(&ExecStateRecord::Account(AccountRecord {
+            address: Address::from([1u8; 20]),
+            nonce: 1,
+            balance: B256::ZERO,
+            code: None,
+        }))
+        .unwrap();
         // Deliberately omit the End footer.
         pack.commit().unwrap();
         drop(pack);
