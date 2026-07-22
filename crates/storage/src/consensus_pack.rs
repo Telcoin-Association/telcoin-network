@@ -338,6 +338,16 @@ impl ConsensusPack {
         self.epoch
     }
 
+    /// Return the committee persisted in this pack's [`EpochMeta`] — the epoch-START
+    /// snapshot this epoch's consensus output is decoded and verified against.
+    ///
+    /// Every open path keeps this handle-level copy faithful to the on-disk meta:
+    /// `open_append` either writes it as the new meta or errors on a meta mismatch, and
+    /// the reopen/import paths clone it out of the persisted record.
+    pub(crate) fn committee(&self) -> &Committee {
+        &self.committee
+    }
+
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
     /// Returns when save is complete and provides how many bytes the output took in the pack file.
     pub async fn save_consensus_output(
