@@ -1,7 +1,7 @@
 //! E2E coverage for governance ejection (`ConsensusRegistry::burn`) of validators.
 //!
 //! `burn` retires the validator, confiscates its stake, and swap-and-pops it out of the stored
-//! current/next/subsequent committee arrays. Two scenarios are covered:
+//! current/next/subsequent committee arrays. Four scenarios are covered:
 //!
 //! - [`test_validator_ejected_from_future_committee_only`]: the burned validator sits ONLY in
 //!   future committees, so no running committee changes shape. This test deliberately has NO
@@ -13,13 +13,25 @@
 //!   LIVE committee, which shrinks mid-epoch. This is the end-to-end acceptance test for the
 //!   `EpochRecord::committee_compatible` tolerance: on pre-fix code every node deterministically
 //!   halts at the first epoch boundary after the burn.
+//! - [`test_committee_member_restarted_mid_epoch_after_ejection`]: after the burn shrinks the live
+//!   committee's stored arrays, a DIFFERENT committee member is killed and restarted inside the
+//!   same epoch. This is the regression test for the epoch-entry read pinning: the restart must
+//!   re-derive the epoch view from the previous epoch's closing block (not the post-burn canonical
+//!   tip), rejoin consensus mid-epoch, and close the epoch with records identical to the rest of
+//!   the fleet.
+//! - [`test_network_halts_when_ejections_shrink_committee_below_tolerance`]: governance burns TWO
+//!   of the five committee members in one epoch, shrinking the committee below the
+//!   `committee_compatible` tolerance. The tolerance is deliberately bounded, so the network
+//!   answers with a designed fail-stop: every validator exits with code 1 at the next epoch
+//!   boundary instead of running an unsafe committee.
 
 use crate::common::{
-    acquire_test_permit, assert_epoch_records_verify, create_genesis_for_test,
-    fetch_verified_epoch_record, generate_new_validator_txs, get_block_number,
+    acquire_test_permit, assert_epoch_reached, assert_epoch_records_verify,
+    create_genesis_for_test, current_epoch, fetch_verified_epoch_record,
+    generate_new_validator_txs, get_block_number, get_latest_consensus_header_number,
     get_tx_receipt_block, kill_child, loop_epochs, send_owner_tx, start_nodes,
-    wait_for_epoch_at_least, wait_for_mid_epoch, wait_for_rpc, ProcessGuard, EPOCH_DURATION,
-    INITIAL_STAKE_AMOUNT, NEW_VALIDATOR,
+    wait_for_epoch_at_least, wait_for_head_at_least, wait_for_mid_epoch, wait_for_rpc,
+    ProcessGuard, EPOCH_DURATION, INITIAL_STAKE_AMOUNT, NEW_VALIDATOR,
 };
 use alloy::{
     primitives::{utils::parse_ether, Bytes},
@@ -34,16 +46,29 @@ use tn_reth::{
     test_utils::TransactionFactory,
     RethChainSpec,
 };
+use tn_test_utils::wait_until;
 use tn_types::{Address, EpochCertificate, EpochRecord, U256};
-use tokio::time::{timeout, Instant};
+use tokio::time::timeout;
 use tracing::info;
 
-/// Name of the genesis-configured non-committee node used by the mid-epoch ejection test.
+/// Name of the genesis-configured non-committee node used by the current-committee ejection
+/// tests.
 ///
 /// It is funded and key-configured at genesis (via [`create_genesis_for_test`]'s extra-node
 /// parameter) but never stakes, so it only follows the chain — an observer in behavior, without
-/// tightening the committee quorum when it is down.
+/// tightening the committee quorum when it is down. The below-tolerance halt test configures it
+/// (genesis creation requires the extra node) but never starts it.
 const GENESIS_OBSERVER: &str = "genesis-observer";
+
+/// Per-test epoch duration (seconds) for the mid-epoch restart regression.
+///
+/// [`test_committee_member_restarted_mid_epoch_after_ejection`] must fit its whole in-epoch
+/// sequence — fresh-boundary entry, one full leader rotation, the governance burn, the burn-block
+/// execution pin, kill, restart, and the mid-epoch consensus rejoin — inside ONE epoch. That
+/// sequence's worst case is ~29s, so the module-wide [`EPOCH_DURATION`] (10s) cannot host it;
+/// 40s banks comfortable margin without stretching the test into extra epochs. Every timeout in
+/// that test which scales with epoch length derives from this constant, not [`EPOCH_DURATION`].
+const RESTART_EPOCH_DURATION: u64 = 40;
 
 /// Find the epoch that contains `block` by walking the epoch-info ring buffer down from the
 /// current epoch.
@@ -61,6 +86,33 @@ async fn epoch_of_block<P: Provider>(provider: &P, block: u64) -> eyre::Result<u
         }
     }
     Err(eyre::eyre!("block {block} is older than the epoch info ring buffer"))
+}
+
+/// Submit a governance `burn` for `victim` with owner nonce `nonce` and wait for confirmation.
+///
+/// A confirmation straddling an epoch boundary can get orphaned and lost; on failure the
+/// identical tx is retried once with the same nonce (idempotent: same payload, same hash) from
+/// the next measured mid-epoch window. Returns the block the burn's receipt landed in.
+async fn burn_with_retry<P: Provider>(
+    provider: &P,
+    rpc_url: &str,
+    governance_wallet: &mut TransactionFactory,
+    chain: Arc<RethChainSpec>,
+    victim: Address,
+    nonce: u64,
+) -> eyre::Result<u64> {
+    let calldata: Bytes =
+        ConsensusRegistry::burnCall { validatorAddress: victim }.abi_encode().into();
+    match send_owner_tx(rpc_url, governance_wallet, chain.clone(), calldata.clone()).await {
+        Ok((_hash, block)) => Ok(block),
+        Err(first_try) => {
+            info!(target: "eject-test", %first_try, ?victim, "burn confirmation failed; retrying once");
+            governance_wallet.set_nonce(nonce);
+            wait_for_mid_epoch(provider, rpc_url).await?;
+            let (_hash, block) = send_owner_tx(rpc_url, governance_wallet, chain, calldata).await?;
+            Ok(block)
+        }
+    }
 }
 
 #[ignore = "only run independently from all other it tests"]
@@ -266,36 +318,9 @@ async fn test_validator_ejected_from_future_committee_only() -> eyre::Result<()>
     assert_epoch_records_verify(&endpoints, 0..=latest_closed, EPOCH_DURATION * 6).await?;
 
     // the burned validator's node keeps following the chain (epoch-close blocks keep coming)
-    let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 3);
-    loop {
-        let head_after = get_block_number(newval_url)?;
-        if head_after > head_before.max(burn_block) {
-            break;
-        }
-        eyre::ensure!(
-            Instant::now() < deadline,
-            "burned validator's node head stuck at {head_after} (started {head_before})"
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    wait_for_head_at_least(newval_url, head_before.max(burn_block) + 1, EPOCH_DURATION * 3).await?;
 
     Ok(())
-}
-
-/// Wait (bounded) for `epoch` to be reached on `http_url`, failing with a message that names the
-/// calling phase instead of hanging until the harness slow-timeout kills the test.
-async fn assert_epoch_reached(http_url: &str, epoch: u32, phase: &str) -> eyre::Result<()> {
-    let provider = ProviderBuilder::new().connect_http(http_url.parse()?);
-    let bound = EPOCH_DURATION * 6;
-    match timeout(Duration::from_secs(bound), wait_for_epoch_at_least(&provider, epoch)).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => {
-            Err(eyre::eyre!("{phase}: node {http_url} failed reaching epoch {epoch}: {e}"))
-        }
-        Err(_) => {
-            Err(eyre::eyre!("{phase}: node {http_url} did not reach epoch {epoch} within {bound}s"))
-        }
-    }
 }
 
 #[ignore = "only run independently from all other it tests"]
@@ -588,19 +613,508 @@ async fn test_validator_ejected_from_current_committee_mid_epoch() -> eyre::Resu
 
     // the ejected validator's node keeps following as an observer: its head advances past the
     // transfer's block and it serves the shrunken epoch-E record with a verifying cert
-    let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 3);
-    loop {
-        let head = get_block_number(&victim_url)?;
-        if head > tx_block {
-            break;
-        }
-        eyre::ensure!(
-            Instant::now() < deadline,
-            "ejected validator's node head stuck at {head} (transfer landed at {tx_block})"
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    wait_for_head_at_least(&victim_url, tx_block + 1, EPOCH_DURATION * 3).await?;
     fetch_verified_epoch_record(&victim_url, e, EPOCH_DURATION * 3).await?;
+
+    Ok(())
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test(flavor = "multi_thread")]
+/// Regression test for epoch-entry read pinning: a committee member killed and restarted
+/// MID-EPOCH, AFTER a governance burn ejected a DIFFERENT committee member, must rejoin the SAME
+/// epoch view its peers are running and close the epoch with identical records.
+///
+/// THE INVARIANT: every epoch-scoped entry read — committee membership, epoch info, fee and
+/// rewards seeding — pins to the previous epoch's closing block, which `concludeEpoch` writes
+/// exactly once at the boundary. A fresh boundary crossing, a crash-restart, and a mode-change
+/// re-entry therefore all re-derive the identical epoch view: same rewards rows, same quorum
+/// threshold, same round-robin leader schedule. Without the pin, a restart reads the canonical
+/// TIP, which a mid-epoch `burn` has already mutated (swap-and-pop of the victim from the stored
+/// current-committee array). The restarted node then enters epoch E with a 4-member view while
+/// its peers run the 5-member epoch: it cannot verify their consensus certificates (wrong quorum,
+/// wrong leader schedule) so its consensus height freezes until the boundary, and any close it
+/// reaches seeds rewards without the ejected leader's row — a divergent withdrawals_root, hence a
+/// divergent closing-block hash, hence a divergent epoch-record digest.
+///
+/// Scenario: 5 genesis committee validators plus the genesis-configured follower, all six
+/// started (the follower extends the record-consistency assert to the sync path). Mid-epoch E,
+/// governance burns committee member `validator-5` (the victim, whose node stays up); then
+/// `validator-2` (the kill target) is killed and restarted on its same datadir inside the SAME
+/// epoch. Premise gates make the scenario airtight rather than timing-lucky:
+///
+/// - VICTIM-LED COMMIT: one full leader rotation (5 commits) is observed inside epoch E before the
+///   burn. The leader schedule is strict round-robin over the 5 authorities and a fresh epoch's
+///   leader swap table is empty, so the victim led at least one commit — its leader-rewards row is
+///   nonzero, and an entry view that drops the row provably diverges at the close (with a zero row
+///   both views would close identically and the test would prove nothing).
+/// - REPRO PIN: the kill target must have EXECUTED the burn block before dying. Otherwise its
+///   restart tip would still be pre-burn state, and even an unpinned tip read would derive the
+///   correct 5-member committee — an accidental pass.
+/// - IN-EPOCH GUARDS: the epoch is entered exactly at its boundary flip (banking the full duration
+///   for the sequence above), and every wait re-checks that epoch E is still current, failing
+///   loudly as "premise broken" if the sequence straddles a boundary.
+///
+/// The detectors, in order: (a) the restarted node's consensus height re-advances past
+/// everything it could have held at death — commits it can only acquire by verifying the
+/// 5-member committee's certificates — while the fleet is still in epoch E; (b) the E -> E+1
+/// boundary closes on all six nodes; (c) epoch records 0..=E verify on all six nodes with
+/// final-state HASH equality (the record-divergence detector); (d) a transfer submitted through
+/// the RESTARTED node's own RPC confirms, and the burned validator keeps following the chain as
+/// an observer.
+async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Result<()> {
+    let _permit = acquire_test_permit();
+
+    // committee wallets + a follower wallet; seed 33 = consensus registry owner
+    let observer_wallet = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
+    let mut nodes = vec![
+        ("validator-1", Address::from_slice(&[0x11; 20])),
+        ("validator-2", Address::from_slice(&[0x22; 20])),
+        ("validator-3", Address::from_slice(&[0x33; 20])),
+        ("validator-4", Address::from_slice(&[0x44; 20])),
+        ("validator-5", Address::from_slice(&[0x55; 20])),
+    ];
+    // the victim (burned mid-epoch, node stays up); the kill target is validator-2 = index 1
+    let victim_addr = nodes[4].1;
+
+    // setup genesis with the longer per-test epoch (see RESTART_EPOCH_DURATION)
+    let temp_dir = tempfile::TempDir::with_prefix("eject_restart")?;
+    let temp_path = temp_dir.path();
+
+    let mut governance_wallet =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let genesis = create_genesis_for_test(
+        temp_path,
+        (GENESIS_OBSERVER, observer_wallet.address()),
+        governance_wallet.address(),
+        &nodes,
+        RESTART_EPOCH_DURATION,
+    )?;
+
+    // start all six nodes (committee + genesis observer)
+    nodes.push((GENESIS_OBSERVER, observer_wallet.address()));
+    let (procs, mut endpoints) = start_nodes(temp_path, &nodes, "eject_restart", 1)?;
+    // Guard ensures processes are killed on drop (normal return, error, or panic).
+    let mut guard = ProcessGuard::new(procs);
+    let victim_url = endpoints[4].http_url.clone();
+    let rpc_url = endpoints[0].http_url.clone();
+
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    wait_for_rpc(&provider).await?;
+    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+
+    // ---- Phase 0: cross the 0 -> 1 boundary ----
+    wait_for_epoch_at_least(&provider, 1).await?;
+
+    // Before killing validator-2, require ITS datadir to hold the certified epoch-0 record.
+    // `save_dummy_epoch0` is in-memory only, so a node killed after executing the epoch-0
+    // closing block but before persisting the real record 0 cannot restart (`run_epoch` exits:
+    // "We have epoch 0 in our database if we are past epoch 0"). That crash window is a
+    // pre-existing product issue orthogonal to the pinning fix under test; gating the kill on
+    // the kill target serving certified record 0 keeps this test deterministic.
+    fetch_verified_epoch_record(&endpoints[1].http_url, 0, RESTART_EPOCH_DURATION * 2).await?;
+
+    // ---- Fresh-boundary entry: catch the flip into epoch E ----
+    // The in-epoch sequence below (rotation, burn, pin, kill, restart, rejoin) worst-cases at
+    // ~29s; entering exactly at the flip banks the full epoch duration for it, where a
+    // mid-epoch entry would squander half.
+    let pre_flip = current_epoch(&provider).await?.epoch_id;
+    wait_until(
+        Duration::from_secs(RESTART_EPOCH_DURATION * 2),
+        &format!("fresh-boundary entry: waiting for the epoch to flip past {pre_flip} on node 0"),
+        || async { Ok(current_epoch(&provider).await?.epoch_id > pre_flip) },
+    )
+    .await?;
+    let e = current_epoch(&provider).await?.epoch_id;
+    // the flip poll re-checks every ~10ms, so observing a double-flip means this thread stalled
+    // for a whole epoch — the "fresh entry" premise is gone
+    eyre::ensure!(
+        e == pre_flip + 1,
+        "premise broken: entered epoch {e}, expected the fresh flip to {}",
+        pre_flip + 1
+    );
+    info!(target: "eject-test", epoch = e, "entered epoch at a fresh boundary");
+
+    // ---- Victim-led premise: observe one full leader rotation inside epoch E ----
+    // The leader schedule is strict round-robin over the committee (leader(round) =
+    // authorities[round/2 - 1 mod 5]) and a fresh epoch starts with an empty leader swap table
+    // (reputation scores only finalize a swap after many more sub-dags), so with all five
+    // validators live, five consecutive commits are one full rotation containing a victim-led
+    // commit. Each commit appends exactly one consensus header, so height h0 + 5 == five
+    // commits, all inside epoch E because h0 is read after the flip and the wait re-checks the
+    // epoch. This guarantees the victim's leader-rewards row is nonzero before the burn.
+    let h0 = get_latest_consensus_header_number(&rpc_url)?;
+    wait_until(
+        Duration::from_secs(RESTART_EPOCH_DURATION),
+        &format!(
+            "victim-led premise: waiting for consensus height {} (h0 {h0} + one full \
+             rotation) on node 0",
+            h0 + 5
+        ),
+        || async {
+            let now = current_epoch(&provider).await?.epoch_id;
+            eyre::ensure!(
+                now == e,
+                "premise broken: epoch flipped to {now} before one full leader rotation \
+                 completed inside epoch {e}"
+            );
+            Ok(get_latest_consensus_header_number(&rpc_url)? >= h0 + 5)
+        },
+    )
+    .await?;
+    info!(target: "eject-test", epoch = e, "one full leader rotation observed");
+
+    // ---- Governance burn of the victim, mid-epoch E — deliberately NO retry ----
+    // A retry could slide the burn across the boundary and silently break the mid-epoch
+    // premise; the ensure below turns that into a loud failure instead. Nonce 0: the burn is
+    // this wallet's first transaction.
+    let calldata: Bytes =
+        ConsensusRegistry::burnCall { validatorAddress: victim_addr }.abi_encode().into();
+    let (_burn_hash, burn_block) =
+        send_owner_tx(&rpc_url, &mut governance_wallet, chain.clone(), calldata).await?;
+    let burn_epoch = epoch_of_block(&provider, burn_block).await?;
+    eyre::ensure!(
+        burn_epoch == e,
+        "premise broken: burn landed in epoch {burn_epoch}, not mid-epoch {e}"
+    );
+    info!(target: "eject-test", burn_block, epoch = e, "victim burned mid-epoch");
+
+    // brief on-chain shape check: the victim is retired and the eligible set shrank 5 -> 4
+    assert!(registry.isRetired(victim_addr).call().await?, "victim must be retired");
+    assert_eq!(
+        registry.getEligibleValidatorCount().call().await?,
+        U256::from(4),
+        "eligible count must drop 5 -> 4"
+    );
+
+    // ---- Repro pin: the kill target must EXECUTE the burn block before dying ----
+    // The pre-fix bug is an entry read of POST-burn registry state at the canonical tip. If the
+    // node died before executing the burn block, its tip at restart would still be pre-burn
+    // state and even an unpinned read would derive the correct 5-member committee — the test
+    // would pass pre-fix by accident. Requiring the burn block on the kill target's head makes
+    // the restart provably face post-burn state at its tip.
+    wait_for_head_at_least(&endpoints[1].http_url, burn_block, 10).await?;
+
+    // ---- Kill validator-2 (datadir preserved), still mid-epoch E ----
+    // h_kill: the kill target's own consensus tip just before death — a floor for the rejoin
+    // assert below.
+    let h_kill = get_latest_consensus_header_number(&endpoints[1].http_url)?;
+    let mut target_child = guard.take(1).ok_or_else(|| eyre::eyre!("no kill-target process"))?;
+    kill_child(&mut target_child);
+    let downed_provider = ProviderBuilder::new().connect_http(endpoints[1].http_url.parse()?);
+    assert!(downed_provider.get_chain_id().await.is_err(), "kill target must be down");
+    info!(target: "eject-test", h_kill, epoch = e, "kill target down mid-epoch");
+
+    // ---- Restart validator-2 on its same datadir, still mid-epoch E ----
+    let (mut new_children, mut new_endpoints) =
+        start_nodes(temp_path, &nodes[1..2], "eject_restart", 2)?;
+    let new_child = new_children.pop().ok_or_else(|| eyre::eyre!("no restarted process"))?;
+    let new_endpoint = new_endpoints.pop().ok_or_else(|| eyre::eyre!("no restarted endpoint"))?;
+    guard.replace(1, new_child);
+    endpoints[1] = new_endpoint;
+    let restarted_provider = ProviderBuilder::new().connect_http(endpoints[1].http_url.parse()?);
+    wait_for_rpc(&restarted_provider).await?;
+
+    // ---- Premise: the kill/restart round trip stayed inside epoch E on both sides ----
+    // A restart that straddled the boundary re-enters at E+1, where even an unpinned tip read
+    // is correct — the test would prove nothing, so fail loudly instead of silently passing.
+    let anchor_epoch = current_epoch(&provider).await?.epoch_id;
+    let restarted_epoch = current_epoch(&restarted_provider).await?.epoch_id;
+    eyre::ensure!(
+        anchor_epoch == e && restarted_epoch == e,
+        "premise broken: restart straddled the epoch boundary (node 0 at {anchor_epoch}, \
+         restarted node at {restarted_epoch}, wanted {e})"
+    );
+
+    // ---- (a) THE MID-EPOCH REJOIN ASSERT: consensus re-advances within epoch E ----
+    // The rejoin floor is everything the restarted node could hold WITHOUT verifying new
+    // certificates: its own tip at death (h_kill) and node 0's tip observed after the restart
+    // came back up (h_peer covers commits that landed between the h_kill snapshot and process
+    // death). Exceeding the max of both proves the node verified and followed commits produced
+    // by the 5-member committee AFTER its restart — impossible on an entry view read from the
+    // post-burn tip, where the 4-member quorum and leader schedule reject every peer
+    // certificate and the node's consensus height freezes until the boundary.
+    let h_peer = get_latest_consensus_header_number(&rpc_url)?;
+    let rejoin_floor = h_kill.max(h_peer);
+    info!(
+        target: "eject-test",
+        h_kill, h_peer, rejoin_floor, "waiting for the mid-epoch consensus rejoin"
+    );
+    wait_until(
+        Duration::from_secs(RESTART_EPOCH_DURATION),
+        &format!(
+            "mid-epoch rejoin: waiting for the restarted node's consensus height to exceed \
+             {rejoin_floor} within epoch {e}"
+        ),
+        || async {
+            let now = current_epoch(&provider).await?.epoch_id;
+            eyre::ensure!(
+                now == e,
+                "REGRESSION (mid-epoch rejoin failed): epoch flipped to {now} while the \
+                 restarted node's consensus height was still <= {rejoin_floor} — a committee \
+                 member restarted after the ejection never re-verified its peers' certificates \
+                 inside epoch {e}"
+            );
+            Ok(get_latest_consensus_header_number(&endpoints[1].http_url)? > rejoin_floor)
+        },
+    )
+    .await?;
+    info!(target: "eject-test", epoch = e, "restarted node rejoined consensus mid-epoch");
+
+    // ---- (b) The E -> E+1 boundary closes on ALL SIX nodes ----
+    for (idx, endpoint) in endpoints.iter().enumerate() {
+        assert_epoch_reached(
+            &endpoint.http_url,
+            e + 1,
+            &format!("POST-RESTART BOUNDARY (node index {idx})"),
+        )
+        .await?;
+    }
+    info!(target: "eject-test", epoch = e + 1, "boundary closed on all six nodes");
+
+    // ---- (c) THE RECORD-DIVERGENCE ASSERT: records 0..=E hash-identical on all six ----
+    // `assert_epoch_records_verify` requires every node to serve a CERTIFIED record for every
+    // epoch AND to have executed each record's final block with the exact hash the record
+    // commits to. An entry view that dropped the ejected leader's rewards row surfaces here:
+    // divergent withdrawals in the closing block -> divergent closing-block hash -> divergent
+    // record digest, reported as a hash mismatch on the restarted node.
+    assert_epoch_records_verify(&endpoints, 0..=e, RESTART_EPOCH_DURATION * 2).await?;
+    info!(target: "eject-test", epoch = e, "epoch records verify hash-identical on all six nodes");
+
+    // ---- (d) Liveness through the restarted node; the burned validator keeps following ----
+    // Submit the transfer via the RESTARTED node's own RPC: its pool/batch path must be live
+    // again, not merely its sync path.
+    let recipient = Address::from_slice(&[0x77; 20]);
+    let transfer = governance_wallet.create_eip1559_encoded(
+        chain,
+        None,
+        100,
+        Some(recipient),
+        parse_ether("1")?,
+        Bytes::default(),
+    );
+    let pending = restarted_provider.send_raw_transaction(&transfer).await?;
+    // a confirmation straddling a boundary can get orphaned and re-injected; allow two epochs
+    let hash =
+        timeout(Duration::from_secs(RESTART_EPOCH_DURATION * 2 + 11), pending.watch()).await??;
+    let tx_block = get_tx_receipt_block(&endpoints[1].http_url, &hash.to_string())?;
+    info!(target: "eject-test", tx_block, "post-restart transfer confirmed via the restarted node");
+
+    // the burned validator's node keeps following as an observer: its head advances past the
+    // transfer's block (the next block arrives at latest with the E+2 closing block)
+    wait_for_head_at_least(&victim_url, tx_block + 1, RESTART_EPOCH_DURATION * 3).await?;
+
+    Ok(())
+}
+
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test(flavor = "multi_thread")]
+/// Prove the network halts BY DESIGN when governance ejections shrink the committee below the
+/// tolerated bound within one epoch.
+///
+/// On-chain there is no committee floor: `ConsensusRegistry::burn` only rejects an ejection that
+/// would leave a committee empty or larger than the eligible set, so back-to-back burns walk the
+/// stored committees 5 -> 4 -> 3 inside a single epoch. Three members is below both bounds of
+/// `EpochRecord::committee_compatible` (the 4-member floor and `ceil(2 * 5 / 3) = 4`), so at the
+/// next epoch boundary every validator's `build_epoch_record` rejects the shrunken committee
+/// read against the previous record's `next_committee`, the error propagates out of the epoch
+/// manager, and the process exits with code 1 — a deliberate fail-stop rather than running a
+/// committee too small to be safe against the promised set. Recovery is manual, so the test ends
+/// at the halt: every validator exits with code 1 carrying the incompatibility error on stderr,
+/// and no endpoint answers RPC afterwards.
+///
+/// If the two burns straddle an epoch boundary the halt shifts one epoch later: 5 -> 4 is a
+/// tolerated shrink and that boundary closes, then 4 -> 3 fails the 4-member floor. Either way
+/// the epoch containing the SECOND burn is the epoch that cannot close.
+async fn test_network_halts_when_ejections_shrink_committee_below_tolerance() -> eyre::Result<()> {
+    let _permit = acquire_test_permit();
+
+    // committee wallets; seed 33 = consensus registry owner
+    let nodes = vec![
+        ("validator-1", Address::from_slice(&[0x11; 20])),
+        ("validator-2", Address::from_slice(&[0x22; 20])),
+        ("validator-3", Address::from_slice(&[0x33; 20])),
+        ("validator-4", Address::from_slice(&[0x44; 20])),
+        ("validator-5", Address::from_slice(&[0x55; 20])),
+    ];
+    // the victims: committee validators 4 and 5
+    let (victim_a_name, victim_a_addr) = nodes[3];
+    let (victim_b_name, victim_b_addr) = nodes[4];
+
+    // setup genesis
+    let temp_dir = tempfile::TempDir::with_prefix("eject_halt")?;
+    let temp_path = temp_dir.path();
+
+    let mut governance_wallet =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    // `create_genesis_for_test` always configures one extra non-committee node; it is funded and
+    // key-configured at genesis but deliberately NEVER STARTED: at the halt boundary every
+    // VALIDATOR deterministically fails `build_epoch_record` and exits, while a follower's fate
+    // is timing-dependent (it may stall waiting for consensus that never comes instead of
+    // exiting). Starting only validators keeps every spawned process's expected exit definite.
+    let unstarted_wallet = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
+    let genesis = create_genesis_for_test(
+        temp_path,
+        (GENESIS_OBSERVER, unstarted_wallet.address()),
+        governance_wallet.address(),
+        &nodes,
+        EPOCH_DURATION,
+    )?;
+
+    // start ONLY the 5 committee validators
+    let (procs, endpoints) = start_nodes(temp_path, &nodes, "eject_halt", 1)?;
+    // Guard ensures processes are killed on drop (normal return, error, or panic).
+    let mut guard = ProcessGuard::new(procs);
+    let rpc_url = endpoints[0].http_url.clone();
+
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    wait_for_rpc(&provider).await?;
+    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+
+    // ---- Phase 0: cross the 0 -> 1 boundary before burning ----
+    // A burn during epoch 0 would be absorbed: record 0 is built without a previous record, so
+    // there is no promised `next_committee` for the shrunken committee read to be incompatible
+    // with. The halt requires a boundary whose previous record promised the pre-burn committee.
+    wait_for_epoch_at_least(&provider, 1).await?;
+
+    // pre-burn baseline: 5 eligible validators, size-5 committees, both victims unretired
+    assert_eq!(registry.getEligibleValidatorCount().call().await?, U256::from(5));
+    assert_eq!(registry.getNextCommitteeSize().call().await?, 5);
+    for victim in [victim_a_addr, victim_b_addr] {
+        assert!(
+            !registry.isRetired(victim).call().await?,
+            "victim {victim} must not be retired at baseline"
+        );
+    }
+
+    // victim BLS keys for by-key exclusion asserts
+    let mut victim_bls_keys = Vec::new();
+    for name in [victim_a_name, victim_b_name] {
+        let node_info = Config::load_from_path_or_default::<NodeInfo>(
+            temp_path.join(name).join("node-info.yaml").as_path(),
+            ConfigFmt::YAML,
+        )?;
+        let bls: Bytes = node_info.bls_public_key.compress().into();
+        victim_bls_keys.push(bls);
+    }
+
+    // ---- Two governance burns, launched mid-epoch away from the boundary ----
+    let burn_snap = wait_for_mid_epoch(&provider, &rpc_url).await?;
+    info!(target: "eject-test", epoch = burn_snap.epoch_id, "burning two committee validators");
+    let burn_a_block = burn_with_retry(
+        &provider,
+        &rpc_url,
+        &mut governance_wallet,
+        chain.clone(),
+        victim_a_addr,
+        0,
+    )
+    .await?;
+    let burn_b_block =
+        burn_with_retry(&provider, &rpc_url, &mut governance_wallet, chain, victim_b_addr, 1)
+            .await?;
+
+    // Anchor the halt to where the burns actually landed. Both in one epoch is the intended
+    // shape; a straddle across adjacent epochs is tolerated (the 5 -> 4 boundary closes and the
+    // halt shifts one epoch later — see the doc comment). Either way the epoch containing the
+    // SECOND burn cannot close.
+    let burn_a_epoch = epoch_of_block(&provider, burn_a_block).await?;
+    let burn_b_epoch = epoch_of_block(&provider, burn_b_block).await?;
+    eyre::ensure!(
+        burn_b_epoch == burn_a_epoch || burn_b_epoch == burn_a_epoch + 1,
+        "burns landed in epochs {burn_a_epoch} and {burn_b_epoch}; expected one epoch or an \
+         adjacent straddle"
+    );
+    let halt_epoch = burn_b_epoch;
+    info!(
+        target: "eject-test",
+        burn_a_block, burn_a_epoch, burn_b_block, burn_b_epoch, halt_epoch, "burns confirmed"
+    );
+
+    // ---- Post-burn shape: both retired, 3 eligible, stored committees shrink to 3 ----
+    for victim in [victim_a_addr, victim_b_addr] {
+        assert!(
+            registry.isRetired(victim).call().await?,
+            "burned validator {victim} must be retired"
+        );
+    }
+    assert_eq!(
+        registry.getEligibleValidatorCount().call().await?,
+        U256::from(3),
+        "eligible count must drop 5 -> 3"
+    );
+    assert_eq!(
+        registry.getNextCommitteeSize().call().await?,
+        3,
+        "next committee size must auto-decrement to the 3 remaining eligible validators"
+    );
+    // the next and subsequent committees relative to the halt epoch — the arrays the failing
+    // record build reads — exclude both victims by address and by BLS key
+    for target in halt_epoch + 1..=halt_epoch + 2 {
+        let vals = registry.getCommitteeValidators(target).call().await?;
+        assert_eq!(vals.len(), 3, "epoch {target} committee must shrink to 3 members");
+        assert!(
+            vals.iter().all(|v| {
+                v.validatorAddress != victim_a_addr && v.validatorAddress != victim_b_addr
+            }),
+            "victims must be swap-and-popped out of epoch {target} committee"
+        );
+        let keys = registry.getCommitteeBlsPubkeys(target).call().await?;
+        assert_eq!(keys.len(), 3);
+        assert!(keys.iter().all(|k| !victim_bls_keys.contains(k)));
+    }
+
+    // ---- THE HALT ASSERT: every validator exits, on its own, with code 1 ----
+    //
+    // At the close of `halt_epoch` every validator's `build_epoch_record` reads the 3-member
+    // committee, rejects it against the previous record's promise, and the node exits through
+    // `main`'s error path. Exit code 1 distinguishes the designed error-exit from a signal
+    // death (`ExitStatus::code()` returns `None` for signals).
+    //
+    // All 5 must exit — the epoch cannot close for anyone. Known residual risk: a validator
+    // lagging at the boundary could in principle miss the closing commit once its peers exit
+    // first; the single shared 4-epoch-duration deadline (bounding all validators at once, so the
+    // total wait is independent of node count) absorbs realistic same-host lag, and a genuine
+    // stall should fail the test rather than be tolerated.
+    let exits =
+        guard.wait_for_natural_exits(0..nodes.len(), Duration::from_secs(EPOCH_DURATION * 4))?;
+    for (idx, status) in exits {
+        eyre::ensure!(
+            status.code() == Some(1),
+            "validator index {idx} exited with {status:?}; expected the designed error exit \
+             (code 1)"
+        );
+    }
+    info!(target: "eject-test", halt_epoch, "all validators fail-stopped at the halt boundary");
+
+    // ---- Tie each exit to the designed reason via the node's stderr log ----
+    // `main` prints the propagated error on stderr before exiting 1; the distinctive substring
+    // is from `build_epoch_record`'s error ("Last epochs next committee not compatible with
+    // this epochs committee!").
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
+    let log_dir = std::path::PathBuf::from(manifest_dir).join("test_logs").join("eject_halt");
+    for (name, _) in &nodes {
+        let stderr_path = log_dir.join(format!("node{name}-run1.stderr.log"));
+        let stderr = std::fs::read_to_string(&stderr_path)?;
+        eyre::ensure!(
+            stderr.contains("not compatible with this epochs committee"),
+            "{name} stderr ({}) lacks the epoch-record incompatibility error; the node exited \
+             with code 1 for the wrong reason",
+            stderr_path.display()
+        );
+    }
+
+    // ---- Liveness-negative: the network is down, no validator endpoint answers RPC ----
+    for endpoint in &endpoints {
+        let dead = ProviderBuilder::new().connect_http(endpoint.http_url.parse()?);
+        assert!(
+            dead.get_chain_id().await.is_err(),
+            "validator RPC {} still answers after the designed halt",
+            endpoint.http_url
+        );
+    }
 
     Ok(())
 }

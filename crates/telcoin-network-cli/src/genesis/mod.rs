@@ -106,6 +106,11 @@ pub struct GenesisArgs {
     /// Min delay for a node to produce a new header.
     #[arg(long)]
     pub min_header_delay_ms: Option<u64>,
+    /// Max time a worker waits before sealing a batch of pending transactions. Paces block
+    /// production under transaction load; it does not seal empty batches, so it does not
+    /// gate idle round advance (the header delays do that).
+    #[arg(long)]
+    pub max_batch_delay_ms: Option<u64>,
     /// Numeric chain id that will go in the genesis.
     /// Default is 0xde7e1 (911329).  Used mostly for testing.
     #[arg(long, default_value_t = 911329, value_parser=maybe_hex)]
@@ -302,6 +307,9 @@ impl GenesisArgs {
         if let Some(min_header_delay_ms) = self.min_header_delay_ms {
             parameters.min_header_delay = Duration::from_millis(min_header_delay_ms);
         }
+        if let Some(max_batch_delay_ms) = self.max_batch_delay_ms {
+            parameters.max_batch_delay = Duration::from_millis(max_batch_delay_ms);
+        }
         parameters.basefee_address = Some(self.basefee_address);
 
         // write genesis and config to file
@@ -338,6 +346,7 @@ mod tests {
             dev_funded_account: None,
             max_header_delay_ms: None,
             min_header_delay_ms: None,
+            max_batch_delay_ms: None,
             chain_id: 2017,
             worker_fee_configs: configs.into_iter().map(String::from).collect(),
             accounts: None,

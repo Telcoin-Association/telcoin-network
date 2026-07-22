@@ -239,12 +239,13 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
 /// A validator that misses more than `parameters.gc_depth - 10` (50 - 10 = 40) consensus
 /// rounds while offline is pushed outside the GC window (see the primary network handler's
 /// `outside_gc_window` check) and must rejoin via the follow/catch-up path rather than
-/// live consensus. The `min_secs` floor is the real guarantee: `max_header_delay = 1s`
-/// bounds a round to ~1s and the heavy restart tests run serially (nextest `e2e` group,
-/// max-threads = 1) so nothing else steals cores, so 60s reliably clears the ~40-round /
-/// ~40s threshold with margin while still cutting ~10s per test vs the old fixed 70s
-/// sleep. The peer-advancement check is only a stall-guard against the network wedging
-/// (which would make the downtime meaningless), not a substitute for the floor. Node
+/// live consensus. The `min_secs` floor is the real guarantee: with the e2e genesis's
+/// `max_header_delay = 500ms` an idle round is bounded to ~500ms (idle rounds are paced by
+/// the header delays, not `max_batch_delay`) and the heavy restart tests run serially
+/// (nextest `e2e` group, max-threads = 1) so nothing else steals cores, so 60s reliably
+/// clears the ~40-round (~20s) threshold with margin while still cutting ~10s per test vs
+/// the old fixed 70s sleep. The peer-advancement check is only a stall-guard against the network
+/// wedging (which would make the downtime meaningless), not a substitute for the floor. Node
 /// index 2 is the killed one; 0/1/3 stay live.
 fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<()> {
     // Nodes 0/1/3 stay live (index 2 is the killed one).

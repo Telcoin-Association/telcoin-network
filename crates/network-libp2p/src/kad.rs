@@ -932,8 +932,6 @@ mod test {
         // worker id and chain id are both interpolated, not literal
         assert_eq!(NetworkType::Worker(3).req_res_protocol(7)?.as_ref(), "/tn-worker-3-7/0.0.1");
         assert_eq!(NetworkType::Worker(3).kad_protocol(7)?.as_ref(), "/tn-worker-3-kad-7/0.0.1");
-        // the bulk-transfer stream protocol is chain-namespaced too (role-agnostic)
-        assert_eq!(crate::types::stream_protocol(2017)?.as_ref(), "/tn-stream-2017/0.0.1");
         // the per-role sync protocol is chain-namespaced as well
         assert_eq!(
             NetworkType::Primary.sync_protocol(2017)?.as_ref(),
@@ -949,11 +947,8 @@ mod test {
             NetworkType::Worker(3).peer_exchange_protocol(7)?.as_ref(),
             "/tn-worker-3-peer-exchange-7/0.0.1"
         );
-        // a stream node advertises the bulk-transfer protocol first, then the
-        // per-role sync protocol; both carry the chain id, and the order is the
-        // negotiation-preference contract (existing opens keep using the bulk one)
-        let (bulk_transfer, sync) = crate::types::stream_protocols(NetworkType::Worker(3), 2017)?;
-        assert_eq!(bulk_transfer.as_ref(), "/tn-stream-2017/0.0.1");
+        // a stream node advertises exactly the per-role sync protocol (chain-namespaced)
+        let sync = crate::types::stream_protocol(NetworkType::Worker(3), 2017)?;
         assert_eq!(sync.as_ref(), "/tn-worker-3-sync-2017/0.0.1");
         Ok(())
     }
