@@ -5,7 +5,7 @@
 
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -16,8 +16,8 @@ use tn_executor::subscriber::spawn_subscriber;
 use tn_network_libp2p::types::{MessageId, NetworkCommand};
 use tn_network_types::MockPrimaryToWorkerClient;
 use tn_node::{
-    catchup_accumulator, derive_base_fees_for_entered_epoch, derive_idle_worker_fee,
-    sync_num_workers_from_chain,
+    build_epoch_record, catchup_accumulator, derive_base_fees_for_entered_epoch,
+    derive_idle_worker_fee, sync_num_workers_from_chain,
 };
 use tn_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},
@@ -27,7 +27,8 @@ use tn_primary::{
 use tn_reth::{
     payload::TNPayload,
     test_utils::{
-        create_committee_from_state, seeded_genesis_from_random_batches,
+        create_committee_from_state, execute_payload_and_update_canonical_chain,
+        governance_burn_tx, governance_owner_factory, seeded_genesis_from_random_batches,
         test_genesis_with_consensus_registry, test_genesis_with_consensus_registry_and_workers,
         TransactionFactory,
     },
@@ -41,11 +42,11 @@ use tn_test_utils::{
 use tn_types::{
     adiri_genesis,
     gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator},
-    Address, Batch, BlsSignature, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochCertificate, EpochDigest,
-    EpochRecord, ExecHeader, GenesisAccount, Notifier, ReputationScores, SealedHeader,
-    SignatureVerificationState, TaskManager, TnReceiver as _, TnSender as _, WorkerId, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE, U256,
+    Address, Batch, BlockNumHash, BlsPublicKey, BlsSignature, Certificate, CommittedSubDag,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
+    EpochCertificate, EpochDigest, EpochRecord, ExecHeader, GenesisAccount, Notifier,
+    ReputationScores, SealedHeader, SignatureVerificationState, TaskManager, TnReceiver as _,
+    TnSender as _, WorkerId, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::{
@@ -757,7 +758,7 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
     let mut closing_output = outputs.pop().expect("epoch-closing output");
 
     // forward every pre-close output, then wait for the engine to execute each (the engine
-    // sends exactly one update per consensus output) so recovery scans a settled chain
+    // sends exactly one update per consensus output) so every block recovery scans is committed
     let sent = outputs.len();
     for output in outputs {
         to_engine.send(output).await?;
@@ -767,6 +768,13 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
             .await?
             .expect("engine update per output");
     }
+
+    // The engine update is sent from finish_executing_output AFTER the blocks commit but
+    // BEFORE finalize_block writes the finalized marker in its own transaction, so under load
+    // the marker can still lag the persisted tip here. A real restart never reads through that
+    // window: startup heals the marker before anything consults it. Mirror that startup step
+    // so catchup pins the settled tip instead of racing the marker write.
+    reth_env.heal_finalized_to_persisted_tip()?;
 
     // simulate node recovery at startup: catchup sizes the accumulator from pinned chain state
     // and rebuilds gas stats (fees are owned by the entry seeding)
@@ -2004,18 +2012,19 @@ async fn test_derive_idle_worker_fee_eip1559_decays_from_last_produced_epoch() -
     Ok(())
 }
 
-/// One epoch-entry pass over the accumulator exactly as `run_epoch` performs it: read the
-/// entered epoch's state from the canonical tip, resolve the previous epoch's closing block
-/// (`blockHeight - 1`, written once at the boundary), and derive+apply the worker count and
-/// every worker's base fee from that pinned state. Epoch 0 has no prior epoch: the count syncs
-/// from genesis `WorkerConfigs` state and fees keep the MIN defaults.
+/// One epoch-entry pass over the accumulator exactly as `run_epoch` performs it: the atomic
+/// `epoch_state_at_epoch_start` read yields the entered epoch's state together with the pin
+/// header — the previous epoch's closing block (`blockHeight - 1`, written once at the
+/// boundary) — and the worker count and every worker's base fee derive+apply from that pinned
+/// state. Epoch 0 has no prior epoch: the count syncs from genesis `WorkerConfigs` state and
+/// fees keep the MIN defaults.
 fn run_epoch_entry_sequence(
     reth_env: &RethEnv,
     gas_accumulator: &GasAccumulator,
 ) -> eyre::Result<()> {
-    // run_epoch reads the entered epoch's info from the canonical tip; the values are written
-    // once at the boundary, so any mid-epoch tip serves identical ones
-    let entered_state = reth_env.epoch_state_from_canonical_tip()?;
+    // run_epoch's entry read is pinned to the previous epoch's closing block; the pin resolves
+    // from boundary-written-once scalars, so any mid-epoch tip yields the identical header
+    let (entered_state, epoch_start_header) = reth_env.epoch_state_at_epoch_start()?;
     if entered_state.epoch == 0 {
         sync_num_workers_from_chain(
             reth_env,
@@ -2023,15 +2032,7 @@ fn run_epoch_entry_sequence(
             entered_state.epoch_info.blockHeight,
         )?;
     } else {
-        let closing_number = entered_state
-            .epoch_info
-            .blockHeight
-            .checked_sub(1)
-            .ok_or_else(|| eyre::eyre!("entered epoch reports blockHeight 0"))?;
-        let closing = reth_env
-            .sealed_header_by_number(closing_number)?
-            .ok_or_else(|| eyre::eyre!("missing closing block {closing_number}"))?;
-        derive_base_fees_for_entered_epoch(reth_env, entered_state.epoch, &closing)?
+        derive_base_fees_for_entered_epoch(reth_env, entered_state.epoch, &epoch_start_header)?
             .apply(gas_accumulator);
     }
     Ok(())
@@ -2165,6 +2166,317 @@ async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
         gas_accumulator.get_values(1),
         (1 + HAMMER_BLOCKS, 42_000 + HAMMER_BLOCKS * 10_000, 60_000 + HAMMER_BLOCKS * 30_000_000),
         "worker 1's live gas totals must survive the re-entry",
+    );
+
+    Ok(())
+}
+
+/// IT-3: the epoch-record chain survives a mid-epoch governance ejection end-to-end.
+///
+/// A 5-validator registry chain closes epoch 0 normally (rec0), then governance burns a
+/// current-committee validator mid-epoch-1 before the epoch-1 close. The producer's inputs
+/// are REAL post-ejection chain reads (the same `getCommitteeBlsPubkeys` path the node's
+/// `write_epoch_record` uses), so rec1's committee is the shrunken, swap-and-popped 4-member
+/// array while rec0's `next_committee` promised 5 — the exact shape that made
+/// `build_epoch_record`'s strict comparison halt every node at the boundary before it
+/// tolerated compatible shrinks via [`EpochRecord::committee_compatible`]. Epoch 2 then
+/// closes with an exact 4-member handoff (rec2), and all three records round-trip the
+/// epoch-record db in order.
+#[tokio::test]
+async fn test_epoch_record_chain_across_mid_epoch_ejection() -> eyre::Result<()> {
+    let record_dir = TempDir::with_prefix("epoch_record_ejection_records")?;
+    let reth_dir = TempDir::with_prefix("epoch_record_ejection_reth")?;
+    // the committee fixture only backs the consensus-chain handle holding the record store
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .with_rng(StdRng::seed_from_u64(8991))
+        .build();
+    let consensus_chain =
+        ConsensusChain::new_for_test(record_dir.path().to_owned(), fixture.committee()).await?;
+    let records = consensus_chain.epochs();
+
+    // 5-validator registry genesis so one ejection leaves a 4-member committee (the sync
+    // tolerance floor)
+    let genesis = test_genesis_with_consensus_registry(5);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let task_manager = TaskManager::new("epoch record ejection test");
+    let reth_env =
+        RethEnv::new_for_temp_chain(chain.clone(), reth_dir.path(), &task_manager, None)?;
+
+    // committee reads through the same `getCommitteeBlsPubkeys` path the node performs for
+    // `write_epoch_record`. The node pins that read to the epoch-closing block; every read
+    // below happens while the canonical tip IS the relevant closing block, so the tip read
+    // resolves the identical state.
+    let keys_for_epoch = |e: u32| -> eyre::Result<Vec<BlsPublicKey>> {
+        Ok(reth_env
+            .bls_pubkeys_for_epoch(e)?
+            .iter()
+            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
+            .collect())
+    };
+
+    // block 1: close epoch 0 normally
+    let worker_id: WorkerId = 0;
+    let output1 = manual_consensus_output(1, 0, 1, true);
+    let payload1 = payload_with_base_fee(
+        chain.sealed_genesis_header(),
+        &output1,
+        MIN_PROTOCOL_BASE_FEE,
+        worker_id,
+    );
+    let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload1, vec![])?;
+    let header1 = block1.recovered_block.clone_sealed_header();
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1);
+
+    // rec0 from real post-close reads: a full 5-member handoff
+    let committee0 = keys_for_epoch(0)?;
+    assert_eq!(committee0.len(), 5);
+    let rec0 = build_epoch_record(
+        0,
+        committee0,
+        keys_for_epoch(1)?,
+        None,
+        BlockNumHash::new(header1.number, header1.hash()),
+        ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
+    )?;
+    records.save_record(rec0.clone()).await?;
+
+    // mid-epoch 1: governance burns a seated validator (a middle slot so swap-and-pop
+    // visibly reorders the survivors)
+    let epoch1_pre_burn = keys_for_epoch(1)?;
+    assert_eq!(epoch1_pre_burn, rec0.next_committee, "epoch 1 starts on the promised committee");
+    let target_bls = epoch1_pre_burn[1];
+    let target_addr = reth_env.epoch_state_from_canonical_tip()?.validators[1].validatorAddress;
+    let mut governance = governance_owner_factory();
+    let burn_tx = governance_burn_tx(&mut governance, chain.clone(), target_addr);
+    let output2 = manual_consensus_output(1, 1, 2, false);
+    let payload2 = payload_with_base_fee(header1, &output2, MIN_PROTOCOL_BASE_FEE, worker_id);
+    let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload2, vec![burn_tx])?;
+    let header2 = block2.recovered_block.clone_sealed_header();
+
+    // block 3: close epoch 1 over the shrunken committee
+    let output3 = manual_consensus_output(2, 1, 3, true);
+    let payload3 = payload_with_base_fee(header2, &output3, MIN_PROTOCOL_BASE_FEE, worker_id);
+    let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload3, vec![])?;
+    let header3 = block3.recovered_block.clone_sealed_header();
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 2);
+
+    // rec1 from real post-ejection reads, chained to the db round-tripped rec0: the exact
+    // producer shape that halted the network before the tolerance fix
+    let committee1 = keys_for_epoch(1)?;
+    assert_eq!(committee1.len(), 4, "on-chain committee shrank mid-epoch");
+    assert!(!committee1.contains(&target_bls));
+    let prev0 = records.record_by_epoch(0).await.expect("rec0 round-trips the record db");
+    assert_eq!(prev0, rec0);
+    let rec1 = build_epoch_record(
+        1,
+        committee1.clone(),
+        keys_for_epoch(2)?,
+        Some(&prev0),
+        BlockNumHash::new(header3.number, header3.hash()),
+        ConsensusNumHash::new(3, ConsensusHeaderDigest::default()),
+    )
+    .expect("mid-epoch ejection must not prevent the epoch record from building");
+    assert_eq!(rec1.committee, committee1, "the record carries the shrunken on-chain read");
+    assert_eq!(rec1.parent_hash, prev0.digest(), "rec1 chains to rec0");
+
+    // the producer built exactly the shape the sync verifier's tolerance accepts
+    let promised: BTreeSet<BlsPublicKey> = prev0.next_committee.iter().copied().collect();
+    assert!(rec1.committee_compatible(&promised));
+    let recorded: BTreeSet<BlsPublicKey> = rec1.committee.iter().copied().collect();
+    assert!(recorded.is_subset(&promised));
+    let ejected: Vec<_> = promised.difference(&recorded).collect();
+    assert_eq!(ejected, vec![&target_bls], "exactly the burned key left the committee");
+    records.save_record(rec1.clone()).await?;
+
+    // block 4: close epoch 2 — the chain continues normally after the ejection epoch
+    let output4 = manual_consensus_output(1, 2, 4, true);
+    let payload4 = payload_with_base_fee(header3, &output4, MIN_PROTOCOL_BASE_FEE, worker_id);
+    let block4 = execute_payload_and_update_canonical_chain(&reth_env, payload4, vec![])?;
+    let header4 = block4.recovered_block.clone_sealed_header();
+
+    let committee2 = keys_for_epoch(2)?;
+    let prev1 = records.record_by_epoch(1).await.expect("rec1 round-trips the record db");
+    assert_eq!(prev1, rec1);
+    assert_eq!(committee2, prev1.next_committee, "the post-ejection handoff is exact again");
+    let rec2 = build_epoch_record(
+        2,
+        committee2,
+        keys_for_epoch(3)?,
+        Some(&prev1),
+        BlockNumHash::new(header4.number, header4.hash()),
+        ConsensusNumHash::new(4, ConsensusHeaderDigest::default()),
+    )?;
+    assert_eq!(rec2.parent_hash, prev1.digest(), "rec2 chains through the ejection epoch");
+    records.save_record(rec2.clone()).await?;
+
+    // the full record chain reads back in order
+    for expected in [&rec0, &rec1, &rec2] {
+        let stored =
+            records.record_by_epoch(expected.epoch).await.expect("saved record is readable");
+        assert_eq!(&stored, expected);
+    }
+
+    Ok(())
+}
+
+/// ENTRY-READ INVARIANT end-to-end: the previous epoch's closing block rules the ENTIRE epoch —
+/// re-entry timing cannot change the committee or the rewards rows.
+///
+/// A governance `burn` swap-and-pops the ejected validator out of the CURRENT epoch's stored
+/// committee arrays immediately, so a node re-entering `run_epoch` mid-epoch (crash-restart or
+/// ModeChange) that read the canonical tip would seed `RewardsCounter::set_committee` with the
+/// shrunken post-burn committee. `get_address_counts` resolves tallied authorities through that
+/// committee, so the ejected leader's accumulated reward row silently vanishes and the
+/// `generate_withdrawals` set the closing block commits diverges from peers that kept the
+/// epoch-start committee — a different `withdrawals_root`, a different closing-block hash, and
+/// a different epoch-record digest across the fleet. The entry read is therefore pinned to the
+/// previous epoch's closing block (`epoch_state_at_epoch_start`), making every entry shape
+/// derive the identical committee.
+///
+/// Four legs:
+/// - A: on-time entry (before the burn) derives the full committee from the pinned read and seeds
+///   the counter exactly as `run_epoch` does; every member tallies leader blocks.
+/// - B: after a mid-epoch burn, the RE-ENTRY pinned read returns the identical committee (victim
+///   included) while the tip read shows the shrunken set; re-seeding from the pinned read preserves
+///   the victim's row and the production close consumer (`generate_withdrawals`, the
+///   `withdrawals_root` input) still emits all N entries.
+/// - C: control proving the machinery detects the pre-fix bug — the same tallies seeded from the
+///   post-burn TIP committee drop the victim's row and emit N-1 withdrawals.
+/// - D: epoch 0 pins genesis, and the pinned-read committee equals the tip-read committee — entry
+///   semantics for the genesis epoch are unchanged.
+#[tokio::test]
+async fn mid_epoch_burn_reentry_keeps_epoch_start_committee_and_rewards() -> eyre::Result<()> {
+    const VICTIM_LEADER_BLOCKS: u32 = 7;
+
+    let reth_dir = TempDir::with_prefix("burn_reentry_reth")?;
+    // 5-validator registry genesis: one ejection leaves 4 members, so pinned (5) and tip (4)
+    // committee sizes are distinguishable
+    let genesis = test_genesis_with_consensus_registry(5);
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let task_manager = TaskManager::new("burn reentry test");
+    let reth_env =
+        RethEnv::new_for_temp_chain(chain.clone(), reth_dir.path(), &task_manager, None)?;
+
+    // block 1: close epoch 0 — this closing block seats epoch 1's committee and is the pin
+    // every epoch-1 entry read must derive from
+    let worker_id: WorkerId = 0;
+    let output1 = manual_consensus_output(1, 0, 1, true);
+    let payload1 = payload_with_base_fee(
+        chain.sealed_genesis_header(),
+        &output1,
+        MIN_PROTOCOL_BASE_FEE,
+        worker_id,
+    );
+    let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload1, vec![])?;
+    let header1 = block1.recovered_block.clone_sealed_header();
+    assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1);
+
+    // Leg A — entry BEFORE the burn: the pinned read production performs at every entry
+    let (state_a, pin_a) = reth_env.epoch_state_at_epoch_start()?;
+    assert_eq!(state_a.epoch, 1);
+    assert_eq!(pin_a.hash(), header1.hash(), "pin is epoch 0's closing block");
+    // the soon-to-be-burned victim: a middle slot so swap-and-pop visibly reorders survivors
+    let victim_addr = state_a.validators[1].validatorAddress;
+    let victim_bls = BlsPublicKey::from_literal_bytes(state_a.bls_pubkeys[1].as_ref())
+        .map_err(|err| eyre::eyre!("failed to decode victim bls key: {err:?}"))?;
+    let committee_a = create_committee_from_state(state_a).await?;
+    assert_eq!(committee_a.epoch(), 1);
+    assert_eq!(committee_a.size(), 5, "on-time entry derives the full epoch-start committee");
+
+    // seed the counter exactly as run_epoch does at entry, then tally leader blocks for every
+    // member — the victim's count is distinctive so its row is unmistakable
+    let gas_accumulator = GasAccumulator::new(1);
+    let rewards = gas_accumulator.rewards_counter();
+    rewards.set_committee(committee_a.clone());
+    for authority in committee_a.authorities() {
+        let count =
+            if authority.execution_address() == victim_addr { VICTIM_LEADER_BLOCKS } else { 1 };
+        for _ in 0..count {
+            rewards.inc_leader_count(&authority.id());
+        }
+    }
+    let counts_a = rewards.get_address_counts();
+    assert_eq!(counts_a.len(), 5, "every committee member has a reward row");
+    assert_eq!(counts_a.get(&victim_addr), Some(&VICTIM_LEADER_BLOCKS));
+
+    // Leg B — mid-epoch burn, then re-entry (the crash-restart / ModeChange shape)
+    let mut governance = governance_owner_factory();
+    let burn_tx = governance_burn_tx(&mut governance, chain.clone(), victim_addr);
+    let output2 = manual_consensus_output(1, 1, 2, false);
+    let payload2 = payload_with_base_fee(header1, &output2, MIN_PROTOCOL_BASE_FEE, worker_id);
+    execute_payload_and_update_canonical_chain(&reth_env, payload2, vec![burn_tx])?;
+
+    // the tip view shrinks immediately — this is what a pre-fix re-entry would have read
+    let tip_state = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(tip_state.epoch, 1);
+    assert_eq!(tip_state.validators.len(), 4, "tip committee shrank post-burn");
+    assert!(tip_state.validators.iter().all(|v| v.validatorAddress != victim_addr));
+
+    // RE-ENTRY read: pinned to the same closing block, so the committee is IDENTICAL to leg
+    // A's — victim included; the pin is exactly what differs from the tip read above
+    let (state_b, pin_b) = reth_env.epoch_state_at_epoch_start()?;
+    assert_eq!(pin_b.hash(), pin_a.hash(), "pin unchanged by the burn");
+    let committee_b = create_committee_from_state(state_b).await?;
+    assert_eq!(
+        committee_b.bls_keys(),
+        committee_a.bls_keys(),
+        "re-entry derives the exact epoch-start committee"
+    );
+    assert!(committee_b.bls_keys().contains(&victim_bls), "the burned victim is still a member");
+
+    // re-seed from the pinned read as a real re-entry does: every accumulated reward row
+    // survives, and the production close consumer (generate_withdrawals feeds the closing
+    // block's withdrawals_root) still emits all 5 entries
+    rewards.set_committee(committee_b);
+    let counts_b = rewards.get_address_counts();
+    assert_eq!(counts_b, counts_a, "re-entry preserves every reward row");
+    let withdrawals_b = rewards.generate_withdrawals();
+    assert_eq!(withdrawals_b.len(), 5, "the epoch close pays every epoch-start member");
+    assert!(withdrawals_b
+        .iter()
+        .any(|w| w.address == victim_addr && w.amount == VICTIM_LEADER_BLOCKS as u64));
+
+    // Leg C — control: the same tallies seeded from the post-burn TIP committee drop the
+    // victim's row — the divergence the pin prevents, proving the assertions above would
+    // catch a regression to tip-seeded entry
+    let tip_committee = create_committee_from_state(tip_state).await?;
+    assert_eq!(tip_committee.size(), 4);
+    let control = GasAccumulator::new(1).rewards_counter();
+    for authority in committee_a.authorities() {
+        let count =
+            if authority.execution_address() == victim_addr { VICTIM_LEADER_BLOCKS } else { 1 };
+        for _ in 0..count {
+            control.inc_leader_count(&authority.id());
+        }
+    }
+    control.set_committee(tip_committee);
+    let control_counts = control.get_address_counts();
+    assert_eq!(control_counts.len(), 4, "tip seeding silently drops the ejected leader's row");
+    assert!(!control_counts.contains_key(&victim_addr));
+    let control_withdrawals = control.generate_withdrawals();
+    assert_eq!(control_withdrawals.len(), 4);
+    assert_ne!(
+        control_withdrawals, withdrawals_b,
+        "tip-seeded close builds different withdrawals — a divergent withdrawals_root"
+    );
+
+    // Leg D — epoch 0: a fresh chain pins genesis, and the pinned committee equals the tip
+    // committee — genesis-epoch entry semantics are unchanged by the pin
+    let fresh_dir = TempDir::with_prefix("burn_reentry_epoch0")?;
+    let fresh_task_manager = TaskManager::new("burn reentry epoch 0");
+    let fresh_env =
+        RethEnv::new_for_temp_chain(chain.clone(), fresh_dir.path(), &fresh_task_manager, None)?;
+    let (state_0, pin_0) = fresh_env.epoch_state_at_epoch_start()?;
+    assert_eq!(pin_0.number, 0, "epoch 0 pins genesis");
+    assert_eq!(state_0.epoch, 0);
+    let committee_0 = create_committee_from_state(state_0).await?;
+    let committee_0_tip =
+        create_committee_from_state(fresh_env.epoch_state_from_canonical_tip()?).await?;
+    assert_eq!(committee_0.size(), 5);
+    assert_eq!(
+        committee_0.bls_keys(),
+        committee_0_tip.bls_keys(),
+        "epoch 0's pinned view matches the tip view"
     );
 
     Ok(())

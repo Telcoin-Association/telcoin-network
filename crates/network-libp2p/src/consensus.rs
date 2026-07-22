@@ -133,12 +133,11 @@ where
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         metrics: PeerManagerMetrics,
-        stream_protocols: (StreamProtocol, StreamProtocol),
+        stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
         let (req_res, peer_exchange) = req_res;
-        let (stream_legacy, stream_sync) = stream_protocols;
-        let stream = StreamBehavior::new(stream_legacy, stream_sync);
+        let stream = StreamBehavior::new(stream_protocol);
         Self { peer_manager, gossipsub, req_res, peer_exchange, kademlia, stream }
     }
 }
@@ -423,7 +422,7 @@ where
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
-        let stream_protocols = crate::types::stream_protocols(network_type, chain_id)?;
+        let stream_protocol = crate::types::stream_protocol(network_type, chain_id)?;
         let mut behavior = TNBehavior::new(
             peer_id,
             gossipsub,
@@ -431,12 +430,25 @@ where
             kademlia,
             network_config.peer_config(),
             PeerManagerMetrics::new_for(&network_type),
-            stream_protocols,
+            stream_protocol,
         );
 
-        // Promote the surviving records into the local peer cache.
+        // Promote the surviving records into the local peer cache. The store's contents are
+        // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
+        // duty), so entries are restored UNPINNED and stay prunable at the first committee
+        // rotation. Our own record is skipped: both primary and worker key their record by
+        // the primary BLS key, and there is no point caching ourselves as a known peer.
+        let own_key = key_config.primary_public_key();
+        let mut restored: usize = 0;
         for (key, info) in known {
-            behavior.peer_manager.add_known_peer(key, info);
+            if key == own_key {
+                continue;
+            }
+            behavior.peer_manager.add_restored_peer(key, info);
+            restored += 1;
+        }
+        if restored > 0 {
+            info!(target: "network-kad", restored, "restored persisted kad records into the local peer cache");
         }
 
         let network_pubkey = keypair.public().into();
@@ -737,20 +749,20 @@ where
                 let _ = reply.send(Ok(()));
             }
             NetworkCommand::AddBootstrapPeers { peers, reply } => {
-                // update peer manager
+                // update peer manager: always pin bootstrap peers (even when a record already
+                // exists, e.g. restored unpinned from persistence), but never overwrite an
+                // existing record with the config-derived stub
                 let peer = &mut self.swarm.behaviour_mut().peer_manager;
                 for (bls, info) in peers {
-                    if peer.auth_to_peer(bls).is_none() {
-                        peer.add_known_peer(
-                            bls,
-                            NetworkInfo {
-                                pubkey: info.network_key,
-                                multiaddrs: vec![info.network_address],
-                                timestamp: now(),
-                                rpc: None,
-                            },
-                        );
-                    }
+                    peer.add_bootstrap_peer(
+                        bls,
+                        NetworkInfo {
+                            pubkey: info.network_key,
+                            multiaddrs: vec![info.network_address],
+                            timestamp: now(),
+                            rpc: None,
+                        },
+                    );
                 }
                 let _ = reply.send(Ok(()));
             }
@@ -938,7 +950,7 @@ where
                 let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
-            NetworkCommand::OpenStream { peer, kind, reply } => {
+            NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
                 let (peer_id, addrs) = match self.swarm.behaviour().peer_manager.auth_to_peer(peer)
                 {
@@ -963,7 +975,7 @@ where
                 // Pass the reply channel directly to the stream behavior.
                 // The stream (or error) will be returned to the caller via oneshot
                 // without any intermediate tracking.
-                self.swarm.behaviour_mut().stream.open_stream(peer_id, kind, addrs, reply);
+                self.swarm.behaviour_mut().stream.open_stream(peer_id, addrs, reply);
             }
             #[cfg(test)]
             NetworkCommand::KadStoreGet { key, reply } => {
@@ -1498,13 +1510,15 @@ where
 
         let GossipMessage { topic, .. } = gossip;
 
-        // ensure publisher is authorized
+        // Ensure the publisher is authorized. Semantics per topic entry:
+        //   - absent  => topic not subscribed here: reject.
+        //   - `None`  => subscribed, any publisher allowed (open topic): accept.
+        //   - `Some`  => subscribed, committee-restricted: accept only a resolved BLS key that is
+        //     in the allowlist.
         if gossip.source.is_some_and(|id| {
             let bls_key = self.swarm.behaviour().peer_manager.peer_to_bls(&id);
             self.authorized_publishers.get(topic.as_str()).is_some_and(|auth| {
-                auth.is_none()
-                    || (bls_key.is_some()
-                        && auth.as_ref().expect("is some").contains(&bls_key.expect("is some")))
+                auth.as_ref().is_none_or(|set| bls_key.is_some_and(|key| set.contains(&key)))
             })
         }) {
             GossipAcceptance::Accept
@@ -1653,21 +1667,19 @@ where
     /// This handles inbound and outbound stream events for bulk data transfer.
     fn process_stream_event(&mut self, event: StreamEvent) -> NetworkResult<()> {
         match event {
-            StreamEvent::InboundStream { peer, kind, stream } => {
+            StreamEvent::InboundStream { peer, stream } => {
                 debug!(
                     target: "network",
                     ?peer,
-                    ?kind,
                     "inbound stream received"
                 );
-                // Forward raw stream to application layer, tagged with the
-                // negotiated protocol so it routes to the sync or legacy reader.
+                // Forward the raw stream to the application layer, which reads it
+                // as a typed sync stream.
                 if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
-                    if let Err(e) = self.event_stream.try_send(NetworkEvent::InboundStream {
-                        peer: bls,
-                        kind,
-                        stream,
-                    }) {
+                    if let Err(e) = self
+                        .event_stream
+                        .try_send(NetworkEvent::InboundStream { peer: bls, stream })
+                    {
                         error!(target: "network", ?e, "failed to forward inbound stream");
                     }
                 } else {
@@ -2012,6 +2024,16 @@ where
     }
 
     /// Cleanup kad record queries (called on last step).
+    ///
+    /// The winning record is promoted ONLY into the peer manager's `known_peers` cache (via
+    /// `add_discovered_peer`) and deliberately NOT written to the kad store: `known_peers` is
+    /// the read model of discovery, and the node needs the resolution, not the record.
+    /// Persisting merely-queried third-party records would enlist libp2p's `PutRecordJob` to
+    /// republish them on every replication run (hourly by libp2p default), making this node an
+    /// hourly replicator of records it never needed to serve, and would erode the store's
+    /// max-records cap — the node's DHT storage-duty budget — with query traffic. Nothing is
+    /// lost: peers push their own records on first connect (an inbound kad put handled by
+    /// [`Self::process_kad_put_request`]), which is the path that legitimately feeds the store.
     fn close_kad_query(&mut self, query_id: &QueryId) {
         if let Some(query) = self.kad_record_queries.remove(query_id) {
             if let Some(node_record) = query.result {

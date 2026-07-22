@@ -135,6 +135,20 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     fn persist<T: Table>(&self) -> impl Future<Output = ()> + Send {
         std::future::ready(())
     }
+    /// Durable variant of [`Database::persist`].
+    ///
+    /// For a backend that persists in the background, a plain [`Database::persist`] barrier can
+    /// resolve while a concurrently-open write txn has *absorbed* this caller's write but not yet
+    /// committed it, so a crash in that window loses the record even though `persist` returned. The
+    /// future returned here resolves only once the write is durably committed to the physical
+    /// store, including that absorbed-into-an-open-txn case. Synchronously-durable backends
+    /// inherit the plain `persist` behaviour.
+    ///
+    /// Use at anti-equivocation externalization points (proposer header broadcast, vote return)
+    /// where losing the record on restart makes an honest node equivocate.
+    fn persist_durable<T: Table>(&self) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
     /// Sync version of persist- useful for test not for prod code.
     /// Since this is intended for testing don't bother with the Table hint.
     fn sync_persist(&self) {}

@@ -20,6 +20,10 @@ tn-node = { workspace = true }
 # is actually compiled into the binary. Enabled for the `docker-adiri` image via a Docker build arg;
 # default/mainnet builds omit it. See `tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH`.
 adiri = ["telcoin-network-cli/adiri", "tn-node/adiri"]
+# Opt back in to reth's RocksDB storage backend (librocksdb-sys). Off by default: storage
+# is MDBX-only today, so the node uses reth's zero-size `RocksDBProvider` stub and skips
+# compiling the RocksDB C++ engine. Must be enabled before any storage-v2 experimentation.
+rocksdb = ["telcoin-network-cli/rocksdb", "tn-node/rocksdb"]
 
 [lints]
 workspace = true

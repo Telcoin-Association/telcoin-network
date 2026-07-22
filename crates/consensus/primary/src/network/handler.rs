@@ -3,11 +3,11 @@
 use super::PrimaryResponse;
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
-    network::{message::PrimaryGossip, PendingStreamRequest, StreamRequestKind},
+    network::message::PrimaryGossip,
     state_sync::{CertificateCollector, StateSynchronizer},
     ConsensusBusApp, NodeMode,
 };
-use futures::{AsyncWrite, AsyncWriteExt as _};
+use futures::AsyncWriteExt as _;
 use parking_lot::Mutex;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -18,16 +18,16 @@ use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     write_frame, GossipMessage, PrimarySyncRequest, Stream, SyncFrame, SyncFrameError,
 };
-use tn_storage::{consensus::ConsensusChain, CertificateStore, VoteDigestStore};
+use tn_storage::{consensus::ConsensusChain, tables::Votes, CertificateStore, VoteDigestStore};
 use tn_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlsPublicKey, Certificate,
     ConsensusResult, ConsensusResultDigest, Database, Epoch, EpochCertificate, EpochDigest,
-    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, ReadStream, Round,
-    SignatureVerificationState, TnSender as _, Vote, B256,
+    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
+    SignatureVerificationState, TnSender as _, Vote,
 };
-use tokio::{io::AsyncReadExt, sync::Mutex as TokioMutex, time::timeout};
+use tokio::{sync::Mutex as TokioMutex, time::timeout};
 use tracing::{debug, error, info, warn};
 
 /// Total timeout for sending a 16kb buffer of pack file data.
@@ -72,6 +72,10 @@ struct ConsensusCertTally {
     signers: HashSet<BlsPublicKey>,
 }
 
+/// Dedup key for an epoch vote at ingress: `(author, epoch, epoch-record hash)`. See the
+/// `epoch_votes_seen` field and issue #898.
+type EpochVoteKey = (BlsPublicKey, Epoch, EpochDigest);
+
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
 pub(crate) struct RequestHandler<DB> {
@@ -93,6 +97,17 @@ pub(crate) struct RequestHandler<DB> {
     auth_last_vote: Arc<AuthEquivocationMap>,
     /// Track consensus headers until we hit a simple quorum then send on.
     consensus_certs: Arc<Mutex<HashMap<ConsensusResultDigest, ConsensusCertTally>>>,
+    /// Deduplicate epoch votes at ingress, keyed on `(author, epoch, epoch-record hash)`.
+    ///
+    /// The value is a monotonic recency sequence used to evict the least-recently-seen entry
+    /// once the map reaches [`MAX_EPOCH_VOTES`](super::MAX_EPOCH_VOTES), bounding memory
+    /// against a vote flood. A key is inserted only after its signature verifies, so this gate
+    /// skips repeated verifies of an already-accepted vote without letting a bad-signature vote
+    /// poison the slot of the real author. The `epoch` field is part of the key even though it is
+    /// not covered by the vote signature: this ensures a replay that tampers with `vote.epoch`
+    /// lands on a different key and cannot evict/pre-empt the real vote's slot. See the
+    /// `PrimaryGossip::EpochVote` handler and issue #898.
+    epoch_votes_seen: Arc<Mutex<HashMap<EpochVoteKey, u64>>>,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
 }
@@ -121,6 +136,7 @@ where
             requested_parents: Default::default(),
             auth_last_vote: Arc::new(auth_last_vote),
             consensus_certs: Default::default(),
+            epoch_votes_seen: Default::default(),
             consensus_chain,
         }
     }
@@ -220,6 +236,38 @@ where
         } else {
             self.consensus_chain.epochs().get_committee_keys(epoch).await
         }
+    }
+
+    /// True if a vote for this `(author, epoch, epoch-record)` has already been verified and
+    /// forwarded.
+    ///
+    /// Cheap read used as a pre-verify gate: an accepted vote is re-gossiped by its author on a
+    /// timer and duplicated by the gossip mesh, so this caps repeated BLS verifies of the same
+    /// valid vote. See [`RequestHandler::record_epoch_vote`] and issue #898.
+    fn epoch_vote_seen(&self, author: BlsPublicKey, epoch: Epoch, epoch_hash: EpochDigest) -> bool {
+        self.epoch_votes_seen.lock().contains_key(&(author, epoch, epoch_hash))
+    }
+
+    /// Record a verified `(author, epoch, epoch-record)` vote so later replays are dropped before
+    /// the signature check.
+    ///
+    /// Callers MUST invoke this only after [`EpochVote::check_signature`] succeeds: recording a
+    /// bad-signature vote would let a Byzantine committee publisher poison the slot of the real
+    /// author and suppress their vote. Eviction is least-recently-seen once the map reaches
+    /// [`MAX_EPOCH_VOTES`](super::MAX_EPOCH_VOTES), so a flood of distinct keys cannot grow it
+    /// without bound; a false negative after eviction only costs one extra verify (the collector
+    /// dedups per signer downstream), never a dropped honest vote.
+    fn record_epoch_vote(&self, author: BlsPublicKey, epoch: Epoch, epoch_hash: EpochDigest) {
+        let key = (author, epoch, epoch_hash);
+        let mut guard = self.epoch_votes_seen.lock();
+        let next_seq = guard.values().copied().max().unwrap_or(0) + 1;
+        if guard.len() >= super::MAX_EPOCH_VOTES && !guard.contains_key(&key) {
+            let evict = guard.iter().min_by_key(|entry| *entry.1).map(|entry| *entry.0);
+            if let Some(evict) = evict {
+                guard.remove(&evict);
+            }
+        }
+        guard.insert(key, next_seq);
     }
 
     /// Process gossip from the committee.
@@ -430,41 +478,57 @@ where
                 }
             }
             PrimaryGossip::EpochVote(vote) => {
+                // Uniform gate ordering (issue #898): run the cheap, attacker-independent checks
+                // before the expensive BLS verify so unauthorized or duplicate votes are dropped
+                // without consuming verification resources.
+
+                // 1. Topic must match.
                 ensure!(
                     topic.to_string().eq(&tn_config::LibP2pConfig::epoch_vote_topic(
                         self.consensus_config.chain_id()
                     )),
                     PrimaryNetworkError::InvalidTopic
                 );
-                // Authorize before verifying. `epoch_vote_topic` is an open gossip topic, so any
-                // observer can publish an `EpochVote` with arbitrary fields; `check_signature` is a
-                // full BLS pairing verify, so verifying first lets a non-committee observer force
-                // one verify per message on every honest primary (GHSA-j2g4-553f-875r). The
-                // collector only ever uses a vote whose author is a committee member of
-                // `vote.epoch` (`manage_epoch_votes` drops the rest), so gate on
-                // committee membership by epoch number first and pay the verify
-                // only for a member of a known epoch. Mirrors the `Consensus` arm
-                // above. Membership is by epoch *number*, not `epoch_hash`, so a
-                // member's vote for a forked/alternative record is still admitted (the collector's
-                // equivocation path needs it). A non-member yields the benign, non-penalizing
-                // `PeerNotInCommittee` rather than `PeerNotAuthor`, which is `Fatal` and, on the
-                // gossip path, charged to the honest relayer rather than the author.
+                // 2. Committee membership BEFORE crypto. An epoch vote is signed by a member of the
+                //    committee for `vote.epoch` (see `EpochVote` and `manage_epoch_votes`), so a
+                //    non-member is rejected without a signature check. `get_committee` resolves the
+                //    current/next committee synchronously (the live-voting window) and falls back
+                //    to stored epoch records for older epochs. Membership is by epoch *number*, not
+                //    `epoch_hash`, so a member's vote for a forked/alternative record is still
+                //    admitted (the collector's equivocation path needs it). A non-member yields the
+                //    benign, non-penalizing `PeerNotInCommittee` rather than the `Fatal`
+                //    `PeerNotAuthor`, which on the gossip path is charged to the honest relayer
+                //    rather than the author (GHSA-j2g4-553f-875r). Mirrors the `Consensus` arm.
                 if let Some(committee) = self.get_committee(vote.epoch).await {
                     ensure!(
                         committee.contains(&vote.public_key),
                         PrimaryNetworkError::PeerNotInCommittee(Box::new(vote.public_key))
                     );
-                    ensure!(
-                        vote.check_signature(),
-                        PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+                    // 3. Drop votes already verified and forwarded for this (author, record).
+                    if !self.epoch_vote_seen(vote.public_key, vote.epoch, vote.epoch_hash) {
+                        // 4. Signature check LAST — the most expensive gate.
+                        ensure!(
+                            vote.check_signature(),
+                            PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+                        );
+                        // Record only AFTER a valid signature so a bad-signature vote cannot
+                        // poison the dedup slot for the real author.
+                        self.record_epoch_vote(vote.public_key, vote.epoch, vote.epoch_hash);
+                        // Fire-and-forget: no oneshot, no blocking.
+                        let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
+                    }
+                } else {
+                    // Committee for this epoch is not known yet (we are behind, or the epoch is
+                    // bogus). Drop without penalty and without writing request state from an
+                    // unverified, attacker-controlled epoch number; the author re-gossips its
+                    // vote and the epoch is learned via consensus / epoch-record sync.
+                    debug!(
+                        target: "primary",
+                        epoch = vote.epoch,
+                        author = ?vote.public_key,
+                        "dropping epoch vote for unknown committee epoch"
                     );
-                    // Fire-and-forget: no oneshot, no blocking
-                    let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
                 }
-                // Unknown epoch (no committee yet): we cannot authenticate the vote and the
-                // collector cannot use it, so drop it. The outgoing committee republishes votes
-                // until quorum, so a vote that races ahead of its epoch record is re-delivered
-                // once the epoch is known.
             }
         }
 
@@ -814,37 +878,28 @@ where
                         self.consensus_config.key_config(),
                     );
                     if vote.digest() != vote_info.vote_digest() {
-                        // Check if a certificate was already formed for this header author at this
-                        // round. If one exists, the old vote contributed to a real certificate, so
-                        // voting for a different header at the same round would be equivocation.
-                        // If no certificate exists, the old vote was never aggregated (e.g. the
-                        // proposer was killed before collecting enough votes, then restarted and
-                        // created a new header at the same round). In that case it is safe to
-                        // re-vote for the new header.
-                        let cert_exists = self
-                            .consensus_config
-                            .node_storage()
-                            .read_by_index(header.author(), header.round())
-                            .unwrap_or(None)
-                            .is_some();
-                        if cert_exists {
-                            warn!(
-                                "Authority {} submitted different header {:?} for voting",
-                                header.author(),
-                                header,
-                            );
-                            return Err(
-                                HeaderError::AlreadyVoted(header.digest(), header.round()).into()
-                            );
-                        }
-                        // No certificate was formed for the old vote — allow re-voting.
+                        // We have already signed a *different* vote for this author at
+                        // this (epoch, round); refuse to sign a second one.
+                        //
+                        // The previous behavior re-voted whenever `read_by_index` found no
+                        // certificate for the earlier vote. That probe is unsound across a
+                        // crash: the certificate tables are `TableHint::Epoch`, written
+                        // non-durably through the layered epoch DB, so a certificate that
+                        // *was* formed can be lost on restart and read back as absent,
+                        // letting the node sign a distinct vote for a slot already
+                        // aggregated into a live certificate. (`.unwrap_or(None)` also
+                        // failed a storage error open into the same branch.) A `false` or
+                        // errored read cannot prove the earlier vote was never certified,
+                        // so the only safe action is to refuse. See #934, #963.
                         warn!(
-                            "Authority {} re-proposing at round {} with a different header; \
-                         previous vote was for an uncertified header — allowing re-vote",
+                            "Authority {} submitted a different header {:?} for a round it was \
+                             already voted on; refusing to re-vote to avoid equivocation",
                             header.author(),
-                            header.round(),
+                            header,
                         );
-                        // Fall through to create and store the new vote below.
+                        return Err(
+                            HeaderError::AlreadyVoted(header.digest(), header.round()).into()
+                        );
                     } else {
                         debug!(
                             "Resending vote {vote:?} for {} at round {}",
@@ -868,6 +923,14 @@ where
 
         // Update the vote digest store with the vote we just sent.
         self.consensus_config.node_storage().write_vote(&vote)?;
+
+        // Wait for the `Votes` record to be durable before returning the vote to the peer. The
+        // epoch DB persists asynchronously, so `write_vote` returns before the record hits disk;
+        // returning the vote first would let a crash in that window lose the record. On restart the
+        // recast guard would then read nothing and could sign a *different* vote for the same
+        // author/round while the pre-crash vote is already held by the peer: equivocation from an
+        // ordinary crash. See issue #934.
+        self.consensus_config.node_storage().persist_durable::<Votes>().await;
 
         Ok(PrimaryResponse::Vote(vote))
     }
@@ -1060,143 +1123,6 @@ where
     #[cfg(test)]
     pub(crate) fn consensus_certs_has(&self, digest: &ConsensusResultDigest) -> bool {
         self.consensus_certs.lock().contains_key(digest)
-    }
-
-    /// Send an epoch pack file over a stream.
-    ///
-    /// `stop_number` selects what is sent and is the ONLY difference from the client's perspective
-    /// between a full and a partial transfer:
-    /// - `None`: stream the complete (finished) epoch pack, exactly as before.
-    /// - `Some(n)`: stream only the verifiable prefix up to and including consensus number `n`
-    ///   (used for the in-progress current epoch).
-    pub(super) async fn send_epoch_over_stream<S>(
-        mut stream: S,
-        consensus_chain: &ConsensusChain,
-        epoch: Epoch,
-        stop_number: Option<u64>,
-        buffer_timeout: Duration,
-        peer: BlsPublicKey,
-    ) -> PrimaryNetworkResult<()>
-    where
-        S: AsyncWrite + Unpin + Send,
-    {
-        let mut bytes = vec![0_u8; 16 * 1024]; // Use a 16kb read buffer.
-                                               // `limit` bounds how many data-file bytes we send. `None` streams to EOF (whole epoch);
-                                               // `Some(end)` streams `[0, end)` — the prefix containing outputs up to `stop_number`.
-        let (mut epoch_stream, limit): (Box<dyn ReadStream>, Option<u64>) = match stop_number {
-            None => (
-                consensus_chain
-                    .get_epoch_stream(epoch)
-                    .await
-                    .map_err(|_| PrimaryNetworkError::StreamUnavailable(epoch))?,
-                None,
-            ),
-            Some(number) => {
-                let (epoch_stream, end) = consensus_chain
-                    .get_partial_epoch_stream(epoch, number)
-                    .await
-                    .map_err(|_| PrimaryNetworkError::StreamUnavailable(epoch))?;
-                (epoch_stream, Some(end))
-            }
-        };
-        let mut sent: u64 = 0;
-        loop {
-            // Cap the next read so a partial transfer never sends past `limit`.
-            let to_read = match limit {
-                Some(limit) => {
-                    if sent >= limit {
-                        break;
-                    }
-                    std::cmp::min(bytes.len() as u64, limit - sent) as usize
-                }
-                None => bytes.len(),
-            };
-            let n = epoch_stream.read(&mut bytes[..to_read]).await?;
-            if n == 0 {
-                break;
-            }
-            timeout(buffer_timeout, stream.write_all(&bytes[..n])).await??;
-            sent += n as u64;
-        }
-
-        // attempt to close the stream gracefully
-        if let Err(e) = stream.close().await {
-            tracing::warn!(target: "primary::network", %peer, %epoch, ?e, "stream close failed");
-        }
-
-        Ok(())
-    }
-
-    /// Process request to open a stream for an epoch pack (full or partial prefix).
-    pub(super) async fn process_request_epoch_stream(
-        &self,
-        peer: BlsPublicKey,
-        pending_request: Option<PendingStreamRequest>,
-        stream: Stream,
-        request_digest: B256,
-        consensus_chain: &ConsensusChain,
-    ) -> PrimaryNetworkResult<()> {
-        // `None` indicates unexpected request
-        let Some(request) = pending_request else {
-            // this is a protocol violation - return error for penalty
-            warn!(
-                target: "primary::network",
-                %peer,
-                ?request_digest,
-                "inbound stream has no matching pending request"
-            );
-            return Err(PrimaryNetworkError::UnknownStreamRequest(request_digest));
-        };
-
-        match request.kind() {
-            StreamRequestKind::EpochPack(epoch) => {
-                debug!(
-                    target: "primary::network",
-                    %peer,
-                    ?request_digest,
-                    epoch,
-                    "processing inbound epoch stream"
-                );
-
-                // set timeout to prevent slow-read attack
-                Self::send_epoch_over_stream(
-                    stream,
-                    consensus_chain,
-                    epoch,
-                    None,
-                    SEND_STREAM_BUFFER_TIMEOUT,
-                    peer,
-                )
-                .await
-                .inspect_err(|e| {
-                    warn!(target: "primary::network", %peer, ?e, "failed to send epoch over stream")
-                })
-            }
-            StreamRequestKind::EpochPackPartial { epoch, last_consensus_number } => {
-                debug!(
-                    target: "primary::network",
-                    %peer,
-                    ?request_digest,
-                    epoch,
-                    stop_number = last_consensus_number,
-                    "processing inbound partial epoch stream"
-                );
-
-                // set timeout to prevent slow-read attack
-                Self::send_epoch_over_stream(
-                    stream,
-                    consensus_chain,
-                    epoch,
-                    Some(last_consensus_number),
-                    SEND_STREAM_BUFFER_TIMEOUT,
-                    peer,
-                )
-                .await
-                .inspect_err(|e| {
-                    warn!(target: "primary::network", %peer, ?e, "failed to send partial epoch over stream")
-                })
-            }
-        }
     }
 
     /// Serve an inbound epoch-pack sync exchange.

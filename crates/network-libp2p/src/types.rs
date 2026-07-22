@@ -1,8 +1,7 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, stream::StreamKind, GossipMessage,
-    PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -97,11 +96,9 @@ impl NetworkType {
     /// Bulk-sync streaming wire protocol, isolated per role (and per worker) and
     /// namespaced by `chain_id` so nodes on different chains never negotiate it.
     ///
-    /// The stream behaviour registers this alongside the chain-namespaced
-    /// bulk-transfer `/tn-stream-{chain_id}/0.0.1` upgrade so a responder accepts
-    /// it; the typed [`SyncFrame`](crate::sync::SyncFrame) layer rides on streams
-    /// negotiated with this protocol. Additive for now: no call site opens it
-    /// until the per-exchange cutovers migrate the bulk paths.
+    /// The stream behaviour registers this as its sole upgrade; the typed
+    /// [`SyncFrame`](crate::sync::SyncFrame) layer rides on streams negotiated
+    /// with this protocol.
     pub(crate) fn sync_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
         match self {
             Self::Primary => owned_protocol(format!("/tn-primary-sync-{chain_id}/0.0.1")),
@@ -126,30 +123,15 @@ impl NetworkType {
     }
 }
 
-/// Bulk-transfer stream protocol, namespaced by `chain_id`.
-///
-/// Role-agnostic: primaries and workers run separate swarms, so (matching the
-/// pre-namespacing behaviour) only the chain id is folded in.
-pub(crate) fn stream_protocol(chain_id: u64) -> NetworkResult<StreamProtocol> {
-    owned_protocol(format!("/tn-stream-{chain_id}/0.0.1"))
-}
-
-/// The chain-namespaced stream protocols a node advertises on the stream
-/// behaviour, in dialer-preference order: the bulk-transfer
-/// `/tn-stream-{chain_id}/0.0.1` first (so existing opens keep negotiating it),
-/// then the per-role sync protocol the typed
-/// [`SyncFrame`](crate::sync::SyncFrame) layer rides on. Both carry the chain id,
+/// The chain-namespaced stream protocol a node advertises on the stream
+/// behaviour: the per-role sync protocol the typed
+/// [`SyncFrame`](crate::sync::SyncFrame) layer rides on. It carries the chain id,
 /// so the stream subsystem isolates chains the same way req-res and kad do.
-///
-/// Returned as a `(bulk_transfer, sync)` pair rather than a list so the two roles
-/// stay distinct downstream: an inbound listen advertises both (bulk first) while
-/// an outbound open advertises only the one matching its
-/// [`StreamKind`](crate::stream::StreamKind).
-pub(crate) fn stream_protocols(
+pub(crate) fn stream_protocol(
     network_type: NetworkType,
     chain_id: u64,
-) -> NetworkResult<(StreamProtocol, StreamProtocol)> {
-    Ok((stream_protocol(chain_id)?, network_type.sync_protocol(chain_id)?))
+) -> NetworkResult<StreamProtocol> {
+    network_type.sync_protocol(chain_id)
 }
 
 /// libp2p gossipsub protocol-id prefix, namespaced by `chain_id` so nodes on
@@ -262,15 +244,12 @@ pub enum NetworkEvent<Req, Res> {
     Error(String, ResponseChannel<Res>),
     /// An inbound stream was established by a peer.
     ///
-    /// The application routes the raw stream by `kind`: a [`StreamKind::Legacy`]
-    /// stream is read on the digest-correlation path, a [`StreamKind::Sync`]
-    /// stream carries the typed [`SyncFrame`](crate::sync::SyncFrame) layer with
-    /// the request in its first frame.
+    /// Every stream negotiates the per-role sync protocol and carries the typed
+    /// [`SyncFrame`](crate::sync::SyncFrame) layer, with the request in its first
+    /// frame.
     InboundStream {
         /// The peer that opened the stream.
         peer: BlsPublicKey,
-        /// The protocol the inbound stream negotiated.
-        kind: StreamKind,
         /// The established raw p2p stream for reading data.
         stream: Stream,
     },
@@ -494,16 +473,13 @@ where
     },
     /// Open a raw stream to a peer for bulk data transfer.
     ///
-    /// A [`StreamKind::Legacy`] open negotiates `/tn-stream` and the caller writes
-    /// a correlation digest; a [`StreamKind::Sync`] open negotiates the per-role
-    /// sync protocol and the caller writes a [`SyncFrame`](crate::sync::SyncFrame)
-    /// request. A sync open that fails negotiation is penalty-exempt so the caller
-    /// can fall back to legacy.
+    /// The open negotiates the per-role sync protocol and the caller writes a
+    /// [`SyncFrame`](crate::sync::SyncFrame) request as the first frame. An open
+    /// that fails negotiation is penalty-exempt (honest version/role skew), so
+    /// the caller can retry another peer.
     OpenStream {
         /// The peer to open the stream to.
         peer: BlsPublicKey,
-        /// Which protocol the open negotiates.
-        kind: StreamKind,
         /// Channel for returning the established stream to application layer.
         reply: oneshot::Sender<NetworkResult<Stream>>,
     },
@@ -788,19 +764,13 @@ where
 
     /// Open a raw stream to a peer for bulk data transfer.
     ///
-    /// `kind` selects the protocol: [`StreamKind::Legacy`] negotiates `/tn-stream`
-    /// (the caller then writes a correlation digest), [`StreamKind::Sync`]
-    /// negotiates the per-role sync protocol (the caller then writes a
-    /// [`SyncFrame`](crate::sync::SyncFrame) request). A sync open that fails
-    /// negotiation returns an error without penalizing the peer, so the caller can
-    /// fall back to the legacy path.
-    pub async fn open_stream(
-        &self,
-        peer: BlsPublicKey,
-        kind: StreamKind,
-    ) -> NetworkResult<NetworkResult<Stream>> {
+    /// The open negotiates the per-role sync protocol; the caller then writes a
+    /// [`SyncFrame`](crate::sync::SyncFrame) request as the first frame. An open
+    /// that fails negotiation returns an error without penalizing the peer
+    /// (honest version/role skew), so the caller can retry another peer.
+    pub async fn open_stream(&self, peer: BlsPublicKey) -> NetworkResult<NetworkResult<Stream>> {
         let (reply, rx) = oneshot::channel();
-        self.sender.send(NetworkCommand::OpenStream { peer, kind, reply }).await?;
+        self.sender.send(NetworkCommand::OpenStream { peer, reply }).await?;
         rx.await.map_err(Into::into)
     }
 

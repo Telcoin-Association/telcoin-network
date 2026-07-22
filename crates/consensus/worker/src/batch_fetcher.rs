@@ -10,11 +10,26 @@ use crate::{
 };
 use std::{
     collections::{BTreeSet, HashMap},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
 use tn_types::{now, Batch, BlockHash, Database, DbTxMut, Epoch, B256};
 use tracing::{debug, error, instrument};
+
+/// Minimum delay before retrying a [`BatchFetcher::fetch_for_primary`] pass that
+/// recovered no batches (locally or from a peer).
+///
+/// The retry loop is otherwise unpaced: `request_batches` returns immediately,
+/// without applying its own retry backoff, when the worker has no connected
+/// peers, so an explicit floor here keeps a no-peer (or all-peers-failed)
+/// condition from re-looping at the scheduler's full rate (see issue #865).
+const FETCH_RETRY_MIN_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Upper bound for the exponential backoff between no-progress retry passes.
+///
+/// Caps how long a persistent no-peer condition waits before re-checking, so a
+/// worker peer that (re)connects is still picked up promptly.
+const FETCH_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 /// The type to fetch batches for the primary.
@@ -151,12 +166,19 @@ impl<DB: Database> BatchFetcher<DB> {
         // preallocate hashmap
         let mut fetched_batches = HashMap::with_capacity(missing_digests.len());
 
+        // delay before re-looping after a pass that recovers nothing, so a no-peer /
+        // all-peers-failed condition backs off instead of spinning (see issue #865)
+        let mut backoff = FETCH_RETRY_MIN_BACKOFF;
+
         // loop until `missing_digests` empty
         loop {
             debug!(target: "batch_fetcher", "loop start");
             if missing_digests.is_empty() {
                 return Ok(fetched_batches);
             }
+
+            // snapshot remaining digests so a pass that recovers none can back off
+            let missing_before = missing_digests.len();
 
             // 1) fetch from local storage
             let local_before = fetched_batches.len();
@@ -177,35 +199,53 @@ impl<DB: Database> BatchFetcher<DB> {
             if let Ok(mut new_batches) = self.request_batches_from_peers(&mut missing_digests).await
             {
                 self.metrics.record_batches_fetched("remote", new_batches.len());
-                // set received_at timestamp for remote batches
-                let mut updated_new_batches = HashMap::new();
-                let mut txn = self.batch_store.write_txn().map_err(|e| {
-                    WorkerNetworkError::DBCommit(format!("Failed to retrieve write txn: {e}"))
-                })?;
 
-                // update batch timestamps and insert to db
-                //
-                // NOTE: `request_batches` already removed successful digests from
-                // `missing_digests`, so all returned batches are valid and should be stored.
-                for (digest, batch) in new_batches.iter_mut() {
-                    batch.set_received_at(now());
-                    updated_new_batches.insert(*digest, batch.clone());
-                    // also persist the batches, so they are available after restarts
-                    txn.insert::<NodeBatchesCache>(digest, batch)
-                        .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to insert batch! Node shutting down...")).map_err(|e| WorkerNetworkError::DBInsert(format!("Failed to insert: {e}")))?;
+                // Only touch the batch store when peers actually returned something. An empty
+                // response (no connected peers, or every peer failed) must not open and commit
+                // an empty write transaction on every pass (see issue #865).
+                if !new_batches.is_empty() {
+                    // set received_at timestamp for remote batches
+                    let mut updated_new_batches = HashMap::new();
+                    let mut txn = self.batch_store.write_txn().map_err(|e| {
+                        WorkerNetworkError::DBCommit(format!("Failed to retrieve write txn: {e}"))
+                    })?;
+
+                    // update batch timestamps and insert to db
+                    //
+                    // NOTE: `request_batches` already removed successful digests from
+                    // `missing_digests`, so all returned batches are valid and should be stored.
+                    for (digest, batch) in new_batches.iter_mut() {
+                        batch.set_received_at(now());
+                        updated_new_batches.insert(*digest, batch.clone());
+                        // also persist the batches, so they are available after restarts
+                        txn.insert::<NodeBatchesCache>(digest, batch)
+                            .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to insert batch! Node shutting down...")).map_err(|e| WorkerNetworkError::DBInsert(format!("Failed to insert: {e}")))?;
+                    }
+
+                    // commit db after all inserts
+                    txn.commit()
+                        .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to commit batch! Node shutting down...")).map_err(|e| WorkerNetworkError::DBCommit(format!("Failed to commit: {e}")))?;
+
+                    // add recovered batches to final collection
+                    fetched_batches
+                        .extend(updated_new_batches.iter().map(|(d, b)| (*d, (*b).clone())));
+
+                    // return if done, otherwise try again
+                    if missing_digests.is_empty() {
+                        return Ok(fetched_batches);
+                    }
                 }
+            }
 
-                // commit db after all inserts
-                txn.commit()
-                    .inspect_err(|e| error!(target: "batch_fetcher", ?e, "failed to commit batch! Node shutting down...")).map_err(|e| WorkerNetworkError::DBCommit(format!("Failed to commit: {e}")))?;
-
-                // add recovered batches to final collection
-                fetched_batches.extend(updated_new_batches.iter().map(|(d, b)| (*d, (*b).clone())));
-
-                // return if done, otherwise try again
-                if missing_digests.is_empty() {
-                    return Ok(fetched_batches);
-                }
+            // Pace the retry loop: reset the backoff to the floor when this pass made progress
+            // (some digests resolved), otherwise sleep for the current backoff and grow it toward
+            // the cap. This keeps a persistent no-peer or all-peers-failed condition from spinning
+            // without delaying a pass that is still fetching batches (see issue #865).
+            if missing_digests.len() < missing_before {
+                backoff = FETCH_RETRY_MIN_BACKOFF;
+            } else {
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(FETCH_RETRY_MAX_BACKOFF);
             }
         }
     }
@@ -261,178 +301,22 @@ impl<DB: Database> BatchFetcher<DB> {
 mod tests {
     use crate::{
         batch_fetcher::BatchFetcher,
-        network::{stream_codec::write_batch, WorkerNetworkHandle},
-        test_utils::{create_test_batches, encode_batches_to_stream_bytes, setup_batch_db},
+        network::WorkerNetworkHandle,
+        test_utils::{create_test_batches, setup_batch_db},
     };
-    use futures::io::Cursor;
-    use std::collections::{BTreeSet, HashMap};
+    use std::{
+        collections::BTreeSet,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
     use tempfile::TempDir;
-    use tn_network_libp2p::error::NetworkError;
+    use tn_network_libp2p::types::{NetworkCommand, NetworkHandle};
     use tn_storage::consensus::ConsensusChain;
-    use tn_types::{max_batch_size, Batch, BlockHash, Committee, TaskManager, B256};
-
-    #[tokio::test]
-    async fn test_validate_batches_from_stream() {
-        let batches = create_test_batches(3);
-        let digests: BTreeSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
-
-        // encode batches to wire format
-        let bytes = encode_batches_to_stream_bytes(&batches).await;
-        let mut cursor = Cursor::new(bytes);
-
-        // create handle (sends commands nowhere)
-        let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-
-        // read and validate
-        let result = handle.read_and_validate_batches_with_timeout(&mut cursor, &digests).await;
-        let validated = result.expect("should validate successfully");
-
-        assert_eq!(validated.len(), batches.len());
-        let validated_digests: BTreeSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
-        assert_eq!(validated_digests, digests);
-    }
-
-    #[tokio::test]
-    async fn test_validate_rejects_too_many_batches() {
-        // encode 5 batches but only request 3 digests
-        let batches = create_test_batches(5);
-        let bytes = encode_batches_to_stream_bytes(&batches).await;
-        let mut cursor = Cursor::new(bytes);
-
-        // only request 3
-        let digests: BTreeSet<BlockHash> = batches.iter().take(3).map(|b| b.digest()).collect();
-
-        let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-
-        let result = handle.read_and_validate_batches_with_timeout(&mut cursor, &digests).await;
-        assert!(matches!(result, Err(NetworkError::ProtocolError(_))));
-    }
-
-    #[tokio::test]
-    async fn test_validate_rejects_unexpected_digest() {
-        // encode batch A but request digest B
-        let batches = create_test_batches(1);
-        let bytes = encode_batches_to_stream_bytes(&batches).await;
-        let mut cursor = Cursor::new(bytes);
-
-        // request a different digest
-        let fake_digest = B256::random();
-        let digests: BTreeSet<BlockHash> = BTreeSet::from([fake_digest]);
-
-        let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-
-        let result = handle.read_and_validate_batches_with_timeout(&mut cursor, &digests).await;
-        assert!(matches!(result, Err(NetworkError::ProtocolError(_))));
-    }
-
-    #[tokio::test]
-    async fn test_validate_rejects_duplicate_batch() {
-        // manually encode the same batch twice
-        let batch = Batch { transactions: vec![vec![42u8; 32]], ..Default::default() };
-        let max_size = max_batch_size(0);
-        let mut output = Vec::new();
-        let mut encode_buffer = Vec::with_capacity(max_size);
-        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
-
-        // chunk count = 2
-        output.extend_from_slice(&2u32.to_le_bytes());
-        // write same batch twice
-        write_batch(&mut output, &batch, &mut encode_buffer, &mut compressed_buffer, 0)
-            .await
-            .unwrap();
-        write_batch(&mut output, &batch, &mut encode_buffer, &mut compressed_buffer, 0)
-            .await
-            .unwrap();
-
-        let mut cursor = Cursor::new(output);
-
-        // request set includes the batch digest (and count=2 passes the count check)
-        let digest = batch.digest();
-        let another_digest = B256::random();
-        let digests: BTreeSet<BlockHash> = BTreeSet::from([digest, another_digest]);
-
-        let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-
-        let result = handle.read_and_validate_batches_with_timeout(&mut cursor, &digests).await;
-        assert!(matches!(result, Err(NetworkError::ProtocolError(_))));
-    }
-
-    #[tokio::test]
-    async fn test_validate_detects_stream_closed() {
-        // encode chunk count of 2 but write 0 batches
-        let mut output = Vec::new();
-        output.extend_from_slice(&2u32.to_le_bytes());
-        // no batch data follows
-
-        let mut cursor = Cursor::new(output);
-
-        let digests: BTreeSet<BlockHash> = BTreeSet::from([B256::random(), B256::random()]);
-
-        let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-
-        let result = handle.read_and_validate_batches_with_timeout(&mut cursor, &digests).await;
-        // should fail reading the first batch (stream too short)
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_validate_empty_stream_with_oversized_digest_set() {
-        // create 501 dummy digests (exceeds MAX_BATCH_DIGESTS_PER_REQUEST = 500)
-        let digests: BTreeSet<BlockHash> = (0..501u64)
-            .map(|i| {
-                let mut bytes = [0u8; 32];
-                bytes[..8].copy_from_slice(&i.to_le_bytes());
-                B256::from(bytes)
-            })
-            .collect();
-        assert_eq!(digests.len(), 501);
-
-        // empty stream (immediately closes) — no batches to read
-        let mut cursor = Cursor::new(Vec::<u8>::new());
-
-        let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-
-        // should truncate and return Ok(vec![]) instead of Err(ProtocolError)
-        let result = handle.read_and_validate_batches_with_timeout(&mut cursor, &digests).await;
-        let validated = result.expect("should truncate gracefully, not error");
-        assert!(validated.is_empty());
-    }
-
-    /// Test that `read_and_validate_batches_with_timeout` returns Ok with only the
-    /// batches present in the stream when the stream closes before all requested
-    /// digests are fulfilled.
-    #[tokio::test]
-    async fn test_validate_partial_stream_fulfillment() {
-        let all_batches = create_test_batches(5);
-        let all_digests: BTreeSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
-        assert_eq!(all_digests.len(), 5);
-
-        // only encode 3 of the 5 batches into the stream
-        let partial_batches = &all_batches[..3];
-        let bytes = encode_batches_to_stream_bytes(partial_batches).await;
-        let mut cursor = Cursor::new(bytes);
-
-        let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
-
-        // pass all 5 digests but stream only has 3
-        let result = handle.read_and_validate_batches_with_timeout(&mut cursor, &all_digests).await;
-        let validated = result.expect("should succeed with partial fulfillment");
-
-        assert_eq!(validated.len(), 3, "should return only the 3 batches from the stream");
-
-        // verify returned digests match the 3 encoded batches
-        let validated_digests: BTreeSet<BlockHash> = validated.iter().map(|(d, _)| *d).collect();
-        let expected_digests: BTreeSet<BlockHash> =
-            partial_batches.iter().map(|b| b.digest()).collect();
-        assert_eq!(validated_digests, expected_digests);
-    }
+    use tn_types::{BlockHash, Committee, TaskManager};
+    use tokio::sync::mpsc;
 
     // ============================================================================
     // BatchFetcher Local-Only Tests
@@ -487,67 +371,65 @@ mod tests {
     }
 
     // ============================================================================
-    // BatchFetcher Partial Local + Stream Tests
+    // BatchFetcher No-Peer Backoff Test
     // ============================================================================
 
-    /// Test the fetch_for_primary component flow where 1 of 5 batches is local
-    /// and the remaining 4 are received via stream.
+    /// Regression test for issue #865: with batches to fetch and no connected
+    /// worker peers, `fetch_for_primary` must back off between attempts instead of
+    /// spinning at the scheduler's full rate.
     ///
-    /// Since `fetch_for_primary` requires a real libp2p network for the stream path,
-    /// this test exercises the same internal code paths directly:
-    /// 1. `fetch_local` retrieves the 1 local batch and identifies 4 missing
-    /// 2. `read_and_validate_batches_with_timeout` decodes the 4 remote batches from a stream
-    /// 3. The combined result contains all 5 batches
+    /// A network handle answers every `ConnectedPeers` query with an empty peer
+    /// set (the production no-peer path, where `request_batches` returns
+    /// `Ok(empty)` without applying its own retry backoff) and counts the queries.
+    /// The fetch never completes (the digests are never in the local db and no
+    /// peer ever connects), so it runs in the background and is stopped after a
+    /// fixed window; the number of `connected_peers` polls over that window must
+    /// stay small. Without the per-pass backoff this loop polls thousands of times.
     #[tokio::test]
-    async fn test_fetch_for_primary_partial_local_with_stream() {
-        let all_batches = create_test_batches(5);
-        // only store the first batch locally
-        let db = setup_batch_db(&all_batches[..1]);
-        let all_digests: BTreeSet<BlockHash> = all_batches.iter().map(|b| b.digest()).collect();
+    async fn test_fetch_for_primary_backs_off_without_peers() {
+        // digests that are never in the local db, so `fetch_local` cannot satisfy them
+        let batches = create_test_batches(2);
+        let digests: BTreeSet<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+        let db = setup_batch_db(&[]);
         let temp_dir = TempDir::new().expect("temp dir");
 
+        // network handle whose `connected_peers` always reports "no peers" and counts calls
+        let (tx, mut rx) = mpsc::channel(10);
         let task_manager = TaskManager::default();
-        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+        let handle =
+            WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
+
+        let connected_peers_calls = Arc::new(AtomicUsize::new(0));
+        let calls = connected_peers_calls.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let NetworkCommand::ConnectedPeers { reply } = cmd {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    // no connected worker peers
+                    let _ = reply.send(vec![]);
+                }
+            }
+        });
+
         let fetcher = BatchFetcher::new(
-            handle.clone(),
+            handle,
             db,
             ConsensusChain::new(temp_dir.path().to_path_buf(), Committee::default())
                 .expect("consensus chain"),
             crate::metrics::WorkerMetrics::new_for_worker(0),
         );
 
-        // step 1: fetch_local finds 1 batch, leaves 4 missing
-        let mut missing_digests = all_digests.clone();
-        let mut fetched_batches = HashMap::new();
-        fetcher.fetch_local(&mut missing_digests, &mut fetched_batches).await.unwrap();
+        // `fetch_for_primary` retries forever while digests are missing and no peer
+        // connects, so drive it in the background and stop it after a fixed window.
+        let fetch = tokio::spawn(async move { fetcher.fetch_for_primary(digests).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        fetch.abort();
 
-        assert_eq!(fetched_batches.len(), 1);
-        assert_eq!(missing_digests.len(), 4);
-        assert!(fetched_batches.contains_key(&all_batches[0].digest()));
-
-        // step 2: simulate streaming the 4 remaining batches from a peer
-        let remote_batches: Vec<_> = all_batches[1..].to_vec();
-        let bytes = encode_batches_to_stream_bytes(&remote_batches).await;
-        let mut cursor = Cursor::new(bytes);
-
-        let streamed = handle
-            .read_and_validate_batches_with_timeout(&mut cursor, &missing_digests)
-            .await
-            .expect("should read batches from stream");
-
-        assert_eq!(streamed.len(), 4);
-
-        // step 3: combine local + streamed (mirrors fetch_for_primary's combine logic)
-        for (digest, batch) in streamed {
-            missing_digests.remove(&digest);
-            fetched_batches.insert(digest, batch);
-        }
-
-        // all 5 batches recovered
-        assert!(missing_digests.is_empty());
-        assert_eq!(fetched_batches.len(), 5);
-        for batch in &all_batches {
-            assert!(fetched_batches.contains_key(&batch.digest()));
-        }
+        let polls = connected_peers_calls.load(Ordering::Relaxed);
+        assert!(polls > 0, "fetch loop should have attempted at least once");
+        assert!(
+            polls < 50,
+            "no-peer fetch loop should back off, but polled connected_peers {polls} times in 500ms"
+        );
     }
 }

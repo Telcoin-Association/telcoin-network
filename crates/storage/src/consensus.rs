@@ -406,7 +406,41 @@ impl ConsensusChain {
             return Err(ConsensusChainError::PrevCommitteeEpochMismatch);
         }
         let old_pack = self.current_pack();
+        // Same-epoch re-entry (mid-epoch restart, or a mode change that re-runs
+        // epoch setup) intentionally reuses the already-open pack, matching on
+        // epoch number alone. The pack's persisted `EpochMeta` — committee
+        // included — is the epoch-START snapshot; chain state can legitimately
+        // diverge from it mid-epoch (a governance burn shrinks the on-chain
+        // committee immediately), so comparing anything beyond the epoch number
+        // here would reject the re-entry and strand the node. Keeping the
+        // original pack is load-bearing: this epoch's consensus output must be
+        // decoded and verified against the committee the epoch started with.
         if old_pack.epoch() == committee.epoch() && !old_pack.is_static() {
+            // TRIPWIRE (diagnostics only): the pack's persisted committee is the epoch-START
+            // snapshot, and the entry `committee` is derived from a read pinned to that same
+            // epoch-start state — so the two BLS key sets can differ only if an unpinned
+            // (canonical-tip) entry read is ever reintroduced. Warn loudly at the first
+            // mid-epoch re-entry after a governance burn instead of staying silent until the
+            // epoch record splits. Do NOT error: either way the pack's epoch-start snapshot
+            // remains authoritative for decoding this epoch's output, and the re-entry must
+            // proceed.
+            let pack_keys = old_pack.committee().bls_keys();
+            let entry_keys = committee.bls_keys();
+            if pack_keys != entry_keys {
+                let missing_from_entry: Vec<_> = pack_keys.difference(&entry_keys).collect();
+                let added_in_entry: Vec<_> = entry_keys.difference(&pack_keys).collect();
+                warn!(
+                    target: "consensus-chain",
+                    epoch = committee.epoch(),
+                    pack_committee_len = pack_keys.len(),
+                    entry_committee_len = entry_keys.len(),
+                    ?missing_from_entry,
+                    ?added_in_entry,
+                    "same-epoch re-entry committee differs from the pack's epoch-start snapshot; \
+                     an unpinned (tip-based) entry read has likely been reintroduced — keeping \
+                     the pack's committee"
+                );
+            }
             return Ok(());
         }
         old_pack.persist().await?;
@@ -693,11 +727,14 @@ impl ConsensusChain {
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file for the
     /// current epoch. This should be called "in-order" as consensus is executed.
+    /// Returns the number of bytes the encoded Output takes on disk IF this is written to the
+    /// current pack or 0 otherwise (old consensus).
     pub async fn save_consensus_output(
         &self,
         consensus: ConsensusOutput,
-    ) -> Result<(), ConsensusChainError> {
+    ) -> Result<u64, ConsensusChainError> {
         let number = consensus.number();
+        let mut output_bytes = 0;
         if number > self.latest_consensus.number() {
             let epoch = consensus.sub_dag().leader_epoch();
             let pack = &self.current_pack();
@@ -715,7 +752,7 @@ impl ConsensusChain {
                     // If this an open pack file then save.
                     // Note, saving an output that is already in the pack is a no-op, not an error
                     // so this is fine.
-                    pack.save_consensus_output(consensus).await?;
+                    output_bytes = pack.save_consensus_output(consensus).await?;
                 } else if !pack.contains_consensus_header_number(number).await.unwrap_or_default() {
                     // If this is a static file and this output is missing this is an error...
                     error!(target: "consensus-chain", epoch, number, "Failed to update latest consensus, data not in expected pack file.");
@@ -724,7 +761,7 @@ impl ConsensusChain {
                 self.latest_consensus.update(epoch, number).await;
             }
         }
-        Ok(())
+        Ok(output_bytes)
     }
 
     /// Load and return the consensus output from the current epoch.
@@ -876,6 +913,57 @@ impl ConsensusChain {
             }
         } else {
             Err(ConsensusChainError::NoCurrentEpoch)
+        }
+    }
+
+    /// Stream-decode raw v1 (header-first) pack-file bytes for `epoch` from `reader` (e.g. the
+    /// reassembled `request_consensus_output` sync stream) into a verified [`ConsensusOutput`],
+    /// using the committee from the pack we hold for `epoch` (current / static / staging). Verifies
+    /// the header's digest equals `expected_hash` the instant the header record is read — before
+    /// any batch is buffered — so a wrong/forged output is rejected without buffering its
+    /// batches, and the unverified pre-check buffer is bounded to a single header record rather
+    /// than the whole output. Errors with [`ConsensusChainError::NoCurrentEpoch`] if we have no
+    /// pack for `epoch` (so cannot resolve its committee) — the caller should treat that as
+    /// "not yet decodable".
+    pub async fn stream_decode_consensus_output<R: AsyncRead + Unpin>(
+        &self,
+        epoch: Epoch,
+        reader: R,
+        expected_hash: ConsensusHeaderDigest,
+    ) -> Result<ConsensusOutput, ConsensusChainError> {
+        let pack = self.current_pack();
+        if epoch == pack.epoch() {
+            return Ok(pack.decode_output_stream(reader, expected_hash).await?);
+        }
+        if let Ok(pack) = self.get_static(epoch).await {
+            Ok(pack.decode_output_stream(reader, expected_hash).await?)
+        } else if let Some(staging) = self.staging() {
+            if epoch == staging.pack.epoch() {
+                Ok(staging.pack.decode_output_stream(reader, expected_hash).await?)
+            } else {
+                Err(ConsensusChainError::NoCurrentEpoch)
+            }
+        } else {
+            Err(ConsensusChainError::NoCurrentEpoch)
+        }
+    }
+
+    /// True if the consensus chain contains a pack or partial pack for epoch.
+    ///
+    /// Useful to determine if calls will find a pack file to work with (like
+    /// stream_decode_consenus_output()). This will also warm the pack cache if this is not the
+    /// current epochs pack.
+    pub async fn contains_decode_epoch(&self, epoch: Epoch) -> bool {
+        let pack = self.current_pack();
+        if epoch == pack.epoch() {
+            return true;
+        }
+        if let Ok(_pack) = self.get_static(epoch).await {
+            true
+        } else if let Some(staging) = self.staging() {
+            epoch == staging.pack.epoch()
+        } else {
+            false
         }
     }
 
@@ -1188,7 +1276,7 @@ impl ConsensusChainReader for ConsensusChain {
 }
 
 impl ConsensusChainWriter for ConsensusChain {
-    async fn save_consensus_output(&self, consensus: ConsensusOutput) -> eyre::Result<()> {
+    async fn save_consensus_output(&self, consensus: ConsensusOutput) -> eyre::Result<u64> {
         ConsensusChain::save_consensus_output(self, consensus).await.map_err(Into::into)
     }
 
@@ -1340,6 +1428,7 @@ mod test {
 
     use crate::consensus::{ConsensusSlot, LatestConsensus};
     use std::{
+        collections::BTreeMap,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -1348,8 +1437,8 @@ mod test {
     };
 
     use tn_types::{
-        test_genesis, ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochRecord,
-        Hash as _,
+        test_genesis, Authority, BlsPublicKey, Committee, ConsensusHeader, ConsensusHeaderDigest,
+        ConsensusNumHash, Epoch, EpochRecord, Hash as _,
     };
 
     use crate::{
@@ -2008,6 +2097,74 @@ mod test {
         );
     }
 
+    /// `stream_decode_consensus_output` resolves the epoch's committee (here the current pack),
+    /// stream-decodes the reassembled bytes, and verifies the header digest against the expected
+    /// hash: a matching hash returns the equal output, a wrong hash is rejected with
+    /// `UnexpectedConsensusDigest` (the wrapper for the requested-output receive path).
+    #[tokio::test]
+    async fn test_stream_decode_consensus_output() {
+        use crate::consensus_pack::PackError;
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_stream_decode").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        let mut parent = ConsensusHeader::default().digest();
+        let mut outputs = Vec::new();
+        for i in 0..5u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+
+        for (i, original) in outputs.iter().enumerate() {
+            let number = i as u64 + 1;
+            let bytes = consensus_chain
+                .consensus_output_bytes_by_number(number)
+                .await
+                .expect("query ok")
+                .expect("bytes present");
+
+            // Correct hash: resolves the current pack's committee, decodes, and verifies.
+            let decoded = consensus_chain
+                .stream_decode_consensus_output(0, Cursor::new(bytes.clone()), original.digest())
+                .await
+                .expect("verified stream decode");
+            compare_outputs(&decoded, original);
+
+            // Wrong hash: rejected with UnexpectedConsensusDigest through the ConsensusChainError.
+            let res = consensus_chain
+                .stream_decode_consensus_output(
+                    0,
+                    Cursor::new(bytes),
+                    ConsensusHeader::default().digest(),
+                )
+                .await;
+            assert!(
+                matches!(
+                    res,
+                    Err(ConsensusChainError::PackError(
+                        PackError::UnexpectedConsensusDigest { .. }
+                    ))
+                ),
+                "wrong hash must be rejected, got {res:?}"
+            );
+        }
+    }
+
     /// Regression test for the `pack_install` lock.
     ///
     /// A validator that restarts while behind runs two subsystems against the same
@@ -2182,6 +2339,58 @@ mod test {
                 .expect("imported output readable after restart");
             compare_outputs(&got, output);
         }
+    }
+
+    /// A same-epoch `new_epoch` re-entry whose committee differs from the pack's persisted
+    /// epoch-start snapshot — what a canonical-tip-seeded entry read would pass after a
+    /// mid-epoch governance burn swap-and-pops a validator — must still return Ok and keep
+    /// the original pack untouched. The committee cross-check on that path is a warn-only
+    /// tripwire; the pack's epoch-start snapshot stays authoritative for decoding this
+    /// epoch's output.
+    #[tokio::test]
+    async fn test_same_epoch_reentry_with_shrunken_committee_keeps_pack() {
+        let temp_dir = TempDir::with_prefix("test_reentry_shrunken").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        // Open epoch 0 with committee A (the epoch-start snapshot the pack persists).
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        assert_eq!(consensus_chain.current_pack().epoch(), 0);
+        assert_eq!(consensus_chain.current_pack().committee().bls_keys(), committee.bls_keys());
+
+        // Committee B: same epoch with one member dropped, mirroring the post-burn on-chain
+        // committee a tip-based read would return.
+        let mut authorities: BTreeMap<BlsPublicKey, Authority> =
+            committee.authorities().into_iter().map(|a| (*a.protocol_key(), a)).collect();
+        let (dropped, _) = authorities.pop_last().expect("fixture committee is non-empty");
+        let shrunken = Committee::new_for_test(authorities, 0, BTreeMap::default());
+        assert_eq!(shrunken.epoch(), committee.epoch());
+        assert!(shrunken.bls_keys().len() < committee.bls_keys().len());
+
+        // Same-epoch re-entry with the mismatched committee: Ok (the tripwire only warns),
+        // and the current pack is unchanged — same epoch, still committee A.
+        consensus_chain
+            .new_epoch(previous_epoch, shrunken)
+            .await
+            .expect("same-epoch re-entry with a mismatched committee must remain Ok");
+        let pack = consensus_chain.current_pack();
+        assert_eq!(pack.epoch(), 0, "re-entry must not change the current pack's epoch");
+        assert_eq!(
+            pack.committee().bls_keys(),
+            committee.bls_keys(),
+            "pack must retain the epoch-start committee snapshot"
+        );
+        assert!(
+            pack.committee().bls_keys().contains(&dropped),
+            "the burned member stays in the pack's snapshot for decoding this epoch"
+        );
     }
 
     #[tokio::test]

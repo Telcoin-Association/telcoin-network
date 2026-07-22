@@ -130,6 +130,11 @@ where
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
     ) -> eyre::Result<Self> {
+        // Reject a configuration whose consensus parameters exceed the protocol ceilings the
+        // consensus-pack reader relies on, so a node can never commit an output it cannot later
+        // reconstruct.
+        config.parameters.validate()?;
+
         let local_network = LocalNetwork::new(key_config.primary_public_key());
 
         let primary_public_key = key_config.primary_public_key();

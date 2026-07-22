@@ -19,16 +19,17 @@ tn-config = { workspace = true }
 tn-primary = { workspace = true }
 metrics = { workspace = true }
 reth-metrics = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 metrics-util = { workspace = true }
+roaring = { workspace = true }
 tempfile = { workspace = true }
+tn-network-libp2p = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
 tn-storage = { workspace = true, features = ["test-utils"] }
 tn-test-utils-committee = { workspace = true }
 tn-test-utils = { workspace = true }
-rand = { workspace = true }
-rand_chacha = { workspace = true }
 tn-types = { workspace = true }
 
 [[test]]

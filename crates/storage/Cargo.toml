@@ -41,6 +41,8 @@ tn-reth = { workspace = true }
 tn-test-utils = { workspace = true }
 rand = { workspace = true }
 roaring = { workspace = true }
+# Async barrier tests for `persist_durable` need a runtime + timers.
+tokio = { workspace = true, features = [ "macros", "rt", "time" ] }
 
 [features]
 redb = []

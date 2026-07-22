@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 mod close_epoch;
 mod run_epoch;
 mod start_epoch;
+pub use close_epoch::build_epoch_record;
 pub(crate) use run_epoch::RunEpochMode;
 
 /// Name of the process-lifetime [`TaskManager`] that owns tasks outliving any single epoch
@@ -805,8 +806,7 @@ where
     /// crash-window finalized-marker lag to the persisted canonical tip
     /// (`RethEnv::heal_finalized_to_persisted_tip` — before anything reads the marker), recover
     /// the [`GasAccumulator`] via [`catchup_accumulator`], spawn the long-running p2p networks
-    /// ([`spawn_node_networks`](Self::spawn_node_networks)), subscribe the primary to the
-    /// epoch-vote and consensus-output gossip topics, spawn the epoch-record and vote
+    /// ([`spawn_node_networks`](Self::spawn_node_networks)), spawn the epoch-record and vote
     /// collectors, restore execution state ([`try_restore_state`](Self::try_restore_state)),
     /// and spawn the engine-update task. It then requests any missing epoch pack files and
     /// launches the app-scoped consensus fetch workers.
@@ -877,14 +877,13 @@ where
         self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();
-        primary_network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::epoch_vote_topic(network_config.chain_id()))
-            .await?;
-        primary_network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::consensus_output_topic(network_config.chain_id()))
-            .await?;
+        // `epoch_vote_topic` and `consensus_output_topic` are committee-only publish topics, so
+        // they are subscribed per-epoch in `spawn_primary_network_for_epoch` against a
+        // committee-restricted publisher set (alongside `primary_topic`), and intentionally not
+        // once here in the process-lifetime path. That makes the network layer drop non-committee
+        // messages before re-propagation and refreshes the authorized set on every committee
+        // rotation, rather than accepting any publisher once at node start. See issues #898 and
+        // #912.
         state_sync::spawn_epoch_record_collector(
             self.consensus_chain.clone(),
             primary_network_handle.clone(),

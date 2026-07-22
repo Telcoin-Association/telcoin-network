@@ -5,8 +5,15 @@ use reth_metrics::{
     metrics::{Counter, Gauge, Histogram},
     Metrics,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use tn_types::{Noticer, TaskSpawner};
 use tracing::debug;
+
+/// Process-wide running max of consensus output byte sizes.
+///
+/// The `metrics` `Gauge` handle has no getter, so the "max since startup" gauge needs an
+/// external running max. There is one `PrimaryMetrics` per process, so a static is fine.
+static MAX_CONSENSUS_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Metrics for the primary's consensus pipeline.
 ///
@@ -50,6 +57,21 @@ pub struct PrimaryMetrics {
     /// Time from leader header creation to subdag commit (whole seconds - the
     /// timestamps are second-granularity, so this flags pathological commits, not p50s).
     pub(crate) commit_latency_seconds: Histogram,
+    /// The largest consensus output (in pack file encoded bytes) we have seen since startup.
+    pub(crate) max_consensus_output_bytes: Gauge,
+    /// The most recent consensus output (in pack file encoded bytes) we have seen.
+    pub(crate) consensus_output_bytes: Gauge,
+}
+
+impl PrimaryMetrics {
+    /// Record the encoded byte size of a freshly saved consensus output.
+    ///
+    /// Updates the most-recent gauge and the since-startup max gauge.
+    pub fn record_consensus_output_bytes(&self, bytes: u64) {
+        self.consensus_output_bytes.set(bytes as f64);
+        let prev = MAX_CONSENSUS_OUTPUT_BYTES.fetch_max(bytes, Ordering::Relaxed);
+        self.max_consensus_output_bytes.set(prev.max(bytes) as f64);
+    }
 }
 
 /// Spawn a node-lifetime task that mirrors consensus watch channels into gauges.
@@ -175,6 +197,7 @@ mod tests {
             metrics.committed_round.set(15.0);
             metrics.subdags_committed_total.increment(1);
             metrics.commit_latency_seconds.record(1.0);
+            metrics.record_consensus_output_bytes(123);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -197,6 +220,10 @@ mod tests {
         find("tn_primary.certificates_pending");
         find("tn_primary.subdags_committed_total");
         find("tn_primary.commit_latency_seconds");
+        let (_, _, _, value) = find("tn_primary.consensus_output_bytes");
+        assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
+        let (_, _, _, value) = find("tn_primary.max_consensus_output_bytes");
+        assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
     }
 
     /// The mirror task must keep the round gauges in sync with the watch channels.
