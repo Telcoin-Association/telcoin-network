@@ -275,7 +275,7 @@ impl<DB: Database> Proposer<DB> {
         // anti-equivocation guard would then read nothing and build a *different* header for this
         // same round while the pre-crash header is already on the network: equivocation from an
         // ordinary crash. See issue #934.
-        proposer_store.persist_durable::<LastProposed>().await;
+        proposer_store.persist::<LastProposed>().await;
 
         // Send the new header to the `Certifier` that will broadcast and certify it.
         consensus_bus.headers().send(header.clone()).await.map_err(|e| Box::new(e).into())

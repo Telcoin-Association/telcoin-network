@@ -939,7 +939,7 @@ where
         // recast guard would then read nothing and could sign a *different* vote for the same
         // author/round while the pre-crash vote is already held by the peer: equivocation from an
         // ordinary crash. See issue #934.
-        self.consensus_config.node_storage().persist_durable::<Votes>().await;
+        self.consensus_config.node_storage().persist::<Votes>().await;
 
         Ok(PrimaryResponse::Vote(vote))
     }
