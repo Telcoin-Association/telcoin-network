@@ -98,7 +98,7 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 ///   boundary and confirm matching state roots (also measures the live migration gas);
 /// - the swap fails closed on [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]: an unexpected on-chain
 ///   deployment aborts the block (fatal error) rather than migrating over an incompatible layout.
-pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
+pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = 722;
 
 #[cfg(test)]
 mod tests {
