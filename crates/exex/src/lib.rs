@@ -86,7 +86,7 @@ mod notification;
 /// Historical block replay for ExEx catch-up.
 pub mod replay;
 
-pub use context::TnExExContext;
+pub use context::{FinishedHeightReporter, ReplaySubscribeStream, TnExExContext};
 pub use event::TnExExEvent;
 pub use manager::{
     exex_channel_capacity, resolve_exex_channel_capacity, TnExExManager, TnExExManagerHandle,
