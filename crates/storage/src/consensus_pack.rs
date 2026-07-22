@@ -2346,8 +2346,10 @@ pub(crate) mod test {
             assert!(pack.get_consensus_output(num_outputs as u64 * 2).await.is_ok());
             drop(pack);
 
-            let mut f1 = File::open(temp_dir.path().join("epoch-0")).expect("log file");
-            let mut f2 = File::open(temp_dir2.path().join("epoch-0")).expect("log file");
+            let mut f1 = File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
+                .expect("log file");
+            let mut f2 = File::open(temp_dir2.path().join("epoch-0").join(Inner::DATA_NAME))
+                .expect("log file");
             assert_eq!(
                 f1.seek(SeekFrom::End(0)).unwrap(),
                 f2.seek(SeekFrom::End(0)).unwrap(),
