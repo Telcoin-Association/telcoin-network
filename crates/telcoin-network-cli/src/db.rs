@@ -5,6 +5,7 @@
 //! `MissingBatches` check and classifying each missing batch as Absent (a real data gap) vs
 //! Misordered (present, but in the wrong consensus-header group).
 
+use crate::{node::NamedChain, version::SHORT_VERSION};
 use clap::{Args, Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::{bail, eyre};
@@ -12,14 +13,19 @@ use human_bytes::human_bytes;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
-use tn_config::TelcoinDirs as _;
+use tn_config::{Config, TelcoinDirs as _};
 use tn_reth::{
-    iter_static_files, open_db_read_only, traits::TNPrimitives, DatabaseArguments, DatabaseEnv,
-    RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
+    iter_static_files, open_db_read_only, snapshot::SnapshotRestorer, traits::TNPrimitives,
+    DatabaseArguments, DatabaseEnv, RethCommand, RethConfig, RethDatabaseT as _, RethEnv,
+    RethMdbxError, StaticFileProvider, Tables,
 };
-use tn_storage::{consensus_pack::DATA_NAME, pack_validate::validate_pack_file};
-use tn_types::Epoch;
+use tn_storage::{
+    consensus_pack::DATA_NAME, exec_state_pack::ExecStatePackReader,
+    pack_validate::validate_pack_file,
+};
+use tn_types::{BlockNumHash, Epoch, ExecHeader, SealedHeader, TaskManager, B256};
 
 /// Inspect and diagnose telcoin-network databases.
 #[derive(Debug, Parser)]
@@ -37,6 +43,9 @@ enum DbSubcommand {
 
     /// Validate a consensus epoch pack file: walk the `data` stream and report integrity issues.
     Validate(DbValidateArgs),
+
+    /// Load an EVM state-export pack into a new reth database under the datadir.
+    LoadState(DbLoadStateArgs),
 }
 
 impl DbCommand {
@@ -65,6 +74,7 @@ impl DbCommand {
                 println!("{}", db_stats_table(&db)?);
             }
             DbSubcommand::Validate(args) => args.execute()?,
+            DbSubcommand::LoadState(args) => args.execute(datadir)?,
         }
         Ok(())
     }
@@ -143,6 +153,95 @@ fn epoch_from_dir_name(dir: &Path) -> Option<Epoch> {
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_prefix("epoch-"))
         .and_then(|num| num.parse::<Epoch>().ok())
+}
+
+/// Restore an EVM state-export pack into a new reth database under the datadir.
+#[derive(Debug, Args)]
+pub struct DbLoadStateArgs {
+    /// Path to an exec-state pack directory (contains a `state_data` file), e.g. an `epoch-NN`
+    /// export produced by `--enable-state-export`.
+    pub pack: PathBuf,
+
+    /// Named chain whose genesis to initialize (bundled). If omitted, genesis is loaded from the
+    /// datadir config. Genesis is the trust root and must match the chain the pack came from.
+    #[arg(long)]
+    pub chain: Option<NamedChain>,
+}
+
+impl DbLoadStateArgs {
+    /// Resolve the genesis chain spec, then restore the pack into a fresh reth DB under `datadir`.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        // Genesis chain spec: bundled via `--chain`, else from the datadir config (mirrors the node
+        // command). Genesis is the trust root, so it must match the chain the pack came from.
+        let tn_config = match self.chain {
+            Some(NamedChain::Adiri | NamedChain::TestNet) => {
+                Config::load_adiri(&datadir, false, SHORT_VERSION)?
+            }
+            Some(NamedChain::MainNet) => Config::load_mainnet(&datadir, false, SHORT_VERSION)?,
+            None => Config::load(&datadir, false, SHORT_VERSION)?,
+        };
+
+        // `RethConfig::new` is the only public constructor; `RethCommand` has no `Default`, so
+        // parse an empty arg list for its defaults (rpc/txpool are irrelevant to a one-shot
+        // restore).
+        let reth_config = RethConfig::new(
+            RethCommand::parse_from(["telcoin-network"]),
+            None,
+            &datadir,
+            false,
+            Arc::new(tn_config.chain_spec()),
+        );
+
+        let (block, root) = restore_pack(&reth_config, datadir.reth_db_path(), &self.pack)?;
+        println!(
+            "restored execution state at block {} (state root {root:#x}) into {}",
+            block.number,
+            datadir.reth_db_path().display()
+        );
+        Ok(())
+    }
+}
+
+/// Build a fresh reth DB from `reth_config` and restore the exec-state pack at `pack` into it,
+/// returning the snapshot block and its recomputed state root.
+///
+/// Runs inside a one-shot tokio runtime because `SnapshotRestorer::open` (reth provider setup)
+/// requires a runtime context; the restore steps themselves are synchronous.
+fn restore_pack(
+    reth_config: &RethConfig,
+    db_path: PathBuf,
+    pack: &Path,
+) -> eyre::Result<(BlockNumHash, B256)> {
+    // The reth provider setup (`RethEnv::new` inside `SnapshotRestorer::open`) captures the current
+    // tokio handle, so establish a runtime context. The restore steps are otherwise synchronous;
+    // any tasks the provider spawns run on the multi-thread runtime's workers.
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
+    let _guard = runtime.enter();
+
+    let db = RethEnv::new_database(reth_config, db_path)?;
+    let task_manager = TaskManager::new("db-load-state");
+
+    let mut reader = ExecStatePackReader::open(pack)
+        .map_err(|e| eyre!("failed to open state pack {}: {e}", pack.display()))?;
+    let final_state = BlockNumHash::new(reader.meta().block_number, reader.meta().block_hash);
+    let window = scaffold_window(reader.headers());
+
+    // `open` refuses a datadir that already holds chain data, so this only lands in a fresh one.
+    let restorer = SnapshotRestorer::open(reth_config, db, &task_manager)?;
+    restorer.import_chain_scaffold(&window, final_state)?;
+    let root = restorer.import_state(&mut reader)?;
+    restorer.finish(final_state)?;
+    Ok((final_state, root))
+}
+
+/// Turn a pack's embedded headers (snapshot header first, then ancestors) into the ascending,
+/// genesis-excluded window `SnapshotRestorer::import_chain_scaffold` expects.
+fn scaffold_window(headers: &[ExecHeader]) -> Vec<SealedHeader> {
+    let mut window: Vec<SealedHeader> =
+        headers.iter().cloned().map(SealedHeader::seal_slow).collect();
+    window.sort_by_key(|h| h.number);
+    window.retain(|h| h.number != 0);
+    window
 }
 
 #[derive(Debug, Clone)]
@@ -409,5 +508,24 @@ mod tests {
         let Commands::Db(_) = cli.command else {
             panic!("expected the db subcommand");
         };
+    }
+
+    #[test]
+    fn parse_db_load_state_subcommand() {
+        let cli = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "load-state", "/tmp/epoch-3"])
+            .expect("cli parsed");
+        let Commands::Db(_) = cli.command else {
+            panic!("expected the db subcommand");
+        };
+    }
+
+    #[test]
+    fn scaffold_window_orders_and_drops_genesis() {
+        use tn_types::ExecHeader;
+        let header = |number| ExecHeader { number, ..Default::default() };
+        // out of order and including genesis (block 0)
+        let headers = vec![header(3), header(1), header(0), header(2)];
+        let numbers: Vec<u64> = super::scaffold_window(&headers).iter().map(|h| h.number).collect();
+        assert_eq!(numbers, vec![1, 2, 3], "ascending, contiguous, genesis dropped");
     }
 }
