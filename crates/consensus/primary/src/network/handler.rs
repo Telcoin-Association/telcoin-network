@@ -564,6 +564,23 @@ where
                     self.consensus_config.key_config(),
                 );
 
+                // This fast path recasts a stored vote before taking the per-author lock, so it
+                // must be gated on the same durability barrier as the slow paths.
+                // If any epoch-DB commit has failed, the `Votes` guard for this
+                // author/round may live only in the authoritative mem layer and
+                // never on disk, so recasting here would risk the same
+                // self-inflicted equivocation on restart that the first-vote barrier guards
+                // against. The poison latch fails this barrier after any failed
+                // commit; fail-stop the node rather than recast a non-durable vote
+                // (issue #975).
+                self.consensus_config
+                    .node_storage()
+                    .persist_durable::<Votes>()
+                    .await
+                    .inspect_err(|e| {
+                        error!(target: "primary", "epoch DB durable barrier failed on fast vote recast; initiating node shutdown: {e}");
+                        self.consensus_config.shutdown().notify();
+                    })?;
                 info!(target: "primary", "Recast vote {vote:?} for {} at round {}", header, header.round());
                 return Ok(PrimaryResponse::Vote(vote));
             }
@@ -915,6 +932,21 @@ where
                             header,
                             header.round()
                         );
+                        // Recast of a prior matching vote. If any epoch-DB commit has since failed,
+                        // the `Votes` guard for this author/round may live only in the
+                        // authoritative mem layer and not on disk, so
+                        // resending it here would risk the same
+                        // self-inflicted equivocation on restart. The poison latch fails this
+                        // barrier after any failed commit; fail-stop rather than recast a
+                        // non-durable vote (issue #975).
+                        self.consensus_config
+                            .node_storage()
+                            .persist_durable::<Votes>()
+                            .await
+                            .inspect_err(|e| {
+                                error!(target: "primary", "epoch DB durable barrier failed on vote recast; initiating node shutdown: {e}");
+                                self.consensus_config.shutdown().notify();
+                            })?;
                         return Ok(PrimaryResponse::Vote(vote));
                     }
                 }
@@ -939,7 +971,20 @@ where
         // recast guard would then read nothing and could sign a *different* vote for the same
         // author/round while the pre-crash vote is already held by the peer: equivocation from an
         // ordinary crash. See issue #934.
-        self.consensus_config.node_storage().persist_durable::<Votes>().await;
+        //
+        // If the barrier reports a failed commit (disk full, `EIO`, checksum), the vote is not on
+        // disk, so returning it would risk that same self-inflicted equivocation. Fail-stop the
+        // node and refuse to return the vote. The error maps to `PrimaryNetworkError::Storage`,
+        // which carries no peer penalty: this is our local disk failure, not the peer's fault
+        // (issue #975).
+        self.consensus_config
+            .node_storage()
+            .persist_durable::<Votes>()
+            .await
+            .inspect_err(|e| {
+                error!(target: "primary", "epoch DB durable barrier failed for vote; initiating node shutdown: {e}");
+                self.consensus_config.shutdown().notify();
+            })?;
 
         Ok(PrimaryResponse::Vote(vote))
     }

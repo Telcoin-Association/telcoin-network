@@ -130,7 +130,7 @@ impl<DB: Database> Database for CompositeDatabase<DB> {
         self.get_db(T::HINT).persist::<T>()
     }
 
-    fn persist_durable<T: Table>(&self) -> impl Future<Output = ()> + Send {
+    fn persist_durable<T: Table>(&self) -> impl Future<Output = eyre::Result<()>> + Send {
         self.get_db(T::HINT).persist_durable::<T>()
     }
 

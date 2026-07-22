@@ -144,10 +144,15 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     /// store, including that absorbed-into-an-open-txn case. Synchronously-durable backends
     /// inherit the plain `persist` behaviour.
     ///
+    /// Resolves to `Err` if the physical commit failed (e.g. disk full, `EIO`, a checksum error),
+    /// so a caller can refuse to externalize an artifact whose anti-equivocation record never
+    /// reached disk and fail-stop instead of silently equivocating on restart (issue #975).
+    /// Synchronously-durable backends never fail here.
+    ///
     /// Use at anti-equivocation externalization points (proposer header broadcast, vote return)
     /// where losing the record on restart makes an honest node equivocate.
-    fn persist_durable<T: Table>(&self) -> impl Future<Output = ()> + Send {
-        std::future::ready(())
+    fn persist_durable<T: Table>(&self) -> impl Future<Output = eyre::Result<()>> + Send {
+        std::future::ready(Ok::<(), eyre::Report>(()))
     }
     /// Sync version of persist- useful for test not for prod code.
     /// Since this is intended for testing don't bother with the Table hint.
