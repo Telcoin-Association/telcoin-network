@@ -202,19 +202,18 @@ pub async fn catchup_accumulator(
 
         // Cross-view guard: a finalized header pinned in a different epoch than the canonical
         // tip would pin the whole restore (scan range, worker count, leader-count bound) to the
-        // wrong epoch's state. Startup heals the finalized marker to the persisted canonical
-        // tip (`RethEnv::heal_finalized_to_persisted_tip`) before this restore runs, so the
-        // benign crash-window lag can no longer reach this comparison — a firing guard means
-        // the two views still disagree after the heal: genuine database inconsistency.
-        // Investigate the database; do not restart-loop past this.
+        // wrong epoch's state. The marker commits atomically with the blocks, and startup
+        // heals any lag left by a pre-fix database (`RethEnv::heal_finalized_to_persisted_tip`)
+        // before this restore runs, so a benign marker lag can no longer reach this comparison
+        // — a firing guard means the two views still disagree after the heal: genuine database
+        // inconsistency. Investigate the database; do not restart-loop past this.
         if epoch_state.epoch != canonical_epoch {
             return Err(eyre!(
                 "startup accumulator restore: finalized header {} pins epoch {} but the \
                  canonical tip reports epoch {canonical_epoch} — the views disagree across an \
                  epoch boundary even though startup heals the finalized marker to the canonical \
-                 tip before this restore. This is database inconsistency, not the benign \
-                 crash-window marker lag; refusing to rebuild gas stats against the wrong \
-                 epoch's state",
+                 tip before this restore. This is database inconsistency, not a benign marker \
+                 lag; refusing to rebuild gas stats against the wrong epoch's state",
                 block.number,
                 epoch_state.epoch,
             ));
@@ -803,7 +802,7 @@ where
     /// Build the process-lifetime components, then drive the epoch loop until shutdown.
     ///
     /// Startup proceeds in order: create the execution engine and start it, heal any
-    /// crash-window finalized-marker lag to the persisted canonical tip
+    /// finalized-marker lag left by a pre-fix database to the persisted canonical tip
     /// (`RethEnv::heal_finalized_to_persisted_tip` — before anything reads the marker), recover
     /// the [`GasAccumulator`] via [`catchup_accumulator`], spawn the long-running p2p networks
     /// ([`spawn_node_networks`](Self::spawn_node_networks)), spawn the epoch-record and vote
@@ -857,9 +856,11 @@ where
             )
             .await?;
 
-        // Heal a finalized marker left lagging the persisted canonical tip by a crash between
-        // the blocks-commit and finalize-commit transactions BEFORE anything reads the marker:
-        // the catchup below pins every chain-derived input to the finalized header.
+        // Heal a finalized marker left lagging the persisted canonical tip by a pre-fix
+        // version (which committed blocks and the marker in separate transactions) BEFORE
+        // anything reads the marker: the catchup below pins every chain-derived input to the
+        // finalized header. Current versions commit the marker atomically with the blocks, so
+        // this is defense-in-depth for old databases.
         let reth_env = engine.get_reth_env().await;
         reth_env.heal_finalized_to_persisted_tip()?;
         // retrieve epoch information from canonical tip on startup
