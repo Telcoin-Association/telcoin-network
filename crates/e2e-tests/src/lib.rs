@@ -191,9 +191,11 @@ fn config_local_testnet_inner(
         "--dev-funded-account".into(),
         "test-source".into(),
         "--max-header-delay-ms".into(),
-        "1000".into(),
-        "--min-header-delay-ms".into(),
         "500".into(),
+        "--min-header-delay-ms".into(),
+        "250".into(),
+        "--max-batch-delay-ms".into(),
+        "250".into(),
     ];
     if let Some(duration) = epoch_duration_secs {
         genesis_args.push("--epoch-duration-in-secs".into());

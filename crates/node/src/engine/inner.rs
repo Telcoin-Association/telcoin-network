@@ -19,7 +19,7 @@ use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServe
 use tn_types::{
     gas_accumulator::GasAccumulator, Address, BatchSender, BatchValidation, BlockHeader,
     BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer,
-    SealedHeader, TaskSpawner, WorkerId,
+    SealedHeader, TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -376,11 +376,21 @@ impl ExecutionNodeInner {
         self.reth_env.epoch_state_from_canonical_tip()
     }
 
-    /// Read committee validator keys for epoch.
-    pub(super) fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
+    /// Read the current epoch's [EpochState] pinned to the previous epoch's closing block
+    /// (genesis for epoch 0), returning the pin header alongside it.
+    pub(super) fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
+        self.reth_env.epoch_state_at_epoch_start()
+    }
+
+    /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
+    pub(super) fn validators_for_epoch_at_block(
+        &self,
+        epoch: u32,
+        block_hash: B256,
+    ) -> eyre::Result<Vec<BlsPublicKey>> {
         Ok(self
             .reth_env
-            .bls_pubkeys_for_epoch(epoch)?
+            .bls_pubkeys_for_epoch_at_block(epoch, block_hash)?
             .iter()
             .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
             .collect())
