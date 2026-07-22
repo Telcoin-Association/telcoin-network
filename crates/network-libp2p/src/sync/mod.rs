@@ -1,10 +1,8 @@
 //! Typed sync-frame layer for bulk request/response exchanges.
 //!
-//! The legacy bulk path opens a raw `/tn-stream` substream and correlates it
-//! back to a prior request-response handshake by writing a 32-byte digest. This
-//! module is the additive groundwork for folding that handshake into the stream
-//! itself: an exchange carries its request as the first frame, and the responder
-//! answers in the same stream.
+//! An exchange carries its request as the first frame of the stream, and the
+//! responder answers in the same stream: there is no separate request-response
+//! handshake or digest correlation. This is the sole bulk-transfer path.
 //!
 //! ## Framing
 //!
@@ -24,10 +22,8 @@
 //!
 //! The frames ride on streams negotiated with the per-role sync protocols
 //! (`/tn-primary-sync/0.0.1`, `/tn-worker-{id}-sync/0.0.1`), which the stream
-//! behaviour registers alongside the legacy `/tn-stream/0.0.1` upgrade. This
-//! layer is inert for now: no call site opens a sync stream until the
-//! per-exchange cutovers migrate the worker batch, epoch pack, and missing
-//! certificate paths.
+//! behaviour registers as its sole upgrade. Every bulk path (worker batch, epoch
+//! pack, missing certificates, consensus output) rides this layer.
 //!
 //! [`encode_message`]: crate::encode_message
 //! [`decode_message`]: crate::decode_message

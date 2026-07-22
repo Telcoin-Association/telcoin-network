@@ -29,7 +29,7 @@ use tn_types::{
     EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Name of the per-epoch [`TaskManager`], created fresh and torn down each epoch.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
@@ -135,34 +135,43 @@ where
         self.last_consensus_header = None;
         // We have not created this epoch's primary yet (no committee) so get it from chain
         // ourselves... Note, any consensus output to replay should be in the same epoch...
-        let (committee, epoch_info, epoch_start) =
+        let (committee, epoch_info, epoch_start, epoch_start_header) =
             self.get_committee_with_epoch_start_info(engine).await?;
         self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
+        debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
         self.metrics.current.set(committee.epoch() as f64);
         self.metrics.boundary_timestamp_seconds.set(self.epoch_boundary as f64);
 
         let reth_env = engine.get_reth_env().await;
 
-        // ENTRY-READ INVARIANT: the previous epoch's closing state rules the entire epoch.
-        // `entered` and `epoch_info.blockHeight` come from the ONE atomic canonical-tip read
-        // above (`get_committee_with_epoch_start_info`), and `concludeEpoch` writes an epoch's
-        // `blockHeight` exactly once at the boundary, so both are immutable within the epoch: a
-        // ModeChange re-entry re-reads IDENTICAL values and re-derives identical fees (a pure
-        // function of prior-epoch closing state). That value-stability is the safety argument
-        // under concurrent execution - `send_leftover_consensus_output_to_engine` forwards
-        // leftover output without waiting, so the engine may still be executing (calling
-        // `inc_block`) while this entry runs: `apply`'s resize no-ops, its fee writes rewrite
-        // the same values, and `GasAccumulator::set_num_workers` refuses to shrink below an
-        // in-flight worker id - NOT quiescence. See the `mode_change_reentry_is_idempotent` IT.
+        // ENTRY-READ INVARIANT: the previous epoch's closing block rules the entire epoch.
+        // Every epoch-scoped entry read - committee membership, `epoch_info`, and the fee
+        // derivation below - derives from the ONE pinned header returned by the atomic
+        // `epoch_state_at_epoch_start` read above (via `get_committee_with_epoch_start_info`):
+        // the previous epoch's closing block, `getEpochInfo(entered).blockHeight - 1` (genesis
+        // for epoch 0). `concludeEpoch` writes an epoch's `blockHeight` exactly once at the
+        // boundary, so the pin itself is re-derivable at ANY tip: a fresh boundary crossing, a
+        // crash-restart replay, and a ModeChange re-entry all resolve the same header. The
+        // consequence: a re-entry AFTER a mid-epoch governance `burn` (which swap-and-pops the
+        // CURRENT epoch's stored committee arrays immediately) re-reads the IDENTICAL
+        // epoch-start membership - RewardsCounter rows, quorum thresholds, leader schedule -
+        // instead of the post-burn tip set, so entry timing can no longer change the node's
+        // view of the epoch.
+        //
+        // That value-stability is also the safety argument under concurrent execution -
+        // `send_leftover_consensus_output_to_engine` forwards leftover output without waiting,
+        // so the engine may still be executing (calling `inc_block`) while this entry runs:
+        // `apply`'s resize no-ops, its fee writes rewrite the same values, and
+        // `GasAccumulator::set_num_workers` refuses to shrink below an in-flight worker id -
+        // NOT quiescence. See the `mode_change_reentry_is_idempotent` IT.
         //
         // Seed the accumulator's worker count and per-worker base fees for the entered epoch
-        // from the previous epoch's closing block (`getEpochInfo(entered).blockHeight - 1`).
-        // This is the single seam every entry shape converges on: a live producer that just
-        // crossed the boundary (recomputing the value `adjust_base_fees` produced at close),
-        // every close_epoch(None) recovery shape (replay-and-close, crash-after-close,
-        // leftover-drain), and a mid-epoch sync or restart all derive the same values from the
-        // same pinned state. Runs before replay drives `inc_block`, so replay operates on a
-        // correctly sized accumulator.
+        // from the pinned header (the previous epoch's closing block). This is the single seam
+        // every entry shape converges on: a live producer that just crossed the boundary
+        // (recomputing the value `adjust_base_fees` produced at close), every close_epoch(None)
+        // recovery shape (replay-and-close, crash-after-close, leftover-drain), and a mid-epoch
+        // sync or restart all derive the same values from the same pinned state. Runs before
+        // replay drives `inc_block`, so replay operates on a correctly sized accumulator.
         let entered = committee.epoch();
         if entered == 0 {
             // Epoch 0 has no prior epoch: fees stay at the MIN defaults (epoch-0 blocks carry
@@ -180,14 +189,7 @@ where
             // prior-epoch header scan here (~86k headers for a 24h epoch of 1s blocks -
             // seconds, and the derive logs its elapsed time); acceptable because entries are
             // rare.
-            let closing_number = epoch_info
-                .blockHeight
-                .checked_sub(1)
-                .ok_or_else(|| eyre::eyre!("entered epoch {entered} reports blockHeight 0"))?;
-            let closing = reth_env.sealed_header_by_number(closing_number)?.ok_or_else(|| {
-                eyre::eyre!("missing closing block {closing_number} for entered epoch {entered}")
-            })?;
-            super::derive_base_fees_for_entered_epoch(&reth_env, entered, &closing)?
+            super::derive_base_fees_for_entered_epoch(&reth_env, entered, &epoch_start_header)?
                 .apply(&gas_accumulator);
         }
         // Produce a "dummy" epoch 0 EpochRecord if missing.
@@ -221,7 +223,7 @@ where
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
             gas_accumulator.rewards_counter().set_committee(committee.clone());
-            let mut replay = self.replay_missed_consensus(committee, to_engine).await?;
+            let mut replay = self.replay_missed_consensus(committee.clone(), to_engine).await?;
             if let Some(target_hash) = replay.take_epoch_close_hash() {
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
@@ -242,7 +244,9 @@ where
 
         // subscribe to output early to prevent missed messages
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
-        let consensus_config = self.configure_consensus(engine, network_config).await?;
+        let consensus_config = self
+            .configure_consensus(engine, network_config, committee, &epoch_start_header)
+            .await?;
 
         // The networks need their one-time, per-process setup (start listening, register bootstrap
         // peers) on the first iteration that actually reaches `create_consensus`. This is usually
@@ -263,6 +267,7 @@ where
                 gas_accumulator.clone(),
                 consensus_bus.clone(),
                 consensus_config.clone(),
+                &epoch_start_header,
             )
             .await?;
         // Networks are now set up; subsequent epochs rotate committees instead of re-seeding.

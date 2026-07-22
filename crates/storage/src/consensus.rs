@@ -416,6 +416,31 @@ impl ConsensusChain {
         // original pack is load-bearing: this epoch's consensus output must be
         // decoded and verified against the committee the epoch started with.
         if old_pack.epoch() == committee.epoch() && !old_pack.is_static() {
+            // TRIPWIRE (diagnostics only): the pack's persisted committee is the epoch-START
+            // snapshot, and the entry `committee` is derived from a read pinned to that same
+            // epoch-start state — so the two BLS key sets can differ only if an unpinned
+            // (canonical-tip) entry read is ever reintroduced. Warn loudly at the first
+            // mid-epoch re-entry after a governance burn instead of staying silent until the
+            // epoch record splits. Do NOT error: either way the pack's epoch-start snapshot
+            // remains authoritative for decoding this epoch's output, and the re-entry must
+            // proceed.
+            let pack_keys = old_pack.committee().bls_keys();
+            let entry_keys = committee.bls_keys();
+            if pack_keys != entry_keys {
+                let missing_from_entry: Vec<_> = pack_keys.difference(&entry_keys).collect();
+                let added_in_entry: Vec<_> = entry_keys.difference(&pack_keys).collect();
+                warn!(
+                    target: "consensus-chain",
+                    epoch = committee.epoch(),
+                    pack_committee_len = pack_keys.len(),
+                    entry_committee_len = entry_keys.len(),
+                    ?missing_from_entry,
+                    ?added_in_entry,
+                    "same-epoch re-entry committee differs from the pack's epoch-start snapshot; \
+                     an unpinned (tip-based) entry read has likely been reintroduced — keeping \
+                     the pack's committee"
+                );
+            }
             return Ok(());
         }
         old_pack.persist().await?;
@@ -1403,6 +1428,7 @@ mod test {
 
     use crate::consensus::{ConsensusSlot, LatestConsensus};
     use std::{
+        collections::BTreeMap,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -1411,8 +1437,8 @@ mod test {
     };
 
     use tn_types::{
-        test_genesis, ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, Epoch, EpochRecord,
-        Hash as _,
+        test_genesis, Authority, BlsPublicKey, Committee, ConsensusHeader, ConsensusHeaderDigest,
+        ConsensusNumHash, Epoch, EpochRecord, Hash as _,
     };
 
     use crate::{
@@ -2313,6 +2339,58 @@ mod test {
                 .expect("imported output readable after restart");
             compare_outputs(&got, output);
         }
+    }
+
+    /// A same-epoch `new_epoch` re-entry whose committee differs from the pack's persisted
+    /// epoch-start snapshot — what a canonical-tip-seeded entry read would pass after a
+    /// mid-epoch governance burn swap-and-pops a validator — must still return Ok and keep
+    /// the original pack untouched. The committee cross-check on that path is a warn-only
+    /// tripwire; the pack's epoch-start snapshot stays authoritative for decoding this
+    /// epoch's output.
+    #[tokio::test]
+    async fn test_same_epoch_reentry_with_shrunken_committee_keeps_pack() {
+        let temp_dir = TempDir::with_prefix("test_reentry_shrunken").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        // Open epoch 0 with committee A (the epoch-start snapshot the pack persists).
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        assert_eq!(consensus_chain.current_pack().epoch(), 0);
+        assert_eq!(consensus_chain.current_pack().committee().bls_keys(), committee.bls_keys());
+
+        // Committee B: same epoch with one member dropped, mirroring the post-burn on-chain
+        // committee a tip-based read would return.
+        let mut authorities: BTreeMap<BlsPublicKey, Authority> =
+            committee.authorities().into_iter().map(|a| (*a.protocol_key(), a)).collect();
+        let (dropped, _) = authorities.pop_last().expect("fixture committee is non-empty");
+        let shrunken = Committee::new_for_test(authorities, 0, BTreeMap::default());
+        assert_eq!(shrunken.epoch(), committee.epoch());
+        assert!(shrunken.bls_keys().len() < committee.bls_keys().len());
+
+        // Same-epoch re-entry with the mismatched committee: Ok (the tripwire only warns),
+        // and the current pack is unchanged — same epoch, still committee A.
+        consensus_chain
+            .new_epoch(previous_epoch, shrunken)
+            .await
+            .expect("same-epoch re-entry with a mismatched committee must remain Ok");
+        let pack = consensus_chain.current_pack();
+        assert_eq!(pack.epoch(), 0, "re-entry must not change the current pack's epoch");
+        assert_eq!(
+            pack.committee().bls_keys(),
+            committee.bls_keys(),
+            "pack must retain the epoch-start committee snapshot"
+        );
+        assert!(
+            pack.committee().bls_keys().contains(&dropped),
+            "the burned member stays in the pack's snapshot for decoding this epoch"
+        );
     }
 
     #[tokio::test]

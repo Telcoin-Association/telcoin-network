@@ -15,58 +15,27 @@ use parking_lot::Mutex;
 use tn_network_libp2p::{
     error::NetworkError,
     read_frame,
-    types::{NetworkHandle, NetworkResponseMessage, NetworkResult},
-    write_frame, Penalty, StreamError, StreamKind, SyncFrame, WorkerSyncRequest,
+    types::{NetworkHandle, NetworkResult},
+    write_frame, Penalty, StreamError, SyncFrame, WorkerSyncRequest,
 };
 use tn_types::{
     encode, max_batch_size, try_decode, Batch, BlockHash, BlsPublicKey, Epoch, RpcInfo,
-    SealedBatch, TaskSpawner, B256,
+    SealedBatch, TaskSpawner,
 };
 use tracing::{debug, warn};
 
 use crate::{
-    network::{stream_codec, Req, Res, MAX_BATCH_DIGESTS_PER_REQUEST},
+    network::{Req, Res, MAX_BATCH_DIGESTS_PER_REQUEST},
     WorkerGossip, WorkerRPCError, WorkerRequest, WorkerResponse,
 };
 
-/// Timeout for streaming a single batch from peer. Batches capped at 1MB.
+/// Timeout for reading a single sync data frame from a peer. Batches capped at 1MB.
 const BATCH_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Timeout bounding the gap before each per-chunk count header while reading a
-/// batch response stream.
-///
-/// A count header is emitted by the responder only *after* it bulk-loads that
-/// chunk's batches from its database (`send_batches_over_stream`), so, unlike an
-/// individual batch read, the inter-chunk gap can legitimately exceed the short
-/// `BATCH_STREAM_TIMEOUT`; reusing that timeout here would spuriously disconnect
-/// an honest sender whose chunk-boundary DB fetch is slow. It is sized instead to
-/// be at least the responder's own whole-stream `SEND_STREAM_TIMEOUT` self-cap
-/// (`handler.rs`): an honest sender always emits the next count within that
-/// window (or aborts its own send first), whereas a peer that stalls
-/// indefinitely before the next count is disconnected rather than parking the
-/// requester (and its `MAX_CONCURRENT_BATCH_STREAMS` slot) forever.
-const INTER_CHUNK_STREAM_TIMEOUT: Duration = Duration::from_secs(200);
-
-/// Compile-time guard for the invariant above: the inter-chunk tolerance must be
-/// at least the responder's whole-stream self-cap, or an honest sender whose next
-/// count header is delayed by its per-chunk DB load could be disconnected.
-/// Raising `SEND_STREAM_TIMEOUT` above this without widening it here fails the
-/// build.
-const _: () =
-    assert!(INTER_CHUNK_STREAM_TIMEOUT.as_secs() >= super::handler::SEND_STREAM_TIMEOUT.as_secs());
-
-/// Overall deadline for reading a complete legacy batch response. Mirrors the
-/// responder's `SEND_STREAM_TIMEOUT` (200s, at which the sender aborts its own
-/// send) plus headroom for transit of the final bytes, so an honest transfer
-/// always completes within it while a peer that only trickles progress — keeping
-/// each individual read just under the per-read bound — cannot stall the fetch
-/// for the full per-batch budget.
-const BATCH_READ_TOTAL_TIMEOUT: Duration = Duration::from_secs(210);
 
 /// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the request
 /// frame is written. A peer that negotiated the sync protocol but does not answer
-/// (e.g. an item-4 node that registered the protocol but reads the stream on the
-/// legacy digest path) trips this and the requester falls back to legacy.
+/// (e.g. an item-4 node that registered the protocol but never sends `Ack`) trips
+/// this, so the requester stops waiting and tries the next peer.
 const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Headroom added to `max_batch_size` for the sync-frame envelope (the `SyncFrame`
@@ -89,7 +58,7 @@ pub(crate) fn max_sync_frame_size(epoch: Epoch) -> usize {
 enum SyncAttempt {
     /// The peer served the requested batches over the sync protocol.
     Fetched(Vec<(BlockHash, Batch)>),
-    /// The peer did not answer the sync exchange; fall back to legacy.
+    /// The peer did not answer the sync exchange; skip it (no legacy fallback).
     Unsupported,
     /// The peer answered but the exchange failed; try the next peer.
     Failed(NetworkError),
@@ -109,9 +78,10 @@ pub struct WorkerNetworkHandle {
     /// Absent means not yet probed (try the sync protocol); `false` means the
     /// peer did not answer a sync open (a pre-item-4 peer that fails negotiation,
     /// or an item-4 peer that registered the protocol but does not serve it), so
-    /// go straight to legacy; `true` means the peer served a sync exchange. The
-    /// cache is reset each epoch ([`Self::update_epoch`]) so a peer upgraded over
-    /// the rotation boundary is re-probed.
+    /// it is skipped this epoch (there is no legacy fallback); `true` means the
+    /// peer served a sync exchange. The cache is reset each epoch
+    /// ([`Self::update_epoch`]) so a peer upgraded over the rotation boundary is
+    /// re-probed.
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
     /// The genesis chain id, used to namespace gossip topics this handle publishes.
     chain_id: u64,
@@ -293,16 +263,14 @@ impl WorkerNetworkHandle {
         }
     }
 
-    /// Request batches from a single peer, preferring the typed sync protocol.
+    /// Request batches from a single peer over the typed sync protocol.
     ///
-    /// Unless the peer is cached as legacy-only, this first attempts a
-    /// `/tn-worker-{id}-sync` exchange that folds the request into the opening
-    /// stream frame. If the peer does not answer that exchange — it fails
-    /// negotiation (a pre-item-4 peer), or it negotiated the protocol but sent no
-    /// `Ack` (an item-4 peer that registered the protocol without serving it) —
-    /// the peer is cached as legacy-only and the request falls back to the legacy
-    /// `RequestBatchesStream` ack-plus-digest path. The sync probe is
-    /// penalty-exempt, so falling back never lowers the peer's score.
+    /// Opens a `/tn-worker-{id}-sync` exchange that folds the request into the
+    /// opening stream frame. There is no legacy fallback (#739, step 9c): a peer
+    /// that does not answer the sync protocol (negotiation fails, or it negotiated
+    /// but never `Ack`ed) is cached unsyncable this epoch and skipped, and the
+    /// caller tries the next peer. The sync probe is penalty-exempt, so skipping
+    /// never lowers the peer's score.
     async fn request_batches_from_peer(
         &self,
         peer: BlsPublicKey,
@@ -314,9 +282,12 @@ impl WorkerNetworkHandle {
             return Ok(vec![]);
         }
 
-        // a peer known not to serve sync skips the probe entirely this epoch
+        // a peer known not to serve sync this epoch is skipped so the caller tries
+        // the next peer
         if self.sync_capability.lock().get(&peer) == Some(&false) {
-            return self.request_batches_from_peer_legacy(peer, batch_digests).await;
+            return Err(NetworkError::RPCRetryable(format!(
+                "peer {peer} does not serve the batch sync protocol this epoch"
+            )));
         }
 
         match self.request_batches_from_peer_sync(peer, batch_digests).await {
@@ -325,13 +296,17 @@ impl WorkerNetworkHandle {
                 Ok(batches)
             }
             SyncAttempt::Unsupported => {
+                // no legacy fallback: cache the peer unsyncable this epoch and let
+                // the caller try the next peer
                 self.sync_capability.lock().insert(peer, false);
                 debug!(
                     target: "worker::network",
                     %peer,
-                    "peer did not answer sync, falling back to legacy batch request"
+                    "peer does not answer the batch sync protocol, skipping"
                 );
-                self.request_batches_from_peer_legacy(peer, batch_digests).await
+                Err(NetworkError::RPCRetryable(format!(
+                    "peer {peer} does not serve the batch sync protocol"
+                )))
             }
             SyncAttempt::Failed(e) => {
                 // the peer speaks sync but this exchange failed; try the next peer
@@ -347,7 +322,7 @@ impl WorkerNetworkHandle {
     /// [`SyncFrame::Req`] frame, and reads the response: an [`SyncFrame::Ack`]
     /// followed by [`SyncFrame::Data`] frames terminated by [`SyncFrame::End`].
     /// Returns [`SyncAttempt::Unsupported`] when the peer does not answer (so the
-    /// caller falls back to legacy), [`SyncAttempt::Fetched`] on success, or
+    /// caller skips it), [`SyncAttempt::Fetched`] on success, or
     /// [`SyncAttempt::Failed`] when the peer answered but the exchange failed.
     async fn request_batches_from_peer_sync(
         &self,
@@ -364,11 +339,11 @@ impl WorkerNetworkHandle {
     ///
     /// `Err(SyncAttempt::Unsupported)` means the peer did not answer the protocol
     /// (negotiation failed, or it negotiated but never sent `Ack`), so the caller
-    /// falls back to legacy. `Err(SyncAttempt::Failed(_))` means a transient or
-    /// exchange-level error once the peer has proved sync-capable, so the caller
-    /// keeps it sync-capable and tries the next peer. A transport I/O error during
-    /// the open (`UpgradeIo`) is transient rather than a protocol mismatch, so it
-    /// maps to `Failed` instead of poisoning the per-epoch capability cache.
+    /// skips it (there is no legacy fallback). `Err(SyncAttempt::Failed(_))` means
+    /// a transient or exchange-level error once the peer has proved sync-capable, so
+    /// the caller keeps it sync-capable and tries the next peer. A transport I/O
+    /// error during the open (`UpgradeIo`) is transient rather than a protocol
+    /// mismatch, so it maps to `Failed` instead of poisoning the capability cache.
     async fn try_sync_batch_exchange(
         &self,
         peer: BlsPublicKey,
@@ -377,16 +352,15 @@ impl WorkerNetworkHandle {
         // open the sync stream, flattening the command-channel and stream-open
         // results. Only a genuine negotiation failure (`UpgradeFailed`) is a
         // pre-item-4 peer that does not advertise the protocol -> Unsupported
-        // (penalty-exempt, cached legacy-only). A transient upgrade I/O error or
-        // any other open error is not proof the peer lacks sync -> try next peer.
+        // (penalty-exempt, cached unsyncable this epoch). A transient upgrade I/O
+        // error or any other open error is not proof the peer lacks sync -> try
+        // next peer.
         let mut stream =
-            self.handle.open_stream(peer, StreamKind::Sync).await.and_then(|s| s).map_err(|e| {
-                match () {
-                    () if matches!(e, NetworkError::Stream(StreamError::UpgradeFailed)) => {
-                        SyncAttempt::Unsupported
-                    }
-                    () => SyncAttempt::Failed(e),
+            self.handle.open_stream(peer).await.and_then(|s| s).map_err(|e| match () {
+                () if matches!(e, NetworkError::Stream(StreamError::UpgradeFailed)) => {
+                    SyncAttempt::Unsupported
                 }
+                () => SyncAttempt::Failed(e),
             })?;
 
         // write the request in the opening frame. Negotiation already succeeded,
@@ -406,10 +380,13 @@ impl WorkerNetworkHandle {
                 )))
             })?;
 
-        // read the responder's first frame. A timeout (outer `Err`) means no `Ack`
-        // -> an item-4 peer that negotiated sync but does not serve it, so fall
-        // back to legacy. A read I/O error (inner `Err`) after negotiation is
-        // transient -> try the next peer.
+        // read the responder's first frame. Negotiation already succeeded, so the
+        // peer IS sync-capable: a missing `Ack` (timeout) or any read error is a
+        // transient exchange failure, not a capability signal. Both map to `Failed`
+        // (try the next peer, keep the peer sync-capable) rather than `Unsupported`,
+        // which would cache the peer unsyncable for the whole epoch with no fallback
+        // (#739, step 9c removed the legacy path). Only a negotiation failure at open
+        // time (`UpgradeFailed`, above) proves the peer lacks the sync protocol.
         let (mut decode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
         let first = tokio::time::timeout(
             SYNC_ACK_TIMEOUT,
@@ -421,25 +398,15 @@ impl WorkerNetworkHandle {
             ),
         )
         .await
-        .map_err(|_elapsed| SyncAttempt::Unsupported)?
+        .map_err(|_elapsed| {
+            SyncAttempt::Failed(NetworkError::RPCRetryable(
+                "timed out reading sync ack frame".to_string(),
+            ))
+        })?
         .map_err(|e| {
-            // a clean EOF or connection close means the peer did not answer the
-            // sync protocol (e.g. a pre-cutover peer that closed the misread
-            // stream) -> fall back to legacy and cache legacy-only, exactly like
-            // the ack-timeout case above. Any other I/O error after a successful
-            // negotiation is transient -> keep the peer sync-capable, try the next.
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::BrokenPipe
-            ) {
-                SyncAttempt::Unsupported
-            } else {
-                SyncAttempt::Failed(NetworkError::RPCRetryable(format!(
-                    "failed to read sync ack frame: {e}"
-                )))
-            }
+            SyncAttempt::Failed(NetworkError::RPCRetryable(format!(
+                "failed to read sync ack frame: {e}"
+            )))
         })?;
 
         match first {
@@ -464,9 +431,9 @@ impl WorkerNetworkHandle {
     /// Read `Data` frames terminated by `End` from an accepted sync exchange,
     /// decoding and validating each batch as it arrives.
     ///
-    /// Mirrors the legacy reader's validation: every batch must have been
-    /// requested, none may repeat, and the running total may not exceed the
-    /// request. Each frame read is bounded by [`BATCH_STREAM_TIMEOUT`].
+    /// Validates every batch: it must have been requested, none may repeat, and
+    /// the running total may not exceed the request. Each frame read is bounded by
+    /// [`BATCH_STREAM_TIMEOUT`].
     pub(crate) async fn read_sync_batches<S: AsyncRead + Unpin + Send>(
         &self,
         stream: &mut S,
@@ -540,246 +507,6 @@ impl WorkerNetworkHandle {
         Ok(batches)
     }
 
-    /// Request batches from a single peer over the legacy `/tn-stream` path.
-    ///
-    /// This method:
-    /// 1. Sends a `RequestBatchesStream` request to negotiate
-    /// 2. If accepted, opens a stream with the request digest for correlation
-    /// 3. Reads and validates batches from the stream in real-time
-    async fn request_batches_from_peer_legacy(
-        &self,
-        peer: BlsPublicKey,
-        batch_digests: &BTreeSet<BlockHash>,
-    ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
-        // sanity check - should never happen
-        if batch_digests.is_empty() {
-            warn!(target: "worker::network", "requested empty batches from peer!");
-            return Ok(vec![]);
-        }
-
-        // send request to negotiate stream
-        let request = WorkerRequest::RequestBatchesStream {
-            batch_digests: batch_digests.clone(),
-            epoch: self.epoch(),
-        };
-        let request_digest = self.generate_batch_request_id(batch_digests);
-
-        // send request and await response from peer
-        //
-        // SAFETY: network layer handles request timeout
-        let NetworkResponseMessage { peer: _, result: res } =
-            self.handle.send_request(request, peer).await?.await??;
-        match res {
-            WorkerResponse::RequestBatchesStream { ack } => {
-                // return error if denied to try next peer
-                if !ack {
-                    return Err(NetworkError::RPCError(
-                        "Peer {peer:%} denied request to sync".to_string(),
-                    ));
-                }
-
-                debug!(
-                    target: "worker::network",
-                    %peer,
-                    ?ack,
-                    "peer ack for stream request"
-                );
-
-                // open raw stream then write request_digest for correlation
-                let mut stream = self.handle.open_stream(peer, StreamKind::Legacy).await??;
-                stream.write_all(request_digest.as_slice()).await.map_err(|e| {
-                    NetworkError::RPCError(format!("failed to write request digest: {e}"))
-                })?;
-                stream.flush().await.map_err(|e| {
-                    NetworkError::RPCError(format!("failed to flush request digest: {e}"))
-                })?;
-
-                debug!(
-                    target: "worker::network",
-                    %peer,
-                    "stream opened - reading and validating batches..."
-                );
-
-                // read and validate batches from stream with timeout per batch
-                let batches =
-                    self.read_and_validate_batches_with_timeout(&mut stream, batch_digests).await?;
-
-                Ok(batches)
-            }
-            WorkerResponse::ReportBatch => Err(NetworkError::RPCError(
-                "Got wrong response: report batch instead of stream ack".to_string(),
-            )),
-            WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
-                "Got wrong response: peer exchange instead of stream ack".to_string(),
-            )),
-            WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
-            WorkerResponse::RecoverableError(WorkerRPCError(s)) => {
-                Err(NetworkError::RPCRetryable(s))
-            }
-        }
-    }
-
-    /// Read and validate batches from a stream.
-    ///
-    /// Validates each batch in real-time:
-    /// - Checks batch count matches expected
-    /// - Verifies each batch digest was requested
-    /// - Detects duplicate batches
-    ///
-    /// The sender chunks batch digests into groups of 200 and writes
-    /// `[chunk_count][batches...][flush]` per chunk. This method loops
-    /// reading chunks until the stream closes.
-    ///
-    /// SAFETY: the read cannot hang or be dragged out indefinitely. Four bounds
-    /// combine: an overall [`BATCH_READ_TOTAL_TIMEOUT`] on the whole exchange
-    /// (mirroring the responder's own `SEND_STREAM_TIMEOUT` send cap, so a peer
-    /// that only trickles progress is cut off while an honest transfer still
-    /// completes); an [`INTER_CHUNK_STREAM_TIMEOUT`] bounding the wait before each
-    /// per-chunk count header (so a peer cannot park this requester between chunks
-    /// even while the overall deadline still has budget); the per-batch
-    /// [`BATCH_STREAM_TIMEOUT`] on each `read_batch`; and a cap on the number of
-    /// chunk headers at the request's chunk span
-    /// (`ceil(requested / BATCH_DIGESTS_READ_CHUNK_SIZE)`). The cap is essential
-    /// because a fast run of zero-count chunks makes no `.await` yield, so no
-    /// timeout can interrupt it — erroring out on the cap is what breaks that
-    /// busy-loop.
-    pub(crate) async fn read_and_validate_batches_with_timeout<S: AsyncRead + Unpin + Send>(
-        &self,
-        stream: &mut S,
-        requested_digests: &BTreeSet<BlockHash>,
-    ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
-        // a well-behaved sender writes exactly one chunk header per group of
-        // `BATCH_DIGESTS_READ_CHUNK_SIZE` requested digests (see
-        // `send_batches_over_stream`), each header optionally followed by that many
-        // batches. Capping the headers we read to that span stops a peer from
-        // spinning this loop forever with an endless run of zero-count (no-progress)
-        // chunks: the running-total guard never trips on a zero count and the
-        // per-batch timeout never engages for an empty chunk, so a plain timeout
-        // cannot break the loop — the cap can.
-        let max_chunks =
-            requested_digests.len().div_ceil(stream_codec::BATCH_DIGESTS_READ_CHUNK_SIZE);
-
-        // bound the entire exchange. The responder caps its own send at
-        // `SEND_STREAM_TIMEOUT`, so an honest transfer always finishes within this
-        // deadline while a peer that stalls or trickles is cut off. A genuine stall
-        // parks on `Pending`, so this timeout fires; the busy-loop case is handled
-        // by `max_chunks` above.
-        let read = async {
-            // allocate reusable buffers
-            //
-            // SAFETY: num of requests capped by `MAX_CONCURRENT_BATCH_STREAMS`
-            let max_size = max_batch_size(self.epoch);
-            let mut decode_buffer = Vec::with_capacity(max_size);
-            let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(max_size));
-
-            // SAFETY: requested_digests is capped to MAX_BATCH_DIGESTS_PER_REQUEST (500) above.
-            // Worst-case allocation: 500 entries of (B256, Batch) where each batch is up to 1MB.
-            // This bounds memory to ~500MB rather than the theoretical ~33GB from 33k digests.
-            let mut batches = Vec::with_capacity(requested_digests.len());
-            let mut received_digests = HashSet::with_capacity(requested_digests.len());
-            let mut chunks_read = 0usize;
-
-            // read chunks until stream closes (sender writes multiple chunks for large requests)
-            loop {
-                // read the next chunk-count header, bounding the wait before it so a
-                // peer cannot stall indefinitely between chunks and park this
-                // requester (and its `MAX_CONCURRENT_BATCH_STREAMS` slot) forever. A
-                // clean `StreamClosed` becomes a `None` break-sentinel (transfer
-                // complete); any other error propagates.
-                let next_count = tokio::time::timeout(
-                    INTER_CHUNK_STREAM_TIMEOUT,
-                    stream_codec::read_chunk_count(stream),
-                )
-                .await
-                .map_err(|_| {
-                    warn!(target: "worker::network", "timeout waiting for next batch chunk count");
-                    NetworkError::Timeout
-                })?
-                .map_or_else(
-                    |e| {
-                        if matches!(e, super::error::WorkerNetworkError::StreamClosed) {
-                            Ok(None)
-                        } else {
-                            Err(NetworkError::RPCError(format!("Failed to read batch count: {e}")))
-                        }
-                    },
-                    |count| Ok(Some(count as usize)),
-                )?;
-
-                // `None` = the sender closed the stream after its last chunk: done.
-                let Some(batch_chunk_count) = next_count else { break };
-
-                // a well-behaved sender never writes more chunk headers than the
-                // request spans; anything beyond that is a peer making no progress.
-                chunks_read += 1;
-                if chunks_read > max_chunks {
-                    return Err(NetworkError::ProtocolError(format!(
-                        "Peer sent more than the expected {max_chunks} batch chunks"
-                    )));
-                }
-
-                // validate running total doesn't exceed requested
-                if batches.len() + batch_chunk_count > requested_digests.len() {
-                    return Err(NetworkError::ProtocolError(format!(
-                        "Peer sent too many batches: expected {}, received {}",
-                        requested_digests.len(),
-                        batches.len() + batch_chunk_count
-                    )));
-                }
-
-                // validate each batch as it arrives - immediately return error for malformed
-                // batches
-                //
-                // SAFETY: ensure timeout for stream per batch (disconnect if no progress made)
-                for i in 0..batch_chunk_count {
-                    let batch = tokio::time::timeout(
-                        BATCH_STREAM_TIMEOUT,
-                        stream_codec::read_batch(
-                            stream,
-                            &mut decode_buffer,
-                            &mut compressed_buffer,
-                            self.epoch,
-                        ),
-                    )
-                    .await
-                    .map_err(|_| {
-                        warn!(target: "worker::network", "timeout streaming batch");
-                        NetworkError::Timeout
-                    })?
-                    .map_err(|e| {
-                        warn!(target: "worker::network", ?e, "error reading batch from stream");
-                        NetworkError::RPCError(format!("Failed to read batch {}: {e}", i))
-                    })?;
-
-                    let batch_digest = batch.digest();
-
-                    // validate batch was requested
-                    if !requested_digests.contains(&batch_digest) {
-                        return Err(NetworkError::ProtocolError(format!(
-                            "Peer sent unexpected batch with digest {batch_digest}"
-                        )));
-                    }
-
-                    // validate batch is unique (no duplicates)
-                    if !received_digests.insert(batch_digest) {
-                        return Err(NetworkError::ProtocolError(format!(
-                            "Peer sent duplicate batch with digest {batch_digest}"
-                        )));
-                    }
-
-                    batches.push((batch_digest, batch));
-                }
-            }
-
-            Ok::<_, NetworkError>(batches)
-        };
-
-        tokio::time::timeout(BATCH_READ_TOTAL_TIMEOUT, read).await.map_err(|_elapsed| {
-            warn!(target: "worker::network", "timeout reading batch stream");
-            NetworkError::Timeout
-        })?
-    }
-
     /// Report penalty to peer manager.
     pub(super) async fn report_penalty(&self, peer: BlsPublicKey, penalty: Penalty) {
         self.handle.report_penalty(peer, penalty).await;
@@ -809,16 +536,6 @@ impl WorkerNetworkHandle {
         self.epoch = epoch;
         self.sync_capability.lock().clear();
     }
-
-    /// Helper method to digest missing batch request before initiating stream.
-    ///
-    /// The digest is used to detect duplicate requests from peers.
-    pub(crate) fn generate_batch_request_id(&self, batch_digests: &BTreeSet<BlockHash>) -> B256 {
-        let mut hasher = tn_types::DefaultHashFunction::new();
-        let bytes = encode(batch_digests);
-        hasher.update(&bytes);
-        B256::from_slice(hasher.finalize().as_bytes())
-    }
 }
 
 // support IT tests
@@ -844,11 +561,5 @@ impl WorkerNetworkHandle {
         requested_digests: &mut BTreeSet<BlockHash>,
     ) -> NetworkResult<Vec<(BlockHash, Batch)>> {
         self.request_batches(requested_digests).await
-    }
-
-    /// Publicly available for tests.
-    /// See [Self::generate_batch_request_id].
-    pub fn pub_generate_batch_request_id(&self, batch_digests: &BTreeSet<BlockHash>) -> B256 {
-        self.generate_batch_request_id(batch_digests)
     }
 }

@@ -206,6 +206,7 @@ telcoin-network genesis \
 | `--epoch-duration-in-secs`, `--epoch_length`         | `86400`        | Epoch duration in seconds (default: 24 hours)                                             |
 | `--max-header-delay-ms`                              | none           | Max delay between header proposals (milliseconds)                                         |
 | `--min-header-delay-ms`                              | none           | Min delay between header proposals (milliseconds)                                         |
+| `--max-batch-delay-ms`                               | none           | Max delay before a worker seals a batch of pending transactions (milliseconds)            |
 | `--dev-funded-account`                               | none           | Fund a deterministic test account. Never use in production                                |
 | `--accounts`                                         | none           | Path to a YAML file mapping addresses to genesis accounts                                 |
 

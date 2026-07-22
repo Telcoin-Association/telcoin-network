@@ -206,8 +206,27 @@ where
             return Ok(());
         }
 
-        let committee_keys = engine.validators_for_epoch(epoch).await?;
-        let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
+        // CLOSE-TIME READS, INTENTIONALLY POST-BURN: these committee reads see the on-chain
+        // state at epoch CLOSE, not the epoch-start pin used by the entry path. That is by
+        // design: a mid-epoch governance burn swap-and-pops the ejected validator out of the
+        // ConsensusRegistry's committee arrays immediately, and the epoch record is meant to
+        // commit that shrunken committee (`build_epoch_record` tolerates the shrink against
+        // the previous record's `next_committee` promise). Do NOT "fix" these reads to the
+        // epoch-start pin.
+        //
+        // They ARE pinned, though — to `parent_state`, the epoch-closing block this record
+        // commits as `final_state`. `parent_state` is the bus's `recent_blocks` watch value,
+        // not the reth canonical tip: the engine publishes each executed output's last block
+        // and its consensus hash in ONE watch write, so the bus can lag the true tip
+        // mid-execution but never lead it. At the only call site (the live boundary arm of
+        // `run_epoch`, after `close_epoch`'s `wait_for_consensus_execution`) the wait resolved
+        // on the exact write that carries the closing block, so this read IS that block; the
+        // pin makes the record's committee reads and its `final_state` derive from the same
+        // header by construction instead of by timing.
+        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
+        let committee_keys = engine.validators_for_epoch_at_block(epoch, parent_state.hash).await?;
+        let next_committee_keys =
+            engine.validators_for_epoch_at_block(epoch + 1, parent_state.hash).await?;
         let prev_record = if epoch == 0 {
             None
         } else {
@@ -218,7 +237,6 @@ where
             .take()
             .expect("epoch was finished with last consensus header");
         let target_hash = last_consensus_header.digest();
-        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
 
         let epoch_rec = build_epoch_record(
             epoch,
@@ -341,7 +359,8 @@ where
 /// Build the finalized [`EpochRecord`] for a just-completed epoch.
 ///
 /// The committee keys are the fresh on-chain reads for `epoch` and `epoch + 1`
-/// at the canonical tip; `prev` is the stored record for `epoch - 1`, required
+/// pinned to the epoch-closing block the record commits as `final_state`;
+/// `prev` is the stored record for `epoch - 1`, required
 /// for every epoch after 0. The new record chains to `prev` via `parent_hash`,
 /// and the committee read for this epoch must be compatible with the previous
 /// record's `next_committee` under [`EpochRecord::committee_compatible`]: the

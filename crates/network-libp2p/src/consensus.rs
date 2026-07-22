@@ -133,12 +133,11 @@ where
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         metrics: PeerManagerMetrics,
-        stream_protocols: (StreamProtocol, StreamProtocol),
+        stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
         let (req_res, peer_exchange) = req_res;
-        let (stream_legacy, stream_sync) = stream_protocols;
-        let stream = StreamBehavior::new(stream_legacy, stream_sync);
+        let stream = StreamBehavior::new(stream_protocol);
         Self { peer_manager, gossipsub, req_res, peer_exchange, kademlia, stream }
     }
 }
@@ -423,7 +422,7 @@ where
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
-        let stream_protocols = crate::types::stream_protocols(network_type, chain_id)?;
+        let stream_protocol = crate::types::stream_protocol(network_type, chain_id)?;
         let mut behavior = TNBehavior::new(
             peer_id,
             gossipsub,
@@ -431,7 +430,7 @@ where
             kademlia,
             network_config.peer_config(),
             PeerManagerMetrics::new_for(&network_type),
-            stream_protocols,
+            stream_protocol,
         );
 
         // Promote the surviving records into the local peer cache. The store's contents are
@@ -951,7 +950,7 @@ where
                 let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
             }
-            NetworkCommand::OpenStream { peer, kind, reply } => {
+            NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
                 let (peer_id, addrs) = match self.swarm.behaviour().peer_manager.auth_to_peer(peer)
                 {
@@ -976,7 +975,7 @@ where
                 // Pass the reply channel directly to the stream behavior.
                 // The stream (or error) will be returned to the caller via oneshot
                 // without any intermediate tracking.
-                self.swarm.behaviour_mut().stream.open_stream(peer_id, kind, addrs, reply);
+                self.swarm.behaviour_mut().stream.open_stream(peer_id, addrs, reply);
             }
             #[cfg(test)]
             NetworkCommand::KadStoreGet { key, reply } => {
@@ -1668,21 +1667,19 @@ where
     /// This handles inbound and outbound stream events for bulk data transfer.
     fn process_stream_event(&mut self, event: StreamEvent) -> NetworkResult<()> {
         match event {
-            StreamEvent::InboundStream { peer, kind, stream } => {
+            StreamEvent::InboundStream { peer, stream } => {
                 debug!(
                     target: "network",
                     ?peer,
-                    ?kind,
                     "inbound stream received"
                 );
-                // Forward raw stream to application layer, tagged with the
-                // negotiated protocol so it routes to the sync or legacy reader.
+                // Forward the raw stream to the application layer, which reads it
+                // as a typed sync stream.
                 if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
-                    if let Err(e) = self.event_stream.try_send(NetworkEvent::InboundStream {
-                        peer: bls,
-                        kind,
-                        stream,
-                    }) {
+                    if let Err(e) = self
+                        .event_stream
+                        .try_send(NetworkEvent::InboundStream { peer: bls, stream })
+                    {
                         error!(target: "network", ?e, "failed to forward inbound stream");
                     }
                 } else {
