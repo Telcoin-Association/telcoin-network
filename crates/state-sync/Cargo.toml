@@ -30,8 +30,6 @@ tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macr
 tn-storage = { workspace = true, features = ["test-utils"] }
 tn-test-utils-committee = { workspace = true }
 tn-test-utils = { workspace = true }
-rand = { workspace = true }
-rand_chacha = { workspace = true }
 tn-types = { workspace = true }
 
 [[test]]

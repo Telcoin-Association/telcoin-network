@@ -200,7 +200,17 @@ async fn manage_epoch_votes(
         for _ in 0..5 {
             match network.request_epoch_cert(Some(epoch_rec.epoch), None).await {
                 Ok((new_epoch_rec, cert)) => {
-                    if new_epoch_rec.verify_with_cert(&cert) {
+                    // Anchor the downloaded record to the locally-trusted committee using the
+                    // same routine the state-sync ingest path uses (see crates/state-sync
+                    // epoch.rs). `verify_with_cert` alone only proves the record is
+                    // self-consistent with its own embedded committee, so a peer could return an
+                    // attacker-committee record self-signed by that committee; the anchor rejects
+                    // it because its committee is not the one derived from prev.next_committee.
+                    if db
+                        .validate_downloaded_record(epoch_rec.epoch, &new_epoch_rec, &cert)
+                        .await
+                        .is_valid()
+                    {
                         let new_epoch_hash = new_epoch_rec.digest();
                         if new_epoch_hash != epoch_hash {
                             warn!(
@@ -217,6 +227,12 @@ async fn manage_epoch_votes(
                         }
                         got_epoch_record = true;
                         break;
+                    } else {
+                        warn!(
+                            target: "epoch-manager",
+                            "rejected an unanchored epoch record for epoch {} received from a peer during recovery",
+                            epoch_rec.epoch,
+                        );
                     }
                 }
                 Err(err) => error!(

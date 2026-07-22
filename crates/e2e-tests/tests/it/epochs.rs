@@ -83,9 +83,7 @@ async fn test_epoch_boundary_inner(
     // track the number of times the new validator was in the epoch committee
     let mut new_validator_in_committee_count = 0;
 
-    // sleep for first epoch with 1s offset and begin assertions loop
-    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
-
+    // No pre-pad sleep is needed here: the loop's first poll waits for the epoch to change.
     let mut shuffled = false;
     let mut latest_epoch = 0u32;
     // the new validator has a 1/6 chance of being selected for the new committee
@@ -133,9 +131,18 @@ async fn test_epoch_boundary_inner(
         // TODO issue 375, should use tn_latestConsensusHeader RPC for this when fixed.
         for ep in endpoints {
             for epoch in 0..=latest_epoch {
-                // Certificate availability is a fixed async quorum-voting cost, so floor
-                // this deadline at 30s instead of letting it shrink with EPOCH_DURATION.
-                fetch_verified_epoch_record(&ep.http_url, epoch, (EPOCH_DURATION * 3).max(30))
+                // This poll runs only after the new validator has been shuffled into the
+                // committee, so it can be waiting on the new-validator epoch record. That
+                // epoch has zero quorum redundancy: super_quorum = (committee * 2) / 3 + 1 = 4,
+                // exactly the established validators that remain once the new one joins. If a
+                // single established vote is slow to reach the freshly-joined node, that node
+                // falls back to its own vote-collection loop, which can run its full timeout
+                // (25 x 2.5s = ~62.5s) before the failed-quorum record collector back-fills the
+                // cert on its 5s cadence. Floor the deadline above that window (65s) rather
+                // than letting it shrink with EPOCH_DURATION. (The sync test's analogous poll
+                // is floored at 60s but is not exposed to this window: it kills/restarts a
+                // node rather than adding one to the committee.)
+                fetch_verified_epoch_record(&ep.http_url, epoch, (EPOCH_DURATION * 3).max(65))
                     .await?;
             }
         }
@@ -296,9 +303,7 @@ async fn test_epoch_sync_inner(
     })
     .await?;
 
-    // sleep for first epoch with 1s offset and begin assertions loop
-    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
-
+    // No pre-pad sleep is needed here: loop_epochs polls until the epoch changes.
     // Go through at least 5 epochs.
     loop_epochs(0, 5, &endpoints[0].http_url, EPOCH_DURATION).await?;
     // Kill a node
@@ -338,11 +343,14 @@ async fn test_epoch_sync_inner(
                 .join("data");
             let pack_file_exists = std::fs::exists(file_test).unwrap_or_default();
             assert!(pack_file_exists, "Missing an epoch pack file for {val_name} on epoch {epoch}");
-            // When a new validator joins the committee mid-test, its epoch vote quorum
-            // collection can time out (25 × 2.5s = ~62s) before the failed-quorum P2P
-            // fallback runs. The spawn_epoch_record_collector retries every 5s
-            // independently, so 60s gives enough time for it to succeed. This is a fixed
-            // cost, so floor the deadline at 60s rather than scaling it with EPOCH_DURATION.
+            // A node was killed and restarted earlier in this test, so it must back-fill the
+            // epoch certificates it missed while down. That recovery is a fixed async cost:
+            // the restarted node re-collects each missing cert from its peers via the
+            // 5s-cadence record collector (spawn_epoch_record_collector), independent of
+            // EPOCH_DURATION. Floor the deadline at 60s rather than letting it shrink with the
+            // epoch cadence. (Unlike test_epoch_boundary, this test never adds a validator to
+            // the committee, so it is not exposed to the ~62.5s new-validator vote-quorum
+            // window.)
             let epoch_rec =
                 fetch_verified_epoch_record(&ep.http_url, epoch, (EPOCH_DURATION * 6).max(60))
                     .await
