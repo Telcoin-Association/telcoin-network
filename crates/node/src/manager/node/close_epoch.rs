@@ -18,7 +18,7 @@ use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
 use std::collections::BTreeSet;
 use tn_config::TelcoinDirs;
-use tn_reth::recover_raw_transaction;
+use tn_reth::{recover_raw_transaction, RethEnv};
 use tn_storage::tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
     NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
@@ -30,7 +30,7 @@ use tn_types::{
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -249,6 +249,85 @@ where
 
         self.consensus_chain.epochs().save_record(epoch_rec.clone()).await?;
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
+        Ok(())
+    }
+
+    /// Export the just-closed epoch's final execution state to a snapshot pack.
+    ///
+    /// A no-op unless `--enable-state-export` spawned the exporter. The export runs on the
+    /// exporter's background thread (a full plain-state walk can be slow) and its outcome is
+    /// logged; the epoch transition does not wait on it. The pack is written under
+    /// `consensus-db/state_exports/epoch-{N}/`. The block exported is the epoch's final executed
+    /// block — the same value [`write_epoch_record`](Self::write_epoch_record) records as the
+    /// epoch's `final_state`.
+    pub(super) async fn export_epoch_state(
+        &self,
+        primary: &PrimaryNode<DB>,
+        reth_env: &RethEnv,
+    ) -> eyre::Result<()> {
+        let Some(exporter) = &self.exec_state_exporter else {
+            return Ok(());
+        };
+        let epoch = primary.current_committee().await.epoch();
+        let block = self.consensus_bus.latest_execution_block_num_hash();
+        let export_root = self.tn_datadir.consensus_db_path().join("state_exports");
+        let final_dir = export_root.join(format!("epoch-{epoch}"));
+        // Idempotent: a completed export for this epoch already sits at the final location (e.g.
+        // the boundary is re-processed after a restart); nothing to do.
+        if final_dir.exists() {
+            debug!(target: "tn::snapshot", epoch, "epoch state already exported; skipping");
+            return Ok(());
+        }
+        // Export into a temp sibling and atomically rename it into place on success, so external
+        // tooling only ever observes a complete `epoch-{N}` directory. Clear any leftover temp from
+        // a prior failed attempt first.
+        let tmp_dir = export_root.join(format!("epoch-{epoch}.tmp"));
+        if tmp_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
+                warn!(target: "tn::snapshot", epoch, error = %e, "failed to clear stale temp export dir");
+            }
+        }
+
+        match exporter.trigger_export(reth_env.clone(), block, tmp_dir.clone()) {
+            Ok(rx) => {
+                // fire-and-forget: log the result without blocking the epoch transition.
+                // The reth env task spawner should be the node/app scoped spawner NOT the epoch
+                // scoped spawner (about to die).
+                reth_env.get_task_spawner().spawn_task(format!("exporting execution state for epoch {epoch}"), async move {
+                    match rx.await {
+                        // move the completed pack into place; external tooling watches for the
+                        // final dir appearing atomically.
+                        Ok(Ok(outcome)) => match std::fs::rename(&tmp_dir, &final_dir) {
+                            Ok(()) => info!(
+                                target: "tn::snapshot",
+                                epoch,
+                                block = outcome.block.number,
+                                accounts = outcome.stats.account_count,
+                                path = ?final_dir,
+                                "exported epoch execution state"
+                            ),
+                            Err(e) => {
+                                error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch state into place");
+                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                            }
+                        },
+                        // export failed or the worker went away: drop the partial temp dir.
+                        Ok(Err(e)) => {
+                            warn!(target: "tn::snapshot", epoch, error = %e, "epoch state export failed");
+                            let _ = std::fs::remove_dir_all(&tmp_dir);
+                        }
+                        Err(_) => {
+                            warn!(target: "tn::snapshot", epoch, "epoch state export worker dropped the reply");
+                            let _ = std::fs::remove_dir_all(&tmp_dir);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            Err(e) => {
+                warn!(target: "tn::snapshot", epoch, error = %e, "could not enqueue epoch state export")
+            }
+        }
         Ok(())
     }
 

@@ -368,6 +368,9 @@ where
                 // Write the epoch record to DB and save in manager for next epoch.
                 self.write_epoch_record(&primary, engine).await?;
 
+                // Export the epoch's final execution state (no-op unless --enable-state-export).
+                self.export_epoch_state(&primary, &reth_env).await?;
+
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
                 epoch_boundary_reached = true;
             },
