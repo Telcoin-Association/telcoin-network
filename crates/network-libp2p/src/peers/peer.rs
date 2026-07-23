@@ -267,6 +267,25 @@ impl Peer {
         &self.score
     }
 
+    /// Adopt `other`'s reputation if it is worse than this peer's own.
+    ///
+    /// Reputation (the accumulated [Score], and therefore any ban it encodes) is a property of the
+    /// peer's confirmed domain identity, not of the transport key it currently presents. When an
+    /// anonymous-inbound record is promoted over a record already stored under that identity
+    /// (`AllPeers::upsert_peer`), the promoted record must not shed a ban - or any worse score -
+    /// held by the record it displaces, or a peer could reset its own reputation simply by
+    /// reconnecting under a fresh network key before its kad record arrives (issue #998). The whole
+    /// [Score] is adopted, not just its aggregate, so the ban-decay lockout that keeps the ban in
+    /// force also carries across; `reputation()` and `AllPeers::peer_banned` then keep reporting
+    /// the ban after the rotation. This is a no-op when this peer's own score is already the
+    /// worse (or equal) of the two, so a genuinely better-behaved displaced record never drags
+    /// the promoted record down.
+    pub(super) fn retain_worse_reputation(&mut self, other: &Peer) {
+        if other.score < self.score {
+            self.score = other.score.clone();
+        }
+    }
+
     /// Register the dialing peer as connected.
     ///
     /// This method also updates the number of incoming connections +1.
