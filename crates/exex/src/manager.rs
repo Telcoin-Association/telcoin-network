@@ -337,21 +337,35 @@ impl Router {
     }
 
     /// Handle a canonical commit: detect any block-number gap (reth drops canonical-stream lag
-    /// silently), surface it as `Lagged`, then deliver the executed chain. Shared by the `Commit`
-    /// and degraded `Reorg` arms.
+    /// silently), surface it as `Lagged`, then deliver the executed chain. An empty commit is
+    /// ignored (no gap check, no fan-out), since reth's `Chain` accessors panic on it. Shared by
+    /// the `Commit` and degraded `Reorg` arms.
     fn handle_canon_commit(&mut self, new: Arc<Chain>) {
-        let range = new.range();
-        let first = *range.start();
-        canon_gap(&mut self.last_canon_tip, first, *range.end()).into_iter().for_each(|missed| {
-            warn!(
-                target: "exex::manager",
-                missed,
-                first,
-                "canonical ChainExecuted gap detected; surfacing Lagged",
+        // Defense-in-depth: reth's `Chain::range()` (and `Chain::tip()`) panic on
+        // an empty chain ("Chain should have at least one block"). The sole live
+        // producer, `RethEnv::finish_executing_output`, never commits an empty
+        // chain: it early-returns before building one. That guarantee lives only
+        // in the engine's control flow, not in a check here, so guard it. A panic
+        // on this task would permanently disable fan-out for every ExEx (or, with
+        // `exex_critical` set, crash the node); an empty commit is ignored instead.
+        if new.is_empty() {
+            warn!(target: "exex::manager", "ignoring empty canonical commit");
+        } else {
+            let range = new.range();
+            let first = *range.start();
+            canon_gap(&mut self.last_canon_tip, first, *range.end()).into_iter().for_each(
+                |missed| {
+                    warn!(
+                        target: "exex::manager",
+                        missed,
+                        first,
+                        "canonical ChainExecuted gap detected; surfacing Lagged",
+                    );
+                    self.fan_out(&TnExExNotification::Lagged { missed });
+                },
             );
-            self.fan_out(&TnExExNotification::Lagged { missed });
-        });
-        self.fan_out(&TnExExNotification::ChainExecuted { new });
+            self.fan_out(&TnExExNotification::ChainExecuted { new });
+        }
     }
 
     /// Record an ExEx progress event, then recompute the minimum finished height.
@@ -505,6 +519,28 @@ mod tests {
         // Exactly one notification, no spurious Lagged marker.
         assert!(matches!(rx.try_recv(), Ok(TnExExNotification::Lagged { missed: FILLER })));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_canonical_commit_is_ignored_not_panicked() {
+        // reth's `Chain::range()`/`tip()` panic on an empty chain. An empty
+        // canonical commit must be dropped (no fan-out, no gap-tracker advance)
+        // rather than panic the manager task and disable ExEx fan-out for the
+        // node's lifetime. Reverting the `is_empty` guard makes this test panic
+        // with "Chain should have at least one block".
+        let (tx, mut rx) = mpsc::channel(4);
+        let (min_finished_height_tx, _min_rx) = watch::channel(None);
+        let mut router = Router {
+            exexes: vec![ExExHandle::new("test".to_string(), tx)],
+            min_finished_height_tx,
+            last_canon_tip: None,
+        };
+
+        router.handle_canon_commit(Arc::new(Chain::default()));
+
+        // Nothing fanned out, and the discontinuity tracker did not advance.
+        assert!(rx.try_recv().is_err());
+        assert_eq!(router.last_canon_tip, None);
     }
 
     #[test]

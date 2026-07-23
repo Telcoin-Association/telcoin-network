@@ -5,7 +5,7 @@ use futures::{stream, StreamExt};
 use std::pin::Pin;
 use tn_reth::RethEnv;
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{BlockHeader as _, BlockNumber};
+use tn_types::BlockNumber;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -225,16 +225,21 @@ fn dedup_chain_executed(
 
     stream
         .scan(None::<BlockNumber>, |last_height, item| {
-            // Borrow `item` only long enough to read the execution height.
-            let height = match &item {
-                Ok(TnExExNotification::ChainExecuted { new }) => Some(new.tip().number()),
-                _ => None,
+            // A `ChainExecuted` is de-duplicated by execution height, read through
+            // the non-panicking `blocks()` map: `Chain::tip()` panics on an empty
+            // chain ("Chain should have at least one block"). An empty chain (never
+            // produced today, but guarded defensively) carries no height and is
+            // dropped; it advances nothing and has nothing to deliver. Every other
+            // item (errors, `Lagged` markers, certificate/output signals) carries
+            // no height and always passes through.
+            let keep = match &item {
+                Ok(TnExExNotification::ChainExecuted { new }) => new
+                    .blocks()
+                    .last_key_value()
+                    .is_some_and(|(&height, _)| keep_height(last_height, height)),
+                _ => true,
             };
-            let keep = match height {
-                Some(h) => keep_height(last_height, h).then_some(item),
-                None => Some(item),
-            };
-            futures::future::ready(Some(keep))
+            futures::future::ready(Some(keep.then_some(item)))
         })
         .filter_map(futures::future::ready)
 }
@@ -271,5 +276,22 @@ mod tests {
         assert!(matches!(out[0], Ok(TnExExNotification::Lagged { missed: 1 })));
         assert!(out[1].is_err());
         assert!(matches!(out[2], Ok(TnExExNotification::Lagged { missed: 2 })));
+    }
+
+    #[tokio::test]
+    async fn dedup_drops_empty_chain_without_panicking() {
+        // A (defensively) empty `ChainExecuted` carries no height, and
+        // `Chain::tip()` panics on it. dedup must drop the empty item and keep
+        // draining the stream: the trailing `Lagged` marker still passes through.
+        // Reverting the guard to `new.tip().number()` makes this test panic.
+        use crate::Chain;
+        use std::sync::Arc;
+        let items: Vec<eyre::Result<TnExExNotification>> = vec![
+            Ok(TnExExNotification::ChainExecuted { new: Arc::new(Chain::default()) }),
+            Ok(TnExExNotification::Lagged { missed: 7 }),
+        ];
+        let out: Vec<_> = dedup_chain_executed(stream::iter(items)).collect().await;
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Ok(TnExExNotification::Lagged { missed: 7 })));
     }
 }
