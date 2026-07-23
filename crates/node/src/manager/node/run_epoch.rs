@@ -99,10 +99,11 @@ where
     ///    iteration. Otherwise, block until the engine has executed the last replayed output before
     ///    going live.
     /// 4. Subscribe to consensus output, configure consensus, and create the primary/worker
-    ///    components. The one-time per-process network setup is gated on `network_first_init`,
-    ///    which is driven by `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the
-    ///    replay-and-close return above can defer setup to a following iteration without skipping
-    ///    it.
+    ///    components. The previous and next committees' keys are resolved first in ONE batched read
+    ///    pinned to the epoch-start header and threaded into both steps as parameters. The one-time
+    ///    per-process network setup is gated on `network_first_init`, which is driven by
+    ///    `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the replay-and-close
+    ///    return above can defer setup to a following iteration without skipping it.
     /// 5. Start the primary (if this node is an active CVV), the subscriber, the worker batch
     ///    builder, and the engine batch builder; reattach any orphaned batches.
     /// 6. `tokio::select!` over three exits: node shutdown, the epoch boundary
@@ -156,14 +157,18 @@ where
         // CURRENT epoch's stored committee arrays immediately) re-reads the IDENTICAL
         // epoch-start membership - RewardsCounter rows, quorum thresholds, leader schedule -
         // instead of the post-burn tip set, so entry timing can no longer change the node's
-        // view of the epoch.
+        // view of the epoch. The neighbor-committee hoist below (previous and next, batched in
+        // one pinned EVM at the same header) is an entry read too and inherits the same
+        // stability.
         //
         // That value-stability is also the safety argument under concurrent execution -
         // `send_leftover_consensus_output_to_engine` forwards leftover output without waiting,
         // so the engine may still be executing (calling `inc_block`) while this entry runs:
-        // `apply`'s resize no-ops, its fee writes rewrite the same values, and
-        // `GasAccumulator::set_num_workers` refuses to shrink below an in-flight worker id -
-        // NOT quiescence. See the `mode_change_reentry_is_idempotent` IT.
+        // `apply`'s resize no-ops and its fee writes rewrite the same values. The guard is
+        // value-stability, NOT quiescence and NOT any refusal inside `set_num_workers` (it
+        // truncates unconditionally): the pinned re-read yields the identical count so the resize
+        // no-ops, and a shrink below an in-flight worker id would trip `inc_block`'s production
+        // panic rather than pass silently. See the `mode_change_reentry_is_idempotent` IT.
         //
         // Seed the accumulator's worker count and per-worker base fees for the entered epoch
         // from the pinned header (the previous epoch's closing block). This is the single seam
@@ -244,9 +249,37 @@ where
 
         // subscribe to output early to prevent missed messages
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
-        let consensus_config = self
-            .configure_consensus(engine, network_config, committee, &epoch_start_header)
-            .await?;
+
+        // Neighbor committees from on-chain state - canonical source of truth - resolve through
+        // ONE pinned EVM at the held epoch-start header. The previous epoch's committee array
+        // is frozen once this epoch starts (a mid-epoch burn mutates the current and future
+        // epochs' arrays, never a past epoch's), and the registry at the pin already serves the
+        // next epoch's committee, so a post-burn re-entry derives the same sets (see the
+        // ENTRY-READ INVARIANT above). Both stay hard errors: either read failing already
+        // halted the entry before this hoist.
+        let (previous_committee_keys, next_committee_keys): (HashSet<BlsPublicKey>, Vec<_>) =
+            if entered == 0 {
+                // epoch 0 has no previous committee
+                let [next] = engine
+                    .validators_for_epochs_at_header(&[entered + 1], &epoch_start_header)
+                    .await?
+                    .try_into()
+                    .map_err(|_| eyre::eyre!("neighbor-committee batch arity mismatch"))?;
+                (HashSet::new(), next)
+            } else {
+                let [previous, next] = engine
+                    .validators_for_epochs_at_header(
+                        &[entered - 1, entered + 1],
+                        &epoch_start_header,
+                    )
+                    .await?
+                    .try_into()
+                    .map_err(|_| eyre::eyre!("neighbor-committee batch arity mismatch"))?;
+                (previous.into_iter().collect(), next)
+            };
+
+        let consensus_config =
+            self.configure_consensus(network_config, committee, next_committee_keys).await?;
 
         // The networks need their one-time, per-process setup (start listening, register bootstrap
         // peers) on the first iteration that actually reaches `create_consensus`. This is usually
@@ -268,6 +301,7 @@ where
                 consensus_bus.clone(),
                 consensus_config.clone(),
                 &epoch_start_header,
+                previous_committee_keys,
             )
             .await?;
         // Networks are now set up; subsequent epochs rotate committees instead of re-seeding.
