@@ -19,6 +19,42 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+/// Building a consensus config with a peer-score config whose `min_score > max_score` must fail
+/// at construction, before any `PeerManager`/`Score` exists. This pins the startup wiring of
+/// `ScoreConfig::validate` into `ConsensusConfig::new_with_committee`: without that call the bad
+/// bounds would install into the global score config and only panic later, inside the running
+/// swarm, at the first non-fatal peer penalty (`Score::add`'s `f64::clamp`).
+#[test]
+fn consensus_config_rejects_invalid_score_config() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    // Borrow one authority's valid base config/storage/keys so the only invalid input is the
+    // peer-score config we inject below.
+    let (base_config, node_storage, key_config) = {
+        let authority = fixture.authorities().next().expect("fixture yields an authority");
+        let cc = authority.consensus_config();
+        (cc.config().clone(), cc.node_storage().clone(), cc.key_config().clone())
+    };
+
+    let mut network_config = NetworkConfig::default();
+    let score = &mut network_config.peer_config_mut().score_config;
+    score.min_score = 1.0;
+    score.max_score = -1.0;
+
+    let Err(err) = ConsensusConfig::new_with_committee_for_test(
+        base_config,
+        node_storage,
+        key_config,
+        fixture.committee(),
+        network_config,
+    ) else {
+        panic!("min_score > max_score must be rejected when the consensus config is built");
+    };
+    assert!(
+        err.to_string().contains("min_score"),
+        "the rejection must name the offending field, got: {err}"
+    );
+}
+
 /// Helper function to create peers.
 fn create_test_peers<Req: TNMessage, Res: TNMessage>(
     num_peers: NonZeroUsize,
