@@ -111,7 +111,7 @@ pub fn config_local_testnet_with_epoch_duration(
     accounts: Option<Vec<(Address, GenesisAccount)>>,
     epoch_duration_secs: Option<u32>,
 ) -> eyre::Result<()> {
-    config_local_testnet_inner(temp_path, passphrase, accounts, epoch_duration_secs, &[])
+    config_local_testnet_inner(temp_path, passphrase, accounts, epoch_duration_secs, &[], None)
 }
 
 /// Like [`config_local_testnet_with_epoch_duration`], but also lets the caller set per-worker
@@ -139,7 +139,19 @@ pub fn config_local_testnet_with_worker_fee_configs(
         accounts,
         epoch_duration_secs,
         worker_fee_configs,
+        None,
     )
+}
+
+/// Like [`config_local_testnet`], but sets a restart-test garbage-collection depth so a
+/// killed CVV crosses the `CvvInactive` demotion threshold after a shorter downtime.
+pub fn config_local_testnet_with_gc_depth(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    gc_depth: Option<u32>,
+) -> eyre::Result<()> {
+    config_local_testnet_inner(temp_path, passphrase, accounts, None, &[], gc_depth)
 }
 
 /// Shared implementation for the `config_local_testnet*` helpers.
@@ -154,6 +166,7 @@ fn config_local_testnet_inner(
     accounts: Option<Vec<(Address, GenesisAccount)>>,
     epoch_duration_secs: Option<u32>,
     worker_fee_configs: &[&str],
+    gc_depth: Option<u32>,
 ) -> eyre::Result<()> {
     let validators = [
         ("validator-1", "0x1111111111111111111111111111111111111111"),
@@ -200,6 +213,10 @@ fn config_local_testnet_inner(
     if let Some(duration) = epoch_duration_secs {
         genesis_args.push("--epoch-duration-in-secs".into());
         genesis_args.push(duration.to_string());
+    }
+    if let Some(gc_depth) = gc_depth {
+        genesis_args.push("--gc-depth".into());
+        genesis_args.push(gc_depth.to_string());
     }
     // Append one `--worker-fee-config` flag per provided entry. When empty, clap falls back to the
     // genesis default (`0:0:u64::MAX`, an inert EIP-1559 strategy). Any provided configs replace
