@@ -3360,3 +3360,96 @@ async fn oversized_publish_is_refused_locally() -> eyre::Result<()> {
 
     Ok(())
 }
+
+/// Regression (issue #1010): the swarm must cap the number of concurrent established connections a
+/// single peer may hold. Without the `connection_limits::Behaviour` installed by `TNBehavior::new`,
+/// one unbanned peer could open connections with no per-peer ceiling: the peer-count gate counts
+/// *distinct* `PeerId`s, and the inbound admission callback rejects only self-connections and
+/// banned peers.
+///
+/// This drives the exact behaviour the production path installs (`connection_limits_behaviour`)
+/// through the swarm's admission + registration sequence and asserts the cap (1) fires at
+/// `MAX_ESTABLISHED_CONNECTIONS_PER_PEER + 1`, (2) is per-peer (a distinct peer is unaffected), and
+/// (3) counts *concurrent* connections (closing one frees a slot). Before the fix there is no such
+/// behaviour, so no admission is ever denied on this basis.
+#[test]
+fn connection_limit_caps_established_connections_per_peer() {
+    use libp2p::{
+        core::ConnectedPoint,
+        swarm::{
+            behaviour::ConnectionEstablished, ConnectionClosed, ConnectionId, FromSwarm,
+            NetworkBehaviour as _,
+        },
+    };
+
+    // exactly the behaviour installed in production
+    let mut limits = super::connection_limits_behaviour();
+    let cap = usize::try_from(super::MAX_ESTABLISHED_CONNECTIONS_PER_PEER).expect("cap fits usize");
+
+    let peer = PeerId::random();
+    let addr = create_multiaddr(None);
+    let listener =
+        ConnectedPoint::Listener { local_addr: addr.clone(), send_back_addr: addr.clone() };
+
+    // the first `cap` inbound connections from one peer are admitted and registered
+    (0..cap).for_each(|i| {
+        let id = ConnectionId::new_unchecked(i);
+        assert!(
+            limits.handle_established_inbound_connection(id, peer, &addr, &addr).is_ok(),
+            "connection {i} from a peer within the cap must be admitted"
+        );
+        // production path: a successful admission is followed by
+        // `FromSwarm::ConnectionEstablished`, which is what actually increments the
+        // per-peer counter inside `connection_limits`
+        limits.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+            peer_id: peer,
+            connection_id: id,
+            endpoint: &listener,
+            failed_addresses: &[],
+            other_established: i,
+        }));
+    });
+
+    // the next connection from the SAME peer is denied by the per-peer cap
+    let over_cap = ConnectionId::new_unchecked(cap);
+    assert!(
+        limits.handle_established_inbound_connection(over_cap, peer, &addr, &addr).is_err(),
+        "connection number {} from the same peer must be denied by the per-peer cap",
+        cap + 1
+    );
+
+    // a distinct peer is unaffected: the cap is per-peer, not global
+    let other_peer = PeerId::random();
+    assert!(
+        limits
+            .handle_established_inbound_connection(
+                ConnectionId::new_unchecked(cap + 1),
+                other_peer,
+                &addr,
+                &addr,
+            )
+            .is_ok(),
+        "a distinct peer must not be denied because another peer reached the cap"
+    );
+
+    // closing one of the first peer's connections frees a slot: the cap tracks *concurrent*
+    // connections, and the decrement path must work
+    limits.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+        peer_id: peer,
+        connection_id: ConnectionId::new_unchecked(0),
+        endpoint: &listener,
+        cause: None,
+        remaining_established: cap - 1,
+    }));
+    assert!(
+        limits
+            .handle_established_inbound_connection(
+                ConnectionId::new_unchecked(cap + 2),
+                peer,
+                &addr,
+                &addr,
+            )
+            .is_ok(),
+        "after one of the peer's connections closes, a fresh connection from it must be admitted"
+    );
+}

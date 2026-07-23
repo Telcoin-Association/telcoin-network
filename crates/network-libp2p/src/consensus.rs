@@ -19,6 +19,7 @@ use crate::{
 };
 use futures::StreamExt as _;
 use libp2p::{
+    connection_limits::{self, ConnectionLimits},
     gossipsub::{
         self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
         PublishError, Topic, TopicHash,
@@ -79,6 +80,37 @@ const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("1
 /// `MAX_MULTIADDRS_PER_PEER`; that set cap is what bounds accumulation across repeated records.
 const MAX_ADVERTISED_MULTIADDRS: usize = 16;
 
+/// Maximum number of concurrent established connections a single peer may hold, across both
+/// directions (inbound and outbound).
+///
+/// libp2p reports every established connection to the swarm but imposes no per-peer ceiling of its
+/// own. The peer-count admission gate (`PeerConfig::max_peers`) counts *distinct* `PeerId`s, so one
+/// peer holding many simultaneous connections still counts as one, and the inbound admission
+/// callback rejects only self-connections and banned peers. Without this cap a single unbanned peer
+/// could open connections up to the OS / QUIC file-descriptor and memory limits. Installing a
+/// [`connection_limits::Behaviour`] with this per-peer bound closes that gap (issue #1010).
+///
+/// The value is generous headroom over legitimate use: a peer needs at most one inbound and one
+/// outbound connection concurrently (this node dials with `PeerCondition::Disconnected`, so it does
+/// not stack redundant outbound dials), and brief reconnection churn adds only a small transient
+/// overlap. Eight leaves room for that churn while bounding a hostile peer to a fixed, small number
+/// of connections instead of an unbounded fan-out.
+const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
+
+/// Build the [`connection_limits::Behaviour`] that caps concurrent established connections per peer
+/// at [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`].
+///
+/// Only the per-peer bound is set; the other `connection_limits` dimensions (pending / established
+/// totals and per-direction caps) are intentionally left unbounded so this change adds exactly the
+/// missing per-peer ceiling and nothing else. Shared by [`TNBehavior::new`] and its regression test
+/// so both exercise the identical limit.
+fn connection_limits_behaviour() -> connection_limits::Behaviour {
+    connection_limits::Behaviour::new(
+        ConnectionLimits::default()
+            .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER)),
+    )
+}
+
 /// Custom network libp2p behaviour type for Telcoin Network.
 ///
 /// The behavior composes multiple sub-behaviors:
@@ -101,6 +133,13 @@ where
     /// The peer manager — first so banned-peer denials short-circuit
     /// before other behaviors register the connection.
     pub(crate) peer_manager: peers::PeerManager,
+    /// Per-peer connection ceiling (issue #1010).
+    ///
+    /// Placed immediately after `peer_manager` so self / banned denials still fire first (a banned
+    /// peer is rejected before it is counted here), and before the remaining behaviors so an
+    /// over-cap connection is denied before `req_res` / `gossipsub` / `kademlia` register any
+    /// per-peer state for it.
+    pub(crate) connection_limits: connection_limits::Behaviour,
     /// The gossipsub network behavior.
     pub(crate) gossipsub: gossipsub::Behaviour,
     /// The request-response network behavior.
@@ -137,9 +176,18 @@ where
         stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
+        let connection_limits = connection_limits_behaviour();
         let (req_res, peer_exchange) = req_res;
         let stream = StreamBehavior::new(stream_protocol);
-        Self { peer_manager, gossipsub, req_res, peer_exchange, kademlia, stream }
+        Self {
+            peer_manager,
+            connection_limits,
+            gossipsub,
+            req_res,
+            peer_exchange,
+            kademlia,
+            stream,
+        }
     }
 }
 
@@ -667,6 +715,10 @@ where
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 TNBehaviorEvent::PeerExchange(event) => self.process_peer_exchange_event(event)?,
                 TNBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
+                // `connection_limits::Behaviour` emits no events (its `ToSwarm` is `Infallible`);
+                // this arm is uninhabited and exists only to keep the match exhaustive over the
+                // derived event enum.
+                TNBehaviorEvent::ConnectionLimits(event) => match event {},
                 TNBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
                 TNBehaviorEvent::Stream(event) => self.process_stream_event(event)?,
             },
