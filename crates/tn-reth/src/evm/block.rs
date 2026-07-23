@@ -142,57 +142,21 @@ where
         Self { evm, ctx, receipts: Vec::new(), gas_used: 0, spec, receipt_builder }
     }
 
-    /// Increase the beneficiary account balance and withdraw from governance safe.
+    /// Apply the closing epoch call to ConsensusRegistry.
     ///
-    /// This must be called once per epoch, before the conclude epoch call.
-    fn apply_consensus_block_rewards(
+    /// The single epoch-boundary system call: the registry distributes the closing epoch's
+    /// rewards, applies its slashes, settles queued stake version changes, and rotates the
+    /// epoch atomically.
+    fn apply_closing_epoch_contract_call(
         &mut self,
+        randomness: B256,
         rewards: BTreeMap<Address, u32>,
     ) -> TnRethResult<()> {
-        let calldata = self.generate_apply_incentives_calldata(
+        debug!(target: "engine", ?randomness, "applying closing contract call");
+        let calldata = self.generate_conclude_epoch_calldata(
+            randomness,
             rewards.iter().map(|(address, count)| (*address, *count)).collect(),
         )?;
-
-        trace!(target: "engine", ?calldata, "apply incentives calldata");
-
-        // execute system call to consensus registry
-        let mut res = match self.evm.transact_system_call(
-            SYSTEM_ADDRESS,
-            CONSENSUS_REGISTRY_ADDRESS,
-            calldata,
-        ) {
-            Ok(res) => res,
-            Err(e) => {
-                // fatal error
-                error!(target: "engine", "error applying consensus block rewards contract call: {:?}", e);
-                return Err(TnRethError::EVMCustom(format!(
-                    "applying consensus block rewards failed: {e}"
-                )));
-            }
-        };
-
-        // return error if closing epoch call failed
-        if !res.result.is_success() {
-            // execution failed
-            error!(target: "engine", "failed applying consensus block rewards call: {:?}", res.result);
-            return Err(TnRethError::EVMCustom(
-                "failed applying consensus block rewards".to_string(),
-            ));
-        }
-        trace!(target: "engine", ?res, "applying consensus block rewards");
-
-        // clean up SYSTEM_ADDRESS — only touched as the system caller, not a real state change
-        res.state.remove(&SYSTEM_ADDRESS);
-        // commit the changes
-        self.evm.db_mut().commit(res.state);
-
-        Ok(())
-    }
-
-    /// Apply the closing epoch call to ConsensusRegistry.
-    fn apply_closing_epoch_contract_call(&mut self, randomness: B256) -> TnRethResult<()> {
-        debug!(target: "engine", ?randomness, "applying closing contract call");
-        let calldata = self.generate_conclude_epoch_calldata(randomness)?;
         trace!(target: "engine", ?calldata, "close epoch calldata");
 
         // execute system call to consensus registry
@@ -266,7 +230,7 @@ where
     ///
     /// Fires exactly once, from the epoch-closing block that concludes
     /// `CONSENSUS_REGISTRY_FORK_EPOCH - 1`, as the FIRST step of that block's close-epoch handling
-    /// — before `applyIncentives`/`concludeEpoch`, which then run on the swapped-in code with
+    /// — before `concludeEpoch`, which then runs on the swapped-in code with
     /// the migrated sets (the new committee read and eligible-count guard require them). From
     /// this block onward every node runs on the new code with populated sets.
     ///
@@ -387,31 +351,22 @@ where
     }
 
     /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
-    fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> TnRethResult<Bytes> {
+    fn generate_conclude_epoch_calldata(
+        &mut self,
+        randomness: B256,
+        reward_infos: Vec<(Address, u32)>,
+    ) -> TnRethResult<Bytes> {
         // shuffle all validators for new committee
         let mut new_committee = self.shuffle_new_committee(randomness)?;
 
         // sort addresses in ascending order (0x0...0xf)
         new_committee.sort();
-        debug!(target: "engine", ?new_committee, "new committee sorted by address");
+        debug!(target: "engine", ?new_committee, ?reward_infos, "new committee sorted by address");
 
-        // encode the call to bytes with method selector and args
-        let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
-            .abi_encode()
-            .into();
-
-        Ok(bytes)
-    }
-
-    /// Generate calldata for applying incentives when concluding the epoch.
-    fn generate_apply_incentives_calldata(
-        &mut self,
-        reward_infos: Vec<(Address, u32)>,
-    ) -> TnRethResult<Bytes> {
-        debug!(target: "engine", ?reward_infos, "applying incentives");
-
-        // encode the call to bytes with method selector and args
-        let bytes = ConsensusRegistry::applyIncentivesCall {
+        // encode the call to bytes with method selector and args; slashing is not enabled, so
+        // the slashes array is always empty
+        let bytes = ConsensusRegistry::concludeEpochCall {
+            newCommittee: new_committee,
             rewardInfos: reward_infos
                 .iter()
                 .map(|(address, count)| RewardInfo {
@@ -419,6 +374,7 @@ where
                     consensusHeaderCount: U256::from(*count),
                 })
                 .collect(),
+            slashes: Vec::new(),
         }
         .abi_encode()
         .into();
@@ -799,7 +755,7 @@ where
             // FORK_EPOCH` makes the swapped code + migrated per-status sets live for
             // the remainder of this very block.
             //
-            // This MUST run BEFORE the rewards/conclude calls below. `shuffle_new_committee`
+            // This MUST run BEFORE the conclude call below. `shuffle_new_committee`
             // (inside `apply_closing_epoch_contract_call`) routes its committee-pool read
             // by the registry's code hash (`read_committee_eligible_pool`): swapping first
             // flips that gate to the post-fork `getValidatorsInfo` union for the remainder
@@ -821,12 +777,11 @@ where
                 })?;
             }
 
-            self.apply_consensus_block_rewards(self.ctx.rewards_counter.get_address_counts())
-                .map_err(|e| {
-                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
-                })?;
-
-            self.apply_closing_epoch_contract_call(randomness).map_err(|e| {
+            self.apply_closing_epoch_contract_call(
+                randomness,
+                self.ctx.rewards_counter.get_address_counts(),
+            )
+            .map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
 

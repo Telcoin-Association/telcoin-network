@@ -6,7 +6,7 @@ The compatibility crate for using `reth` as an execution library for Telcoin Net
 
 Telcoin Network uses EVM for executing transactions.
 The consensus layer is agnostic to the execution environment.
-System calls are used to apply incentives at the end of every epoch before calling `concludeEpoch` on the ConsensusRegistry.
+At the end of every epoch a single system call to `concludeEpoch` on the ConsensusRegistry distributes the closing epoch's incentives, applies its slashes, settles queued stake version changes, and rotates the epoch atomically.
 
 The current fork is `pectra`.
 
