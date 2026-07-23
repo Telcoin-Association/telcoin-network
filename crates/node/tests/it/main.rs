@@ -2277,11 +2277,10 @@ async fn test_epoch_record_chain_across_mid_epoch_ejection() -> eyre::Result<()>
 
     // committee reads through the same `getCommitteeBlsPubkeys` path the node performs for
     // `write_epoch_record`. The node pins that read to the epoch-closing block; every read
-    // below happens while the canonical tip IS the relevant closing block, so the tip read
-    // resolves the identical state.
+    // below happens while the canonical tip IS the relevant closing block.
     let keys_for_epoch = |e: u32| -> eyre::Result<Vec<BlsPublicKey>> {
         Ok(reth_env
-            .bls_pubkeys_for_epoch(e)?
+            .bls_pubkeys_for_epoch_at_block(e, reth_env.canonical_tip().hash())?
             .iter()
             .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
             .collect())
