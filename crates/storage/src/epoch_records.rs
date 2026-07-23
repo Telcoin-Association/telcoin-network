@@ -223,6 +223,55 @@ impl EpochRecordDb {
         })
     }
 
+    /// Read every [`EpochRecord`] from a bare records pack file (e.g. an `epoch_records` file
+    /// copied out of an export bundle) without needing its sidecar indexes. Records come back
+    /// in stored (epoch-ascending) order.
+    ///
+    /// Used by `db load-state` to rebuild a fully-indexed records database from a data-only bundle:
+    /// the returned records are re-saved through [`EpochRecordDb::save_record`] (which rebuilds the
+    /// indexes) and also supply the previous-epoch / final-consensus-number context needed to
+    /// stream-import the matching consensus pack.
+    pub fn read_records_from_pack<P: Into<PathBuf>>(
+        path: P,
+    ) -> Result<Vec<EpochRecord>, EpochDbError> {
+        let pack = Pack::<EpochRecord>::open(
+            path.into(),
+            Inner::PACK_EPOCH,
+            true,
+            PackCompression::ZStd,
+            EPOCH_PACK_VERSION,
+        )
+        .map_err(|_| EpochDbError::CorruptDb)?;
+        let mut records = Vec::new();
+        for record in pack.raw_iter().map_err(|_| EpochDbError::CorruptDb)? {
+            records.push(record.map_err(|_| EpochDbError::CorruptDb)?);
+        }
+        Ok(records)
+    }
+
+    /// Read every [`EpochCertificate`] from a bare certs pack file (e.g. an `epoch_certs` file
+    /// copied out of an export bundle) without needing its sidecar index. Certificates come back in
+    /// stored order; match one to its record with `cert.epoch_hash == record.digest()`.
+    ///
+    /// Used by `db load-state` to verify each restored epoch record against its certificate.
+    pub fn read_certs_from_pack<P: Into<PathBuf>>(
+        path: P,
+    ) -> Result<Vec<EpochCertificate>, EpochDbError> {
+        let pack = Pack::<EpochCertificate>::open(
+            path.into(),
+            Inner::CERT_PACK_EPOCH,
+            true,
+            PackCompression::ZStd,
+            EPOCH_PACK_VERSION,
+        )
+        .map_err(|_| EpochDbError::CorruptDb)?;
+        let mut certs = Vec::new();
+        for cert in pack.raw_iter().map_err(|_| EpochDbError::CorruptDb)? {
+            certs.push(cert.map_err(|_| EpochDbError::CorruptDb)?);
+        }
+        Ok(certs)
+    }
+
     /// Return any delayed error recorded by the background thread.
     /// Also clears the error.
     pub fn get_error(&self) -> Result<(), EpochDbError> {
@@ -864,7 +913,7 @@ mod test {
     };
 
     use crate::epoch_records::{
-        epoch_committee_valid, EpochRecordDb, EpochRecordValidation, RECORDS_NAME,
+        epoch_committee_valid, EpochRecordDb, EpochRecordValidation, CERTS_NAME, RECORDS_NAME,
     };
 
     // Minimal BlsSigner wrapper around a BlsKeypair.
@@ -929,6 +978,45 @@ mod test {
         }
         let cert = EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
         (record, cert)
+    }
+
+    #[tokio::test]
+    async fn read_records_and_certs_from_pack_round_trips() {
+        let temp_dir = TempDir::with_prefix("read_records_from_pack").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        // Write a handful of records with their certificates, flush, and close so the on-disk
+        // `epochs.pack` / `epoch_certs.pack` are complete.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let mut records = Vec::new();
+        let mut certs = Vec::new();
+        let mut parent = EpochDigest::default();
+        for epoch in 0..6u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            db.save(record.clone(), cert.clone()).await.expect("save record + cert");
+            records.push(record);
+            certs.push(cert);
+        }
+        db.persist().await.expect("persist");
+        drop(db);
+
+        // Reading the bare packs (no sidecar indexes) must return every record and cert in order.
+        let got_records = EpochRecordDb::read_records_from_pack(temp_dir.path().join(RECORDS_NAME))
+            .expect("read records from pack");
+        assert_eq!(got_records.len(), records.len());
+        for (got, want) in got_records.iter().zip(records.iter()) {
+            assert_eq!(got.epoch, want.epoch);
+            assert_eq!(got.digest(), want.digest());
+        }
+
+        let got_certs = EpochRecordDb::read_certs_from_pack(temp_dir.path().join(CERTS_NAME))
+            .expect("read certs from pack");
+        assert_eq!(got_certs.len(), certs.len());
+        for (got, want) in got_certs.iter().zip(certs.iter()) {
+            assert_eq!(got.epoch_hash, want.epoch_hash);
+        }
     }
 
     #[tokio::test]
@@ -1306,6 +1394,54 @@ mod test {
         let validation = db.validate_downloaded_record(0, &rec0, &cert0).await;
         assert_eq!(validation, EpochRecordValidation::Valid);
         assert!(validation.is_valid());
+    }
+
+    #[tokio::test]
+    async fn validate_chain_against_seeded_genesis_dummy() {
+        // Mirrors `db load-state`'s verification: seed a dummy epoch-0 carrying the genesis
+        // committee, verify the real epoch-0 record against it *before* saving (so the dummy — not
+        // the record itself — is the trust anchor), then verify epoch 1 against the saved epoch-0's
+        // `next_committee`.
+        let temp_dir = TempDir::with_prefix("validate_seeded_dummy").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let committee: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let genesis_keys: Vec<BlsPublicKey> = committee.iter().map(|s| s.public_key()).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        db.save_dummy_epoch0(EpochRecord {
+            epoch: 0,
+            committee: genesis_keys.clone(),
+            next_committee: genesis_keys,
+            ..Default::default()
+        })
+        .await
+        .expect("seed dummy");
+
+        // Epoch 0 verifies against the seeded dummy (record index still empty), then is saved.
+        let (rec0, cert0) = make_test_pair(0, &committee, EpochDigest::default());
+        assert_eq!(
+            db.validate_downloaded_record(0, &rec0, &cert0).await,
+            EpochRecordValidation::Valid,
+            "epoch 0 should verify against the seeded genesis committee"
+        );
+        db.save(rec0.clone(), cert0.clone()).await.expect("save epoch 0");
+
+        // Epoch 1 chains from the saved epoch-0 record and verifies against its `next_committee`.
+        let (rec1, cert1) = make_test_pair(1, &committee, rec0.digest());
+        assert_eq!(
+            db.validate_downloaded_record(1, &rec1, &cert1).await,
+            EpochRecordValidation::Valid,
+            "epoch 1 should verify against the saved epoch-0 next_committee"
+        );
+
+        // A record whose committee is unrelated to the trusted chain is rejected.
+        let attacker: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let (bad1, bad_cert1) = make_test_pair(1, &attacker, rec0.digest());
+        assert_ne!(
+            db.validate_downloaded_record(1, &bad1, &bad_cert1).await,
+            EpochRecordValidation::Valid,
+            "a record signed by an unanchored committee must be rejected"
+        );
     }
 
     #[tokio::test]
