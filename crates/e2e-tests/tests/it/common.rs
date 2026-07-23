@@ -43,7 +43,7 @@ use tn_test_utils::{wait_until, wait_until_blocking};
 use tn_types::{
     address, get_available_tcp_port, keccak256,
     test_utils::{init_test_tracing, CommandParser},
-    Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount, RpcInfo, U256,
+    Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount, NodeMode, RpcInfo, U256,
 };
 use tokio::{
     runtime::Builder,
@@ -528,6 +528,16 @@ pub(crate) fn get_latest_consensus_header(node: &str) -> eyre::Result<HashMap<St
 /// Retrieve a node's identifying information.
 pub(crate) fn get_node_info(node: &str) -> eyre::Result<HashMap<String, Value>> {
     call_rpc(node, "tn_info", rpc_params![], 10, "tn_info")
+}
+
+/// Retrieve a node's current consensus participation mode ([`NodeMode`]) over RPC.
+///
+/// Reads the live mode (via `tn_nodeMode`), so repeated calls can observe transient modes such as
+/// [`NodeMode::CvvInactive`] while a restarted node catches up. A node whose RPC is not yet up
+/// (e.g. mid-restart) surfaces as an `Err` here rather than panicking; `call_rpc`'s own retries
+/// absorb brief unavailability.
+pub(crate) fn get_node_mode(node: &str) -> eyre::Result<NodeMode> {
+    call_rpc(node, "tn_nodeMode", rpc_params![], 10, "tn_nodeMode")
 }
 
 /// Query a node's highest consensus chain block height.

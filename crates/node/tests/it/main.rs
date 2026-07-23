@@ -250,6 +250,10 @@ impl EngineToPrimary for NoopEngineToPrimary {
     fn node_info(&self) -> &RpcNodeInfo {
         unreachable!("EngineToPrimary RPC is not exercised in this test")
     }
+
+    fn node_mode(&self) -> tn_types::NodeMode {
+        unreachable!("EngineToPrimary RPC is not exercised in this test")
+    }
 }
 
 /// A worker's transaction pool charges the base fee supplied at epoch setup (the
