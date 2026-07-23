@@ -383,16 +383,24 @@ impl ExecutionNodeInner {
     }
 
     /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
+    /// On-chain BLS key bytes are decoded here; a decode failure is a hard error, mirroring the
+    /// epoch-entry committee read.
     pub(super) fn validators_for_epoch_at_block(
         &self,
         epoch: u32,
         block_hash: B256,
     ) -> eyre::Result<Vec<BlsPublicKey>> {
-        Ok(self
-            .reth_env
+        self.reth_env
             .bls_pubkeys_for_epoch_at_block(epoch, block_hash)?
             .iter()
-            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
-            .collect())
+            .map(|bls| {
+                BlsPublicKey::from_literal_bytes(bls.as_ref()).map_err(|err| {
+                    eyre::eyre!(
+                        "failed to create bls key from on-chain bytes for epoch {epoch} at block \
+                         {block_hash:?}: {err:?}"
+                    )
+                })
+            })
+            .collect()
     }
 }
