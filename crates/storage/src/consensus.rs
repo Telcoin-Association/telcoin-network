@@ -115,6 +115,20 @@ impl LatestConsensus {
         }
     }
 
+    /// Encode a slot file's 16-byte payload: `epoch` (u32 LE) + `number` (u64 LE) + a crc32 (LE)
+    /// over the two. Mirrors [`Self::read_slot`].
+    fn encode_slot(epoch: Epoch, number: u64) -> [u8; 16] {
+        let mut buffer = [0_u8; 16];
+        buffer[0..4].copy_from_slice(&epoch.to_le_bytes());
+        buffer[4..12].copy_from_slice(&number.to_le_bytes());
+        let mut crc32_hasher = crc32fast::Hasher::new();
+        crc32_hasher.update(&epoch.to_le_bytes());
+        crc32_hasher.update(&number.to_le_bytes());
+        let crc32 = crc32_hasher.finalize();
+        buffer[12..16].copy_from_slice(&crc32.to_le_bytes());
+        buffer
+    }
+
     /// Create a new latest consensus that saves files into base_path.
     fn new(base_path: &Path) -> Result<Self, ConsensusChainError> {
         let slot1_path = base_path.join("consensus_slot1");
@@ -155,14 +169,7 @@ impl LatestConsensus {
                             ConsensusSlot::Slot1 => &mut slot1,
                             ConsensusSlot::Slot2 => &mut slot2,
                         };
-                        let mut buffer = [0_u8; 16];
-                        buffer[0..4].copy_from_slice(&epoch.to_le_bytes());
-                        buffer[4..12].copy_from_slice(&number.to_le_bytes());
-                        let mut crc32_hasher = crc32fast::Hasher::new();
-                        crc32_hasher.update(&epoch.to_le_bytes());
-                        crc32_hasher.update(&number.to_le_bytes());
-                        let crc32 = crc32_hasher.finalize();
-                        buffer[12..16].copy_from_slice(&crc32.to_le_bytes());
+                        let buffer = LatestConsensus::encode_slot(epoch, number);
                         if let Err(e) = f.seek(SeekFrom::Start(0)) {
                             error!(target: "consensus_chain", ?e, ?slot, "failed to sync a latest consensus state file");
                             continue;
@@ -1034,6 +1041,27 @@ impl ConsensusChain {
         self.latest_consensus.epoch()
     }
 
+    /// Write the "latest consensus" slot hint under `base_path` to `(epoch, number)` so a node
+    /// opened there resumes from that consensus output instead of genesis. Writes one slot
+    /// (`consensus_slot1`); the other stays `(0, 0)` and loses the [`LatestConsensus::new`]
+    /// reconciliation. Used by `db load-state` after rebuilding an imported epoch's packs.
+    pub fn write_latest_consensus_hint(
+        base_path: &Path,
+        epoch: Epoch,
+        number: u64,
+    ) -> Result<(), ConsensusChainError> {
+        let buffer = LatestConsensus::encode_slot(epoch, number);
+        let mut slot = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(base_path.join("consensus_slot1"))?;
+        slot.seek(SeekFrom::Start(0))?;
+        slot.write_all(&buffer)?;
+        slot.sync_all()?;
+        Ok(())
+    }
+
     /// Resolve when the current epoch is fully persisted to storage.
     pub async fn persist_current(&self) -> Result<(), ConsensusChainError> {
         let pack = &self.current_pack();
@@ -1470,6 +1498,20 @@ mod test {
         assert_eq!(latest.epoch(), 2);
         assert_eq!(latest.number(), 20);
         assert_eq!(latest.current_slot(), ConsensusSlot::Slot2);
+    }
+
+    #[tokio::test]
+    async fn write_latest_consensus_hint_sets_resume_point() {
+        // `db load-state` writes one slot so a restarted node resumes at the imported epoch's final
+        // consensus rather than genesis.
+        let temp_dir = TempDir::with_prefix("write_hint").unwrap();
+        ConsensusChain::write_latest_consensus_hint(temp_dir.path(), 3, 42).expect("write hint");
+
+        // A fresh LatestConsensus (what the node opens at startup) must pick up the hint from the
+        // one written slot; the empty second slot reads as (0, 0) and loses reconciliation.
+        let latest = LatestConsensus::new(temp_dir.path()).unwrap();
+        assert_eq!(latest.epoch(), 3);
+        assert_eq!(latest.number(), 42);
     }
 
     /// A corrupt slot file must not fail to open the chain; the other (valid) slot is used.
