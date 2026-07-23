@@ -9,11 +9,11 @@ request method, JSON-RPC body, and content type; the header contract is
 deliberately minimal (see Scope).
 
 Because every instance is stateless and identical, the gateway can be scaled
-horizontally: any replica can serve any request. This is PR3 of the epic
-(issue #712): it adds the edge protections (per-IP and global rate limits, a
-configurable request-size limit, and shallow `eth_sendRawTransaction` screening)
-on top of the PR2 proxy core. Observability and deployment (Prometheus,
-Dockerfile, k8s/HPA) land in PR4.
+horizontally: any replica can serve any request. This is PR4 of the epic
+(issue #712): it adds observability and deployment (a Prometheus `/metrics`
+endpoint, a container image, and reference Kubernetes manifests including an
+autoscaler keyed on the in-flight-request gauge) on top of the PR2 proxy core
+and the PR3 edge protections.
 
 ## Scope (v1)
 
@@ -109,6 +109,7 @@ Every flag has an environment-variable fallback.
 | `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
+| `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 
 Durations use `humantime` syntax (`5s`, `2m`, `500ms`).
@@ -217,3 +218,46 @@ spec's standard "Invalid Request" code).
 On SIGTERM (or ctrl-c) the gateway stops accepting new connections and drains
 in-flight requests, up to `--graceful-shutdown-timeout`. Requests still running
 after the deadline are force-closed.
+
+## Observability
+
+Pass `--metrics <addr>` (or `WORKER_GATEWAY_METRICS_ADDR`) to expose a Prometheus
+scrape endpoint at `GET /metrics` on its own listener, separate from the client
+JSON-RPC port. Leave it unset to disable metrics entirely (the instrumentation
+then compiles to no-ops). The endpoint is unauthenticated, so bind it to an
+internal interface, not the public edge.
+
+The endpoint reuses the node's `tn-metrics` recorder, so the gateway's
+`tn_worker_gateway_*` series render alongside a node's `tn_*` metrics under one
+Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
+`grafana-worker-gateway.json`.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests currently in flight; the intended autoscaling signal. |
+| `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected`) | Proxied requests by terminal outcome. |
+| `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected proxied requests, broken down by reason (the conditions in the failure table above). |
+| `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency. |
+| `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
+
+The gateway's own `/health` and `/ready` probes are not proxied and are excluded
+from these series, so they reflect real client load only. The scrape also
+carries a `tn_info{version}` build gauge and process metrics; the process
+metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
+shared recorder's reth-compatible naming.
+
+## Deployment
+
+A container image is built by `bin/worker-gateway/Dockerfile`, which mirrors the
+node's `etc/Dockerfile` (rust:1.94 builder, slim debian runtime, non-root user).
+Build it from the repository root:
+
+```
+docker build -f bin/worker-gateway/Dockerfile -t telcoin-worker-gateway:latest .
+```
+
+Reference Kubernetes manifests live under `deploy/k8s/` (a Deployment, Service,
+ServiceMonitor, and a HorizontalPodAutoscaler keyed on the
+`tn_worker_gateway_inflight_requests` gauge). They are a starting point, not a
+turnkey install: see `deploy/README.md` for the placeholders to replace and the
+prometheus-adapter rule the autoscaler needs.

@@ -33,6 +33,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limit_per_ip,
         rate_limit_global,
         graceful_shutdown_timeout,
+        metrics_addr,
     } = settings;
 
     info!(
@@ -72,6 +73,39 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     );
     let spawner = task_manager.get_spawner();
     let shutdown = Notifier::new();
+
+    // Optional Prometheus scrape endpoint on its own listener. Reuses the node's
+    // `tn-metrics` recorder + server so the gateway's `tn_worker_gateway_*` series
+    // render alongside the node's `tn_*` metrics under one collector; with
+    // `--metrics` unset the `metrics` facade macros stay cheap no-ops.
+    //
+    // It runs under its OWN task manager, deliberately NOT passed to
+    // `join_until_exit`: `start_metrics_server` spawns long-lived accept/upkeep
+    // loops that have no graceful-shutdown branch, so joining them would stall
+    // shutdown for the whole join deadline. Held in `_metrics_task_manager` for
+    // the process lifetime and torn down with the process once the proxy has
+    // drained; the endpoint stays up through the drain so a final scrape still
+    // succeeds.
+    let _metrics_task_manager = if let Some(metrics_addr) = metrics_addr {
+        tn_metrics::install_recorder()?;
+        let metrics_task_manager = TaskManager::new("worker-gateway-metrics");
+        let bound = tn_metrics::start_metrics_server(
+            metrics_addr,
+            &metrics_task_manager.get_spawner(),
+            env!("CARGO_PKG_VERSION"),
+            tn_metrics::MetricsHooks::default(),
+        )
+        .await?;
+        // Seed each worker's readiness gauge so the series exists (at 0) before
+        // the first poll cycle publishes a real value.
+        upstreams
+            .iter()
+            .for_each(|upstream| crate::telemetry::set_upstream_ready(upstream.worker_id, false));
+        info!(target: "gateway", %bound, "metrics endpoint listening");
+        Some(metrics_task_manager)
+    } else {
+        None
+    };
 
     let state = AppState { readiness: Arc::clone(&readiness), http: proxy_client };
 

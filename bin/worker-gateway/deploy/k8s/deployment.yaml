@@ -1,0 +1,83 @@
+# Reference Deployment for the Telcoin Network worker gateway.
+# This is a starting point, not a turnkey manifest -- see ../README.md for the
+# placeholders you must replace before applying it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-gateway
+  labels:
+    app: worker-gateway
+    app.kubernetes.io/name: worker-gateway
+    app.kubernetes.io/part-of: telcoin-network
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: worker-gateway
+  template:
+    metadata:
+      labels:
+        app: worker-gateway
+        app.kubernetes.io/name: worker-gateway
+        app.kubernetes.io/part-of: telcoin-network
+    spec:
+      # Slightly longer than the gateway's own --graceful-shutdown-timeout
+      # (default 30s, WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT) so the process
+      # can finish draining in-flight proxied requests before the kubelet sends
+      # SIGKILL.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: worker-gateway
+          # Replace with your registry ref, e.g. registry.example.com/telcoin/worker-gateway:<tag>
+          image: telcoin-worker-gateway:latest
+          env:
+            # Client JSON-RPC + /health + /ready all listen here.
+            - name: WORKER_GATEWAY_LISTEN_ADDR
+              value: "0.0.0.0:8545"
+            # Prometheus /metrics listens on this SEPARATE address (equivalent
+            # to the --metrics flag). Keep it cluster-internal; it is unauthenticated.
+            - name: WORKER_GATEWAY_METRICS_ADDR
+              value: "0.0.0.0:9100"
+            # Placeholder upstream worker endpoints. Replace with your in-cluster
+            # worker Service DNS, or drop these two vars and mount a --config file
+            # from a ConfigMap (WORKER_GATEWAY_CONFIG / --config) instead.
+            - name: WORKER_GATEWAY_UPSTREAM_RPC_URL
+              value: "http://tn-worker.telcoin-network.svc.cluster.local:8545"
+            - name: WORKER_GATEWAY_UPSTREAM_READINESS_URL
+              value: "http://tn-worker.telcoin-network.svc.cluster.local:8545/ready"
+          ports:
+            - name: rpc
+              containerPort: 8545
+            - name: metrics
+              containerPort: 9100
+          livenessProbe:
+            # /health is liveness: always 200 while the process is up.
+            httpGet:
+              path: /health
+              port: rpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            # /ready is readiness: 200 when an upstream worker is ready, else 503.
+            httpGet:
+              path: /ready
+              port: rpc
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            # Matches the non-root uid baked into the image.
+            runAsUser: 1101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault

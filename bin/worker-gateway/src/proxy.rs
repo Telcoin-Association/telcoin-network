@@ -31,6 +31,7 @@ use url::Url;
 use crate::{
     error::{error_response, GatewayError},
     server::AppState,
+    telemetry,
 };
 
 /// Default maximum request body the gateway will buffer before forwarding.
@@ -66,6 +67,10 @@ pub(crate) async fn proxy(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    // Track this proxied request in the in-flight gauge (the autoscaling signal)
+    // and time it; the guard releases both on every return path below.
+    let _in_flight = telemetry::RequestInFlight::enter();
+
     let body = match body {
         Ok(body) => body,
         Err(rejection) => return reject_body(&rejection),
@@ -97,7 +102,10 @@ pub(crate) async fn proxy(
     };
 
     match forward(&state.http, method, &headers, body.clone(), rpc_url, peer).await {
-        Ok(response) => response,
+        Ok(response) => {
+            telemetry::record_forwarded();
+            response
+        }
         Err(err) => {
             warn!(target: "gateway::proxy", ?err, "forwarding to upstream failed");
             error_response(&err, body.as_ref())
