@@ -1389,4 +1389,51 @@ mod test {
         // Beyond the one-epoch fallback horizon there is nothing to serve.
         assert!(db.get_committee_keys(3).await.is_none());
     }
+
+    /// The dummy epoch-0 record is memory-only: `persist` never writes it, so a reopen loses
+    /// it entirely — no record 0, no committee anchor for validating downloaded records. This
+    /// is why every epoch-close path must overwrite the dummy with a real, persisted record
+    /// before a restart can be survived: a real record saved and persisted comes back from
+    /// reopen with its digest and committee anchor intact.
+    #[tokio::test]
+    async fn test_dummy_epoch0_lost_on_reopen_but_persisted_record_survives() {
+        let temp_dir = TempDir::with_prefix("test_dummy_epoch0_lost_on_reopen").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
+
+        // Save the dummy record 0 and persist: the dummy lives only in memory, so even an
+        // explicit persist leaves nothing durable behind.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let dummy = EpochRecord {
+            epoch: 0,
+            committee: committee.clone(),
+            next_committee: committee.clone(),
+            ..Default::default()
+        };
+        db.save_dummy_epoch0(dummy).await.expect("save dummy epoch 0");
+        db.persist().await.expect("persist dummy");
+        // The dummy serves reads while this handle is open.
+        assert!(db.contains_epoch(0).await);
+        drop(db);
+
+        // Reopen: the dummy is gone — no record and no committee anchor.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("reopen after dummy");
+        assert!(!db.contains_epoch(0).await, "dummy epoch 0 must not survive reopen");
+        assert!(db.record_by_epoch(0).await.is_none(), "no durable record 0 after reopen");
+        assert!(db.get_committee_keys(0).await.is_none(), "no committee anchor after reopen");
+
+        // A real record 0, saved and persisted, survives the same reopen cycle.
+        let (real0, _cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save_record(real0.clone()).await.expect("save real record 0");
+        db.persist().await.expect("persist real record 0");
+        drop(db);
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("reopen after real record");
+        assert!(db.contains_epoch(0).await, "persisted record 0 must survive reopen");
+        let survived = db.record_by_epoch(0).await.expect("record 0 after reopen");
+        assert_eq!(survived.digest(), real0.digest(), "record survives with equal digest");
+        let anchor = db.get_committee_keys(0).await.expect("committee anchor restored");
+        assert_eq!(anchor, committee.iter().copied().collect::<BTreeSet<_>>());
+    }
 }

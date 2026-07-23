@@ -70,7 +70,8 @@ where
     /// different leader epoch means execution fell behind across an epoch boundary, which this
     /// recovery path cannot reason about, so it errors rather than replay across the boundary.
     /// If a replayed output is itself the epoch close, the returned [`super::ReplayResult`]
-    /// reports its hash and replay stops there.
+    /// reports its hash, the boundary header is stashed in `last_consensus_header` for the
+    /// caller's close-and-write sequence, and replay stops there.
     pub(super) async fn replay_missed_consensus(
         &mut self,
         committee: Committee,
@@ -100,6 +101,9 @@ where
             self.metrics.replayed_outputs_total.increment(1);
             last_replayed_hash = Some(output_hash);
             if is_epoch_close {
+                // stash the boundary header (digest-identical to `output_hash`) for the caller's
+                // close-and-write sequence
+                self.last_consensus_header = Some(consensus_header);
                 return Ok(ReplayResult {
                     epoch_close_hash: Some(output_hash),
                     last_replayed_hash,
