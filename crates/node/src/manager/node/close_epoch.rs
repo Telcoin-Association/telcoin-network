@@ -19,9 +19,13 @@ use eyre::eyre;
 use std::collections::BTreeSet;
 use tn_config::TelcoinDirs;
 use tn_reth::{recover_raw_transaction, RethEnv};
-use tn_storage::tables::{
-    CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
-    NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
+use tn_storage::{
+    consensus_pack::DATA_NAME,
+    epoch_records::RECORDS_NAME,
+    tables::{
+        CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
+        NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
+    },
 };
 use tn_types::{
     Batch, BlockHash, BlockNumHash, BlsPublicKey, ConsensusHeaderDigest, ConsensusNumHash,
@@ -252,14 +256,16 @@ where
         Ok(())
     }
 
-    /// Export the just-closed epoch's final execution state to a snapshot pack.
+    /// Export the just-closed epoch's final execution state, plus the epoch's consensus pack and
+    /// the epoch-records pack, into a snapshot bundle.
     ///
-    /// A no-op unless `--enable-state-export` spawned the exporter. The export runs on the
+    /// A no-op unless `--enable-state-export` spawned the exporter. The state export runs on the
     /// exporter's background thread (a full plain-state walk can be slow) and its outcome is
-    /// logged; the epoch transition does not wait on it. The pack is written under
-    /// `consensus-db/state_exports/epoch-{N}/`. The block exported is the epoch's final executed
-    /// block — the same value [`write_epoch_record`](Self::write_epoch_record) records as the
-    /// epoch's `final_state`.
+    /// logged; the epoch transition does not wait on it. The bundle is written under
+    /// `consensus-db/state_exports/epoch-{N}/` and ends up with three files: `state_data` (the exec
+    /// state pack), `consensus_data` (the closed epoch's consensus pack), and `epoch_records` (the
+    /// epoch-records pack). The block exported is the epoch's final executed block — the same value
+    /// [`write_epoch_record`](Self::write_epoch_record) records as the epoch's `final_state`.
     pub(super) async fn export_epoch_state(
         &self,
         primary: &PrimaryNode<DB>,
@@ -278,6 +284,25 @@ where
             debug!(target: "tn::snapshot", epoch, "epoch state already exported; skipping");
             return Ok(());
         }
+
+        // Flush the closed epoch's consensus pack and the epoch-records pack so the copies in the
+        // completion task capture complete files. The consensus pack is only persisted by the
+        // *next* epoch's `new_epoch`, so persist it here while epoch N is still the current
+        // pack. A persist hiccup must not crash the node, so log and skip the export.
+        if let Err(e) = self.consensus_chain.persist_current().await {
+            warn!(target: "tn::snapshot", epoch, error = %e, "could not persist consensus pack; skipping export");
+            return Ok(());
+        }
+        if let Err(e) = self.consensus_chain.epochs().persist().await {
+            warn!(target: "tn::snapshot", epoch, error = %e, "could not persist epoch records; skipping export");
+            return Ok(());
+        }
+        // Source packs live under the epochs base dir; they are copied into the bundle so the
+        // finished export directory holds all three (state + consensus + records).
+        let epochs_dir = self.tn_datadir.epochs_db_path();
+        let src_consensus = epochs_dir.join(format!("epoch-{epoch}")).join(DATA_NAME);
+        let src_records = epochs_dir.join(RECORDS_NAME);
+
         // Export into a temp sibling and atomically rename it into place on success, so external
         // tooling only ever observes a complete `epoch-{N}` directory. Clear any leftover temp from
         // a prior failed attempt first.
@@ -295,22 +320,35 @@ where
                 // scoped spawner (about to die).
                 reth_env.get_task_spawner().spawn_task(format!("exporting execution state for epoch {epoch}"), async move {
                     match rx.await {
-                        // move the completed pack into place; external tooling watches for the
-                        // final dir appearing atomically.
-                        Ok(Ok(outcome)) => match std::fs::rename(&tmp_dir, &final_dir) {
-                            Ok(()) => info!(
-                                target: "tn::snapshot",
-                                epoch,
-                                block = outcome.block.number,
-                                accounts = outcome.stats.account_count,
-                                path = ?final_dir,
-                                "exported epoch execution state"
-                            ),
-                            Err(e) => {
-                                error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch state into place");
-                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                        // copy the consensus + epoch-records packs alongside the state pack, then
+                        // atomically move the complete bundle into place; external tooling watches
+                        // for the final dir appearing atomically.
+                        Ok(Ok(outcome)) => {
+                            let copied = std::fs::copy(&src_consensus, tmp_dir.join("consensus_data"))
+                                .and_then(|_| {
+                                    std::fs::copy(&src_records, tmp_dir.join("epoch_records"))
+                                });
+                            match copied {
+                                Ok(_) => match std::fs::rename(&tmp_dir, &final_dir) {
+                                    Ok(()) => info!(
+                                        target: "tn::snapshot",
+                                        epoch,
+                                        block = outcome.block.number,
+                                        accounts = outcome.stats.account_count,
+                                        path = ?final_dir,
+                                        "exported epoch state + consensus + records"
+                                    ),
+                                    Err(e) => {
+                                        error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch bundle into place");
+                                        let _ = std::fs::remove_dir_all(&tmp_dir);
+                                    }
+                                },
+                                Err(e) => {
+                                    error!(target: "tn::snapshot", epoch, error = %e, "failed to copy consensus/epoch-records packs into export");
+                                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                                }
                             }
-                        },
+                        }
                         // export failed or the worker went away: drop the partial temp dir.
                         Ok(Err(e)) => {
                             warn!(target: "tn::snapshot", epoch, error = %e, "epoch state export failed");
