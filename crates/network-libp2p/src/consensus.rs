@@ -419,6 +419,19 @@ where
             kad_store.remove(&key);
         }
 
+        // Give the provider tables the same tolerant startup load: purge any provider
+        // rows whose bytes no longer decode (schema/version skew or corruption) so the
+        // first post-restart provider read can not panic the ConsensusNetwork task and
+        // then repeat that panic on every restart (issue #999).
+        let purged_providers = kad_store.scrub_corrupt_providers();
+        if purged_providers > 0 {
+            warn!(
+                target: "network-kad",
+                purged_providers,
+                "purged undecodable provider records from kad store at startup"
+            );
+        }
+
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
         // create custom behavior
