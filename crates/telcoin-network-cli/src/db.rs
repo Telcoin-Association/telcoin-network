@@ -5,21 +5,35 @@
 //! `MissingBatches` check and classifying each missing batch as Absent (a real data gap) vs
 //! Misordered (present, but in the wrong consensus-header group).
 
+use crate::{node::NamedChain, version::SHORT_VERSION};
 use clap::{Args, Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::{bail, eyre};
 use human_bytes::human_bytes;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
-use tn_config::TelcoinDirs as _;
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, TelcoinDirs as _};
 use tn_reth::{
-    iter_static_files, open_db_read_only, traits::TNPrimitives, DatabaseArguments, DatabaseEnv,
-    RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
+    iter_static_files, open_db_read_only, snapshot::SnapshotRestorer, traits::TNPrimitives,
+    DatabaseArguments, DatabaseEnv, RethCommand, RethConfig, RethDatabaseT as _, RethEnv,
+    RethMdbxError, StaticFileProvider, Tables,
 };
-use tn_storage::{consensus_pack::DATA_NAME, pack_validate::validate_pack_file};
-use tn_types::Epoch;
+use tn_storage::{
+    consensus::ConsensusChain,
+    consensus_pack::{ConsensusPack, DATA_NAME},
+    epoch_records::{EpochRecordDb, EpochRecordValidation},
+    exec_state_pack::ExecStatePackReader,
+    pack_validate::validate_pack_file,
+};
+use tn_types::{
+    BlockNumHash, Committee, Epoch, EpochCertificate, EpochDigest, EpochRecord, ExecHeader,
+    SealedHeader, TaskManager, B256,
+};
 
 /// Inspect and diagnose telcoin-network databases.
 #[derive(Debug, Parser)]
@@ -37,6 +51,9 @@ enum DbSubcommand {
 
     /// Validate a consensus epoch pack file: walk the `data` stream and report integrity issues.
     Validate(DbValidateArgs),
+
+    /// Load an EVM state-export pack into a new reth database under the datadir.
+    LoadState(DbLoadStateArgs),
 }
 
 impl DbCommand {
@@ -65,6 +82,7 @@ impl DbCommand {
                 println!("{}", db_stats_table(&db)?);
             }
             DbSubcommand::Validate(args) => args.execute()?,
+            DbSubcommand::LoadState(args) => args.execute(datadir)?,
         }
         Ok(())
     }
@@ -143,6 +161,316 @@ fn epoch_from_dir_name(dir: &Path) -> Option<Epoch> {
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_prefix("epoch-"))
         .and_then(|num| num.parse::<Epoch>().ok())
+}
+
+/// Restore an EVM state-export pack into a new reth database under the datadir.
+#[derive(Debug, Args)]
+pub struct DbLoadStateArgs {
+    /// Path to an exec-state pack directory (contains a `state_data` file), e.g. an `epoch-NN`
+    /// export produced by `--enable-state-export`.
+    pub pack: PathBuf,
+
+    /// Named chain whose genesis to initialize (bundled). If omitted, genesis is loaded from the
+    /// datadir config. Genesis is the trust root and must match the chain the pack came from.
+    #[arg(long)]
+    pub chain: Option<NamedChain>,
+}
+
+impl DbLoadStateArgs {
+    /// Resolve the genesis chain spec, then restore the pack into a fresh reth DB under `datadir`.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        // Genesis chain spec: bundled via `--chain`, else from the datadir config (mirrors the node
+        // command). Genesis is the trust root, so it must match the chain the pack came from.
+        let tn_config = match self.chain {
+            Some(NamedChain::Adiri | NamedChain::TestNet) => {
+                Config::load_adiri(&datadir, false, SHORT_VERSION)?
+            }
+            Some(NamedChain::MainNet) => Config::load_mainnet(&datadir, false, SHORT_VERSION)?,
+            None => Config::load(&datadir, false, SHORT_VERSION)?,
+        };
+
+        // `RethConfig::new` is the only public constructor; `RethCommand` has no `Default`, so
+        // parse an empty arg list for its defaults (rpc/txpool are irrelevant to a one-shot
+        // restore).
+        let reth_config = RethConfig::new(
+            RethCommand::parse_from(["telcoin-network"]),
+            None,
+            &datadir,
+            false,
+            Arc::new(tn_config.chain_spec()),
+        );
+
+        let (block, root) = restore_pack(&reth_config, datadir.reth_db_path(), &self.pack)?;
+        println!(
+            "restored execution state at block {} (state root {root:#x}) into {}",
+            block.number,
+            datadir.reth_db_path().display()
+        );
+
+        // Rebuild the consensus + epoch-records packs from the bundle's data-only files, when the
+        // bundle carries them. A plain copy would not work: these files have no index sidecars and
+        // the packs do not rebuild indexes on open, so we reconstruct fully-indexed, queryable
+        // packs at their datadir homes under `consensus-db/epochs/`, verifying each epoch record
+        // against its certificate as we go.
+        let bundle_consensus = self.pack.join("consensus_data");
+        let bundle_records = self.pack.join("epoch_records");
+        let bundle_certs = self.pack.join("epoch_certs");
+        match (bundle_consensus.exists(), bundle_records.exists(), bundle_certs.exists()) {
+            (true, true, true) => {
+                // The genesis committee is the trust root for record verification; load it exactly
+                // as the node does (its yaml was materialized by the `Config::load_*` step above).
+                let genesis_committee =
+                    Config::load_from_path::<Committee>(datadir.committee_path(), ConfigFmt::YAML)
+                        .map_err(|e| {
+                            eyre!(
+                                "failed to load genesis committee from {} (needed to verify epoch \
+                                 records): {e}",
+                                datadir.committee_path().display()
+                            )
+                        })?;
+                restore_consensus_and_records(
+                    &datadir.epochs_db_path(),
+                    &genesis_committee,
+                    &bundle_consensus,
+                    &bundle_records,
+                    &bundle_certs,
+                )?;
+            }
+            (false, false, false) => {} // state-only pack — nothing else to restore
+            _ => bail!(
+                "incomplete export bundle: expected consensus_data, epoch_records, and \
+                 epoch_certs together (re-export with the current version)"
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// Build a fresh reth DB from `reth_config` and restore the exec-state pack at `pack` into it,
+/// returning the snapshot block and its recomputed state root.
+///
+/// Runs inside a one-shot tokio runtime because `SnapshotRestorer::open` (reth provider setup)
+/// requires a runtime context; the restore steps themselves are synchronous.
+fn restore_pack(
+    reth_config: &RethConfig,
+    db_path: PathBuf,
+    pack: &Path,
+) -> eyre::Result<(BlockNumHash, B256)> {
+    // The reth provider setup (`RethEnv::new` inside `SnapshotRestorer::open`) captures the current
+    // tokio handle, so establish a runtime context. The restore steps are otherwise synchronous;
+    // any tasks the provider spawns run on the multi-thread runtime's workers.
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
+    let _guard = runtime.enter();
+
+    let db = RethEnv::new_database(reth_config, db_path)?;
+    let task_manager = TaskManager::new("db-load-state");
+
+    let mut reader = ExecStatePackReader::open(pack)
+        .map_err(|e| eyre!("failed to open state pack {}: {e}", pack.display()))?;
+    let final_state = BlockNumHash::new(reader.meta().block_number, reader.meta().block_hash);
+    let window = scaffold_window(reader.headers());
+
+    // `open` refuses a datadir that already holds chain data, so this only lands in a fresh one.
+    let restorer = SnapshotRestorer::open(reth_config, db, &task_manager)?;
+    restorer.import_chain_scaffold(&window, final_state)?;
+    let root = restorer.import_state(&mut reader)?;
+    restorer.finish(final_state)?;
+    Ok((final_state, root))
+}
+
+/// Per-record read timeout for the consensus stream import. The source is a local file so reads are
+/// fast; this is a generous ceiling that fails cleanly on a truncated/corrupt pack instead of
+/// hanging.
+const STREAM_IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Rebuild fully-indexed, verified consensus + epoch-records packs under `epochs_dir` from an
+/// export bundle's data-only files.
+///
+/// The bundle's `epoch_records` / `epoch_certs` / `consensus_data` are bare pack `data` streams
+/// with no index sidecars, and the packs do not rebuild indexes on open, so we reconstruct them:
+/// every epoch record is verified against its certificate (anchored to `genesis_committee`, then
+/// chained forward) and re-saved with its cert — rebuilding `epochs.pack` + its indexes — and the
+/// closed epoch's consensus pack is stream-imported (rebuilding `epoch-{N}/` + its idx/hash/bhash).
+fn restore_consensus_and_records(
+    epochs_dir: &Path,
+    genesis_committee: &Committee,
+    bundle_consensus: &Path,
+    bundle_records: &Path,
+    bundle_certs: &Path,
+) -> eyre::Result<()> {
+    fs::create_dir_all(epochs_dir)?;
+
+    // Read the records straight from the bare bundle pack (no index needed). They drive the
+    // records-DB rebuild, the per-record verification, and the consensus stream import (previous
+    // epoch + final consensus number).
+    let records = EpochRecordDb::read_records_from_pack(bundle_records).map_err(|e| {
+        eyre!("failed to read epoch records from {}: {e}", bundle_records.display())
+    })?;
+    if records.is_empty() {
+        bail!("bundle epoch_records contains no records");
+    }
+    // Certificates are matched to records by digest (`cert.epoch_hash == record.digest()`). Not
+    // every record necessarily has one: the just-closed tip epoch's cert is only aggregated at the
+    // next epoch's start, so it is typically absent at export time.
+    let certs = EpochRecordDb::read_certs_from_pack(bundle_certs).map_err(|e| {
+        eyre!("failed to read epoch certificates from {}: {e}", bundle_certs.display())
+    })?;
+    let cert_by_hash: HashMap<EpochDigest, EpochCertificate> =
+        certs.into_iter().map(|c| (c.epoch_hash, c)).collect();
+    // `save_record` appends in order starting at epoch 0, so the bundle must hold a contiguous run
+    // from epoch 0. Check up front for a clear error instead of a mid-loop `EpochOutOfOrder`.
+    for (i, record) in records.iter().enumerate() {
+        if record.epoch as usize != i {
+            bail!(
+                "bundle epoch records are not contiguous from epoch 0 (position {i} is epoch {})",
+                record.epoch
+            );
+        }
+    }
+    let n = records.last().expect("records non-empty").epoch;
+
+    // Both `save_record` and `stream_import` are async; the exec-state restore already built and
+    // dropped its own runtime, so drive the rebuild to completion on a fresh one here.
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
+    runtime.block_on(async {
+        // 1. Rebuild the indexed epoch-records DB, verifying each record against its certificate as
+        //    we go. Verify BEFORE saving so `validate_downloaded_record` anchors epoch 0 to the
+        //    seeded genesis committee and epoch N to the already-saved record N-1.
+        let db = EpochRecordDb::open(epochs_dir)
+            .map_err(|e| eyre!("failed to open epoch records db: {e}"))?;
+
+        // Seed a dummy epoch-0 record carrying the genesis committee (mirrors the node's genesis
+        // bootstrap in run_epoch.rs); it is the trusted anchor for verifying epoch 0 and is only
+        // consulted while the real record index is still empty.
+        let genesis_keys: Vec<_> = genesis_committee.bls_keys().into_iter().collect();
+        db.save_dummy_epoch0(EpochRecord {
+            epoch: 0,
+            committee: genesis_keys.clone(),
+            next_committee: genesis_keys,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| eyre!("failed to seed genesis committee: {e}"))?;
+
+        for (i, record) in records.iter().enumerate() {
+            match cert_by_hash.get(&record.digest()) {
+                Some(cert) => {
+                    // The blessed validator: checks epoch, parent hash, committee compatibility,
+                    // and a super-quorum certificate from the trusted
+                    // (chained-from-genesis) committee.
+                    match db.validate_downloaded_record(record.epoch, record, cert).await {
+                        EpochRecordValidation::Valid => {}
+                        other => bail!(
+                            "epoch {} record failed certificate verification: {other:?}",
+                            record.epoch
+                        ),
+                    }
+                    db.save(record.clone(), cert.clone())
+                        .await
+                        .map_err(|e| eyre!("failed to save epoch record {}: {e}", record.epoch))?;
+                }
+                None => {
+                    // No certificate in the bundle — expected for the just-closed tip epoch, whose
+                    // cert is only aggregated at the next epoch's start. Anchor it to the verified
+                    // chain by its parent hash and store it unverified rather than failing.
+                    let expected_parent =
+                        if i == 0 { EpochDigest::default() } else { records[i - 1].digest() };
+                    if record.parent_hash != expected_parent {
+                        bail!(
+                            "epoch {} record has no certificate and does not chain to its \
+                             predecessor",
+                            record.epoch
+                        );
+                    }
+                    eprintln!(
+                        "warning: epoch {} record has no certificate in the bundle (not yet \
+                         collected at export time); stored unverified but chained to the verified \
+                         predecessor",
+                        record.epoch
+                    );
+                    db.save_record(record.clone())
+                        .await
+                        .map_err(|e| eyre!("failed to save epoch record {}: {e}", record.epoch))?;
+                }
+            }
+        }
+        db.persist().await.map_err(|e| eyre!("failed to persist epoch records: {e}"))?;
+        drop(db);
+
+        // 2. Rebuild the closed epoch's consensus pack. Epoch 0 would need a pre-epoch-0 genesis
+        //    descriptor that a data-only bundle doesn't carry, so skip it (records + state still
+        //    land); every later epoch uses the previous record as its genesis link.
+        if n == 0 {
+            eprintln!(
+                "warning: skipping epoch-0 consensus pack rebuild (requires a genesis descriptor \
+                 not present in the bundle); restored epoch records and execution state only"
+            );
+            return Ok(());
+        }
+        let previous = &records[(n - 1) as usize];
+        let final_record = &records[n as usize];
+        let epoch_dir = epochs_dir.join(format!("epoch-{n}"));
+        let file = tokio::fs::File::open(bundle_consensus).await.map_err(|e| {
+            eyre!("failed to open consensus data {}: {e}", bundle_consensus.display())
+        })?;
+        // Landing directly at `epochs_dir` (not a temp) is safe here: this is an offline, single
+        // writer restore into a fresh datadir, so the online rename/install-lock dance is unneeded.
+        let pack = ConsensusPack::stream_import(
+            epochs_dir,
+            file,
+            n,
+            previous,
+            final_record.final_consensus.number,
+            STREAM_IMPORT_TIMEOUT,
+        )
+        .await
+        .map_err(|e| {
+            let _ = fs::remove_dir_all(&epoch_dir);
+            eyre!("consensus stream import for epoch {n} failed: {e}")
+        })?;
+        pack.persist().await.map_err(|e| eyre!("failed to persist consensus pack: {e}"))?;
+        // The chain was verified as it streamed; confirm the rebuilt tip is exactly the epoch's
+        // final consensus header before declaring success.
+        let tip = pack.latest_consensus_header().await;
+        drop(pack);
+        let tip_ok = matches!(
+            &tip,
+            Some(header)
+                if header.number == final_record.final_consensus.number
+                    && header.digest() == final_record.final_consensus.hash
+        );
+        if !tip_ok {
+            let _ = fs::remove_dir_all(&epoch_dir);
+            bail!("rebuilt consensus pack tip does not match epoch {n} final consensus: {tip:?}");
+        }
+
+        // Point the consensus "latest" slot hint at this epoch's final consensus so a node started
+        // on this datadir resumes syncing from here instead of from genesis.
+        ConsensusChain::write_latest_consensus_hint(
+            epochs_dir,
+            n,
+            final_record.final_consensus.number,
+        )
+        .map_err(|e| eyre!("failed to write consensus slot hint: {e}"))?;
+        Ok(())
+    })?;
+
+    println!(
+        "restored and verified epoch records 0..={n} and consensus pack for epoch {n} into {}; \
+         a node started here will resume syncing from epoch {n}",
+        epochs_dir.display()
+    );
+    Ok(())
+}
+
+/// Turn a pack's embedded headers (snapshot header first, then ancestors) into the ascending,
+/// genesis-excluded window `SnapshotRestorer::import_chain_scaffold` expects.
+fn scaffold_window(headers: &[ExecHeader]) -> Vec<SealedHeader> {
+    let mut window: Vec<SealedHeader> =
+        headers.iter().cloned().map(SealedHeader::seal_slow).collect();
+    window.sort_by_key(|h| h.number);
+    window.retain(|h| h.number != 0);
+    window
 }
 
 #[derive(Debug, Clone)]
@@ -409,5 +737,24 @@ mod tests {
         let Commands::Db(_) = cli.command else {
             panic!("expected the db subcommand");
         };
+    }
+
+    #[test]
+    fn parse_db_load_state_subcommand() {
+        let cli = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "load-state", "/tmp/epoch-3"])
+            .expect("cli parsed");
+        let Commands::Db(_) = cli.command else {
+            panic!("expected the db subcommand");
+        };
+    }
+
+    #[test]
+    fn scaffold_window_orders_and_drops_genesis() {
+        use tn_types::ExecHeader;
+        let header = |number| ExecHeader { number, ..Default::default() };
+        // out of order and including genesis (block 0)
+        let headers = vec![header(3), header(1), header(0), header(2)];
+        let numbers: Vec<u64> = super::scaffold_window(&headers).iter().map(|h| h.number).collect();
+        assert_eq!(numbers, vec![1, 2, 3], "ascending, contiguous, genesis dropped");
     }
 }
