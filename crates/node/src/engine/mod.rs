@@ -16,8 +16,8 @@ use std::{future::Future, net::SocketAddr, sync::Arc};
 use tn_config::Config;
 use tn_exex::ExExInstallFn;
 use tn_reth::{
-    system_calls::EpochState, CanonStateNotificationStream, RethConfig, RethDb, RethEnv,
-    WorkerTxPool,
+    error::StateReadResult, system_calls::EpochState, CanonStateNotificationStream, RethConfig,
+    RethDb, RethEnv, WorkerTxPool,
 };
 use tn_rpc::EngineToPrimary;
 use tn_types::{
@@ -300,7 +300,10 @@ impl ExecutionNode {
 
     /// Read the current epoch's [EpochState] pinned to the previous epoch's closing block
     /// (genesis for epoch 0), returning the pin header alongside it.
-    pub async fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
+    ///
+    /// Failures are classified per `StateReadError` so boundary callers can retry node-local
+    /// provider faults before halting.
+    pub async fn epoch_state_at_epoch_start(&self) -> StateReadResult<(EpochState, SealedHeader)> {
         let guard = self.internal.read().await;
         guard.epoch_state_at_epoch_start()
     }
@@ -311,12 +314,34 @@ impl ExecutionNode {
     /// (canonical-tip) variant would make the result depend on when the caller runs
     /// relative to a mid-epoch governance burn. Callers must choose their pin header
     /// explicitly (epoch-start for entry reads, the epoch-closing block for the record).
+    ///
+    /// Failures are classified per `StateReadError` so boundary callers retry node-local
+    /// provider faults before halting; the plural sibling
+    /// [`Self::validators_for_epochs_at_block`] serves the epoch record's multi-epoch close
+    /// read from one snapshot.
     pub async fn validators_for_epoch_at_block(
         &self,
         epoch: u32,
         block_hash: B256,
-    ) -> eyre::Result<Vec<BlsPublicKey>> {
+    ) -> StateReadResult<Vec<BlsPublicKey>> {
         let guard = self.internal.read().await;
         guard.validators_for_epoch_at_block(epoch, block_hash)
+    }
+
+    /// Read committee validator keys for several epochs from ONE state snapshot pinned to the
+    /// block identified by `block_hash`.
+    ///
+    /// The batched sibling of [`Self::validators_for_epoch_at_block`]: the returned outer `Vec`
+    /// is ordered as `epochs`, and every epoch's keys derive from the same pinned state, so a
+    /// multi-epoch consumer (the epoch record's committee + next-committee reads) cannot
+    /// straddle a block commit between reads. Failures are classified per `StateReadError` so
+    /// boundary callers retry node-local provider faults before halting.
+    pub async fn validators_for_epochs_at_block(
+        &self,
+        epochs: Vec<Epoch>,
+        block_hash: B256,
+    ) -> StateReadResult<Vec<Vec<BlsPublicKey>>> {
+        let guard = self.internal.read().await;
+        guard.validators_for_epochs_at_block(epochs, block_hash)
     }
 }

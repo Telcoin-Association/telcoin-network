@@ -17,7 +17,11 @@
 //! [`ReplayResult`] types that thread control flow through the loop.
 
 use crate::{engine::ExecutionNode, manager::EpochManager, worker::worker_task_manager_name};
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    future::{ready, Future},
+    time::Duration,
+};
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::ConsensusBus;
@@ -719,7 +723,7 @@ async fn adjust_base_fees(
     // Only a proven identity VIOLATION or an exhausted provider fault halts.
     let (entered_epoch, epoch_info) = match retry_provider_faults(
         "close-time epoch info (identity check)",
-        || reth_env.get_current_epoch_info_at_header(&tip),
+        || ready(reth_env.get_current_epoch_info_at_header(&tip)),
     )
     .await
     {
@@ -773,7 +777,7 @@ async fn adjust_base_fees(
     // and move to the new fees), so it must never fail open: retry, then halt. Pinned to the SAME
     // `tip` the identity check validated (one-header discipline).
     match retry_provider_faults("close-time worker fee configs", || {
-        reth_env.get_worker_fee_configs_at_block(tip.hash())
+        ready(reth_env.get_worker_fee_configs_at_block(tip.hash()))
     })
     .await
     {
@@ -807,27 +811,37 @@ async fn adjust_base_fees(
     Ok(())
 }
 
-/// Total attempts (first try + retries) for each close-time chain read in [`adjust_base_fees`]
-/// before a node-local provider fault halts the close.
+/// Total attempts (first try + retries) for each classified pinned chain read at an epoch seam —
+/// the close-time reads in [`adjust_base_fees`], the epoch-record committee reads, and the
+/// epoch-entry reads — before a node-local provider fault escalates to the caller (a halt for
+/// every hard read; a warn-skip for the best-effort epoch + 2 prefetch).
 const CLOSE_READ_ATTEMPTS: u32 = 3;
 
-/// Pause between close-time read retries in [`retry_provider_faults`].
+/// Pause between read retries in [`retry_provider_faults`].
 const CLOSE_READ_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Run `read` up to [`CLOSE_READ_ATTEMPTS`] times, sleeping [`CLOSE_READ_RETRY_BACKOFF`] between
 /// tries, retrying ONLY on [`StateReadError::Provider`].
 ///
-/// Provider faults are node-local (a transient I/O error may clear on a re-read), so a bounded
-/// retry preserves liveness before the caller escalates to a halt. Chain-global failures are
-/// deterministic products of the pinned block — re-reading cannot change them — so they return
-/// immediately for the caller's fail-open arm. Success passes straight through.
-async fn retry_provider_faults<T>(
+/// Provider faults are node-local (a transient I/O error may clear on a re-read: every pinned
+/// read constructs a fresh state provider per attempt), so a bounded retry preserves liveness
+/// before the caller escalates to a halt. Chain-global failures are deterministic products of the
+/// pinned block — re-reading cannot change them — so they return immediately for the caller's
+/// fail-open arm. Success passes straight through.
+///
+/// `read` returns a future so the async epoch-record and epoch-entry committee reads share this
+/// policy with the synchronous close-time reads (which adapt with [`std::future::ready`]). Each
+/// attempt calls `read` afresh, so every retry re-runs the whole read.
+pub(super) async fn retry_provider_faults<T, Fut>(
     what: &'static str,
-    mut read: impl FnMut() -> Result<T, StateReadError>,
-) -> Result<T, StateReadError> {
+    mut read: impl FnMut() -> Fut,
+) -> Result<T, StateReadError>
+where
+    Fut: Future<Output = Result<T, StateReadError>>,
+{
     let mut attempt = 1u32;
     loop {
-        match read() {
+        match read().await {
             Err(StateReadError::Provider(detail)) if attempt < CLOSE_READ_ATTEMPTS => {
                 warn!(
                     target: "epoch-manager",
@@ -835,7 +849,7 @@ async fn retry_provider_faults<T>(
                     max_attempts = CLOSE_READ_ATTEMPTS,
                     what,
                     detail,
-                    "node-local provider fault on close-time read - retrying"
+                    "node-local provider fault on pinned chain read - retrying"
                 );
                 attempt += 1;
                 tokio::time::sleep(CLOSE_READ_RETRY_BACKOFF).await;
@@ -961,7 +975,7 @@ mod tests {
         let calls = Cell::new(0u32);
         let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            Err(StateReadError::Provider("mdbx i/o fault".into()))
+            ready(Err(StateReadError::Provider("mdbx i/o fault".into())))
         })
         .await;
 
@@ -976,11 +990,11 @@ mod tests {
         let calls = Cell::new(0u32);
         let res = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            if calls.get() == 1 {
+            ready(if calls.get() == 1 {
                 Err(StateReadError::Provider("transient i/o fault".into()))
             } else {
                 Ok(7u64)
-            }
+            })
         })
         .await;
 
@@ -995,7 +1009,7 @@ mod tests {
         let calls = Cell::new(0u32);
         let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            Err(StateReadError::ChainGlobal("contract absent".into()))
+            ready(Err(StateReadError::ChainGlobal("contract absent".into())))
         })
         .await;
 
