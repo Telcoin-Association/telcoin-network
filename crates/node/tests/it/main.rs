@@ -28,9 +28,9 @@ use tn_reth::{
     payload::TNPayload,
     test_utils::{
         create_committee_from_state, execute_payload_and_update_canonical_chain,
-        governance_burn_tx, governance_owner_factory, seeded_genesis_from_random_batches,
-        test_genesis_with_consensus_registry, test_genesis_with_consensus_registry_and_workers,
-        TransactionFactory,
+        governance_burn_tx, governance_owner_factory, plant_finalized_marker,
+        seeded_genesis_from_random_batches, test_genesis_with_consensus_registry,
+        test_genesis_with_consensus_registry_and_workers, TransactionFactory,
     },
     ExecutedBlock, NewCanonicalChain, RethChainSpec, RethEnv,
 };
@@ -198,14 +198,15 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
     assert_eq!(expected, gas_accumulator.rewards_counter().get_address_counts());
     assert_eq!(expected, recovered.rewards_counter().get_address_counts());
 
-    // Simulate the crash window: rewind the finalized marker to a mid-chain header, as if the
-    // node died between the blocks-commit and finalize-commit transactions. Calling
-    // finalize_block directly is safe here: the watches are plain non-monotonic setters, and
-    // the engine has exited so the in-memory tree is empty and remove_persisted_blocks no-ops.
+    // Simulate a pre-fix database: rewind the persisted finalized marker to a mid-chain header
+    // and seed the watches to match, as if this node restarted on a database written by a
+    // version that committed blocks and the marker in separate transactions and died between
+    // them. Current versions commit both atomically, so only a pre-fix database presents this
+    // lag.
     let tip_header = reth_env.finalized_header()?.expect("live run finalized the tip");
     let rewind_to =
         reth_env.sealed_header_by_number(tip_header.number / 2)?.expect("mid-chain header exists");
-    reth_env.finalize_block(rewind_to.clone())?;
+    plant_finalized_marker(&reth_env, rewind_to.clone())?;
     let stale = reth_env.finalized_header()?.expect("rewound finalized header");
     assert_eq!(stale.number, rewind_to.number, "precondition: the marker lags the tip");
 
@@ -769,12 +770,16 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
             .expect("engine update per output");
     }
 
-    // The engine update is sent from finish_executing_output AFTER the blocks commit but
-    // BEFORE finalize_block writes the finalized marker in its own transaction, so under load
-    // the marker can still lag the persisted tip here. A real restart never reads through that
-    // window: startup heals the marker before anything consults it. Mirror that startup step
-    // so catchup pins the settled tip instead of racing the marker write.
-    reth_env.heal_finalized_to_persisted_tip()?;
+    // finish_executing_output commits the blocks AND the finalized/safe markers in one
+    // transaction before it sends the engine update, so the persisted marker cannot lag the
+    // persisted tip here. The in-memory finalized watch catchup reads, though, is set by
+    // finalize_block moments later in the engine task — settle it deterministically with the
+    // same header the engine writes (idempotent) instead of racing that update. A real restart
+    // never sees this transient: the watch is seeded from the settled database rows.
+    let settled_tip = reth_env
+        .sealed_header_by_number(reth_env.last_block_number()?)?
+        .expect("persisted tip header exists");
+    reth_env.finalize_block(settled_tip)?;
 
     // simulate node recovery at startup: catchup sizes the accumulator from pinned chain state
     // and rebuilds gas stats (fees are owned by the entry seeding)
@@ -920,8 +925,10 @@ fn payload_with_base_fee(
 
 /// Make an executed block canonical, mirroring `tn_engine`'s payload-builder chain update.
 ///
-/// Finalization is intentionally left to the caller so tests can construct a chain whose
-/// finality lags the canonical tip.
+/// `finish_executing_output` commits the finalized/safe markers atomically with the block, so
+/// the persisted marker tracks the tip here; the in-memory watch update (`finalize_block`) is
+/// left to the caller. Tests that need a chain whose finality lags the canonical tip plant the
+/// lag afterwards via `plant_finalized_marker` (simulating a pre-fix database).
 fn extend_canonical_chain(reth_env: &RethEnv, block: ExecutedBlock) -> eyre::Result<SealedHeader> {
     let header = block.recovered_block.clone_sealed_header();
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
@@ -934,9 +941,10 @@ fn extend_canonical_chain(reth_env: &RethEnv, block: ExecutedBlock) -> eyre::Res
 /// Catchup pins every chain-derived input (scan range, worker-count read block, leader-count
 /// bound) to the ONE finalized header, and startup heals that marker to the persisted
 /// canonical tip BEFORE catchup runs (`RethEnv::heal_finalized_to_persisted_tip`). A lagging
-/// marker is the crash-window artifact of blocks and the marker committing in separate
-/// transactions; healing it is sound because every persisted canonical block is
-/// consensus-final by construction.
+/// marker is the artifact of pre-fix versions that committed blocks and the marker in
+/// separate transactions — current versions commit both atomically, so each phase plants the
+/// lag directly (`plant_finalized_marker`) to model such a database. Healing is sound because
+/// every persisted canonical block is consensus-final by construction.
 ///
 /// Phase A — mid-epoch lag (block 1 finalized; block 2 canonical-only; both carry a real
 /// transfer): catchup ALONE still pins its scan to the stale marker and undercounts (control),
@@ -1006,8 +1014,9 @@ async fn catchup_heals_finality_lag_across_epoch_boundary() -> eyre::Result<()> 
     reth_env.finalize_block(block1_header.clone())?;
     assert!(block1_header.gas_used > 0, "block 1's transfer must land for sharp gas assertions");
 
-    // block 2 (epoch 0): canonical but NOT finalized - the crash-window mid-epoch lag - with a
-    // second executed transfer so the healed recount is measurably larger than the control
+    // block 2 (epoch 0): canonical but NOT finalized - the pre-fix crash-window mid-epoch lag
+    // - with a second executed transfer so the healed recount is measurably larger than the
+    // control
     let transfer2 = tx_factory.create_eip1559_encoded(
         chain.clone(),
         None,
@@ -1025,6 +1034,9 @@ async fn catchup_heals_finality_lag_across_epoch_boundary() -> eyre::Result<()> 
         &[],
     )?;
     let block2_header = extend_canonical_chain(&reth_env, block2)?;
+    // extend committed the marker atomically with block 2; rewind it to block 1 (database rows
+    // + watches) to model a pre-fix database whose separate marker write was lost in a crash
+    plant_finalized_marker(&reth_env, block1_header.clone())?;
     assert!(block2_header.gas_used > 0, "block 2's transfer must land for sharp gas assertions");
 
     // Phase A control: catchup ALONE pins its scan to the stale marker (block 1), passes the
@@ -1043,8 +1055,8 @@ async fn catchup_heals_finality_lag_across_epoch_boundary() -> eyre::Result<()> 
     // catchup leaves fees to the entry seeding: block 1's non-MIN fee is NOT adopted
     assert_eq!(recovered.base_fee(worker_id).base_fee(), MIN_PROTOCOL_BASE_FEE);
 
-    // Phase A heal: the marker advances to the persisted canonical tip through finalize_block,
-    // updating the in-memory watch catchup reads alongside the database row
+    // Phase A heal: the marker advances to the persisted canonical tip - the heal rewrites the
+    // database rows and updates the in-memory watch catchup reads through finalize_block
     reth_env.heal_finalized_to_persisted_tip()?;
     let healed = reth_env.finalized_header()?.expect("healed finalized header");
     assert_eq!(healed.number, block2_header.number, "heal advances the marker to the tip");
@@ -1068,9 +1080,12 @@ async fn catchup_heals_finality_lag_across_epoch_boundary() -> eyre::Result<()> 
     let block3 =
         reth_env.build_block_from_batch_payload(payload3, &no_txs, block2_header.hash(), &[])?;
     let block3_header = extend_canonical_chain(&reth_env, block3)?;
+    // rewind the atomically-committed marker to block 2: the pre-fix lag now crosses the
+    // epoch boundary
+    plant_finalized_marker(&reth_env, block2_header.clone())?;
 
     // precondition: the views genuinely disagree at epoch granularity - the canonical tip's
-    // epoch state places the epoch start PAST the finalized header (block 2 after Phase A)
+    // epoch state places the epoch start PAST the finalized header (block 2)
     let finalized = reth_env.finalized_header()?.expect("finalized header");
     assert_eq!(finalized.number, block2_header.number, "finality pinned at block 2");
     let tip_state = reth_env.epoch_state_from_canonical_tip()?;
@@ -1127,8 +1142,9 @@ async fn catchup_heals_finality_lag_across_epoch_boundary() -> eyre::Result<()> 
 }
 
 /// The heal refuses a node whose finalized marker points PAST the persisted canonical tip: the
-/// marker only ever trails the tip (blocks commit first), so a marker ahead of it means the
-/// execution database lost blocks this node already attested as final.
+/// marker only ever trails or equals the tip (it commits atomically with the blocks; pre-fix
+/// versions committed the blocks first), so a marker ahead of it means the execution database
+/// lost blocks this node already attested as final.
 #[tokio::test]
 async fn heal_errors_when_finalized_marker_ahead_of_tip() -> eyre::Result<()> {
     let temp_dir = TempDir::with_prefix("heal_marker_ahead")?;
@@ -1136,10 +1152,11 @@ async fn heal_errors_when_finalized_marker_ahead_of_tip() -> eyre::Result<()> {
         default_test_execution_node(None, None, &temp_dir.path().join("reth"), None)?;
     let reth_env = execution_node.get_reth_env().await;
 
-    // Plant a marker past the (genesis-only) tip. finalize_block with a fabricated header is
-    // safe here: its hash is not in the in-memory block map, so remove_persisted_blocks no-ops.
+    // Plant a marker past the (genesis-only) tip via a direct database write - only a
+    // corrupted or pre-fix database can present this state, since the production path commits
+    // the marker atomically with the blocks and can never run ahead of them.
     let ahead = SealedHeader::new(ExecHeader { number: 5, ..Default::default() }, B256::random());
-    reth_env.finalize_block(ahead)?;
+    plant_finalized_marker(&reth_env, ahead)?;
 
     let err = reth_env
         .heal_finalized_to_persisted_tip()
@@ -1166,6 +1183,58 @@ async fn heal_noop_on_fresh_genesis() -> eyre::Result<()> {
     assert!(
         reth_env.finalized_header()?.is_none(),
         "fresh genesis stays unfinalized after the heal",
+    );
+
+    Ok(())
+}
+
+/// The kill-between-commits gap can no longer open: blocks and the finalized/safe markers
+/// commit in ONE database transaction (`RethEnv::finish_executing_output`), so a node that
+/// dies immediately after the blocks-commit — before `finalize_block`'s in-memory update ever
+/// runs — restarts on a database whose finalized marker ALREADY equals the persisted tip.
+/// There is no between-commits state, so the startup heal has nothing to repair and takes its
+/// no-op path (no warn-path heal needed).
+#[tokio::test]
+async fn finalized_marker_commits_atomically_with_blocks() -> eyre::Result<()> {
+    let temp_dir = TempDir::with_prefix("atomic_finalized_marker")?;
+    let chain: Arc<RethChainSpec> = Arc::new(adiri_genesis().into());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &temp_dir.path().join("reth"),
+        None,
+    )?;
+    let reth_env = execution_node.get_reth_env().await;
+
+    // execute one consensus output and commit it WITHOUT calling finalize_block: the exact
+    // on-disk state of a node killed right after finish_executing_output's commit
+    let genesis_header = chain.sealed_genesis_header();
+    let no_txs: Vec<Vec<u8>> = vec![];
+    let output = manual_consensus_output(0, 0, 1, false);
+    let payload = payload_with_base_fee(genesis_header.clone(), &output, MIN_PROTOCOL_BASE_FEE, 0);
+    let block =
+        reth_env.build_block_from_batch_payload(payload, &no_txs, genesis_header.hash(), &[])?;
+    let block_header = extend_canonical_chain(&reth_env, block)?;
+
+    // fresh read-only provider reads: the persisted marker already equals the persisted tip
+    assert_eq!(reth_env.last_block_number()?, block_header.number);
+    assert_eq!(
+        reth_env.last_finalized_block_number()?,
+        block_header.number,
+        "the finalized marker commits atomically with the blocks",
+    );
+
+    // the heal has nothing to repair: it takes the no-op path, which never touches the
+    // in-memory watches (still unset because finalize_block never ran)
+    reth_env.heal_finalized_to_persisted_tip()?;
+    assert!(
+        reth_env.finalized_header()?.is_none(),
+        "a no-op heal leaves the watches untouched - no warn-path heal was needed",
+    );
+    assert_eq!(
+        reth_env.last_finalized_block_number()?,
+        block_header.number,
+        "the no-op heal leaves the settled marker in place",
     );
 
     Ok(())

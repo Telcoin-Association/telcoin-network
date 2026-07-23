@@ -950,8 +950,8 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
     // assert gossip message
-    if let NetworkEvent::Gossip { message: msg, .. } = event {
-        assert_eq!(msg.data, expected_result);
+    if let NetworkEvent::Gossip(gossip) = event {
+        assert_eq!(gossip.message.data, expected_result);
     } else {
         panic!("unexpected network event received");
     }
@@ -1022,10 +1022,10 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
     // assert gossip message and that the resolved relayer identity is carried
-    if let NetworkEvent::Gossip { message: msg, relayer, .. } = event {
-        assert_eq!(msg.data, expected_result);
+    if let NetworkEvent::Gossip(gossip) = event {
+        assert_eq!(gossip.message.data, expected_result);
         assert_eq!(
-            relayer,
+            gossip.relayer,
             Some(target_peer_bls),
             "resolved relayer's BLS identity must be attached to the delivered gossip"
         );
@@ -1241,8 +1241,9 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 
     while !received && start.elapsed() < timeout {
         match tokio::time::timeout(Duration::from_millis(500), nvv_events.recv()).await {
-            Ok(Some(NetworkEvent::Gossip { message: msg, relayer: from, .. })) => {
-                assert_eq!(msg.data, expected_msg, "Gossip message data mismatch");
+            Ok(Some(NetworkEvent::Gossip(gossip))) => {
+                assert_eq!(gossip.message.data, expected_msg, "Gossip message data mismatch");
+                let from = gossip.relayer;
                 debug!(target: "network", ?from, "nvv received gossip from peer");
                 received = true;
             }
@@ -1267,11 +1268,12 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 /// A pruned peer that does not support the dedicated peer-exchange protocol still
 /// receives the goodbye.
 ///
-/// The raw swarm below advertises only the legacy `/tn-primary-{chain}/0.0.1`
-/// req-res protocol, exactly the wire surface of a not-yet-upgraded node. The
-/// target's goodbye attempt on `/tn-primary-peer-exchange-{chain}/0.0.1` fails
-/// with `UnsupportedProtocols` (penalty-exempt) and must fall back to the
-/// `PeerExchange` variant embedded in the legacy request enum.
+/// The raw swarm below advertises only the `/tn-primary-{chain}/0.0.2` req-res
+/// protocol and not the dedicated peer-exchange protocol, exactly the wire
+/// surface of a peer that has not adopted peer-exchange. The target's goodbye
+/// attempt on `/tn-primary-peer-exchange-{chain}/0.0.1` fails with
+/// `UnsupportedProtocols` (penalty-exempt) and must fall back to the
+/// `PeerExchange` variant embedded in the request enum.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre::Result<()> {
     tn_types::test_utils::init_test_tracing();
@@ -2231,8 +2233,8 @@ async fn test_gossip_explicit_peer_includes_next_committee() -> eyre::Result<()>
     publisher.publish(TEST_TOPIC.into(), expected.clone()).await?;
     let event =
         timeout(Duration::from_secs(2), next_peer_events.recv()).await?.expect("gossip received");
-    if let NetworkEvent::Gossip { message: msg, .. } = event {
-        assert_eq!(msg.data, expected);
+    if let NetworkEvent::Gossip(gossip) = event {
+        assert_eq!(gossip.message.data, expected);
     } else {
         panic!("unexpected network event received");
     }
@@ -2377,8 +2379,8 @@ async fn test_get_kad_records() -> eyre::Result<()> {
 
     // wait for gossip from disconnected peer
     match timeout(Duration::from_secs(5), nvv_events.recv()).await {
-        Ok(Some(NetworkEvent::Gossip { message: msg, .. })) => {
-            let GossipMessage { source, data, .. } = msg;
+        Ok(Some(NetworkEvent::Gossip(gossip))) => {
+            let GossipMessage { source, data, .. } = gossip.message;
             assert_eq!(source, Some(target_peer_id));
             assert_eq!(data, expected_msg);
         }
@@ -3201,8 +3203,10 @@ fn accepted_gossip_with_unresolved_relayer_is_delivered() -> eyre::Result<()> {
         accepted_gossip_event(message.clone(), None, None);
     assert_matches!(
         event,
-        NetworkEvent::Gossip { message: delivered, relayer: None, author: None }
-            if delivered.data == message.data
+        NetworkEvent::Gossip(payload)
+            if payload.relayer.is_none()
+                && payload.author.is_none()
+                && payload.message.data == message.data
     );
     Ok(())
 }
@@ -3214,7 +3218,7 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
         accepted_gossip_event(message, Some(bls), None);
-    assert_matches!(event, NetworkEvent::Gossip { relayer: Some(got), .. } if got == bls);
+    assert_matches!(event, NetworkEvent::Gossip(payload) if payload.relayer == Some(bls));
     Ok(())
 }
 
@@ -3298,7 +3302,7 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
         accepted_gossip_event(message, None, Some(author));
-    assert_matches!(event, NetworkEvent::Gossip { author: Some(got), .. } if got == author);
+    assert_matches!(event, NetworkEvent::Gossip(payload) if payload.author == Some(author));
     Ok(())
 }
 

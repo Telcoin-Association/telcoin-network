@@ -11,8 +11,9 @@ use crate::{
     send_or_log_error,
     stream::{StreamBehavior, StreamEvent},
     types::{
-        KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo, NetworkResponseMessage,
-        NetworkResponseSender, NetworkResult, NetworkType, NodeRecord, ResponseChannel, RpcInfo,
+        GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
+        NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NodeRecord,
+        ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -2191,5 +2192,5 @@ fn accepted_gossip_event<Req, Res>(
     relayer: Option<BlsPublicKey>,
     author: Option<BlsPublicKey>,
 ) -> NetworkEvent<Req, Res> {
-    NetworkEvent::Gossip { message, relayer, author }
+    NetworkEvent::Gossip(Box::new(GossipPayload { message, relayer, author }))
 }

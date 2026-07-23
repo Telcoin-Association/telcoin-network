@@ -53,11 +53,11 @@ pub enum TnRethError {
     SignerRecovery(#[from] alloy::consensus::crypto::RecoveryError),
     /// The persisted finalized marker points past the persisted canonical tip.
     ///
-    /// The marker only ever trails the tip (blocks and the marker commit in separate
-    /// transactions, blocks first), so a marker ahead of the tip means the execution
-    /// database lost blocks this node already attested as final. Surfaced by the
-    /// startup heal (`RethEnv::heal_finalized_to_persisted_tip`) to refuse startup
-    /// instead of silently re-executing past attested state.
+    /// The marker only ever trails or equals the tip (it commits atomically with the
+    /// blocks; pre-fix versions committed the blocks first), so a marker ahead of the
+    /// tip means the execution database lost blocks this node already attested as
+    /// final. Surfaced by the startup heal (`RethEnv::heal_finalized_to_persisted_tip`)
+    /// to refuse startup instead of silently re-executing past attested state.
     #[error(
         "finalized marker {finalized} is ahead of the persisted canonical tip {tip}: \
          execution db is behind a marker this node already attested; refusing to start"

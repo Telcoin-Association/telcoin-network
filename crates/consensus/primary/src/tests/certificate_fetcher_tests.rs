@@ -583,19 +583,29 @@ async fn test_timeout_scenario() {
     let start_time = tokio::time::Instant::now();
     let mut request_count = 0;
 
-    // collect all requests but never respond: drop each fetch (its reply included) so the
-    // requester sees no response. `ok().flatten()` collapses a timeout or a closed channel
-    // to `None`.
+    // Collect each fetch request but hold onto its reply sender instead of dropping it, so the
+    // per-peer fetch hangs (neither Ok nor Err) and `fetch_from_peers` cannot fast-fail. Since
+    // #866, a peer that *reports* an empty/failed result lets the fetch return promptly, so only a
+    // genuinely unresponsive peer parks the fetch until the outer `timeout` deadline, which is
+    // what this test exercises. `ok().flatten()` collapses a recv timeout or closed channel to
+    // `None`.
+    let mut held_replies = Vec::new();
     loop {
-        if timeout(Duration::from_millis(200), fake_receiver.recv()).await.ok().flatten().is_some()
+        if let Some(fetch) =
+            timeout(Duration::from_millis(200), fake_receiver.recv()).await.ok().flatten()
         {
+            held_replies.push(fetch);
             request_count += 1;
             // continue collecting requests until we've seen them all
         } else if request_count >= num_peers {
-            // timeout or channel closed, and all requests collected
+            // recv timed out (peers are parked, not answering) and all requests collected
             break;
         }
     }
+
+    // every peer request was captured and its reply is still held (peers stay unresponsive for the
+    // rest of the test), so the in-flight fetch can only end via the outer timeout
+    assert!(held_replies.len() >= num_peers, "should have collected a request from every peer");
 
     // wait for the fetch operation to timeout
     tokio::time::sleep(expected_timeout + Duration::from_secs(1)).await;
@@ -1010,9 +1020,14 @@ async fn test_invalid_cert_from_sole_peer_does_not_panic() {
     });
 
     // regression (#822): with a single peer, `peer_index` already equals `peers.len()` when the
-    // response arrives, so logging the rejected cert used to panic on `peers[peer_index]`.
-    // `fetch_from_peers` has no single-peer error-return path, so post-fix it keeps waiting and
-    // the timeout elapses; pre-fix it panics before this future can complete.
+    // response arrives, so logging the rejected cert used to panic on `peers[peer_index]` (now
+    // fixed by logging the `peer` from the result tuple).
+    //
+    // regression (#866): that invalid response is the sole peer's only result, so once it is
+    // rejected every spawned fetch has reported without success and `fetch_from_peers` must
+    // fast-fail with `NoCertificateFetched`. Before #866 the early-exit checks gated on
+    // `tx_results.is_closed()`, which never became true (the loop holds `tx_results`), so the
+    // function parked until the outer timeout and this future resolved to `Pending`/`Elapsed`.
     let outcome = timeout(
         Duration::from_secs(2),
         fetch_from_peers(
@@ -1026,11 +1041,75 @@ async fn test_invalid_cert_from_sole_peer_does_not_panic() {
     .await;
 
     // positive signal that the invalid response was actually delivered, so the rejection/logging
-    // path ran (this is where the pre-fix `peers[peer_index]` panic fires); without it the timeout
-    // assertion alone could pass vacuously if the mock stopped delivering.
+    // path ran (this is where the pre-#822 `peers[peer_index]` panic fires); without it the outcome
+    // assertion could pass vacuously if the mock stopped delivering.
     let delivered = timeout(Duration::from_secs(1), answered_rx).await.ok().and_then(Result::ok);
     assert!(delivered.is_some(), "sole peer never delivered its response");
-    // and the fix means we reached that path without panicking; the fetch stays pending, so the
-    // outer timeout elapses rather than returning a value.
-    assert!(outcome.is_err(), "fetch_from_peers should still be pending, got {outcome:?}");
+    // no panic (we got a value at all), and the rejected sole peer fast-fails with
+    // `NoCertificateFetched` rather than parking until the 2s outer timeout.
+    assert_matches!(
+        outcome,
+        Ok(Err(CertManagerError::NoCertificateFetched)),
+        "sole invalid peer should fast-fail with NoCertificateFetched instead of parking"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_fetch_from_peers_fast_fails_on_all_empty() {
+    init_test_tracing();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let task_manager = TaskManager::default();
+
+    // every committee peer will be asked; each answers with an empty response
+    let peers: Vec<BlsPublicKey> =
+        fixture.committee().others_primaries_by_id(None).into_iter().map(|(_, key)| key).collect();
+    assert!(peers.len() >= 2, "need multiple peers to exercise the staggered fan-out");
+
+    let (network, mut fetch_rx) = MockFetcher::new();
+    // drain every per-peer fetch and reply with an empty certificate set
+    tokio::spawn(async move {
+        while let Some((_peer, _request, reply)) = fetch_rx.recv().await {
+            let _ = reply.send(Ok(vec![]));
+        }
+    });
+
+    // regression (#866): with all peers returning empty, `fetch_from_peers` must return
+    // `NoCertificateFetched` as soon as the last spawned fetch reports, rather than parking until
+    // the outer `fallback_delay * (peers.len() + 2)` timeout. Before the fix the early-exit checks
+    // gated on `tx_results.is_closed()`, which never became true (this task holds `tx_results`), so
+    // the function hung and this future would have timed out (`Err(Elapsed)`).
+    let num_peers = peers.len() as u32;
+    let fallback_delay = Duration::from_millis(100);
+    let outer_timeout = fallback_delay * (num_peers + 2);
+
+    let start = tokio::time::Instant::now();
+    let outcome = timeout(
+        outer_timeout,
+        fetch_from_peers(
+            network,
+            peers,
+            MissingCertificatesRequest::default(),
+            task_manager.get_spawner(),
+            fallback_delay,
+        ),
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    assert_matches!(
+        outcome,
+        Ok(Err(CertManagerError::NoCertificateFetched)),
+        "all-empty fetch should resolve to NoCertificateFetched, not hang until the outer timeout"
+    );
+    // A prompt return must land well within the outer timeout, not merely before it. The last peer
+    // is spawned after ~`(num_peers - 1) * fallback_delay` and answers immediately, so the fetch
+    // returns by roughly that point. Bound at `(num_peers + 1) * fallback_delay`, one
+    // `fallback_delay` under the outer timeout, so a regression that let the fetch drift toward
+    // the deadline fails here instead of passing the tautological `elapsed < outer_timeout`
+    // that the `Ok(_)` match above already implies.
+    let prompt_bound = fallback_delay * (num_peers + 1);
+    assert!(
+        elapsed < prompt_bound,
+        "fetch should fast-fail well within the timeout (elapsed {elapsed:?}, bound {prompt_bound:?}, outer {outer_timeout:?})"
+    );
 }
