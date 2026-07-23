@@ -126,7 +126,7 @@ impl<DB: Database> Database for CompositeDatabase<DB> {
         self.get_db(T::HINT).last_record::<T>()
     }
 
-    fn persist<T: Table>(&self) -> impl Future<Output = ()> + Send {
+    fn persist<T: Table>(&self) -> impl Future<Output = eyre::Result<()>> + Send {
         self.get_db(T::HINT).persist::<T>()
     }
 

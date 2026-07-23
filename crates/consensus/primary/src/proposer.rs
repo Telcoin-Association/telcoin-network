@@ -343,7 +343,16 @@ impl<DB: Database> Proposer<DB> {
             // restart the anti-equivocation guard would then read nothing and build a *different*
             // header for this same round while the pre-crash header is already on the network:
             // equivocation from an ordinary crash. See issue #934.
-            proposer_store.persist::<LastProposed>().await;
+            //
+            // If the barrier reports a failed commit (disk full, `EIO`, checksum), the record is
+            // not on disk, so broadcasting would risk that same self-inflicted equivocation.
+            // Refuse to broadcast and return a fatal error instead: the proposer runs as a
+            // critical task, so returning here fail-stops the node cleanly rather than continuing
+            // on a lost guard record (issue #975).
+            proposer_store
+                .persist::<LastProposed>()
+                .await
+                .map_err(|e| ProposerError::DurableBarrierFailed(e.to_string()))?;
         }
 
         // Send the new header to the `Certifier` that will broadcast and certify it.

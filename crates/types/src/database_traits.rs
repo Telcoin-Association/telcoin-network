@@ -141,9 +141,14 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     /// This is the single durability barrier: await it at externalization points (the proposer's
     /// header broadcast, the vote handler's vote return, and the certifier's proposed-certificate
     /// externalization) where losing the record across a crash would make an honest node
-    /// equivocate. See issues #934, #962, and #963.
-    fn persist<T: Table>(&self) -> impl Future<Output = ()> + Send {
-        std::future::ready(())
+    /// equivocate. See issues #934, #962, #963, and #975.
+    ///
+    /// Resolves to `Err` if the physical commit failed (e.g. disk full, `EIO`, a checksum error),
+    /// so a caller can refuse to externalize an artifact whose anti-equivocation record never
+    /// reached disk and fail-stop instead of silently equivocating on restart (issue #975).
+    /// Synchronously-durable backends never fail here.
+    fn persist<T: Table>(&self) -> impl Future<Output = eyre::Result<()>> + Send {
+        std::future::ready(Ok::<(), eyre::Report>(()))
     }
     /// Synchronous, catch-up-only sibling of [`Database::persist`], for tests that cannot `await`.
     ///
