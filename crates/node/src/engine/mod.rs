@@ -305,18 +305,18 @@ impl ExecutionNode {
         guard.epoch_state_at_epoch_start()
     }
 
-    /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
+    /// Read the committee's BLS keys for `epoch`, pinned to the block identified by `block_hash`.
     ///
     /// This is deliberately the ONLY committee read the engine exposes: an unpinned
     /// (canonical-tip) variant would make the result depend on when the caller runs
     /// relative to a mid-epoch governance burn. Callers must choose their pin header
     /// explicitly (epoch-start for entry reads, the epoch-closing block for the record).
-    pub async fn validators_for_epoch_at_block(
+    pub async fn committee_keys_for_epoch_at_block(
         &self,
         epoch: u32,
         block_hash: B256,
     ) -> eyre::Result<Vec<BlsPublicKey>> {
         let guard = self.internal.read().await;
-        guard.validators_for_epoch_at_block(epoch, block_hash)
+        guard.committee_keys_for_epoch_at_block(epoch, block_hash)
     }
 }

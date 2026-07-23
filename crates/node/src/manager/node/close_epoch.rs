@@ -224,9 +224,10 @@ where
         // pin makes the record's committee reads and its `final_state` derive from the same
         // header by construction instead of by timing.
         let parent_state = self.consensus_bus.latest_execution_block_num_hash();
-        let committee_keys = engine.validators_for_epoch_at_block(epoch, parent_state.hash).await?;
+        let committee_keys =
+            engine.committee_keys_for_epoch_at_block(epoch, parent_state.hash).await?;
         let next_committee_keys =
-            engine.validators_for_epoch_at_block(epoch + 1, parent_state.hash).await?;
+            engine.committee_keys_for_epoch_at_block(epoch + 1, parent_state.hash).await?;
         let prev_record = if epoch == 0 {
             None
         } else {
