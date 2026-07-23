@@ -182,7 +182,7 @@ where
             HashSet::new() // no previous committee
         } else {
             engine
-                .validators_for_epoch_at_block(epoch - 1, epoch_start_header.hash())
+                .committee_keys_for_epoch_at_block(epoch - 1, epoch_start_header.hash())
                 .await?
                 .into_iter()
                 .collect()
@@ -249,7 +249,7 @@ where
         // epoch + 2 read is logged and skipped rather than aborting epoch start.
         prefetches.extend(consensus_config.next_committee_keys().iter());
         match engine
-            .validators_for_epoch_at_block(committee.epoch() + 2, epoch_start_header.hash())
+            .committee_keys_for_epoch_at_block(committee.epoch() + 2, epoch_start_header.hash())
             .await
         {
             Ok(keys) => prefetches.extend(keys),
@@ -290,7 +290,7 @@ where
         // already serves the next epoch's committee, and a post-burn re-entry folds the same
         // next-committee keys into the config as an on-time entry.
         let next_committee_keys = engine
-            .validators_for_epoch_at_block(committee.epoch() + 1, epoch_start_header.hash())
+            .committee_keys_for_epoch_at_block(committee.epoch() + 1, epoch_start_header.hash())
             .await?;
 
         // create config for consensus

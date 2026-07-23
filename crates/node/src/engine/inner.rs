@@ -382,8 +382,8 @@ impl ExecutionNodeInner {
         self.reth_env.epoch_state_at_epoch_start()
     }
 
-    /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
-    pub(super) fn validators_for_epoch_at_block(
+    /// Read the committee's BLS keys for `epoch`, pinned to the block identified by `block_hash`.
+    pub(super) fn committee_keys_for_epoch_at_block(
         &self,
         epoch: u32,
         block_hash: B256,
