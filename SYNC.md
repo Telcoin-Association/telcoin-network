@@ -73,3 +73,83 @@ Consensus headers have to be retrieved in "reverse" from a newer hash backwards 
   - This can be done in parallel (as epoch records come in for instance)
   - Once the latest committee is known then the node can download the latest output as it received
 - Once an unbroken chain of consensus output has been retrieved then start executing it in order to create the execution chain.
+
+## Bootstrapping From a State Snapshot (Export / Import)
+
+The metadata chains above let a node sync trustlessly from genesis, but re-executing every epoch's
+consensus output to rebuild the execution state is expensive for a node joining an established network.
+As an alternative, a running node can periodically **export** its final execution state together with
+the consensus/epoch metadata as a portable **bundle**, and a fresh node can **import** that bundle to
+start near the network tip and then sync *forward* using the same metadata-chain mechanisms above.
+
+The snapshot narrows what must be re-derived rather than replacing the trust model:
+- The **epoch records** in the bundle are re-verified on import against the genesis committee, exactly
+  as in the trustless flow — each record's certificate is checked and the committee is chained forward
+  from epoch 0. A tampered record chain is rejected.
+- The **consensus pack** for the snapshot epoch is rebuilt and its final header is checked against the
+  (certificate-verified) epoch record's final consensus hash.
+- The **execution state** is taken from the bundle as a trusted starting point (its state root is
+  recomputed as it is stored). You trust whoever produced the bundle for the execution state; the
+  committee/consensus history remains self-verifying.
+
+### The export bundle
+
+With `--enable-state-export`, at each epoch boundary the node writes a bundle to
+`consensus-db/state_exports/epoch-{N}/` (atomically — the directory only appears once complete)
+containing four files:
+- `state_data` — the EVM state at the epoch's final block (accounts, storage, bytecode, block headers).
+- `consensus_data` — the closed epoch's consensus pack (`data` stream).
+- `epoch_records` — the epoch-records pack (`epochs.pack`).
+- `epoch_certs` — the epoch-certificates pack, which lets the importer verify the records.
+
+The just-closed (tip) epoch's certificate is not aggregated until the next epoch starts (see The Epoch
+Chain above), so the tip record is imported chained-but-unverified (anchored by hash to its verified
+predecessor); every earlier epoch is fully verified.
+
+### 1. Enabling export on a running node
+
+Add the global `--enable-state-export` flag to the `node` command:
+
+```
+telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask \
+  --datadir DATADIR --enable-state-export
+```
+
+Each completed epoch leaves a new `DATADIR/consensus-db/state_exports/epoch-{N}/`. Copy the `epoch-{N}`
+directory you want to bootstrap from to the new node's machine.
+
+### 2. Initializing a new node from a bundle
+
+Into a **fresh** datadir (the importer refuses one that already holds reth chain data), load the bundle:
+
+```
+telcoin-network db load-state /path/to/epoch-N --chain adiri --datadir NEW_DATADIR
+```
+
+`--chain` selects the genesis and genesis committee (the trust root) and must match the network the
+bundle came from. `db load-state`:
+- restores the execution state into a new reth database,
+- rebuilds the fully-indexed epoch-records and consensus packs, verifying every record against its
+  certificate (chained from the genesis committee), and
+- writes the consensus "latest" slot hint so a restart resumes at epoch N.
+
+### 3. Starting the node
+
+Start the node normally against the same datadir (configured with keys/identity as usual — the import
+only adds chain state):
+
+```
+telcoin-network node -vvv --http --observer --chain adiri --bls-passphrase-source ask \
+  --datadir NEW_DATADIR
+```
+
+On startup the node reads the slot hint, opens epoch N's consensus pack, and begins syncing *forward*
+from epoch N — downloading and verifying newer epoch records and consensus output via the metadata
+chains above — instead of replaying from genesis.
+
+### Caveats
+
+- Epoch 0: a bundle taken at the end of epoch 0 restores state and records but not an epoch-0 consensus
+  pack (reconstructing it needs a pre-epoch-0 genesis descriptor the bundle does not carry), so no
+  resume hint is written. Bootstrap from a later epoch.
+- The target datadir must be fresh, all four bundle files must be present, and `--chain` must match the source network.
