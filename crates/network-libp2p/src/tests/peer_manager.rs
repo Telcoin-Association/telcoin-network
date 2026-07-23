@@ -1452,6 +1452,37 @@ async fn test_peer_action_ban_arms_temporarily_banned() {
     );
 }
 
+// A ban admission that overflows the bounded temporarily-banned cache must unban the evicted
+// oldest peer, mirroring the age-based eviction path. Otherwise the evicted peer would linger on
+// the gossipsub blacklist (installed via the `Banned` event) after leaving the reconnection cache.
+#[tokio::test]
+async fn test_size_cap_eviction_emits_unbanned() {
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().max_temporarily_banned_peers = 2;
+    let mut peer_manager = create_test_peer_manager(Some(network_config));
+
+    // ban three distinct peers into a cache capped at two; the first (oldest) is evicted.
+    let peers: Vec<PeerId> = (0..3).map(|_| PeerId::random()).collect();
+    peers.iter().for_each(|&peer| {
+        peer_manager.apply_peer_action(peer, PeerAction::Ban(Vec::new()));
+    });
+
+    // occupancy never exceeds the cap and the oldest peer was evicted.
+    assert_eq!(peer_manager.temporarily_banned.len(), 2, "cache must stay within its size cap");
+    assert!(
+        !peer_manager.temporarily_banned.contains(&peers[0]),
+        "the oldest peer must be evicted on overflow"
+    );
+
+    // the evicted oldest peer is unbanned, so downstream blacklist state is released for it.
+    let events = collect_all_events(&mut peer_manager);
+    let unbanned = extract_events(&events, |e| matches!(e, PeerEvent::Unbanned(_)));
+    assert!(
+        unbanned.iter().any(|e| matches!(e, PeerEvent::Unbanned(id) if *id == peers[0])),
+        "cap eviction must emit PeerEvent::Unbanned for the evicted oldest peer"
+    );
+}
+
 // Regression: an in-flight dial whose peer became banned mid-dial must be
 // rejected at `handle_pending_outbound_connection`. Pre-fix, the
 // `dial_attempt_already_registered` short-circuit returned `Ok(vec![])` with

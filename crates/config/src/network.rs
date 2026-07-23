@@ -373,6 +373,14 @@ pub struct PeerConfig {
     pub max_banned_peers: usize,
     /// The maximum number of disconnected peers to maintain before pruning.
     pub max_disconnected_peers: usize,
+    /// The maximum number of entries retained in the temporarily-banned reconnection cache.
+    ///
+    /// This bounds the `temporarily_banned` cache (`BannedPeerCache`), which is keyed by `PeerId`
+    /// and otherwise grows only with the reputation-ban rate between heartbeats. On overflow the
+    /// oldest entry is evicted, so the cache never exceeds this size regardless of ban admission
+    /// rate. This is distinct from `max_banned_peers`, which bounds the reputation-ban table in
+    /// `AllPeers`; this knob bounds the swarm-level reconnection-timeout cache.
+    pub max_temporarily_banned_peers: usize,
     /// The config for scoring peers.
     pub score_config: ScoreConfig,
 }
@@ -393,6 +401,7 @@ impl Default for PeerConfig {
             excess_peers_reconnection_timeout: Duration::from_secs(600),
             max_banned_peers: 100,
             max_disconnected_peers: 100,
+            max_temporarily_banned_peers: 100,
             score_config: ScoreConfig::default(),
         }
     }
@@ -565,6 +574,28 @@ mod tests {
             default.sync_config.max_skip_rounds_for_missing_certs
         );
         assert_eq!(parsed.quic_config.max_idle_timeout, default.quic_config.max_idle_timeout);
+    }
+
+    #[test]
+    fn temporarily_banned_cap_has_valid_default() {
+        // The temporarily-banned cache cap must ship with a sane, positive default so the cache is
+        // bounded out of the box, parallel to `max_banned_peers`.
+        let default = PeerConfig::default();
+        assert!(
+            default.max_temporarily_banned_peers > 0,
+            "max_temporarily_banned_peers default must be positive"
+        );
+        assert_eq!(
+            default.max_temporarily_banned_peers, 100,
+            "default should mirror the sibling max_banned_peers cap"
+        );
+
+        // an empty config falls back to the default, so operators inherit the bound automatically.
+        let parsed: NetworkConfig = serde_yaml::from_str("{}").expect("empty mapping deserializes");
+        assert_eq!(
+            parsed.peer_config.max_temporarily_banned_peers,
+            default.max_temporarily_banned_peers,
+        );
     }
 
     #[test]
