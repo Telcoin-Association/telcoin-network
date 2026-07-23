@@ -536,9 +536,12 @@ fn test_upsert_peer_merge_releases_displaced_banned_record() {
     all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
     assert_eq!(all_peers.banned_peers.total(), 1);
 
-    // the peer reconnects anonymously with its rotated key, then its kad record arrives;
-    // the anonymous record wins the merge and the displaced banned record releases its
-    // bookkeeping as it is dropped (the ban itself is shed: pre-existing merge semantics)
+    // this record was banned purely at the connection-status layer (`Disconnecting { banned }`);
+    // its *score* was never lowered, so it carries no reputation ban. the peer reconnects
+    // anonymously with its rotated key, then its kad record arrives: the anonymous record wins the
+    // merge and the displaced record releases its `banned_peers` counter as it is dropped. because
+    // there is no reputation ban to carry (issue #998), the merged record stays Trusted - the
+    // reputation-ban case is covered by `test_upsert_peer_anonymous_inbound_merge_retains_ban`.
     let addr2 = create_multiaddr(None);
     all_peers.update_connection_status(
         &peer_id_2,
@@ -555,6 +558,163 @@ fn test_upsert_peer_merge_releases_displaced_banned_record() {
     assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
     let peer = all_peers.get_peer(&peer_id_2).expect("promoted peer resolves");
     assert!(matches!(peer.connection_status(), ConnectionStatus::Connected { .. }));
+    assert_eq!(peer.reputation(), Reputation::Trusted);
+}
+
+#[test]
+fn test_upsert_peer_anonymous_inbound_merge_retains_ban() {
+    // Regression (issue #998): a peer must not shed a *reputation* ban by reconnecting anonymously
+    // under a fresh network key before its kad record arrives. The anonymous-inbound record wins
+    // the merge in `upsert_peer`, but it must inherit the worse (banned) reputation of the record
+    // it displaces instead of resetting to a default (Trusted) score. On unpatched code the
+    // promoted record keeps its fresh score and the final `reputation()`/`peer_banned` assertions
+    // fail.
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(37);
+    let addr = create_multiaddr(None);
+
+    // establish a real reputation ban under the first network key: connect, then a Fatal penalty
+    // drops the score below the ban threshold; the follow-up disconnect completes the ban
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.process_penalty(&peer_id_1, Penalty::Fatal);
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
+    assert_eq!(
+        all_peers.get_peer(&peer_id_1).map(|p| p.reputation()),
+        Some(Reputation::Banned),
+        "precondition: the peer is reputation-banned under its first network key",
+    );
+    assert!(all_peers.peer_banned(&peer_id_1));
+    assert_eq!(all_peers.banned_peers.total(), 1);
+
+    // the banned peer reconnects anonymously under a fresh network key (new peer id), creating a
+    // live inbound record, then publishes its self-signed kad record so `upsert_peer` merges the
+    // anonymous record onto the confirmed identity
+    let addr2 = create_multiaddr(None);
+    all_peers.update_connection_status(
+        &peer_id_2,
+        NewConnectionStatus::Connected {
+            multiaddr: addr2.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.upsert_peer(bls, net2, vec![addr2]);
+
+    // the merged record keeps the worse (banned) reputation: the ban survives the rotation and
+    // `peer_banned` still reports it under the new peer id
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    let peer = all_peers.get_peer(&peer_id_2).expect("promoted peer resolves");
+    assert_eq!(
+        peer.reputation(),
+        Reputation::Banned,
+        "the anonymous-inbound merge must retain the displaced record's reputation ban",
+    );
+    assert!(
+        all_peers.peer_banned(&peer_id_2),
+        "the reputation ban must survive a network-key rotation via anonymous inbound",
+    );
+}
+
+#[test]
+fn test_upsert_peer_cold_rotation_preserves_reputation_ban() {
+    // Regression (issue #998): the ordinary "cold" network-key rotation, where there is NO live
+    // anonymous-inbound record. `migrated` is None, so the new `(migrated, rotated)` merge arm is
+    // NOT exercised; the banned record carries forward via `migrated.or(rotated)` = rotated and
+    // `normalize_carried_status` re-applies its ban. This pins that the fix leaves cold-rotation
+    // ban preservation intact. The over-correction guard - that the merge does not drag a worse
+    // promoted record UP to a better displaced score - is
+    // `test_upsert_peer_anonymous_inbound_merge_keeps_promoted_worse_ban`, which does run the new
+    // arm's no-op branch.
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(38);
+    let addr = create_multiaddr(None);
+
+    // establish a real reputation ban under the first network key
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.process_penalty(&peer_id_1, Penalty::Fatal);
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.get_peer(&peer_id_1).map(|p| p.reputation()), Some(Reputation::Banned),);
+
+    // rotate the network key with NO live anonymous inbound record present: `migrated` is None, so
+    // the banned record carries forward wholesale and normalizes its transport status
+    all_peers.upsert_peer(bls, net2, vec![addr]);
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    let peer = all_peers.get_peer(&peer_id_2).expect("rotated peer resolves");
+    assert_eq!(peer.reputation(), Reputation::Banned);
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Banned { .. }));
+    assert!(all_peers.peer_banned(&peer_id_2));
+    assert_eq!(all_peers.banned_peers.total(), 1);
+}
+
+#[test]
+fn test_upsert_peer_anonymous_inbound_merge_keeps_promoted_worse_ban() {
+    // Over-correction guard (issue #998): the merge must retain the WORSE of the two reputations in
+    // BOTH directions. Here the promoted anonymous-inbound record is itself banned while the
+    // record it displaces under the confirmed identity is better-behaved (Trusted). The
+    // `retain_worse_reputation` no-op branch (`other.score < self.score` is false) must leave the
+    // promoted record's ban intact and NOT drag it up to the displaced record's Trusted score. This
+    // is the direction that kills the "always copy the displaced score" mutation, which the
+    // same-direction retains-ban test cannot detect.
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(39);
+    let addr = create_multiaddr(None);
+
+    // a Trusted, better-behaved record under the confirmed identity via the first network key (its
+    // score is never lowered), which will become the displaced `rotated` record in the merge
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    assert_eq!(all_peers.get_peer(&peer_id_1).map(|p| p.reputation()), Some(Reputation::Trusted));
+
+    // the peer connects anonymously under a fresh network key and misbehaves BEFORE its kad record
+    // arrives, so the anonymous record (still `Unidentified`, not yet resolved to `bls`) is itself
+    // reputation-banned by a Fatal penalty
+    let addr2 = create_multiaddr(None);
+    all_peers.update_connection_status(
+        &peer_id_2,
+        NewConnectionStatus::Connected {
+            multiaddr: addr2.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.process_penalty(&peer_id_2, Penalty::Fatal);
+    assert_eq!(
+        all_peers.get_peer(&peer_id_2).map(|p| p.reputation()),
+        Some(Reputation::Banned),
+        "precondition: the anonymous inbound record is itself banned before its kad record arrives",
+    );
+
+    // the kad record arrives and binds the banned anonymous record to `bls`, whose confirmed record
+    // is merely Trusted: the promoted (banned) record must keep its own worse reputation
+    all_peers.upsert_peer(bls, net2, vec![addr2]);
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    let peer = all_peers.get_peer(&peer_id_2).expect("promoted peer resolves");
+    assert_eq!(
+        peer.reputation(),
+        Reputation::Banned,
+        "the merge must not upgrade a banned promoted record to a better displaced score",
+    );
+    assert!(
+        all_peers.peer_banned(&peer_id_2),
+        "the promoted record's own ban must survive binding to a better-behaved identity",
+    );
 }
 
 #[test]

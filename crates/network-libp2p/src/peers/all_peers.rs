@@ -224,12 +224,15 @@ impl AllPeers {
         // `bls_by_peer_id` entry derived from its previous network key
         let rotated = (current != confirmed).then(|| self.evict(&confirmed)).flatten();
         // migrate any record reachable from the new peer id (anonymous-inbound promotion or a
-        // repeat upsert); a rotated record it displaces releases its counter bookkeeping
-        // NOTE: when the anonymous record wins this merge it keeps its fresh score, so a banned
-        // peer that reconnects anonymously before its kad record arrives sheds its ban here
-        // (pre-existing semantics); carrying reputation across the merge is a possible follow-up
-        let migrated = self.peers.remove(&current);
-        if let (Some(_), Some(displaced)) = (migrated.as_ref(), rotated.as_ref()) {
+        // repeat upsert). when such a record collides with a rotated record already stored under
+        // the confirmed identity, the promoted record wins the merge - but reputation belongs to
+        // the confirmed identity, not to the transport key, so carry the worse of the two
+        // reputations onto the promoted record before releasing the displaced record's counter
+        // bookkeeping. Otherwise a banned peer could shed its ban by reconnecting anonymously under
+        // a fresh network key before its kad record arrives (issue #998).
+        let mut migrated = self.peers.remove(&current);
+        if let (Some(promoted), Some(displaced)) = (migrated.as_mut(), rotated.as_ref()) {
+            promoted.retain_worse_reputation(displaced);
             self.release_displaced_record(displaced);
         }
         // otherwise the rotated record carries forward (same domain peer, new transport key),
