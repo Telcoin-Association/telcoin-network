@@ -1191,6 +1191,27 @@ pub(crate) async fn wait_for_mid_epoch<P: Provider>(
     }
 }
 
+/// Seconds of runway left before `snap`'s epoch closes, measured from the host clock against the
+/// epoch's start.
+///
+/// Mirrors the phase arithmetic [`wait_for_mid_epoch`] performs: the block before the epoch's
+/// first block (`block_height - 1`) is the previous epoch's closing block, produced exactly at the
+/// boundary, so its timestamp is when this epoch started; every testnet node runs on this host, so
+/// the host-clock vs block-timestamp comparison is sound. Saturates to 0 once the boundary is due.
+/// `as_secs()` floors the host clock while the block timestamp is already whole seconds, so the
+/// result can over-report the true remaining budget by strictly under a second; a caller must keep
+/// a margin over its worst-case sequence rather than treat the value as exact.
+pub(crate) fn epoch_seconds_remaining(node: &str, snap: &EpochSnapshot) -> eyre::Result<u64> {
+    let boundary_block = snap.block_height.saturating_sub(1);
+    let epoch_start = read_block_timestamp(node, boundary_block)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("host clock is after the unix epoch")
+        .as_secs();
+    let phase = now.saturating_sub(epoch_start);
+    Ok(snap.epoch_duration.saturating_sub(phase))
+}
+
 /// Fetch the receipt for `tx_hash` from `node` via `eth_getTransactionReceipt` and return the
 /// `blockNumber` it landed in.
 ///
