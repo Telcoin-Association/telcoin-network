@@ -395,4 +395,37 @@ impl ExecutionNodeInner {
             .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
             .collect())
     }
+
+    /// Read committee validator keys for epoch, pinned to `header`'s state.
+    pub(super) fn validators_for_epoch_at_header(
+        &self,
+        epoch: u32,
+        header: &SealedHeader,
+    ) -> eyre::Result<Vec<BlsPublicKey>> {
+        Ok(self
+            .reth_env
+            .bls_pubkeys_for_epoch_at_header(epoch, header)?
+            .iter()
+            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
+            .collect())
+    }
+
+    /// Read several epochs' committee validator keys, pinned to `header`'s state — ONE pinned
+    /// EVM for the whole batch, results ordered to match `epochs`.
+    pub(super) fn validators_for_epochs_at_header(
+        &self,
+        epochs: &[Epoch],
+        header: &SealedHeader,
+    ) -> eyre::Result<Vec<Vec<BlsPublicKey>>> {
+        Ok(self
+            .reth_env
+            .bls_pubkeys_for_epochs_at_header(epochs, header)?
+            .iter()
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
+                    .collect()
+            })
+            .collect())
+    }
 }

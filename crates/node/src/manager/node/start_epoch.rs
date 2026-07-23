@@ -4,7 +4,11 @@
 //! committee and epoch-start info are read pinned to the previous epoch's
 //! closing block — the closing block rules the entire epoch, so every entry
 //! shape derives the identical committee no matter when it runs — then turned
-//! into a [`Committee`] and a per-epoch [`ConsensusConfig`]. From
+//! into a [`Committee`] and a per-epoch [`ConsensusConfig`]. The neighbor
+//! (previous/next) committee key sets arrive as parameters, resolved by
+//! `run_epoch` in one batched read at the same pin; the only chain read issued
+//! here is the best-effort epoch + 2 prefetch, which reuses the held pin
+//! header. From
 //! that the node's mode is identified (CVV, CVV-inactive, or observer) and the
 //! [`PrimaryNode`] and [`WorkerNode`] are created together with their per-epoch
 //! [`PrimaryNetwork`]/[`WorkerNetwork`] interfaces.
@@ -113,9 +117,10 @@ where
     ///
     /// The single atomic `epoch_state_at_epoch_start` read yields the committee, the `EpochInfo`,
     /// the epoch-start timestamp, and the pin header (the previous epoch's closing block; genesis
-    /// for epoch 0), returned together so the caller (`run_epoch`) can compute the epoch boundary
-    /// and thread the committee and pin into [`configure_consensus`] and [`create_consensus`] for
-    /// further pinned reads without a second system call. The pin is what makes every
+    /// for epoch 0), returned together so the caller (`run_epoch`) can compute the epoch boundary,
+    /// batch the neighbor-committee reads at the same pin, and thread the committee into
+    /// [`configure_consensus`] and the pin into [`create_consensus`] for the remaining pinned
+    /// read — all without a second system call. The pin is what makes every
     /// entry shape — fresh boundary crossing, crash-restart replay, or ModeChange re-entry, before
     /// or after a mid-epoch governance `burn` — derive the IDENTICAL committee; the
     /// `EpochInfo`/epoch-start scalars are unchanged by the pin, since `concludeEpoch` writes them
@@ -151,9 +156,10 @@ where
     ///
     /// These components are short-lived: they exist only for the current epoch and are torn
     /// down at its close. The node mode is (re)identified first, and the previous epoch's
-    /// committee is read from on-chain state at `epoch_start_header` so peers from the outgoing
-    /// committee are not banned during the handover. `initial_epoch` is threaded down to gate
-    /// the one-time per-process network setup (see [`init_network_for_epoch`]).
+    /// committee keys — resolved by `run_epoch`'s batched read pinned to `epoch_start_header` —
+    /// are threaded in so peers from the outgoing committee are not banned during the handover.
+    /// `initial_epoch` is threaded down to gate the one-time per-process network setup (see
+    /// [`init_network_for_epoch`]).
     ///
     /// After both nodes are up, the next two committees' validator keys are prefetched through
     /// the primary and worker network handles so their network info is already resolved when
@@ -168,25 +174,10 @@ where
         consensus_bus: ConsensusBus,
         consensus_config: ConsensusConfig<DB>,
         epoch_start_header: &SealedHeader,
+        previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>)> {
         // create config for consensus
         let _mode = self.identify_node_mode(&consensus_config, &consensus_bus).await?;
-        let epoch = consensus_config.committee().epoch();
-
-        // Previous committee from on-chain state - canonical source of truth. The previous
-        // epoch's committee array is frozen once this epoch starts (a mid-epoch burn mutates
-        // the current and future epochs' arrays, never a past epoch's), so this pinned read is
-        // value-identical to a tip read — pinned purely so every epoch-scoped read in this
-        // path derives from the one epoch-start header.
-        let previous_committee_keys: HashSet<BlsPublicKey> = if epoch == 0 {
-            HashSet::new() // no previous committee
-        } else {
-            engine
-                .validators_for_epoch_at_block(epoch - 1, epoch_start_header.hash())
-                .await?
-                .into_iter()
-                .collect()
-        };
 
         let consensus_bus_app = consensus_bus.app().clone();
         let primary = self
@@ -248,9 +239,7 @@ where
         // the config (already read at the pin — no second chain read to fail), and a failed
         // epoch + 2 read is logged and skipped rather than aborting epoch start.
         prefetches.extend(consensus_config.next_committee_keys().iter());
-        match engine
-            .validators_for_epoch_at_block(committee.epoch() + 2, epoch_start_header.hash())
-            .await
+        match engine.validators_for_epoch_at_header(committee.epoch() + 2, epoch_start_header).await
         {
             Ok(keys) => prefetches.extend(keys),
             Err(e) => warn!(target: "epoch-manager", ?e, "skipping epoch + 2 committee prefetch"),
@@ -270,28 +259,20 @@ where
     /// Assemble the per-epoch [`ConsensusConfig`] from state pinned to the previous epoch's
     /// closing block.
     ///
-    /// `committee` and `epoch_start_header` are threaded in from `run_epoch`'s single entry
-    /// read ([`Self::get_committee_with_epoch_start_info`]) — this method issues no epoch-start
-    /// read of its own, so the config cannot derive from a different pin than the rest of the
-    /// entry path. It folds in the next committee's keys — read at the same pin — so the
-    /// network can pre-resolve the successor committee. Produces a config scoped to this epoch
-    /// only.
+    /// `committee` and `next_committee_keys` are threaded in from `run_epoch`'s pinned entry
+    /// reads ([`Self::get_committee_with_epoch_start_info`] and the batched neighbor-committee
+    /// hoist) — this method issues no chain read of its own, so the config cannot derive from a
+    /// different pin than the rest of the entry path. Folding in the next committee's keys —
+    /// read at the same pin — lets the network pre-resolve the successor committee. Produces a
+    /// config scoped to this epoch only.
     pub(super) async fn configure_consensus(
         &self,
-        engine: &ExecutionNode,
         network_config: &NetworkConfig,
         committee: Committee,
-        epoch_start_header: &SealedHeader,
+        next_committee_keys: Vec<BlsPublicKey>,
     ) -> eyre::Result<ConsensusConfig<DB>> {
         let validators = committee.bls_keys();
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
-
-        // Pinned like every other epoch-scoped read in this path: the registry at the pin
-        // already serves the next epoch's committee, and a post-burn re-entry folds the same
-        // next-committee keys into the config as an on-time entry.
-        let next_committee_keys = engine
-            .validators_for_epoch_at_block(committee.epoch() + 1, epoch_start_header.hash())
-            .await?;
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
