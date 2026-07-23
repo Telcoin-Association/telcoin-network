@@ -21,7 +21,7 @@ use tn_config::TelcoinDirs;
 use tn_reth::{recover_raw_transaction, RethEnv};
 use tn_storage::{
     consensus_pack::DATA_NAME,
-    epoch_records::RECORDS_NAME,
+    epoch_records::{CERTS_NAME, RECORDS_NAME},
     tables::{
         CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
         NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
@@ -262,9 +262,10 @@ where
     /// A no-op unless `--enable-state-export` spawned the exporter. The state export runs on the
     /// exporter's background thread (a full plain-state walk can be slow) and its outcome is
     /// logged; the epoch transition does not wait on it. The bundle is written under
-    /// `consensus-db/state_exports/epoch-{N}/` and ends up with three files: `state_data` (the exec
-    /// state pack), `consensus_data` (the closed epoch's consensus pack), and `epoch_records` (the
-    /// epoch-records pack). The block exported is the epoch's final executed block — the same value
+    /// `consensus-db/state_exports/epoch-{N}/` and ends up with four files: `state_data` (the exec
+    /// state pack), `consensus_data` (the closed epoch's consensus pack), `epoch_records` (the
+    /// epoch-records pack), and `epoch_certs` (the epoch-certificates pack, which lets an importer
+    /// verify the records). The block exported is the epoch's final executed block — the same value
     /// [`write_epoch_record`](Self::write_epoch_record) records as the epoch's `final_state`.
     pub(super) async fn export_epoch_state(
         &self,
@@ -302,6 +303,7 @@ where
         let epochs_dir = self.tn_datadir.epochs_db_path();
         let src_consensus = epochs_dir.join(format!("epoch-{epoch}")).join(DATA_NAME);
         let src_records = epochs_dir.join(RECORDS_NAME);
+        let src_certs = epochs_dir.join(CERTS_NAME);
 
         // Export into a temp sibling and atomically rename it into place on success, so external
         // tooling only ever observes a complete `epoch-{N}` directory. Clear any leftover temp from
@@ -327,6 +329,9 @@ where
                             let copied = std::fs::copy(&src_consensus, tmp_dir.join("consensus_data"))
                                 .and_then(|_| {
                                     std::fs::copy(&src_records, tmp_dir.join("epoch_records"))
+                                })
+                                .and_then(|_| {
+                                    std::fs::copy(&src_certs, tmp_dir.join("epoch_certs"))
                                 });
                             match copied {
                                 Ok(_) => match std::fs::rename(&tmp_dir, &final_dir) {
@@ -336,7 +341,7 @@ where
                                         block = outcome.block.number,
                                         accounts = outcome.stats.account_count,
                                         path = ?final_dir,
-                                        "exported epoch state + consensus + records"
+                                        "exported epoch state + consensus + records + certs"
                                     ),
                                     Err(e) => {
                                         error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch bundle into place");
@@ -344,7 +349,7 @@ where
                                     }
                                 },
                                 Err(e) => {
-                                    error!(target: "tn::snapshot", epoch, error = %e, "failed to copy consensus/epoch-records packs into export");
+                                    error!(target: "tn::snapshot", epoch, error = %e, "failed to copy consensus/epoch-records/certs packs into export");
                                     let _ = std::fs::remove_dir_all(&tmp_dir);
                                 }
                             }
