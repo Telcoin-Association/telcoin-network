@@ -21,6 +21,7 @@ pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
 pub mod epoch_records;
+pub mod exec_state_pack;
 pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;

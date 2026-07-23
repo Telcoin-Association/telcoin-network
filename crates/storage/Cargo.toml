@@ -23,6 +23,9 @@ tokio = { workspace = true, features = [ "sync", "fs" ] }
 crc32fast = "1.5.0"
 cfg-if = { workspace = true }
 serde = { workspace = true }
+# Headers are stored RLP-encoded (their canonical form); the BCS record codec cannot
+# round-trip alloy's serde types (skip_serializing_if / quantity attributes).
+alloy-rlp = { workspace = true }
 zstd = "0.13.3"
 
 # redb backend

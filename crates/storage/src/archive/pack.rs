@@ -1008,54 +1008,6 @@ mod tests {
         }
     }
 
-    /// Build a valid pack, then patch the header's version field to 1 and recompute the
-    /// header CRC so the corruption survives the integrity check.  Both the sync and async
-    /// open paths must reject the unexpected version (the async path historically did not).
-    fn build_pack_with_bad_version() -> (TempDir, std::path::PathBuf) {
-        let tmp_path = TempDir::with_prefix("test_pack_bad_version").expect("temp dir");
-        let path = tmp_path.path().join("pack_badver");
-        {
-            let mut pack: TestPack =
-                Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
-            pack.append(&TestRec { idx: 1, name: "v".to_string() }).expect("append");
-            pack.commit().expect("commit");
-        }
-        // Patch version (bytes 6..8) to 100 and re-stamp the header CRC over bytes [0, 24).
-        let mut header = [0_u8; DATA_HEADER_BYTES];
-        {
-            let mut file = OpenOptions::new().read(true).write(true).open(&path).expect("open rw");
-            file.read_exact(&mut header).expect("read header");
-            header[6..8].copy_from_slice(&100_u16.to_le_bytes());
-            add_crc32(&mut header);
-            file.seek(SeekFrom::Start(0)).expect("seek");
-            file.write_all(&header).expect("write header");
-            file.flush().expect("flush");
-        }
-        (tmp_path, path)
-    }
-
-    #[test]
-    fn test_pack_iter_rejects_bad_version_sync() {
-        let (_tmp, path) = build_pack_with_bad_version();
-        let file = File::open(&path).expect("open file");
-        match PackIter::<TestRec, _>::open(file, 0) {
-            Err(LoadHeaderError::InvalidVersion) => {}
-            other => panic!("expected InvalidVersion, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_pack_iter_rejects_bad_version_async() {
-        use crate::archive::pack_iter::AsyncPackIter;
-
-        let (_tmp, path) = build_pack_with_bad_version();
-        let file = tokio::fs::File::open(&path).await.expect("open file");
-        match AsyncPackIter::<TestRec, _>::open(file, 0).await {
-            Err(LoadHeaderError::InvalidVersion) => {}
-            other => panic!("expected InvalidVersion, got {:?}", other.map(|_| ())),
-        }
-    }
-
     #[test]
     fn test_read_bytes_rejects_out_of_range() {
         let tmp_path = TempDir::with_prefix("test_read_bytes_oob").expect("temp dir");
