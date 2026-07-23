@@ -139,8 +139,9 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     /// hint so a composite backend only waits on the relevant physical store.
     ///
     /// This is the single durability barrier: await it at externalization points (the proposer's
-    /// header broadcast, the vote handler's vote return) where losing the record across a crash
-    /// would make an honest node equivocate. See issues #934 and #962.
+    /// header broadcast, the vote handler's vote return, and the certifier's proposed-certificate
+    /// externalization) where losing the record across a crash would make an honest node
+    /// equivocate. See issues #934, #962, and #963.
     fn persist<T: Table>(&self) -> impl Future<Output = ()> + Send {
         std::future::ready(())
     }
