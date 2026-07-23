@@ -14,6 +14,7 @@
 //! next epoch starts from a clean slate. Historic data survives in the
 //! `ConsensusChain` store; only the per-epoch working tables are cleared.
 
+use super::run_epoch::retry_provider_faults;
 use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
 use std::collections::BTreeSet;
@@ -223,10 +224,29 @@ where
         // on the exact write that carries the closing block, so this read IS that block; the
         // pin makes the record's committee reads and its `final_state` derive from the same
         // header by construction instead of by timing.
+        //
+        // READ-FAILURE POLICY: both committees resolve through ONE retried, batched read
+        // (`validators_for_epochs_at_block`) so they share a single pinned snapshot and a
+        // single header resolution. Failures are classified per `StateReadError`: a node-local
+        // provider fault is retried (`retry_provider_faults`), then HALTS the boundary; a
+        // chain-global failure halts immediately. There is deliberately NO fail-open arm here —
+        // a wrong committee in a signed epoch record is permanent divergence every syncing node
+        // inherits, while halting is only a single-node liveness failure.
         let parent_state = self.consensus_bus.latest_execution_block_num_hash();
-        let committee_keys = engine.validators_for_epoch_at_block(epoch, parent_state.hash).await?;
-        let next_committee_keys =
-            engine.validators_for_epoch_at_block(epoch + 1, parent_state.hash).await?;
+        let committees = retry_provider_faults("epoch-record committee reads", || {
+            engine.validators_for_epochs_at_block(vec![epoch, epoch + 1], parent_state.hash)
+        })
+        .await
+        .map_err(|e| {
+            eyre!(
+                "failed committee read at epoch-closing block {} ({:?}) for the epoch {epoch} \
+                 record - halting rather than recording a committee this node cannot verify: {e}",
+                parent_state.number,
+                parent_state.hash
+            )
+        })?;
+        let [committee_keys, next_committee_keys]: [Vec<BlsPublicKey>; 2] =
+            committees.try_into().map_err(|_| eyre!("committee batch read arity mismatch"))?;
         let prev_record = if epoch == 0 {
             None
         } else {

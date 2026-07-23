@@ -11,6 +11,7 @@ use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_reth::{
+    error::StateReadResult,
     system_calls::EpochState,
     worker::{WorkerComponents, WorkerNetwork},
     RethEnv, RpcServerHandle, WorkerTxPool,
@@ -378,21 +379,51 @@ impl ExecutionNodeInner {
 
     /// Read the current epoch's [EpochState] pinned to the previous epoch's closing block
     /// (genesis for epoch 0), returning the pin header alongside it.
-    pub(super) fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
+    ///
+    /// Failures are classified per `StateReadError` so boundary callers can retry node-local
+    /// provider faults before halting.
+    pub(super) fn epoch_state_at_epoch_start(&self) -> StateReadResult<(EpochState, SealedHeader)> {
         self.reth_env.epoch_state_at_epoch_start()
     }
 
     /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
+    ///
+    /// Failures are classified per `StateReadError` so boundary callers can retry node-local
+    /// provider faults before halting.
     pub(super) fn validators_for_epoch_at_block(
         &self,
         epoch: u32,
         block_hash: B256,
-    ) -> eyre::Result<Vec<BlsPublicKey>> {
+    ) -> StateReadResult<Vec<BlsPublicKey>> {
         Ok(self
             .reth_env
             .bls_pubkeys_for_epoch_at_block(epoch, block_hash)?
             .iter()
             .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
+            .collect())
+    }
+
+    /// Read committee validator keys for several epochs from ONE state snapshot pinned to the
+    /// block identified by `block_hash`.
+    ///
+    /// The batched sibling of [`Self::validators_for_epoch_at_block`]: the returned outer `Vec`
+    /// is ordered as `epochs`, and every epoch's keys decode from the same pinned state.
+    /// Failures are classified per `StateReadError` so boundary callers can retry node-local
+    /// provider faults before halting.
+    pub(super) fn validators_for_epochs_at_block(
+        &self,
+        epochs: Vec<Epoch>,
+        block_hash: B256,
+    ) -> StateReadResult<Vec<Vec<BlsPublicKey>>> {
+        Ok(self
+            .reth_env
+            .bls_pubkeys_for_epochs_at_block(&epochs, block_hash)?
+            .iter()
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
+                    .collect()
+            })
             .collect())
     }
 }

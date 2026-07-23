@@ -20,6 +20,7 @@
 //! yet executed is replayed to the engine, with a guard that refuses to cross an
 //! epoch boundary.
 
+use super::run_epoch::retry_provider_faults;
 use crate::{
     engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode, worker::WorkerNode,
     EngineToPrimaryRpc,
@@ -120,7 +121,15 @@ where
     /// or after a mid-epoch governance `burn` — derive the IDENTICAL committee; the
     /// `EpochInfo`/epoch-start scalars are unchanged by the pin, since `concludeEpoch` writes them
     /// exactly once at the boundary.
-    /// On-chain BLS key bytes are decoded here and a decode failure aborts committee construction.
+    ///
+    /// The pinned read retries node-local provider faults (`retry_provider_faults`) before
+    /// halting. Each attempt re-runs the whole read, including the canonical-tip bootstrap —
+    /// safe, because the bootstrap consumes only boundary-written-once registry scalars, so
+    /// every attempt resolves the same pin.
+    /// On-chain BLS key bytes are decoded here and a decode failure aborts committee
+    /// construction; the decode stays a plain hard error OUTSIDE the retry, since decode
+    /// failures are deterministic products of the on-chain bytes and re-reading cannot change
+    /// them.
     pub(super) async fn get_committee_with_epoch_start_info(
         &self,
         engine: &ExecutionNode,
@@ -128,7 +137,14 @@ where
         let (
             EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start },
             epoch_start_header,
-        ) = engine.epoch_state_at_epoch_start().await?;
+        ) = retry_provider_faults("epoch-entry state read", || engine.epoch_state_at_epoch_start())
+            .await
+            .map_err(|e| {
+                eyre!(
+                    "failed epoch-entry state read - halting rather than entering an epoch with \
+                     an unverifiable committee: {e}"
+                )
+            })?;
         let validators = validators
             .iter()
             .zip(bls_pubkeys.iter())
@@ -181,11 +197,18 @@ where
         let previous_committee_keys: HashSet<BlsPublicKey> = if epoch == 0 {
             HashSet::new() // no previous committee
         } else {
-            engine
-                .validators_for_epoch_at_block(epoch - 1, epoch_start_header.hash())
-                .await?
-                .into_iter()
-                .collect()
+            retry_provider_faults("previous-committee read at the epoch-start pin", || {
+                engine.validators_for_epoch_at_block(epoch - 1, epoch_start_header.hash())
+            })
+            .await
+            .map_err(|e| {
+                eyre!(
+                    "failed previous-committee read at the epoch-start pin - halting rather than \
+                     starting an epoch that cannot verify the outgoing committee: {e}"
+                )
+            })?
+            .into_iter()
+            .collect()
         };
 
         let consensus_bus_app = consensus_bus.app().clone();
@@ -246,11 +269,14 @@ where
         // post-burn re-entry prefetching the same sets an on-time entry prefetched. The
         // prefetch is a best-effort network warm-up: the next committee's keys are reused from
         // the config (already read at the pin — no second chain read to fail), and a failed
-        // epoch + 2 read is logged and skipped rather than aborting epoch start.
+        // epoch + 2 read is logged and skipped rather than aborting epoch start. A node-local
+        // provider fault is retried (`retry_provider_faults`) before the skip, so a transient
+        // I/O blip does not silently drop the warm-up.
         prefetches.extend(consensus_config.next_committee_keys().iter());
-        match engine
-            .validators_for_epoch_at_block(committee.epoch() + 2, epoch_start_header.hash())
-            .await
+        match retry_provider_faults("epoch + 2 committee prefetch", || {
+            engine.validators_for_epoch_at_block(committee.epoch() + 2, epoch_start_header.hash())
+        })
+        .await
         {
             Ok(keys) => prefetches.extend(keys),
             Err(e) => warn!(target: "epoch-manager", ?e, "skipping epoch + 2 committee prefetch"),
@@ -289,9 +315,18 @@ where
         // Pinned like every other epoch-scoped read in this path: the registry at the pin
         // already serves the next epoch's committee, and a post-burn re-entry folds the same
         // next-committee keys into the config as an on-time entry.
-        let next_committee_keys = engine
-            .validators_for_epoch_at_block(committee.epoch() + 1, epoch_start_header.hash())
-            .await?;
+        let next_committee_keys =
+            retry_provider_faults("next-committee read at the epoch-start pin", || {
+                engine
+                    .validators_for_epoch_at_block(committee.epoch() + 1, epoch_start_header.hash())
+            })
+            .await
+            .map_err(|e| {
+                eyre!(
+                    "failed next-committee read at the epoch-start pin - halting rather than \
+                     configuring consensus with an unverifiable next committee: {e}"
+                )
+            })?;
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
