@@ -12,6 +12,10 @@ NIGHTLY:=$(shell cat $(ROOT_DIR)/rust-nightly)
 # Default tag is latest if not specified
 TAG ?= latest
 
+# git commit embedded in the image version string (vergen override; avoids needing .git in
+# the build context). Falls back to `unknown` outside a git checkout.
+GIT_SHA := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+
 help:
 	@echo ;
 	@echo "=== Prerequisites ===" ;
@@ -149,7 +153,12 @@ docker-login:
 # build and push latest adiri image for amd64 and arm64
 # CARGO_FEATURES=adiri compiles in the testnet fork logic (ConsensusRegistry fork, ADIRI_DUP_BATCH_EPOCH).
 docker-adiri:
-	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+
+# build and push latest devnet image for amd64 and arm64
+# CARGO_FEATURES=faucet compiles in the faucet support only
+docker-devnet:
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
 
 # push local adiri:latest to the gcloud artifact registry
 docker-push:
