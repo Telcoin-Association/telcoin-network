@@ -128,28 +128,30 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
         Ok(())
     }
 
-    /// Some implementations may perform perstance operations in the background.
-    /// If so they can return a future that will resolve when they are complete.
-    /// This allows us to use a mostly sync DB interface but still allow async
-    /// "catch-up".  Uses Table as a hint.
+    /// Await until this caller's background writes are durably committed to the physical store.
+    ///
+    /// Some backends persist in the background: an `insert` updates an in-memory layer and enqueues
+    /// the disk write, returning before it is durable. This barrier resolves only once every write
+    /// ordered before it is durably committed, including the subtle case where a concurrently-open
+    /// write txn has *absorbed* this caller's bare insert, in which case the ack is deferred until
+    /// that physical txn commits. Synchronously-durable backends (raw MDBX / redb, `MemDatabase`)
+    /// are already durable on return, so the default no-op is correct for them. Uses `Table` as a
+    /// hint so a composite backend only waits on the relevant physical store.
+    ///
+    /// This is the single durability barrier: await it at externalization points (the proposer's
+    /// header broadcast, the vote handler's vote return, and the certifier's proposed-certificate
+    /// externalization) where losing the record across a crash would make an honest node
+    /// equivocate. See issues #934, #962, and #963.
     fn persist<T: Table>(&self) -> impl Future<Output = ()> + Send {
         std::future::ready(())
     }
-    /// Durable variant of [`Database::persist`].
+    /// Synchronous, catch-up-only sibling of [`Database::persist`], for tests that cannot `await`.
     ///
-    /// For a backend that persists in the background, a plain [`Database::persist`] barrier can
-    /// resolve while a concurrently-open write txn has *absorbed* this caller's write but not yet
-    /// committed it, so a crash in that window loses the record even though `persist` returned. The
-    /// future returned here resolves only once the write is durably committed to the physical
-    /// store, including that absorbed-into-an-open-txn case. Synchronously-durable backends
-    /// inherit the plain `persist` behaviour.
-    ///
-    /// Use at anti-equivocation externalization points (proposer header broadcast, vote return)
-    /// where losing the record on restart makes an honest node equivocate.
-    fn persist_durable<T: Table>(&self) -> impl Future<Output = ()> + Send {
-        std::future::ready(())
-    }
-    /// Sync version of persist- useful for test not for prod code.
-    /// Since this is intended for testing don't bother with the Table hint.
+    /// Unlike `persist` this deliberately does **not** provide the durability barrier: it must
+    /// never defer past an open write txn, because a caller holding that txn open on the calling
+    /// thread would self-deadlock (the txn it would wait on only commits after this returns). It
+    /// merely lets the background writer catch up for read-your-writes ordering. Test-only;
+    /// production code that needs durability awaits `persist`. The `Table` hint is unnecessary
+    /// here.
     fn sync_persist(&self) {}
 }

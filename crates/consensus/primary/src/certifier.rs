@@ -454,7 +454,7 @@ impl<DB: Database> Certifier<DB> {
                         // needs the exclusion.
                         //
                         // Holding it across the barrier would be actively harmful, because
-                        // `persist_durable` is a *whole-DB* barrier - the table parameter is unused
+                        // `persist` is a *whole-DB* barrier - the table parameter is unused
                         // and only selects which of the three DBs to target - so it defers while
                         // any write txn on the epoch DB is open and drains only at refcount zero,
                         // with no timeout. Under catch-up or epoch close that is tens to hundreds
@@ -471,7 +471,7 @@ impl<DB: Database> Certifier<DB> {
                         // certifier re-proposes the same header, re-collecting votes over an unordered
                         // channel, which can aggregate a different 2f+1 subset into a distinct aggregate
                         // signature and thereby perturb the leader-signature randomness. See #934, #963.
-                        self.config.node_storage().persist_durable::<ProposedCertificates>().await;
+                        self.config.node_storage().persist::<ProposedCertificates>().await;
 
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
