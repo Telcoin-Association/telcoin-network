@@ -28,8 +28,11 @@ pub struct TnExExContext {
     /// (see [`TnExExNotification`]); replay is the authoritative catch-up path.
     notifications: mpsc::Receiver<TnExExNotification>,
     /// Bounded channel to report events (e.g. `FinishedHeight`) back to the
-    /// manager. Only ever written via a non-blocking `try_send`, in
-    /// [`report_finished_height`](Self::report_finished_height).
+    /// manager. Written only via a non-blocking `try_send` — directly in
+    /// [`report_finished_height`](Self::report_finished_height), or through the
+    /// [`FinishedHeightReporter`] that
+    /// [`replay_and_subscribe`](Self::replay_and_subscribe) carries out when it
+    /// consumes the context.
     events: mpsc::Sender<TnExExEvent>,
     /// Read-only handle to reth for EVM chain state and history.
     reth_env: RethEnv,
@@ -149,10 +152,12 @@ impl TnExExContext {
     ///
     /// This is the recommended way for stateful ExExes to initialize:
     /// ```rust,ignore
-    /// let mut stream = ctx.replay_and_subscribe(last_indexed_block + 1);
+    /// let (reporter, mut stream) = ctx.replay_and_subscribe(last_indexed_block + 1);
     /// while let Some(result) = stream.next().await {
     ///     let notification = result?; // surface replay/tip errors
     ///     // Process identically — no distinction between replay and live
+    ///     // ...then, once the work is durably persisted:
+    ///     reporter.report_finished_height(durable_height); // keep the pruning floor advancing
     /// }
     /// ```
     ///
@@ -166,16 +171,36 @@ impl TnExExContext {
     /// than silently — re-`replay_from` the gap to reconcile. See
     /// [`replay_from`](Self::replay_from) for replay state-diff fidelity.
     ///
-    /// Note: this consumes `self` because the live notification stream is moved
-    /// into the returned combined stream. The event sender is dropped, so
-    /// [`report_finished_height`](Self::report_finished_height) can no longer be
-    /// called — use [`replay_from`](Self::replay_from) directly if you need to
-    /// keep reporting `FinishedHeight` while catching up.
+    /// # Progress reporting
+    ///
+    /// This consumes `self` because the live notification stream is moved into the
+    /// returned combined stream, so the context's own
+    /// [`report_finished_height`](Self::report_finished_height) goes with it. To
+    /// keep progress reporting on this path, a [`FinishedHeightReporter`] is
+    /// returned **alongside** the stream. A stateful ExEx that catches up here MUST
+    /// still call
+    /// [`report_finished_height`](FinishedHeightReporter::report_finished_height)
+    /// after it durably persists each height: an ExEx that never reports leaves its
+    /// finished height at `None`, and a single such ExEx pins the node-wide
+    /// [`min_finished_height`](crate::TnExExManagerHandle::min_finished_height) to
+    /// `None` (pruning disabled) for **every** ExEx, permanently. See
+    /// [`TnExExEvent::FinishedHeight`].
+    ///
+    /// This path returns one combined stream, so it cannot itself re-`replay_from`
+    /// to reconcile a [`Lagged`](TnExExNotification::Lagged) gap; an ExEx that must
+    /// reconcile lag should drive [`replay_from`](Self::replay_from) and the live
+    /// channel directly instead.
     pub fn replay_and_subscribe(
         self,
         start_block: BlockNumber,
-    ) -> impl futures::Stream<Item = eyre::Result<TnExExNotification>> {
-        let TnExExContext { notifications, reth_env, events: _, consensus_chain: _ } = self;
+    ) -> (FinishedHeightReporter, ReplaySubscribeStream) {
+        let TnExExContext { notifications, reth_env, events, consensus_chain: _ } = self;
+
+        // Carry the event sender out with the stream so an ExEx on this path can
+        // still report `FinishedHeight` after it durably persists. Dropping it here
+        // (the previous behavior) left the ExEx structurally unable to report,
+        // which pins the node-wide `min_finished_height` to `None` for every ExEx.
+        let reporter = FinishedHeightReporter { events };
 
         // Live notifications buffered since context creation (wrapped as `Ok`).
         let live = ReceiverStream::new(notifications).map(Ok);
@@ -197,7 +222,57 @@ impl TnExExContext {
         // De-duplicating by monotonic execution height drops the second copy.
         // This is unrelated to BFT/reorgs (TN has none) — it is purely the
         // replay/live seam.
-        dedup_chain_executed(replay.chain(live))
+        //
+        // Boxed because `impl Trait` cannot be nested inside the tuple return
+        // (E0562); the one allocation happens once, at ExEx startup.
+        (reporter, Box::pin(dedup_chain_executed(replay.chain(live))))
+    }
+}
+
+/// The combined replay-then-live notification stream returned by
+/// [`TnExExContext::replay_and_subscribe`], boxed so it can be returned alongside
+/// a [`FinishedHeightReporter`] (a bare `impl Stream` cannot be nested in a tuple
+/// return). Poll it with [`futures::StreamExt::next`].
+pub type ReplaySubscribeStream =
+    Pin<Box<dyn futures::Stream<Item = eyre::Result<TnExExNotification>> + Send>>;
+
+/// Reports durable ExEx progress back to the node after
+/// [`replay_and_subscribe`](TnExExContext::replay_and_subscribe) has consumed the
+/// context.
+///
+/// [`replay_and_subscribe`](TnExExContext::replay_and_subscribe) moves the live
+/// notification stream out of the [`TnExExContext`], consuming it — so the
+/// context's own [`report_finished_height`](TnExExContext::report_finished_height)
+/// is no longer reachable on that path. This handle carries the event sender out
+/// alongside the combined stream so a stateful ExEx can keep reporting how far it
+/// has durably processed.
+///
+/// Reporting matters even though nothing prunes yet: an ExEx whose finished height
+/// stays `None` pins the node-wide
+/// [`min_finished_height`](crate::TnExExManagerHandle::min_finished_height) to
+/// `None` for every ExEx (see [`TnExExEvent::FinishedHeight`]). The handle is cheap
+/// to clone (an [`mpsc::Sender`] over an `Arc`), so it can be moved into whatever
+/// sub-task owns durable persistence.
+#[derive(Clone, Debug)]
+pub struct FinishedHeightReporter {
+    /// Bounded event channel back to the manager: the originating
+    /// [`TnExExContext`]'s `events` sender, moved out when
+    /// [`replay_and_subscribe`](TnExExContext::replay_and_subscribe) consumed the
+    /// context.
+    events: mpsc::Sender<TnExExEvent>,
+}
+
+impl FinishedHeightReporter {
+    /// Report durable progress to the node (non-blocking; latest-wins).
+    ///
+    /// Identical semantics to
+    /// [`TnExExContext::report_finished_height`](TnExExContext::report_finished_height):
+    /// sends [`TnExExEvent::FinishedHeight`] with a non-blocking `try_send`, so an
+    /// ExEx can never back-pressure the manager. `FinishedHeight` is latest-wins,
+    /// so a report dropped on a momentarily-full channel is harmless — the next
+    /// report carries a higher height.
+    pub fn report_finished_height(&self, height: BlockNumber) {
+        let _ = self.events.try_send(TnExExEvent::FinishedHeight(height));
     }
 }
 
@@ -276,6 +351,21 @@ mod tests {
         assert!(matches!(out[0], Ok(TnExExNotification::Lagged { missed: 1 })));
         assert!(out[1].is_err());
         assert!(matches!(out[2], Ok(TnExExNotification::Lagged { missed: 2 })));
+    }
+
+    #[tokio::test]
+    async fn finished_height_reporter_delivers_on_the_event_channel() {
+        // The reporter that `replay_and_subscribe` hands back must put a
+        // `FinishedHeight` event on the same channel the manager drains. This is
+        // exactly the reporting the convenience path used to drop: the event sender
+        // was bound to `_` and discarded, leaving the ExEx unable to report.
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let reporter = FinishedHeightReporter { events: events_tx };
+
+        reporter.report_finished_height(42);
+
+        assert!(matches!(events_rx.try_recv(), Ok(TnExExEvent::FinishedHeight(42))));
+        assert!(events_rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -382,8 +382,25 @@ impl Router {
     }
 
     /// Recompute the minimum finished height across all ExExes and publish it.
+    ///
+    /// The floor is fail-safe: any ExEx that has not reported yet holds it at
+    /// `None` (a pruner reads "prune nothing"), because the manager cannot know how
+    /// far a silent ExEx has durably processed. This is a *startup* transient for
+    /// ExExes that eventually report, but **permanent** for one that never does —
+    /// a single non-reporting ExEx pins the node-wide floor to `None` for every
+    /// ExEx. Excluding non-reporters is *not* a safe alternative: a stateful ExEx
+    /// (e.g. one catching up via
+    /// [`replay_and_subscribe`](crate::TnExExContext::replay_and_subscribe))
+    /// consumes history, so excluding it would let a pruner delete blocks below its
+    /// true floor and cause data loss on restart. The sound fix is to keep every
+    /// stateful ExEx *able* to report (it now can on every catch-up path) rather
+    /// than to guess a floor for one that stays silent.
     fn recompute_min(&mut self) {
-        // Minimum finished height: None if any ExEx hasn't reported yet.
+        // `try_fold` short-circuits to `None` the moment any ExEx's `finished_height`
+        // is `None`; `.flatten()` maps that short-circuit back to a published `None`.
+        // Removing the `?` (folding only the reporters) would silently narrow the
+        // floor to the reporting ExExes and drop the fail-safe — see the
+        // `recompute_min_*` tests, which pin this behavior against that mutation.
         let min_height = self
             .exexes
             .iter()
@@ -419,7 +436,13 @@ pub struct TnExExManagerHandle {
 impl TnExExManagerHandle {
     /// Returns the current minimum finished height across all ExExes.
     ///
-    /// Returns `None` if any ExEx hasn't reported a finished height yet.
+    /// Fail-safe: returns `None` if any ExEx has not reported a finished height
+    /// yet, which a pruner must read as "prune nothing". This is a startup
+    /// transient for ExExes that eventually report, but **permanent** while any
+    /// ExEx never reports — one non-reporting ExEx holds the floor at `None` for
+    /// the whole node. Every stateful ExEx can report on every catch-up path (see
+    /// [`FinishedHeightReporter`](crate::FinishedHeightReporter)), so the remaining
+    /// `None` case is a genuinely silent ExEx, not a structural gap.
     pub fn min_finished_height(&self) -> Option<BlockNumber> {
         *self.min_finished_height.borrow()
     }
@@ -584,5 +607,66 @@ mod tests {
         // Out-of-order/duplicate commit (older range) → no gap, tip never rewinds.
         assert_eq!(canon_gap(&mut tip, 5, 8), None);
         assert_eq!(tip, Some(13));
+    }
+
+    /// Build a `Router` with `n` ExEx handles wired to a fresh min-height watch.
+    /// Returns the router, the watch receiver used to observe the published floor,
+    /// and the notification receivers (kept alive so the handles' senders stay open).
+    fn router_with(
+        n: usize,
+    ) -> (Router, watch::Receiver<Option<BlockNumber>>, Vec<mpsc::Receiver<TnExExNotification>>)
+    {
+        let (min_tx, min_rx) = watch::channel(None);
+        let (exexes, rxs): (Vec<_>, Vec<_>) = (0..n)
+            .map(|i| {
+                let (tx, rx) = mpsc::channel(1);
+                (ExExHandle::new(format!("exex-{i}"), tx), rx)
+            })
+            .unzip();
+        let router = Router { exexes, min_finished_height_tx: min_tx, last_canon_tip: None };
+        (router, min_rx, rxs)
+    }
+
+    #[test]
+    fn recompute_min_holds_at_none_until_every_exex_reports() {
+        let (mut router, min_rx, _rxs) = router_with(2);
+
+        // Nothing reported yet → the floor is None.
+        router.recompute_min();
+        assert_eq!(*min_rx.borrow(), None);
+
+        // Only ExEx 0 reports → the floor STAYS None: one non-reporting ExEx pins
+        // it for the whole node. This is the confirm-by-mutation anchor — dropping
+        // the `?` short-circuit in `recompute_min` (folding only the reporters)
+        // would publish `Some(10)` here and fail this assertion.
+        router.handle_event(0, TnExExEvent::FinishedHeight(10));
+        assert_eq!(
+            *min_rx.borrow(),
+            None,
+            "one non-reporting ExEx must pin the node-wide floor to None",
+        );
+
+        // Every ExEx has now reported → the floor is the minimum across them.
+        router.handle_event(1, TnExExEvent::FinishedHeight(7));
+        assert_eq!(*min_rx.borrow(), Some(7));
+    }
+
+    #[test]
+    fn recompute_min_tracks_the_minimum_once_all_report() {
+        let (mut router, min_rx, _rxs) = router_with(3);
+
+        router.handle_event(0, TnExExEvent::FinishedHeight(20));
+        router.handle_event(1, TnExExEvent::FinishedHeight(30));
+        // One ExEx (index 2) is still silent → the floor is pinned to None.
+        assert_eq!(*min_rx.borrow(), None);
+
+        // All three report → the floor is the minimum (10), independent of order.
+        router.handle_event(2, TnExExEvent::FinishedHeight(10));
+        assert_eq!(*min_rx.borrow(), Some(10));
+
+        // A later, higher report on the current-min ExEx raises the floor to the
+        // next-lowest reported height.
+        router.handle_event(2, TnExExEvent::FinishedHeight(25));
+        assert_eq!(*min_rx.borrow(), Some(20));
     }
 }
