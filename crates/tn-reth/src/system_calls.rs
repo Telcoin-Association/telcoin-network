@@ -155,12 +155,16 @@ sol!(
             address owner_
         ) external;
 
-        /// Conclude the current epoch. Caller must pass a new committee of eligible validators.
-        function concludeEpoch(address[] calldata newCommittee) external;
-        /// Apply incentives for the epoch. This must be called before `concludeEpoch`.
-        function applyIncentives(RewardInfo[] calldata rewardInfos) external;
-        /// Apply negative incentives for the epoch. This must be called before `concludeEpoch`.
-        function applySlashes(Slash[] calldata slashes) external;
+        /// Conclude the current epoch in one atomic call: distributes the closing epoch's
+        /// rewards, applies its slashes, settles queued stake version changes, and rotates the
+        /// epoch. The registry enforces the internal stage order (rewards, then slashes, then
+        /// version settlement). Caller must pass a new committee of eligible validators;
+        /// `rewardInfos` and `slashes` may be empty while those mechanisms are disabled.
+        function concludeEpoch(
+            address[] calldata newCommittee,
+            RewardInfo[] calldata rewardInfos,
+            Slash[] calldata slashes
+        ) external;
         /// One-time in-protocol fork migration: back-fills the appended per-status `validatorSets`
         /// and the cached `eligibleValidatorCount` from the preserved `currentStatus` source of
         /// truth after the registry bytecode is swapped in place. System-gated and idempotent.

@@ -3681,7 +3681,7 @@ mod tests {
         )?;
         assert_eq!(eligible, U256::from(4));
 
-        // block 2: close the epoch — the concludeEpoch + applyIncentives system calls must
+        // block 2: close the epoch — the unified concludeEpoch system call must
         // succeed over the shrunken committee (on-chain close survives mid-epoch ejection)
         let consensus_output = consensus_output_for_tests(2, 1, 2, true);
         let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
