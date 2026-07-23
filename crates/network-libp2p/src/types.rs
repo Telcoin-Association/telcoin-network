@@ -200,12 +200,6 @@ impl<Res> ResponseChannel<Res> {
 }
 
 /// Events created from network activity.
-// The `Gossip` variant carries the payload plus two resolved BLS identities (relayer + author)
-// for penalty attribution, making it the largest variant. `NetworkEvent` is a short-lived message
-// moved across a small-capacity channel, so the per-slot size is immaterial, whereas boxing a
-// field would add a heap allocation to the hot gossip-delivery path; the peer-manager event enum
-// takes the same allowance (see `peers/types.rs`).
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum NetworkEvent<Req, Res> {
     /// Direct request from peer.
@@ -232,14 +226,9 @@ pub enum NetworkEvent<Req, Res> {
     /// `GossipMessage::source`) are distinct peers, and charging a content fault to the wrong
     /// one bans honest peers (see issues #801/#819); they are named rather than positional so
     /// the two cannot be transposed.
-    Gossip {
-        /// The gossip message payload.
-        message: GossipMessage,
-        /// BLS identity of the relaying peer (`propagation_source`), when resolved.
-        relayer: Option<BlsPublicKey>,
-        /// BLS identity of the message author (`GossipMessage::source`), when resolved.
-        author: Option<BlsPublicKey>,
-    },
+    ///
+    /// The payload is boxed as [`GossipPayload`] so this variant does not size the whole enum.
+    Gossip(Box<GossipPayload>),
     /// Send an error back the requester.
     Error(String, ResponseChannel<Res>),
     /// An inbound stream was established by a peer.
@@ -253,6 +242,22 @@ pub enum NetworkEvent<Req, Res> {
         /// The established raw p2p stream for reading data.
         stream: Stream,
     },
+}
+
+/// Boxed payload of [`NetworkEvent::Gossip`].
+///
+/// Held behind a `Box` in the variant so `NetworkEvent` is not sized to two inline
+/// `BlsPublicKey`s (288 B each); that indirection is what lets `NetworkEvent` carry no
+/// `#[allow(clippy::large_enum_variant)]`. See [`NetworkEvent::Gossip`] for the relayer
+/// and author identity semantics.
+#[derive(Debug)]
+pub struct GossipPayload {
+    /// The gossip message payload.
+    pub message: GossipMessage,
+    /// BLS identity of the relaying peer (`propagation_source`), when resolved.
+    pub relayer: Option<BlsPublicKey>,
+    /// BLS identity of the message author (`GossipMessage::source`), when resolved.
+    pub author: Option<BlsPublicKey>,
 }
 
 // ============================================================================
