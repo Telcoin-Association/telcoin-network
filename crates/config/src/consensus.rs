@@ -57,6 +57,12 @@ where
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
     ) -> eyre::Result<Self> {
+        // Production entry point: enforce the operational floors that the shared, test-facing
+        // `new_with_committee` deliberately skips so DAG test fixtures may use small `gc_depth`
+        // values. The protocol ceilings are still validated for every constructor inside
+        // `new_with_committee`.
+        config.parameters.validate_operational_floors()?;
+
         // load committee from file
         let committee: Committee =
             Config::load_from_path_or_default(tn_datadir.committee_path(), ConfigFmt::YAML)?;
@@ -105,6 +111,11 @@ where
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
     ) -> eyre::Result<Self> {
+        // Production entry point: enforce the operational floors (see
+        // [`Parameters::validate_operational_floors`]); the shared test-facing constructor skips
+        // them so DAG fixtures may use small `gc_depth` values.
+        config.parameters.validate_operational_floors()?;
+
         Self::new_with_committee(
             config,
             node_storage,
