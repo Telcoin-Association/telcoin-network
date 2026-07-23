@@ -1843,22 +1843,12 @@ impl RethEnv {
         Ok((state, pin_header))
     }
 
-    /// Read the latest committee and epoch information from the [ConsensusRegistry] on-chain.
-    pub fn validators_for_epoch(
-        &self,
-        epoch: u32,
-    ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
-        debug!(target: "engine", "retrieving validators for epoch {epoch}");
-        let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
-        self.read_consensus_registry(calldata).map_err(Into::into)
-    }
-
     /// Read the committee validators for the provided epoch from the [ConsensusRegistry], pinned
     /// to the state of the block identified by `block_hash`.
     ///
-    /// Unlike [`Self::validators_for_epoch`], which reads the mutable canonical tip, every node
-    /// issuing this read at the same block decodes the identical committee — even after a
-    /// mid-epoch governance `burn` swap-and-pops the stored committee arrays.
+    /// Every node issuing this read at the same block decodes the identical committee — even
+    /// after a mid-epoch governance `burn` swap-and-pops the stored committee arrays; an
+    /// unpinned canonical-tip read would not.
     pub fn validators_for_epoch_at_block(
         &self,
         epoch: u32,
@@ -1872,19 +1862,12 @@ impl RethEnv {
         self.read_consensus_registry_at_header(&header, calldata).map_err(Into::into)
     }
 
-    /// Read the BLS pubkeys for the committee of the provided epoch from the [ConsensusRegistry]
-    /// on-chain.
-    pub fn bls_pubkeys_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
-        let calldata = ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into();
-        self.read_consensus_registry(calldata).map_err(Into::into)
-    }
-
     /// Read the BLS pubkeys for the committee of the provided epoch from the
     /// [ConsensusRegistry], pinned to the state of the block identified by `block_hash`.
     ///
-    /// Unlike [`Self::bls_pubkeys_for_epoch`], which reads the mutable canonical tip, every node
-    /// issuing this read at the same block decodes the identical key set — even after a
-    /// mid-epoch governance `burn` swap-and-pops the stored committee arrays.
+    /// Every node issuing this read at the same block decodes the identical key set — even
+    /// after a mid-epoch governance `burn` swap-and-pops the stored committee arrays; an
+    /// unpinned canonical-tip read would not.
     pub fn bls_pubkeys_for_epoch_at_block(
         &self,
         epoch: u32,
@@ -3650,7 +3633,7 @@ mod tests {
 
         // capture pre-burn committee pubkeys for the current and both future epochs
         let pre_burn = (0u32..=2)
-            .map(|e| reth_env.bls_pubkeys_for_epoch(e))
+            .map(|e| reth_env.bls_pubkeys_for_epoch_at_block(e, reth_env.canonical_tip().hash()))
             .collect::<eyre::Result<Vec<_>>>()?;
 
         // eject a middle slot so the swap-and-pop reorder is visible
@@ -3692,7 +3675,8 @@ mod tests {
         // current + both future committees shrink with EXACT swap-and-pop order: the last
         // element moves into the burned slot and the array truncates by one
         for e in 0u32..=2 {
-            let post = reth_env.bls_pubkeys_for_epoch(e)?;
+            let post =
+                reth_env.bls_pubkeys_for_epoch_at_block(e, reth_env.canonical_tip().hash())?;
             let mut expected = pre_burn[e as usize].clone();
             let idx = expected
                 .iter()
@@ -3709,8 +3693,10 @@ mod tests {
         // positional zip pin: the address committee and pubkey committee stay index-aligned
         // (the node zips these arrays by position to build its committee)
         for e in 0u32..=2 {
-            let infos = reth_env.validators_for_epoch(e)?;
-            let keys = reth_env.bls_pubkeys_for_epoch(e)?;
+            let infos =
+                reth_env.validators_for_epoch_at_block(e, reth_env.canonical_tip().hash())?;
+            let keys =
+                reth_env.bls_pubkeys_for_epoch_at_block(e, reth_env.canonical_tip().hash())?;
             assert_eq!(infos.len(), keys.len());
             for (info, key) in infos.iter().zip(keys.iter()) {
                 let direct =
@@ -3743,7 +3729,8 @@ mod tests {
         assert_eq!(epoch, 1);
         assert_eq!(committee.len(), 4);
         assert!(committee.iter().all(|v| v.validatorAddress != target));
-        let shuffled = reth_env.bls_pubkeys_for_epoch(3)?;
+        let shuffled =
+            reth_env.bls_pubkeys_for_epoch_at_block(3, reth_env.canonical_tip().hash())?;
         assert_eq!(shuffled.len(), 4);
         assert!(!shuffled.contains(&target_bls));
 
@@ -3868,7 +3855,11 @@ mod tests {
         // one (with 6 eligible validators and 5 seats every shuffled committee excludes
         // exactly one; the shuffle is seed-deterministic so the arrangement is stable)
         let committee_addrs = |e: u32| -> eyre::Result<Vec<Address>> {
-            Ok(reth_env.validators_for_epoch(e)?.into_iter().map(|v| v.validatorAddress).collect())
+            Ok(reth_env
+                .validators_for_epoch_at_block(e, reth_env.canonical_tip().hash())?
+                .into_iter()
+                .map(|v| v.validatorAddress)
+                .collect())
         };
         let mut current_epoch = 0u32;
         let mut subdag_index = 2u64;
@@ -3899,9 +3890,12 @@ mod tests {
         let target_bls = reth_env.get_bls_pubkey(canonical_header.hash(), target)?;
 
         // pre-burn snapshots of the running + both future committees
-        let pre_current = reth_env.bls_pubkeys_for_epoch(w)?;
-        let pre_next = reth_env.bls_pubkeys_for_epoch(w + 1)?;
-        let pre_subsequent = reth_env.bls_pubkeys_for_epoch(w + 2)?;
+        let pre_current =
+            reth_env.bls_pubkeys_for_epoch_at_block(w, reth_env.canonical_tip().hash())?;
+        let pre_next =
+            reth_env.bls_pubkeys_for_epoch_at_block(w + 1, reth_env.canonical_tip().hash())?;
+        let pre_subsequent =
+            reth_env.bls_pubkeys_for_epoch_at_block(w + 2, reth_env.canonical_tip().hash())?;
         assert!(!pre_current.contains(&target_bls));
         assert!(
             pre_next.contains(&target_bls) || pre_subsequent.contains(&target_bls),
@@ -3922,11 +3916,15 @@ mod tests {
 
         // the running committee is byte-identical: future-only ejection cannot perturb the
         // current epoch (so on-chain reads for epoch W match any pre-burn snapshot exactly)
-        assert_eq!(reth_env.bls_pubkeys_for_epoch(w)?, pre_current);
+        assert_eq!(
+            reth_env.bls_pubkeys_for_epoch_at_block(w, reth_env.canonical_tip().hash())?,
+            pre_current
+        );
 
         // future committees shrink via swap-and-pop exactly where the target was seated
         for (e, pre) in [(w + 1, &pre_next), (w + 2, &pre_subsequent)] {
-            let post = reth_env.bls_pubkeys_for_epoch(e)?;
+            let post =
+                reth_env.bls_pubkeys_for_epoch_at_block(e, reth_env.canonical_tip().hash())?;
             if let Some(idx) = pre.iter().position(|k| k == &target_bls) {
                 let mut expected = pre.to_vec();
                 let last = expected.len() - 1;
@@ -4086,10 +4084,10 @@ mod tests {
         let closing_header = block2.recovered_block.clone_sealed_header();
 
         // pre-burn snapshots of the epoch 2 and 3 committees (the tip IS the closing block here)
-        let pre_v2 = reth_env.validators_for_epoch(2)?;
-        let pre_v3 = reth_env.validators_for_epoch(3)?;
-        let pre_b2 = reth_env.bls_pubkeys_for_epoch(2)?;
-        let pre_b3 = reth_env.bls_pubkeys_for_epoch(3)?;
+        let pre_v2 = reth_env.validators_for_epoch_at_block(2, reth_env.canonical_tip().hash())?;
+        let pre_v3 = reth_env.validators_for_epoch_at_block(3, reth_env.canonical_tip().hash())?;
+        let pre_b2 = reth_env.bls_pubkeys_for_epoch_at_block(2, reth_env.canonical_tip().hash())?;
+        let pre_b3 = reth_env.bls_pubkeys_for_epoch_at_block(3, reth_env.canonical_tip().hash())?;
         assert_eq!(pre_v2.len(), 5);
         assert_eq!(pre_v3.len(), 5);
 
@@ -4127,9 +4125,9 @@ mod tests {
         assert!(pinned_b2.contains(&target_bls));
         assert!(pinned_b3.contains(&target_bls));
 
-        // the tip variant of the same read shows the post-burn set: the pin is what makes the
-        // difference
-        let tip_v2 = reth_env.validators_for_epoch(2)?;
+        // the same read pinned to the post-burn canonical tip shows the post-burn set: the pin
+        // block is what makes the difference
+        let tip_v2 = reth_env.validators_for_epoch_at_block(2, reth_env.canonical_tip().hash())?;
         assert_eq!(tip_v2.len(), 4);
         assert!(tip_v2.iter().all(|v| v.validatorAddress != target));
 
