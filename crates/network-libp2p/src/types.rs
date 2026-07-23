@@ -77,10 +77,21 @@ impl NetworkType {
     /// Request-response wire protocol, isolated per role (and per worker) and
     /// namespaced by `chain_id` so nodes on different chains never negotiate a
     /// connection.
+    ///
+    /// Bumped to `/0.0.2` by the #739 legacy-variant deletion: the migration
+    /// removed the dead-but-positional request/response variants that were kept
+    /// on the wire during the rollout (`StreamEpoch`, `StreamEpochPartial`,
+    /// `StreamConsensusOutput`, `MissingCertificates`, the worker
+    /// `RequestBatchesStream`, and their acks/replies). Deleting them shifts BCS
+    /// variant discriminants, so the protocol version is bumped in the same
+    /// change: a `/0.0.2` node never negotiates request-response with a
+    /// not-yet-upgraded `/0.0.1` peer, so the two never exchange a stale
+    /// discriminant. Only this protocol changed; kad, sync, and peer-exchange
+    /// stay at `/0.0.1`.
     pub(crate) fn req_res_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
         match self {
-            Self::Primary => owned_protocol(format!("/tn-primary-{chain_id}/0.0.1")),
-            Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-{chain_id}/0.0.1")),
+            Self::Primary => owned_protocol(format!("/tn-primary-{chain_id}/0.0.2")),
+            Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-{chain_id}/0.0.2")),
         }
     }
 

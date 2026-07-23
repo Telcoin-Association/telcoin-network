@@ -350,7 +350,7 @@ impl<DB: Database> Proposer<DB> {
             // critical task, so returning here fail-stops the node cleanly rather than continuing
             // on a lost guard record (issue #975).
             proposer_store
-                .persist_durable::<LastProposed>()
+                .persist::<LastProposed>()
                 .await
                 .map_err(|e| ProposerError::DurableBarrierFailed(e.to_string()))?;
         }

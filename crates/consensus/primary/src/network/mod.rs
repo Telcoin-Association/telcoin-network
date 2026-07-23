@@ -411,9 +411,6 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
             PrimaryResponse::RecoverableError(PrimaryRPCError(s))
             | PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
-            PrimaryResponse::RequestedCertificates(_vec) => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is requested certificates!".to_string(),
-            )),
             PrimaryResponse::MissingParents(parents) => {
                 Ok(RequestVoteResult::MissingParents(parents))
             }
@@ -422,9 +419,6 @@ impl PrimaryNetworkHandle {
             )),
             PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is peer exchange!".to_string(),
-            )),
-            PrimaryResponse::StreamRequestAck { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is stream ack!".to_string(),
             )),
         }
     }
@@ -1263,23 +1257,11 @@ where
                         cancel,
                     );
                 }
-                PrimaryRequest::MissingCertificates { inner } => {
-                    self.process_request_for_missing_certs(peer, inner, channel, cancel)
-                }
                 PrimaryRequest::PeerExchange { .. } => {
                     warn!(target: "primary::network", "primary application received unexpected peer exchange message");
                 }
                 PrimaryRequest::EpochRecord { epoch, hash } => {
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
-                }
-                PrimaryRequest::StreamEpoch { .. } => {
-                    self.process_epoch_stream(peer, channel, cancel)
-                }
-                PrimaryRequest::StreamEpochPartial { .. } => {
-                    self.process_epoch_stream(peer, channel, cancel)
-                }
-                PrimaryRequest::StreamConsensusOutput { .. } => {
-                    self.process_consensus_output_stream(peer, channel, cancel)
                 }
             },
             NetworkEvent::Gossip(gossip) => {
@@ -1341,35 +1323,6 @@ where
         });
     }
 
-    /// Answer a legacy request-response `MissingCertificates` request.
-    ///
-    /// Item 7 (#739) cut the certificate fetch fully over to the `/tn-primary-sync`
-    /// protocol, so this request-response path is no longer served: peers fetch
-    /// certificates over sync. The request variant is retained for wire compatibility
-    /// (BCS variant indices stay until the coordinated `/0.0.2` bump, item 9); a legacy
-    /// requester is answered with a typed error rather than served.
-    fn process_request_for_missing_certs(
-        &self,
-        peer: BlsPublicKey,
-        _request: MissingCertificatesRequest,
-        channel: ResponseChannel<PrimaryResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("MissingCertsDeprecated-{peer}");
-        let response = PrimaryResponse::Error(PrimaryRPCError(
-            "missing certificates are served over the sync protocol only".to_string(),
-        ));
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                _ = network_handle.handle.send_response(response, channel) => (),
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
-        });
-    }
-
     /// Attempt to retrieve consensus chain header from the database.
     fn process_epoch_record_request(
         &self,
@@ -1420,62 +1373,6 @@ where
                         let response = header.into_response();
                         let _ = network_handle.handle.send_response(response, channel).await;
                     }
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
-        });
-    }
-
-    /// Answer a legacy request-response `StreamEpoch` / `StreamEpochPartial` request.
-    ///
-    /// Item 9c (#739) removed the raw `/tn-stream` epoch-pack path, so peers fetch full
-    /// and partial epoch packs over the `/tn-primary-sync` protocol. The request variants
-    /// are retained for wire compatibility (BCS variant indices stay until the coordinated
-    /// `/0.0.2` bump); a legacy requester is answered with a typed error rather than served.
-    fn process_epoch_stream(
-        &self,
-        peer: BlsPublicKey,
-        channel: ResponseChannel<PrimaryResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("EpochPackDeprecated-{peer}");
-        let response = PrimaryResponse::Error(PrimaryRPCError(
-            "epoch packs are served over the sync protocol only".to_string(),
-        ));
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                _ = network_handle.handle.send_response(response, channel) => (),
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
-        });
-    }
-
-    /// Answer a legacy request-response `StreamConsensusOutput` request.
-    ///
-    /// Item 9b (#739) cut the consensus-output fetch fully over to the
-    /// `/tn-primary-sync` protocol, so this request-response path is no longer served:
-    /// peers fetch a single consensus output over sync. The request variant is retained
-    /// for wire compatibility (BCS variant indices stay until the coordinated `/0.0.2`
-    /// bump, item 9c); a legacy requester is answered with a typed error rather than
-    /// served.
-    fn process_consensus_output_stream(
-        &self,
-        peer: BlsPublicKey,
-        channel: ResponseChannel<PrimaryResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("ConsensusOutputDeprecated-{peer}");
-        let response = PrimaryResponse::Error(PrimaryRPCError(
-            "consensus output is served over the sync protocol only".to_string(),
-        ));
-        self.task_spawner.spawn_task(task_name, async move {
-            tokio::select! {
-                _ = network_handle.handle.send_response(response, channel) => (),
                 // cancel notification from network layer
                 _ = cancel => (),
             }

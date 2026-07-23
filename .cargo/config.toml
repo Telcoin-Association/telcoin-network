@@ -33,3 +33,31 @@ debug = false
 [profile.test.build-override]
 opt-level = 0
 codegen-units = 256
+
+# End-to-end test profile (see crates/e2e-tests). Selected with `--profile e2e` when
+# building the `telcoin-network` node binary the e2e suite spawns - through the Makefile's
+# `build-e2e-bin` target and, when `TN_BIN_PATH` is unset, the escargot build in
+# `get_telcoin_network_binary`. Inheriting `release` builds every crate at opt-level 2,
+# including the revm/reth/BLS dependencies where consensus and EVM runtime is spent; the
+# `dev`/`test` profiles above cap those dependencies at opt-level 1, so a plain dev build
+# would leave the hot code unoptimized. `debug-assertions` and `overflow-checks` are turned
+# back on - `release` disables them - so the suite still exercises the payload-builder and
+# header-validation invariants it asserts against. As a distinct profile its artifacts live
+# under `target/e2e/`, not shared with the dev/test `target/debug/` graph, so the dependency
+# closure compiles once more: the one-time build cost of running the suite optimized.
+[profile.e2e]
+inherits = "release"
+opt-level = 2
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+debug-assertions = true
+overflow-checks = true
+# release's default of 16, stated explicitly: codegen stays parallel (not serialized to 1 or
+# LTO) so the optimized rebuild above stays as cheap as possible.
+codegen-units = 16
+
+# Dependencies still compile at the profile's opt-level 2 but skip their debuginfo: it is
+# never inspected for third-party crates, and dropping it avoids the I/O cost on the large
+# reth/revm graph, mirroring the `dev`/`test` profiles' `package."*"` overrides.
+[profile.e2e.package."*"]
+debug = false

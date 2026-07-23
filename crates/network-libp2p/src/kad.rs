@@ -919,18 +919,18 @@ mod test {
     /// negotiating with each other (issue #765).
     #[test]
     fn test_network_type_protocol_names() -> crate::types::NetworkResult<()> {
-        assert_eq!(NetworkType::Primary.req_res_protocol(2017)?.as_ref(), "/tn-primary-2017/0.0.1");
+        assert_eq!(NetworkType::Primary.req_res_protocol(2017)?.as_ref(), "/tn-primary-2017/0.0.2");
         assert_eq!(NetworkType::Primary.kad_protocol(2017)?.as_ref(), "/tn-primary-kad-2017/0.0.1");
         assert_eq!(
             NetworkType::Worker(0).req_res_protocol(2017)?.as_ref(),
-            "/tn-worker-0-2017/0.0.1"
+            "/tn-worker-0-2017/0.0.2"
         );
         assert_eq!(
             NetworkType::Worker(0).kad_protocol(2017)?.as_ref(),
             "/tn-worker-0-kad-2017/0.0.1"
         );
         // worker id and chain id are both interpolated, not literal
-        assert_eq!(NetworkType::Worker(3).req_res_protocol(7)?.as_ref(), "/tn-worker-3-7/0.0.1");
+        assert_eq!(NetworkType::Worker(3).req_res_protocol(7)?.as_ref(), "/tn-worker-3-7/0.0.2");
         assert_eq!(NetworkType::Worker(3).kad_protocol(7)?.as_ref(), "/tn-worker-3-kad-7/0.0.1");
         // the per-role sync protocol is chain-namespaced as well
         assert_eq!(

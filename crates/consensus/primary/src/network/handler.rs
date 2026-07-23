@@ -575,7 +575,7 @@ where
                 // (issue #975).
                 self.consensus_config
                     .node_storage()
-                    .persist_durable::<Votes>()
+                    .persist::<Votes>()
                     .await
                     .inspect_err(|e| {
                         error!(target: "primary", "epoch DB durable barrier failed on fast vote recast; initiating node shutdown: {e}");
@@ -932,7 +932,7 @@ where
                         // non-durable vote (issue #975).
                         self.consensus_config
                             .node_storage()
-                            .persist_durable::<Votes>()
+                            .persist::<Votes>()
                             .await
                             .inspect_err(|e| {
                                 error!(target: "primary", "epoch DB durable barrier failed on vote recast; initiating node shutdown: {e}");
@@ -970,7 +970,7 @@ where
         // (issue #975).
         self.consensus_config
             .node_storage()
-            .persist_durable::<Votes>()
+            .persist::<Votes>()
             .await
             .inspect_err(|e| {
                 error!(target: "primary", "epoch DB durable barrier failed for vote; initiating node shutdown: {e}");

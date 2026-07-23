@@ -454,7 +454,7 @@ impl<DB: Database> Certifier<DB> {
                         // needs the exclusion.
                         //
                         // Holding it across the barrier would be actively harmful, because
-                        // `persist_durable` is a *whole-DB* barrier - the table parameter is unused
+                        // `persist` is a *whole-DB* barrier - the table parameter is unused
                         // and only selects which of the three DBs to target - so it defers while
                         // any write txn on the epoch DB is open and drains only at refcount zero,
                         // with no timeout. Under catch-up or epoch close that is tens to hundreds
@@ -480,7 +480,7 @@ impl<DB: Database> Certifier<DB> {
                         // (issue #975).
                         self.config
                             .node_storage()
-                            .persist_durable::<ProposedCertificates>()
+                            .persist::<ProposedCertificates>()
                             .await
                             .map_err(|e| {
                                 error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize: {e}");

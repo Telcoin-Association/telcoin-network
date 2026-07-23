@@ -146,9 +146,6 @@ impl WorkerNetworkHandle {
         let res = res.await??.result;
         match res {
             WorkerResponse::ReportBatch => Ok(()),
-            WorkerResponse::RequestBatchesStream { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a report batch is stream ack!".to_string(),
-            )),
             WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a report batch is peer exchange!".to_string(),
             )),

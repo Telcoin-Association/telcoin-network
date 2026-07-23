@@ -23,7 +23,10 @@ use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
 use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
-use reth_provider::{StateProvider, StateProviderBox, StateProviderFactory};
+use reth_provider::{
+    CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
+    DatabaseProviderFactory as _, StateProvider, StateProviderBox, StateProviderFactory,
+};
 use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
@@ -737,6 +740,26 @@ pub fn execute_payload_and_update_canonical_chain(
     reth_env.finish_executing_output(vec![block.clone()], None)?;
     reth_env.finalize_block(canonical_header.clone())?;
     Ok(block)
+}
+
+/// Plant the persisted finalized/safe markers at `header` and seed the in-memory watches to
+/// match, simulating a restart on a database written by a pre-fix node version.
+///
+/// Pre-fix versions committed blocks and the finalized/safe markers in separate database
+/// transactions, so a crash between the two commits restarted the node with the marker lagging
+/// the persisted canonical tip — the state `RethEnv::heal_finalized_to_persisted_tip` repairs.
+/// Current versions commit both atomically in `RethEnv::finish_executing_output`, so tests use
+/// this direct write to construct the pre-fix state.
+pub fn plant_finalized_marker(reth_env: &RethEnv, header: SealedHeader) -> eyre::Result<()> {
+    let provider = reth_env.inner.blockchain_provider.database_provider_rw()?;
+    provider.save_finalized_block_number(header.number)?;
+    provider.save_safe_block_number(header.number)?;
+    provider.commit()?;
+    // a restarting node seeds the finalized/safe watches from the (stale) database rows at
+    // provider construction; mirror that so watch readers see the planted marker
+    reth_env.inner.blockchain_provider.set_finalized(header.clone());
+    reth_env.inner.blockchain_provider.set_safe(header);
+    Ok(())
 }
 
 /// Build a test genesis whose `ConsensusRegistry` is freshly deployed from the current artifact
