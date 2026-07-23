@@ -2812,6 +2812,73 @@ async fn test_publisherless_put_cannot_delete_own_record() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Inbound `AddProvider` gates the store write on the provider's ban status, at
+/// parity with the `PutRecord` path (issue #1001). Under `StoreInserts::FilterBoth`
+/// this arm is the sole write path for inbound provider records, so an un-gated
+/// arm would persist an attacker-supplied record from a peer already banned at the
+/// application layer.
+///
+/// A record from an un-banned provider is stored; a record from a banned provider
+/// is dropped before it reaches the store. Deleting the ban filter in
+/// `process_kad_add_provider` (storing unconditionally, i.e. today's behaviour)
+/// makes the banned-provider assertion fail, pinning the gate.
+#[tokio::test]
+async fn test_add_provider_rejects_banned_provider() -> eyre::Result<()> {
+    use libp2p::kad;
+
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // An un-banned provider: its record is persisted (positive path preserved).
+    // libp2p guarantees `provider == source`, so the provider id is authenticated;
+    // this test drives the handler directly and keys each record on its provider.
+    let honest = PeerId::random();
+    let honest_record = kad::ProviderRecord {
+        key: kad::RecordKey::new(&honest.to_bytes()),
+        provider: honest,
+        expires: None,
+        addresses: vec![],
+    };
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&honest));
+    network.process_kad_add_provider(Some(honest_record.clone()))?;
+    assert_eq!(
+        network.swarm.behaviour_mut().kademlia.store_mut().providers(&honest_record.key).len(),
+        1,
+        "un-banned provider record is stored",
+    );
+
+    // A banned provider: register a default record then apply a Fatal penalty,
+    // which crosses the ban threshold on the first hit.
+    let attacker = PeerId::random();
+    network.swarm.behaviour_mut().peer_manager.disconnect_peer(attacker, false);
+    network.swarm.behaviour_mut().peer_manager.process_penalty(attacker, Penalty::Fatal);
+    assert!(
+        network.swarm.behaviour().peer_manager.peer_banned(&attacker),
+        "attacker provider is banned",
+    );
+
+    // Its `AddProvider` is dropped: nothing lands in the store for the attacker key.
+    let attacker_record = kad::ProviderRecord {
+        key: kad::RecordKey::new(&attacker.to_bytes()),
+        provider: attacker,
+        expires: None,
+        addresses: vec![],
+    };
+    network.process_kad_add_provider(Some(attacker_record.clone()))?;
+    assert!(
+        network
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .providers(&attacker_record.key)
+            .is_empty(),
+        "banned provider record is not stored (issue #1001)",
+    );
+
+    Ok(())
+}
+
 /// A signed record advertising an RPC endpoint with a well-formed URL but the
 /// wrong scheme is accepted (the signature is authentic) and promoted with the
 /// malformed endpoint stripped, without penalizing the sender.
@@ -2916,7 +2983,12 @@ async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result
     // seed the DB before the network starts, simulating records that survived
     // a node restart from before the upgrade
     {
-        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), NetworkType::Primary);
+        let mut kad_store = KadStore::new(
+            db.clone(),
+            PeerId::random(),
+            config_1.key_config(),
+            NetworkType::Primary,
+        );
 
         // valid pre-upgrade record signed by authority 2 over the legacy encoding
         let old_info = OldNetworkInfo {
@@ -2976,7 +3048,7 @@ async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result
 
     // the corrupt record was purged from the persistent store; the legacy
     // record's original signed bytes were preserved
-    let store = KadStore::new(db, config_1.key_config(), NetworkType::Primary);
+    let store = KadStore::new(db, PeerId::random(), config_1.key_config(), NetworkType::Primary);
     assert!(store.get(&kad::RecordKey::new(&garbage_bls)).is_none(), "corrupt record purged");
     assert!(store.get(&kad::RecordKey::new(&owner_bls)).is_some(), "legacy record preserved");
 
@@ -3014,7 +3086,12 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
     // seed the DB before the network starts with two VALID records: one for a committee
     // authority and one for the non-committee outsider
     {
-        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), NetworkType::Primary);
+        let mut kad_store = KadStore::new(
+            db.clone(),
+            PeerId::random(),
+            config_1.key_config(),
+            NetworkType::Primary,
+        );
 
         let key_config_2 = config_2.key_config();
         let authority_record = NodeRecord::build(
@@ -3113,7 +3190,12 @@ async fn test_restore_skips_own_record() -> eyre::Result<()> {
     // seed the DB with a valid record for the node's OWN primary BLS key, built the same way
     // the node builds its own record
     {
-        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), NetworkType::Primary);
+        let mut kad_store = KadStore::new(
+            db.clone(),
+            PeerId::random(),
+            config_1.key_config(),
+            NetworkType::Primary,
+        );
         let key_config = config_1.key_config();
         let own_record = NodeRecord::build(
             key_config.primary_network_public_key(),

@@ -165,6 +165,13 @@ fn instant_to_system(expires: &Option<Instant>) -> Option<SystemTime> {
 pub struct KadStore<DB> {
     db: DB,
     node_key: RecordKey,
+    /// This node's libp2p peer id.
+    ///
+    /// Used by [`RecordStore::provided`] to enumerate only the provider records
+    /// the node itself authored (via `start_providing`), mirroring upstream
+    /// `MemoryStore`'s `local_id`. Provider records supplied by inbound peers are
+    /// never re-announced as our own. See issue #1001.
+    local_peer_id: PeerId,
     /// Provide some sanity defaults for store sizing.
     /// Not bothering to expose these as knobs currenty since they are
     /// basically just here to prevent or mitigate attacks on the Kad store.
@@ -180,7 +187,17 @@ pub struct KadStore<DB> {
 
 impl<DB: Database> KadStore<DB> {
     /// Create a new KadStore backed by db.
-    pub fn new(db: DB, key_config: &KeyConfig, kad_type: NetworkType) -> Self {
+    ///
+    /// `local_peer_id` is this node's libp2p peer id (the identity the swarm is
+    /// built with); it must match the id libp2p stamps on records the node
+    /// publishes via `start_providing`, so [`RecordStore::provided`] re-announces
+    /// only the node's own provider records.
+    pub fn new(
+        db: DB,
+        local_peer_id: PeerId,
+        key_config: &KeyConfig,
+        kad_type: NetworkType,
+    ) -> Self {
         let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
         // Defaults for sanity.
         let config = MemoryStoreConfig::default();
@@ -193,7 +210,8 @@ impl<DB: Database> KadStore<DB> {
                 db.iter::<KadWorkerProviderRecords>().count(),
             ),
         };
-        let store = Self { db, node_key, config, num_records, num_providers, kad_type };
+        let store =
+            Self { db, node_key, local_peer_id, config, num_records, num_providers, kad_type };
         store.update_records_gauge();
         store
     }
@@ -470,9 +488,21 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn provided(&self) -> Self::ProvidedIter<'_> {
-        let v = self.providers(&self.node_key);
+        // Enumerate only the provider records this node itself authored. Upstream
+        // `MemoryStore::provided` filters on `provider == local_id`; restore that
+        // guard here so the periodic republish job never re-announces a provider
+        // record supplied by an inbound peer. Paired with the ban gate on inbound
+        // `AddProvider` (`process_kad_add_provider` in consensus.rs), this closes
+        // the divergence described in issue #1001. The `Vec` is filtered before
+        // `into_iter().map(..)` so the concrete `ProvidedIter` type is preserved.
+        let local_peer_id = self.local_peer_id;
+        let provided: Vec<ProviderRecord> = self
+            .providers(&self.node_key)
+            .into_iter()
+            .filter(|record| record.provider == local_peer_id)
+            .collect();
 
-        v.into_iter().map(Cow::Owned)
+        provided.into_iter().map(Cow::Owned)
     }
 
     fn remove_provider(&mut self, key: &RecordKey, p: &PeerId) {
@@ -665,8 +695,10 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db.clone(), &key_config, NetworkType::Primary);
-        let mut kad_store_worker = KadStore::new(db, &key_config, NetworkType::Worker(0));
+        let mut kad_store =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        let mut kad_store_worker =
+            KadStore::new(db, PeerId::random(), &key_config, NetworkType::Worker(0));
 
         let rec = test_record(false);
         let rec2 = test_record(false);
@@ -732,35 +764,33 @@ mod test {
         let provider_rec2 = test_provider_record();
         let provider_rec3 = test_provider_record();
         kad_store.db.sync_persist();
-        assert_eq!(kad_store.provided().count(), 0);
+        assert_eq!(kad_store.providers(&provider_rec1.key).len(), 0);
         kad_store.add_provider(provider_rec1.clone()).expect("add provider");
         kad_store.add_provider(provider_rec2.clone()).expect("add provider");
         kad_store.add_provider(provider_rec3.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
-        assert_eq!(kad_store.provided().count(), 1);
+        assert_eq!(kad_store.providers(&provider_rec1.key).len(), 1);
         kad_store.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.add_provider(provider_rec1_2.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
-        assert_eq!(kad_store.provided().count(), 3);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 3);
         assert_eq!(kad_store.providers(&provider_rec2.key).len(), 1);
         assert_eq!(kad_store.providers(&provider_rec3.key).len(), 1);
 
         assert_eq!(kad_store_worker.num_providers, 0);
-        assert_eq!(kad_store_worker.provided().count(), 0);
+        assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 0);
         kad_store_worker.add_provider(provider_rec1.clone()).expect("add provider");
         kad_store_worker.add_provider(provider_rec2.clone()).expect("add provider");
         kad_store_worker.add_provider(provider_rec3.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
-        assert_eq!(kad_store_worker.provided().count(), 1);
+        assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 1);
         kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store_worker.add_provider(provider_rec1_2.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
-        assert_eq!(kad_store_worker.provided().count(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec2.key).len(), 1);
         assert_eq!(kad_store_worker.providers(&provider_rec3.key).len(), 1);
@@ -774,31 +804,25 @@ mod test {
         kad_store.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
         kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
-        assert_eq!(kad_store.provided().count(), 2);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 2);
         kad_store.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.db.sync_persist();
-        assert_eq!(kad_store.provided().count(), 3);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 3);
         kad_store.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
-        assert_eq!(kad_store.provided().count(), 3);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 3);
 
         kad_store_worker.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
         kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
-        assert_eq!(kad_store_worker.provided().count(), 2);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 2);
         kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.db.sync_persist();
-        assert_eq!(kad_store_worker.provided().count(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
         kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
-        assert_eq!(kad_store_worker.provided().count(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
 
         kad_store.remove_provider(&provider_rec1.key, &provider_rec1.provider);
@@ -808,7 +832,6 @@ mod test {
         kad_store.remove_provider(&provider_rec1_2.key, &provider_rec1_2.provider);
         kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 2);
-        assert_eq!(kad_store.provided().count(), 0);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 0);
         kad_store.remove_provider(&provider_rec2.key, &provider_rec2.provider);
         kad_store.db.sync_persist();
@@ -822,7 +845,6 @@ mod test {
         kad_store_worker.remove_provider(&provider_rec1_2.key, &provider_rec1_2.provider);
         kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 2);
-        assert_eq!(kad_store_worker.provided().count(), 0);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 0);
         kad_store_worker.remove_provider(&provider_rec2.key, &provider_rec2.provider);
         kad_store.db.sync_persist();
@@ -840,6 +862,56 @@ mod test {
         assert_eq!(kad_store_worker.num_providers, 0);
     }
 
+    /// `provided()` enumerates only the provider records the node itself authored.
+    ///
+    /// The `node_key`-injection guard from issue #1001: an attacker can address an
+    /// `AddProvider` at this node's own key (`node_key` is derived from the public
+    /// primary key, which is not secret), landing a record in the exact slot
+    /// `provided()` reads. Both records are stored under `node_key`, but the
+    /// republish job must re-announce only the record whose `provider` is this
+    /// node. Removing the `provider == local_peer_id` filter in `provided()` makes
+    /// this test fail (the attacker record is enumerated), pinning the guard.
+    #[test]
+    fn test_provided_enumerates_only_self_authored_records() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+
+        // The store's identity: records authored by this peer id are "ours".
+        let local_peer_id = PeerId::random();
+        let mut kad_store = KadStore::new(db, local_peer_id, &key_config, NetworkType::Primary);
+
+        // Both records key on `node_key`, the slot `provided()` reads.
+        let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
+        let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
+        let ours = ProviderRecord {
+            key: node_key.clone(),
+            provider: local_peer_id,
+            expires,
+            addresses: vec![],
+        };
+        let attacker = ProviderRecord {
+            key: node_key.clone(),
+            provider: PeerId::random(),
+            expires,
+            addresses: vec![],
+        };
+
+        kad_store.add_provider(ours.clone()).expect("add our provider record");
+        kad_store.add_provider(attacker.clone()).expect("add attacker provider record");
+        kad_store.db.sync_persist();
+
+        // Both are physically stored under `node_key`...
+        assert_eq!(kad_store.providers(&node_key).len(), 2, "both records stored under node_key");
+
+        // ...but `provided()` re-announces only the record this node authored.
+        let provided: Vec<ProviderRecord> =
+            kad_store.provided().map(|record| record.into_owned()).collect();
+        assert_eq!(provided.len(), 1, "provided() enumerates only self-authored records");
+        assert_eq!(provided[0].provider, local_peer_id, "the enumerated record is ours");
+    }
+
     /// Expired records must be filtered from `get()` and `records()` even though
     /// they remain on disk until `put()` triggers eviction.
     #[test]
@@ -848,7 +920,7 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
+        let mut kad_store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
 
         let expired = test_record(true);
         kad_store.put(expired.clone()).expect("put expired record");
@@ -865,7 +937,7 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
+        let mut kad_store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
 
         let config = MemoryStoreConfig::default();
 
@@ -890,8 +962,10 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db.clone(), &key_config, NetworkType::Primary);
-        let mut kad_store_worker = KadStore::new(db, &key_config, NetworkType::Worker(0));
+        let mut kad_store =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        let mut kad_store_worker =
+            KadStore::new(db, PeerId::random(), &key_config, NetworkType::Worker(0));
 
         let config = MemoryStoreConfig::default();
 

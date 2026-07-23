@@ -392,7 +392,7 @@ where
             .set_publication_interval(Some(libp2p.kad_publication_interval))
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
-        let mut kad_store = KadStore::new(db.clone(), &key_config, network_type);
+        let mut kad_store = KadStore::new(db.clone(), peer_id, &key_config, network_type);
 
         // Load the Kad records from DB for the local peer cache, decoding with a legacy
         // fallback so records persisted by pre-upgrade software still load. Collect
@@ -1720,14 +1720,7 @@ where
                         num_provider_peers: _,
                     } => {}
                     kad::InboundRequest::AddProvider { record } => {
-                        if let Some(record) = record {
-                            self.swarm
-                                .behaviour_mut()
-                                .kademlia
-                                .store_mut()
-                                .add_provider(record)
-                                .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))?;
-                        }
+                        self.process_kad_add_provider(record)?;
                     }
                     kad::InboundRequest::GetRecord { num_closer_peers: _, present_locally: _ } => {}
                     kad::InboundRequest::PutRecord { source, connection: _, record } => {
@@ -1955,6 +1948,40 @@ where
             trace!(target: "network-kad", ?source, "processing fatal penalty for invalid peer record");
             self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Fatal);
         }
+
+        Ok(())
+    }
+
+    /// Process an inbound kad add-provider request.
+    ///
+    /// Brought to parity with [`Self::process_kad_put_request`]. Kademlia runs
+    /// under [`kad::StoreInserts::FilterBoth`], so this arm is the sole write
+    /// path for inbound provider records: an attacker-supplied record would
+    /// otherwise be persisted with no ban or authenticity check, unlike every
+    /// other sender-supplied write. libp2p has already verified that a provider
+    /// record's `provider` equals the authenticated request source, so gating on
+    /// [`PeerManager::peer_banned`] rejects records from banned peers (including a
+    /// peer banned at the application layer that the `PutRecord` path would also
+    /// reject) before anything reaches the store. Records from banned peers are
+    /// dropped rather than written. See issue #1001.
+    fn process_kad_add_provider(
+        &mut self,
+        record: Option<kad::ProviderRecord>,
+    ) -> NetworkResult<()> {
+        // The ban check borrows the swarm immutably and completes before the
+        // store write borrows it mutably, so the combinator chain avoids holding
+        // both borrows at once.
+        record
+            .filter(|record| !self.swarm.behaviour().peer_manager.peer_banned(&record.provider))
+            .map(|record| {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .add_provider(record)
+                    .map_err(|e| NetworkError::StoreKademliaRecord(e.to_string()))
+            })
+            .transpose()?;
 
         Ok(())
     }
