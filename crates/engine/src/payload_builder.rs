@@ -192,7 +192,8 @@ pub fn execute_consensus_output(
         executed_blocks,
         Some((leader_round, consensus_num_hash, engine_update_tx)),
     )?;
-    // remove blocks from memory and stores them in the database
+    // update the in-memory finalized/safe watches and prune persisted blocks from memory
+    // (the database markers committed atomically with the blocks above)
     reth_env.finalize_block(canonical_header.clone())?;
 
     // return new canonical header for next engine task

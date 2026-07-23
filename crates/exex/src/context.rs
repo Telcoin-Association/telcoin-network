@@ -55,13 +55,13 @@ impl TnExExContext {
     /// Handle to reth for querying EVM chain state and history — for reads only.
     ///
     /// Use this **only** for reads. `RethEnv`'s public surface is *not*
-    /// mutation-free: it also exposes DB-writing methods — notably
-    /// `finish_executing_output` (commits blocks and broadcasts a canonical-state
-    /// notification) and `finalize_block` (persists the finalized/safe block
-    /// numbers) — and this handle shares state with the node's live execution
-    /// writer. Calling a writing method from an ExEx would corrupt the follower's
-    /// chain state. The read-only contract here is by convention, not enforced by
-    /// the type.
+    /// mutation-free: it also exposes state-writing methods — notably
+    /// `finish_executing_output` (commits blocks with the finalized/safe markers
+    /// and broadcasts a canonical-state notification) and `finalize_block`
+    /// (updates the in-memory finalized/safe watches) — and this handle shares
+    /// state with the node's live execution writer. Calling a writing method from
+    /// an ExEx would corrupt the follower's chain state. The read-only contract
+    /// here is by convention, not enforced by the type.
     ///
     /// Reads commonly useful to an ExEx (see [`RethEnv`] for the full surface):
     ///
