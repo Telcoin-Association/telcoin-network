@@ -745,14 +745,14 @@ async fn adjust_base_fees(
     };
 
     let block_height = epoch_info.blockHeight;
-    debug_assert_eq!(
-        tip.number + 1,
-        block_height,
-        "close-time base-fee identity: canonical tip {} + 1 != entered-epoch {entered_epoch} \
-         blockHeight {block_height}",
-        tip.number,
-    );
     if tip.number + 1 != block_height {
+        error!(
+            target: "epoch-manager",
+            tip_number = tip.number,
+            entered_epoch,
+            block_height,
+            "close-time base-fee identity: canonical tip + 1 != entered-epoch blockHeight"
+        );
         return Err(eyre::eyre!(
             "close-time base-fee identity violated: canonical tip {} + 1 != entered-epoch \
              {entered_epoch} blockHeight {block_height} at tip {:?} - refusing to price base fees \
@@ -1116,6 +1116,35 @@ mod tests {
         assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
         assert_eq!(acc.base_fee(1).base_fee(), 9_099, "worker 1 fee unchanged");
         assert_eq!(acc.get_values(0), (1, 1_000_000, 30_000_000), "worker 0 gas unchanged");
+
+        Ok(())
+    }
+
+    /// Identity-violation arm: with the registry present but NO closing block executed, the
+    /// canonical tip is genesis and the identity read succeeds with epoch 0's record
+    /// (`blockHeight` 0), so `tip + 1 != blockHeight` and the guard halts the close with the
+    /// descriptive error instead of pricing base fees off a non-closing block.
+    #[tokio::test]
+    async fn adjust_base_fees_errors_when_tip_is_not_a_closing_block() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("adjust_fees_identity_violation")?;
+        let task_manager = TaskManager::new("adjust fees identity violation");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(4_242);
+
+        let err = adjust_base_fees(&reth_env, &acc)
+            .await
+            .expect_err("non-closing tip must violate the close-time identity");
+        assert!(
+            err.to_string().contains("close-time base-fee identity violated"),
+            "unexpected error: {err}"
+        );
+
+        // the guard trips before the config read, so fees stay untouched
+        assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
 
         Ok(())
     }
