@@ -386,8 +386,13 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         }
         .is_ok()
         {
-            // Record was removed so dec num_records.
-            self.num_records -= 1;
+            // Record was removed so dec num_records. Saturate to match the eviction
+            // siblings (`evict_expired_records`): on MDBX `db.remove` returns `Ok` even
+            // when the key was absent, so a `remove` for an uncounted key (a double
+            // `remove`, or one for a row already dropped by eviction) would otherwise
+            // drive this `usize` below zero and wrap to `usize::MAX`, permanently
+            // wedging `put` behind the `num_records >= max_records` cap.
+            self.num_records = self.num_records.saturating_sub(1);
             self.update_records_gauge();
         }
     }
@@ -492,7 +497,12 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 .is_ok()
                 {
                     // Provider is empty and we removed it so dec num_providers.
-                    self.num_providers -= 1;
+                    // Saturate to match `evict_expired_providers`: should the counter
+                    // ever drift below the on-disk provider-key count, this emptying
+                    // removal must clamp at zero rather than wrap to `usize::MAX` and
+                    // wedge `add_provider` behind the `num_providers >= max_provided_keys`
+                    // cap.
+                    self.num_providers = self.num_providers.saturating_sub(1);
                 }
             } else {
                 let _ = match self.kad_type {
@@ -977,5 +987,82 @@ mod test {
             .build()
             .map(|_| ())
             .map_err(Into::into)
+    }
+
+    /// `remove` for a key that was never `put` must not drive `num_records` below zero.
+    /// On MDBX `db.remove` reports `Ok` even for an absent key, so the `is_ok()` gate in
+    /// `remove` fires and reaches the decrement. Before the `saturating_sub` fix this
+    /// wrapped the `usize` to `usize::MAX` (debug: panicked), permanently satisfying
+    /// `num_records >= max_records` and wedging every future `put` (issue #1005).
+    #[test]
+    fn test_kad_remove_uncounted_record_saturates() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
+
+        let rec = test_record(false);
+        assert_eq!(kad_store.num_records, 0);
+        kad_store.remove(&rec.key);
+        assert_eq!(kad_store.num_records, 0, "removing an uncounted record must clamp at zero");
+
+        // The counter is still sound: a subsequent put is accepted, not wedged.
+        kad_store.put(rec.clone()).expect("put must still succeed after a no-op remove");
+        assert_eq!(kad_store.num_records, 1);
+    }
+
+    /// Removing the same record twice must not underflow `num_records`. The first `remove`
+    /// deletes the row and decrements to zero; the second finds nothing on disk yet MDBX
+    /// still reports `Ok`, so the decrement runs again. `saturating_sub` keeps it at zero
+    /// (issue #1005).
+    #[test]
+    fn test_kad_double_remove_record_saturates() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
+
+        let rec = test_record(false);
+        kad_store.put(rec.clone()).expect("put record");
+        assert_eq!(kad_store.num_records, 1);
+        kad_store.remove(&rec.key);
+        kad_store.remove(&rec.key);
+        assert_eq!(kad_store.num_records, 0, "double remove must clamp at zero, not wrap");
+
+        // Not wedged: the cap still admits fresh records.
+        let fresh = test_record(false);
+        kad_store.put(fresh).expect("put must still succeed");
+        assert_eq!(kad_store.num_records, 1);
+    }
+
+    /// `remove_provider`'s decrement is currently guarded by the `db.get(..) == Some`
+    /// precondition, so it is latent rather than live like the records path above. This
+    /// test drives the guarded decrement directly by simulating the counter drifting below
+    /// the true on-disk provider-key count, and asserts the emptying removal clamps at zero
+    /// instead of wrapping to `usize::MAX` and wedging `add_provider` (issue #1005).
+    #[test]
+    fn test_kad_remove_provider_saturates_on_counter_drift() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
+
+        let pr = test_provider_record();
+        kad_store.add_provider(pr.clone()).expect("add provider");
+        assert_eq!(kad_store.num_providers, 1);
+
+        // Simulate a counter that has drifted below the on-disk count while the provider
+        // row still exists; the emptying removal must saturate, not underflow.
+        kad_store.num_providers = 0;
+        kad_store.remove_provider(&pr.key, &pr.provider);
+        assert_eq!(kad_store.num_providers, 0, "emptying removal must clamp at zero");
+
+        // Not wedged: add_provider still admits a fresh key.
+        let pr2 = test_provider_record();
+        kad_store.add_provider(pr2).expect("add_provider must still succeed");
+        assert_eq!(kad_store.num_providers, 1);
     }
 }
