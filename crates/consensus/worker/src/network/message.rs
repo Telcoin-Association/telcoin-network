@@ -1,7 +1,5 @@
 //! Messages sent between workers.
 
-use std::collections::BTreeSet;
-
 use crate::network::error::WorkerNetworkError;
 use serde::{Deserialize, Serialize};
 use tn_network_libp2p::{PeerExchangeMap, TNMessage};
@@ -38,18 +36,6 @@ pub enum WorkerRequest {
         /// The sealed batch that this worker is reporting.
         sealed_batch: SealedBatch,
     },
-    /// Request batches via stream.
-    ///
-    /// This initiates a stream-based batch transfer. The responder will
-    /// return `WorkerResponse::RequestBatchesStream` with acceptance status.
-    /// If accepted, the requestor opens a stream with the request digest
-    /// in the header for correlation.
-    RequestBatchesStream {
-        /// The batch digests being requested.
-        batch_digests: BTreeSet<BlockHash>,
-        /// The epoch these batches were produced.
-        epoch: Epoch,
-    },
     /// Exchange peer information.
     ///
     /// This "request" is sent to peers when this node disconnects
@@ -78,15 +64,6 @@ impl From<PeerExchangeMap> for WorkerRequest {
 pub enum WorkerResponse {
     /// Status 200 response when a peer accepts a proposed batch.
     ReportBatch,
-    /// Response to stream-based batch request.
-    ///
-    /// If `ack` is true, the requestor should open a stream with the
-    /// request digest in the header. The responder will send batches
-    /// over that stream.
-    RequestBatchesStream {
-        /// Whether the request is accepted.
-        ack: bool,
-    },
     /// Exchange peer information.
     PeerExchange {
         /// The peer information being exchanged.
