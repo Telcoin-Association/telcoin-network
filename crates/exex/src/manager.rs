@@ -17,7 +17,9 @@
 //! ExEx can detect the gap and reconcile via [`replay`](crate::replay).
 
 use crate::{Chain, TnExExEvent, TnExExNotification};
-use futures::stream::{self, select_all, select_with_strategy, PollNext, StreamExt, TryStreamExt};
+use futures::stream::{
+    self, select_all, select_with_strategy, PollNext, Stream, StreamExt, TryStreamExt,
+};
 use reth_provider::CanonStateNotification;
 use std::sync::Arc;
 use tn_reth::CanonStateNotificationStream;
@@ -193,18 +195,11 @@ impl TnExExManager {
             ReceiverStream::new(rx).map(move |ev| RouterEvent::Event { idx, ev })
         }));
 
-        // Biased priority certs > consensus > canon > events via a constant `PollNext::Left`, which
-        // drains the higher-priority stream fully before the next (matching the original sequential
-        // poll order, where each stream was drained to `Pending` before the next was polled).
-        let merged = select_with_strategy(
-            certs,
-            select_with_strategy(
-                consensus,
-                select_with_strategy(canon, events, prefer_left),
-                prefer_left,
-            ),
-            prefer_left,
-        );
+        // Merge the four sources under a bounded-fairness round-robin schedule (see
+        // `merge_sources`): the priority ordering certs > consensus > canon > events is kept as
+        // throughput shares, but no source can be deferred indefinitely by a continuously-ready
+        // higher-priority feed.
+        let merged = merge_sources(certs, consensus, canon, events);
 
         // The fold ends only by observing a closed source stream (signalled as `StreamEnded`); it
         // never yields a real error, so the result is discarded and the manager reports `Ok(())`.
@@ -220,10 +215,40 @@ impl TnExExManager {
     }
 }
 
-/// Always drains the higher-priority (left) stream first, giving the fixed source order
+/// Round-robins the two sides of a merge: returns the current choice and flips the stored
+/// `PollNext` state, so each side is polled first on alternating polls. This is the round-robin
+/// idiom documented for [`select_with_strategy`]. The state is seeded from `PollNext::default()`
+/// (`Left`), so the left (higher-priority) side still wins the very first poll.
+fn round_robin(last: &mut PollNext) -> PollNext {
+    last.toggle()
+}
+
+/// Merges the manager's four input streams into one, in priority order
 /// certs > consensus output > canonical state > events.
-fn prefer_left(_: &mut ()) -> PollNext {
-    PollNext::Left
+///
+/// Each of the three nested [`select_with_strategy`] layers uses [`round_robin`] rather than a
+/// constant `PollNext::Left` bias. Round-robin at every layer keeps the priority *ordering* as a
+/// bounded bias: when all four sources are continuously ready the merge yields them in the fixed
+/// proportion `certs : consensus : canon : events == 4 : 2 : 1 : 1` (i.e. 1/2 > 1/4 > 1/8 = 1/8,
+/// monotone in priority), while capping the deferral of any single source to one poll of its
+/// sibling. A continuously-ready certificate or consensus feed therefore can no longer starve the
+/// canonical-state or ExEx-event streams, which a constant `PollNext::Left` bias permitted without
+/// any upper bound.
+fn merge_sources<T>(
+    certs: impl Stream<Item = T>,
+    consensus: impl Stream<Item = T>,
+    canon: impl Stream<Item = T>,
+    events: impl Stream<Item = T>,
+) -> impl Stream<Item = T> {
+    select_with_strategy(
+        certs,
+        select_with_strategy(
+            consensus,
+            select_with_strategy(canon, events, round_robin),
+            round_robin,
+        ),
+        round_robin,
+    )
 }
 
 /// A single merged input to the [`TnExExManager`] event loop.
@@ -584,5 +609,80 @@ mod tests {
         // Out-of-order/duplicate commit (older range) → no gap, tip never rewinds.
         assert_eq!(canon_gap(&mut tip, 5, 8), None);
         assert_eq!(tip, Some(13));
+    }
+
+    // Tags which source a merged item came from, so the merge tests can assert both
+    // fairness (no source is starved) and the preserved priority ordering.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Source {
+        Cert,
+        Consensus,
+        Canon,
+        Event,
+    }
+
+    #[test]
+    fn round_robin_seeds_left_then_alternates() {
+        // Seeded from the default (`Left`), certificates win the first poll; the state then
+        // flips on every call, so neither side is ever polled first twice in a row.
+        let mut state = PollNext::default();
+        assert!(matches!(round_robin(&mut state), PollNext::Left));
+        assert!(matches!(round_robin(&mut state), PollNext::Right));
+        assert!(matches!(round_robin(&mut state), PollNext::Left));
+        assert!(matches!(round_robin(&mut state), PollNext::Right));
+    }
+
+    #[tokio::test]
+    async fn merge_bounds_low_priority_starvation() {
+        // The highest-priority source is continuously ready and infinite; the lowest-priority
+        // source carries a single, distinguishable item. Under the round-robin schedule that lone
+        // event must surface within a small, bounded number of polls rather than be deferred
+        // forever behind the ready certificate feed.
+        //
+        // Confirm-by-mutation: reverting `round_robin` to a constant `PollNext::Left` (the original
+        // `prefer_left`) leaves the `Event` unreachable while the certificate stream stays ready,
+        // so `saw_event` stays false and this assertion fails.
+        let certs = stream::repeat(Source::Cert);
+        let consensus = stream::empty::<Source>();
+        let canon = stream::empty::<Source>();
+        let events = stream::once(async { Source::Event });
+
+        let observed: Vec<Source> =
+            merge_sources(certs, consensus, canon, events).take(8).collect().await;
+
+        let saw_event = observed.contains(&Source::Event);
+        assert!(saw_event, "low-priority event starved under a ready cert feed: {observed:?}");
+    }
+
+    #[tokio::test]
+    async fn merge_preserves_priority_ordering_without_flattening() {
+        // With all four sources continuously ready, the round-robin nest yields the fixed
+        // proportion certs : consensus : canon : events == 4 : 2 : 1 : 1 over each 8-item cycle.
+        // Assert the priority ordering survives as a strict, monotone bias (certs > consensus >
+        // canon) with the two lowest tying (canon == events), i.e. the fix does not silently
+        // flatten priority into a uniform round-robin across all four sources.
+        //
+        // Confirm-by-mutation: under a constant `PollNext::Left` every item is a certificate, so
+        // `consensus_n > canon_n` (0 > 0) fails.
+        const N: usize = 8 * 100;
+        let certs = stream::repeat(Source::Cert);
+        let consensus = stream::repeat(Source::Consensus);
+        let canon = stream::repeat(Source::Canon);
+        let events = stream::repeat(Source::Event);
+
+        let observed: Vec<Source> =
+            merge_sources(certs, consensus, canon, events).take(N).collect().await;
+
+        let count = |want: Source| observed.iter().filter(|s| **s == want).count();
+        let certs_n = count(Source::Cert);
+        let consensus_n = count(Source::Consensus);
+        let canon_n = count(Source::Canon);
+        let events_n = count(Source::Event);
+
+        assert!(certs_n > consensus_n, "certs {certs_n} !> consensus {consensus_n}");
+        assert!(consensus_n > canon_n, "consensus {consensus_n} !> canon {canon_n}");
+        assert_eq!(canon_n, events_n, "canon {canon_n} != events {events_n} (lowest two must tie)");
+        // The exact 4:2:1:1 shares document the schedule the ordering rests on.
+        assert_eq!((certs_n, consensus_n, canon_n, events_n), (N / 2, N / 4, N / 8, N / 8));
     }
 }
