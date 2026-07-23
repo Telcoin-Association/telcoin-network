@@ -708,7 +708,8 @@ enum DBMessage<DB: Database> {
     /// is deferred while a write txn is open so it fires only after that physical txn commits. A
     /// bare `Insert` enqueued while a txn is open is absorbed into it (`db_run`), so an immediate
     /// ack could return before the write is durable; deferring closes that window. The ack carries
-    /// a [`DurableAck`] so a failed physical commit surfaces as an error to `persist` (issue #975).
+    /// a [`DurableAck`] so a failed physical commit surfaces as an error to `persist` (issue
+    /// #975).
     DurableBarrier(tokio::sync::oneshot::Sender<DurableAck>),
     Stats(tokio::sync::oneshot::Sender<LayeredDbStats>),
     Shutdown,
@@ -1315,10 +1316,9 @@ mod test {
 
         // A fresh barrier with NO open txn: the runner would ack `Committed` immediately, but the
         // poison latch must make it fail so the recast exits fail-stop instead of equivocating.
-        let second =
-            tokio::time::timeout(Duration::from_secs(5), db.persist::<TestTable>())
-                .await
-                .expect("second barrier must resolve");
+        let second = tokio::time::timeout(Duration::from_secs(5), db.persist::<TestTable>())
+            .await
+            .expect("second barrier must resolve");
         assert!(
             second.is_err(),
             "after a failed commit the poison latch must fail every later persist, even with no open txn"
@@ -1358,10 +1358,9 @@ mod test {
         // A barrier with no open txn: without the latch the runner acks `Committed` immediately;
         // with it the past bare-insert failure must surface as Err so the guard-write caller
         // fail-stops instead of externalizing a non-durable record.
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), db.persist::<TestTable>())
-                .await
-                .expect("barrier must resolve");
+        let result = tokio::time::timeout(Duration::from_secs(5), db.persist::<TestTable>())
+            .await
+            .expect("barrier must resolve");
         assert!(
             result.is_err(),
             "a failed bare insert (the write_last_proposed/write_vote path) must trip the poison latch so persist fails"
