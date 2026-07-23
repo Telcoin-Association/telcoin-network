@@ -135,6 +135,12 @@ where
         // reconstruct.
         config.parameters.validate()?;
 
+        // Reject a peer-score configuration whose bounds would panic `Score::add`'s `f64::clamp`
+        // (a `min_score > max_score` or `NaN` bound) or silently disable reputation enforcement,
+        // on the same startup footing as the consensus parameters above, long before the first
+        // peer penalty routes the config through the running swarm.
+        network_config.peer_config().score_config.validate()?;
+
         let local_network = LocalNetwork::new(key_config.primary_public_key());
 
         let primary_public_key = key_config.primary_public_key();
