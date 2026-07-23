@@ -293,6 +293,13 @@ impl ExecutionNode {
     }
 
     /// Read [EpochState] from the canonical tip.
+    ///
+    /// The committee arrays this returns mutate mid-epoch: a governance `burn` swap-and-pops the
+    /// ejected validator out of the CURRENT epoch's stored committees immediately, so tip reads
+    /// before and after the burn disagree. Epoch-scoped consensus reads must use
+    /// [`Self::epoch_state_at_epoch_start`] / [`Self::validators_for_epoch_at_block`] instead;
+    /// the tip read remains correct for point-in-time queries (its `epoch` scalar is
+    /// boundary-written-once).
     pub async fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         let guard = self.internal.read().await;
         guard.epoch_state_from_canonical_tip()
@@ -307,10 +314,12 @@ impl ExecutionNode {
 
     /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
     ///
-    /// This is deliberately the ONLY committee read the engine exposes: an unpinned
-    /// (canonical-tip) variant would make the result depend on when the caller runs
-    /// relative to a mid-epoch governance burn. Callers must choose their pin header
+    /// This is deliberately the only *pinned* committee-keys accessor the engine exposes: an
+    /// unpinned (canonical-tip) variant of THIS read would make the result depend on when the
+    /// caller runs relative to a mid-epoch governance burn. Callers must choose their pin header
     /// explicitly (epoch-start for entry reads, the epoch-closing block for the record).
+    /// [`Self::epoch_state_from_canonical_tip`] still exposes tip-read committee fields, for
+    /// point-in-time queries only.
     pub async fn validators_for_epoch_at_block(
         &self,
         epoch: u32,
