@@ -281,7 +281,7 @@ impl Peer {
         self.note_multiaddr(multiaddr);
 
         match &mut self.connection_status {
-            ConnectionStatus::Connected { num_in, .. } => *num_in += 1,
+            ConnectionStatus::Connected { num_in, .. } => *num_in = num_in.saturating_add(1),
             ConnectionStatus::Disconnected { .. }
             | ConnectionStatus::Banned { .. }
             | ConnectionStatus::Dialing { .. }
@@ -307,7 +307,7 @@ impl Peer {
         self.note_multiaddr(multiaddr);
 
         match &mut self.connection_status {
-            ConnectionStatus::Connected { num_out, .. } => *num_out += 1,
+            ConnectionStatus::Connected { num_out, .. } => *num_out = num_out.saturating_add(1),
             ConnectionStatus::Disconnected { .. }
             | ConnectionStatus::Banned { .. }
             | ConnectionStatus::Dialing { .. }
@@ -465,5 +465,51 @@ mod tests {
             "the most recent address must be recorded even at the cap boundary"
         );
         assert!(peer.multiaddrs.len() <= MAX_MULTIADDRS_PER_PEER);
+    }
+
+    /// Regression (issue #1010, informational): the per-connection counters are `u8` and were
+    /// incremented with a plain `*num_in += 1`. In a debug build (overflow checks on) the 256th
+    /// inbound connection from one peer panicked; in a release build it wrapped `255 -> 0`.
+    /// `saturating_add` makes the counter well-defined for a hostile peer: it clamps at `u8::MAX`
+    /// instead of panicking or wrapping. This test would panic on the 256th call before the fix.
+    #[test]
+    fn register_incoming_saturates_and_never_panics() {
+        // constructing a `Peer` builds its `Score`, which reads the global score config
+        super::super::score::init_peer_score_config(ScoreConfig::default());
+        let mut peer = Peer::default_for_test();
+
+        // far more inbound connections than `u8::MAX`; a plain `+= 1` panics here in a debug build
+        (0..300).for_each(|_| peer.register_incoming(create_multiaddr(None)));
+
+        if let ConnectionStatus::Connected { num_in, num_out } = peer.connection_status {
+            assert_eq!(num_in, u8::MAX, "inbound counter must saturate at u8::MAX, not wrap");
+            assert_eq!(num_out, 0, "no outbound connections were registered");
+        } else {
+            panic!(
+                "peer must be Connected after inbound registrations: {:?}",
+                peer.connection_status
+            );
+        }
+    }
+
+    /// Regression (issue #1010, informational): the outbound counter mirror of
+    /// [`register_incoming_saturates_and_never_panics`]. `register_outgoing` must clamp `num_out`
+    /// at `u8::MAX` rather than panic (debug) or wrap (release).
+    #[test]
+    fn register_outgoing_saturates_and_never_panics() {
+        super::super::score::init_peer_score_config(ScoreConfig::default());
+        let mut peer = Peer::default_for_test();
+
+        (0..300).for_each(|_| peer.register_outgoing(create_multiaddr(None)));
+
+        if let ConnectionStatus::Connected { num_in, num_out } = peer.connection_status {
+            assert_eq!(num_out, u8::MAX, "outbound counter must saturate at u8::MAX, not wrap");
+            assert_eq!(num_in, 0, "no inbound connections were registered");
+        } else {
+            panic!(
+                "peer must be Connected after outbound registrations: {:?}",
+                peer.connection_status
+            );
+        }
     }
 }
