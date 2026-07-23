@@ -24,6 +24,7 @@ use tn_reth::{
     RethMdbxError, StaticFileProvider, Tables,
 };
 use tn_storage::{
+    consensus::ConsensusChain,
     consensus_pack::{ConsensusPack, DATA_NAME},
     epoch_records::{EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
@@ -442,11 +443,21 @@ fn restore_consensus_and_records(
             let _ = fs::remove_dir_all(&epoch_dir);
             bail!("rebuilt consensus pack tip does not match epoch {n} final consensus: {tip:?}");
         }
+
+        // Point the consensus "latest" slot hint at this epoch's final consensus so a node started
+        // on this datadir resumes syncing from here instead of from genesis.
+        ConsensusChain::write_latest_consensus_hint(
+            epochs_dir,
+            n,
+            final_record.final_consensus.number,
+        )
+        .map_err(|e| eyre!("failed to write consensus slot hint: {e}"))?;
         Ok(())
     })?;
 
     println!(
-        "restored and verified epoch records 0..={n} and consensus pack for epoch {n} into {}",
+        "restored and verified epoch records 0..={n} and consensus pack for epoch {n} into {}; \
+         a node started here will resume syncing from epoch {n}",
         epochs_dir.display()
     );
     Ok(())
