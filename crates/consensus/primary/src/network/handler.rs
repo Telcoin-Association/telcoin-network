@@ -895,37 +895,28 @@ where
                         self.consensus_config.key_config(),
                     );
                     if vote.digest() != vote_info.vote_digest() {
-                        // Check if a certificate was already formed for this header author at this
-                        // round. If one exists, the old vote contributed to a real certificate, so
-                        // voting for a different header at the same round would be equivocation.
-                        // If no certificate exists, the old vote was never aggregated (e.g. the
-                        // proposer was killed before collecting enough votes, then restarted and
-                        // created a new header at the same round). In that case it is safe to
-                        // re-vote for the new header.
-                        let cert_exists = self
-                            .consensus_config
-                            .node_storage()
-                            .read_by_index(header.author(), header.round())
-                            .unwrap_or(None)
-                            .is_some();
-                        if cert_exists {
-                            warn!(
-                                "Authority {} submitted different header {:?} for voting",
-                                header.author(),
-                                header,
-                            );
-                            return Err(
-                                HeaderError::AlreadyVoted(header.digest(), header.round()).into()
-                            );
-                        }
-                        // No certificate was formed for the old vote — allow re-voting.
+                        // We have already signed a *different* vote for this author at
+                        // this (epoch, round); refuse to sign a second one.
+                        //
+                        // The previous behavior re-voted whenever `read_by_index` found no
+                        // certificate for the earlier vote. That probe is unsound across a
+                        // crash: the certificate tables are `TableHint::Epoch`, written
+                        // non-durably through the layered epoch DB, so a certificate that
+                        // *was* formed can be lost on restart and read back as absent,
+                        // letting the node sign a distinct vote for a slot already
+                        // aggregated into a live certificate. (`.unwrap_or(None)` also
+                        // failed a storage error open into the same branch.) A `false` or
+                        // errored read cannot prove the earlier vote was never certified,
+                        // so the only safe action is to refuse. See #934, #963.
                         warn!(
-                            "Authority {} re-proposing at round {} with a different header; \
-                         previous vote was for an uncertified header — allowing re-vote",
+                            "Authority {} submitted a different header {:?} for a round it was \
+                             already voted on; refusing to re-vote to avoid equivocation",
                             header.author(),
-                            header.round(),
+                            header,
                         );
-                        // Fall through to create and store the new vote below.
+                        return Err(
+                            HeaderError::AlreadyVoted(header.digest(), header.round()).into()
+                        );
                     } else {
                         debug!(
                             "Resending vote {vote:?} for {} at round {}",

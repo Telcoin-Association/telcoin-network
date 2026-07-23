@@ -203,8 +203,8 @@ where
                     warn!(target: "worker::network", "worker application received unexpected peer exchange message");
                 }
             },
-            NetworkEvent::Gossip { message, relayer, author } => {
-                self.process_gossip(message, relayer, author);
+            NetworkEvent::Gossip(gossip) => {
+                self.process_gossip(gossip.message, gossip.relayer, gossip.author);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = WorkerResponse::Error(message::WorkerRPCError(msg));

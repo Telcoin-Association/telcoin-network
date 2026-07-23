@@ -134,6 +134,18 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// The proposer's intervals and genesis certificate are created in this function.
     /// Also set `advance_round` to true.
+    ///
+    /// The starting round is recovered from the `LastProposed` guard record rather than always
+    /// starting at zero. `prime_consensus` restores `primary_round` from the last *committed*
+    /// leader round, which trails the last *proposed* round after a crash, so a proposer that
+    /// started at zero would propose fresh at `committed + 1` and only reach the last proposed
+    /// round `P` again after recovery parents arrive - by which point `LastProposed` has been
+    /// overwritten and the round-`P` header is rebuilt with a *different* digest (`created_at` is
+    /// wall-clock and sits inside the digest preimage). Voters holding a durable `Votes` record
+    /// for round `P` then reject that new digest with `AlreadyVoted` forever, because nothing
+    /// converts elapsed time into progress. Seeding `round` to `P - 1` makes the first proposal
+    /// land on `P`, so the repropose filter in `Self::propose_next_header` hits and the
+    /// byte-identical header is re-sent - the premise the fail-closed vote guard depends on.
     pub(crate) fn new(
         config: ConsensusConfig<DB>,
         authority_id: AuthorityIdentifier, // We need to be a validator so must have an id.
@@ -146,6 +158,31 @@ impl<DB: Database> Proposer<DB> {
         // create min/max delay intervals
         let min_delay_interval = tokio::time::interval(config.parameters().min_header_delay);
         let max_delay_interval = tokio::time::interval(config.parameters().max_header_delay);
+
+        // Recover the round of the last header this authority proposed.
+        //
+        // A read failure is not fatal: it only costs the reproposal, so log it and fall back to
+        // the pre-recovery behavior of starting at round 0. The stored header is ignored unless it
+        // is from the current epoch (the epoch DB is cleared on a clean rollover, but two exit
+        // paths skip that clear, so a stale record can outlive its epoch) and unless it is ahead
+        // of `primary_round` (a node that already caught up past `P` via state sync must not be
+        // dragged backwards - `propose_next_header` would ignore the seed anyway).
+        let recovered_round = config
+            .node_storage()
+            .get_last_proposed()
+            .inspect_err(|e| {
+                error!(
+                    target: "primary::proposer",
+                    ?e,
+                    "failed to read last proposed header - starting from round 0",
+                );
+            })
+            .ok()
+            .flatten()
+            .filter(|header| header.epoch() == config.committee().epoch())
+            .map(|header| header.round())
+            .filter(|round| *round > consensus_bus.app().primary_round())
+            .map_or(0, |round| round.saturating_sub(1));
 
         Self {
             authority_id,
@@ -160,7 +197,7 @@ impl<DB: Database> Proposer<DB> {
             rx_shutdown,
             consensus_bus,
             proposer_store: config.node_storage().clone(),
-            round: 0,
+            round: recovered_round,
             last_parents: genesis,
             last_leader: None,
             digests: VecDeque::with_capacity(2 * config.parameters().max_header_num_of_batches),
@@ -259,32 +296,64 @@ impl<DB: Database> Proposer<DB> {
     }
 
     /// Store the header in the `ProposerStore` and send to `Certifier`.
+    ///
+    /// `LastProposed` is a single-slot record (its key is the constant `LAST_PROPOSAL_KEY`), so
+    /// every write replaces the previous one. It is only overwritten by a header that supersedes
+    /// the stored one, so a transient proposal at a *lower* round cannot erase the guard record
+    /// for a higher round that this authority has already broadcast. Losing that record is what
+    /// lets a restart rebuild a round-`P` header with a fresh digest and deadlock against voters
+    /// holding a durable `Votes` record for `P`.
+    ///
+    /// The comparison is epoch-aware. Rounds restart per epoch, so a round-only test would refuse
+    /// every write in a new epoch for as long as a higher-round record from the previous epoch
+    /// survived - which is reachable, because the epoch-close table clear is both conditional and
+    /// not durability-barriered. That would silently disable the anti-equivocation guard for a
+    /// whole epoch, so a header from a different epoch always supersedes.
+    ///
+    /// The round test is `>=`, not `>`, and the equality case is load-bearing: reproposing the
+    /// identical header for the *same* round must still take the write branch, because that is what
+    /// keeps the reproposal behind the durability barrier below. The certifier depends on this. It
+    /// releases its proposal lock before its own barrier, which is only safe because a reproposed
+    /// header cannot reach the certifier until this barrier acks - and since the barrier is
+    /// whole-DB and FIFO, that ack implies the certifier's earlier `ProposedCertificates` insert is
+    /// durable too. Narrowing this to `>` would let a reproposal skip the barrier and overtake that
+    /// insert, so a certificate could be re-gossiped from a record that is still memory-only.
     async fn store_and_send_header(
         header: &Header,
         proposer_store: DB,
         consensus_bus: &ConsensusBus,
     ) -> ProposerResult<()> {
-        // Store the last header.
-        proposer_store
-            .write_last_proposed(header)
+        // A read error is fatal here: failing it open would fall through to the write and clobber
+        // the very record this guard exists to preserve.
+        let stored = proposer_store
+            .get_last_proposed()
             .map_err(|e| ProposerError::StoreError(e.to_string()))?;
+        let supersedes_stored = stored
+            .is_none_or(|last| last.epoch() != header.epoch() || header.round() >= last.round());
 
-        // Wait for the `LastProposed` record to be durable before broadcasting. The epoch DB
-        // persists asynchronously, so `write_last_proposed` returns before the record hits disk;
-        // broadcasting first would let a crash in that window lose the record. On restart the
-        // anti-equivocation guard would then read nothing and build a *different* header for this
-        // same round while the pre-crash header is already on the network: equivocation from an
-        // ordinary crash. See issue #934.
-        //
-        // If the barrier reports a failed commit (disk full, `EIO`, checksum), the record is not on
-        // disk, so broadcasting would risk that same self-inflicted equivocation. Refuse to
-        // broadcast and return a fatal error instead: the proposer runs as a critical task, so
-        // returning here fail-stops the node cleanly rather than continuing on a lost guard record
-        // (issue #975).
-        proposer_store
-            .persist_durable::<LastProposed>()
-            .await
-            .map_err(|e| ProposerError::DurableBarrierFailed(e.to_string()))?;
+        if supersedes_stored {
+            // Store the last header.
+            proposer_store
+                .write_last_proposed(header)
+                .map_err(|e| ProposerError::StoreError(e.to_string()))?;
+
+            // Wait for the `LastProposed` record to be durable before broadcasting. The epoch DB
+            // persists asynchronously, so `write_last_proposed` returns before the record hits
+            // disk; broadcasting first would let a crash in that window lose the record. On
+            // restart the anti-equivocation guard would then read nothing and build a *different*
+            // header for this same round while the pre-crash header is already on the network:
+            // equivocation from an ordinary crash. See issue #934.
+            //
+            // If the barrier reports a failed commit (disk full, `EIO`, checksum), the record is
+            // not on disk, so broadcasting would risk that same self-inflicted equivocation.
+            // Refuse to broadcast and return a fatal error instead: the proposer runs as a
+            // critical task, so returning here fail-stops the node cleanly rather than continuing
+            // on a lost guard record (issue #975).
+            proposer_store
+                .persist_durable::<LastProposed>()
+                .await
+                .map_err(|e| ProposerError::DurableBarrierFailed(e.to_string()))?;
+        }
 
         // Send the new header to the `Certifier` that will broadcast and certify it.
         consensus_bus.headers().send(header.clone()).await.map_err(|e| Box::new(e).into())

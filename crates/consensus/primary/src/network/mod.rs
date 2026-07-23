@@ -1282,8 +1282,8 @@ where
                     self.process_consensus_output_stream(peer, channel, cancel)
                 }
             },
-            NetworkEvent::Gossip { message, relayer, author } => {
-                self.process_gossip(message, relayer, author);
+            NetworkEvent::Gossip(gossip) => {
+                self.process_gossip(gossip.message, gossip.relayer, gossip.author);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = PrimaryResponse::Error(PrimaryRPCError(msg));
