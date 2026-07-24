@@ -337,7 +337,7 @@ where
                         // copy the consensus + epoch-records packs alongside the state pack, then
                         // atomically move the complete bundle into place; external tooling watches
                         // for the final dir appearing atomically.
-                        Ok(Ok(outcome)) => {
+                        Ok(Ok(Some(outcome))) => {
                             let copied = std::fs::copy(&src_consensus, tmp_dir.join("consensus_data"))
                                 .and_then(|_| {
                                     std::fs::copy(&src_records, tmp_dir.join("epoch_records"))
@@ -365,6 +365,11 @@ where
                                     let _ = std::fs::remove_dir_all(&tmp_dir);
                                 }
                             }
+                        }
+                        // intentional skip: the epoch is not resumable, so no bundle was written.
+                        Ok(Ok(None)) => {
+                            info!(target: "tn::snapshot", epoch, "skipped state export for epoch: snapshot would not be resumable; no bundle written");
+                            let _ = std::fs::remove_dir_all(&tmp_dir);
                         }
                         // export failed or the worker went away: drop the partial temp dir.
                         Ok(Err(e)) => {

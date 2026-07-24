@@ -548,105 +548,24 @@ impl SnapshotRestorer {
         Ok(root)
     }
 
-    /// Verify the shipped window can seed the restored node's first epoch-entry base fees.
-    ///
-    /// At epoch entry the node derives each worker's base fee from the previous epoch's genuine
-    /// blocks; a worker with an `Eip1559` config that produced no genuine block in that epoch has
-    /// no chain-observable fee anchor and the node walks BACKWARD through earlier epochs to
-    /// find one. A restored node only has the shipped `window`, so such a walk would run off
-    /// the bottom of the window into pre-snapshot history the snapshot omitted, and halt.
-    ///
-    /// This mirrors that attribution: it reads the worker fee configs at block `B` (the closing
-    /// block of the epoch below `entered`, which defines `entered`'s configuration) against the
-    /// post-import state, then requires every `Eip1559` worker to have produced at least one
-    /// genuine batch block within `window`. `Static` workers need no anchor — their fee is
-    /// pinned by config. Errors name the offending worker. Must run AFTER
-    /// [`import_state`](Self::import_state), since it reads contract state at `B`.
+    /// Restore-side driver for [`check_fee_precondition`]: verifies the shipped window can seed the
+    /// restored node's first epoch-entry base fees, reading contract state through this restorer's
+    /// env. Must run AFTER [`import_state`](Self::import_state), since it reads contract state at
+    /// `B`.
     pub fn derive_fee_precondition(
         &self,
         entered: Epoch,
         window: &[SealedHeader],
     ) -> eyre::Result<()> {
-        let closing = window
-            .last()
-            .ok_or_else(|| eyre!("snapshot restore: cannot check fees over an empty window"))?;
-
-        // worker strategies at the closing block define the entered epoch's configuration
-        let (num_workers, configs) =
-            self.reth_env.get_worker_fee_configs_at_block(closing.hash()).wrap_err(
-                "snapshot restore: reading worker fee configs at the snapshot's final block",
-            )?;
-
-        // workers with a genuine batch block inside the shipped window
-        let mut produced: BTreeSet<WorkerId> = BTreeSet::new();
-        for header in window {
-            if is_worker_batch_block(header) {
-                produced.insert(worker_id_from_header(header));
-            }
-        }
-
-        let prior = entered.saturating_sub(1);
-        for (worker_id, config) in configs.iter().enumerate() {
-            let worker_id = worker_id as WorkerId;
-            if matches!(config, WorkerFeeConfig::Eip1559 { .. }) && !produced.contains(&worker_id) {
-                return Err(eyre!(
-                    "snapshot restore: worker {worker_id} has an EIP-1559 fee config but produced \
-                     no genuine block in the shipped epoch-{prior} window; the restored node would \
-                     walk into pre-snapshot history deriving its base fee when entering epoch \
-                     {entered} and halt"
-                ));
-            }
-        }
-
-        debug!(
-            target: "tn::reth",
-            entered,
-            num_workers,
-            produced = produced.len(),
-            "snapshot restore: fee precondition satisfied"
-        );
-        Ok(())
+        check_fee_precondition(&self.reth_env, entered, window)
     }
 
-    /// Verify the restored node can derive its first post-import epoch's base fees without walking
-    /// below the snapshot block — the resume-time driver for [`derive_fee_precondition`].
-    ///
-    /// The restore side does not know the entered epoch up front (a state-only pack carries no
-    /// records), so it reads it from the restored state at `B` — the window's last header, whose
-    /// registry state (stamped by `concludeEpoch` at that closing block) names the epoch the node
-    /// will enter — and defers to [`derive_fee_precondition`].
-    ///
-    /// A no-op when the node will enter epoch 0 or 1: entering epoch 1 stops at the epoch-0 base
-    /// case of the base-fee walk (`derive_idle_worker_fee_at`) and never reads state below `B`, so
-    /// there is nothing to guard (and an epoch-0 snapshot is not consensus-resumable regardless).
-    /// The entered-epoch read is best-effort: a read fault logs a warning and skips the precheck
-    /// rather than failing an otherwise-valid import (the node would simply read this at startup).
-    /// An actual idle-epoch violation, by contrast, is a hard error naming the offending worker.
-    ///
-    /// Must run AFTER [`import_state`](Self::import_state) (it reads contract state at `B`) and
-    /// before [`finish`](Self::finish).
+    /// Restore-side driver for [`check_fees_resumable`]: reads the entered epoch from the restored
+    /// state at `B` and verifies fee derivability. Must run AFTER
+    /// [`import_state`](Self::import_state) (it reads contract state at `B`) and before
+    /// [`finish`](Self::finish).
     pub fn check_resumable_fees(&self, window: &[SealedHeader]) -> eyre::Result<()> {
-        let closing = window.last().ok_or_else(|| {
-            eyre!("snapshot restore: cannot check fee resumability over an empty window")
-        })?;
-        let entered = match self.reth_env.get_current_epoch_info_at_header(closing) {
-            Ok((entered, _info)) => entered,
-            Err(e) => {
-                warn!(
-                    target: "tn::reth",
-                    error = %e,
-                    "snapshot restore: could not read the entered epoch at the snapshot block; \
-                     skipping the fee-derivability precheck"
-                );
-                return Ok(());
-            }
-        };
-        // Entering epoch 0 or 1 never walks below B (the walk stops at the epoch-0 base case), so
-        // there is nothing to verify.
-        if entered < 2 {
-            return Ok(());
-        }
-        self.derive_fee_precondition(entered, window)
+        check_fees_resumable(&self.reth_env, window)
     }
 
     /// Persist the finalized/safe markers at `B` and sanity-check the reconstructed tip.
@@ -683,6 +602,103 @@ impl SnapshotRestorer {
 
         Ok(())
     }
+}
+
+/// Verify a snapshot's shipped `window` can seed the restored node's first epoch-entry base fees,
+/// reading contract state at `B` (= `window.last()`) through `reth_env`.
+///
+/// At epoch entry the node derives each worker's base fee from the previous epoch's genuine blocks;
+/// a worker with an `Eip1559` config that produced no genuine block in that epoch has no
+/// chain-observable fee anchor and the node walks BACKWARD through earlier epochs to find one. A
+/// node holding only the shipped `window` (a snapshot-restored node bootstrapped from an idle epoch)
+/// would run off the bottom of the window into pre-snapshot history and halt. This reads the worker
+/// fee configs at `B` (the closing block of the epoch below `entered`, which defines `entered`'s
+/// configuration) and requires every `Eip1559` worker to have produced at least one genuine batch
+/// block within `window`; `Static` workers need no anchor. Errors name the offending worker.
+///
+/// Shared by the restore side ([`SnapshotRestorer::derive_fee_precondition`]) and the export side
+/// (which runs it against a candidate bundle's window before writing it) — one implementation, no
+/// drift.
+pub fn check_fee_precondition(
+    reth_env: &RethEnv,
+    entered: Epoch,
+    window: &[SealedHeader],
+) -> eyre::Result<()> {
+    let closing = window
+        .last()
+        .ok_or_else(|| eyre!("snapshot restore: cannot check fees over an empty window"))?;
+
+    // worker strategies at the closing block define the entered epoch's configuration
+    let (num_workers, configs) = reth_env
+        .get_worker_fee_configs_at_block(closing.hash())
+        .wrap_err("snapshot restore: reading worker fee configs at the snapshot's final block")?;
+
+    // workers with a genuine batch block inside the shipped window
+    let mut produced: BTreeSet<WorkerId> = BTreeSet::new();
+    for header in window {
+        if is_worker_batch_block(header) {
+            produced.insert(worker_id_from_header(header));
+        }
+    }
+
+    let prior = entered.saturating_sub(1);
+    for (worker_id, config) in configs.iter().enumerate() {
+        let worker_id = worker_id as WorkerId;
+        if matches!(config, WorkerFeeConfig::Eip1559 { .. }) && !produced.contains(&worker_id) {
+            return Err(eyre!(
+                "snapshot restore: worker {worker_id} has an EIP-1559 fee config but produced \
+                 no genuine block in the shipped epoch-{prior} window; the restored node would \
+                 walk into pre-snapshot history deriving its base fee when entering epoch \
+                 {entered} and halt"
+            ));
+        }
+    }
+
+    debug!(
+        target: "tn::reth",
+        entered,
+        num_workers,
+        produced = produced.len(),
+        "snapshot restore: fee precondition satisfied"
+    );
+    Ok(())
+}
+
+/// Verify a snapshot `window` is fee-resumable without being told the entered epoch: read it from
+/// the state at `B` (the window's last header, whose registry state — stamped by `concludeEpoch` at
+/// that closing block — names the epoch a node would enter) and defer to [`check_fee_precondition`].
+///
+/// A no-op when the node would enter epoch 0 or 1: entering epoch 1 stops at the epoch-0 base case
+/// of the base-fee walk (`derive_idle_worker_fee_at`) and never reads state below `B`, so there is
+/// nothing to guard (and an epoch-0 snapshot is not consensus-resumable regardless). The
+/// entered-epoch read is best-effort: a read fault logs a warning and returns `Ok` rather than
+/// blocking on a transient/absent read (the restore side reads it again at startup; the export side
+/// proceeds). An actual idle-epoch violation is a hard error naming the offending worker.
+///
+/// On the restore side, run AFTER [`SnapshotRestorer::import_state`] (it reads contract state at
+/// `B`). On the export side, run against a candidate bundle's window before writing the pack.
+pub fn check_fees_resumable(reth_env: &RethEnv, window: &[SealedHeader]) -> eyre::Result<()> {
+    let closing = window.last().ok_or_else(|| {
+        eyre!("snapshot restore: cannot check fee resumability over an empty window")
+    })?;
+    let entered = match reth_env.get_current_epoch_info_at_header(closing) {
+        Ok((entered, _info)) => entered,
+        Err(e) => {
+            warn!(
+                target: "tn::reth",
+                error = %e,
+                "snapshot restore: could not read the entered epoch at the snapshot block; \
+                 skipping the fee-derivability precheck"
+            );
+            return Ok(());
+        }
+    };
+    // Entering epoch 0 or 1 never walks below B (the walk stops at the epoch-0 base case), so there
+    // is nothing to verify.
+    if entered < 2 {
+        return Ok(());
+    }
+    check_fee_precondition(reth_env, entered, window)
 }
 
 /// The worker id encoded in a header's `difficulty` (low 16 bits).

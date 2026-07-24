@@ -26,9 +26,9 @@
 //! guards. To keep the exported epoch (and every epoch the observer later enters) anchorable at `B`,
 //! this test runs a steady transaction stream, so every epoch contains a genuine worker block. This
 //! mirrors a real network, which is never idle. A companion test in this file
-//! (`test_state_import_rejects_idle_epoch_bundle`) deliberately runs an idle network to prove
-//! `db load-state` *rejects* such a bundle at import time rather than importing it and crashing the
-//! node at first epoch entry.
+//! (`test_state_export_skips_idle_epoch_bundle`) runs an idle network to prove the exporter *skips*
+//! producing a bundle for an epoch it could not resume from, rather than writing one that would be
+//! rejected at import.
 //!
 //! ## Why the assertions prove *import*, not just *sync*
 //!
@@ -424,31 +424,30 @@ async fn test_state_export_import_bootstrap_inner() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Issue-2 regression (negative): a bundle exported from an IDLE epoch — one with no genuine worker
-/// block to anchor base-fee derivation — must be REJECTED by `db load-state` at import time, with a
-/// clear worker-naming error, rather than importing "successfully" and crashing the node at first
-/// epoch entry (`worker configs return decode failed`). Exercises the `check_resumable_fees`
-/// precheck wired into `restore_pack`.
+/// The exporter must NOT produce a bundle it knows is un-resumable. On an IDLE network (epochs with
+/// no genuine worker block), each epoch `>= 1`'s snapshot fails the fee-derivability precheck, so
+/// the exporter skips it and writes no bundle. Epoch 0 is still exported (entering epoch 1 never
+/// walks below the snapshot, so it is fee-resumable). The importer's reject guard is the
+/// counterpart, unit-tested in `tn-reth`; an idle bundle can no longer reach it via a real exporter.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
-fn test_state_import_rejects_idle_epoch_bundle() -> eyre::Result<()> {
+fn test_state_export_skips_idle_epoch_bundle() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .enable_time()
         .build()
         .expect("tokio runtime");
-    rt.block_on(test_state_import_rejects_idle_epoch_bundle_inner())
+    rt.block_on(test_state_export_skips_idle_epoch_bundle_inner())
 }
 
-async fn test_state_import_rejects_idle_epoch_bundle_inner() -> eyre::Result<()> {
-    info!(target: "restart-test", "test_state_import_rejects_idle_epoch_bundle");
-    let tmp_guard =
-        tempfile::TempDir::with_prefix("state_import_idle_reject").expect("tempdir is okay");
+async fn test_state_export_skips_idle_epoch_bundle_inner() -> eyre::Result<()> {
+    info!(target: "restart-test", "test_state_export_skips_idle_epoch_bundle");
+    let tmp_guard = tempfile::TempDir::with_prefix("state_export_skip").expect("tempdir is okay");
     let temp_path = tmp_guard.path().to_path_buf();
     // No funded stream account: this network runs IDLE on purpose. Under skip-empty-execution an
     // idle epoch produces only its epoch-closing block, which is not a genuine worker batch block,
-    // so the exported epoch has no fee anchor and the bundle is not resumable.
+    // so each epoch >= 1's snapshot has no fee anchor and the exporter must skip it.
     config_local_testnet_with_epoch_duration(
         &temp_path,
         Some("restart_test".to_string()),
@@ -459,7 +458,7 @@ async fn test_state_import_rejects_idle_epoch_bundle_inner() -> eyre::Result<()>
 
     let bin = e2e_tests::get_telcoin_network_binary();
 
-    // 4-validator committee, exporter on validator-1, and NO transaction stream (every epoch idle).
+    // 4-validator committee, exporter on validator-1 (instance 0 -> node0 log), NO tx stream.
     let mut guard = ProcessGuard::empty();
     let mut client_urls: [String; 4] = Default::default();
     for (i, url) in client_urls.iter_mut().enumerate() {
@@ -472,19 +471,19 @@ async fn test_state_import_rejects_idle_epoch_bundle_inner() -> eyre::Result<()>
                 bin,
                 &temp_path,
                 rpc_port,
-                "state_import_idle_reject",
+                "state_export_skip",
                 0,
                 &["--enable-state-export"],
             )
         } else {
-            start_validator(i, bin, &temp_path, rpc_port, "state_import_idle_reject", 0)
+            start_validator(i, bin, &temp_path, rpc_port, "state_export_skip", 0)
         };
         guard.push(child);
     }
 
     network_advancing(&client_urls)?;
 
-    // Advance past the export epoch so its (idle) bundle is written.
+    // Advance a few epochs so the exporter has processed several idle boundaries.
     let provider = ProviderBuilder::new().connect_http(client_urls[0].parse()?);
     let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
     wait_until(
@@ -494,49 +493,37 @@ async fn test_state_import_rejects_idle_epoch_bundle_inner() -> eyre::Result<()>
     )
     .await?;
 
+    // Positive proof the exporter ran the precheck and skipped: its node log records the skip. The
+    // exporter is instance 0, so its stdout is captured to node0-run0.log under this test's dir.
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set");
+    let exporter_log = std::path::Path::new(&manifest)
+        .join("test_logs")
+        .join("state_export_skip")
+        .join("node0-run0.log");
+    wait_until(
+        Duration::from_secs(EXPORT_EPOCH_DURATION * 4),
+        "exporter to log an idle-epoch export skip",
+        || async {
+            Ok(std::fs::read_to_string(&exporter_log)
+                .map(|log| log.contains("snapshot would not be resumable"))
+                .unwrap_or(false))
+        },
+    )
+    .await?;
+
+    // Direct observable: the idle epoch-IMPORT_EPOCH bundle was never written. Epoch IMPORT_EPOCH
+    // closed well before MIN_LEAD_EPOCH, so its (skip) export decision is complete by now.
     let bundle_dir = temp_path
         .join("validator-1")
         .join("consensus-db")
         .join("state_exports")
         .join(format!("epoch-{IMPORT_EPOCH}"));
-    wait_until(
-        Duration::from_secs(EXPORT_EPOCH_DURATION * 4),
-        &format!("exporter to write the epoch-{IMPORT_EPOCH} bundle"),
-        || async { Ok(bundle_dir.is_dir()) },
-    )
-    .await?;
-
-    // Attempt the import into a fresh observer datadir; it must FAIL at the fee-derivability
-    // precheck because the exported epoch is idle.
-    let observer_dir = temp_path.join("observer");
-    let output = tokio::task::block_in_place(|| {
-        bin.command()
-            .arg("--datadir")
-            .arg(&observer_dir)
-            .arg("db")
-            .arg("load-state")
-            .arg(&bundle_dir)
-            .output()
-    })?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success(),
-        "db load-state unexpectedly SUCCEEDED importing an idle-epoch bundle (issue 2 unguarded)\n\
-         stdout:\n{stdout}\nstderr:\n{stderr}"
+        !bundle_dir.exists(),
+        "exporter wrote a bundle for idle epoch {IMPORT_EPOCH} that it should have skipped: \
+         {bundle_dir:?}"
     );
-    assert!(
-        stderr.contains("produced no genuine block")
-            || stdout.contains("produced no genuine block"),
-        "idle bundle was rejected, but not for the expected fee-derivability reason\n\
-         stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    // Rejection happens before the resume hint is written, so no bootstrappable datadir is produced.
-    assert!(
-        !stdout.contains("resume syncing from epoch"),
-        "an idle bundle must be rejected before a resume hint is written:\n{stdout}"
-    );
-    info!(target: "restart-test", "db load-state correctly rejected the idle-epoch bundle");
+    info!(target: "restart-test", "exporter correctly skipped the idle epoch-{IMPORT_EPOCH} bundle");
 
     guard.kill_all();
     Ok(())
