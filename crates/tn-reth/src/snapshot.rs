@@ -57,7 +57,7 @@ use reth_provider::{
     TrieWriter,
 };
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_trie::StateRoot;
+use reth_trie::{IntermediateStateRootState, StateRoot, StateRootProgress};
 use reth_trie_db::DatabaseStateRoot;
 use std::{
     cmp::Ordering,
@@ -247,6 +247,14 @@ impl RethEnv {
     }
 }
 
+/// Number of accounts [`SnapshotRestorer::import_state`] buffers before flushing a chunk to reth's
+/// state tables.
+///
+/// Mirrors reth's `AVERAGE_COUNT_ACCOUNTS_PER_GB_STATE_DUMP` (its `dump_state` batches on the same
+/// bound): roughly one gigabyte of state per chunk, so the resident account set and the reth
+/// `BundleState` mirror stay near that ceiling instead of scaling with the whole chain.
+const IMPORT_ACCOUNT_CHUNK: usize = 285_228;
+
 /// Rebuilds a state-only snapshot into a fresh, empty datadir.
 ///
 /// The restore side is the inverse of [`PinnedStateView`]: it takes the exec state pack produced by
@@ -259,11 +267,11 @@ impl RethEnv {
 /// # Why restore does not use reth's `init_from_state_dump`
 ///
 /// reth's `init_from_state_dump` is private and JSONL-only. Instead,
-/// [`import_state`](Self::import_state) feeds the pack's accounts to reth's *public*
+/// [`import_state`](Self::import_state) streams the pack's accounts through reth's *public*
 /// state-insertion building blocks ([`insert_state`], [`insert_genesis_hashes`],
-/// [`insert_history`]) and recomputes the state root from scratch with [`StateRoot`] — the same
-/// tables and the same from-scratch check `init_from_state_dump` performs internally, without the
-/// JSONL parser.
+/// [`insert_history`]) in bounded chunks and recomputes the state root from scratch with
+/// [`StateRoot`] — the same tables and the same from-scratch check `init_from_state_dump` performs
+/// internally, without the JSONL parser.
 ///
 /// # Why this reimplements reth's `setup_without_evm`
 ///
@@ -285,8 +293,8 @@ impl RethEnv {
 ///    state tables and writes a header-only chain up to `B` (real hashes in the window, zero-hash
 ///    dummies below it), so the state import has a real `header(B)` to check its recomputed root
 ///    against.
-/// 3. [`import_state`](Self::import_state) writes the pack's accounts into reth's state tables,
-///    recomputes the state root from scratch, and hard-fails on any mismatch with
+/// 3. [`import_state`](Self::import_state) streams the pack's accounts into reth's state tables in
+///    bounded chunks, recomputes the state root from scratch, and hard-fails on any mismatch with
 ///    `header(B).state_root`.
 /// 4. [`derive_fee_precondition`](Self::derive_fee_precondition) verifies the shipped window is
 ///    self-sufficient for the node's first epoch-entry base-fee derivation, so the restored node
@@ -492,37 +500,128 @@ impl SnapshotRestorer {
     /// Import the pack's plain-state accounts into the scaffolded datadir and return the recomputed
     /// state root.
     ///
-    /// Streams every [`ExecStateAccount`] out of `reader`, writes them into reth's state tables
-    /// with the public building blocks [`insert_genesis_hashes`], [`insert_history`], and
-    /// [`insert_state`] (mirroring what reth's private `dump_state` does, but reading from the
-    /// pack, not JSONL), then recomputes the state root FROM SCRATCH with
-    /// [`StateRoot::from_tx`] and hard-fails unless it equals both the pack's declared root and
-    /// `header(B).state_root` (written by
+    /// Streams every [`ExecStateAccount`] out of `reader` in bounded chunks of
+    /// [`IMPORT_ACCOUNT_CHUNK`] accounts, writing each chunk into reth's state tables with the
+    /// public building blocks [`insert_genesis_hashes`], [`insert_history`], and [`insert_state`]
+    /// (mirroring what reth's private `dump_state` does, but reading from the pack, not JSONL). The
+    /// state root is then recomputed FROM SCRATCH with [`StateRoot::from_tx`], driven incrementally
+    /// via [`StateRoot::root_with_progress`] so the in-flight `TrieUpdates` are flushed to disk as
+    /// they accumulate rather than pinned in RAM. The import hard-fails unless the recomputed root
+    /// equals both the pack's declared root and `header(B).state_root` (written by
     /// [`import_chain_scaffold`](Self::import_chain_scaffold)). No JSONL, no ETL.
+    ///
+    /// # Memory profile
+    ///
+    /// Only one chunk of accounts (and the reth `BundleState` mirror for that chunk) is resident at
+    /// a time, and the trie-update flushing bounds the recompute's memory. The output is
+    /// byte-identical to a single-shot import: the plain-state, hashed, and history writes are
+    /// order-independent `upsert`s, and the per-block change-set `append_dup`s land under the same
+    /// block key regardless of how the accounts are batched — see the ascending-address invariant.
+    ///
+    /// # Ascending-address invariant
+    ///
+    /// The per-chunk [`insert_state`] is correct ONLY if accounts arrive strictly ascending by
+    /// address across the whole stream. Every chunk's change sets are appended under the same block
+    /// `B` with `append_dup` keyed by address, so the subkeys must be globally ascending or the
+    /// underlying MDBX append rejects them. The exporter
+    /// ([`PinnedStateView::export_state_pack`]) guarantees this ordering — it walks the
+    /// `PlainAccountState` cursor in ascending, unique address order — so a well-formed pack always
+    /// satisfies it. This method still verifies the order explicitly and returns a clear error on
+    /// any violation, turning a corrupt, crafted, or out-of-order pack into a loud failure instead
+    /// of a cryptic append_dup error.
     pub fn import_state(&self, reader: &mut ExecStatePackReader) -> eyre::Result<B256> {
+        self.import_state_with_chunk_size(reader, IMPORT_ACCOUNT_CHUNK)
+    }
+
+    /// [`import_state`](Self::import_state) with an explicit account-chunk size.
+    ///
+    /// Factored out so tests can force multiple chunks with a tiny size; production always calls
+    /// [`import_state`], which passes [`IMPORT_ACCOUNT_CHUNK`].
+    fn import_state_with_chunk_size(
+        &self,
+        reader: &mut ExecStatePackReader,
+        chunk_size: usize,
+    ) -> eyre::Result<B256> {
         let expected_root = reader.meta().state_root;
         let b = reader.meta().block_number;
 
-        // pull the full account set out of the pack (address + genesis-shaped account)
-        let accounts: Vec<(Address, GenesisAccount)> = reader
-            .accounts()
-            .map(|res| res.map(|a| (a.address, a.account)))
-            .collect::<Result<_, _>>()?;
-
         let provider = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
 
-        // write plain + hashed + history state, mirroring reth's private `dump_state` sequence but
-        // driven from the pack's accounts rather than a JSONL reader.
-        insert_genesis_hashes(&provider, accounts.iter().map(|(a, g)| (a, g)))?;
-        insert_history(&provider, accounts.iter().map(|(a, g)| (a, g)), b)?;
-        insert_state(&provider, accounts.iter().map(|(a, g)| (a, g)), b)?;
+        // stream the pack's accounts in bounded chunks, writing plain + hashed + history state per
+        // chunk, mirroring reth's private `dump_state` sequence but driven from the pack (not
+        // JSONL). only one chunk is resident at a time, which bounds both the account set and the
+        // reth BundleState `insert_state` builds. the ascending-address check enforces the
+        // append_dup ordering the per-block change-set writes require.
+        //
+        // cap the preallocation at IMPORT_ACCOUNT_CHUNK so a very large chunk_size (e.g. a
+        // single-shot import) cannot overflow the allocation; the vec still grows if more than that
+        // many accounts land in one chunk.
+        let mut batch: Vec<(Address, GenesisAccount)> =
+            Vec::with_capacity(chunk_size.min(IMPORT_ACCOUNT_CHUNK));
+        let mut prev_address: Option<Address> = None;
+
+        let flush_batch = |batch: &mut Vec<(Address, GenesisAccount)>| -> eyre::Result<()> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            insert_genesis_hashes(&provider, batch.iter().map(|(a, g)| (a, g)))?;
+            insert_history(&provider, batch.iter().map(|(a, g)| (a, g)), b)?;
+            insert_state(&provider, batch.iter().map(|(a, g)| (a, g)), b)?;
+            batch.clear();
+            Ok(())
+        };
+
+        while let Some(account) = reader.next_account() {
+            let account = account?;
+            let address = account.address;
+
+            // strictly ascending, unique addresses are required for the per-block append_dup
+            // change-set writes above; the exporter guarantees this, so a violation means the pack
+            // is corrupt or was not produced by the exporter.
+            if let Some(prev) = prev_address {
+                if address <= prev {
+                    return Err(eyre!(
+                        "snapshot restore: pack accounts are not in strictly ascending address \
+                         order at {address}; the pack is corrupt or was not produced by the \
+                         exporter"
+                    ));
+                }
+            }
+            prev_address = Some(address);
+
+            batch.push((address, account.account));
+            if batch.len() >= chunk_size {
+                flush_batch(&mut batch)?;
+            }
+        }
+        // flush the final partial chunk
+        flush_batch(&mut batch)?;
 
         // recompute the state root from scratch out of the just-written hashed state and persist
-        // the trie nodes. the scaffold cleared the trie tables, so this is a full rebuild.
-        let (root, trie_updates) = StateRoot::from_tx(provider.tx_ref())
-            .root_with_updates()
-            .map_err(|e| eyre!("snapshot restore: state root computation failed: {e}"))?;
-        provider.write_trie_updates(trie_updates)?;
+        // the trie nodes. the scaffold cleared the trie tables, so this is a full rebuild with no
+        // prefix sets. drive it incrementally: `root_with_progress` yields the trie updates in
+        // batches, which are written and released each iteration so they are never all pinned in
+        // RAM, resuming from the returned intermediate state until it completes.
+        let root = {
+            let tx = provider.tx_ref();
+            let mut intermediate: Option<IntermediateStateRootState> = None;
+            loop {
+                let computer = StateRoot::from_tx(tx).with_intermediate_state(intermediate.take());
+                match computer
+                    .root_with_progress()
+                    .map_err(|e| eyre!("snapshot restore: state root computation failed: {e}"))?
+                {
+                    StateRootProgress::Progress(state, _, updates) => {
+                        provider.write_trie_updates(updates)?;
+                        intermediate = Some(*state);
+                    }
+                    StateRootProgress::Complete(root, _, updates) => {
+                        provider.write_trie_updates(updates)?;
+                        break root;
+                    }
+                }
+            }
+        };
 
         // authoritative check: the recomputed root must match the pack's declared root and the
         // scaffolded header(B). a mismatch means the shipped accounts do not hash to the claimed
@@ -734,7 +833,7 @@ mod tests {
     use reth_provider::{AccountReader, DBProvider, DatabaseProviderFactory, StateProvider};
     use std::{collections::BTreeMap, path::Path, sync::Arc};
     use tempfile::TempDir;
-    use tn_storage::exec_state_pack::{ExecStateAccount, ExecStatePackReader};
+    use tn_storage::exec_state_pack::{ExecStateAccount, ExecStatePackReader, ExecStatePackWriter};
     use tn_types::{
         gas_accumulator::RewardsCounter, test_genesis, Address, BlockNumHash, Bytes, ExecHeader,
         GenesisAccount, SealedHeader, TaskManager, B256, U256,
@@ -1289,6 +1388,251 @@ mod tests {
         restorer
             .check_resumable_fees(&window)
             .expect("an epoch-<=1 snapshot must skip the fee-derivability precheck");
+
+        Ok(())
+    }
+
+    /// One more slot than the exporter packs into a single storage record, so the account below is
+    /// emitted across more than one `STORAGE_CHUNK_SLOTS`-bounded storage chunk and the chunked
+    /// import reassembles it across that boundary. Kept local (the pack constant is private) and
+    /// deliberately just past the boundary to keep the heavy multi-slot env cheap.
+    const MULTI_CHUNK_SLOTS: u64 = 64 * 1024 + 1;
+
+    /// Restore twice from one pack — once streaming in tiny two-account chunks, once in a single
+    /// chunk — and prove the two agree.
+    ///
+    /// The source holds several accounts in ascending address order (forcing multiple chunks at
+    /// chunk size 2) and one contract whose storage spans more than one `STORAGE_CHUNK_SLOTS` pack
+    /// record (forcing the chunked import to reassemble an account across storage-chunk
+    /// boundaries). Both imports must recompute the SAME root, that root must equal the pack's
+    /// declared root (the dual hard-fail check passes), and the chunked restore must read the state
+    /// back intact — including a probe slot from deep inside the large account. Byte-identical
+    /// output between chunked and single-shot is the correctness proof for the streaming rewrite.
+    #[tokio::test]
+    async fn import_streams_in_chunks_matches_single_shot() -> eyre::Result<()> {
+        let code: Bytes = Bytes::from_static(CODE);
+
+        // several accounts in ascending address order so chunk size 2 spans multiple chunks
+        let eoa_a = Address::from([0x0a; 20]);
+        let eoa_b = Address::from([0x0b; 20]);
+        let contract = Address::from([0x0c; 20]);
+        let big = Address::from([0x0d; 20]);
+        let eoa_e = Address::from([0x0e; 20]);
+        let eoa_f = Address::from([0x0f; 20]);
+        let (slot_a, slot_b) = (B256::from([0x01; 32]), B256::from([0x02; 32]));
+
+        // a probe slot deep inside the large account's storage, to prove the multi-chunk reassembly
+        // round-trips a slot beyond the first storage record
+        let probe_slot = word(MULTI_CHUNK_SLOTS - 7);
+        // well above every `word(i + 1)` filler below, so the probe value is unambiguous
+        let probe_value = word(0x7_0000_0000);
+
+        // build the large account's storage: MULTI_CHUNK_SLOTS non-zero slots keyed by index, with
+        // the probe slot carrying a distinctive value
+        let big_storage: BTreeMap<B256, B256> = (0..MULTI_CHUNK_SLOTS)
+            .map(|i| {
+                let slot = word(i);
+                let value = if slot == probe_slot { probe_value } else { word(i + 1) };
+                (slot, value)
+            })
+            .collect();
+
+        let genesis = test_genesis().extend_accounts([
+            (
+                eoa_a,
+                GenesisAccount {
+                    nonce: Some(1),
+                    balance: U256::from(100u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                eoa_b,
+                GenesisAccount {
+                    nonce: Some(2),
+                    balance: U256::from(200u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                contract,
+                GenesisAccount {
+                    nonce: Some(3),
+                    balance: U256::from(300u64),
+                    code: Some(code.clone()),
+                    storage: Some(BTreeMap::from([(slot_a, word(111)), (slot_b, word(222))])),
+                    private_key: None,
+                },
+            ),
+            (
+                big,
+                GenesisAccount {
+                    nonce: Some(4),
+                    balance: U256::from(400u64),
+                    code: Some(code.clone()),
+                    storage: Some(big_storage),
+                    private_key: None,
+                },
+            ),
+            (
+                eoa_e,
+                GenesisAccount {
+                    nonce: Some(5),
+                    balance: U256::from(500u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                eoa_f,
+                GenesisAccount {
+                    nonce: Some(6),
+                    balance: U256::from(600u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+        ]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        // source: export the genesis state at its real root
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Chunked Import Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
+        let state_root = genesis_header.state_root;
+
+        // a contiguous 1-block window pinning the exported root (block 1 is empty, so its state
+        // equals genesis and header(B).state_root == state_root)
+        let b = 1u64;
+        let h1 = synthetic_header(b, genesis_header.hash(), state_root, 0, true);
+        let window = vec![h1.clone()];
+        let final_state = BlockNumHash::new(b, h1.hash());
+
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, state_root, &[h1.header().clone()], pack_dir.path());
+
+        // restore #1: stream in tiny two-account chunks (6 accounts => at least three chunks)
+        let chunked_dir = TempDir::new()?;
+        let chunked_tm = TaskManager::new("Chunked Import Dest Chunked");
+        let (chunked_config, chunked_db) = temp_config_and_db(chain.clone(), chunked_dir.path())?;
+        let chunked_root = {
+            let restorer =
+                SnapshotRestorer::open(&chunked_config, chunked_db.clone(), &chunked_tm)?;
+            restorer.import_chain_scaffold(&window, final_state)?;
+            let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+            let root = restorer.import_state_with_chunk_size(&mut reader, 2)?;
+            restorer.finish(final_state)?;
+            root
+        };
+        assert_eq!(chunked_root, state_root, "chunked import must recompute the declared root");
+
+        // restore #2: single chunk (one flush) from the same pack
+        let single_dir = TempDir::new()?;
+        let single_tm = TaskManager::new("Chunked Import Dest Single");
+        let (single_config, single_db) = temp_config_and_db(chain.clone(), single_dir.path())?;
+        let single_root = {
+            let restorer = SnapshotRestorer::open(&single_config, single_db, &single_tm)?;
+            restorer.import_chain_scaffold(&window, final_state)?;
+            let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+            let root = restorer.import_state_with_chunk_size(&mut reader, usize::MAX)?;
+            restorer.finish(final_state)?;
+            root
+        };
+
+        // the whole point: chunked output is byte-identical to single-shot at the root level
+        assert_eq!(
+            chunked_root, single_root,
+            "chunked import must produce the same state root as a single-shot import"
+        );
+
+        // and the chunked datadir reads the state back intact, including the deep probe slot
+        let reader = RethEnv::new(
+            &chunked_config,
+            &chunked_tm,
+            chunked_db,
+            None,
+            RewardsCounter::default(),
+        )?;
+        assert_eq!(reader.last_block_number()?, b);
+        let state = reader.latest()?;
+        assert_eq!(state.account_balance(&eoa_a)?, Some(U256::from(100u64)));
+        assert_eq!(state.account_balance(&eoa_f)?, Some(U256::from(600u64)));
+        assert_eq!(state.storage(contract, slot_a)?, Some(U256::from(111u64)));
+        assert_eq!(
+            state.storage(big, probe_slot)?,
+            Some(U256::from_be_bytes(probe_value.0)),
+            "a slot past the first storage chunk must survive the chunked reassembly"
+        );
+
+        Ok(())
+    }
+
+    /// A pack whose accounts are NOT in strictly ascending address order is rejected with a clear
+    /// error before any state root is computed.
+    ///
+    /// The exporter can never emit such a pack, so this crafts one directly with the writer
+    /// (two accounts in descending address order) to prove the guard turns a corrupt or
+    /// hand-crafted pack into a loud, specific failure rather than a cryptic MDBX append_dup error.
+    #[tokio::test]
+    async fn import_rejects_out_of_order_pack() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+
+        // a fresh source only to obtain a real genesis root/header for the window + pack meta
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Out Of Order Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
+        let state_root = genesis_header.state_root;
+
+        let b = 1u64;
+        let h1 = synthetic_header(b, genesis_header.hash(), state_root, 0, true);
+        let window = vec![h1.clone()];
+        let final_state = BlockNumHash::new(b, h1.hash());
+
+        // hand-write a corrupt pack: the snapshot header pins the exported root (so `create`
+        // accepts it), then two accounts appended in DESCENDING address order.
+        let pack_dir = TempDir::new()?;
+        let higher = Address::from([0xcc; 20]);
+        let lower = Address::from([0x11; 20]);
+        {
+            let mut writer =
+                ExecStatePackWriter::create(pack_dir.path(), state_root, &[h1.header().clone()])?;
+            let acct = |address: Address| ExecStateAccount {
+                address,
+                account: GenesisAccount {
+                    nonce: Some(1),
+                    balance: U256::from(1u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            };
+            writer.append_account(&acct(higher))?;
+            writer.append_account(&acct(lower))?;
+            writer.finish()?;
+        }
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Out Of Order Dest");
+        let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+        let restorer = SnapshotRestorer::open(&reth_config, db, &dst_tm)?;
+        restorer.import_chain_scaffold(&window, final_state)?;
+        let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+
+        let err = restorer
+            .import_state(&mut reader)
+            .expect_err("a descending-address pack must be rejected");
+        assert!(
+            err.to_string().contains("strictly ascending address order"),
+            "expected an ascending-order rejection, got: {err:?}"
+        );
 
         Ok(())
     }
