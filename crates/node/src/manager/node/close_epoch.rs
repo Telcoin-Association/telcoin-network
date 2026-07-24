@@ -14,14 +14,13 @@
 //! next epoch starts from a clean slate. Historic data survives in the
 //! `ConsensusChain` store; only the per-epoch working tables are cleared.
 
-use crate::{engine::ExecutionNode, manager::EpochManager};
+use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, time::Duration};
 use tn_config::TelcoinDirs;
 use tn_reth::{recover_raw_transaction, RethEnv};
 use tn_storage::{
     consensus_pack::DATA_NAME,
-    epoch_records::{CERTS_NAME, RECORDS_NAME},
     tables::{
         CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
         NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
@@ -35,6 +34,15 @@ use tn_types::{
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, info_span, warn, Instrument};
+
+/// Bounded wait for the just-closed epoch's certificate during state export.
+///
+/// Epoch N's certificate is only aggregated at epoch N+1's start, so it is typically absent the
+/// moment N closes. The completion task waits up to this long for the collector to produce it
+/// before failing the export (the next epoch's boundary retries). Generous on purpose: the export's
+/// full plain-state walk has already elapsed by the time this wait begins, so the cert is normally
+/// present immediately.
+const CERT_WAIT: Duration = Duration::from_secs(30);
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -268,17 +276,25 @@ where
         Ok(())
     }
 
-    /// Export the just-closed epoch's final execution state, plus the epoch's consensus pack and
-    /// the epoch-records pack, into a snapshot bundle.
+    /// Export the just-closed epoch's final execution state, plus the epoch's consensus pack and a
+    /// bounded epoch-records/certs bundle, into a snapshot bundle.
     ///
     /// A no-op unless `--enable-state-export` spawned the exporter. The state export runs on the
     /// exporter's background thread (a full plain-state walk can be slow) and its outcome is
     /// logged; the epoch transition does not wait on it. The bundle is written under
     /// `consensus-db/state_exports/epoch-{N}/` and ends up with four files: `state_data` (the exec
-    /// state pack), `consensus_data` (the closed epoch's consensus pack), `epoch_records` (the
-    /// epoch-records pack), and `epoch_certs` (the epoch-certificates pack, which lets an importer
-    /// verify the records). The block exported is the epoch's final executed block — the same value
-    /// [`write_epoch_record`](Self::write_epoch_record) records as the epoch's `final_state`.
+    /// state pack), `consensus_data` (the closed epoch's consensus pack), `epoch_records` (records
+    /// `0..=N`), and `epoch_certs` (a certificate for every record `>= 1`, which lets an importer
+    /// fully verify the record chain). The block exported is the epoch's final executed block — the
+    /// same value [`write_epoch_record`](Self::write_epoch_record) records as the epoch's
+    /// `final_state`.
+    ///
+    /// Unlike a plain copy of the live shared `epochs.pack` / `epoch_certs.pack`, the records/certs
+    /// bundle is a bounded `0..=N` selection built through the records-DB actor in the completion
+    /// task, so a later epoch appending to the live packs cannot race into the export. The task
+    /// also waits a bounded time for epoch N's own certificate (only aggregated at the next epoch's
+    /// start) and fails the export without it, so an importer never has to store the tip record
+    /// unverified.
     pub(super) async fn export_epoch_state(
         &self,
         primary: &PrimaryNode<DB>,
@@ -298,24 +314,26 @@ where
             return Ok(());
         }
 
-        // Flush the closed epoch's consensus pack and the epoch-records pack so the copies in the
-        // completion task capture complete files. The consensus pack is only persisted by the
-        // *next* epoch's `new_epoch`, so persist it here while epoch N is still the current
-        // pack. A persist hiccup must not crash the node, so log and skip the export.
+        // Flush the closed epoch's consensus pack so the copy in the completion task captures a
+        // complete file. The consensus pack is only persisted by the *next* epoch's `new_epoch`, so
+        // persist it here while epoch N is still the current pack. The bounded records/certs bundle
+        // is built through the actor (not copied), so no records-pack flush is needed here. A
+        // persist hiccup must not crash the node, so log and skip the export.
         if let Err(e) = self.consensus_chain.persist_current().await {
             warn!(target: "tn::snapshot", epoch, error = %e, "could not persist consensus pack; skipping export");
             return Ok(());
         }
-        if let Err(e) = self.consensus_chain.epochs().persist().await {
-            warn!(target: "tn::snapshot", epoch, error = %e, "could not persist epoch records; skipping export");
-            return Ok(());
-        }
-        // Source packs live under the epochs base dir; they are copied into the bundle so the
-        // finished export directory holds all three (state + consensus + records).
+        // The consensus pack is a per-epoch file under the epochs base dir; it is copied into the
+        // bundle. The records/certs are written from the actor in the completion task instead.
         let epochs_dir = self.tn_datadir.epochs_db_path();
         let src_consensus = epochs_dir.join(format!("epoch-{epoch}")).join(DATA_NAME);
-        let src_records = epochs_dir.join(RECORDS_NAME);
-        let src_certs = epochs_dir.join(CERTS_NAME);
+
+        // Cloned into the completion task so it can read the bounded record set from the actor and
+        // nudge the epoch-record collector to backfill epoch N's certificate; both are
+        // node-lifetime handles, safe to outlive the epoch-scoped resources torn down after
+        // this returns.
+        let consensus_chain = self.consensus_chain.clone();
+        let consensus_bus = self.consensus_bus.clone();
 
         // Export into a temp sibling and atomically rename it into place on success, so external
         // tooling only ever observes a complete `epoch-{N}` directory. Clear any leftover temp from
@@ -334,34 +352,70 @@ where
                 // scoped spawner (about to die).
                 reth_env.get_task_spawner().spawn_task(format!("exporting execution state for epoch {epoch}"), async move {
                     match rx.await {
-                        // copy the consensus + epoch-records packs alongside the state pack, then
-                        // atomically move the complete bundle into place; external tooling watches
-                        // for the final dir appearing atomically.
+                        // copy the per-epoch consensus pack, write the bounded records/certs bundle
+                        // (after waiting for epoch N's cert), then atomically move the complete
+                        // bundle into place; external tooling watches for the final dir appearing
+                        // atomically.
                         Ok(Ok(Some(outcome))) => {
-                            let copied = std::fs::copy(&src_consensus, tmp_dir.join("consensus_data"))
-                                .and_then(|_| {
-                                    std::fs::copy(&src_records, tmp_dir.join("epoch_records"))
-                                })
-                                .and_then(|_| {
-                                    std::fs::copy(&src_certs, tmp_dir.join("epoch_certs"))
-                                });
-                            match copied {
-                                Ok(_) => match std::fs::rename(&tmp_dir, &final_dir) {
-                                    Ok(()) => info!(
-                                        target: "tn::snapshot",
-                                        epoch,
-                                        block = outcome.block.number,
-                                        accounts = outcome.stats.account_count,
-                                        path = ?final_dir,
-                                        "exported epoch state + consensus + records + certs"
-                                    ),
-                                    Err(e) => {
-                                        error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch bundle into place");
-                                        let _ = std::fs::remove_dir_all(&tmp_dir);
-                                    }
-                                },
+                            // the consensus pack is a per-epoch file, so a plain copy is race-free.
+                            if let Err(e) = std::fs::copy(&src_consensus, tmp_dir.join("consensus_data")) {
+                                error!(target: "tn::snapshot", epoch, error = %e, "failed to copy consensus pack into export");
+                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                                return Ok(());
+                            }
+
+                            // nudge the epoch-record collector so an observer backfills epoch N's
+                            // cert. never decrease requested_missing_epoch (mirrors open_epoch_pack).
+                            let current = *consensus_bus.requested_missing_epoch().borrow();
+                            consensus_bus.requested_missing_epoch().send_replace(current.max(epoch));
+
+                            // epoch N's record must already exist (write_epoch_record ran before
+                            // this export); its cert is only aggregated at the next epoch's start,
+                            // so wait a bounded time for it. without a cert an importer would have
+                            // to store the tip record unverified, so fail the export instead.
+                            let Some(record_n) = consensus_chain.epochs().record_by_epoch(epoch).await else {
+                                warn!(target: "tn::snapshot", epoch, "epoch record missing at export time; skipping export");
+                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                                return Ok(());
+                            };
+                            if consensus_chain
+                                .epochs()
+                                .cert_by_digest_with_timeout(record_n.digest(), CERT_WAIT)
+                                .await
+                                .is_none()
+                            {
+                                warn!(target: "tn::snapshot", epoch, wait_secs = CERT_WAIT.as_secs(), "epoch certificate not aggregated within wait; skipping export (next epoch retries)");
+                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                                return Ok(());
+                            }
+
+                            // write the bounded 0..=N records+certs from the actor, so a later epoch
+                            // appending to the live packs cannot race into this bundle.
+                            if let Err(e) = consensus_chain
+                                .epochs()
+                                .export_bounded_bundle(
+                                    epoch,
+                                    &tmp_dir.join("epoch_records"),
+                                    &tmp_dir.join("epoch_certs"),
+                                )
+                                .await
+                            {
+                                error!(target: "tn::snapshot", epoch, error = %e, "failed to write epoch records/certs bundle into export");
+                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                                return Ok(());
+                            }
+
+                            match std::fs::rename(&tmp_dir, &final_dir) {
+                                Ok(()) => info!(
+                                    target: "tn::snapshot",
+                                    epoch,
+                                    block = outcome.block.number,
+                                    accounts = outcome.stats.account_count,
+                                    path = ?final_dir,
+                                    "exported epoch state + consensus + records + certs"
+                                ),
                                 Err(e) => {
-                                    error!(target: "tn::snapshot", epoch, error = %e, "failed to copy consensus/epoch-records/certs packs into export");
+                                    error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch bundle into place");
                                     let _ = std::fs::remove_dir_all(&tmp_dir);
                                 }
                             }
