@@ -111,6 +111,11 @@ pub struct GenesisArgs {
     /// gate idle round advance (the header delays do that).
     #[arg(long)]
     pub max_batch_delay_ms: Option<u64>,
+    /// Garbage-collection depth in DAG rounds. Lowering it demotes a lagging CVV to
+    /// `CvvInactive` after fewer rounds of downtime (the follow/state-sync path). Test-only
+    /// knob; when unset, `Parameters::default` uses the `MAX_GC_DEPTH` protocol default.
+    #[arg(long)]
+    pub gc_depth: Option<u32>,
     /// Numeric chain id that will go in the genesis.
     /// Default is 0xde7e1 (911329).  Used mostly for testing.
     #[arg(long, default_value_t = 911329, value_parser=maybe_hex)]
@@ -310,6 +315,9 @@ impl GenesisArgs {
         if let Some(max_batch_delay_ms) = self.max_batch_delay_ms {
             parameters.max_batch_delay = Duration::from_millis(max_batch_delay_ms);
         }
+        if let Some(gc_depth) = self.gc_depth {
+            parameters.gc_depth = gc_depth;
+        }
         parameters.basefee_address = Some(self.basefee_address);
 
         // write genesis and config to file
@@ -347,6 +355,7 @@ mod tests {
             max_header_delay_ms: None,
             min_header_delay_ms: None,
             max_batch_delay_ms: None,
+            gc_depth: None,
             chain_id: 2017,
             worker_fee_configs: configs.into_iter().map(String::from).collect(),
             accounts: None,

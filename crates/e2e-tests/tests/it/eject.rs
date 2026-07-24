@@ -27,7 +27,7 @@
 
 use crate::common::{
     acquire_test_permit, assert_epoch_reached, assert_epoch_records_verify,
-    create_genesis_for_test, current_epoch, fetch_verified_epoch_record,
+    create_genesis_for_test, current_epoch, epoch_seconds_remaining, fetch_verified_epoch_record,
     generate_new_validator_txs, get_block_number, get_latest_consensus_header_number,
     get_tx_receipt_block, kill_child, loop_epochs, send_owner_tx, start_nodes,
     wait_for_epoch_at_least, wait_for_head_at_least, wait_for_mid_epoch, wait_for_rpc,
@@ -651,9 +651,10 @@ async fn test_validator_ejected_from_current_committee_mid_epoch() -> eyre::Resu
 /// - REPRO PIN: the kill target must have EXECUTED the burn block before dying. Otherwise its
 ///   restart tip would still be pre-burn state, and even an unpinned tip read would derive the
 ///   correct 5-member committee — an accidental pass.
-/// - IN-EPOCH GUARDS: the epoch is entered exactly at its boundary flip (banking the full duration
-///   for the sequence above), and every wait re-checks that epoch E is still current, failing
-///   loudly as "premise broken" if the sequence straddles a boundary.
+/// - IN-EPOCH GUARDS: epoch E is entered only when it holds enough runway for the sequence above
+///   (the current epoch when its remaining budget clears the margin, otherwise a fresh flip into
+///   the next epoch), and every wait re-checks that epoch E is still current, failing loudly as
+///   "premise broken" if the sequence straddles a boundary.
 ///
 /// The detectors, in order: (a) the restarted node's consensus height re-advances past
 /// everything it could have held at death — commits it can only acquire by verifying the
@@ -715,26 +716,49 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
     // the kill target serving certified record 0 keeps this test deterministic.
     fetch_verified_epoch_record(&endpoints[1].http_url, 0, RESTART_EPOCH_DURATION * 2).await?;
 
-    // ---- Fresh-boundary entry: catch the flip into epoch E ----
-    // The in-epoch sequence below (rotation, burn, pin, kill, restart, rejoin) worst-cases at
-    // ~29s; entering exactly at the flip banks the full epoch duration for it, where a
-    // mid-epoch entry would squander half.
-    let pre_flip = current_epoch(&provider).await?.epoch_id;
-    wait_until(
-        Duration::from_secs(RESTART_EPOCH_DURATION * 2),
-        &format!("fresh-boundary entry: waiting for the epoch to flip past {pre_flip} on node 0"),
-        || async { Ok(current_epoch(&provider).await?.epoch_id > pre_flip) },
-    )
-    .await?;
-    let e = current_epoch(&provider).await?.epoch_id;
-    // the flip poll re-checks every ~10ms, so observing a double-flip means this thread stalled
-    // for a whole epoch — the "fresh entry" premise is gone
-    eyre::ensure!(
-        e == pre_flip + 1,
-        "premise broken: entered epoch {e}, expected the fresh flip to {}",
-        pre_flip + 1
-    );
-    info!(target: "eject-test", epoch = e, "entered epoch at a fresh boundary");
+    // ---- Enter epoch E: reuse the epoch we are already in when it still has runway ----
+    // Phase 0 crossed into the current epoch within a poll cadence of the flip, so we are already
+    // fresh in it. The in-epoch sequence below (rotation, burn, pin, kill, restart, rejoin)
+    // worst-cases at ~29s; if the current epoch still holds that much runway plus margin, run the
+    // sequence here and save a whole ~40s warm-up epoch. Otherwise (for example a slow record-0
+    // certification above that burned into the budget) fall back to the next fresh boundary, which
+    // banks the full epoch duration. The fall-back branch is exactly the prior behavior, so this
+    // is a strict improvement; the budget guard is REQUIRED, not cosmetic: without it a
+    // degraded-network record-0 fetch could shove the ~29s sequence past the boundary and trip a
+    // spurious "premise broken" at one of the in-epoch guards below.
+    //
+    // ~29s worst-case sequence (see `RESTART_EPOCH_DURATION`) plus ~4s margin.
+    const SEQUENCE_BUDGET_SECS: u64 = 33;
+    let entry = current_epoch(&provider).await?;
+    let e = if epoch_seconds_remaining(&rpc_url, &entry)? >= SEQUENCE_BUDGET_SECS {
+        info!(
+            target: "eject-test",
+            epoch = entry.epoch_id,
+            "running the regression in the current epoch (sufficient budget)"
+        );
+        entry.epoch_id
+    } else {
+        // Not enough runway left in this epoch: wait out the flip and run fresh in the next one.
+        let pre_flip = entry.epoch_id;
+        wait_until(
+            Duration::from_secs(RESTART_EPOCH_DURATION * 2),
+            &format!(
+                "fresh-boundary entry: waiting for the epoch to flip past {pre_flip} on node 0"
+            ),
+            || async { Ok(current_epoch(&provider).await?.epoch_id > pre_flip) },
+        )
+        .await?;
+        let flipped = current_epoch(&provider).await?.epoch_id;
+        // the flip poll re-checks every ~10ms, so observing a double-flip means this thread stalled
+        // for a whole epoch (the "fresh entry" premise is gone)
+        eyre::ensure!(
+            flipped == pre_flip + 1,
+            "premise broken: entered epoch {flipped}, expected the fresh flip to {}",
+            pre_flip + 1
+        );
+        info!(target: "eject-test", epoch = flipped, "entered epoch at a fresh boundary");
+        flipped
+    };
 
     // ---- Victim-led premise: observe one full leader rotation inside epoch E ----
     // The leader schedule is strict round-robin over the committee (leader(round) =

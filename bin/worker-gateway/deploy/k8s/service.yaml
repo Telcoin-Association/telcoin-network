@@ -1,0 +1,21 @@
+# ClusterIP Service fronting the worker gateway pods.
+# Exposes both the client JSON-RPC port and the (cluster-internal) metrics port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-gateway
+  labels:
+    app: worker-gateway
+    app.kubernetes.io/name: worker-gateway
+    app.kubernetes.io/part-of: telcoin-network
+spec:
+  type: ClusterIP
+  selector:
+    app: worker-gateway
+  ports:
+    - name: rpc
+      port: 8545
+      targetPort: rpc
+    - name: metrics
+      port: 9100
+      targetPort: metrics

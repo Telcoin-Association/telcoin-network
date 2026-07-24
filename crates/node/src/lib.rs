@@ -127,6 +127,10 @@ impl EngineToPrimary for EngineToPrimaryRpc {
     fn node_info(&self) -> &tn_rpc::RpcNodeInfo {
         &self.node_info
     }
+
+    fn node_mode(&self) -> tn_types::NodeMode {
+        self.consensus_bus.current_node_mode().into()
+    }
 }
 
 #[cfg(test)]

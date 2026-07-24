@@ -129,7 +129,10 @@ impl PeerManager {
             config.max_banned_peers,
             config.max_disconnected_peers,
         );
-        let temporarily_banned = BannedPeerCache::new(config.excess_peers_reconnection_timeout);
+        let temporarily_banned = BannedPeerCache::new(
+            config.excess_peers_reconnection_timeout,
+            config.max_temporarily_banned_peers,
+        );
 
         // initialize global score config
         init_peer_score_config(config.score_config);
@@ -343,6 +346,19 @@ impl PeerManager {
         self.discovery_heartbeat();
     }
 
+    /// Temporarily ban `peer_id` in the bounded reconnection-timeout cache.
+    ///
+    /// If admitting the peer pushes the cache past its size cap, the oldest entry is evicted and a
+    /// [`PeerEvent::Unbanned`] is emitted for it, so dependent state (such as the gossipsub
+    /// blacklist maintained via `Banned`/`Unbanned`) stays in sync with the removal. This mirrors
+    /// the age-based eviction in [`Self::unban_temp_banned_peers`], which unbans each dropped peer.
+    fn temporarily_ban(&mut self, peer_id: PeerId) {
+        let (_is_new, evicted) = self.temporarily_banned.insert(peer_id);
+        if let Some(evicted_peer) = evicted {
+            self.push_event(PeerEvent::Unbanned(evicted_peer));
+        }
+    }
+
     /// Apply a [PeerAction].
     ///
     /// Actions on peers happen when their reputation or connection status changes.
@@ -350,18 +366,18 @@ impl PeerManager {
         match action {
             PeerAction::Ban(ip_addrs) => {
                 debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in ban");
-                self.temporarily_banned.insert(peer_id);
+                self.temporarily_ban(peer_id);
                 self.process_ban(&peer_id);
             }
             PeerAction::Disconnect => {
                 debug!(target: "peer-manager", ?peer_id, "reputation update results in disconnect");
-                self.temporarily_banned.insert(peer_id);
+                self.temporarily_ban(peer_id);
                 self.push_event(PeerEvent::DisconnectPeer(peer_id));
             }
             PeerAction::DisconnectWithPX => {
                 debug!(target: "peer-manager", ?peer_id, "reputation update results in temp ban with PX");
                 // prevent immediate reconnection attempts
-                self.temporarily_banned.insert(peer_id);
+                self.temporarily_ban(peer_id);
                 let exchange = self.peers.peer_exchange();
                 self.events.push_back(PeerEvent::DisconnectPeerX(peer_id, exchange));
             }
