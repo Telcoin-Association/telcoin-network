@@ -43,7 +43,7 @@ use tn_test_utils::{wait_until, wait_until_blocking};
 use tn_types::{
     address, get_available_tcp_port, keccak256,
     test_utils::{init_test_tracing, CommandParser},
-    Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount, RpcInfo, U256,
+    Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount, NodeMode, RpcInfo, U256,
 };
 use tokio::{
     runtime::Builder,
@@ -528,6 +528,16 @@ pub(crate) fn get_latest_consensus_header(node: &str) -> eyre::Result<HashMap<St
 /// Retrieve a node's identifying information.
 pub(crate) fn get_node_info(node: &str) -> eyre::Result<HashMap<String, Value>> {
     call_rpc(node, "tn_info", rpc_params![], 10, "tn_info")
+}
+
+/// Retrieve a node's current consensus participation mode ([`NodeMode`]) over RPC.
+///
+/// Reads the live mode (via `tn_nodeMode`), so repeated calls can observe transient modes such as
+/// [`NodeMode::CvvInactive`] while a restarted node catches up. A node whose RPC is not yet up
+/// (e.g. mid-restart) surfaces as an `Err` here rather than panicking; `call_rpc`'s own retries
+/// absorb brief unavailability.
+pub(crate) fn get_node_mode(node: &str) -> eyre::Result<NodeMode> {
+    call_rpc(node, "tn_nodeMode", rpc_params![], 10, "tn_nodeMode")
 }
 
 /// Query a node's highest consensus chain block height.
@@ -1179,6 +1189,27 @@ pub(crate) async fn wait_for_mid_epoch<P: Provider>(
         // Poll ~4x/sec so the mid-epoch window (as narrow as ~2s at a 5s epoch) is caught promptly.
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// Seconds of runway left before `snap`'s epoch closes, measured from the host clock against the
+/// epoch's start.
+///
+/// Mirrors the phase arithmetic [`wait_for_mid_epoch`] performs: the block before the epoch's
+/// first block (`block_height - 1`) is the previous epoch's closing block, produced exactly at the
+/// boundary, so its timestamp is when this epoch started; every testnet node runs on this host, so
+/// the host-clock vs block-timestamp comparison is sound. Saturates to 0 once the boundary is due.
+/// `as_secs()` floors the host clock while the block timestamp is already whole seconds, so the
+/// result can over-report the true remaining budget by strictly under a second; a caller must keep
+/// a margin over its worst-case sequence rather than treat the value as exact.
+pub(crate) fn epoch_seconds_remaining(node: &str, snap: &EpochSnapshot) -> eyre::Result<u64> {
+    let boundary_block = snap.block_height.saturating_sub(1);
+    let epoch_start = read_block_timestamp(node, boundary_block)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("host clock is after the unix epoch")
+        .as_secs();
+    let phase = now.saturating_sub(epoch_start);
+    Ok(snap.epoch_duration.saturating_sub(phase))
 }
 
 /// Fetch the receipt for `tx_hash` from `node` via `eth_getTransactionReceipt` and return the

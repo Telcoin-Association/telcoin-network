@@ -19,7 +19,8 @@ use tn_config::KeyConfig;
 use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
-use tn_types::{decode, encode, BlockHash, Database, DefaultHashFunction};
+use tn_types::{decode, encode, try_decode, BlockHash, Database, DefaultHashFunction};
+use tracing::warn;
 
 /// A record stored in the DHT.
 /// This is a "shadow" struct for a kad Record so we can serialize/deserialize
@@ -159,12 +160,38 @@ fn instant_to_system(expires: &Option<Instant>) -> Option<SystemTime> {
     }
 }
 
+/// Decode a stored provider-record blob, tolerating bytes that no longer decode.
+///
+/// The provider tables persist `Vec<KadProviderRecord>` values. A schema/version skew
+/// across a restart, or on-disk corruption, can leave a row whose bytes the current
+/// software can no longer decode. The panicking [`decode`] would turn that single bad
+/// row into a crash of the whole `ConsensusNetwork` task on the first provider read
+/// after restart, and because the row is never purged the crash recurs on every
+/// restart. This returns `None` (logging a warning) instead, so the caller can skip
+/// the row on a read-only path or purge it on a mutating one. This is the provider-table
+/// analogue of the tolerant startup load the `KadRecords` table already gets in
+/// `consensus.rs` (issue #999).
+fn decode_providers(key: &BlockHash, raw: &[u8]) -> Option<Vec<KadProviderRecord>> {
+    try_decode::<Vec<KadProviderRecord>>(raw)
+        .inspect_err(|error| {
+            warn!(target: "network-kad", ?error, ?key, "skipping undecodable provider record");
+        })
+        .ok()
+}
+
 /// Provide a persistant store for kademlia data.
 /// Wraps around the consensus DB.
 #[derive(Clone, Debug)]
 pub struct KadStore<DB> {
     db: DB,
     node_key: RecordKey,
+    /// This node's libp2p peer id.
+    ///
+    /// Used by [`RecordStore::provided`] to enumerate only the provider records
+    /// the node itself authored (via `start_providing`), mirroring upstream
+    /// `MemoryStore`'s `local_id`. Provider records supplied by inbound peers are
+    /// never re-announced as our own. See issue #1001.
+    local_peer_id: PeerId,
     /// Provide some sanity defaults for store sizing.
     /// Not bothering to expose these as knobs currenty since they are
     /// basically just here to prevent or mitigate attacks on the Kad store.
@@ -180,7 +207,17 @@ pub struct KadStore<DB> {
 
 impl<DB: Database> KadStore<DB> {
     /// Create a new KadStore backed by db.
-    pub fn new(db: DB, key_config: &KeyConfig, kad_type: NetworkType) -> Self {
+    ///
+    /// `local_peer_id` is this node's libp2p peer id (the identity the swarm is
+    /// built with); it must match the id libp2p stamps on records the node
+    /// publishes via `start_providing`, so [`RecordStore::provided`] re-announces
+    /// only the node's own provider records.
+    pub fn new(
+        db: DB,
+        local_peer_id: PeerId,
+        key_config: &KeyConfig,
+        kad_type: NetworkType,
+    ) -> Self {
         let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
         // Defaults for sanity.
         let config = MemoryStoreConfig::default();
@@ -193,7 +230,8 @@ impl<DB: Database> KadStore<DB> {
                 db.iter::<KadWorkerProviderRecords>().count(),
             ),
         };
-        let store = Self { db, node_key, config, num_records, num_providers, kad_type };
+        let store =
+            Self { db, node_key, local_peer_id, config, num_records, num_providers, kad_type };
         store.update_records_gauge();
         store
     }
@@ -259,16 +297,24 @@ impl<DB: Database> KadStore<DB> {
                 .db
                 .iter::<KadProviderRecords>()
                 .filter_map(|(k, v)| {
-                    let recs: Vec<KadProviderRecord> = decode(v.as_ref());
-                    (!recs.is_empty() && recs.iter().all(|r| r.is_expired(now))).then_some(k)
+                    // An undecodable row is unusable; treat it as droppable so eviction
+                    // frees the slot and purges it instead of panicking (issue #999).
+                    let should_drop = decode_providers(&k, v.as_ref())
+                        .map(|recs| !recs.is_empty() && recs.iter().all(|r| r.is_expired(now)))
+                        .unwrap_or(true);
+                    should_drop.then_some(k)
                 })
                 .collect(),
             NetworkType::Worker(_) => self
                 .db
                 .iter::<KadWorkerProviderRecords>()
                 .filter_map(|(k, v)| {
-                    let recs: Vec<KadProviderRecord> = decode(v.as_ref());
-                    (!recs.is_empty() && recs.iter().all(|r| r.is_expired(now))).then_some(k)
+                    // An undecodable row is unusable; treat it as droppable so eviction
+                    // frees the slot and purges it instead of panicking (issue #999).
+                    let should_drop = decode_providers(&k, v.as_ref())
+                        .map(|recs| !recs.is_empty() && recs.iter().all(|r| r.is_expired(now)))
+                        .unwrap_or(true);
+                    should_drop.then_some(k)
                 })
                 .collect(),
         };
@@ -284,6 +330,64 @@ impl<DB: Database> KadStore<DB> {
         }
         self.num_providers = self.num_providers.saturating_sub(evicted);
         evicted
+    }
+
+    /// Purge provider-table rows whose stored bytes no longer decode, giving the provider
+    /// tables the tolerant startup load the `KadRecords` table already gets in
+    /// `consensus.rs`. Without this, a schema/version skew or on-disk corruption leaves a
+    /// row that panics the whole `ConsensusNetwork` task on the first provider read after
+    /// restart, and because the row is never purged the panic recurs on every restart.
+    /// Returns the number of rows removed and keeps `num_providers` in step (issue #999).
+    pub fn scrub_corrupt_providers(&mut self) -> usize {
+        let corrupt: Vec<BlockHash> = match self.kad_type {
+            NetworkType::Primary => self
+                .db
+                .iter::<KadProviderRecords>()
+                .filter_map(|(k, v)| decode_providers(&k, v.as_ref()).is_none().then_some(k))
+                .collect(),
+            NetworkType::Worker(_) => self
+                .db
+                .iter::<KadWorkerProviderRecords>()
+                .filter_map(|(k, v)| decode_providers(&k, v.as_ref()).is_none().then_some(k))
+                .collect(),
+        };
+        let evicted = corrupt
+            .iter()
+            .filter(|k| match self.kad_type {
+                NetworkType::Primary => self.db.remove::<KadProviderRecords>(k).is_ok(),
+                NetworkType::Worker(_) => self.db.remove::<KadWorkerProviderRecords>(k).is_ok(),
+            })
+            .count();
+        self.num_providers = self.num_providers.saturating_sub(evicted);
+        evicted
+    }
+
+    /// Merge a new provider record into an existing, already-decoded set for one key:
+    /// replace the entry that shares the provider peer if present, otherwise prune expired
+    /// entries, enforce the per-key cap, and append. Keyword-free analogue of the in-place
+    /// update loop, factored out so the caller can decide what to do when the stored row
+    /// does not decode.
+    fn merge_provider(
+        &self,
+        existing: Vec<KadProviderRecord>,
+        kr: KadProviderRecord,
+    ) -> libp2p::kad::store::Result<Vec<KadProviderRecord>> {
+        let found = existing.iter().any(|r| r.provider == kr.provider);
+        if found {
+            Ok(existing
+                .into_iter()
+                .map(|r| if r.provider == kr.provider { kr.clone() } else { r })
+                .collect())
+        } else {
+            let now = SystemTime::now();
+            let mut pruned: Vec<KadProviderRecord> =
+                existing.into_iter().filter(|r| !r.is_expired(now)).collect();
+            (pruned.len() < self.config.max_providers_per_key)
+                .then_some(())
+                .ok_or(Error::MaxProvidedKeys)?;
+            pruned.push(kr);
+            Ok(pruned)
+        }
     }
 }
 
@@ -409,108 +513,121 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         if self.num_providers >= self.config.max_provided_keys {
             // Try to free a slot by evicting fully-expired provider key groups.
             self.evict_expired_providers();
-            if self.num_providers >= self.config.max_provided_keys {
-                return Err(Error::MaxProvidedKeys);
-            }
         }
+        // Re-check after the eviction attempt; still full is a hard error.
+        (self.num_providers < self.config.max_provided_keys)
+            .then_some(())
+            .ok_or(Error::MaxProvidedKeys)?;
+
         let key = self.key_to_hash(&record.key);
         let kr: KadProviderRecord = record.into();
-        let mut inc_providers = false;
-        let records: Vec<KadProviderRecord> = if let Ok(Some(recs)) = match self.kad_type {
+        let stored = match self.kad_type {
             NetworkType::Primary => self.db.get::<KadProviderRecords>(&key),
             NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&key),
-        } {
-            let mut recs: Vec<KadProviderRecord> = decode(&recs);
-            let mut found = false;
-            for r in recs.iter_mut() {
-                if r.provider == kr.provider {
-                    *r = kr.clone();
-                    found = true;
-                }
-            }
-            if !found {
-                // prune expired entries before checking the cap
-                let now = SystemTime::now();
-                recs.retain(|r| !r.is_expired(now));
-                if recs.len() >= self.config.max_providers_per_key {
-                    return Err(Error::MaxProvidedKeys);
-                }
-                recs.push(kr);
-            }
-            recs
-        } else {
-            inc_providers = true;
-            vec![kr]
-        };
+        }
+        .ok()
+        .flatten();
+
+        // A present-but-undecodable row is treated as absent for the merge: the new
+        // provider set overwrites (purges) it instead of the read panicking. Unlike a
+        // genuinely new key it is already counted in `num_providers`, so only a missing
+        // row bumps the gauge (issue #999).
+        let row_exists = stored.is_some();
+        let merged = stored
+            .as_deref()
+            .and_then(|raw| decode_providers(&key, raw))
+            .map(|existing| self.merge_provider(existing, kr.clone()))
+            .transpose()?;
+        let records: Vec<KadProviderRecord> = merged.unwrap_or_else(|| vec![kr]);
+
         match self.kad_type {
             NetworkType::Primary => self
                 .db
                 .insert::<KadProviderRecords>(&key, &encode(&records))
-                .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?,
+                .map_err(|_| Error::ValueTooLarge)?,
             NetworkType::Worker(_) => self
                 .db
                 .insert::<KadWorkerProviderRecords>(&key, &encode(&records))
-                .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?,
+                .map_err(|_| Error::ValueTooLarge)?,
         }
-        if inc_providers {
-            // If this was a new record and it was inserted then inc num_providers.
-            // I.E. Don't inc if this updated an existing provider record.
+        if !row_exists {
+            // A brand-new key: bump the counter. An overwrite (including of a purged
+            // corrupt row) leaves the count unchanged.
             self.num_providers += 1;
         }
         Ok(())
     }
 
     fn providers(&self, key: &RecordKey) -> Vec<ProviderRecord> {
-        let key = self.key_to_hash(key);
-        if let Ok(Some(recs)) = match self.kad_type {
-            NetworkType::Primary => self.db.get::<KadProviderRecords>(&key),
-            NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&key),
-        } {
-            let now = SystemTime::now();
-            let records: Vec<KadProviderRecord> = decode(&recs);
-            records.into_iter().filter(|r| !r.is_expired(now)).map(|r| r.into()).collect()
-        } else {
-            vec![]
-        }
+        let hash = self.key_to_hash(key);
+        let stored = match self.kad_type {
+            NetworkType::Primary => self.db.get::<KadProviderRecords>(&hash),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&hash),
+        };
+        let now = SystemTime::now();
+        // Read-only path: an undecodable row is skipped (returns nothing) rather than
+        // panicking. The startup scrub and the mutating paths do the actual purge.
+        stored
+            .ok()
+            .flatten()
+            .and_then(|recs| decode_providers(&hash, &recs))
+            .map(|records| {
+                records.into_iter().filter(|r| !r.is_expired(now)).map(Into::into).collect()
+            })
+            .unwrap_or_default()
     }
 
     fn provided(&self) -> Self::ProvidedIter<'_> {
-        let v = self.providers(&self.node_key);
+        // Enumerate only the provider records this node itself authored. Upstream
+        // `MemoryStore::provided` filters on `provider == local_id`; restore that
+        // guard here so the periodic republish job never re-announces a provider
+        // record supplied by an inbound peer. Paired with the ban gate on inbound
+        // `AddProvider` (`process_kad_add_provider` in consensus.rs), this closes
+        // the divergence described in issue #1001. The `Vec` is filtered before
+        // `into_iter().map(..)` so the concrete `ProvidedIter` type is preserved.
+        let local_peer_id = self.local_peer_id;
+        let provided: Vec<ProviderRecord> = self
+            .providers(&self.node_key)
+            .into_iter()
+            .filter(|record| record.provider == local_peer_id)
+            .collect();
 
-        v.into_iter().map(Cow::Owned)
+        provided.into_iter().map(Cow::Owned)
     }
 
     fn remove_provider(&mut self, key: &RecordKey, p: &PeerId) {
-        let key = self.key_to_hash(key);
-        if let Ok(Some(recs)) = match self.kad_type {
-            NetworkType::Primary => self.db.get::<KadProviderRecords>(&key),
-            NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&key),
-        } {
-            let records: Vec<KadProviderRecord> = decode(&recs);
-            let records: Vec<KadProviderRecord> =
-                records.into_iter().filter(|r| r.provider != *p).collect();
-            if records.is_empty() {
-                if match self.kad_type {
-                    NetworkType::Primary => self.db.remove::<KadProviderRecords>(&key),
-                    NetworkType::Worker(_) => self.db.remove::<KadWorkerProviderRecords>(&key),
+        let hash = self.key_to_hash(key);
+        let stored = match self.kad_type {
+            NetworkType::Primary => self.db.get::<KadProviderRecords>(&hash),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerProviderRecords>(&hash),
+        }
+        .ok()
+        .flatten();
+
+        if let Some(raw) = stored {
+            // An undecodable row is purged wholesale (it is unusable and would otherwise
+            // panic every read); a decodable row keeps every provider except `p`.
+            let remaining: Vec<KadProviderRecord> = decode_providers(&hash, &raw)
+                .map(|records| records.into_iter().filter(|r| r.provider != *p).collect())
+                .unwrap_or_default();
+            if remaining.is_empty() {
+                let removed = match self.kad_type {
+                    NetworkType::Primary => self.db.remove::<KadProviderRecords>(&hash),
+                    NetworkType::Worker(_) => self.db.remove::<KadWorkerProviderRecords>(&hash),
                 }
-                .is_ok()
-                {
-                    // Provider is empty and we removed it so dec num_providers.
-                    // Saturate to match `evict_expired_providers`: should the counter
-                    // ever drift below the on-disk provider-key count, this emptying
-                    // removal must clamp at zero rather than wrap to `usize::MAX` and
-                    // wedge `add_provider` behind the `num_providers >= max_provided_keys`
-                    // cap.
+                .is_ok();
+                if removed {
+                    // The key holds no providers now (all filtered out, or the row was
+                    // purged): drop the count once, saturating to avoid an underflow panic.
                     self.num_providers = self.num_providers.saturating_sub(1);
                 }
             } else {
                 let _ = match self.kad_type {
                     NetworkType::Primary => {
-                        self.db.insert::<KadProviderRecords>(&key, &encode(&records))
+                        self.db.insert::<KadProviderRecords>(&hash, &encode(&remaining))
                     }
                     NetworkType::Worker(_) => {
-                        self.db.insert::<KadWorkerProviderRecords>(&key, &encode(&records))
+                        self.db.insert::<KadWorkerProviderRecords>(&hash, &encode(&remaining))
                     }
                 };
             }
@@ -675,8 +792,10 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db.clone(), &key_config, NetworkType::Primary);
-        let mut kad_store_worker = KadStore::new(db, &key_config, NetworkType::Worker(0));
+        let mut kad_store =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        let mut kad_store_worker =
+            KadStore::new(db, PeerId::random(), &key_config, NetworkType::Worker(0));
 
         let rec = test_record(false);
         let rec2 = test_record(false);
@@ -742,35 +861,33 @@ mod test {
         let provider_rec2 = test_provider_record();
         let provider_rec3 = test_provider_record();
         kad_store.db.sync_persist();
-        assert_eq!(kad_store.provided().count(), 0);
+        assert_eq!(kad_store.providers(&provider_rec1.key).len(), 0);
         kad_store.add_provider(provider_rec1.clone()).expect("add provider");
         kad_store.add_provider(provider_rec2.clone()).expect("add provider");
         kad_store.add_provider(provider_rec3.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
-        assert_eq!(kad_store.provided().count(), 1);
+        assert_eq!(kad_store.providers(&provider_rec1.key).len(), 1);
         kad_store.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.add_provider(provider_rec1_2.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
-        assert_eq!(kad_store.provided().count(), 3);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 3);
         assert_eq!(kad_store.providers(&provider_rec2.key).len(), 1);
         assert_eq!(kad_store.providers(&provider_rec3.key).len(), 1);
 
         assert_eq!(kad_store_worker.num_providers, 0);
-        assert_eq!(kad_store_worker.provided().count(), 0);
+        assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 0);
         kad_store_worker.add_provider(provider_rec1.clone()).expect("add provider");
         kad_store_worker.add_provider(provider_rec2.clone()).expect("add provider");
         kad_store_worker.add_provider(provider_rec3.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
-        assert_eq!(kad_store_worker.provided().count(), 1);
+        assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 1);
         kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store_worker.add_provider(provider_rec1_2.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
-        assert_eq!(kad_store_worker.provided().count(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec2.key).len(), 1);
         assert_eq!(kad_store_worker.providers(&provider_rec3.key).len(), 1);
@@ -784,31 +901,25 @@ mod test {
         kad_store.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
         kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
-        assert_eq!(kad_store.provided().count(), 2);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 2);
         kad_store.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.db.sync_persist();
-        assert_eq!(kad_store.provided().count(), 3);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 3);
         kad_store.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 3);
-        assert_eq!(kad_store.provided().count(), 3);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 3);
 
         kad_store_worker.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
         kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
-        assert_eq!(kad_store_worker.provided().count(), 2);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 2);
         kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.db.sync_persist();
-        assert_eq!(kad_store_worker.provided().count(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
         kad_store_worker.add_provider(provider_rec1_1.clone()).expect("add provider");
         kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 3);
-        assert_eq!(kad_store_worker.provided().count(), 3);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 3);
 
         kad_store.remove_provider(&provider_rec1.key, &provider_rec1.provider);
@@ -818,7 +929,6 @@ mod test {
         kad_store.remove_provider(&provider_rec1_2.key, &provider_rec1_2.provider);
         kad_store.db.sync_persist();
         assert_eq!(kad_store.num_providers, 2);
-        assert_eq!(kad_store.provided().count(), 0);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 0);
         kad_store.remove_provider(&provider_rec2.key, &provider_rec2.provider);
         kad_store.db.sync_persist();
@@ -832,7 +942,6 @@ mod test {
         kad_store_worker.remove_provider(&provider_rec1_2.key, &provider_rec1_2.provider);
         kad_store.db.sync_persist();
         assert_eq!(kad_store_worker.num_providers, 2);
-        assert_eq!(kad_store_worker.provided().count(), 0);
         assert_eq!(kad_store_worker.providers(&provider_rec1.key).len(), 0);
         kad_store_worker.remove_provider(&provider_rec2.key, &provider_rec2.provider);
         kad_store.db.sync_persist();
@@ -850,6 +959,56 @@ mod test {
         assert_eq!(kad_store_worker.num_providers, 0);
     }
 
+    /// `provided()` enumerates only the provider records the node itself authored.
+    ///
+    /// The `node_key`-injection guard from issue #1001: an attacker can address an
+    /// `AddProvider` at this node's own key (`node_key` is derived from the public
+    /// primary key, which is not secret), landing a record in the exact slot
+    /// `provided()` reads. Both records are stored under `node_key`, but the
+    /// republish job must re-announce only the record whose `provider` is this
+    /// node. Removing the `provider == local_peer_id` filter in `provided()` makes
+    /// this test fail (the attacker record is enumerated), pinning the guard.
+    #[test]
+    fn test_provided_enumerates_only_self_authored_records() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+
+        // The store's identity: records authored by this peer id are "ours".
+        let local_peer_id = PeerId::random();
+        let mut kad_store = KadStore::new(db, local_peer_id, &key_config, NetworkType::Primary);
+
+        // Both records key on `node_key`, the slot `provided()` reads.
+        let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
+        let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
+        let ours = ProviderRecord {
+            key: node_key.clone(),
+            provider: local_peer_id,
+            expires,
+            addresses: vec![],
+        };
+        let attacker = ProviderRecord {
+            key: node_key.clone(),
+            provider: PeerId::random(),
+            expires,
+            addresses: vec![],
+        };
+
+        kad_store.add_provider(ours.clone()).expect("add our provider record");
+        kad_store.add_provider(attacker.clone()).expect("add attacker provider record");
+        kad_store.db.sync_persist();
+
+        // Both are physically stored under `node_key`...
+        assert_eq!(kad_store.providers(&node_key).len(), 2, "both records stored under node_key");
+
+        // ...but `provided()` re-announces only the record this node authored.
+        let provided: Vec<ProviderRecord> =
+            kad_store.provided().map(|record| record.into_owned()).collect();
+        assert_eq!(provided.len(), 1, "provided() enumerates only self-authored records");
+        assert_eq!(provided[0].provider, local_peer_id, "the enumerated record is ours");
+    }
+
     /// Expired records must be filtered from `get()` and `records()` even though
     /// they remain on disk until `put()` triggers eviction.
     #[test]
@@ -858,7 +1017,7 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
+        let mut kad_store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
 
         let expired = test_record(true);
         kad_store.put(expired.clone()).expect("put expired record");
@@ -875,7 +1034,7 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
+        let mut kad_store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
 
         let config = MemoryStoreConfig::default();
 
@@ -900,8 +1059,10 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db.clone(), &key_config, NetworkType::Primary);
-        let mut kad_store_worker = KadStore::new(db, &key_config, NetworkType::Worker(0));
+        let mut kad_store =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        let mut kad_store_worker =
+            KadStore::new(db, PeerId::random(), &key_config, NetworkType::Worker(0));
 
         let config = MemoryStoreConfig::default();
 
@@ -929,18 +1090,18 @@ mod test {
     /// negotiating with each other (issue #765).
     #[test]
     fn test_network_type_protocol_names() -> crate::types::NetworkResult<()> {
-        assert_eq!(NetworkType::Primary.req_res_protocol(2017)?.as_ref(), "/tn-primary-2017/0.0.1");
+        assert_eq!(NetworkType::Primary.req_res_protocol(2017)?.as_ref(), "/tn-primary-2017/0.0.2");
         assert_eq!(NetworkType::Primary.kad_protocol(2017)?.as_ref(), "/tn-primary-kad-2017/0.0.1");
         assert_eq!(
             NetworkType::Worker(0).req_res_protocol(2017)?.as_ref(),
-            "/tn-worker-0-2017/0.0.1"
+            "/tn-worker-0-2017/0.0.2"
         );
         assert_eq!(
             NetworkType::Worker(0).kad_protocol(2017)?.as_ref(),
             "/tn-worker-0-kad-2017/0.0.1"
         );
         // worker id and chain id are both interpolated, not literal
-        assert_eq!(NetworkType::Worker(3).req_res_protocol(7)?.as_ref(), "/tn-worker-3-7/0.0.1");
+        assert_eq!(NetworkType::Worker(3).req_res_protocol(7)?.as_ref(), "/tn-worker-3-7/0.0.2");
         assert_eq!(NetworkType::Worker(3).kad_protocol(7)?.as_ref(), "/tn-worker-3-kad-7/0.0.1");
         // the per-role sync protocol is chain-namespaced as well
         assert_eq!(
@@ -1000,7 +1161,7 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
+        let mut kad_store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
 
         let rec = test_record(false);
         assert_eq!(kad_store.num_records, 0);
@@ -1022,7 +1183,7 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
+        let mut kad_store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
 
         let rec = test_record(false);
         kad_store.put(rec.clone()).expect("put record");
@@ -1048,7 +1209,7 @@ mod test {
         let db = open_db(tmp_dir.path());
         let key_config =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
-        let mut kad_store = KadStore::new(db, &key_config, NetworkType::Primary);
+        let mut kad_store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
 
         let pr = test_provider_record();
         kad_store.add_provider(pr.clone()).expect("add provider");
@@ -1064,5 +1225,156 @@ mod test {
         let pr2 = test_provider_record();
         kad_store.add_provider(pr2).expect("add_provider must still succeed");
         assert_eq!(kad_store.num_providers, 1);
+    }
+
+    // ---- issue #999: provider tables tolerate undecodable rows instead of panicking ----
+
+    /// Bytes that are not a valid BCS `Vec<KadProviderRecord>`: the leading ULEB128 length
+    /// overflows a `u32`, so decoding always errors. This stands in for a row written by an
+    /// incompatible schema/version or corrupted on disk. Every test below relies on the
+    /// tolerant `decode_providers` helper: swap it back to the panicking `decode` and each
+    /// one fails (a panic), which is the guard-reversal check the issue asks for.
+    const CORRUPT_PROVIDER_BYTES: [u8; 5] = [0xff, 0xff, 0xff, 0xff, 0xff];
+
+    fn test_key_config() -> KeyConfig {
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()))
+    }
+
+    /// A random, distinct provider key.
+    fn fresh_record_key() -> RecordKey {
+        RecordKey::new(&encode(&test_key_config().primary_public_key()))
+    }
+
+    fn inject_corrupt_primary_provider<DB: Database>(store: &KadStore<DB>, key: &RecordKey) {
+        let hash = store.key_to_hash(key);
+        store
+            .db
+            .insert::<KadProviderRecords>(&hash, &CORRUPT_PROVIDER_BYTES.to_vec())
+            .expect("inject corrupt provider row");
+    }
+
+    fn inject_corrupt_worker_provider<DB: Database>(store: &KadStore<DB>, key: &RecordKey) {
+        let hash = store.key_to_hash(key);
+        store
+            .db
+            .insert::<KadWorkerProviderRecords>(&hash, &CORRUPT_PROVIDER_BYTES.to_vec())
+            .expect("inject corrupt worker provider row");
+    }
+
+    fn live_provider_under(key: &RecordKey) -> ProviderRecord {
+        let provider = PeerId::random();
+        let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
+        ProviderRecord { key: key.clone(), provider, expires, addresses: vec![] }
+    }
+
+    /// `providers()` is a read-only path: an undecodable row must be skipped (empty result)
+    /// rather than panic the caller, and neighbouring good rows must be unaffected.
+    #[test]
+    fn test_kad_providers_skips_corrupt_row() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+
+        let good_key = fresh_record_key();
+        store.add_provider(live_provider_under(&good_key)).expect("add good provider");
+
+        let corrupt_key = fresh_record_key();
+        inject_corrupt_primary_provider(&store, &corrupt_key);
+
+        // The corrupt key yields nothing; the good key is untouched.
+        assert!(store.providers(&corrupt_key).is_empty(), "corrupt row skipped, not panicked");
+        assert_eq!(store.providers(&good_key).len(), 1, "good row still readable");
+    }
+
+    /// `remove_provider()` is a mutating path: an undecodable row is purged wholesale and the
+    /// provider count is decremented, modelling a restart where `new()` counted the bad row.
+    #[test]
+    fn test_kad_remove_provider_purges_corrupt_row() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+
+        let corrupt_key = fresh_record_key();
+        // Seed then "restart" so `new()` counts the injected row exactly as it would on disk.
+        let seed = KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        inject_corrupt_primary_provider(&seed, &corrupt_key);
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        assert_eq!(store.num_providers, 1, "corrupt row counted at startup");
+
+        store.remove_provider(&corrupt_key, &PeerId::random());
+        assert!(store.providers(&corrupt_key).is_empty(), "corrupt row purged");
+        assert_eq!(store.num_providers, 0, "count decremented on purge");
+    }
+
+    /// `add_provider()` over a corrupt existing row overwrites (purges) it without panicking,
+    /// and must not double-count: the row was already counted at startup.
+    #[test]
+    fn test_kad_add_provider_over_corrupt_row_overwrites() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+
+        let key = fresh_record_key();
+        let seed = KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        inject_corrupt_primary_provider(&seed, &key);
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        assert_eq!(store.num_providers, 1, "corrupt row counted at startup");
+
+        let rec = live_provider_under(&key);
+        store.add_provider(rec.clone()).expect("add over corrupt row must not panic");
+
+        assert_eq!(store.num_providers, 1, "overwrite of a corrupt row keeps the count stable");
+        let got = store.providers(&key);
+        assert_eq!(got.len(), 1, "corrupt row replaced by the new provider");
+        assert_eq!(got[0].provider, rec.provider);
+    }
+
+    /// The startup scrub purges every undecodable provider row (keeping the count in step) and
+    /// leaves decodable rows intact; a second pass is a no-op. This is the parity with the
+    /// `KadRecords` tolerant startup load that the issue asks for.
+    #[test]
+    fn test_kad_scrub_corrupt_providers_purges_bad_keeps_good() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+
+        let good_key = fresh_record_key();
+        let mut seed =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        seed.add_provider(live_provider_under(&good_key)).expect("add good provider");
+        let corrupt_key = fresh_record_key();
+        inject_corrupt_primary_provider(&seed, &corrupt_key);
+
+        // "restart": both rows are counted without being decoded.
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        assert_eq!(store.num_providers, 2, "good and corrupt rows both counted at startup");
+
+        let purged = store.scrub_corrupt_providers();
+        assert_eq!(purged, 1, "exactly the corrupt row is purged");
+        assert_eq!(store.num_providers, 1, "count reflects the purge");
+        assert_eq!(store.providers(&good_key).len(), 1, "good row survives the scrub");
+        assert!(store.providers(&corrupt_key).is_empty(), "corrupt row gone after scrub");
+
+        assert_eq!(store.scrub_corrupt_providers(), 0, "scrub is idempotent once clean");
+    }
+
+    /// The worker provider table gets the same tolerance as the primary one.
+    #[test]
+    fn test_kad_worker_provider_table_tolerates_corrupt_row() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+
+        let corrupt_key = fresh_record_key();
+        let seed = KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Worker(0));
+        inject_corrupt_worker_provider(&seed, &corrupt_key);
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Worker(0));
+        assert_eq!(store.num_providers, 1, "worker corrupt row counted at startup");
+
+        // read path does not panic, scrub purges it
+        assert!(store.providers(&corrupt_key).is_empty(), "worker read skips corrupt row");
+        assert_eq!(store.scrub_corrupt_providers(), 1, "worker scrub purges corrupt row");
+        assert_eq!(store.num_providers, 0, "worker count reflects the purge");
     }
 }

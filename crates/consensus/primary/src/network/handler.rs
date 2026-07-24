@@ -180,11 +180,19 @@ where
         let (_last_consensus_epoch, last_consensus_number, _) =
             self.consensus_bus.published_consensus_num_hash();
         // Use GC depth to estimate how many rounds we can be behind.
-        // Subtract ten here so if we are right on the GC depth we will still go inactive (small
-        // safety buffer).  Ten is arbitrary but should make sure we are comfortably within
-        // the current DAG. Trying to ride the GC window exactly can lead to subtle races
-        // (allow some time to get going).
-        let gc_depth = self.consensus_config.parameters().gc_depth.saturating_sub(10);
+        // Subtract `GC_ACTIVITY_BUFFER` here so if we are right on the GC depth we will still go
+        // inactive (small safety buffer).  The buffer is arbitrary but should make sure we are
+        // comfortably within the current DAG. Trying to ride the GC window exactly can lead to
+        // subtle races (allow some time to get going).  On a production node
+        // `Parameters::validate_operational_floors` keeps the configured `gc_depth` above this
+        // buffer, so the window is positive.  `saturating_sub` still guards the test-fixture path,
+        // where that floor is intentionally not enforced and a small `gc_depth` can zero the
+        // window.
+        let gc_depth = self
+            .consensus_config
+            .parameters()
+            .gc_depth
+            .saturating_sub(tn_types::GC_ACTIVITY_BUFFER);
         // is our round outside the GC window
         // Will be false when not the same epoch (can't compare rounds) but
         // epoch_behind will work in that case.
@@ -930,7 +938,7 @@ where
         // recast guard would then read nothing and could sign a *different* vote for the same
         // author/round while the pre-crash vote is already held by the peer: equivocation from an
         // ordinary crash. See issue #934.
-        self.consensus_config.node_storage().persist_durable::<Votes>().await;
+        self.consensus_config.node_storage().persist::<Votes>().await;
 
         Ok(PrimaryResponse::Vote(vote))
     }

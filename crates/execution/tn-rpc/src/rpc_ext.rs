@@ -15,7 +15,8 @@ use tn_reth::{
 };
 use tn_types::{
     construct_proof_of_possession_message, Address, BlsPublicKey, Bytes, ConsensusHeader, Epoch,
-    EpochCertificate, EpochDigest, EpochRecord, Genesis, SolCall, SolType, SolValue, B256, U256,
+    EpochCertificate, EpochDigest, EpochRecord, Genesis, NodeMode, SolCall, SolType, SolValue,
+    B256, U256,
 };
 use tokio::sync::{oneshot, Semaphore};
 
@@ -43,6 +44,12 @@ pub trait TelcoinNetworkRpcExtApi {
     /// This should be all the publicly available information to identify and connect to this node.
     #[method(name = "info")]
     async fn info(&self) -> TelcoinNetworkRpcResult<RpcNodeInfo>;
+    /// Return the node's current consensus participation mode.
+    ///
+    /// Read live at call time (not part of the static `tn_info` response), so callers can observe
+    /// transient modes such as `CvvInactive` while a restarted node catches up.
+    #[method(name = "nodeMode")]
+    async fn node_mode(&self) -> TelcoinNetworkRpcResult<NodeMode>;
     /// Return the latest consensus header.
     #[method(name = "latestConsensusHeader")]
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader>;
@@ -196,6 +203,10 @@ where
 {
     async fn info(&self) -> TelcoinNetworkRpcResult<RpcNodeInfo> {
         Ok(self.inner_node_network.node_info().clone())
+    }
+
+    async fn node_mode(&self) -> TelcoinNetworkRpcResult<NodeMode> {
+        Ok(self.inner_node_network.node_mode())
     }
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader> {
         Ok(self.inner_node_network.get_latest_consensus_block())

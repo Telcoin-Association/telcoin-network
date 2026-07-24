@@ -111,7 +111,7 @@ pub fn config_local_testnet_with_epoch_duration(
     accounts: Option<Vec<(Address, GenesisAccount)>>,
     epoch_duration_secs: Option<u32>,
 ) -> eyre::Result<()> {
-    config_local_testnet_inner(temp_path, passphrase, accounts, epoch_duration_secs, &[])
+    config_local_testnet_inner(temp_path, passphrase, accounts, epoch_duration_secs, &[], None)
 }
 
 /// Like [`config_local_testnet_with_epoch_duration`], but also lets the caller set per-worker
@@ -139,7 +139,19 @@ pub fn config_local_testnet_with_worker_fee_configs(
         accounts,
         epoch_duration_secs,
         worker_fee_configs,
+        None,
     )
+}
+
+/// Like [`config_local_testnet`], but sets a restart-test garbage-collection depth so a
+/// killed CVV crosses the `CvvInactive` demotion threshold after a shorter downtime.
+pub fn config_local_testnet_with_gc_depth(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    gc_depth: Option<u32>,
+) -> eyre::Result<()> {
+    config_local_testnet_inner(temp_path, passphrase, accounts, None, &[], gc_depth)
 }
 
 /// Shared implementation for the `config_local_testnet*` helpers.
@@ -154,6 +166,7 @@ fn config_local_testnet_inner(
     accounts: Option<Vec<(Address, GenesisAccount)>>,
     epoch_duration_secs: Option<u32>,
     worker_fee_configs: &[&str],
+    gc_depth: Option<u32>,
 ) -> eyre::Result<()> {
     let validators = [
         ("validator-1", "0x1111111111111111111111111111111111111111"),
@@ -200,6 +213,10 @@ fn config_local_testnet_inner(
     if let Some(duration) = epoch_duration_secs {
         genesis_args.push("--epoch-duration-in-secs".into());
         genesis_args.push(duration.to_string());
+    }
+    if let Some(gc_depth) = gc_depth {
+        genesis_args.push("--gc-depth".into());
+        genesis_args.push(gc_depth.to_string());
     }
     // Append one `--worker-fee-config` flag per provided entry. When empty, clap falls back to the
     // genesis default (`0:0:u64::MAX`, an inert EIP-1559 strategy). Any provided configs replace
@@ -399,17 +416,18 @@ pub fn get_telcoin_network_binary() -> &'static TestBinary {
             return TestBinary::Prebuilt(path);
         }
 
-        // TN_BIN_PATH is unset, so build the node binary in-process via escargot. At
-        // opt-level 0 this is a multi-minute compile, and nextest captures stdout/stderr, so
-        // without this notice the first e2e test looks frozen until the build finishes. Announce
-        // it on stderr (shown on completion, and live under `--no-capture`) so the delay is
-        // attributable rather than an invisible hang.
+        // TN_BIN_PATH is unset, so build the node binary in-process via escargot. Under the
+        // `e2e` profile (opt-level 2) this is a multi-minute compile, and nextest captures
+        // stdout/stderr, so without this notice the first e2e test looks frozen until the build
+        // finishes. Announce it on stderr (shown on completion, and live under `--no-capture`) so
+        // the delay is attributable rather than an invisible hang.
         eprintln!(
             "e2e: TN_BIN_PATH not set; building telcoin-network via cargo before the first test. \
-             This can take several minutes at opt-level 0, and nextest hides it until the build \
-             finishes (add `--no-capture` to watch it). To skip it, run `make test-e2e`, or \
-             prebuild with `cargo build --bin telcoin-network --features tn-storage/test-utils` \
-             and export TN_BIN_PATH=\"$(pwd)/target/debug/telcoin-network\" from the workspace root."
+             This can take several minutes (opt-level 2 under the `e2e` profile), and nextest \
+             hides it until the build finishes (add `--no-capture` to watch it). To skip it, run \
+             `make test-e2e`, or prebuild with `cargo build --profile e2e --bin telcoin-network \
+             --features tn-storage/test-utils` and export \
+             TN_BIN_PATH=\"$(pwd)/target/e2e/telcoin-network\" from the workspace root."
         );
         info!("building main binary for e2e tests");
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
@@ -417,15 +435,22 @@ pub fn get_telcoin_network_binary() -> &'static TestBinary {
         let workspace_root =
             path.parent().and_then(|p| p.parent()).expect("Cannot find workspace root");
 
+        // Build under the `e2e` profile (opt-level 2, safety checks kept on; defined in
+        // .cargo/config.toml) so this in-process build and `make build-e2e-bin` produce and
+        // share one set of artifacts under `target/e2e/`.
+        //
         // No `.current_target()`: passing `--target <triple>` would emit into
-        // `target/<triple>/debug/`, a tree that shares no artifacts with the plain
-        // `target/debug/` that `make build-e2e-bin` and ordinary `cargo build` populate, forcing
-        // a guaranteed cold rebuild. Building into `target/debug/` lets escargot reuse an already
-        // compiled binary (reported "Fresh" by cargo) instead.
+        // `target/<triple>/e2e/`, a tree that shares no artifacts with the plain `target/e2e/`
+        // that `make build-e2e-bin` and ordinary `cargo build --profile e2e` populate, forcing a
+        // guaranteed cold rebuild. Building into `target/e2e/` lets escargot reuse an
+        // already-compiled binary (reported "Fresh" by cargo) instead.
         TestBinary::Cargo(
             CargoBuild::new()
                 .bin("telcoin-network")
                 .features("tn-storage/test-utils")
+                // Match the Makefile's `build-e2e-bin`: opt-level 2 with debug-assertions and
+                // overflow-checks kept on (see `[profile.e2e]` in .cargo/config.toml).
+                .args(["--profile", "e2e"])
                 .manifest_path(workspace_root.join("Cargo.toml"))
                 .target_dir(workspace_root.join("target"))
                 .run()

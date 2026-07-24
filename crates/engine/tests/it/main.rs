@@ -13,9 +13,11 @@ use std::{
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_engine::{ExecutorEngine, TnEngineError, MAX_QUEUED_OUTPUTS};
+use tn_engine::{execute_consensus_output, ExecutorEngine, TnEngineError, MAX_QUEUED_OUTPUTS};
 use tn_reth::{
-    calculate_gas_penalty, recover_signed_transaction,
+    calculate_gas_penalty,
+    payload::BuildArguments,
+    recover_signed_transaction,
     system_calls::EpochState,
     test_utils::{
         calculate_withdrawals_root, create_committee_from_state,
@@ -2363,6 +2365,151 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
         expected_governance_revenue, actual_governance_revenue,
         "governance revenue mismatch — penalty may be using post-refund gas instead of pre-refund gas"
     );
+
+    Ok(())
+}
+
+/// Regression test for issue #989: a later-block build failure inside a single consensus output
+/// must not leave the earlier blocks' eager in-memory canonical advance un-rolled-back (a transient
+/// "phantom" canonical head visible to RPC until the node restarts).
+///
+/// Drives `execute_consensus_output` with a two-batch output where the first block executes and
+/// advances the in-memory state, and the second block carries a single transaction whose gas limit
+/// exceeds the block gas limit. That is a fatal, non-`InvalidTx` build error, so the output fails
+/// after the first block already advanced. The test asserts the in-memory canonical state is
+/// reverted to the pre-output (genesis) tip, nothing was committed durably, and no canon-state
+/// notification or engine update was emitted for the failed output.
+///
+/// Confirm-by-mutation: with the `rollback_in_memory_output` compensation removed from
+/// `execute_consensus_output`, the first block's advance survives and the
+/// `canonical_chain().count() == 0` and `canonical_tip == genesis` assertions below fail — so this
+/// test genuinely pins the post-error in-memory contract rather than passing vacuously.
+#[tokio::test]
+async fn test_partial_output_failure_rolls_back_in_memory_state() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let mut batches = tn_reth::test_utils::batches(chain.clone(), 2);
+
+    // Craft the poison transaction for the second block: a gas limit strictly greater than the
+    // block gas limit (`max_batch_gas`). The block-gas check fires before any balance/nonce
+    // validation, so the sender does not need to be funded; the transaction only needs to be
+    // decodable and signer-recoverable.
+    let genesis = test_genesis_with_consensus_registry(4);
+    let mut tx_factory = TransactionFactory::new_random();
+    let poison_gas_limit = max_batch_gas(0) + 1;
+    let poison_tx = tx_factory
+        .create_explicit_eip1559(
+            Some(genesis.config.chain_id),
+            None, // nonce
+            None, // max_priority_fee_per_gas
+            Some(MAX_FEE_PER_GAS as u128),
+            Some(poison_gas_limit), // gas_limit > block gas limit -> fatal build error
+            Some(Address::random()), // to
+            None,                   // value
+            None,                   // input
+            None,                   // access_list
+        )
+        .encoded_2718();
+
+    // Replace the second block's transactions with only the poison transaction.
+    if let Some(second) = batches.get_mut(1) {
+        let txs = second.transactions_mut();
+        txs.clear();
+        txs.push(poison_tx);
+    }
+
+    // Seed genesis from the first block's transactions only, so the first block executes and
+    // advances the in-memory state before the second block fails.
+    let batch_1 = batches.first().cloned().expect("two batches");
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, std::iter::once(&batch_1));
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // pre-conditions: nothing has advanced yet
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    // subscribe before execution to prove no canon-state notification is emitted for the failure
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+    })
+    .await?;
+
+    // the output fails: the second block's oversized-gas transaction is a fatal build error
+    assert_matches!(result, Err(_), "output with an oversized-gas block must fail to build");
+
+    //=== the phantom head must not survive: in-memory state is rolled back to genesis
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        0,
+        "the first block's in-memory advance must be rolled back after the later block failed"
+    );
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        genesis_header.hash(),
+        "the canonical head must be reset to the pre-output (genesis) tip"
+    );
+
+    // no durable write: persisted tip and finalized marker stay at genesis
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 0, "no block was finalized");
+
+    // no external observer saw the phantom advance
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "a failed output must not broadcast a canon-state notification"
+    );
+    assert!(engine_update_rx.try_recv().is_err(), "a failed output must not send an engine update");
 
     Ok(())
 }

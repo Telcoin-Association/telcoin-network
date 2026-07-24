@@ -490,19 +490,6 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         let (tx, rx) = oneshot::channel();
         let r = self
             .tx
-            .send(DBMessage::CaughtUp(tx))
-            .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"));
-        async move {
-            if r.is_ok() {
-                let _ = rx.await;
-            }
-        }
-    }
-
-    fn persist_durable<T: Table>(&self) -> impl Future<Output = ()> + Send {
-        let (tx, rx) = oneshot::channel();
-        let r = self
-            .tx
             .send(DBMessage::DurableBarrier(tx))
             .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"));
         async move {
@@ -620,11 +607,14 @@ enum DBMessage<DB: Database> {
     Insert(Box<dyn InsertTrait<DB>>),
     Remove(Box<dyn RemoveTrait<DB>>),
     Clear(Box<dyn ClearTrait<DB>>),
+    /// Catch-up ack that fires immediately, even while a write txn is open. Backs
+    /// [`Database::sync_persist`], which is synchronous and must never block on a txn commit
+    /// (the calling thread may hold that very txn open, which would self-deadlock).
     CaughtUp(tokio::sync::oneshot::Sender<()>),
-    /// Durability barrier: like [`DBMessage::CaughtUp`], but the ack is deferred while a write txn
-    /// is open so it fires only after that physical txn commits. A bare `Insert` enqueued while a
-    /// txn is open is absorbed into it (`db_run`), so a plain `CaughtUp` could ack before the
-    /// write is durable; this variant closes that window for anti-equivocation writes.
+    /// Durability barrier backing [`Database::persist`]: like [`DBMessage::CaughtUp`], but the ack
+    /// is deferred while a write txn is open so it fires only after that physical txn commits. A
+    /// bare `Insert` enqueued while a txn is open is absorbed into it (`db_run`), so an immediate
+    /// ack could return before the write is durable; deferring closes that window.
     DurableBarrier(tokio::sync::oneshot::Sender<()>),
     Stats(tokio::sync::oneshot::Sender<LayeredDbStats>),
     Shutdown,
@@ -987,41 +977,13 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_persist_acks_before_open_txn_flushes() {
-        // Documents the issue #934 window: a plain `persist` barrier resolves even though a
-        // concurrently open write txn (e.g. a certificate-store write on the same epoch DB) has
-        // absorbed the caller's bare insert and not yet committed it, so the "persisted" record is
-        // not on disk. `persist_durable` is the fix for exactly this.
+    async fn test_persist_waits_for_open_txn_commit() {
+        // `persist` resolves only after the physical txn that absorbed the write commits, so the
+        // record is guaranteed on disk before the barrier returns. This is the converged durable
+        // barrier (#962) that closes the issue #934 window a non-deferring `persist` left open.
         use tn_types::DbTxMut as _;
         let temp_dir = tempdir().expect("failed to create temp dir");
-        let (raw, db) = open_mdbx_with_raw(&temp_dir.path().join("mdbx_persist_gap"));
-
-        // A concurrent writer holds an epoch-DB write txn open.
-        let concurrent = db.write_txn().expect("write txn");
-        // The anti-equivocation record is a bare insert; with the txn open it is absorbed into it.
-        db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
-
-        // The plain barrier resolves immediately even though the write is not durable.
-        db.persist::<TestTable>().await;
-        assert_eq!(
-            raw.get::<TestTable>(&1).expect("get"),
-            None,
-            "plain persist acked before the absorbed write reached disk (the #934 window)"
-        );
-
-        // Only committing the concurrent txn flushes the absorbed write.
-        concurrent.commit().expect("commit");
-        db.sync_persist();
-        assert_eq!(raw.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_persist_durable_waits_for_open_txn_commit() {
-        // The fix: `persist_durable` resolves only after the physical txn that absorbed the write
-        // commits, so the record is guaranteed on disk before the barrier returns.
-        use tn_types::DbTxMut as _;
-        let temp_dir = tempdir().expect("failed to create temp dir");
-        let (raw, db) = open_mdbx_with_raw(&temp_dir.path().join("mdbx_persist_durable"));
+        let (raw, db) = open_mdbx_with_raw(&temp_dir.path().join("mdbx_persist_defer"));
 
         // A concurrent writer holds an epoch-DB write txn open; the bare insert is absorbed into
         // it.
@@ -1029,7 +991,7 @@ mod test {
         db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
 
         // While the txn is open the barrier must not resolve: polling it for a window times out.
-        let barrier = db.persist_durable::<TestTable>();
+        let barrier = db.persist::<TestTable>();
         tokio::pin!(barrier);
         assert!(
             tokio::time::timeout(Duration::from_millis(200), &mut barrier).await.is_err(),
@@ -1054,13 +1016,13 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_persist_durable_acks_immediately_without_open_txn() {
+    async fn test_persist_acks_immediately_without_open_txn() {
         // With no concurrent txn the bare insert is written directly and durably, so the barrier
         // resolves without waiting.
         let temp_dir = tempdir().expect("failed to create temp dir");
-        let (raw, db) = open_mdbx_with_raw(&temp_dir.path().join("mdbx_persist_durable_fast"));
+        let (raw, db) = open_mdbx_with_raw(&temp_dir.path().join("mdbx_persist_fast"));
         db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
-        db.persist_durable::<TestTable>().await;
+        db.persist::<TestTable>().await;
         assert_eq!(
             raw.get::<TestTable>(&1).expect("get"),
             Some("one".to_string()),

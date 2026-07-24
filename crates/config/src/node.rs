@@ -371,16 +371,20 @@ impl Default for Parameters {
 }
 
 impl Parameters {
-    /// Validate protocol-critical parameters against the ceilings the rest of the protocol depends
-    /// on.
+    /// Validate the protocol **ceilings** every node (production or test fixture) must honor.
     ///
     /// `gc_depth` and `max_header_num_of_batches` together bound how many unique batches a single
     /// committed [`ConsensusOutput`](tn_types::ConsensusOutput) can reference. The consensus-pack
     /// reader derives its reconstruction bound from [`tn_types::MAX_GC_DEPTH`] and
     /// [`tn_types::MAX_HEADER_NUM_OF_BATCHES`], so a node configured above those ceilings could
     /// commit an output that no node (including itself, on restart) can later reconstruct.
-    /// Rejecting such a configuration at startup keeps the producing and reconstructing halves
-    /// in agreement.
+    /// Rejecting such a configuration keeps the producing and reconstructing halves in
+    /// agreement.
+    ///
+    /// These are safe to enforce everywhere, so this runs for every constructor. The lower
+    /// **operational floors** are enforced separately by
+    /// [`Parameters::validate_operational_floors`] at the production entry points only, so DAG
+    /// test fixtures may still use small `gc_depth` values.
     pub fn validate(&self) -> eyre::Result<()> {
         eyre::ensure!(
             self.gc_depth <= tn_types::MAX_GC_DEPTH,
@@ -393,6 +397,53 @@ impl Parameters {
             "max_header_num_of_batches {} exceeds the protocol maximum {}",
             self.max_header_num_of_batches,
             tn_types::MAX_HEADER_NUM_OF_BATCHES,
+        );
+        Ok(())
+    }
+
+    /// Validate the operational **floors** and cross-field coupling: the values below which a node
+    /// degrades silently instead of erroring.
+    ///
+    /// Unlike the ceilings in [`Parameters::validate`], these are enforced only at the production
+    /// startup entry points (`ConsensusConfig::new` / `new_for_epoch`), never in the shared
+    /// test-fixture constructor, so DAG tests that deliberately drive a small `gc_depth` keep
+    /// working (see issue #954, "retain test-only overrides for DAG tests requiring small values").
+    ///
+    /// - `gc_depth` must exceed [`tn_types::GC_ACTIVITY_BUFFER`]. The consensus network handler
+    ///   computes its activity window as `gc_depth - GC_ACTIVITY_BUFFER`; a `gc_depth` at or below
+    ///   the buffer collapses that window to zero and wedges the node inactive during normal
+    ///   operation. Coupling the floor to the same constant the handler subtracts keeps the two
+    ///   from drifting apart.
+    /// - `max_header_num_of_batches` must be at least one, otherwise the proposer caps every header
+    ///   at zero batch digests: it drains no transactions while its digest queue grows without
+    ///   bound.
+    /// - `header_num_of_batches_threshold` must be at least one and must not exceed
+    ///   `max_header_num_of_batches`. The proposer seals a header once it holds `threshold` digests
+    ///   but includes at most `max_header_num_of_batches` of them, so a zero threshold seals empty
+    ///   headers on the fast path and a threshold above the max makes the two conditions mutually
+    ///   inconsistent.
+    pub fn validate_operational_floors(&self) -> eyre::Result<()> {
+        eyre::ensure!(
+            self.gc_depth > tn_types::GC_ACTIVITY_BUFFER,
+            "gc_depth {} must exceed the activity buffer {} or the node cannot stay active",
+            self.gc_depth,
+            tn_types::GC_ACTIVITY_BUFFER,
+        );
+        eyre::ensure!(
+            self.max_header_num_of_batches >= 1,
+            "max_header_num_of_batches must be at least 1, got {}",
+            self.max_header_num_of_batches,
+        );
+        eyre::ensure!(
+            self.header_num_of_batches_threshold >= 1,
+            "header_num_of_batches_threshold must be at least 1, got {}",
+            self.header_num_of_batches_threshold,
+        );
+        eyre::ensure!(
+            self.header_num_of_batches_threshold <= self.max_header_num_of_batches,
+            "header_num_of_batches_threshold {} must not exceed max_header_num_of_batches {}",
+            self.header_num_of_batches_threshold,
+            self.max_header_num_of_batches,
         );
         Ok(())
     }
@@ -417,7 +468,14 @@ mod test {
 
     #[test]
     fn default_parameters_are_within_protocol_ceilings() {
-        Parameters::default().validate().expect("default parameters must validate");
+        Parameters::default().validate().expect("default parameters must be within ceilings");
+    }
+
+    #[test]
+    fn default_parameters_pass_operational_floors() {
+        Parameters::default()
+            .validate_operational_floors()
+            .expect("default parameters must satisfy the operational floors");
     }
 
     #[test]
@@ -435,6 +493,79 @@ mod test {
         assert!(
             params.validate().is_err(),
             "max_header_num_of_batches over the protocol ceiling must be rejected"
+        );
+    }
+
+    #[test]
+    fn parameters_reject_gc_depth_at_or_below_activity_buffer() {
+        let at_buffer = Parameters { gc_depth: tn_types::GC_ACTIVITY_BUFFER, ..Default::default() };
+        assert!(
+            at_buffer.validate_operational_floors().is_err(),
+            "gc_depth equal to the activity buffer collapses the activity window and must be rejected"
+        );
+        let below_buffer =
+            Parameters { gc_depth: tn_types::GC_ACTIVITY_BUFFER - 1, ..Default::default() };
+        assert!(
+            below_buffer.validate_operational_floors().is_err(),
+            "gc_depth below the activity buffer must be rejected"
+        );
+    }
+
+    #[test]
+    fn parameters_accept_gc_depth_one_above_activity_buffer() {
+        let params =
+            Parameters { gc_depth: tn_types::GC_ACTIVITY_BUFFER + 1, ..Default::default() };
+        assert!(
+            params.validate_operational_floors().is_ok(),
+            "the smallest gc_depth leaving a positive activity window must be accepted"
+        );
+    }
+
+    #[test]
+    fn parameters_reject_zero_max_header_num_of_batches() {
+        let params = Parameters {
+            max_header_num_of_batches: 0,
+            header_num_of_batches_threshold: 0,
+            ..Default::default()
+        };
+        assert!(
+            params.validate_operational_floors().is_err(),
+            "a zero max_header_num_of_batches drains no digests and must be rejected"
+        );
+    }
+
+    #[test]
+    fn parameters_reject_zero_header_num_of_batches_threshold() {
+        let params = Parameters { header_num_of_batches_threshold: 0, ..Default::default() };
+        assert!(
+            params.validate_operational_floors().is_err(),
+            "a zero header_num_of_batches_threshold seals empty headers and must be rejected"
+        );
+    }
+
+    #[test]
+    fn parameters_reject_threshold_above_max_header_num_of_batches() {
+        let params = Parameters {
+            max_header_num_of_batches: 2,
+            header_num_of_batches_threshold: 3,
+            ..Default::default()
+        };
+        assert!(
+            params.validate_operational_floors().is_err(),
+            "a threshold above max_header_num_of_batches is mutually inconsistent and must be rejected"
+        );
+    }
+
+    #[test]
+    fn parameters_accept_minimal_valid_batch_bounds() {
+        let params = Parameters {
+            max_header_num_of_batches: 1,
+            header_num_of_batches_threshold: 1,
+            ..Default::default()
+        };
+        assert!(
+            params.validate_operational_floors().is_ok(),
+            "threshold == max == 1 is the minimal consistent batch configuration and must be accepted"
         );
     }
 }
