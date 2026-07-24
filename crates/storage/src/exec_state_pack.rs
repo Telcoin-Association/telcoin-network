@@ -121,7 +121,7 @@ struct AccountRecord {
     address: Address,
     nonce: u64,
     balance: B256,
-    code: Option<Vec<u8>>,
+    code: Option<Bytes>,
 }
 
 impl AccountRecord {
@@ -135,7 +135,7 @@ impl AccountRecord {
             account: GenesisAccount {
                 nonce: Some(self.nonce),
                 balance: U256::from_be_bytes(self.balance.0),
-                code: self.code.map(Bytes::from),
+                code: self.code,
                 storage,
                 private_key: None,
             },
@@ -148,7 +148,7 @@ impl AccountRecord {
             address: self.address,
             nonce: self.nonce,
             balance: U256::from_be_bytes(self.balance.0),
-            code: self.code.map(Bytes::from),
+            code: self.code,
         }
     }
 }
@@ -277,11 +277,21 @@ impl ExecStatePackWriter {
             account.account.code.clone(),
         )?;
         if let Some(storage) = &account.account.storage {
-            // BTreeMap iterates in ascending key order — a stable, deterministic chunk order.
-            let slots: Vec<(B256, B256)> = storage.iter().map(|(k, v)| (*k, *v)).collect();
-            for chunk in slots.chunks(STORAGE_CHUNK_SLOTS) {
-                self.append_storage_chunk(chunk)?;
+            // BTreeMap iterates in ascending key order — a stable, deterministic chunk order. Build
+            // each chunk straight from the iterator and move it into its record, so an account's
+            // storage is never copied into a full intermediate Vec and then again per chunk.
+            let mut chunk: Vec<(B256, B256)> =
+                Vec::with_capacity(STORAGE_CHUNK_SLOTS.min(storage.len()));
+            for (k, v) in storage.iter() {
+                chunk.push((*k, *v));
+                if chunk.len() == STORAGE_CHUNK_SLOTS {
+                    self.append_storage_chunk_owned(std::mem::replace(
+                        &mut chunk,
+                        Vec::with_capacity(STORAGE_CHUNK_SLOTS),
+                    ))?;
+                }
             }
+            self.append_storage_chunk_owned(chunk)?;
         }
         Ok(())
     }
@@ -305,7 +315,7 @@ impl ExecStatePackWriter {
             address,
             nonce,
             balance: B256::from(balance.to_be_bytes::<32>()),
-            code: code.map(|code| code.to_vec()),
+            code,
         };
         Self::append(&mut self.data, &ExecStateRecord::Account(record))
     }
@@ -317,11 +327,20 @@ impl ExecStatePackWriter {
         &mut self,
         slots: &[(B256, B256)],
     ) -> Result<(), ExecStatePackError> {
+        self.append_storage_chunk_owned(slots.to_vec())
+    }
+
+    /// Append one owned chunk of storage slots for the current account, moving it into its record
+    /// (no extra copy) and bumping the tally. Empty chunks are ignored.
+    fn append_storage_chunk_owned(
+        &mut self,
+        slots: Vec<(B256, B256)>,
+    ) -> Result<(), ExecStatePackError> {
         if slots.is_empty() {
             return Ok(());
         }
         self.stats.storage_slots += slots.len() as u64;
-        Self::append(&mut self.data, &ExecStateRecord::Storage(slots.to_vec()))
+        Self::append(&mut self.data, &ExecStateRecord::Storage(slots))
     }
 
     /// Write the trailing [`ExecStateStats`] footer, commit the pack to disk, and
@@ -950,5 +969,21 @@ mod test {
         assert!(
             matches!(err, ExecStatePackError::TooManyHeaders { declared, .. } if declared == u32::MAX)
         );
+    }
+
+    #[test]
+    fn account_code_bytes_encodes_like_vec() {
+        // `AccountRecord.code` is stored as `Option<Bytes>` (avoiding a per-account `to_vec`), where
+        // it used to be `Option<Vec<u8>>`. Under the pack's BCS codec both encode identically —
+        // (Option tag) + (ULEB128 len) + (raw bytes) — so the wire format is unchanged and
+        // `EXEC_STATE_PACK_VERSION` need not bump. This test locks that invariant.
+        let raw = vec![0x60u8, 0x00, 0x2a, 0xff, 0x01];
+        let as_bytes: Option<Bytes> = Some(Bytes::from(raw.clone()));
+        let as_vec: Option<Vec<u8>> = Some(raw);
+        assert_eq!(tn_types::encode(&as_bytes), tn_types::encode(&as_vec));
+
+        let none_bytes: Option<Bytes> = None;
+        let none_vec: Option<Vec<u8>> = None;
+        assert_eq!(tn_types::encode(&none_bytes), tn_types::encode(&none_vec));
     }
 }
