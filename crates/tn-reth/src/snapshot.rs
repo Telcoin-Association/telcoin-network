@@ -72,7 +72,7 @@ use tn_types::{
     Address, BlockBody, BlockNumHash, Bytes, Epoch, ExecHeader, GenesisAccount, SealedBlock,
     SealedHeader, TaskManager, WorkerId, B256,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// The pinned read-only MDBX transaction type — reth's `Tx<RO>` with long-read safety disabled.
 type PinnedTx = <DatabaseEnv as RethDatabaseT>::TX;
@@ -608,6 +608,47 @@ impl SnapshotRestorer {
         Ok(())
     }
 
+    /// Verify the restored node can derive its first post-import epoch's base fees without walking
+    /// below the snapshot block — the resume-time driver for [`derive_fee_precondition`].
+    ///
+    /// The restore side does not know the entered epoch up front (a state-only pack carries no
+    /// records), so it reads it from the restored state at `B` — the window's last header, whose
+    /// registry state (stamped by `concludeEpoch` at that closing block) names the epoch the node
+    /// will enter — and defers to [`derive_fee_precondition`].
+    ///
+    /// A no-op when the node will enter epoch 0 or 1: entering epoch 1 stops at the epoch-0 base
+    /// case of the base-fee walk (`derive_idle_worker_fee_at`) and never reads state below `B`, so
+    /// there is nothing to guard (and an epoch-0 snapshot is not consensus-resumable regardless).
+    /// The entered-epoch read is best-effort: a read fault logs a warning and skips the precheck
+    /// rather than failing an otherwise-valid import (the node would simply read this at startup).
+    /// An actual idle-epoch violation, by contrast, is a hard error naming the offending worker.
+    ///
+    /// Must run AFTER [`import_state`](Self::import_state) (it reads contract state at `B`) and
+    /// before [`finish`](Self::finish).
+    pub fn check_resumable_fees(&self, window: &[SealedHeader]) -> eyre::Result<()> {
+        let closing = window.last().ok_or_else(|| {
+            eyre!("snapshot restore: cannot check fee resumability over an empty window")
+        })?;
+        let entered = match self.reth_env.get_current_epoch_info_at_header(closing) {
+            Ok((entered, _info)) => entered,
+            Err(e) => {
+                warn!(
+                    target: "tn::reth",
+                    error = %e,
+                    "snapshot restore: could not read the entered epoch at the snapshot block; \
+                     skipping the fee-derivability precheck"
+                );
+                return Ok(());
+            }
+        };
+        // Entering epoch 0 or 1 never walks below B (the walk stops at the epoch-0 base case), so
+        // there is nothing to verify.
+        if entered < 2 {
+            return Ok(());
+        }
+        self.derive_fee_precondition(entered, window)
+    }
+
     /// Persist the finalized/safe markers at `B` and sanity-check the reconstructed tip.
     ///
     /// The restored node reads these markers on startup to place its finalized/safe blocks (the
@@ -900,6 +941,29 @@ mod tests {
         SealedHeader::seal_slow(header)
     }
 
+    /// A window header built on top of the real genesis header, so it carries the Cancun/Prague
+    /// fields (`excess_blob_gas`, base fee, gas limit, timestamp, ...) that `evm_env` requires for
+    /// the post-import contract reads — `synthetic_header`'s `Default`-filled header omits them,
+    /// which is fine for tests that only read state but not for ones that issue EVM calls.
+    /// `state_root` pins the exported (genesis) root; `worker_id`/`genuine` drive worker attribution.
+    fn window_header_on_genesis(
+        genesis: &SealedHeader,
+        number: u64,
+        parent: B256,
+        state_root: B256,
+        worker_id: u16,
+        genuine: bool,
+    ) -> SealedHeader {
+        let mut header = genesis.header().clone();
+        header.number = number;
+        header.parent_hash = parent;
+        header.state_root = state_root;
+        header.timestamp = genesis.timestamp + number;
+        header.difficulty = U256::from(worker_id as u64);
+        header.ommers_hash = if genuine { B256::repeat_byte(0xbb) } else { B256::ZERO };
+        SealedHeader::seal_slow(header)
+    }
+
     /// Export the source's plain state into a pack, embedding `headers` (snapshot header first).
     fn export_pack(source: &RethEnv, state_root: B256, headers: &[ExecHeader], dir: &Path) {
         source
@@ -1115,6 +1179,97 @@ mod tests {
         let err = SnapshotRestorer::open(&reth_config, db, &tm)
             .expect_err("open must refuse a datadir that already holds chain data");
         assert!(err.to_string().contains("non-empty"), "unexpected error: {err}");
+
+        Ok(())
+    }
+
+    /// The fee-derivability precheck rejects a snapshot whose EIP-1559 worker produced no genuine
+    /// block in the shipped window (the node would walk below the snapshot and halt), and accepts
+    /// one that did. Uses a consensus-registry genesis (worker 0 is EIP-1559 by default) and passes
+    /// `entered = 2` explicitly so the check runs regardless of the genesis registry epoch.
+    #[tokio::test]
+    async fn fee_precondition_gates_idle_snapshot_epochs() -> eyre::Result<()> {
+        let genesis = crate::test_utils::test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        // source: export the registry genesis state at its real root
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Fee Precondition Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
+        let state_root = genesis_header.state_root;
+        let parent0 = genesis_header.hash();
+
+        // Restore a 1-block window (block 1, parent = genesis, pinning the genesis root) into a
+        // fresh datadir and run the precheck. `genuine` controls whether worker 0's window block is
+        // a genuine batch block.
+        let run = |genuine: bool| -> eyre::Result<()> {
+            let h1 = window_header_on_genesis(&genesis_header, 1, parent0, state_root, 0, genuine);
+            let window = vec![h1.clone()];
+            let final_state = BlockNumHash::new(1, h1.hash());
+            let pack_dir = TempDir::new()?;
+            export_pack(&source, state_root, &[h1.header().clone()], pack_dir.path());
+            let dst_dir = TempDir::new()?;
+            let dst_tm = TaskManager::new("Fee Precondition Dest");
+            let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+            let restorer = SnapshotRestorer::open(&reth_config, db, &dst_tm)?;
+            restorer.import_chain_scaffold(&window, final_state)?;
+            let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+            restorer.import_state(&mut reader)?;
+            // The precheck reads worker configs at B (= the restored genesis state) and scans the
+            // window for genuine blocks; returns its verdict (datadir/guards drop after it runs).
+            restorer.derive_fee_precondition(2, &window)
+        };
+
+        let err = run(false).expect_err("an idle EIP-1559 window must be rejected");
+        assert!(
+            err.to_string().contains("produced no genuine block"),
+            "expected an idle-worker rejection, got: {err:?}"
+        );
+        run(true).expect("a window with a genuine worker block must satisfy the precondition");
+
+        Ok(())
+    }
+
+    /// `check_resumable_fees` is a no-op for a snapshot rooted at the genesis block: the node would
+    /// enter epoch <= 1, whose base-fee derivation never walks below B, so even an idle window is
+    /// tolerated (either the entered-epoch read returns < 2, or a read fault best-effort skips).
+    #[tokio::test]
+    async fn check_resumable_fees_tolerates_epoch_zero_snapshot() -> eyre::Result<()> {
+        let genesis = crate::test_utils::test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Resumable Fees Skip Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
+        let state_root = genesis_header.state_root;
+
+        // an idle 1-block window that WOULD be rejected if the entered epoch were >= 2
+        let h1 = window_header_on_genesis(
+            &genesis_header,
+            1,
+            genesis_header.hash(),
+            state_root,
+            0,
+            false,
+        );
+        let window = vec![h1.clone()];
+        let final_state = BlockNumHash::new(1, h1.hash());
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, state_root, &[h1.header().clone()], pack_dir.path());
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Resumable Fees Skip Dest");
+        let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+        let restorer = SnapshotRestorer::open(&reth_config, db, &dst_tm)?;
+        restorer.import_chain_scaffold(&window, final_state)?;
+        let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+        restorer.import_state(&mut reader)?;
+
+        restorer
+            .check_resumable_fees(&window)
+            .expect("an epoch-<=1 snapshot must skip the fee-derivability precheck");
 
         Ok(())
     }

@@ -274,6 +274,16 @@ fn restore_pack(
     let restorer = SnapshotRestorer::open(reth_config, db, &task_manager)?;
     restorer.import_chain_scaffold(&window, final_state)?;
     let root = restorer.import_state(&mut reader)?;
+    // Reject a bundle the node could not resume from BEFORE declaring the import complete: if the
+    // snapshot's epoch has no worker activity to anchor base-fee derivation, a node started from it
+    // would walk below the snapshot into state it does not have and halt. Fail here with a clear,
+    // worker-naming message instead of letting that surface as a cryptic runtime crash later.
+    restorer.check_resumable_fees(&window).map_err(|e| {
+        eyre!(
+            "{e}; bootstrap from a later epoch's bundle instead (the target datadir now holds \
+             partial chain data and must be recreated before retrying)"
+        )
+    })?;
     restorer.finish(final_state)?;
     Ok((final_state, root))
 }
