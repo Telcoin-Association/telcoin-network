@@ -50,11 +50,15 @@ use reth_db::{
     },
     transaction::{DbTx, DbTxMut},
 };
-use reth_db_common::init::{insert_genesis_hashes, insert_history, insert_state};
+use reth_primitives_traits::{Account, StorageEntry};
 use reth_provider::{
-    BlockWriter, ChainStateBlockWriter, DBProvider, DatabaseProviderFactory, ProviderError,
-    StageCheckpointWriter, StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
-    TrieWriter,
+    BlockWriter, ChainStateBlockWriter, DBProvider, DatabaseProviderFactory, HashingWriter,
+    HistoryWriter, ProviderError, StageCheckpointWriter, StateWriter, StaticFileProviderFactory,
+    StaticFileSegment, StaticFileWriter, StorageSettingsCache, TrieWriter,
+};
+use reth_revm::{
+    bytecode::Bytecode,
+    db::states::{PlainStorageChangeset, StateChangeset},
 };
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_trie::{IntermediateStateRootState, StateRoot, StateRootProgress};
@@ -65,12 +69,13 @@ use std::{
     path::Path,
 };
 use tn_storage::exec_state_pack::{
-    ExecStateAccount, ExecStatePackReader, ExecStatePackWriter, ExecStateStats,
+    ExecStateAccount, ExecStateAccountMeta, ExecStatePackReader, ExecStatePackWriter,
+    ExecStateStats, StateEntry,
 };
 use tn_types::{
     gas_accumulator::{RewardsCounter, WorkerFeeConfig},
     Address, BlockBody, BlockNumHash, Bytes, Epoch, ExecHeader, GenesisAccount, SealedBlock,
-    SealedHeader, TaskManager, WorkerId, B256,
+    SealedHeader, TaskManager, WorkerId, B256, U256,
 };
 use tracing::{debug, warn};
 
@@ -247,14 +252,6 @@ impl RethEnv {
     }
 }
 
-/// Number of accounts [`SnapshotRestorer::import_state`] buffers before flushing a chunk to reth's
-/// state tables.
-///
-/// Mirrors reth's `AVERAGE_COUNT_ACCOUNTS_PER_GB_STATE_DUMP` (its `dump_state` batches on the same
-/// bound): roughly one gigabyte of state per chunk, so the resident account set and the reth
-/// `BundleState` mirror stay near that ceiling instead of scaling with the whole chain.
-const IMPORT_ACCOUNT_CHUNK: usize = 285_228;
-
 /// Rebuilds a state-only snapshot into a fresh, empty datadir.
 ///
 /// The restore side is the inverse of [`PinnedStateView`]: it takes the exec state pack produced by
@@ -268,10 +265,11 @@ const IMPORT_ACCOUNT_CHUNK: usize = 285_228;
 ///
 /// reth's `init_from_state_dump` is private and JSONL-only. Instead,
 /// [`import_state`](Self::import_state) streams the pack's accounts through reth's *public*
-/// state-insertion building blocks ([`insert_state`], [`insert_genesis_hashes`],
-/// [`insert_history`]) in bounded chunks and recomputes the state root from scratch with
-/// [`StateRoot`] — the same tables and the same from-scratch check `init_from_state_dump` performs
-/// internally, without the JSONL parser.
+/// state-insertion building blocks ([`StateWriter::write_state_changes`] for plain state and
+/// bytecode, [`HashingWriter`] for the hashed tables, [`HistoryWriter`] for the history indices)
+/// one account header and one bounded storage chunk at a time, then recomputes the state root from
+/// scratch with [`StateRoot`] — the same hashed/history tables and the same from-scratch check
+/// `init_from_state_dump` performs internally, without the JSONL parser.
 ///
 /// # Why this reimplements reth's `setup_without_evm`
 ///
@@ -293,9 +291,9 @@ const IMPORT_ACCOUNT_CHUNK: usize = 285_228;
 ///    state tables and writes a header-only chain up to `B` (real hashes in the window, zero-hash
 ///    dummies below it), so the state import has a real `header(B)` to check its recomputed root
 ///    against.
-/// 3. [`import_state`](Self::import_state) streams the pack's accounts into reth's state tables in
-///    bounded chunks, recomputes the state root from scratch, and hard-fails on any mismatch with
-///    `header(B).state_root`.
+/// 3. [`import_state`](Self::import_state) streams the pack's accounts into reth's state tables one
+///    account header and one bounded storage chunk at a time, recomputes the state root from
+///    scratch, and hard-fails on any mismatch with `header(B).state_root`.
 /// 4. [`derive_fee_precondition`](Self::derive_fee_precondition) verifies the shipped window is
 ///    self-sufficient for the node's first epoch-entry base-fee derivation, so the restored node
 ///    will not walk below the window into history the snapshot omitted and halt.
@@ -500,102 +498,118 @@ impl SnapshotRestorer {
     /// Import the pack's plain-state accounts into the scaffolded datadir and return the recomputed
     /// state root.
     ///
-    /// Streams every [`ExecStateAccount`] out of `reader` in bounded chunks of
-    /// [`IMPORT_ACCOUNT_CHUNK`] accounts, writing each chunk into reth's state tables with the
-    /// public building blocks [`insert_genesis_hashes`], [`insert_history`], and [`insert_state`]
-    /// (mirroring what reth's private `dump_state` does, but reading from the pack, not JSONL). The
-    /// state root is then recomputed FROM SCRATCH with [`StateRoot::from_tx`], driven incrementally
-    /// via [`StateRoot::root_with_progress`] so the in-flight `TrieUpdates` are flushed to disk as
-    /// they accumulate rather than pinned in RAM. The import hard-fails unless the recomputed root
-    /// equals both the pack's declared root and `header(B).state_root` (written by
-    /// [`import_chain_scaffold`](Self::import_chain_scaffold)). No JSONL, no ETL.
+    /// Drives the pack's chunked read stream ([`ExecStatePackReader::next_entry`]): each
+    /// [`StateEntry::Account`] writes one account header (`PlainAccountState`, `HashedAccounts`,
+    /// `AccountsHistory`, and its `Bytecodes` row) and each [`StateEntry::Storage`] writes one
+    /// bounded slot chunk (`PlainStorageState`, `HashedStorages`, `StoragesHistory`) for the
+    /// current account. Plain state and bytecode go through
+    /// [`StateWriter::write_state_changes`], the hashed tables through [`HashingWriter`], and
+    /// the history indices through [`HistoryWriter`] — the same hashed/history/plain rows
+    /// reth's private `dump_state` writes, but never the `AccountChangeSets`/
+    /// `StorageChangeSets` those helpers also fabricate (see the change-set section). The state
+    /// root is then recomputed FROM SCRATCH with [`StateRoot::from_tx`], driven incrementally
+    /// via [`StateRoot::root_with_progress`] so the in-flight `TrieUpdates` are flushed to disk
+    /// as they accumulate rather than pinned in RAM. The import hard-fails unless
+    /// the recomputed root equals both the pack's declared root and `header(B).state_root` (written
+    /// by [`import_chain_scaffold`](Self::import_chain_scaffold)). No JSONL, no ETL.
     ///
     /// # Memory profile
     ///
-    /// Only one chunk of accounts (and the reth `BundleState` mirror for that chunk) is resident at
-    /// a time, and the trie-update flushing bounds the recompute's memory. The output is
-    /// byte-identical to a single-shot import: the plain-state, hashed, and history writes are
-    /// order-independent `upsert`s, and the per-block change-set `append_dup`s land under the same
-    /// block key regardless of how the accounts are batched — see the ascending-address invariant.
+    /// At most one account header plus one `STORAGE_CHUNK_SLOTS`-bounded storage chunk is resident
+    /// at a time — a whale account's storage is never fully materialized, unlike
+    /// [`ExecStatePackReader::next_account`] (which reassembles it into one `Vec`) or the reth
+    /// `write_state`/`insert_state` path (which builds a whole-account `BundleState`). The
+    /// trie-update flushing bounds the recompute's memory the same way.
+    ///
+    /// # Why the block-`B` change sets are skipped
+    ///
+    /// `insert_state` (and every reth `write_state` variant) records a per-block revert into
+    /// `AccountChangeSets`/`StorageChangeSets`, and there is no public reth API that writes plain
+    /// state per storage chunk WITHOUT also bundling those change sets and materializing the whole
+    /// account. This import deliberately writes neither table for block `B`. That is sound because
+    /// those rows would be fictional anyway (the scaffold fabricates "all state created at `B`"
+    /// over dummy blocks) and nothing a snapshot-bootstrapped node does ever reads them: the
+    /// state root is recomputed from the HASHED tables (not change sets); the node never
+    /// unwinds a persisted canonical block (`TN reorgs are impossible`) and restore finalizes
+    /// `B`, so `B` and below are never rolled back; every registry/fee read pins the canonical
+    /// tip (`= B`), which reth serves from a `LatestStateProvider` (plain state, no change-set
+    /// read); and the node runs archive mode with the pruner fully disabled, so a historical
+    /// read below `B` resolves through `HistoryInfo::NotYetWritten` (the single-`[B]` history
+    /// index + absent prune boundary) rather than a change-set lookup. Blocks executed forward
+    /// from `B` write their change sets normally through `save_blocks`.
     ///
     /// # Ascending-address invariant
     ///
-    /// The per-chunk [`insert_state`] is correct ONLY if accounts arrive strictly ascending by
-    /// address across the whole stream. Every chunk's change sets are appended under the same block
-    /// `B` with `append_dup` keyed by address, so the subkeys must be globally ascending or the
-    /// underlying MDBX append rejects them. The exporter
-    /// ([`PinnedStateView::export_state_pack`]) guarantees this ordering — it walks the
-    /// `PlainAccountState` cursor in ascending, unique address order — so a well-formed pack always
-    /// satisfies it. This method still verifies the order explicitly and returns a clear error on
-    /// any violation, turning a corrupt, crafted, or out-of-order pack into a loud failure instead
-    /// of a cryptic append_dup error.
+    /// The exporter ([`PinnedStateView::export_state_pack`]) emits accounts in strictly ascending,
+    /// unique address order (it walks the `PlainAccountState` cursor). The per-account
+    /// [`HashingWriter::insert_storage_for_hashing`] MERGES a chunk's slots into any existing
+    /// `HashedStorages` dup-list for the address, so re-visiting an address across the stream would
+    /// silently fold two accounts' storage together; the per-account/per-chunk history-index writes
+    /// likewise assume each `(address, slot)` sharded key is touched once. This method verifies the
+    /// ordering explicitly and returns a clear error on any violation, turning a corrupt, crafted,
+    /// or out-of-order pack into a loud failure instead of silent state corruption.
     pub fn import_state(&self, reader: &mut ExecStatePackReader) -> eyre::Result<B256> {
-        self.import_state_with_chunk_size(reader, IMPORT_ACCOUNT_CHUNK)
-    }
-
-    /// [`import_state`](Self::import_state) with an explicit account-chunk size.
-    ///
-    /// Factored out so tests can force multiple chunks with a tiny size; production always calls
-    /// [`import_state`], which passes [`IMPORT_ACCOUNT_CHUNK`].
-    fn import_state_with_chunk_size(
-        &self,
-        reader: &mut ExecStatePackReader,
-        chunk_size: usize,
-    ) -> eyre::Result<B256> {
         let expected_root = reader.meta().state_root;
         let b = reader.meta().block_number;
 
         let provider = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
 
-        // stream the pack's accounts in bounded chunks, writing plain + hashed + history state per
-        // chunk, mirroring reth's private `dump_state` sequence but driven from the pack (not
-        // JSONL). only one chunk is resident at a time, which bounds both the account set and the
-        // reth BundleState `insert_state` builds. the ascending-address check enforces the
-        // append_dup ordering the per-block change-set writes require.
-        //
-        // cap the preallocation at IMPORT_ACCOUNT_CHUNK so a very large chunk_size (e.g. a
-        // single-shot import) cannot overflow the allocation; the vec still grows if more than that
-        // many accounts land in one chunk.
-        let mut batch: Vec<(Address, GenesisAccount)> =
-            Vec::with_capacity(chunk_size.min(IMPORT_ACCOUNT_CHUNK));
+        // TN keeps EVM state in the PLAIN tables (the exporter reads PlainAccountState /
+        // PlainStorageState, and the account-header / storage-chunk writers below target the plain
+        // tables). reth's `write_state_changes` silently SKIPS plain writes when the db is in
+        // hashed-state mode, so a hashed-mode db here would leave the plain tables empty and the
+        // node unable to serve state. assert the mode up front rather than importing a
+        // half-populated db.
+        if provider.cached_storage_settings().use_hashed_state() {
+            return Err(eyre!(
+                "snapshot restore: reth db is in hashed-state mode, but the import writes plain \
+                 state; refusing to import a db whose plain tables would be left empty"
+            ));
+        }
+
+        // drive the pack's chunked read stream, writing one account header or one bounded storage
+        // chunk at a time. only the current chunk (and one header) is ever resident, so a whale
+        // account's storage is never fully materialized. the ascending-address check enforces the
+        // unique-address assumption the per-account HashedStorages merge and history-index writes
+        // rely on.
+        let mut current: Option<Address> = None;
         let mut prev_address: Option<Address> = None;
 
-        let flush_batch = |batch: &mut Vec<(Address, GenesisAccount)>| -> eyre::Result<()> {
-            if batch.is_empty() {
-                return Ok(());
-            }
-            insert_genesis_hashes(&provider, batch.iter().map(|(a, g)| (a, g)))?;
-            insert_history(&provider, batch.iter().map(|(a, g)| (a, g)), b)?;
-            insert_state(&provider, batch.iter().map(|(a, g)| (a, g)), b)?;
-            batch.clear();
-            Ok(())
-        };
+        while let Some(entry) = reader.next_entry() {
+            match entry? {
+                StateEntry::Account(meta) => {
+                    let address = meta.address;
 
-        while let Some(account) = reader.next_account() {
-            let account = account?;
-            let address = account.address;
+                    // strictly ascending, unique addresses: the exporter guarantees this, so a
+                    // violation means the pack is corrupt or was not produced by the exporter.
+                    if let Some(prev) = prev_address {
+                        if address <= prev {
+                            return Err(eyre!(
+                                "snapshot restore: pack accounts are not in strictly ascending \
+                                 address order at {address}; the pack is corrupt or was not \
+                                 produced by the exporter"
+                            ));
+                        }
+                    }
+                    prev_address = Some(address);
+                    current = Some(address);
 
-            // strictly ascending, unique addresses are required for the per-block append_dup
-            // change-set writes above; the exporter guarantees this, so a violation means the pack
-            // is corrupt or was not produced by the exporter.
-            if let Some(prev) = prev_address {
-                if address <= prev {
-                    return Err(eyre!(
-                        "snapshot restore: pack accounts are not in strictly ascending address \
-                         order at {address}; the pack is corrupt or was not produced by the \
-                         exporter"
-                    ));
+                    Self::write_account_header(&provider, &meta, b)?;
+                }
+                StateEntry::Storage(chunk) => {
+                    // a Storage record can only follow an Account record; the pack layout
+                    // guarantees this, but guard so a malformed pack fails loudly here rather than
+                    // silently dropping storage.
+                    let address = current.ok_or_else(|| {
+                        eyre!(
+                            "snapshot restore: pack has a storage chunk before any account; the \
+                             pack is corrupt or was not produced by the exporter"
+                        )
+                    })?;
+                    Self::write_storage_chunk(&provider, address, chunk, b)?;
                 }
             }
-            prev_address = Some(address);
-
-            batch.push((address, account.account));
-            if batch.len() >= chunk_size {
-                flush_batch(&mut batch)?;
-            }
         }
-        // flush the final partial chunk
-        flush_batch(&mut batch)?;
 
         // recompute the state root from scratch out of the just-written hashed state and persist
         // the trie nodes. the scaffold cleared the trie tables, so this is a full rebuild with no
@@ -698,6 +712,107 @@ impl SnapshotRestorer {
                 final_state.hash
             ));
         }
+
+        Ok(())
+    }
+
+    /// Write one account header (nonce/balance/code) into the plain, hashed, history, and bytecode
+    /// tables at block `b`, WITHOUT any change-set row.
+    ///
+    /// This is the account-only half of what reth's `insert_state` + `insert_genesis_hashes` +
+    /// `insert_history` write for a single account: `write_state_changes` upserts
+    /// `PlainAccountState` and (via `contracts`) `Bytecodes` but no `AccountChangeSets`;
+    /// `insert_account_for_hashing` upserts `HashedAccounts`; `insert_account_history_index`
+    /// appends the single `[b]` transition to `AccountsHistory`. The account's storage arrives
+    /// separately as [`Self::write_storage_chunk`] calls, so this never touches storage.
+    fn write_account_header<Provider>(
+        provider: &Provider,
+        meta: &ExecStateAccountMeta,
+        b: u64,
+    ) -> eyre::Result<()>
+    where
+        Provider: StateWriter + HashingWriter + HistoryWriter,
+    {
+        // resolve the bytecode hash once and reuse it across the plain account row, the hashed
+        // account row, and the Bytecodes entry, mirroring reth's genesis-account handling. an empty
+        // code slice is treated as no code (hash left None) so the account keeps KECCAK_EMPTY.
+        let (bytecode_hash, contracts) = match &meta.code {
+            Some(code) if !code.is_empty() => {
+                let bytecode = Bytecode::new_raw_checked(code.clone()).map_err(|e| {
+                    eyre!("snapshot restore: invalid bytecode for account {}: {e}", meta.address)
+                })?;
+                let hash = bytecode.hash_slow();
+                (Some(hash), vec![(hash, bytecode)])
+            }
+            _ => (None, Vec::new()),
+        };
+        let account = Account { nonce: meta.nonce, balance: meta.balance, bytecode_hash };
+
+        // plain account + bytecode only: `write_state_changes` writes NO change sets.
+        provider.write_state_changes(StateChangeset {
+            accounts: vec![(meta.address, Some(account.into()))],
+            storage: Vec::new(),
+            contracts,
+        })?;
+        // hashed account row
+        provider.insert_account_for_hashing([(meta.address, Some(account))])?;
+        // single history transition at block `b`
+        provider.insert_account_history_index([(meta.address, [b])])?;
+
+        Ok(())
+    }
+
+    /// Write one bounded storage chunk for `address` into the plain, hashed, and history tables at
+    /// block `b`, WITHOUT any change-set row.
+    ///
+    /// `chunk` is a slice of the account's `(slot, value)` pairs (at most `STORAGE_CHUNK_SLOTS`),
+    /// already ascending by slot and free of zero values (the exporter filters them). This is the
+    /// storage half of reth's `insert_state`/`insert_genesis_hashes`/`insert_history`:
+    /// `write_state_changes` upserts `PlainStorageState` (no `StorageChangeSets`);
+    /// `insert_storage_for_hashing` MERGES the chunk into the address's `HashedStorages` dup-list;
+    /// `insert_storage_history_index` appends the single `[b]` transition per slot to
+    /// `StoragesHistory`. Merging is why the caller must never re-visit an address (see the
+    /// ascending-address invariant on [`import_state`](Self::import_state)).
+    fn write_storage_chunk<Provider>(
+        provider: &Provider,
+        address: Address,
+        chunk: Vec<(B256, B256)>,
+        b: u64,
+    ) -> eyre::Result<()>
+    where
+        Provider: StateWriter + HashingWriter + HistoryWriter,
+    {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        // plain storage: `write_state_changes` upserts PlainStorageState (values are U256; the
+        // exporter already dropped zero-valued slots) and writes NO change sets. `wipe_storage` is
+        // false — the scaffold cleared the tables, so there is nothing to wipe and every account is
+        // visited once.
+        let plain_storage: Vec<(U256, U256)> = chunk
+            .iter()
+            .map(|(slot, value)| (U256::from_be_bytes(slot.0), U256::from_be_bytes(value.0)))
+            .collect();
+        provider.write_state_changes(StateChangeset {
+            accounts: Vec::new(),
+            storage: vec![PlainStorageChangeset {
+                address,
+                wipe_storage: false,
+                storage: plain_storage,
+            }],
+            contracts: Vec::new(),
+        })?;
+
+        // hashed storage: merges this chunk's slots into the address's existing dup-list.
+        let hashed_entries = chunk
+            .iter()
+            .map(|(slot, value)| StorageEntry { key: *slot, value: U256::from_be_bytes(value.0) });
+        provider.insert_storage_for_hashing([(address, hashed_entries)])?;
+
+        // storage history: one `[b]` transition per slot, keyed by (address, slot).
+        let history = chunk.iter().map(|(slot, _)| ((address, *slot), [b]));
+        provider.insert_storage_history_index(history)?;
 
         Ok(())
     }
@@ -825,18 +940,27 @@ pub fn is_worker_batch_block(header: &SealedHeader) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_worker_batch_block, worker_id_from_header, PinnedStateView, SnapshotRestorer};
+    use super::{
+        is_worker_batch_block, worker_id_from_header, PinnedStateView, SnapshotRestorer, StateEntry,
+    };
     use crate::{MaybePlatformPath, RethChainSpec, RethConfig, RethDb, RethEnv};
     use reth::{args::DatadirArgs, builder::NodeConfig};
-    use reth_db::{cursor::DbCursorRW, tables::PlainStorageState, transaction::DbTxMut};
+    use reth_db::{
+        cursor::{DbCursorRW, DbDupCursorRO},
+        tables::{HashedAccounts, HashedStorages, PlainAccountState, PlainStorageState},
+        transaction::{DbTx, DbTxMut},
+    };
     use reth_primitives_traits::StorageEntry;
-    use reth_provider::{AccountReader, DBProvider, DatabaseProviderFactory, StateProvider};
+    use reth_provider::{
+        AccountReader, ChangeSetReader, DBProvider, DatabaseProviderFactory, StateProvider,
+        StorageChangeSetReader,
+    };
     use std::{collections::BTreeMap, path::Path, sync::Arc};
     use tempfile::TempDir;
     use tn_storage::exec_state_pack::{ExecStateAccount, ExecStatePackReader, ExecStatePackWriter};
     use tn_types::{
-        gas_accumulator::RewardsCounter, test_genesis, Address, BlockNumHash, Bytes, ExecHeader,
-        GenesisAccount, SealedHeader, TaskManager, B256, U256,
+        gas_accumulator::RewardsCounter, keccak256, test_genesis, Address, BlockNumHash, Bytes,
+        ExecHeader, GenesisAccount, SealedHeader, TaskManager, B256, U256,
     };
 
     /// Compile-time proof that a pinned view can be moved into a background upload task.
@@ -1392,27 +1516,36 @@ mod tests {
         Ok(())
     }
 
-    /// One more slot than the exporter packs into a single storage record, so the account below is
-    /// emitted across more than one `STORAGE_CHUNK_SLOTS`-bounded storage chunk and the chunked
-    /// import reassembles it across that boundary. Kept local (the pack constant is private) and
-    /// deliberately just past the boundary to keep the heavy multi-slot env cheap.
-    const MULTI_CHUNK_SLOTS: u64 = 64 * 1024 + 1;
+    /// Several slots more than the exporter packs into a single storage record, so the whale
+    /// account below is emitted across MANY `STORAGE_CHUNK_SLOTS`-bounded storage chunks and the
+    /// streaming import must write each chunk without ever materializing the whole account. Kept
+    /// local (the pack constant is private) and only a few chunks past the boundary to keep the
+    /// heavy multi-slot env cheap.
+    const MULTI_CHUNK_SLOTS: u64 = 4 * 64 * 1024 + 7;
 
-    /// Restore twice from one pack — once streaming in tiny two-account chunks, once in a single
-    /// chunk — and prove the two agree.
+    /// Import a pack containing a WHALE account whose storage spans many storage chunks and prove
+    /// the streaming, per-chunk import is exactly correct.
     ///
-    /// The source holds several accounts in ascending address order (forcing multiple chunks at
-    /// chunk size 2) and one contract whose storage spans more than one `STORAGE_CHUNK_SLOTS` pack
-    /// record (forcing the chunked import to reassemble an account across storage-chunk
-    /// boundaries). Both imports must recompute the SAME root, that root must equal the pack's
-    /// declared root (the dual hard-fail check passes), and the chunked restore must read the state
-    /// back intact — including a probe slot from deep inside the large account. Byte-identical
-    /// output between chunked and single-shot is the correctness proof for the streaming rewrite.
+    /// The source holds several accounts in ascending address order plus one contract (`big`) with
+    /// `MULTI_CHUNK_SLOTS` slots — several times the pack's per-record `STORAGE_CHUNK_SLOTS` bound,
+    /// so the pack emits `big` as one account header followed by many `Storage` chunks and the
+    /// import writes them one chunk at a time (never holding the whole account). The import must:
+    ///
+    /// - recompute the SAME root the pack declares (the dual hard-fail check passes) — this is the
+    ///   byte-exact equivalence proof: the declared root came from the source node's genuine trie
+    ///   built by a full-account write, so matching it proves the streamed hashed state is
+    ///   identical to a whole-account import;
+    /// - read every account back intact — balances, code, and multiple storage slots INCLUDING a
+    ///   probe slot deep past the first storage chunk;
+    /// - leave `AccountChangeSets`/`StorageChangeSets` EMPTY (the deliberate skip that lets the
+    ///   storage stream per chunk); and
+    /// - populate the hashed and plain tables with the same rows a whole-account import would (spot
+    ///   checked against the source's keccak256 keys).
     #[tokio::test]
-    async fn import_streams_in_chunks_matches_single_shot() -> eyre::Result<()> {
+    async fn import_streams_whale_storage_in_chunks() -> eyre::Result<()> {
         let code: Bytes = Bytes::from_static(CODE);
 
-        // several accounts in ascending address order so chunk size 2 spans multiple chunks
+        // several accounts in ascending address order, spanning many storage chunks for `big`
         let eoa_a = Address::from([0x0a; 20]);
         let eoa_b = Address::from([0x0b; 20]);
         let contract = Address::from([0x0c; 20]);
@@ -1421,14 +1554,14 @@ mod tests {
         let eoa_f = Address::from([0x0f; 20]);
         let (slot_a, slot_b) = (B256::from([0x01; 32]), B256::from([0x02; 32]));
 
-        // a probe slot deep inside the large account's storage, to prove the multi-chunk reassembly
-        // round-trips a slot beyond the first storage record
+        // a probe slot deep inside the whale's storage (past several chunk boundaries), to prove
+        // the per-chunk writes round-trip a slot far beyond the first storage record
         let probe_slot = word(MULTI_CHUNK_SLOTS - 7);
         // well above every `word(i + 1)` filler below, so the probe value is unambiguous
         let probe_value = word(0x7_0000_0000);
 
-        // build the large account's storage: MULTI_CHUNK_SLOTS non-zero slots keyed by index, with
-        // the probe slot carrying a distinctive value
+        // build the whale's storage: MULTI_CHUNK_SLOTS non-zero slots keyed by index, with the
+        // probe slot carrying a distinctive value
         let big_storage: BTreeMap<B256, B256> = (0..MULTI_CHUNK_SLOTS)
             .map(|i| {
                 let slot = word(i);
@@ -1503,72 +1636,147 @@ mod tests {
 
         // source: export the genesis state at its real root
         let src_dir = TempDir::new()?;
-        let src_tm = TaskManager::new("Chunked Import Source");
+        let src_tm = TaskManager::new("Whale Import Source");
         let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
         let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
         let state_root = genesis_header.state_root;
 
-        // a contiguous 1-block window pinning the exported root (block 1 is empty, so its state
-        // equals genesis and header(B).state_root == state_root)
+        // sanity: the pack really does emit `big` across more than one storage chunk (otherwise the
+        // whale test would not exercise the per-chunk path at all)
         let b = 1u64;
         let h1 = synthetic_header(b, genesis_header.hash(), state_root, 0, true);
         let window = vec![h1.clone()];
         let final_state = BlockNumHash::new(b, h1.hash());
-
         let pack_dir = TempDir::new()?;
         export_pack(&source, state_root, &[h1.header().clone()], pack_dir.path());
+        {
+            let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+            let mut big_chunks = 0usize;
+            let mut in_big = false;
+            while let Some(entry) = reader.next_entry() {
+                match entry? {
+                    StateEntry::Account(meta) => in_big = meta.address == big,
+                    StateEntry::Storage(_) => {
+                        if in_big {
+                            big_chunks += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                big_chunks > 1,
+                "the whale account must span more than one storage chunk (got {big_chunks})"
+            );
+        }
 
-        // restore #1: stream in tiny two-account chunks (6 accounts => at least three chunks)
-        let chunked_dir = TempDir::new()?;
-        let chunked_tm = TaskManager::new("Chunked Import Dest Chunked");
-        let (chunked_config, chunked_db) = temp_config_and_db(chain.clone(), chunked_dir.path())?;
-        let chunked_root = {
-            let restorer =
-                SnapshotRestorer::open(&chunked_config, chunked_db.clone(), &chunked_tm)?;
+        // restore: single streaming import (the per-entry path never materializes the whole whale)
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Whale Import Dest");
+        let (dst_config, dst_db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+        let root = {
+            let restorer = SnapshotRestorer::open(&dst_config, dst_db.clone(), &dst_tm)?;
             restorer.import_chain_scaffold(&window, final_state)?;
             let mut reader = ExecStatePackReader::open(pack_dir.path())?;
-            let root = restorer.import_state_with_chunk_size(&mut reader, 2)?;
+            let root = restorer.import_state(&mut reader)?;
             restorer.finish(final_state)?;
             root
         };
-        assert_eq!(chunked_root, state_root, "chunked import must recompute the declared root");
-
-        // restore #2: single chunk (one flush) from the same pack
-        let single_dir = TempDir::new()?;
-        let single_tm = TaskManager::new("Chunked Import Dest Single");
-        let (single_config, single_db) = temp_config_and_db(chain.clone(), single_dir.path())?;
-        let single_root = {
-            let restorer = SnapshotRestorer::open(&single_config, single_db, &single_tm)?;
-            restorer.import_chain_scaffold(&window, final_state)?;
-            let mut reader = ExecStatePackReader::open(pack_dir.path())?;
-            let root = restorer.import_state_with_chunk_size(&mut reader, usize::MAX)?;
-            restorer.finish(final_state)?;
-            root
-        };
-
-        // the whole point: chunked output is byte-identical to single-shot at the root level
+        // matching the pack's declared root proves the streamed state is byte-exactly what a
+        // full-account import produces
         assert_eq!(
-            chunked_root, single_root,
-            "chunked import must produce the same state root as a single-shot import"
+            root, state_root,
+            "streaming import must recompute the pack's declared (genuine full-trie) root"
         );
 
-        // and the chunked datadir reads the state back intact, including the deep probe slot
-        let reader = RethEnv::new(
-            &chunked_config,
-            &chunked_tm,
-            chunked_db,
-            None,
-            RewardsCounter::default(),
-        )?;
+        // open a fresh env over the restored datadir for both the table-level assertions and the
+        // state readback
+        let reader =
+            RethEnv::new(&dst_config, &dst_tm, dst_db.clone(), None, RewardsCounter::default())?;
+
+        // change sets at block B MUST be empty: the skip is what lets storage stream per chunk.
+        // genesis (block 0) legitimately keeps its own change sets (init_genesis wrote them and the
+        // scaffold does not clear those tables), so this checks block B specifically rather than
+        // global emptiness — and confirms block 0 still has change sets, proving the test measures
+        // the right thing and the import, not the scaffold, is the differentiator.
+        {
+            let provider = reader.inner.blockchain_provider.database_provider_ro()?;
+            let tx = provider.tx_ref();
+
+            assert!(
+                !provider.account_block_changeset(0)?.is_empty(),
+                "genesis account change sets should still be present (only block B is skipped)"
+            );
+            assert!(
+                provider.account_block_changeset(b)?.is_empty(),
+                "import must write NO account change sets for block B"
+            );
+            assert!(
+                provider.storage_changeset(b)?.is_empty(),
+                "import must write NO storage change sets for block B"
+            );
+
+            // the plain/hashed tables, in contrast, are fully populated. the exact storage-row
+            // count also includes `test_genesis`'s own system-contract slots (dumped by the
+            // exporter), so assert the meaningful invariant — plain and hashed hold the same number
+            // of rows — plus a floor of the whale slots and the contract's two slots.
+            assert!(tx.entries::<PlainAccountState>()? >= 6, "plain accounts must be populated");
+            assert!(tx.entries::<HashedAccounts>()? >= 6, "hashed accounts must be populated");
+            let plain_storage_rows = tx.entries::<PlainStorageState>()?;
+            assert!(
+                plain_storage_rows >= MULTI_CHUNK_SLOTS as usize + 2,
+                "plain storage must hold at least the whale slots plus the contract's two slots \
+                 (got {plain_storage_rows})"
+            );
+            assert_eq!(
+                tx.entries::<HashedStorages>()?,
+                plain_storage_rows,
+                "hashed storage rows must match plain storage rows exactly"
+            );
+
+            // spot-check the hashed tables directly: the whale's deep probe slot lives under
+            // keccak256(address)/keccak256(slot) with its value, exactly as a whole-account import
+            // would write it
+            let hashed_addr = keccak256(big);
+            let hashed_slot = keccak256(probe_slot);
+            let mut cursor = tx.cursor_dup_read::<HashedStorages>()?;
+            let entry = cursor
+                .seek_by_key_subkey(hashed_addr, hashed_slot)?
+                .filter(|e| e.key == hashed_slot)
+                .expect("whale probe slot must be present in HashedStorages");
+            assert_eq!(
+                entry.value,
+                U256::from_be_bytes(probe_value.0),
+                "hashed storage value for the deep probe slot must match"
+            );
+        }
+
+        // read the state back: balances, code, and deep storage slots intact
         assert_eq!(reader.last_block_number()?, b);
         let state = reader.latest()?;
         assert_eq!(state.account_balance(&eoa_a)?, Some(U256::from(100u64)));
         assert_eq!(state.account_balance(&eoa_f)?, Some(U256::from(600u64)));
+        assert_eq!(state.basic_account(&big)?.expect("whale restored").nonce, 4);
+        assert_eq!(
+            state.account_code(&big)?.map(|c| c.original_bytes()),
+            Some(code.clone()),
+            "whale code must round-trip"
+        );
         assert_eq!(state.storage(contract, slot_a)?, Some(U256::from(111u64)));
+        assert_eq!(state.storage(contract, slot_b)?, Some(U256::from(222u64)));
+        assert_eq!(
+            state.storage(big, word(0))?,
+            Some(U256::from(1u64)),
+            "the whale's first slot (first chunk) must survive"
+        );
         assert_eq!(
             state.storage(big, probe_slot)?,
             Some(U256::from_be_bytes(probe_value.0)),
-            "a slot past the first storage chunk must survive the chunked reassembly"
+            "a slot several chunks deep must survive the per-chunk import"
+        );
+        assert_eq!(
+            state.storage(big, word(MULTI_CHUNK_SLOTS - 1))?,
+            Some(U256::from(MULTI_CHUNK_SLOTS)),
+            "the whale's last slot (last chunk) must survive"
         );
 
         Ok(())
