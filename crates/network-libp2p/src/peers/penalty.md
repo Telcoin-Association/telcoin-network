@@ -92,7 +92,6 @@ ban itself was applied elsewhere.
 | ------------------------------------------------ | ------------------------------------------------------ | ----------------------------------------------- |
 | `crates/consensus/worker/src/network/mod.rs:246` | `process_report_batch`                                 | `WorkerNetworkError::into() -> Option<Penalty>` |
 | `crates/consensus/worker/src/network/mod.rs:271` | `process_gossip`                                       | `WorkerNetworkError::penalty()`                 |
-| `crates/consensus/worker/src/network/mod.rs:379` | `process_request_batches_stream` response-error branch | `WorkerNetworkError::into() -> Option<Penalty>` |
 | `crates/consensus/worker/src/network/mod.rs:435` | `process_inbound_stream`                               | `WorkerNetworkError::penalty()`                 |
 
 ### 4.2 `WorkerNetworkError::penalty()` mapping
@@ -141,7 +140,6 @@ Source: `crates/consensus/worker/src/network/error.rs:76-138`.
 | `crates/consensus/primary/src/network/mod.rs:682` | `retrieve_missing_certs`                   | `(&PrimaryNetworkError).into() -> Option<Penalty>` |
 | `crates/consensus/primary/src/network/mod.rs:719` | `retrieve_consensus_header`                | `(&PrimaryNetworkError).into()` — only reachable variant `UnknownConsensusHeaderDigest` → `None` |
 | `crates/consensus/primary/src/network/mod.rs:751` | `retrieve_epoch_record`                    | `(&PrimaryNetworkError).into()`                    |
-| `crates/consensus/primary/src/network/mod.rs:835` | `process_epoch_stream` response-err branch | `(&PrimaryNetworkError).into()`                    |
 | `crates/consensus/primary/src/network/mod.rs:863` | `process_gossip`                           | `(&PrimaryNetworkError).into()`                    |
 | `crates/consensus/primary/src/network/mod.rs:912` | `process_inbound_stream`                   | `(&PrimaryNetworkError).into()`                    |
 

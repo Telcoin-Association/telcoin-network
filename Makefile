@@ -12,6 +12,10 @@ NIGHTLY:=$(shell cat $(ROOT_DIR)/rust-nightly)
 # Default tag is latest if not specified
 TAG ?= latest
 
+# git commit embedded in the image version string (vergen override; avoids needing .git in
+# the build context). Falls back to `unknown` outside a git checkout.
+GIT_SHA := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+
 help:
 	@echo ;
 	@echo "=== Prerequisites ===" ;
@@ -108,13 +112,16 @@ test-faucet:
 	cargo nextest run --package telcoin-network --features faucet --test it ;
 
 # Build the node binary once so e2e test processes reuse it via TN_BIN_PATH instead of
-# rebuilding it through escargot (~3-10s of cargo overhead per test process).
+# rebuilding it through escargot (~3-10s of cargo overhead per test process). Built under the
+# optimized `e2e` profile (opt-level 2 with debug-assertions/overflow-checks kept on; see
+# `[profile.e2e]` in .cargo/config.toml) so the reused binary runs consensus and EVM at speed.
 .PHONY: build-e2e-bin
 build-e2e-bin:
-	cargo build --bin telcoin-network --features tn-storage/test-utils --target-dir $(CURDIR)/target ;
+	cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir $(CURDIR)/target ;
 
 # Location of the binary built by build-e2e-bin, passed to the e2e tests via TN_BIN_PATH.
-E2E_BIN := $(CURDIR)/target/debug/telcoin-network
+# A named cargo profile emits into target/<profile>/, so the `e2e` profile binary lands here.
+E2E_BIN := $(CURDIR)/target/e2e/telcoin-network
 
 # run restart integration tests
 test-restarts: build-e2e-bin
@@ -149,7 +156,12 @@ docker-login:
 # build and push latest adiri image for amd64 and arm64
 # CARGO_FEATURES=adiri compiles in the testnet fork logic (ConsensusRegistry fork, ADIRI_DUP_BATCH_EPOCH).
 docker-adiri:
-	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+
+# build and push latest devnet image for amd64 and arm64
+# CARGO_FEATURES=faucet compiles in the faucet support only
+docker-devnet:
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
 
 # push local adiri:latest to the gcloud artifact registry
 docker-push:

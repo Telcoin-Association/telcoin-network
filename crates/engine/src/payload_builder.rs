@@ -79,6 +79,11 @@ pub fn execute_consensus_output(
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
     let anchor_hash = canonical_header.hash();
+    // The pre-output canonical tip. Each block eagerly advances the shared in-memory state
+    // (see `execute_payload`), but the durable commit happens only after the whole output builds.
+    // If a later block fails, the earlier blocks' advance is rolled back to this header so no
+    // phantom canonical head survives (see `rollback_in_memory_output`).
+    let anchor_header = canonical_header.clone();
     let mut ancestors: Vec<DeferredTrieData> = Vec::with_capacity(batches.len().max(1));
 
     if batches.is_empty() {
@@ -124,7 +129,7 @@ pub fn execute_consensus_output(
         debug!(target: "engine", "executing empty batch payload");
 
         // execute the payload and update the current canonical header
-        canonical_header = execute_payload(
+        let executed = execute_payload(
             payload,
             &vec![],
             &mut executed_blocks,
@@ -132,7 +137,12 @@ pub fn execute_consensus_output(
             &canonical_in_memory_state,
             anchor_hash,
             &ancestors,
-        )?;
+        );
+        // On failure, revert the in-memory advance applied by any earlier block of this output so
+        // the propagated error never leaves a phantom canonical head observable to RPC.
+        canonical_header = executed.inspect_err(|_| {
+            rollback_in_memory_output(&canonical_in_memory_state, &anchor_header, &executed_blocks)
+        })?;
         if let Some(last_block) = executed_blocks.last() {
             ancestors.push(last_block.trie_data_handle());
         }
@@ -166,7 +176,7 @@ pub fn execute_consensus_output(
             );
 
             // execute the payload and update the current canonical header
-            canonical_header = execute_payload(
+            let executed = execute_payload(
                 payload,
                 &batch.transactions,
                 &mut executed_blocks,
@@ -174,7 +184,17 @@ pub fn execute_consensus_output(
                 &canonical_in_memory_state,
                 anchor_hash,
                 &ancestors,
-            )?;
+            );
+            // On failure of a later block, revert the in-memory advance applied by the earlier
+            // blocks of this output so the propagated (node-halting) error never leaves a phantom
+            // canonical head observable to RPC before the node restarts.
+            canonical_header = executed.inspect_err(|_| {
+                rollback_in_memory_output(
+                    &canonical_in_memory_state,
+                    &anchor_header,
+                    &executed_blocks,
+                )
+            })?;
             if let Some(last_block) = executed_blocks.last() {
                 ancestors.push(last_block.trie_data_handle());
             }
@@ -192,7 +212,8 @@ pub fn execute_consensus_output(
         executed_blocks,
         Some((leader_round, consensus_num_hash, engine_update_tx)),
     )?;
-    // remove blocks from memory and stores them in the database
+    // update the in-memory finalized/safe watches and prune persisted blocks from memory
+    // (the database markers committed atomically with the blocks above)
     reth_env.finalize_block(canonical_header.clone())?;
 
     // return new canonical header for next engine task
@@ -219,6 +240,11 @@ fn execute_payload(
     info!(target: "engine", hash = canonical_header.hash().to_string(), number = canonical_header.number, "next block executed");
     crate::metrics::ENGINE_METRICS.blocks_executed_total.increment(1);
     crate::metrics::ENGINE_METRICS.block_gas_used.record(canonical_header.gas_used as f64);
+    // Eagerly advance the shared in-memory state. This is load-bearing within a multi-block
+    // output: the next block in the loop resolves its parent state through this advance. The
+    // advance is speculative until the whole output commits durably after the loop; if a later
+    // block fails to build, `execute_consensus_output` compensates it via
+    // `rollback_in_memory_output`.
     canonical_in_memory_state.set_pending_block(next_canonical_block.clone());
     canonical_in_memory_state
         .update_chain(NewCanonicalChain::Commit { new: vec![next_canonical_block.clone()] });
@@ -228,4 +254,37 @@ fn execute_payload(
     executed_blocks.push(next_canonical_block);
 
     Ok(canonical_header)
+}
+
+/// Roll back the eager per-block in-memory canonical advance for a consensus output whose batch
+/// loop failed partway through.
+///
+/// `execute_payload` advances the shared `CanonicalInMemoryState` (pending block, in-memory chain
+/// segment, and canonical head) for every block it builds, because a later block in the same output
+/// resolves its parent state from that advance. The durable commit and the finalized/safe markers
+/// are written only once the whole output has built (`RethEnv::finish_executing_output` then
+/// `RethEnv::finalize_block`). So when a block after the first fails to build,
+/// `execute_consensus_output` propagates the error before any durable write, leaving the earlier
+/// blocks advanced in memory but absent from the database: a transient "phantom" canonical head
+/// that RPC `latest`/`pending` reads observe until a restart rebuilds in-memory state from the
+/// finalized tip.
+///
+/// This reverts that advance so the phantom head is never observable. The `advanced` blocks are
+/// removed from the in-memory chain with a reorg whose `new` chain is empty (which also clears any
+/// pending block), and the canonical head is reset to `anchor_header`, the output's pre-loop parent
+/// tip. It is a no-op when nothing advanced: an empty `advanced` slice reorgs no blocks and resets
+/// the head to the value it already holds, so it is safe to call on every error exit of the loop.
+///
+/// Scope: this compensates only the pre-durable-commit advance inside the batch loop. Once
+/// `finish_executing_output` commits the blocks they are canonical for real and must not be
+/// reverted; the durable two-transaction commit/finalize window is a separate concern handled by
+/// `RethEnv::heal_finalized_to_persisted_tip`.
+fn rollback_in_memory_output(
+    canonical_in_memory_state: &CanonicalInMemoryState,
+    anchor_header: &SealedHeader,
+    advanced: &[ExecutedBlock],
+) {
+    canonical_in_memory_state
+        .update_chain(NewCanonicalChain::Reorg { new: Vec::new(), old: advanced.to_vec() });
+    canonical_in_memory_state.set_canonical_head(anchor_header.clone());
 }

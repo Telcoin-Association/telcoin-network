@@ -373,6 +373,14 @@ pub struct PeerConfig {
     pub max_banned_peers: usize,
     /// The maximum number of disconnected peers to maintain before pruning.
     pub max_disconnected_peers: usize,
+    /// The maximum number of entries retained in the temporarily-banned reconnection cache.
+    ///
+    /// This bounds the `temporarily_banned` cache (`BannedPeerCache`), which is keyed by `PeerId`
+    /// and otherwise grows only with the reputation-ban rate between heartbeats. On overflow the
+    /// oldest entry is evicted, so the cache never exceeds this size regardless of ban admission
+    /// rate. This is distinct from `max_banned_peers`, which bounds the reputation-ban table in
+    /// `AllPeers`; this knob bounds the swarm-level reconnection-timeout cache.
+    pub max_temporarily_banned_peers: usize,
     /// The config for scoring peers.
     pub score_config: ScoreConfig,
 }
@@ -393,6 +401,7 @@ impl Default for PeerConfig {
             excess_peers_reconnection_timeout: Duration::from_secs(600),
             max_banned_peers: 100,
             max_disconnected_peers: 100,
+            max_temporarily_banned_peers: 100,
             score_config: ScoreConfig::default(),
         }
     }
@@ -496,6 +505,52 @@ impl ScoreConfig {
     pub fn halflife_decay(&self) -> f64 {
         -(2.0f64.ln()) / self.score_halflife
     }
+
+    /// Reject a score configuration that would panic or silently disable peer reputation.
+    ///
+    /// Every field here is read live on the peer-scoring path, so a bad value crashes or
+    /// corrupts scoring at an unpredictable later moment rather than at config load:
+    ///
+    /// - `Score::add` clamps the aggregate score into `[min_score, max_score]` with `f64::clamp`,
+    ///   which panics if `min_score > max_score` or if either bound is `NaN`.
+    /// - `min_score_before_disconnect` / `min_score_before_ban` gate every reputation decision; a
+    ///   `NaN` there makes each `score <= threshold` comparison false, so a misbehaving peer is
+    ///   never disconnected or banned (a silent DoS-tolerance failure).
+    /// - `default_score` seeds every new peer's score; a `NaN` there poisons the same comparisons
+    ///   for that peer.
+    /// - `Self::halflife_decay` divides `-ln(2)` by `score_halflife`; a `0.0` yields `-inf` and a
+    ///   negative value flips exponential decay into unbounded growth.
+    ///
+    /// Validate at startup, on the same footing as `Parameters::validate`, so a bad score
+    /// config fails fast with a field-named error rather than halting the running swarm at
+    /// the first peer penalty.
+    pub fn validate(&self) -> eyre::Result<()> {
+        [
+            ("default_score", self.default_score),
+            ("max_score", self.max_score),
+            ("min_score", self.min_score),
+            ("min_score_before_disconnect", self.min_score_before_disconnect),
+            ("min_score_before_ban", self.min_score_before_ban),
+            ("score_halflife", self.score_halflife),
+        ]
+        .into_iter()
+        .try_for_each(|(name, value)| {
+            eyre::ensure!(value.is_finite(), "ScoreConfig.{name} must be finite, got {value}");
+            Ok(())
+        })?;
+        eyre::ensure!(
+            self.min_score <= self.max_score,
+            "ScoreConfig.min_score ({}) must be <= max_score ({})",
+            self.min_score,
+            self.max_score,
+        );
+        eyre::ensure!(
+            self.score_halflife > 0.0,
+            "ScoreConfig.score_halflife must be > 0, got {}",
+            self.score_halflife,
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -519,6 +574,28 @@ mod tests {
             default.sync_config.max_skip_rounds_for_missing_certs
         );
         assert_eq!(parsed.quic_config.max_idle_timeout, default.quic_config.max_idle_timeout);
+    }
+
+    #[test]
+    fn temporarily_banned_cap_has_valid_default() {
+        // The temporarily-banned cache cap must ship with a sane, positive default so the cache is
+        // bounded out of the box, parallel to `max_banned_peers`.
+        let default = PeerConfig::default();
+        assert!(
+            default.max_temporarily_banned_peers > 0,
+            "max_temporarily_banned_peers default must be positive"
+        );
+        assert_eq!(
+            default.max_temporarily_banned_peers, 100,
+            "default should mirror the sibling max_banned_peers cap"
+        );
+
+        // an empty config falls back to the default, so operators inherit the bound automatically.
+        let parsed: NetworkConfig = serde_yaml::from_str("{}").expect("empty mapping deserializes");
+        assert_eq!(
+            parsed.peer_config.max_temporarily_banned_peers,
+            default.max_temporarily_banned_peers,
+        );
     }
 
     #[test]
@@ -621,5 +698,88 @@ hostname: "my-validator"
                 .expect("deserialize libp2p config with an explicit chain_id");
         assert_eq!(from_disk.chain_id, 0, "an on-disk chain_id must be ignored on read");
         assert_eq!(from_disk.max_rpc_message_size, 1, "other fields still load");
+    }
+
+    #[test]
+    fn default_score_config_validates() {
+        // Mirrors `Parameters::default().validate()` must succeed: the shipped default must
+        // never be the thing that trips the startup guard.
+        ScoreConfig::default().validate().expect("default score config must validate");
+    }
+
+    #[test]
+    fn score_config_rejects_min_greater_than_max() {
+        // Pins the `min_score <= max_score` invariant: without it, `Score::add`'s `f64::clamp`
+        // panics on the first non-fatal peer penalty. Confirmed by mutation: deleting that
+        // `ensure!` makes `validate()` return `Ok` for this config, so this test (asserting
+        // `is_err`) fails.
+        let config = ScoreConfig { min_score: 1.0, max_score: -1.0, ..Default::default() };
+        assert!(config.validate().is_err(), "min_score greater than max_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_accepts_min_equal_to_max() {
+        // The clamp precondition is `min <= max`, so equal bounds are valid and must not be
+        // rejected (guards against an over-tight `<` check).
+        let config = ScoreConfig { min_score: 5.0, max_score: 5.0, ..Default::default() };
+        config.validate().expect("min_score == max_score must validate");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_max_score() {
+        // A `NaN` bound panics `f64::clamp` regardless of ordering.
+        let config = ScoreConfig { max_score: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN max_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_min_score() {
+        let config = ScoreConfig { min_score: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN min_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_default_score() {
+        // `default_score` seeds every new peer's score; a NaN there poisons every later
+        // threshold comparison for that peer.
+        let config = ScoreConfig { default_score: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN default_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_disconnect_threshold() {
+        // A NaN disconnect/ban threshold makes `score <= threshold` always false, so no peer
+        // is ever disconnected or banned: a silent reputation-enforcement failure.
+        let config = ScoreConfig { min_score_before_disconnect: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN disconnect threshold must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_ban_threshold() {
+        let config = ScoreConfig { min_score_before_ban: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN ban threshold must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_zero_halflife() {
+        // `halflife_decay` divides by `score_halflife`; `0.0` yields a `-inf` decay constant.
+        // Pins the `score_halflife > 0.0` invariant.
+        let config = ScoreConfig { score_halflife: 0.0, ..Default::default() };
+        assert!(config.validate().is_err(), "a zero score_halflife must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_negative_halflife() {
+        // A negative halflife flips exponential decay into unbounded growth.
+        let config = ScoreConfig { score_halflife: -1.0, ..Default::default() };
+        assert!(config.validate().is_err(), "a negative score_halflife must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_halflife() {
+        // A NaN halflife is caught by the finite check before the `> 0.0` comparison (which a
+        // NaN would fail anyway); pin it explicitly so the ordering of the two checks is safe.
+        let config = ScoreConfig { score_halflife: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN score_halflife must be rejected");
     }
 }

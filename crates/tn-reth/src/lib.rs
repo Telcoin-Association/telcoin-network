@@ -830,25 +830,19 @@ impl RethEnv {
         Ok(res)
     }
 
-    /// Finalize block (header) executed from consensus output and update chain info.
+    /// Finalize the block (header) executed from consensus output in memory.
     ///
-    /// This stores the finalized block number in the
-    /// database, but still need to set_finalized afterwards for utilization in-memory for
-    /// components, like RPC
+    /// The finalized/safe database markers are persisted atomically with the blocks in
+    /// [`Self::finish_executing_output`]; this method only updates the in-memory
+    /// finalized/safe watches (consumed by components like RPC) and prunes persisted blocks
+    /// from the canonical in-memory state.
     pub fn finalize_block(&self, header: SealedHeader) -> TnRethResult<()> {
         let num_hash = header.num_hash();
-        // persiste final block info for node recovery
-        let provider = self.inner.blockchain_provider.database_provider_rw()?;
-        provider.save_finalized_block_number(header.number)?;
         // this clears up old blocks in-memory
         self.inner.blockchain_provider.set_finalized(header.clone());
 
         // update safe block last because this is less time sensitive but still needs to happen
-        provider.save_safe_block_number(header.number)?;
         self.inner.blockchain_provider.set_safe(header);
-
-        // commit db transaction
-        provider.commit()?;
 
         // cleanup chain state in memory
         // this returns the `canonical_chain().count()` back to 0
@@ -862,22 +856,25 @@ impl RethEnv {
 
     /// Advance a lagging finalized marker to the persisted canonical tip.
     ///
-    /// Blocks commit in [`Self::finish_executing_output`] and the finalized/safe markers commit
-    /// in [`Self::finalize_block`] — two separate database transactions. A crash between them
-    /// restarts the node with `finalized marker < persisted canonical tip`, hiding the gap
-    /// blocks from every marker reader (accumulator catchup, the tx-pool's last-seen seed, the
-    /// RPC `finalized`/`safe` tags).
+    /// Blocks and the finalized/safe markers commit in a single database transaction in
+    /// [`Self::finish_executing_output`], so a crash can no longer leave the marker behind the
+    /// persisted tip — the two-transaction crash window this heal was written for does not
+    /// exist for new writes. The heal is retained as defense-in-depth for databases written by
+    /// pre-fix versions, which committed the markers separately in `finalize_block`: a crash
+    /// between the two transactions restarted the node with `finalized marker < persisted
+    /// canonical tip`, hiding the gap blocks from every marker reader (accumulator catchup,
+    /// the tx-pool's last-seen seed, the RPC `finalized`/`safe` tags).
     ///
     /// Advancing the marker is sound because every persisted canonical block is consensus-final
     /// by construction: blocks only enter the canonical database from committed consensus
     /// output, so there is no speculative or reorgable segment the marker could overrun. The
-    /// lag is purely a two-transaction persistence artifact.
+    /// lag is purely a persistence artifact of the pre-fix two-transaction design.
     ///
-    /// The heal MUST route through [`Self::finalize_block`] rather than a bare
-    /// `save_finalized_block_number` write: the in-memory finalized/safe watches are seeded
-    /// from the (stale) database at provider construction, and startup marker readers like the
-    /// accumulator catchup consult the watch — a DB-only write would leave them reading the
-    /// stale value.
+    /// The heal persists the marker itself ([`Self::finalize_block`] no longer writes the
+    /// database) and then routes through `finalize_block` for the in-memory half: the
+    /// finalized/safe watches are seeded from the (stale) database at provider construction,
+    /// and startup marker readers like the accumulator catchup consult the watch — a DB-only
+    /// write would leave them reading the stale value.
     ///
     /// Replay is unaffected: the missed-consensus watermark derives from the persisted
     /// execution tip (which this method never moves), not the finalized marker, so healing
@@ -899,7 +896,7 @@ impl RethEnv {
         let provider = self.inner.blockchain_provider.database_provider_ro()?;
         let tip = provider.last_block_number()?;
         // None = never finalized (fresh genesis). Some(0) is unreachable in production (the
-        // first finalize_block call is for block >= 1), so collapsing None to 0 is safe.
+        // first marker write covers block >= 1), so collapsing None to 0 is safe.
         let finalized = provider.last_finalized_block_number()?.unwrap_or(0);
 
         if finalized > tip {
@@ -919,15 +916,25 @@ impl RethEnv {
             target: "tn::reth",
             finalized,
             tip,
-            "finalized marker lags the persisted canonical tip (crash between the \
-             blocks-commit and finalize-commit transactions); healing marker to tip"
+            "finalized marker lags the persisted canonical tip (database written by a pre-fix \
+             version that committed blocks and the marker separately); healing marker to tip"
         );
+        // durably fix the marker on disk before touching the watches: finalize_block only
+        // updates in-memory state, so a lagging pre-fix database needs its rows rewritten here
+        let provider_rw = self.inner.blockchain_provider.database_provider_rw()?;
+        provider_rw.save_finalized_block_number(tip)?;
+        provider_rw.save_safe_block_number(tip)?;
+        provider_rw.commit()?;
         self.finalize_block(header)
     }
 
     /// This makes all blocks canonical, commits them to the database,
     /// broadcasts new chain on `canon_state_notification_sender`
     /// and set last executed header as the tracked header.
+    ///
+    /// The finalized/safe markers commit in the same database transaction as the blocks, so a
+    /// crash can never leave the persisted marker behind the persisted tip. The in-memory
+    /// finalized/safe watches are updated afterwards by [`Self::finalize_block`].
     ///
     /// It also clears the canonical in-memory state.
     pub fn finish_executing_output(
@@ -951,6 +958,15 @@ impl RethEnv {
         // insert blocks to db
         let provider_rw = self.inner.blockchain_provider.database_provider_rw()?;
         provider_rw.save_blocks(blocks.clone(), reth_provider::SaveBlocksMode::Full)?;
+        // advance the finalized/safe markers in the same transaction as the blocks: every
+        // canonical block comes from committed consensus output, so the last saved block is
+        // final by construction, and the single commit leaves no crash window where the
+        // persisted tip outruns the marker
+        if let Some(last) = blocks.last() {
+            let last_number = last.recovered_block.number;
+            provider_rw.save_finalized_block_number(last_number)?;
+            provider_rw.save_safe_block_number(last_number)?;
+        }
         provider_rw.commit()?;
 
         // process update

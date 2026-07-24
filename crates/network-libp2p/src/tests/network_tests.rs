@@ -19,6 +19,42 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+/// Building a consensus config with a peer-score config whose `min_score > max_score` must fail
+/// at construction, before any `PeerManager`/`Score` exists. This pins the startup wiring of
+/// `ScoreConfig::validate` into `ConsensusConfig::new_with_committee`: without that call the bad
+/// bounds would install into the global score config and only panic later, inside the running
+/// swarm, at the first non-fatal peer penalty (`Score::add`'s `f64::clamp`).
+#[test]
+fn consensus_config_rejects_invalid_score_config() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    // Borrow one authority's valid base config/storage/keys so the only invalid input is the
+    // peer-score config we inject below.
+    let (base_config, node_storage, key_config) = {
+        let authority = fixture.authorities().next().expect("fixture yields an authority");
+        let cc = authority.consensus_config();
+        (cc.config().clone(), cc.node_storage().clone(), cc.key_config().clone())
+    };
+
+    let mut network_config = NetworkConfig::default();
+    let score = &mut network_config.peer_config_mut().score_config;
+    score.min_score = 1.0;
+    score.max_score = -1.0;
+
+    let Err(err) = ConsensusConfig::new_with_committee_for_test(
+        base_config,
+        node_storage,
+        key_config,
+        fixture.committee(),
+        network_config,
+    ) else {
+        panic!("min_score > max_score must be rejected when the consensus config is built");
+    };
+    assert!(
+        err.to_string().contains("min_score"),
+        "the rejection must name the offending field, got: {err}"
+    );
+}
+
 /// Helper function to create peers.
 fn create_test_peers<Req: TNMessage, Res: TNMessage>(
     num_peers: NonZeroUsize,
@@ -950,8 +986,8 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
     // assert gossip message
-    if let NetworkEvent::Gossip { message: msg, .. } = event {
-        assert_eq!(msg.data, expected_result);
+    if let NetworkEvent::Gossip(gossip) = event {
+        assert_eq!(gossip.message.data, expected_result);
     } else {
         panic!("unexpected network event received");
     }
@@ -1022,10 +1058,10 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
         timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
 
     // assert gossip message and that the resolved relayer identity is carried
-    if let NetworkEvent::Gossip { message: msg, relayer, .. } = event {
-        assert_eq!(msg.data, expected_result);
+    if let NetworkEvent::Gossip(gossip) = event {
+        assert_eq!(gossip.message.data, expected_result);
         assert_eq!(
-            relayer,
+            gossip.relayer,
             Some(target_peer_bls),
             "resolved relayer's BLS identity must be attached to the delivered gossip"
         );
@@ -1241,8 +1277,9 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 
     while !received && start.elapsed() < timeout {
         match tokio::time::timeout(Duration::from_millis(500), nvv_events.recv()).await {
-            Ok(Some(NetworkEvent::Gossip { message: msg, relayer: from, .. })) => {
-                assert_eq!(msg.data, expected_msg, "Gossip message data mismatch");
+            Ok(Some(NetworkEvent::Gossip(gossip))) => {
+                assert_eq!(gossip.message.data, expected_msg, "Gossip message data mismatch");
+                let from = gossip.relayer;
                 debug!(target: "network", ?from, "nvv received gossip from peer");
                 received = true;
             }
@@ -1267,11 +1304,12 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 /// A pruned peer that does not support the dedicated peer-exchange protocol still
 /// receives the goodbye.
 ///
-/// The raw swarm below advertises only the legacy `/tn-primary-{chain}/0.0.1`
-/// req-res protocol, exactly the wire surface of a not-yet-upgraded node. The
-/// target's goodbye attempt on `/tn-primary-peer-exchange-{chain}/0.0.1` fails
-/// with `UnsupportedProtocols` (penalty-exempt) and must fall back to the
-/// `PeerExchange` variant embedded in the legacy request enum.
+/// The raw swarm below advertises only the `/tn-primary-{chain}/0.0.2` req-res
+/// protocol and not the dedicated peer-exchange protocol, exactly the wire
+/// surface of a peer that has not adopted peer-exchange. The target's goodbye
+/// attempt on `/tn-primary-peer-exchange-{chain}/0.0.1` fails with
+/// `UnsupportedProtocols` (penalty-exempt) and must fall back to the
+/// `PeerExchange` variant embedded in the request enum.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre::Result<()> {
     tn_types::test_utils::init_test_tracing();
@@ -2231,8 +2269,8 @@ async fn test_gossip_explicit_peer_includes_next_committee() -> eyre::Result<()>
     publisher.publish(TEST_TOPIC.into(), expected.clone()).await?;
     let event =
         timeout(Duration::from_secs(2), next_peer_events.recv()).await?.expect("gossip received");
-    if let NetworkEvent::Gossip { message: msg, .. } = event {
-        assert_eq!(msg.data, expected);
+    if let NetworkEvent::Gossip(gossip) = event {
+        assert_eq!(gossip.message.data, expected);
     } else {
         panic!("unexpected network event received");
     }
@@ -2377,8 +2415,8 @@ async fn test_get_kad_records() -> eyre::Result<()> {
 
     // wait for gossip from disconnected peer
     match timeout(Duration::from_secs(5), nvv_events.recv()).await {
-        Ok(Some(NetworkEvent::Gossip { message: msg, .. })) => {
-            let GossipMessage { source, data, .. } = msg;
+        Ok(Some(NetworkEvent::Gossip(gossip))) => {
+            let GossipMessage { source, data, .. } = gossip.message;
             assert_eq!(source, Some(target_peer_id));
             assert_eq!(data, expected_msg);
         }
@@ -2811,6 +2849,73 @@ async fn test_publisherless_put_cannot_delete_own_record() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Inbound `AddProvider` gates the store write on the provider's ban status, at
+/// parity with the `PutRecord` path (issue #1001). Under `StoreInserts::FilterBoth`
+/// this arm is the sole write path for inbound provider records, so an un-gated
+/// arm would persist an attacker-supplied record from a peer already banned at the
+/// application layer.
+///
+/// A record from an un-banned provider is stored; a record from a banned provider
+/// is dropped before it reaches the store. Deleting the ban filter in
+/// `process_kad_add_provider` (storing unconditionally, i.e. today's behaviour)
+/// makes the banned-provider assertion fail, pinning the gate.
+#[tokio::test]
+async fn test_add_provider_rejects_banned_provider() -> eyre::Result<()> {
+    use libp2p::kad;
+
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // An un-banned provider: its record is persisted (positive path preserved).
+    // libp2p guarantees `provider == source`, so the provider id is authenticated;
+    // this test drives the handler directly and keys each record on its provider.
+    let honest = PeerId::random();
+    let honest_record = kad::ProviderRecord {
+        key: kad::RecordKey::new(&honest.to_bytes()),
+        provider: honest,
+        expires: None,
+        addresses: vec![],
+    };
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&honest));
+    network.process_kad_add_provider(Some(honest_record.clone()))?;
+    assert_eq!(
+        network.swarm.behaviour_mut().kademlia.store_mut().providers(&honest_record.key).len(),
+        1,
+        "un-banned provider record is stored",
+    );
+
+    // A banned provider: register a default record then apply a Fatal penalty,
+    // which crosses the ban threshold on the first hit.
+    let attacker = PeerId::random();
+    network.swarm.behaviour_mut().peer_manager.disconnect_peer(attacker, false);
+    network.swarm.behaviour_mut().peer_manager.process_penalty(attacker, Penalty::Fatal);
+    assert!(
+        network.swarm.behaviour().peer_manager.peer_banned(&attacker),
+        "attacker provider is banned",
+    );
+
+    // Its `AddProvider` is dropped: nothing lands in the store for the attacker key.
+    let attacker_record = kad::ProviderRecord {
+        key: kad::RecordKey::new(&attacker.to_bytes()),
+        provider: attacker,
+        expires: None,
+        addresses: vec![],
+    };
+    network.process_kad_add_provider(Some(attacker_record.clone()))?;
+    assert!(
+        network
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .providers(&attacker_record.key)
+            .is_empty(),
+        "banned provider record is not stored (issue #1001)",
+    );
+
+    Ok(())
+}
+
 /// A signed record advertising an RPC endpoint with a well-formed URL but the
 /// wrong scheme is accepted (the signature is authentic) and promoted with the
 /// malformed endpoint stripped, without penalizing the sender.
@@ -2915,7 +3020,12 @@ async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result
     // seed the DB before the network starts, simulating records that survived
     // a node restart from before the upgrade
     {
-        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), NetworkType::Primary);
+        let mut kad_store = KadStore::new(
+            db.clone(),
+            PeerId::random(),
+            config_1.key_config(),
+            NetworkType::Primary,
+        );
 
         // valid pre-upgrade record signed by authority 2 over the legacy encoding
         let old_info = OldNetworkInfo {
@@ -2975,7 +3085,7 @@ async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result
 
     // the corrupt record was purged from the persistent store; the legacy
     // record's original signed bytes were preserved
-    let store = KadStore::new(db, config_1.key_config(), NetworkType::Primary);
+    let store = KadStore::new(db, PeerId::random(), config_1.key_config(), NetworkType::Primary);
     assert!(store.get(&kad::RecordKey::new(&garbage_bls)).is_none(), "corrupt record purged");
     assert!(store.get(&kad::RecordKey::new(&owner_bls)).is_some(), "legacy record preserved");
 
@@ -3013,7 +3123,12 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
     // seed the DB before the network starts with two VALID records: one for a committee
     // authority and one for the non-committee outsider
     {
-        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), NetworkType::Primary);
+        let mut kad_store = KadStore::new(
+            db.clone(),
+            PeerId::random(),
+            config_1.key_config(),
+            NetworkType::Primary,
+        );
 
         let key_config_2 = config_2.key_config();
         let authority_record = NodeRecord::build(
@@ -3112,7 +3227,12 @@ async fn test_restore_skips_own_record() -> eyre::Result<()> {
     // seed the DB with a valid record for the node's OWN primary BLS key, built the same way
     // the node builds its own record
     {
-        let mut kad_store = KadStore::new(db.clone(), config_1.key_config(), NetworkType::Primary);
+        let mut kad_store = KadStore::new(
+            db.clone(),
+            PeerId::random(),
+            config_1.key_config(),
+            NetworkType::Primary,
+        );
         let key_config = config_1.key_config();
         let own_record = NodeRecord::build(
             key_config.primary_network_public_key(),
@@ -3201,8 +3321,10 @@ fn accepted_gossip_with_unresolved_relayer_is_delivered() -> eyre::Result<()> {
         accepted_gossip_event(message.clone(), None, None);
     assert_matches!(
         event,
-        NetworkEvent::Gossip { message: delivered, relayer: None, author: None }
-            if delivered.data == message.data
+        NetworkEvent::Gossip(payload)
+            if payload.relayer.is_none()
+                && payload.author.is_none()
+                && payload.message.data == message.data
     );
     Ok(())
 }
@@ -3214,7 +3336,7 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
         accepted_gossip_event(message, Some(bls), None);
-    assert_matches!(event, NetworkEvent::Gossip { relayer: Some(got), .. } if got == bls);
+    assert_matches!(event, NetworkEvent::Gossip(payload) if payload.relayer == Some(bls));
     Ok(())
 }
 
@@ -3298,7 +3420,7 @@ fn accepted_gossip_carries_resolved_author_identity() -> eyre::Result<()> {
     let message = test_gossip_message();
     let event: NetworkEvent<TestWorkerRequest, TestWorkerResponse> =
         accepted_gossip_event(message, None, Some(author));
-    assert_matches!(event, NetworkEvent::Gossip { author: Some(got), .. } if got == author);
+    assert_matches!(event, NetworkEvent::Gossip(payload) if payload.author == Some(author));
     Ok(())
 }
 

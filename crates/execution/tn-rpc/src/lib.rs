@@ -8,7 +8,7 @@ pub use rpc_ext::{TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use serde::Serialize;
 use tn_types::{
     Address, AuthorityIdentifier, BlsPublicKey, ConsensusHeader, Epoch, EpochCertificate,
-    EpochDigest, EpochRecord, Multiaddr, NetworkPublicKey,
+    EpochDigest, EpochRecord, Multiaddr, NetworkPublicKey, NodeMode,
 };
 
 /// Contain the node's identifying info to provide over RPC.
@@ -52,4 +52,9 @@ pub trait EngineToPrimary {
     ) -> impl std::future::Future<Output = Option<(EpochRecord, EpochCertificate)>> + Send;
     /// Return the node's static information.
     fn node_info(&self) -> &RpcNodeInfo;
+    /// Return the node's current consensus participation mode.
+    ///
+    /// Read live so callers can observe transient modes (e.g. `CvvInactive` while a restarted node
+    /// catches up); it is not part of the static [`RpcNodeInfo`].
+    fn node_mode(&self) -> NodeMode;
 }

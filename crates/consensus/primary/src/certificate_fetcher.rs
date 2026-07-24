@@ -464,6 +464,12 @@ async fn fetch_from_peers<F: MissingCertFetcher>(
 
     // track requests per peer
     let mut peer_index = 0;
+    // Count completed per-peer fetches. Each spawned task sends exactly one result unless it is
+    // cancelled on another peer's success (after which we have already returned), so once every
+    // peer has been spawned and `results_received == peer_index`, all fetches have finished. This
+    // replaces `tx_results.is_closed()`, which never became true because this task holds
+    // `tx_results` for the whole loop, so the early-exit checks were dead (issue #866).
+    let mut results_received = 0usize;
 
     // spawn first peer fetch immediately
     if !peers.is_empty() {
@@ -486,6 +492,9 @@ async fn fetch_from_peers<F: MissingCertFetcher>(
     loop {
         tokio::select! {
             Some((peer, result)) = rx_results.recv() => {
+                // a spawned fetch reported back (success, empty, or error)
+                results_received += 1;
+
                 if let Ok(certificates) = result {
                     if !certificates.is_empty() {
                         debug!(target: "primary::cert_fetcher",
@@ -517,8 +526,14 @@ async fn fetch_from_peers<F: MissingCertFetcher>(
                         "Received empty certificate response, continuing with other peers");
                 }
 
-                // check if all peers have been tried and all tasks completed
-                if peer_index >= peers.len() && tx_results.is_closed() {
+                // fast-fail once every peer has been spawned and every spawned fetch has
+                // reported without success, instead of parking until the outer timeout fires.
+                // The caller (`handle_fetch_completion`) restarts immediately, so retry pacing for
+                // an unsatisfiable target comes from the staggered spawn above, a floor of
+                // ~`(peers.len() - 1) * fallback_delay`. With a single peer that stagger is absent,
+                // so pacing then relies on the per-peer fetch latency; real committees are
+                // `3f + 1` (>= 3 peers), where the stagger floor always applies.
+                if peer_index >= peers.len() && results_received >= peer_index {
                     debug!(target: "primary::cert_fetcher",
                         "All peers tried without success");
                     return Err(CertManagerError::NoCertificateFetched);
@@ -544,14 +559,14 @@ async fn fetch_from_peers<F: MissingCertFetcher>(
             }
 
             else => {
-                // all peers spawned, no results yet - wait for tasks to complete
-                if tx_results.is_closed() {
-                    debug!(target: "primary::cert_fetcher",
-                        "No peer could provide certificates");
-                    sleep(fallback_delay).await;
-                    return Err(CertManagerError::NoCertificateFetched);
-                }
-                // continue waiting for results
+                // Defensive terminal that keeps the `select!` total so it can never panic on an
+                // all-disabled poll. The `recv` branch only disables once every sender has
+                // dropped, which cannot happen while this task holds `tx_results`; ordinary
+                // completion is detected by the counter check above. If the channel is ever fully
+                // closed, report the same "nobody had them" verdict.
+                debug!(target: "primary::cert_fetcher",
+                    "No peer could provide certificates");
+                return Err(CertManagerError::NoCertificateFetched);
             }
         }
     }

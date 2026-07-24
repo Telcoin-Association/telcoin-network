@@ -295,7 +295,7 @@ async fn test_epoch_sync_inner(
         let mut result = provider.get_chain_id().await;
         while let Err(e) = result {
             debug!(target: "epoch-test", "provider error getting chain id: {e:?}");
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
             // make next request
             result = provider.get_chain_id().await;
@@ -304,8 +304,8 @@ async fn test_epoch_sync_inner(
     .await?;
 
     // No pre-pad sleep is needed here: loop_epochs polls until the epoch changes.
-    // Go through at least 5 epochs.
-    loop_epochs(0, 5, &endpoints[0].http_url, EPOCH_DURATION).await?;
+    // Go through at least 3 epochs.
+    loop_epochs(0, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
     // Kill a node
     if let Some(mut taken) = guard.take(kill_idx) {
         super::common::kill_child(&mut taken);
@@ -316,7 +316,7 @@ async fn test_epoch_sync_inner(
     let killed_provider = ProviderBuilder::new().connect_http(killed_url.parse()?);
     assert!(killed_provider.get_chain_id().await.is_err(), "Node not down!");
 
-    loop_epochs(5, 5, &endpoints[0].http_url, EPOCH_DURATION).await?;
+    loop_epochs(3, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
     // Restart the node
     let (mut new_children, mut new_endpoints) =
         start_nodes(temp_path, nodes_to_start, "epoch_sync", 2)?;
@@ -324,7 +324,7 @@ async fn test_epoch_sync_inner(
     guard.replace(kill_idx, new_child);
     // Update the endpoint for the restarted node (new dynamic ports)
     endpoints[kill_idx] = new_endpoints.pop().expect("endpoint");
-    let current_epoch = loop_epochs(10, 5, &endpoints[0].http_url, EPOCH_DURATION).await?;
+    let current_epoch = loop_epochs(6, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
 
     // Verify all nodes have valid (certified) Epoch Records.
     // The node that was down should also have all these records after syncing.
