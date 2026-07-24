@@ -1106,4 +1106,46 @@ mod tests {
         assert!(db.cert_by_digest(records[1].digest()).await.is_some());
         assert!(db.cert_by_digest(records[2].digest()).await.is_some());
     }
+
+    /// A bundle whose records chain from a DIFFERENT genesis committee than the local one (the trust
+    /// root loaded from `--chain`) is rejected: a bundle from the wrong chain cannot be imported.
+    /// Epoch 0 carries a cert (real bundles do — it is aggregated at epoch 1's start), so it goes
+    /// through the with-cert path and `validate_downloaded_record` finds its committee incompatible
+    /// with the seeded local genesis committee.
+    #[tokio::test]
+    async fn verify_and_save_rejects_wrong_genesis_committee() {
+        let dir = TempDir::with_prefix("verify_wrong_genesis").expect("temp dir");
+        let mut rng = StdRng::seed_from_u64(4);
+        // The bundle's records are chained from committee A...
+        let signers_a: Vec<TestSigner> = (0..4)
+            .map(|_| TestSigner(std::sync::Arc::new(BlsKeypair::generate(&mut rng))))
+            .collect();
+        // ...but the local genesis committee (the trust root) is a different set B.
+        let signers_b: Vec<TestSigner> = (0..4)
+            .map(|_| TestSigner(std::sync::Arc::new(BlsKeypair::generate(&mut rng))))
+            .collect();
+        let genesis_keys_b: std::collections::BTreeSet<BlsPublicKey> =
+            signers_b.iter().map(|s| s.public_key()).collect();
+
+        // Records 0..=2 chained from committee A, each with a cert.
+        let mut records = Vec::new();
+        let mut cert_by_hash = HashMap::new();
+        let mut parent = EpochDigest::default();
+        for epoch in 0..=2u32 {
+            let (record, cert) = signed_pair(epoch, &signers_a, parent);
+            parent = record.digest();
+            cert_by_hash.insert(cert.epoch_hash, cert);
+            records.push(record);
+        }
+
+        let db = EpochRecordDb::open(dir.path()).expect("open db");
+        let err = super::verify_and_save_epoch_records(&db, genesis_keys_b, &records, &cert_by_hash)
+            .await
+            .expect_err("a bundle from a different genesis committee must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("epoch 0 record failed certificate verification"),
+            "unexpected error: {msg}"
+        );
+    }
 }

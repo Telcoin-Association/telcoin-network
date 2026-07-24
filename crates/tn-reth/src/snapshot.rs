@@ -1383,6 +1383,87 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn import_rejects_truncated_pack() -> eyre::Result<()> {
+        // A valid pack whose `state_data` file is then truncated on disk so the trailing records
+        // (the End footer and part of the account run) are lost. meta + headers at the front
+        // survive, so the reader opens, but the restore must reject the damaged stream rather than
+        // import a partial, footerless state.
+        let a = Address::from([0x0a; 20]);
+        let b_addr = Address::from([0x0b; 20]);
+        let contract = Address::from([0x0c; 20]);
+        let code: Bytes = Bytes::from_static(CODE);
+        let genesis = test_genesis().extend_accounts([
+            (
+                a,
+                GenesisAccount {
+                    nonce: Some(1),
+                    balance: U256::from(100u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                b_addr,
+                GenesisAccount {
+                    nonce: Some(2),
+                    balance: U256::from(200u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                contract,
+                GenesisAccount {
+                    nonce: Some(3),
+                    balance: U256::from(300u64),
+                    code: Some(code.clone()),
+                    storage: Some(BTreeMap::from([(B256::from([0x01; 32]), word(111))])),
+                    private_key: None,
+                },
+            ),
+        ]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Truncated Pack Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
+        let state_root = genesis_header.state_root;
+
+        let b = 1u64;
+        let header_b = synthetic_header(b, genesis_header.hash(), state_root, 0, true);
+        let window = vec![header_b.clone()];
+        let final_state = BlockNumHash::new(b, header_b.hash());
+
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, state_root, &[header_b.header().clone()], pack_dir.path());
+
+        // Corrupt the pack: drop the tail of the `state_data` stream (the End footer and part of the
+        // account run). The meta + header records at the front are untouched.
+        let data_path = pack_dir.path().join("state_data");
+        let len = std::fs::metadata(&data_path)?.len();
+        assert!(len > 24, "pack data should be larger than the truncation amount");
+        std::fs::OpenOptions::new().write(true).open(&data_path)?.set_len(len - 24)?;
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Truncated Pack Dest");
+        let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+        let restorer = SnapshotRestorer::open(&reth_config, db, &dst_tm)?;
+        restorer.import_chain_scaffold(&window, final_state)?;
+        let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+        let err = restorer
+            .import_state(&mut reader)
+            .expect_err("a truncated pack must be rejected, not imported as partial state");
+        // MissingFooter / CorruptPack / a CRC or short-read error are all acceptable — the point is
+        // the restore fails loudly instead of committing a partial state.
+        assert!(!err.to_string().is_empty(), "expected a descriptive error");
+
+        Ok(())
+    }
+
     #[test]
     fn worker_attribution_helpers_match_header_encoding() {
         // genesis (block 0) is never a genuine batch block
