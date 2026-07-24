@@ -16,6 +16,7 @@ clap = { workspace = true, features = ["derive", "env"] }
 tn-config = { workspace = true }
 tn-types = { workspace = true }
 tn-worker = { workspace = true }
+tn-storage = { workspace = true }
 dirs-next = "2.0.0"
 parking_lot = { workspace = true }
 
@@ -37,6 +38,9 @@ reth-evm = { workspace = true }
 reth-node-builder = { workspace = true }
 reth-provider = { workspace = true }
 reth-primitives-traits = { workspace = true }
+reth-stages-types = { workspace = true }
+reth-trie = { workspace = true }
+reth-trie-db = { workspace = true }
 reth-transaction-pool = { workspace = true }
 
 reth-errors = { workspace = true }
