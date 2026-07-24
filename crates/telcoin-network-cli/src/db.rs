@@ -189,6 +189,13 @@ impl DbLoadStateArgs {
             None => Config::load(&datadir, false, SHORT_VERSION)?,
         };
 
+        // Reject a non-resumable bundle BEFORE `restore_pack` mutates the datadir, so a refusal
+        // leaves the target untouched.
+        let bundle_consensus = self.pack.join("consensus_data");
+        let bundle_records = self.pack.join("epoch_records");
+        let bundle_certs = self.pack.join("epoch_certs");
+        reject_non_resumable_bundle(&bundle_consensus, &bundle_records, &bundle_certs)?;
+
         // `RethConfig::new` is the only public constructor; `RethCommand` has no `Default`, so
         // parse an empty arg list for its defaults (rpc/txpool are irrelevant to a one-shot
         // restore).
@@ -207,42 +214,79 @@ impl DbLoadStateArgs {
             datadir.reth_db_path().display()
         );
 
-        // Rebuild the consensus + epoch-records packs from the bundle's data-only files, when the
-        // bundle carries them. A plain copy would not work: these files have no index sidecars and
-        // the packs do not rebuild indexes on open, so we reconstruct fully-indexed, queryable
-        // packs at their datadir homes under `consensus-db/epochs/`, verifying each epoch record
-        // against its certificate as we go.
-        let bundle_consensus = self.pack.join("consensus_data");
-        let bundle_records = self.pack.join("epoch_records");
-        let bundle_certs = self.pack.join("epoch_certs");
-        match (bundle_consensus.exists(), bundle_records.exists(), bundle_certs.exists()) {
-            (true, true, true) => {
-                // The genesis committee is the trust root for record verification; load it exactly
-                // as the node does (its yaml was materialized by the `Config::load_*` step above).
-                let genesis_committee =
-                    Config::load_from_path::<Committee>(datadir.committee_path(), ConfigFmt::YAML)
-                        .map_err(|e| {
-                            eyre!(
-                                "failed to load genesis committee from {} (needed to verify epoch \
-                                 records): {e}",
-                                datadir.committee_path().display()
-                            )
-                        })?;
-                restore_consensus_and_records(
-                    &datadir.epochs_db_path(),
-                    &genesis_committee,
-                    &bundle_consensus,
-                    &bundle_records,
-                    &bundle_certs,
-                )?;
-            }
-            (false, false, false) => {} // state-only pack — nothing else to restore
-            _ => bail!(
-                "incomplete export bundle: expected consensus_data, epoch_records, and \
-                 epoch_certs together (re-export with the current version)"
-            ),
-        }
+        // Rebuild the consensus + epoch-records packs from the bundle's data-only files. A plain
+        // copy would not work: these files have no index sidecars and the packs do not rebuild
+        // indexes on open, so we reconstruct fully-indexed, queryable packs at their datadir homes
+        // under `consensus-db/epochs/`, verifying each epoch record against its certificate as we
+        // go. The bundle was classified complete-and-resumable above.
+        //
+        // The genesis committee is the trust root for record verification; load it exactly as the
+        // node does (its yaml was materialized by the `Config::load_*` step above).
+        let genesis_committee =
+            Config::load_from_path::<Committee>(datadir.committee_path(), ConfigFmt::YAML)
+                .map_err(|e| {
+                    eyre!(
+                        "failed to load genesis committee from {} (needed to verify epoch \
+                         records): {e}",
+                        datadir.committee_path().display()
+                    )
+                })?;
+        restore_consensus_and_records(
+            &datadir.epochs_db_path(),
+            &genesis_committee,
+            &bundle_consensus,
+            &bundle_records,
+            &bundle_certs,
+        )?;
         Ok(())
+    }
+}
+
+/// Reject an export bundle that cannot produce a resumable node, returning `Err` before any datadir
+/// mutation so a refusal leaves the target untouched.
+///
+/// A resumable node needs both the consensus side of the bundle (`consensus_data` + `epoch_records`
+/// + `epoch_certs`, present together) AND a closed epoch `>= 1`:
+///
+/// - A state-only pack (none of the three present) carries no consensus, so a node loaded from it
+///   would have execution state past genesis with no consensus output that produced it and halt.
+/// - A partial bundle (some but not all three present) is a version/corruption mismatch.
+/// - An epoch-0 bundle cannot have its consensus pack rebuilt — that needs a pre-epoch-0 genesis
+///   descriptor the data-only bundle does not carry — so it too would not resume.
+///
+/// The epoch check is a lightweight up-front read of the records (no index sidecar needed);
+/// `restore_consensus_and_records` re-reads and fully verifies them after the reth restore.
+fn reject_non_resumable_bundle(
+    bundle_consensus: &Path,
+    bundle_records: &Path,
+    bundle_certs: &Path,
+) -> eyre::Result<()> {
+    match (bundle_consensus.exists(), bundle_records.exists(), bundle_certs.exists()) {
+        (true, true, true) => {
+            let records = EpochRecordDb::read_records_from_pack(bundle_records).map_err(|e| {
+                eyre!("failed to read epoch records from {}: {e}", bundle_records.display())
+            })?;
+            let last_epoch = records
+                .last()
+                .ok_or_else(|| eyre!("bundle epoch_records contains no records"))?
+                .epoch;
+            if last_epoch == 0 {
+                bail!(
+                    "epoch-0 bundle cannot produce a resumable node (rebuilding the epoch-0 \
+                     consensus pack requires a pre-epoch-0 genesis descriptor the bundle does not \
+                     carry); bootstrap from a later epoch's complete bundle instead"
+                );
+            }
+            Ok(())
+        }
+        (false, false, false) => bail!(
+            "state-only pack cannot produce a resumable node; re-export a complete bundle with \
+             consensus_data, epoch_records, and epoch_certs"
+        ),
+        _ => bail!(
+            "incomplete export bundle: expected consensus_data, epoch_records, and epoch_certs \
+             together (re-export with the current version)"
+        ),
     }
 }
 
@@ -408,14 +452,17 @@ fn restore_consensus_and_records(
         drop(db);
 
         // 2. Rebuild the closed epoch's consensus pack. Epoch 0 would need a pre-epoch-0 genesis
-        //    descriptor that a data-only bundle doesn't carry, so skip it (records + state still
-        //    land); every later epoch uses the previous record as its genesis link.
+        //    descriptor that a data-only bundle doesn't carry, so the pack cannot be rebuilt and a
+        //    node loaded from it would not resume; every later epoch uses the previous record as
+        //    its genesis link. The caller rejects epoch-0 bundles up front (before mutating the
+        //    datadir); bail here too so there is no silent-success path if this is reached
+        //    directly.
         if n == 0 {
-            eprintln!(
-                "warning: skipping epoch-0 consensus pack rebuild (requires a genesis descriptor \
-                 not present in the bundle); restored epoch records and execution state only"
+            bail!(
+                "epoch-0 bundle cannot produce a resumable node (rebuilding the epoch-0 consensus \
+                 pack requires a pre-epoch-0 genesis descriptor not present in the bundle); \
+                 bootstrap from a later epoch's complete bundle instead"
             );
-            return Ok(());
         }
         let previous = &records[(n - 1) as usize];
         let final_record = &records[n as usize];
@@ -766,5 +813,98 @@ mod tests {
         let headers = vec![header(3), header(1), header(0), header(2)];
         let numbers: Vec<u64> = super::scaffold_window(&headers).iter().map(|h| h.number).collect();
         assert_eq!(numbers, vec![1, 2, 3], "ascending, contiguous, genesis dropped");
+    }
+
+    /// Write a bare `epoch_records` pack file (an `epochs.pack`, no sidecar index) holding a
+    /// contiguous run of records `0..=last_epoch`, mirroring the file an export bundle carries.
+    /// Returns the path to that file.
+    fn write_records_bundle(dir: &Path, last_epoch: u32) -> std::path::PathBuf {
+        use tn_storage::epoch_records::{EpochRecordDb, RECORDS_NAME};
+        use tn_types::EpochRecord;
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        rt.block_on(async {
+            let db = EpochRecordDb::open(dir).expect("open epoch records db");
+            for epoch in 0..=last_epoch {
+                db.save_record(EpochRecord { epoch, ..Default::default() })
+                    .await
+                    .expect("save record");
+            }
+            db.persist().await.expect("persist records");
+        });
+        dir.join(RECORDS_NAME)
+    }
+
+    #[test]
+    fn reject_state_only_bundle() {
+        // A state-only pack carries none of the three consensus files, so it cannot resume.
+        let dir = tempfile::tempdir().unwrap();
+        let err = super::reject_non_resumable_bundle(
+            &dir.path().join("consensus_data"),
+            &dir.path().join("epoch_records"),
+            &dir.path().join("epoch_certs"),
+        )
+        .expect_err("state-only pack must be refused");
+        assert!(
+            err.to_string().contains("state-only pack cannot produce a resumable node"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_partial_bundle() {
+        // Some-but-not-all of the three consensus files present is a version/corruption mismatch.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("consensus_data"), b"x").unwrap();
+        fs::write(dir.path().join("epoch_records"), b"x").unwrap();
+        // epoch_certs intentionally absent
+        let err = super::reject_non_resumable_bundle(
+            &dir.path().join("consensus_data"),
+            &dir.path().join("epoch_records"),
+            &dir.path().join("epoch_certs"),
+        )
+        .expect_err("partial bundle must be refused");
+        assert!(err.to_string().contains("incomplete export bundle"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn reject_epoch_0_bundle() {
+        // A complete bundle whose latest record is epoch 0 cannot rebuild its consensus pack, so it
+        // is refused even though all three files are present.
+        let bundle = tempfile::tempdir().unwrap();
+        let records_src = tempfile::tempdir().unwrap();
+        let records_file = write_records_bundle(records_src.path(), 0);
+        fs::copy(&records_file, bundle.path().join("epoch_records")).unwrap();
+        fs::write(bundle.path().join("consensus_data"), b"x").unwrap();
+        fs::write(bundle.path().join("epoch_certs"), b"x").unwrap();
+
+        let err = super::reject_non_resumable_bundle(
+            &bundle.path().join("consensus_data"),
+            &bundle.path().join("epoch_records"),
+            &bundle.path().join("epoch_certs"),
+        )
+        .expect_err("epoch-0 bundle must be refused");
+        assert!(
+            err.to_string().contains("epoch-0 bundle cannot produce a resumable node"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accept_complete_resumable_bundle() {
+        // Positive control: a complete bundle whose records end at epoch >= 1 passes the up-front
+        // classification, proving the refusal is specific rather than a blanket reject.
+        let bundle = tempfile::tempdir().unwrap();
+        let records_src = tempfile::tempdir().unwrap();
+        let records_file = write_records_bundle(records_src.path(), 2);
+        fs::copy(&records_file, bundle.path().join("epoch_records")).unwrap();
+        fs::write(bundle.path().join("consensus_data"), b"x").unwrap();
+        fs::write(bundle.path().join("epoch_certs"), b"x").unwrap();
+
+        super::reject_non_resumable_bundle(
+            &bundle.path().join("consensus_data"),
+            &bundle.path().join("epoch_records"),
+            &bundle.path().join("epoch_certs"),
+        )
+        .expect("complete epoch>=1 bundle must be accepted");
     }
 }

@@ -610,11 +610,12 @@ impl SnapshotRestorer {
 /// At epoch entry the node derives each worker's base fee from the previous epoch's genuine blocks;
 /// a worker with an `Eip1559` config that produced no genuine block in that epoch has no
 /// chain-observable fee anchor and the node walks BACKWARD through earlier epochs to find one. A
-/// node holding only the shipped `window` (a snapshot-restored node bootstrapped from an idle epoch)
-/// would run off the bottom of the window into pre-snapshot history and halt. This reads the worker
-/// fee configs at `B` (the closing block of the epoch below `entered`, which defines `entered`'s
-/// configuration) and requires every `Eip1559` worker to have produced at least one genuine batch
-/// block within `window`; `Static` workers need no anchor. Errors name the offending worker.
+/// node holding only the shipped `window` (a snapshot-restored node bootstrapped from an idle
+/// epoch) would run off the bottom of the window into pre-snapshot history and halt. This reads the
+/// worker fee configs at `B` (the closing block of the epoch below `entered`, which defines
+/// `entered`'s configuration) and requires every `Eip1559` worker to have produced at least one
+/// genuine batch block within `window`; `Static` workers need no anchor. Errors name the offending
+/// worker.
 ///
 /// Shared by the restore side ([`SnapshotRestorer::derive_fee_precondition`]) and the export side
 /// (which runs it against a candidate bundle's window before writing it) — one implementation, no
@@ -666,7 +667,8 @@ pub fn check_fee_precondition(
 
 /// Verify a snapshot `window` is fee-resumable without being told the entered epoch: read it from
 /// the state at `B` (the window's last header, whose registry state — stamped by `concludeEpoch` at
-/// that closing block — names the epoch a node would enter) and defer to [`check_fee_precondition`].
+/// that closing block — names the epoch a node would enter) and defer to
+/// [`check_fee_precondition`].
 ///
 /// A no-op when the node would enter epoch 0 or 1: entering epoch 1 stops at the epoch-0 base case
 /// of the base-fee walk (`derive_idle_worker_fee_at`) and never reads state below `B`, so there is
@@ -961,7 +963,8 @@ mod tests {
     /// fields (`excess_blob_gas`, base fee, gas limit, timestamp, ...) that `evm_env` requires for
     /// the post-import contract reads — `synthetic_header`'s `Default`-filled header omits them,
     /// which is fine for tests that only read state but not for ones that issue EVM calls.
-    /// `state_root` pins the exported (genesis) root; `worker_id`/`genuine` drive worker attribution.
+    /// `state_root` pins the exported (genesis) root; `worker_id`/`genuine` drive worker
+    /// attribution.
     fn window_header_on_genesis(
         genesis: &SealedHeader,
         number: u64,

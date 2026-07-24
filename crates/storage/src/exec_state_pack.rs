@@ -64,6 +64,14 @@ const DATA_NAME: &str = "state_data";
 /// (`MAX_RECORD_SIZE` = 16 MiB, [`crate::archive::pack_iter`]), leaving margin for BCS overhead.
 const STORAGE_CHUNK_SLOTS: usize = 64 * 1024;
 
+/// Upper bound on the header count a pack may declare, enforced before any allocation sized by the
+/// untrusted `header_count`. A genuine pack carries the snapshot header plus at most
+/// `BLOCKHASH_ANCESTORS` (256) ancestors — 257 in all — so this generous cap never rejects a
+/// legitimate pack, while bounding the eager `Vec::with_capacity` in [`ExecStatePackReader::open`]
+/// against a crafted/corrupt count (which would otherwise request a multi-TB allocation before any
+/// per-record CRC/size guard runs).
+const MAX_HEADER_COUNT: u32 = 4096;
+
 /// First record in the pack. Minimal and fixed: it carries the authoritative state
 /// root and describes the shape of the stream that follows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,6 +381,15 @@ impl ExecStatePackReader {
         if meta.header_count == 0 {
             return Err(ExecStatePackError::MissingHeaders);
         }
+        // Reject an implausible count BEFORE the capacity reservation below: `header_count` is read
+        // straight from the (untrusted) meta, and a crafted value would otherwise make
+        // `with_capacity` request a huge allocation before any per-record guard runs.
+        if meta.header_count > MAX_HEADER_COUNT {
+            return Err(ExecStatePackError::TooManyHeaders {
+                declared: meta.header_count,
+                max: MAX_HEADER_COUNT,
+            });
+        }
 
         let mut headers = Vec::with_capacity(meta.header_count as usize);
         for _ in 0..meta.header_count {
@@ -597,6 +614,14 @@ pub enum ExecStatePackError {
     MetaNotFirst,
     /// The pack declared zero headers, or ended before all declared headers were read.
     MissingHeaders,
+    /// The pack declared more headers than any legitimate pack contains. Bounds the up-front
+    /// allocation on the untrusted read path.
+    TooManyHeaders {
+        /// Header count declared by the pack meta.
+        declared: u32,
+        /// Maximum accepted count ([`MAX_HEADER_COUNT`]).
+        max: u32,
+    },
     /// The snapshot header's `state_root` does not match the meta's `state_root`.
     StateRootMismatch,
     /// The snapshot header's number/hash do not match the meta.
@@ -627,6 +652,9 @@ impl fmt::Display for ExecStatePackError {
             Self::CorruptPack => write!(f, "corrupt pack: record out of place"),
             Self::MetaNotFirst => write!(f, "first record was not the meta record"),
             Self::MissingHeaders => write!(f, "pack is missing one or more declared headers"),
+            Self::TooManyHeaders { declared, max } => {
+                write!(f, "pack declares {declared} headers, exceeding the maximum of {max}")
+            }
             Self::StateRootMismatch => {
                 write!(f, "snapshot header state_root does not match meta state_root")
             }
@@ -898,5 +926,29 @@ mod test {
         // The container's version gate (fed EXEC_STATE_PACK_VERSION) rejects it on open.
         let err = ExecStatePackReader::open(dir.path()).expect_err("must reject newer version");
         assert!(matches!(err, ExecStatePackError::Open(_)));
+    }
+
+    #[test]
+    fn open_rejects_implausible_header_count() {
+        let dir = TempDir::with_prefix("exec_state_pack_thc").expect("temp dir");
+        let mut pack = open_raw(dir.path());
+        // A crafted meta declaring far more headers than any legitimate pack. `open` must reject it
+        // up front rather than eagerly reserving a `Vec` sized by the untrusted count (a would-be
+        // multi-TB allocation), before reading any header record.
+        let meta = ExecStateMeta {
+            state_root: B256::ZERO,
+            block_number: 0,
+            block_hash: B256::ZERO,
+            header_count: u32::MAX,
+        };
+        pack.append(&ExecStateRecord::Meta(meta)).unwrap();
+        pack.commit().unwrap();
+        drop(pack);
+
+        let err = ExecStatePackReader::open(dir.path())
+            .expect_err("must reject implausible header_count");
+        assert!(
+            matches!(err, ExecStatePackError::TooManyHeaders { declared, .. } if declared == u32::MAX)
+        );
     }
 }

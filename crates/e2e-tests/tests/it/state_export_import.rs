@@ -20,15 +20,15 @@
 //! When a node enters an epoch it derives each worker's base fee, and for an EIP-1559 worker that
 //! produced no genuine block in the previous epoch it walks BACKWARD through earlier epochs reading
 //! `WorkerConfigs` state to find a fee anchor (`derive_idle_worker_fee_at`). A full node has all of
-//! history (archive mode), but a snapshot-imported node only has state at the snapshot block `B` and
-//! forward — so an idle exported epoch would make the restored node walk below `B` into state the
-//! snapshot omitted and halt. That is exactly the precondition `SnapshotRestorer::derive_fee_precondition`
-//! guards. To keep the exported epoch (and every epoch the observer later enters) anchorable at `B`,
-//! this test runs a steady transaction stream, so every epoch contains a genuine worker block. This
-//! mirrors a real network, which is never idle. A companion test in this file
-//! (`test_state_export_skips_idle_epoch_bundle`) runs an idle network to prove the exporter *skips*
-//! producing a bundle for an epoch it could not resume from, rather than writing one that would be
-//! rejected at import.
+//! history (archive mode), but a snapshot-imported node only has state at the snapshot block `B`
+//! and forward — so an idle exported epoch would make the restored node walk below `B` into state
+//! the snapshot omitted and halt. That is exactly the precondition
+//! `SnapshotRestorer::derive_fee_precondition` guards. To keep the exported epoch (and every epoch
+//! the observer later enters) anchorable at `B`, this test runs a steady transaction stream, so
+//! every epoch contains a genuine worker block. This mirrors a real network, which is never idle. A
+//! companion test in this file (`test_state_export_skips_idle_epoch_bundle`) runs an idle network
+//! to prove the exporter *skips* producing a bundle for an epoch it could not resume from, rather
+//! than writing one that would be rejected at import.
 //!
 //! ## Why the assertions prove *import*, not just *sync*
 //!
@@ -93,8 +93,8 @@ const IMPORT_EPOCH: u32 = 2;
 /// epoch sits comfortably behind the tip and the observer has newer epochs to sync forward through.
 const MIN_LEAD_EPOCH: u32 = IMPORT_EPOCH + 2;
 
-/// Poll `cond` until it returns `true`, failing fast if the observer process exits or the wall-clock
-/// deadline passes.
+/// Poll `cond` until it returns `true`, failing fast if the observer process exits or the
+/// wall-clock deadline passes.
 ///
 /// Unlike the retry-heavy `call_rpc`-based helpers (`get_block_number` etc., which retry 10x on a
 /// refused connection and turn a down node into a multi-minute poll), `cond` should be a single
@@ -152,8 +152,8 @@ async fn test_state_export_import_bootstrap_inner() -> eyre::Result<()> {
     let tmp_guard = tempfile::TempDir::with_prefix("state_export_import").expect("tempdir is okay");
     let temp_path = tmp_guard.path().to_path_buf();
 
-    // A funded factory drives the transaction stream that keeps every epoch non-idle (see the module
-    // docs). Its address must be known before genesis so it can be funded there.
+    // A funded factory drives the transaction stream that keeps every epoch non-idle (see the
+    // module docs). Its address must be known before genesis so it can be funded there.
     let mut tx_factory = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(1234));
     let funded = vec![(
         tx_factory.address(),
@@ -200,8 +200,9 @@ async fn test_state_export_import_bootstrap_inner() -> eyre::Result<()> {
     network_advancing(&client_urls)?;
 
     // Drive a steady transaction stream so every epoch contains a genuine worker block (see the
-    // module docs on why the exported epoch must not be idle). The chain spec comes from the genesis
-    // the ceremony just wrote. The stream runs until `stop` is set at the end of the test.
+    // module docs on why the exported epoch must not be idle). The chain spec comes from the
+    // genesis the ceremony just wrote. The stream runs until `stop` is set at the end of the
+    // test.
     let genesis: Genesis = Config::load_from_path(
         temp_path.join("validator-1").join("genesis").join("genesis.yaml"),
         ConfigFmt::YAML,
@@ -340,8 +341,8 @@ async fn test_state_export_import_bootstrap_inner() -> eyre::Result<()> {
     );
     info!(target: "restart-test", obs_start_block, import_block, "observer started from the import point");
 
-    // Forward sync: the observer climbs from the import block up to the validator's height snapshot,
-    // crossing the epochs it did not import.
+    // Forward sync: the observer climbs from the import block up to the validator's height
+    // snapshot, crossing the epochs it did not import.
     wait_observer(
         &mut guard,
         obs_idx,
@@ -382,10 +383,10 @@ async fn test_state_export_import_bootstrap_inner() -> eyre::Result<()> {
          final hash {import_hash}"
     );
 
-    // Epoch `IMPORT_EPOCH + 1` was NOT in the bundle (it carried records `0..=IMPORT_EPOCH` and only
-    // the epoch-`IMPORT_EPOCH` consensus pack), so a verified record for it on the observer, plus
-    // the executed final block it commits, can only have been obtained by syncing forward from the
-    // import point.
+    // Epoch `IMPORT_EPOCH + 1` was NOT in the bundle (it carried records `0..=IMPORT_EPOCH` and
+    // only the epoch-`IMPORT_EPOCH` consensus pack), so a verified record for it on the
+    // observer, plus the executed final block it commits, can only have been obtained by
+    // syncing forward from the import point.
     let forward_epoch = IMPORT_EPOCH + 1;
     let forward_record =
         fetch_verified_epoch_record(&obs_url, forward_epoch, (EXPORT_EPOCH_DURATION * 6).max(75))
@@ -428,7 +429,8 @@ async fn test_state_export_import_bootstrap_inner() -> eyre::Result<()> {
 /// no genuine worker block), each epoch `>= 1`'s snapshot fails the fee-derivability precheck, so
 /// the exporter skips it and writes no bundle. Epoch 0 is still exported (entering epoch 1 never
 /// walks below the snapshot, so it is fee-resumable). The importer's reject guard is the
-/// counterpart, unit-tested in `tn-reth`; an idle bundle can no longer reach it via a real exporter.
+/// counterpart, unit-tested in `tn-reth`; an idle bundle can no longer reach it via a real
+/// exporter.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_state_export_skips_idle_epoch_bundle() -> eyre::Result<()> {
