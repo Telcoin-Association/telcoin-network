@@ -26,13 +26,15 @@
 //!
 //! # Why not `replay_and_subscribe`?
 //!
-//! [`TnExExContext::replay_and_subscribe`] is the simplest catch-up path, but it
-//! consumes the context (dropping the event sender, so progress can no longer be
-//! reported) and returns one combined stream — so it can't both report
-//! [`FinishedHeight`] via [`report_finished_height`] *and* re-replay to reconcile
-//! a `Lagged`. This example uses [`replay_from`] plus the live channel directly to
-//! keep that control. Reach for `replay_and_subscribe` when your ExEx needs
-//! neither.
+//! [`TnExExContext::replay_and_subscribe`] is the simplest catch-up path. It still
+//! lets you report [`FinishedHeight`] — it hands back a
+//! [`FinishedHeightReporter`] alongside the combined stream — but it returns *one*
+//! combined stream, so it can't itself re-replay to reconcile a `Lagged` gap. This
+//! example drives [`replay_from`] plus the live channel directly to keep that
+//! reconciliation control. Reach for `replay_and_subscribe` when your ExEx does not
+//! need to re-replay after lag.
+//!
+//! [`FinishedHeightReporter`]: tn_exex::FinishedHeightReporter
 //!
 //! [`ChainExecuted`]: tn_exex::TnExExNotification::ChainExecuted
 //! [`Lagged`]: tn_exex::TnExExNotification::Lagged
