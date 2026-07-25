@@ -123,10 +123,11 @@ use tn_config::{
 use tn_types::{
     deconstruct_nonce,
     gas_accumulator::{RewardsCounter, WorkerFeeConfig},
-    Account, Address, BlockBody, BlockHashOrNumber, BlockNumHash, BlockNumber, ConsensusNumHash,
-    EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount, Receipt, Recovered, RecoveredBlock,
-    Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionMeta, TransactionSigned,
-    TxHash, TxNumber, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
+    Account, Address, BlockBody, BlockHashOrNumber, BlockNumHash, BlockNumber,
+    CanonicalExecutionReader, ConsensusNumHash, EngineUpdate, Epoch, ExecHeader, Genesis,
+    GenesisAccount, Receipt, Recovered, RecoveredBlock, Round, SealedBlock, SealedHeader,
+    TaskManager, TaskSpawner, TransactionMeta, TransactionSigned, TxHash, TxNumber, B256,
+    ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
 use traits::{TNPrimitives, TelcoinNode};
@@ -575,6 +576,25 @@ struct RethEnvInner {
 impl std::fmt::Debug for RethEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "RethEnv, config: {:?}", self.inner.node_config)
+    }
+}
+
+impl CanonicalExecutionReader for RethEnv {
+    fn canonical_execution_hash(&self, number: u64) -> Option<B256> {
+        // A read error (e.g. a transient provider/DB error) is treated as "not confirmed" rather
+        // than as a canonical match, so the caller keeps its conservative fork handling.
+        self.sealed_header_by_number(number)
+            .inspect_err(|error| {
+                tracing::debug!(
+                    target: "tn::reth",
+                    ?error,
+                    number,
+                    "canonical_execution_hash: canonical DB read failed; treating as unconfirmed"
+                );
+            })
+            .ok()
+            .flatten()
+            .map(|header| header.hash())
     }
 }
 

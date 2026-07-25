@@ -18,9 +18,9 @@ use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    deconstruct_nonce, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
-    ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round,
-    TnReceiver, TnSender, CHANNEL_CAPACITY,
+    deconstruct_nonce, BlockNumHash, CanonicalExecutionReader, Certificate, CommittedSubDag,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord, EpochVote, Header,
+    Round, TnReceiver, TnSender, CHANNEL_CAPACITY,
 };
 use tokio::{
     sync::{
@@ -301,6 +301,46 @@ pub struct ConsensusBusAppInner {
     /// Lives on the app-lifetime bus because the bus already reaches every consensus
     /// component (proposer, certifier, certificate manager, consensus driver).
     metrics: PrimaryMetrics,
+
+    /// Canonical execution-DB fallback for `wait_for_execution` (installed once the execution
+    /// engine is built); empty until then and in engine-less tests/tools.
+    canonical_reader: CanonicalReaderSlot,
+}
+
+/// Late-bound handle to the canonical execution database, used by
+/// [`ConsensusBusApp::wait_for_execution`] as a fallback when a queried execution tip has been
+/// evicted from the in-memory `recent_blocks` ring.
+///
+/// The bus is constructed before the execution engine exists, so the reader is installed later
+/// (see [`ConsensusBusApp::set_canonical_reader`]). It stays empty in tests and tools that never
+/// wire an engine, in which case `wait_for_execution` keeps its original ring-only behavior.
+#[derive(Default)]
+struct CanonicalReaderSlot(Mutex<Option<Arc<dyn CanonicalExecutionReader>>>);
+
+impl std::fmt::Debug for CanonicalReaderSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanonicalReaderSlot").field("installed", &self.0.lock().is_some()).finish()
+    }
+}
+
+impl CanonicalReaderSlot {
+    /// Install (or replace) the canonical reader. Last writer wins, so a per-epoch engine rebuild
+    /// simply refreshes the handle.
+    fn install(&self, reader: Arc<dyn CanonicalExecutionReader>) {
+        *self.0.lock() = Some(reader);
+    }
+
+    /// Confirm that `block` is the canonical execution block persisted at its height.
+    ///
+    /// Returns `false` when no reader is installed, the height is above the persisted tip, or the
+    /// DB hash differs (a genuine fork).
+    fn confirms(&self, block: &BlockNumHash) -> bool {
+        // Clone the handle out and drop the lock before the DB read: never hold a lock across I/O.
+        let reader = self.0.lock().clone();
+        reader
+            .and_then(|reader| reader.canonical_execution_hash(block.number))
+            .is_some_and(|hash| hash == block.hash)
+    }
 }
 
 /// The thread-safe inner type that holds all the channels for inner-consensus
@@ -371,6 +411,7 @@ impl ConsensusBusApp {
                 // new_with_labels (not Default): binds to the recorder active at bus
                 // construction instead of caching the first-bound recorder process-wide
                 metrics: PrimaryMetrics::new_with_labels(Vec::<metrics::Label>::new()),
+                canonical_reader: CanonicalReaderSlot::default(),
             }),
         }
     }
@@ -658,6 +699,16 @@ impl ConsensusBusApp {
         self.inner.exex_consensus_output.subscribe()
     }
 
+    /// Install the canonical execution-DB reader used by [`Self::wait_for_execution`] as a
+    /// fallback when a queried tip has been evicted from the `recent_blocks` ring.
+    ///
+    /// Called once by the node manager after the execution engine is built; a per-epoch engine
+    /// rebuild simply refreshes the handle. Bus instances that never wire an engine (tests,
+    /// tooling) leave it unset and keep the original ring-only fork check.
+    pub fn set_canonical_reader(&self, reader: Arc<dyn CanonicalExecutionReader>) {
+        self.inner.canonical_reader.install(reader);
+    }
+
     /// Will resolve once we have executed block.
     ///
     /// Return an error if we do not execute the requested block by block number.
@@ -682,8 +733,14 @@ impl ConsensusBusApp {
             // Once we see our hash, should happen when current_number == target_number- trust
             // digesting for this, we are done.
             Ok(())
+        } else if self.inner.canonical_reader.confirms(&block) {
+            // Not in the in-memory ring, but the local execution DB holds exactly this block as
+            // canonical at its height: the ring merely evicted it (its window is `gc_depth` deep),
+            // so this is a stale ring, not a fork.
+            Ok(())
         } else {
-            // Failed to find our block at it's number.
+            // Not in the ring and not confirmed canonical in the DB: a genuine execution fork, or
+            // the block is simply not persisted yet. Fail hard.
             Err(WaitForExecutionElapsed())
         }
     }
