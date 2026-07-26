@@ -8,8 +8,11 @@
 //! rather than `axum::serve`: `axum::serve` never installs a hyper timer, so
 //! hyper's header read timeout is silently disabled and a slow-loris client
 //! could hold connections open forever. Here every connection gets a header
-//! read deadline, a whole-request deadline, `TCP_NODELAY`, and a global
-//! concurrent-connection cap.
+//! read deadline, a whole-request deadline, `TCP_NODELAY`, a global
+//! concurrent-connection cap, and two write-path guards for the response-side
+//! slow loris (a client that stops or trickles its reads while a response
+//! body streams to it): a transport-stall deadline (`TCP_USER_TIMEOUT`) and a
+//! hard cap on total connection lifetime.
 
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
@@ -21,6 +24,7 @@ use axum::{
     routing::get,
     Extension, Json, Router,
 };
+use futures::future::{self, Either};
 use hyper_util::{
     rt::{TokioIo, TokioTimer},
     server::graceful::GracefulShutdown,
@@ -29,7 +33,10 @@ use hyper_util::{
 use reqwest::Client;
 use serde::Serialize;
 use tn_types::{Noticer, TaskError};
-use tokio::{net::TcpListener, sync::Semaphore};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::Semaphore,
+};
 use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, info, warn};
 
@@ -72,6 +79,18 @@ pub(crate) struct ServerLimits {
     /// Maximum concurrently-open inbound connections; further connections wait
     /// in the OS accept backlog.
     pub(crate) max_connections: NonZeroUsize,
+    /// Transport-stall deadline (`TCP_USER_TIMEOUT`) armed on every accepted
+    /// connection, or `None` when disabled. Closes a connection whose peer
+    /// leaves written data unacknowledged (or its receive window closed) this
+    /// long; Linux-family kernels only, best-effort elsewhere.
+    pub(crate) tcp_user_timeout: Option<Duration>,
+    /// Hard cap on a single connection's total lifetime (keep-alive sessions
+    /// included), or `None` when uncapped. Enforced by the runtime independent
+    /// of connection progress, so it fires even when hyper's write path is
+    /// backpressured by a slow-reading client and no future the connection
+    /// owns is being polled forward. The close is abrupt: an exchange still
+    /// in flight when a keep-alive session hits the cap is cut off mid-stream.
+    pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
 }
@@ -88,9 +107,11 @@ struct ReadyBody {
 /// `request_deadline` bounds each whole request; the bare `408` the timeout
 /// layer produces is rewritten into the gateway's JSON-RPC error envelope so
 /// the "always a well-formed JSON-RPC error" contract holds. Streamed
-/// *response* bodies are written after the handler returns and are bounded by
-/// the upstream client's own total timeout instead. `max_request_bytes` caps
-/// the buffered request body.
+/// *response* bodies are written after the handler returns, outside this
+/// deadline; they are bounded by the accept loop's transport-stall deadline
+/// and connection-lifetime cap (the upstream client's total timeout is only
+/// checked when the body is polled, which a slow-reading client can prevent;
+/// see [`accept_loop`]). `max_request_bytes` caps the buffered request body.
 ///
 /// When `rate_limiters` is present it is installed as the outermost layer, so
 /// an over-limit request is shed with a JSON-RPC `429` before its body is
@@ -160,8 +181,19 @@ pub(crate) async fn serve(
 }
 
 /// Accept connections until `shutdown` fires, serving each on its own task
-/// with the configured header deadline, `TCP_NODELAY`, and connection cap,
-/// then drain within `graceful_timeout`.
+/// with the configured header deadline, `TCP_NODELAY`, transport-stall
+/// deadline, lifetime cap, and connection cap, then drain within
+/// `graceful_timeout`.
+///
+/// The two write-path guards close the response-side slow loris: the
+/// whole-request deadline stops covering a response once its head is produced,
+/// and the upstream client's total timeout is only observed when the streamed
+/// body is polled; under downstream backpressure hyper stops polling the body
+/// (its write loop parks on a full write buffer), so that timeout never fires.
+/// `TCP_USER_TIMEOUT` fires in the kernel when the peer stops acknowledging
+/// written data outright, and the connection-lifetime cap is a runtime timer
+/// polled independent of connection progress, so it fires even against a
+/// client trickling one byte per interval to keep the transport alive.
 async fn accept_loop(
     listener: TcpListener,
     app: Router,
@@ -208,15 +240,48 @@ async fn accept_loop(
             debug!(target: "gateway::server", %err, "failed to set TCP_NODELAY");
         }
 
+        // Best-effort: on an unsupported platform (or a setsockopt failure)
+        // the lifetime cap below still bounds a stalled reader.
+        if let Some(Err(err)) =
+            limits.tcp_user_timeout.map(|timeout| set_tcp_user_timeout(&stream, timeout))
+        {
+            debug!(target: "gateway::server", %err, "failed to set TCP_USER_TIMEOUT");
+        }
+
         // Hand handlers the real client address (`ConnectInfo`, consumed by the
         // proxy's `X-Forwarded-For`).
         let service =
             TowerToHyperService::new(app.clone().layer(Extension(ConnectInfo(peer_addr))));
         let connection =
             graceful.watch(connection_builder.serve_connection(TokioIo::new(stream), service));
+        // The lifetime cap is a runtime timer, deliberately NOT a timeout on
+        // any body future: the runtime polls it regardless of whether hyper's
+        // backpressured write path ever polls the connection forward again.
+        // Constructed here (not inside the task) so the deadline counts from
+        // accept even if the spawned task's first poll is delayed. `None` caps
+        // nothing (a never-ready future).
+        let lifetime_cap = limits.max_connection_duration.map_or_else(
+            || Either::Left(future::pending::<()>()),
+            |cap| Either::Right(tokio::time::sleep(cap)),
+        );
         tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                debug!(target: "gateway::server", %err, "connection error");
+            // `biased` so a connection that finishes in the same poll as the
+            // cap expires is reported as what it was (completion or its real
+            // error), never mislabeled as cap-killed.
+            tokio::select! {
+                biased;
+                result = connection => {
+                    if let Err(err) = result {
+                        debug!(target: "gateway::server", %err, "connection error");
+                    }
+                }
+                () = lifetime_cap => {
+                    debug!(
+                        target: "gateway::server",
+                        %peer_addr,
+                        "connection exceeded max lifetime; closing"
+                    );
+                }
             }
             drop(permit);
         });
@@ -241,6 +306,25 @@ async fn accept_loop(
     Ok(())
 }
 
+/// Arm `TCP_USER_TIMEOUT` on an accepted connection: the kernel forcibly
+/// closes the connection when transmitted data stays unacknowledged, or
+/// buffered data stays untransmittable behind a closed receive window, longer
+/// than `timeout`, freeing the slot a fully stalled reader would otherwise
+/// hold.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn set_tcp_user_timeout(stream: &TcpStream, timeout: Duration) -> std::io::Result<()> {
+    socket2::SockRef::from(stream).set_tcp_user_timeout(Some(timeout))
+}
+
+/// `TCP_USER_TIMEOUT` is Linux-family only; elsewhere report it unsupported so
+/// the caller's debug log tells the truth. Production gateways deploy on Linux
+/// (see the crate's `Dockerfile`); on other hosts the connection-lifetime cap
+/// still bounds a stalled reader.
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn set_tcp_user_timeout(_stream: &TcpStream, _timeout: Duration) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "TCP_USER_TIMEOUT requires Linux"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +344,8 @@ mod tests {
             header_read_timeout: Duration::from_secs(5),
             request_deadline: Duration::from_secs(5),
             max_connections: NonZeroUsize::new(64).expect("nonzero"),
+            tcp_user_timeout: None,
+            max_connection_duration: None,
             max_request_bytes: MAX_REQUEST_BYTES,
         }
     }
@@ -627,5 +713,115 @@ mod tests {
                 .expect("send");
             assert_eq!(response.status(), StatusCode::OK);
         }
+    }
+
+    /// Upstream response body sized well above the sum of every buffer
+    /// between the mock upstream and the stalled client (gateway channel,
+    /// socket send/receive buffers, even generously tuned `tcp_wmem`/
+    /// `tcp_rmem` sysctls), so a client that stops reading provably parks the
+    /// stream mid-body.
+    const STALL_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn slow_reader_is_closed_at_connection_lifetime_cap() {
+        // The issue #958 scenario: response streaming to a client that stops
+        // reading. The whole-request deadline no longer covers the response
+        // body, and the upstream client's total timeout is only observed when
+        // the body is polled (which the stall prevents), so only the lifetime
+        // cap bounds this connection.
+        let mock = Router::new().route("/", post(|| async { vec![0_u8; STALL_BODY_BYTES] }));
+        let (upstream_addr, _mock) = spawn(mock).await;
+
+        let state = test_state(&[upstream(upstream_addr)]);
+        state.readiness.set_ready(0, true);
+        // The cap is generous enough that the response head always arrives
+        // inside it, even on a loaded CI host where the whole 3-hop round
+        // trip shares one test runtime.
+        let limits =
+            ServerLimits { max_connection_duration: Some(Duration::from_secs(2)), ..test_limits() };
+        let (gateway_addr, _shutdown) = spawn_with_limits(test_router(state), limits).await;
+
+        let mut stream = TcpStream::connect(gateway_addr).await.expect("connect");
+        stream
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\n\
+                  Content-Length: 47\r\n\r\n{\"jsonrpc\":\"2.0\",\"method\":\"eth_getLogs\",\"id\":1}",
+            )
+            .await
+            .expect("write");
+
+        // Read one chunk (the response head plus some body), then stall past
+        // the lifetime cap without reading further.
+        let mut first = [0_u8; 4096];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut first))
+            .await
+            .expect("response head should arrive well inside the lifetime cap")
+            .expect("first read");
+        assert!(read > 0, "expected the response head to arrive");
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+        // Drain what the socket still holds. The cap closed the connection
+        // mid-body, so the drain must end (EOF or reset both count) well short
+        // of the full body; pre-fix the stream resumes here and delivers all
+        // of it.
+        let mut rest = Vec::new();
+        let drained = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest))
+            .await
+            .expect("connection should be closed by the lifetime cap");
+        drop(drained); // EOF is Ok, an RST is Err; either way `rest` holds what arrived.
+        assert!(
+            read + rest.len() < STALL_BODY_BYTES,
+            "expected a truncated body, got all {} bytes",
+            read + rest.len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn lifetime_cap_closes_idle_connection_and_releases_permit() {
+        let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+        // One connection slot total, capped at 300ms; the header read deadline
+        // (5s) stays out of the way of both asserts below.
+        let limits = ServerLimits {
+            max_connections: NonZeroUsize::new(1).expect("nonzero"),
+            max_connection_duration: Some(Duration::from_millis(300)),
+            ..test_limits()
+        };
+        let (addr, _shutdown) = spawn_with_limits(test_router(state), limits).await;
+
+        // A connection that never sends a byte must be closed by the lifetime
+        // cap (well before the 5s header deadline, hence the 2s bound).
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut buf = [0_u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("connection should be closed by the lifetime cap");
+        assert_eq!(read.expect("read"), 0, "expected EOF from the server");
+
+        // The capped connection's permit must be released: with a single slot,
+        // this probe only gets accepted (and answered) if it was.
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            Client::new().get(format!("http://{addr}/health")).send(),
+        )
+        .await
+        .expect("permit should be released after the cap fires")
+        .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The transport-stall guard actually arms the socket option (readable
+    /// back via `SO_TCP_USER_TIMEOUT`). Linux-family only, like the option.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[tokio::test]
+    async fn tcp_user_timeout_is_armed() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (_client, accepted) =
+            tokio::join!(async { TcpStream::connect(addr).await.expect("connect") }, async {
+                listener.accept().await.expect("accept").0
+            });
+        set_tcp_user_timeout(&accepted, Duration::from_secs(7)).expect("set TCP_USER_TIMEOUT");
+        let armed = socket2::SockRef::from(&accepted).tcp_user_timeout().expect("read back");
+        assert_eq!(armed, Some(Duration::from_secs(7)));
     }
 }
