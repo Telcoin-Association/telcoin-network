@@ -143,6 +143,11 @@ impl TnExExContext {
     /// # Errors
     ///
     /// Returns an error if the current chain tip cannot be read from the DB.
+    ///
+    /// The returned stream is **fused on failure**: a block missing from the
+    /// database or a failed read is yielded as a single `Err` item, after
+    /// which the stream terminates; an error is never followed by a
+    /// silently-skipped block. See [`ReplayStream`].
     pub fn replay_from(&self, start_block: BlockNumber) -> eyre::Result<ReplayStream> {
         let tip = self.reth_env.last_block_number()?;
         Ok(ReplayStream::new(self.reth_env.clone(), start_block, tip))
@@ -168,8 +173,14 @@ impl TnExExContext {
     /// channel while replay runs) is de-duplicated by height so a block is never
     /// processed twice. If the live channel overflowed during a slow replay, the
     /// resulting gap surfaces as a [`TnExExNotification::Lagged`] marker rather
-    /// than silently — re-`replay_from` the gap to reconcile. See
-    /// [`replay_from`](Self::replay_from) for replay state-diff fidelity.
+    /// than silently; re-`replay_from` the gap to reconcile. A replay error is
+    /// likewise terminal for the historical phase: the first `Err` fuses the
+    /// replay stream (see [`ReplayStream`]), so no further historical block is
+    /// delivered after it and any later items come from the live channel at
+    /// tip heights. The `Err` is the explicit signal that the rest of the
+    /// historical range was not delivered; a consumer MUST abort on it (the
+    /// documented `result?` pattern) rather than continue into the live tail.
+    /// See [`replay_from`](Self::replay_from) for replay state-diff fidelity.
     ///
     /// # Progress reporting
     ///
@@ -187,9 +198,10 @@ impl TnExExContext {
     /// [`TnExExEvent::FinishedHeight`].
     ///
     /// This path returns one combined stream, so it cannot itself re-`replay_from`
-    /// to reconcile a [`Lagged`](TnExExNotification::Lagged) gap; an ExEx that must
-    /// reconcile lag should drive [`replay_from`](Self::replay_from) and the live
-    /// channel directly instead.
+    /// to reconcile a [`Lagged`](TnExExNotification::Lagged) gap or a fused replay
+    /// error; an ExEx that must reconcile lag or resume after a replay failure
+    /// should drive [`replay_from`](Self::replay_from) and the live channel
+    /// directly instead.
     pub fn replay_and_subscribe(
         self,
         start_block: BlockNumber,
