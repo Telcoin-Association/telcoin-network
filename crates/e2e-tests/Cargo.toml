@@ -16,6 +16,8 @@ clap = { workspace = true, features = ["derive", "env"] }
 eyre = { workspace = true }
 tn-config = { workspace = true }
 tn-node = { workspace = true }
+# not dev-only: `src/lib.rs` seeds reth's transaction pool defaults before it parses a node command
+tn-reth = { workspace = true, features = ["test-utils"] }
 tn-types = { workspace = true, features = ["test-utils"] }
 tracing = { workspace = true }
 jsonrpsee = { workspace = true }
@@ -31,7 +33,6 @@ alloy = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
-tn-reth = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
