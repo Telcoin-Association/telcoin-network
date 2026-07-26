@@ -829,6 +829,17 @@ where
                 self.authorized_publishers.insert(topic, publishers);
                 send_or_log_error!(reply, res, "Subscribe");
             }
+            NetworkCommand::Unsubscribe { topic, reply } => {
+                let sub: IdentTopic = Topic::new(&topic);
+                let was_subscribed = self.swarm.behaviour_mut().gossipsub.unsubscribe(&sub);
+                // Removing the entry is required, not hygiene: `verify_gossip` reads an absent
+                // entry as "topic not subscribed here" and rejects. Leaving a stale entry behind
+                // pins this topic to the allowlist of whichever committee was current when it was
+                // last subscribed, so a later committee's honest authors would be rejected as
+                // unauthorized.
+                self.authorized_publishers.remove(&topic);
+                send_or_log_error!(reply, was_subscribed, "Unsubscribe");
+            }
             NetworkCommand::ConnectedPeerIds { reply } => {
                 let res = self.swarm.behaviour().peer_manager.connected_or_dialing_peers();
                 debug!(target: "network", ?res, "peer manager connected peers:");

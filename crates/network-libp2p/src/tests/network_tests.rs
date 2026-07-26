@@ -996,6 +996,100 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
 }
 
 #[tokio::test]
+async fn test_unsubscribe_stops_gossip_delivery() -> eyre::Result<()> {
+    // start honest cvv network
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer { config: config_1, network_handle: cvv, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // start honest nvv network
+    let NetworkPeer {
+        config: config_2,
+        network_handle: nvv,
+        network_events: mut nvv_network_events,
+        network,
+    } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // start swarm listening on default any address
+    cvv.start_listening(config_1.primary_address()).await?;
+    nvv.start_listening(config_2.primary_address()).await?;
+    let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
+
+    // unsubscribing a topic that was never subscribed is a benign no-op - the epoch-start
+    // gate calls this on every observer's first epoch
+    assert!(!nvv.unsubscribe(TEST_TOPIC.into()).await?, "never subscribed - nothing to drop");
+
+    // subscribe and dial
+    nvv.subscribe_with_publishers(TEST_TOPIC.into(), config_1.committee_pub_keys()).await?;
+    nvv.add_trusted_peer_and_dial(
+        config_1.key_config().primary_public_key(),
+        config_1.key_config().primary_network_public_key(),
+        cvv_addr,
+    )
+    .await?;
+
+    let random_block = fixture_batch_with_transactions(10);
+    let sealed_block = random_block.seal_slow();
+    let expected_result = Vec::from(&sealed_block);
+
+    // wait until the publisher has observed the subscriber before publishing
+    let topic_hash = TopicHash::from_raw(TEST_TOPIC);
+    let topic_ref = &topic_hash;
+    let handle = &cvv;
+    wait_until(
+        Duration::from_secs(5),
+        "publisher observes a TEST_TOPIC subscriber",
+        move || async move {
+            handle
+                .all_peers()
+                .await
+                .map_err(Into::into)
+                .map(|peers| peers.values().any(|topics| topics.contains(topic_ref)))
+        },
+    )
+    .await?;
+
+    // baseline: while subscribed, gossip is delivered
+    let _message_id = cvv.publish(TEST_TOPIC.into(), expected_result.clone()).await?;
+    let event =
+        timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
+    assert!(
+        matches!(event, NetworkEvent::Gossip(gossip) if gossip.message.data == expected_result)
+    );
+
+    // drop the subscription - reports that it was subscribed
+    assert!(nvv.unsubscribe(TEST_TOPIC.into()).await?, "was subscribed - reports the drop");
+
+    // the unsubscribe propagates: the publisher stops seeing this peer on the topic
+    wait_until(
+        Duration::from_secs(5),
+        "publisher observes no TEST_TOPIC subscriber",
+        move || async move {
+            handle
+                .all_peers()
+                .await
+                .map_err(Into::into)
+                .map(|peers| !peers.values().any(|topics| topics.contains(topic_ref)))
+        },
+    )
+    .await?;
+
+    // with no subscriber left, publishing on the topic has nowhere to go
+    assert!(
+        cvv.publish(TEST_TOPIC.into(), expected_result).await.is_err(),
+        "no remaining subscribers for the topic"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<()> {
     // start honest cvv network
     let TestTypes { peer1, peer2, .. } =
