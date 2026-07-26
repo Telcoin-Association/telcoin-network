@@ -1,8 +1,8 @@
 //! Bullshark
 
 use crate::consensus::{
-    utils, ConsensusError, ConsensusInvariant, ConsensusState, Dag, LeaderSchedule, LeaderSwapTable,
-    Outcome,
+    utils, ConsensusError, ConsensusInvariant, ConsensusState, Dag, LeaderSchedule,
+    LeaderSwapTable, Outcome,
 };
 use std::collections::VecDeque;
 use tn_types::{
@@ -244,7 +244,8 @@ impl Bullshark {
             debug!(min_round, "Subdag has {} certificates", num_certificates);
 
             // We resolve the reputation score that should be stored alongside with this sub dag.
-            let reputation_score = self.resolve_reputation_score(state, &sequence, sub_dag_index)?;
+            let reputation_score =
+                self.resolve_reputation_score(state, &sequence, sub_dag_index)?;
 
             let sub_dag: CommittedSubDag = CommittedSubDag::new(
                 sequence,
