@@ -112,7 +112,7 @@ where
         let unused_gas = gas_limit.saturating_sub(gas_used);
         let refund_amount = unused_gas.saturating_sub(penalty_gas);
 
-        debug!(target: "engine", ?unused_gas, ?penalty_gas, ?refund_amount, "governance collects: {}", penalty_gas as u128 * effective_gas_price);
+        debug!(target: "engine", ?unused_gas, ?penalty_gas, ?refund_amount, "governance collects: {}", effective_gas_price.saturating_mul(u128::from(penalty_gas)));
 
         // return gas to caller (minus penalty)
         if refund_amount > 0 {
@@ -157,15 +157,15 @@ where
         context
             .journal_mut()
             .load_account_mut(beneficiary)?
-            .incr_balance(U256::from(coinbase_gas_price * gas_used));
+            .incr_balance(U256::from(coinbase_gas_price.saturating_mul(gas_used)));
 
         // send the base fee portion to a basefee account for later processing
         // (offchain).
-        debug!(target: "engine", ?basefee, ?gas_used, "allocating basefees {}", basefee * gas_used);
+        debug!(target: "engine", ?basefee, ?gas_used, "allocating basefees {}", basefee.saturating_mul(gas_used));
         context
             .journal_mut()
             .load_account_mut(self.basefee_address)?
-            .incr_balance(U256::from(basefee * gas_used));
+            .incr_balance(U256::from(basefee.saturating_mul(gas_used)));
 
         Ok(())
     }
@@ -184,4 +184,93 @@ where
     >,
 {
     type IT = EthInterpreter;
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for [`TNEvmHandler::reward_beneficiary`] fee crediting.
+    //!
+    //! The saturation boundary test is the mutation guard for the
+    //! `saturating_mul` calls: with the multiplication reverted to a raw `*`
+    //! it fails (overflow-checks panic in the test profile, a wrapped and
+    //! therefore wrong credit in a release build).
+
+    use super::*;
+    use crate::evm::precompile_test_utils::{TestEnv, USER};
+    use reth_revm::{
+        context::{BlockEnv, ContextSetters, TxEnv},
+        interpreter::{interpreter_action::CallOutcome, Gas, InstructionResult},
+        primitives::address,
+    };
+    use tn_types::{Bytes, TxKind};
+
+    /// Block beneficiary credited with the priority-fee portion of gas payments.
+    const BENEFICIARY: Address = address!("3333333000000000000000000000000000000003");
+
+    /// Governance collector credited with the basefee portion of gas payments.
+    const BASEFEE_ADDR: Address = address!("4444444000000000000000000000000000000004");
+
+    /// Basefee (in wei per gas) used by both reward tests.
+    const BASEFEE: u64 = 7;
+
+    /// Build a post-execution [`FrameResult`] with `limit` gas fully spent and
+    /// no refund, so `spent_sub_refunded()` equals `limit`.
+    fn spent_frame(limit: u64) -> FrameResult {
+        FrameResult::Call(CallOutcome::new(
+            InterpreterResult {
+                result: InstructionResult::Return,
+                output: Bytes::default(),
+                gas: Gas::new_spent(limit),
+            },
+            0..0,
+        ))
+    }
+
+    /// Run [`TNEvmHandler::reward_beneficiary`] against a fresh [`TestEnv`]
+    /// for a legacy transaction with the given gas price, spending `gas_limit`
+    /// in full, and return the credited (beneficiary, basefee) balances.
+    fn reward_with(gas_price: u128, gas_limit: u64) -> (U256, U256) {
+        let mut env = TestEnv::new();
+        env.evm.ctx.set_block(BlockEnv {
+            beneficiary: BENEFICIARY,
+            basefee: BASEFEE,
+            ..Default::default()
+        });
+        env.evm.ctx.set_tx(
+            TxEnv::builder()
+                .caller(USER)
+                .kind(TxKind::Call(BENEFICIARY))
+                .gas_limit(gas_limit)
+                .gas_price(gas_price)
+                .build()
+                .expect("valid test tx env"),
+        );
+        let mut frame = spent_frame(gas_limit);
+        TNEvmHandler::new(BASEFEE_ADDR)
+            .reward_beneficiary(&mut env.evm, &mut frame)
+            .expect("reward_beneficiary succeeds");
+        (env.get_balance(BENEFICIARY), env.get_balance(BASEFEE_ADDR))
+    }
+
+    /// In-range fees split exactly: the beneficiary receives
+    /// `(effective_gas_price - basefee) * gas_used` and the basefee address
+    /// receives `basefee * gas_used`, unchanged by the saturating arithmetic.
+    #[test]
+    fn reward_beneficiary_splits_priority_and_base_fee_in_range() {
+        let gas_used = 21_000u64;
+        let (beneficiary, basefee_collector) = reward_with(10, gas_used);
+        assert_eq!(beneficiary, U256::from((10 - u128::from(BASEFEE)) * u128::from(gas_used)));
+        assert_eq!(basefee_collector, U256::from(u128::from(BASEFEE) * u128::from(gas_used)));
+    }
+
+    /// At the overflow boundary the beneficiary credit saturates to
+    /// `u128::MAX` instead of wrapping (release) or panicking (dev/test):
+    /// `coinbase_gas_price` is `u128::MAX - basefee`, so two units of spent
+    /// gas push the raw product past `u128::MAX`.
+    #[test]
+    fn reward_beneficiary_saturates_on_fee_product_overflow() {
+        let (beneficiary, basefee_collector) = reward_with(u128::MAX, 2);
+        assert_eq!(beneficiary, U256::from(u128::MAX));
+        assert_eq!(basefee_collector, U256::from(u128::from(BASEFEE) * 2));
+    }
 }
