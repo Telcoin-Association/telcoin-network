@@ -1084,7 +1084,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
         // assert closing epoch randomness matches extra data field in last block
         let expected_extra = if idx == 7 {
-            Bytes::from(expected_output.keccak_leader_sigs().0)
+            Bytes::from(expected_output.committee_shuffle_seed().0)
         } else {
             Bytes::default()
         };
@@ -1628,7 +1628,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
         // assert closing epoch randomness matches extra data field in last block
         let expected_extra = if idx == 7 {
-            Bytes::from(expected_output.keccak_leader_sigs().0)
+            Bytes::from(expected_output.committee_shuffle_seed().0)
         } else {
             Bytes::default()
         };
@@ -2148,7 +2148,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         assert_eq!(block.difficulty, U256::from(0 << 16));
         // assert closing epoch randomness matches extra data field in last block
         let expected_extra = if idx == 7 {
-            Bytes::from(consensus_output.keccak_leader_sigs().0)
+            Bytes::from(consensus_output.committee_shuffle_seed().0)
         } else {
             Bytes::default()
         };

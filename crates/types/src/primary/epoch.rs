@@ -8,7 +8,7 @@
 
 use crate::{
     crypto, encode, serde::RoaringBitmapSerde, BlsAggregateSignature, BlsPublicKey, BlsSignature,
-    BlsSigner, ConsensusNumHash, Epoch, Intent, IntentMessage, IntentScope,
+    BlsSigner, ConsensusNumHash, Epoch, Intent, IntentMessage, IntentScope, ProtocolSignature as _,
     ValidatorAggregateSignature as _,
 };
 use alloy::eips::BlockNumHash;
@@ -225,6 +225,57 @@ crate::crypto::digest_newtype! {
     pub struct EpochDigest;
 }
 
+/// The canonical per-epoch message a proposer signs to seed the epoch-close committee shuffle.
+///
+/// The signature over this message is stamped on every [`Header`](crate::Header) a proposer
+/// builds for the epoch and, for the epoch's closing leader, is hashed into the committee-shuffle
+/// randomness. The message satisfies four properties that make the derived randomness
+/// unforkable and grind-resistant:
+///
+/// - **Canonical**: both fields are part of the chain-anchored epoch state every node syncs, so
+///   every honest node derives byte-identical message bytes for a given `(authority, epoch)`.
+/// - **Not leader-controllable**: the prior epoch record is sealed by the previous committee before
+///   the current epoch starts; a leader cannot vary it to grind the shuffle.
+/// - **Fixed before proposal**: the prior epoch record is resolved before the primary spawns for
+///   the epoch, so the message exists before any epoch-N header is proposed.
+/// - **Reachable**: it depends only on the epoch record (never the asynchronously-arriving epoch
+///   record *certificate*), so signing it can never block header proposal.
+#[derive(PartialEq, Eq, Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct EpochSeedMessage {
+    /// The epoch whose committee shuffle this seed is for.
+    epoch: Epoch,
+    /// Digest of the previous epoch's [`EpochRecord`] ([`EpochDigest::default`] for epoch 0,
+    /// which has no prior record - matching the repo's epoch-0 filler convention).
+    prior_epoch_record: EpochDigest,
+}
+
+impl EpochSeedMessage {
+    /// Create the canonical seed message for `epoch` anchored to the prior epoch's record digest.
+    pub fn new(epoch: Epoch, prior_epoch_record: EpochDigest) -> Self {
+        Self { epoch, prior_epoch_record }
+    }
+
+    /// The domain-separated intent message this seed commits to.
+    ///
+    /// Kept private so signing and verifying can never diverge on the encoded bytes.
+    fn intent_message(&self) -> IntentMessage<Self> {
+        IntentMessage::new(Intent::consensus(IntentScope::EpochCloseSeed), *self)
+    }
+
+    /// Sign the domain-separated seed message with the proposer's BLS key.
+    ///
+    /// BLS signatures are deterministic, so signing the same message with the same key always
+    /// yields byte-identical output - the proposer signs once per epoch and stamps every header.
+    pub fn sign<S: BlsSigner>(&self, signer: &S) -> BlsSignature {
+        signer.request_signature_direct(&encode(&self.intent_message()))
+    }
+
+    /// Verify `signature` is `author`'s signature over this seed message.
+    pub fn verify(&self, signature: &BlsSignature, author: &BlsPublicKey) -> bool {
+        signature.verify_secure(&self.intent_message(), author)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
@@ -406,5 +457,64 @@ mod test {
         let enc = encode(&b256);
         let edigest2: EpochDigest = decode(&enc);
         assert_eq!(edigest, edigest2);
+    }
+
+    /// Pin: BLS signing of the epoch-close seed message is deterministic (#1032).
+    ///
+    /// The proposer signs the message once per epoch and stamps every header - the whole design
+    /// rests on the same `(key, epoch, prior record)` always yielding byte-identical signatures,
+    /// while any change to the epoch or the prior record yields a different signature.
+    #[test]
+    fn test_epoch_seed_signature_deterministic() {
+        let signer = TestBlsKeypair::new(&mut StdRng::seed_from_u64(1032));
+        let message = EpochSeedMessage::new(7, EpochDigest::default());
+
+        let first = message.sign(&signer);
+        let second = message.sign(&signer);
+        assert_eq!(first, second, "same key + message must yield byte-identical signatures");
+        assert_eq!(first.to_bytes(), second.to_bytes(), "signature bytes must match");
+        assert!(message.verify(&first, &signer.public_key()), "signature must verify");
+
+        // A different epoch yields a different signature (and cross-verification fails).
+        let other_epoch = EpochSeedMessage::new(8, EpochDigest::default());
+        let other_epoch_sig = other_epoch.sign(&signer);
+        assert_ne!(first, other_epoch_sig, "different epoch must yield a different signature");
+        assert!(
+            !other_epoch.verify(&first, &signer.public_key()),
+            "epoch-7 signature must not verify for the epoch-8 message"
+        );
+
+        // A different prior epoch record yields a different signature.
+        let record = EpochRecord { epoch: 6, ..Default::default() };
+        let other_record_sig = EpochSeedMessage::new(7, record.digest()).sign(&signer);
+        assert_ne!(
+            first, other_record_sig,
+            "different prior epoch record must yield a different signature"
+        );
+    }
+
+    /// Pin: domain separation of the epoch-close seed intent (#1032).
+    ///
+    /// The seed message's encoded intent starts with scope byte 4 ([`IntentScope::EpochCloseSeed`])
+    /// while votes start with scope byte 2 ([`IntentScope::ConsensusDigest`]), and even the SAME
+    /// value bytes under the two scopes encode to equal-length but different messages - a seed
+    /// signature can never be replayed as a vote or vice versa.
+    #[test]
+    fn test_epoch_seed_domain_separation() {
+        let seed_encoding = encode(&IntentMessage::new(
+            Intent::consensus(IntentScope::EpochCloseSeed),
+            EpochSeedMessage::new(1, EpochDigest::default()),
+        ));
+        assert_eq!(seed_encoding.first(), Some(&4u8), "seed intent must start with scope byte 4");
+
+        let value = EpochDigest::default();
+        let vote_scoped = encode(&crate::to_intent_message(value));
+        assert_eq!(vote_scoped.first(), Some(&2u8), "vote intent must start with scope byte 2");
+
+        // Craft equal-length messages: the identical value under both scopes.
+        let seed_scoped =
+            encode(&IntentMessage::new(Intent::consensus(IntentScope::EpochCloseSeed), value));
+        assert_eq!(seed_scoped.len(), vote_scoped.len(), "crafted messages must be equal length");
+        assert_ne!(seed_scoped, vote_scoped, "equal values must still encode differently");
     }
 }

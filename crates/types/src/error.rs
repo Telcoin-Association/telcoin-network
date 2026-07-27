@@ -257,6 +257,10 @@ pub enum HeaderError {
     /// The header contains a parent with an invalid aggregate BLS signature.
     #[error("Header's parent missing aggregate BLS signature")]
     ParentMissingSignature,
+    /// The header's epoch-close seed signature does not verify against the author's protocol key
+    /// over the canonical per-epoch seed message.
+    #[error("Header's epoch-close seed signature is invalid")]
+    InvalidSeedSignature,
     /// A parent is not from the previous round.
     #[error("Parent not from previous round.")]
     InvalidParentRound,

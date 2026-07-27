@@ -123,6 +123,7 @@ impl<DB: Database> CommitteeFixture<DB> {
                     .epoch(0)
                     .parents(parents.clone())
                     .with_payload_batch(&fixture_batch_with_transactions(10), 0)
+                    .seed_signature(a.seed_signature(0))
                     .build()
             })
             .collect();

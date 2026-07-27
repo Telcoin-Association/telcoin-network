@@ -8,7 +8,8 @@ use std::{collections::BTreeMap, marker::PhantomData, num::NonZeroUsize};
 use tn_config::{KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, Authority, AuthorityIdentifier, BlsKeypair,
-    BootstrapServer, Committee, Database, Epoch, Multiaddr, TimestampSec, DEFAULT_WORKER_PORT,
+    BootstrapServer, Committee, Database, Epoch, EpochDigest, Multiaddr, TimestampSec,
+    DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -23,6 +24,10 @@ pub struct Builder<DB, F, R = StdRng> {
     epoch_boundary: Option<TimestampSec>,
     new_db: F,
     consensus_parameters: Option<Parameters>,
+    /// Cross-epoch anchor seeded into every authority's [`ConsensusConfig`]. Defaults to
+    /// [`EpochDigest::default`] (the epoch-0 convention); set a non-default value to exercise the
+    /// epoch-close seed path with a real prior-epoch record digest.
+    prior_epoch_record: EpochDigest,
     _phantom_data: PhantomData<DB>,
 }
 
@@ -42,6 +47,7 @@ where
             epoch_boundary: None,
             new_db,
             consensus_parameters: None,
+            prior_epoch_record: EpochDigest::default(),
             _phantom_data: PhantomData::<DB>,
         }
     }
@@ -84,6 +90,17 @@ where
         self
     }
 
+    /// Seed every authority's [`ConsensusConfig`] with a non-default cross-epoch anchor.
+    ///
+    /// The anchor is the digest of the previous epoch's `EpochRecord`. Fixture headers are stamped
+    /// with a seed signature over this same anchor (see [`AuthorityFixture::seed_signature`]), so a
+    /// header built by this fixture verifies against a voter configured with the same value - which
+    /// is what lets a test exercise the epoch-close seed path with a real, non-default digest.
+    pub fn with_prior_epoch_record(mut self, prior_epoch_record: EpochDigest) -> Self {
+        self.prior_epoch_record = prior_epoch_record;
+        self
+    }
+
     /// Use a provided rng. This is useful for deterministic testing.
     pub fn with_rng<RNG: rand::RngCore + rand::CryptoRng>(self, rng: RNG) -> Builder<DB, F, RNG> {
         Builder {
@@ -96,6 +113,7 @@ where
             epoch_boundary: None,
             new_db: self.new_db,
             consensus_parameters: self.consensus_parameters,
+            prior_epoch_record: self.prior_epoch_record,
             _phantom_data: PhantomData::<DB>,
         }
     }
@@ -185,6 +203,7 @@ where
                         network_config,
                         genesis.clone(),
                         &self.consensus_parameters,
+                        self.prior_epoch_record,
                     ),
                 )
             })

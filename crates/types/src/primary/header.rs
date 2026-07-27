@@ -1,8 +1,8 @@
 use crate::{
     crypto, encode,
     error::{HeaderError, HeaderResult},
-    now, AuthorityIdentifier, Batch, BlockHash, BlockNumHash, Committee, Digest, Epoch, Hash,
-    Round, TimestampSec, VoteDigest, WorkerId, MAX_HEADER_NUM_OF_BATCHES,
+    now, AuthorityIdentifier, Batch, BlockHash, BlockNumHash, BlsSignature, Committee, Digest,
+    Epoch, Hash, Round, TimestampSec, VoteDigest, WorkerId, MAX_HEADER_NUM_OF_BATCHES,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,12 @@ struct HeaderInner {
     /// execution result in a signed and validated structure which validates
     /// this execution block as well.
     latest_execution_block: BlockNumHash,
+    /// The author's deterministic BLS signature over the canonical per-epoch
+    /// [`EpochSeedMessage`](crate::EpochSeedMessage). Constant for a given `(author, epoch)`,
+    /// verified by voters before voting, and hashed into the epoch-close committee-shuffle
+    /// randomness when this header is the closing leader. Covered by the header digest (and so
+    /// by votes and the certificate aggregate), which makes the shuffle seed unforkable.
+    seed_signature: BlsSignature,
     /// The [HeaderDigest].
     /// This is cached to avoid calculating frequently (but not serialized).
     /// Note, this struct is private and this field MUST always be set on creation in this module.
@@ -49,6 +55,7 @@ impl Default for HeaderInner {
             payload: Default::default(),
             parents: Default::default(),
             latest_execution_block: Default::default(),
+            seed_signature: Default::default(),
             digest: Default::default(),
         };
 
@@ -73,6 +80,7 @@ impl Header {
         payload: IndexMap<BlockHash, WorkerId>,
         parents: BTreeSet<HeaderDigest>,
         latest_execution_block: BlockNumHash,
+        seed_signature: BlsSignature,
     ) -> Self {
         let mut inner = HeaderInner {
             author,
@@ -83,6 +91,7 @@ impl Header {
             parents,
             digest: HeaderDigest::default(),
             latest_execution_block,
+            seed_signature,
         };
         let digest = Hash::digest(&inner);
         inner.digest = digest;
@@ -174,6 +183,12 @@ impl Header {
         self.inner.latest_execution_block
     }
 
+    /// The author's deterministic BLS signature over the canonical per-epoch
+    /// [`EpochSeedMessage`](crate::EpochSeedMessage) - the epoch-close committee-shuffle seed.
+    pub fn seed_signature(&self) -> &BlsSignature {
+        &self.inner.seed_signature
+    }
+
     /// The nonce of this header used during execution.
     pub fn nonce(&self) -> u64 {
         ((self.inner.epoch as u64) << 32) | self.inner.round as u64
@@ -219,6 +234,9 @@ pub struct HeaderBuilder {
     parents: BTreeSet<HeaderDigest>,
     /// Hash and number of the latest known execution block when this Header was build.
     latest_execution_block: BlockNumHash,
+    /// The author's deterministic BLS signature over the canonical per-epoch
+    /// [`EpochSeedMessage`](crate::EpochSeedMessage).
+    seed_signature: BlsSignature,
 }
 
 impl HeaderBuilder {
@@ -232,6 +250,7 @@ impl HeaderBuilder {
             payload: header.inner.payload.clone(),
             parents: header.inner.parents.clone(),
             latest_execution_block: header.inner.latest_execution_block,
+            seed_signature: header.inner.seed_signature,
         }
     }
 
@@ -248,6 +267,7 @@ impl HeaderBuilder {
             parents: self.parents,
             digest: HeaderDigest::default(),
             latest_execution_block: self.latest_execution_block,
+            seed_signature: self.seed_signature,
         };
 
         inner.digest = Hash::digest(&inner);
@@ -288,6 +308,11 @@ impl HeaderBuilder {
     /// Set the latest_execution_block on the builder.
     pub fn latest_execution_block(mut self, latest_execution_block: BlockNumHash) -> Self {
         self.latest_execution_block = latest_execution_block;
+        self
+    }
+    /// Set the epoch-close seed signature on the builder.
+    pub fn seed_signature(mut self, seed_signature: BlsSignature) -> Self {
+        self.seed_signature = seed_signature;
         self
     }
     /// Helper method to directly set values of the payload
@@ -389,11 +414,12 @@ mod test {
 
     use alloy::{eips::BlockNumHash, primitives::BlockHash};
     use indexmap::IndexMap;
+    use rand::SeedableRng as _;
     use serde::{Deserialize, Serialize};
 
     use crate::{
-        decode, encode, AuthorityIdentifier, Epoch, Header, HeaderDigest, Round, TimestampSec,
-        WorkerId,
+        decode, encode, AuthorityIdentifier, BlsSignature, Epoch, Header, HeaderDigest, Round,
+        TimestampSec, WorkerId,
     };
 
     /// `Header` type for consensus layer- use this to make sure serde is ignoring the inner Arc....
@@ -417,6 +443,9 @@ mod test {
         /// execution result in a signed and validated structure which validates
         /// this execution block as well.
         pub latest_execution_block: BlockNumHash,
+        /// The author's deterministic BLS signature over the canonical per-epoch seed message.
+        /// Mirrors `HeaderInner::seed_signature` - a DELIBERATE wire-format change (#1032).
+        pub seed_signature: BlsSignature,
     }
 
     /// Simple test to make sure that moving to the inner Arc on Header will not
@@ -427,8 +456,17 @@ mod test {
         let mut test_header = HeaderData::default();
         test_header.payload.insert(BlockHash::default(), 0);
         test_header.parents.insert(HeaderDigest::default());
+        // Exercise the seed_signature field (#1032 - a deliberate wire-format change) with
+        // non-default signature bytes so the round-trip covers real content.
+        let keypair = crate::BlsKeypair::generate(&mut rand::rngs::StdRng::seed_from_u64(1032));
+        test_header.seed_signature = crate::Signer::sign(&keypair, b"seed");
         let test_enc = encode(&test_header);
         let header: Header = decode(&test_enc);
+        assert_eq!(
+            &test_header.seed_signature,
+            header.seed_signature(),
+            "seed signature mismatch after decode"
+        );
         let test_enc = encode(&header);
         let test_header2: HeaderData = decode(&test_enc);
         assert_eq!(test_header, test_header2, "Header mismatch");

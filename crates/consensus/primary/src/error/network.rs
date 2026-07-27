@@ -221,6 +221,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidGenesisParent(_)
         | HeaderError::InvalidRound(_)
         | HeaderError::ParentMissingSignature
+        | HeaderError::InvalidSeedSignature
         | HeaderError::InvalidParentTimestamp { .. }
         | HeaderError::UnkownWorkerId
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),

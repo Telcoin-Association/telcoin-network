@@ -47,7 +47,7 @@ use tn_rpc::RpcNodeInfo;
 use tn_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
     CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    Multiaddr, NetworkPublicKey, P2pNode, SealedHeader, TaskManager, TaskSpawner,
+    EpochDigest, Multiaddr, NetworkPublicKey, P2pNode, SealedHeader, TaskManager, TaskSpawner,
     DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
@@ -276,12 +276,18 @@ where
     /// entry path. It folds in the next committee's keys — read at the same pin — so the
     /// network can pre-resolve the successor committee. Produces a config scoped to this epoch
     /// only.
+    ///
+    /// `prior_epoch_record` is the digest of the previous epoch's `EpochRecord` resolved by
+    /// `open_epoch_pack` (default digest for epoch 0). It anchors the canonical epoch-close
+    /// seed message this epoch's proposers sign and voters verify, so it MUST be the real
+    /// chain-derived digest - never a silent default.
     pub(super) async fn configure_consensus(
         &self,
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
         committee: Committee,
         epoch_start_header: &SealedHeader,
+        prior_epoch_record: EpochDigest,
     ) -> eyre::Result<ConsensusConfig<DB>> {
         let validators = committee.bls_keys();
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
@@ -301,6 +307,7 @@ where
             committee,
             network_config.clone(),
             next_committee_keys,
+            prior_epoch_record,
         )?;
 
         Ok(consensus_config)

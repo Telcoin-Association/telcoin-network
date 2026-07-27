@@ -24,7 +24,7 @@ use tn_types::{
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlsPublicKey, Certificate,
     ConsensusResult, ConsensusResultDigest, Database, Epoch, EpochCertificate, EpochDigest,
-    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
+    EpochRecord, EpochSeedMessage, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
     SignatureVerificationState, TnSender as _, Vote,
 };
 use tokio::{sync::Mutex as TokioMutex, time::timeout};
@@ -706,6 +706,21 @@ where
         ensure!(
             num_parents <= committee.size(),
             HeaderError::TooManyParents(num_parents, committee.size()).into()
+        );
+
+        // Verify the author's epoch-close seed signature over the canonical per-epoch seed
+        // message before any blocking wait or state mutation. A certificate needs 2f+1 votes, so
+        // refusing to vote here guarantees every certified header carries at least f+1 honest
+        // attestations that its seed signature is valid - the committee-shuffle randomness
+        // derived from the closing leader's seed cannot be forked or forged (#1032).
+        let author = committee
+            .authority(header.author())
+            .ok_or_else(|| HeaderError::UnknownAuthority(header.author().to_string()))?;
+        let seed_message =
+            EpochSeedMessage::new(committee.epoch(), self.consensus_config.prior_epoch_record());
+        ensure!(
+            seed_message.verify(header.seed_signature(), author.protocol_key()),
+            HeaderError::InvalidSeedSignature.into()
         );
 
         // if peer is ahead, wait for execution to catch up

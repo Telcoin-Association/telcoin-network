@@ -3,7 +3,7 @@
 
 use super::ConsensusHeader;
 use crate::{
-    crypto, encode, Address, Batch, BlockHash, BlsSignature, Certificate, ConsensusHeaderDigest,
+    crypto, encode, Address, Batch, BlockHash, Certificate, ConsensusHeaderDigest,
     ConsensusNumHash, Digest, Epoch, Hash, Header, ReputationScores, Round, SealedHeader,
     TimestampSec, B256,
 };
@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::warn;
 
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
@@ -255,12 +255,14 @@ impl ConsensusOutput {
         self.close_epoch
     }
 
-    /// Generate the source of randomness to shuffle future committees at the epoch boundary. The
-    /// source of randomness comes from the keccak hash of the leader's aggregate signature.
+    /// The source of randomness used to shuffle future committees at the epoch boundary: the
+    /// keccak hash of the leader's deterministic BLS `seed_signature` over the canonical
+    /// per-epoch [`EpochSeedMessage`](crate::EpochSeedMessage).
     ///
-    /// NOTE: this cannot fail - uses [BlsSignature::default] and is considered acceptable with
-    /// permissioned validator set, but should never happen.
-    pub fn keccak_leader_sigs(&self) -> B256 {
+    /// The seed signature is part of the leader's header, so it is covered by the header digest,
+    /// the votes, and the certificate aggregate - every certificate for the leader's header
+    /// carries the same seed, making this value unforkable by the leader.
+    pub fn committee_shuffle_seed(&self) -> B256 {
         self.inner.sub_dag.inner.randomness
     }
 
@@ -305,7 +307,8 @@ struct CommittedSubDagInner {
     /// Property is explicitly private so the method commit_timestamp() should be used instead
     /// which bears additional resolution logic.
     commit_timestamp: TimestampSec,
-    /// Randomness derived from the leaders BLS aggregate signature.
+    /// Randomness derived from the leader's deterministic BLS seed signature over the canonical
+    /// per-epoch [`EpochSeedMessage`](crate::EpochSeedMessage).
     randomness: B256,
 }
 
@@ -375,11 +378,12 @@ impl CommittedSubDag {
         // Make sure the leader is the LAST certificate.
         //
         assert_eq!(leader.digest(), certificates.last().map(|c| c.digest()).unwrap_or_default());
-        let randomness = leader.aggregated_signature().unwrap_or_else(|| {
-                error!(target: "engine", "BLS signature missing for leader - using default for closing epoch");
-                BlsSignature::default()
-            });
-        let randomness = keccak256(randomness.to_bytes());
+        // Derive the committee-shuffle randomness from the leader's deterministic seed signature.
+        // The seed signature is a mandatory header field covered by the header digest, so every
+        // certificate for this leader header carries identical bytes - unlike the certificate's
+        // aggregate signature, which varies with the 2f+1 signer subset and would let a Byzantine
+        // leader fork the shuffle (#1032).
+        let randomness = keccak256(leader.header().seed_signature().to_bytes());
         let headers = certificates.into_iter().map(|c| c.into_header()).collect();
         let inner = Arc::new(CommittedSubDagInner {
             headers,
@@ -447,6 +451,12 @@ impl CommittedSubDag {
     /// Return the Certificates for this SubDag.
     pub fn headers(&self) -> &[Header] {
         &self.inner.headers
+    }
+
+    /// The committee-shuffle randomness: keccak of the leader's deterministic epoch-close seed
+    /// signature over the canonical per-epoch [`EpochSeedMessage`](crate::EpochSeedMessage).
+    pub fn randomness(&self) -> B256 {
+        self.inner.randomness
     }
 
     pub fn reputation_scores(&self) -> &ReputationScores {

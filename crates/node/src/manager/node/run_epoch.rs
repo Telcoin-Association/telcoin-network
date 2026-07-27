@@ -26,7 +26,7 @@ use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache}
 use tn_types::{
     gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator, WorkerFeeConfig},
     BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase,
-    EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
+    EpochDigest, EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -218,7 +218,8 @@ where
         // Do not wait long for tasks to exit, just drop them and move on to next epoch.
         epoch_task_manager.set_join_wait(200);
 
-        self.open_epoch_pack(committee.clone(), epoch_task_manager.get_spawner()).await?;
+        let prior_epoch_record =
+            self.open_epoch_pack(committee.clone(), epoch_task_manager.get_spawner()).await?;
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
@@ -245,7 +246,13 @@ where
         // subscribe to output early to prevent missed messages
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
         let consensus_config = self
-            .configure_consensus(engine, network_config, committee, &epoch_start_header)
+            .configure_consensus(
+                engine,
+                network_config,
+                committee,
+                &epoch_start_header,
+                prior_epoch_record,
+            )
             .await?;
 
         // The networks need their one-time, per-process setup (start listening, register bootstrap
@@ -446,11 +453,16 @@ where
     /// has connections — without that pre-dial this blocks waiting for a record while the very task
     /// that would supply it has not started — then waits up to 30s, erroring if it still does not
     /// arrive.
+    ///
+    /// Returns the digest of the previous epoch's [`EpochRecord`] ([`EpochDigest::default`] for
+    /// epoch 0, which has no prior record), so the caller can seed the per-epoch
+    /// [`ConsensusConfig`](tn_config::ConsensusConfig) with the canonical anchor for the
+    /// epoch-close committee-shuffle seed message.
     async fn open_epoch_pack(
         &mut self,
         committee: Committee,
         task_spawner: TaskSpawner,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<EpochDigest> {
         let current_epoch = committee.epoch();
         let previous_epoch = current_epoch.saturating_sub(1);
         let previous_epoch_rec =
@@ -466,10 +478,16 @@ where
             let current = *self.consensus_bus.requested_missing_epoch().borrow();
             self.consensus_bus.requested_missing_epoch().send_replace(current.max(previous_epoch));
             rec
-        } else if previous_epoch == 0 {
+        } else if current_epoch == 0 {
             EpochRecord {
-                // If we can't find the record then we should be starting at epoch 0- use
-                // this filler.
+                // Genuine genesis (current epoch 0, so there is no prior record to seal). Gated on
+                // `current_epoch == 0`, not `previous_epoch == 0`: at the epoch-0 -> epoch-1
+                // boundary `previous_epoch` is also 0, but a real epoch-0 record exists (or is
+                // syncing), and this filler's digest differs from that real record's digest. Using
+                // the filler at epoch 1 would feed a divergent `prior_epoch_record` into the
+                // epoch-close seed message, so nodes with the real record and nodes with the filler
+                // would sign/verify different seeds (#1032 canonicality). Epoch 1 therefore falls
+                // through to the wait-or-error path below, exactly like epoch >= 2.
                 epoch: 0,
                 committee: committee.bls_keys().iter().copied().collect(),
                 next_committee: committee.bls_keys().iter().copied().collect(),
@@ -520,8 +538,14 @@ where
                 ));
             }
         };
+        // Anchor the epoch-close seed message: the digest of the record sealed for epoch N-1.
+        // Epoch 0 has no prior record, so it uses the default digest (matching the epoch-0
+        // filler convention above). The resolved record (found, filler, or fetched) is
+        // canonical chain state, so every node derives the same digest.
+        let prior_epoch_record =
+            if current_epoch == 0 { EpochDigest::default() } else { previous_epoch_rec.digest() };
         self.consensus_chain.new_epoch(previous_epoch_rec, committee).await?;
-        Ok(())
+        Ok(prior_epoch_record)
     }
 
     /// Forward one consensus output to the engine and record progress.
