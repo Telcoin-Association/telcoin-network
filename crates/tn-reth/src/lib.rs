@@ -539,6 +539,50 @@ impl RethConfig {
 
         Self(this)
     }
+
+    /// Assert the archive-mode invariant that every pinned historical read depends on.
+    ///
+    /// Pinned reads (committee membership, epoch records, epoch state, worker fee configs)
+    /// resolve their state through `state_by_block_hash`, and reth only serves that state from
+    /// the requested block while the history indices covering it are intact.
+    ///
+    /// Reth does catch the pruned case, loudly: `HistoricalStateProviderRef` compares the pinned
+    /// block against the account- and storage-history watermarks it derives from the
+    /// `PruneCheckpoints` table, and returns `ProviderError::StateAtBlockPruned` rather than
+    /// serving the wrong state. That failure is diagnosable, but it lands in the middle of a
+    /// consensus read (committee construction, epoch entry, base-fee seeding), where the
+    /// reachable outcomes are a stalled epoch transition or a halted node. Refusing to start is
+    /// the same fact delivered at the one moment an operator can still act on it.
+    ///
+    /// Note what this does NOT protect against, since the distinction is easy to lose. Those
+    /// watermarks come from the prune checkpoints, so history missing WITHOUT one (an externally
+    /// truncated datadir, a snapshot-restored node with no pre-snapshot history) leaves them
+    /// unset. `HistoryInfo::MaybeInPlainState` then classifies the pinned block and the read
+    /// returns plain state with no error at all. That is the genuinely silent variant, it is not
+    /// a configuration property, and this check cannot see it.
+    ///
+    /// The check is deliberately conservative. `prune_config` returns `None` exactly when no
+    /// pruning was requested, so any `Some` fails here: a per-segment mode, `--full`,
+    /// `--minimal`, or a non-default block interval. A configuration that happens to leave
+    /// account and storage history intact still fails, because deciding which segments a pinned
+    /// read can survive is a review decision, not a startup one.
+    ///
+    /// Two limits are worth stating. This reads the configuration THIS node was built with, so
+    /// it cannot detect a datadir some other binary already pruned; and `prune_config` reflects
+    /// only the CLI-derived [`PruningArgs`], not a reth.toml `[prune]` section (TN never loads
+    /// one, since `NodeConfig::config` stays `None` and the node hand-rolls its init path rather
+    /// than using reth's launcher). Both residuals are covered by `etc/archive-mode-guard.sh`,
+    /// which fails the build if a pruner entry point or a reth.toml load is introduced.
+    fn ensure_archive_mode(&self) -> eyre::Result<()> {
+        self.0.prune_config().map_or(Ok(()), |prune_config| {
+            Err(eyre::eyre!(
+                "pruning is configured ({prune_config:?}) but pinned consensus-registry reads \
+                 require archive mode: once history is pruned, reth fails a pinned read with \
+                 StateAtBlockPruned, so committee, epoch-record, and epoch-state reads would \
+                 break mid-consensus instead of here. Refusing to start"
+            ))
+        })
+    }
 }
 
 /// This is a wrapped abstraction around Reth.
@@ -655,6 +699,12 @@ impl RethEnv {
         basefee_address: Option<Address>,
         rewards_counter: RewardsCounter,
     ) -> eyre::Result<Self> {
+        // Fail fast on a pruning configuration before any database work happens. Every RethEnv in
+        // the process funnels through here, and every pinned registry read this env goes on to
+        // serve resolves historical state through `state_by_block_hash`, which silently degrades
+        // to canonical-tip state once the history it needs has been pruned away.
+        reth_config.ensure_archive_mode()?;
+
         let node_config = reth_config.0.clone();
         let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), rewards_counter);
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
@@ -1747,6 +1797,10 @@ impl RethEnv {
     /// could yield a silently empty range if finality ever lags the canonical tip.
     pub fn epoch_state_at_header(&self, header: &SealedHeader) -> eyre::Result<EpochState> {
         // create EVM with the state at the pinned header
+        //
+        // ARCHIVE-MODE: this read pins historical state via `state_by_block_hash`, which stays
+        // pinned only while pruning is disabled (enforced at startup by
+        // `RethConfig::ensure_archive_mode`).
         let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
@@ -1980,13 +2034,15 @@ impl RethEnv {
     {
         // Create EVM with the state at the pinned header.
         //
-        // ARCHIVE-MODE ASSUMPTION: this node never constructs a pruner (`PruningArgs` are built
-        // with every field disabled and no `PrunerBuilder` exists in the repo), so
-        // `state_by_block_hash` always resolves fully indexed history. If pruning is ever
-        // enabled, reth's `HistoricalStateProvider` can hit a missing history shard and return
-        // `HistoryInfo::MaybeInPlainState`, silently falling back to TIP state for this
-        // "pinned" read — exactly the nondeterminism pinning exists to prevent. Revisit every
-        // pinned registry read before enabling pruning.
+        // ARCHIVE-MODE: `state_by_block_hash` resolves fully indexed history only while pruning
+        // is disabled. With pruning on, reth fails this read with `StateAtBlockPruned` once the
+        // pinned block falls below the history watermark, which halts committee construction
+        // rather than corrupting it. `RethConfig::ensure_archive_mode` (called from
+        // `RethEnv::new`) turns that mid-consensus failure into a refusal to start; revisit
+        // every pinned registry read before relaxing that guard. The genuinely silent variant
+        // (history gone with no prune checkpoint, so `HistoryInfo::MaybeInPlainState` serves
+        // plain state) is NOT covered here, because it is a property of the datadir rather than
+        // of the configuration.
         let state_provider = self
             .inner
             .blockchain_provider
@@ -2047,6 +2103,9 @@ impl RethEnv {
         contract: Address,
         calldata: Bytes,
     ) -> EvmReadResult<Bytes> {
+        // ARCHIVE-MODE: this read pins historical state via `state_by_block_hash`, which stays
+        // pinned only while pruning is disabled (enforced at startup by
+        // `RethConfig::ensure_archive_mode`).
         let state_provider = self
             .inner
             .blockchain_provider
@@ -2147,6 +2206,10 @@ impl RethEnv {
         &self,
         header: &SealedHeader,
     ) -> StateReadResult<(usize, Vec<WorkerFeeConfig>)> {
+        // ARCHIVE-MODE: this read pins historical state via `state_by_block_hash`, which stays
+        // pinned only while pruning is disabled (enforced at startup by
+        // `RethConfig::ensure_archive_mode`). The idle-worker fee walk reaches arbitrarily far
+        // back through epoch boundaries, so it is the deepest historical consumer here.
         let state_provider =
             self.inner.blockchain_provider.state_by_block_hash(header.hash()).map_err(|e| {
                 StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
@@ -2267,6 +2330,9 @@ impl RethEnv {
         let header = self
             .sealed_header_by_hash(block_hash)?
             .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+        // ARCHIVE-MODE: this read pins historical state via `state_by_block_hash`, which stays
+        // pinned only while pruning is disabled (enforced at startup by
+        // `RethConfig::ensure_archive_mode`).
         let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
         let state = StateProviderDatabase::new(&state_provider);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
@@ -2309,6 +2375,9 @@ impl RethEnv {
         &self,
         header: &SealedHeader,
     ) -> StateReadResult<(Epoch, ConsensusRegistry::EpochInfo)> {
+        // ARCHIVE-MODE: this read pins historical state via `state_by_block_hash`, which stays
+        // pinned only while pruning is disabled (enforced at startup by
+        // `RethConfig::ensure_archive_mode`).
         let state_provider =
             self.inner.blockchain_provider.state_by_block_hash(header.hash()).map_err(|e| {
                 StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
@@ -4204,6 +4273,93 @@ mod tests {
                 assert!(mods.remove(&r));
             }
         };
+    }
+
+    /// Build a config the way `new_for_temp_chain` does, then hand its [`PruningArgs`] to
+    /// `enable` so a test can turn on exactly one prune knob.
+    fn config_with_pruning(enable: impl FnOnce(&mut PruningArgs)) -> RethConfig {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut config = RethConfig(NodeConfig { chain, ..NodeConfig::default() });
+        enable(&mut config.0.pruning);
+        config
+    }
+
+    /// The config the node actually ships must satisfy the archive-mode invariant, or every node
+    /// would refuse to start.
+    #[test]
+    fn test_archive_mode_accepts_production_config() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let reth_command = RethCommand::try_parse_from(["tn-reth"])?;
+        RethConfig::new(reth_command, None, tmp_dir.path(), true, chain).ensure_archive_mode()
+    }
+
+    /// `new_for_temp_chain` fills its config from `NodeConfig::default()` rather than
+    /// `RethConfig::new`, so that second construction path needs its own coverage: every test env
+    /// in the workspace is built through it and passes the same startup guard.
+    #[test]
+    fn test_archive_mode_accepts_default_node_config() -> eyre::Result<()> {
+        config_with_pruning(|_| {}).ensure_archive_mode()
+    }
+
+    /// Pruning account history is the knob that directly unpins `state_by_block_hash`: without
+    /// the account-history shards, reth resolves a pinned block to `MaybeInPlainState` and serves
+    /// canonical-tip state instead.
+    #[test]
+    fn test_archive_mode_rejects_account_history_pruning() {
+        let err = config_with_pruning(|pruning| pruning.account_history_distance = Some(128))
+            .ensure_archive_mode()
+            .expect_err("account-history pruning must be rejected");
+        assert!(err.to_string().contains("archive mode"), "unexpected error: {err}");
+    }
+
+    /// Storage history carries the `ConsensusRegistry` slots the committee is decoded from, so
+    /// pruning it unpins the registry reads specifically.
+    #[test]
+    fn test_archive_mode_rejects_storage_history_pruning() {
+        let err = config_with_pruning(|pruning| pruning.storage_history_distance = Some(128))
+            .ensure_archive_mode()
+            .expect_err("storage-history pruning must be rejected");
+        assert!(err.to_string().contains("archive mode"), "unexpected error: {err}");
+    }
+
+    /// `--full` derives a whole prune-mode set from the chain spec rather than setting a single
+    /// segment, so it exercises the composite path through `PruningArgs::prune_config`.
+    #[test]
+    fn test_archive_mode_rejects_full_node_pruning() {
+        let err = config_with_pruning(|pruning| pruning.full = true)
+            .ensure_archive_mode()
+            .expect_err("full-node pruning must be rejected");
+        assert!(err.to_string().contains("archive mode"), "unexpected error: {err}");
+    }
+
+    /// The guard is wired into `RethEnv::new`, so a pruned config stops node startup rather than
+    /// only failing an isolated check nothing calls.
+    #[tokio::test]
+    async fn test_reth_env_new_rejects_pruned_config() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Archive Mode Test Task Manager");
+        let mut config = RethConfig(NodeConfig {
+            datadir: DatadirArgs {
+                datadir: MaybePlatformPath::from(tmp_dir.path().to_path_buf()),
+                static_files_path: None,
+                rocksdb_path: None,
+                pprof_dumps_path: None,
+            },
+            chain,
+            ..NodeConfig::default()
+        });
+        let database = RethEnv::new_database(&config, tmp_dir.path())?;
+
+        // enable pruning only after the database exists, so the guard is the sole reason for the
+        // failure below
+        config.0.pruning.account_history_distance = Some(128);
+
+        let err = RethEnv::new(&config, &task_manager, database, None, RewardsCounter::default())
+            .expect_err("RethEnv::new must refuse a pruned config");
+        assert!(err.to_string().contains("archive mode"), "unexpected error: {err}");
+        Ok(())
     }
 
     #[tokio::test]
