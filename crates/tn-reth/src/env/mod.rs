@@ -141,10 +141,10 @@ impl RethEnv {
     /// Initialize a new transaction pool for worker.
     pub fn init_txn_pool(&self) -> eyre::Result<WorkerTxPool> {
         WorkerTxPool::new(
-            &self.node_config(),
-            &self.get_task_spawner(),
-            &self.blockchain_provider(),
-            &self.evm_config(),
+            self.node_config(),
+            self.get_task_spawner(),
+            self.blockchain_provider(),
+            self.evm_config(),
         )
     }
 

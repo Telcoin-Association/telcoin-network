@@ -24,83 +24,23 @@ mod clippy {
     use tn_reth as _;
 }
 
-use crate::{
-    evm::TNEvm, metrics::RETH_METRICS, system_calls::PRECOMPILE_GENESIS_BYTECODE,
-    traits::TNExecution,
-};
 use alloy::{
-    hex,
-    primitives::{Bytes, ChainId},
+    primitives::ChainId,
     sol_types::{SolCall, SolConstructor},
 };
 use alloy_evm::Evm;
-use error::{
-    EvmReadError, EvmReadResult, StateReadError, StateReadResult, TnRethError, TnRethResult,
-};
-use evm::TnEvmConfig;
-use eyre::OptionExt;
-use jsonrpsee::Methods;
-use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
-use reth::{
-    args::{DatabaseArgs, DatadirArgs},
-    builder::NodeConfig,
-    rpc::{
-        builder::{config::RethRpcServerConfig, RpcModuleBuilder},
-        eth::EthApi,
-        server_types::eth::utils::recover_raw_transaction as reth_recover_raw_transaction,
-    },
-};
-use reth_chainspec::{BaseFeeParams, EthChainSpec};
-use reth_db::init_db;
-use reth_db_common::init::init_genesis;
-use reth_errors::{BlockExecutionError, BlockValidationError};
-use reth_eth_wire::BlockHashNumber;
-use reth_evm::{
-    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
-    ConfigureEvm, EvmFactory,
-};
-use reth_primitives_traits::SignerRecoverable as _;
-use reth_provider::{
-    providers::BlockchainProvider, AccountReader as _, BlockBodyIndicesProvider as _,
-    BlockIdReader as _, BlockNumReader, BlockReader, CanonChainTracker,
-    CanonStateSubscriptions as _, Chain, ChainStateBlockReader, ChainStateBlockWriter, DBProvider,
-    DatabaseProviderFactory, ExecutionOutcome, HeaderProvider as _, ProviderFactory,
-    ReceiptProvider as _, StateProvider as _, StateProviderBox, StateProviderFactory,
-    TransactionVariant, TransactionsProvider as _,
-};
-use reth_revm::{
-    cached::CachedReads,
-    context::result::{EVMError, ExecutionResult, ResultAndState},
-    database::StateProviderDatabase,
-    db::{states::bundle_state::BundleRetention, BundleState},
-    DatabaseCommit, State,
-};
-use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
-use serde_json::Value;
-use std::{
-    ops::RangeInclusive,
-    path::Path,
-    sync::{Arc, OnceLock},
-};
-use system_calls::{
-    ConsensusRegistry::{self},
-    EpochState, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
-};
-use tempfile::TempDir;
+use reth_chainspec::EthChainSpec;
+use reth_provider::DBProvider;
+use std::sync::{Arc, OnceLock};
+use system_calls::SYSTEM_ADDRESS;
 use tn_config::{
-    NodeInfo, CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS, ISSUANCE_ADDRESS, ISSUANCE_JSON,
-    WORKER_CONFIGS_ADDRESS, WORKER_CONFIGS_JSON,
+    CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS,
 };
 use tn_types::{
-    deconstruct_nonce,
-    gas_accumulator::{RewardsCounter, WorkerFeeConfig},
-    Account, Address, BlockBody, BlockHashOrNumber, BlockNumHash, BlockNumber, ConsensusNumHash,
-    EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount, Receipt, Recovered, Round,
-    SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionMeta, TransactionSigned,
-    TxHash, TxNumber, B256, U256,
+    Address, BlockBody, Genesis,
+    SealedBlock, SealedHeader,
 };
-use tracing::{debug, error, info, warn};
-use traits::TelcoinNode;
+use tracing::warn;
 
 // Reth stuff we are just re-exporting.  Need to reduce this over time.
 pub use alloy::primitives::FixedBytes;
