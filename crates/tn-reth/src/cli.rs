@@ -1,12 +1,32 @@
 //! Configure reth environment through CLI.
 
-use std::{collections::HashSet, net::{IpAddr, Ipv4Addr}, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, Ipv4Addr},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use clap::Parser;
-use reth::{args::{DatabaseArgs, DebugArgs, DefaultTxPoolValues, DevArgs, DiscoveryArgs, EngineArgs, EraArgs, EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, StaticFilesArgs, StorageArgs, TxPoolArgs}, network::transactions::{TransactionIngressPolicy, TransactionPropagationMode, config::TransactionPropagationKind}, rpc::builder::{RethRpcModule, RpcModuleSelection}};
+use reth::{
+    args::{
+        DatabaseArgs, DebugArgs, DefaultTxPoolValues, DevArgs, DiscoveryArgs, EngineArgs, EraArgs,
+        EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, StaticFilesArgs,
+        StorageArgs, TxPoolArgs,
+    },
+    network::transactions::{
+        config::TransactionPropagationKind, TransactionIngressPolicy, TransactionPropagationMode,
+    },
+    rpc::builder::{RethRpcModule, RpcModuleSelection},
+};
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_discv4::NatResolver;
-use reth_node_builder::{DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD, DEFAULT_RESERVED_CPU_CORES, DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES, DEFAULT_SPARSE_TRIE_PRUNE_DEPTH, NodeConfig};
+use reth_node_builder::{
+    NodeConfig, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD,
+    DEFAULT_RESERVED_CPU_CORES, DEFAULT_SPARSE_TRIE_MAX_STORAGE_TRIES,
+    DEFAULT_SPARSE_TRIE_PRUNE_DEPTH,
+};
 use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use tn_types::ETHEREUM_BLOCK_GAS_LIMIT_30M;
 use tracing::warn;
@@ -339,18 +359,18 @@ impl RethConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use reth::rpc::builder::RpcModuleSelection;
-	use tempfile::TempDir;
-	use tn_types::test_genesis;
-	use super::*;
+    use tempfile::TempDir;
+    use tn_types::test_genesis;
 
-	/// reth's own per-sender slot default, spelled out rather than imported.
+    /// reth's own per-sender slot default, spelled out rather than imported.
     ///
     /// hard-coding it keeps the assertion below honest if tn's default is ever changed to
     /// coincide with reth's, which is the condition that made 16 unreachable in the first place.
     const RETH_MAX_ACCOUNT_SLOTS_PER_SENDER: usize = 16;
 
-	#[test]
+    #[test]
     fn test_rpc_validator() {
         let mut mods: Option<RpcModuleSelection> = None;
         RethConfig::validate_rpc_modules(&mut mods);
@@ -391,6 +411,4 @@ mod tests {
 
         assert_eq!(config.0.txpool.max_account_slots, RETH_MAX_ACCOUNT_SLOTS_PER_SENDER);
     }
-
-
 }

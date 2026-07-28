@@ -15,8 +15,8 @@ use std::{
 };
 use tn_config::TelcoinDirs as _;
 use tn_reth::{
-    iter_static_files, open_db_read_only, TNPrimitives, DatabaseArguments, DatabaseEnv,
-    RethDatabaseT as _, RethMdbxError, StaticFileProvider, Tables,
+    iter_static_files, open_db_read_only, DatabaseArguments, DatabaseEnv, RethDatabaseT as _,
+    RethMdbxError, StaticFileProvider, TNPrimitives, Tables,
 };
 use tn_storage::{consensus_pack::DATA_NAME, pack_validate::validate_pack_file};
 use tn_types::Epoch;

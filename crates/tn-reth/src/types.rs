@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use reth::rpc::builder::TransportRpcModules;
 use reth_db::DatabaseEnv;
-use reth_transaction_pool::{EthPooledTransaction, ValidPoolTransaction, identifier::TransactionId};
+use reth_transaction_pool::{
+    identifier::TransactionId, EthPooledTransaction, ValidPoolTransaction,
+};
 use tn_types::{EthPrimitives, Recovered, RecoveredBlock};
 
 /// Rpc Server type, used for getting the node started.

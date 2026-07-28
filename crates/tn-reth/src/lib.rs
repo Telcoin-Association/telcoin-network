@@ -25,7 +25,8 @@ mod clippy {
 }
 
 use crate::{
-    evm::TNEvm, metrics::RETH_METRICS, system_calls::PRECOMPILE_GENESIS_BYTECODE, traits::TNExecution,
+    evm::TNEvm, metrics::RETH_METRICS, system_calls::PRECOMPILE_GENESIS_BYTECODE,
+    traits::TNExecution,
 };
 use alloy::{
     hex,
@@ -41,14 +42,10 @@ use eyre::OptionExt;
 use jsonrpsee::Methods;
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use reth::{
-    args::{
-        DatabaseArgs, DatadirArgs,
-    },
+    args::{DatabaseArgs, DatadirArgs},
     builder::NodeConfig,
     rpc::{
-        builder::{
-            config::RethRpcServerConfig, RpcModuleBuilder,
-        },
+        builder::{config::RethRpcServerConfig, RpcModuleBuilder},
         eth::EthApi,
         server_types::eth::utils::recover_raw_transaction as reth_recover_raw_transaction,
     },
@@ -78,9 +75,7 @@ use reth_revm::{
     db::{states::bundle_state::BundleRetention, BundleState},
     DatabaseCommit, State,
 };
-use reth_transaction_pool::{
-    blobstore::DiskFileBlobStore, EthTransactionPool,
-};
+use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use serde_json::Value;
 use std::{
     ops::RangeInclusive,
@@ -100,8 +95,8 @@ use tn_types::{
     deconstruct_nonce,
     gas_accumulator::{RewardsCounter, WorkerFeeConfig},
     Account, Address, BlockBody, BlockHashOrNumber, BlockNumHash, BlockNumber, ConsensusNumHash,
-    EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount, Receipt, Recovered,
-    Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionMeta, TransactionSigned,
+    EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount, Receipt, Recovered, Round,
+    SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionMeta, TransactionSigned,
     TxHash, TxNumber, B256, U256,
 };
 use tracing::{debug, error, info, warn};
@@ -157,6 +152,9 @@ pub mod snapshot;
 pub mod system_calls;
 mod types;
 pub mod worker;
+pub use cli::{
+    init_txpool_defaults, RethCommand, RethConfig, TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
+};
 #[cfg(feature = "faucet")]
 pub use evm::faucet_mint_role_slot;
 #[cfg(not(feature = "faucet"))]
@@ -168,7 +166,6 @@ pub use evm::{
 };
 pub use forward::WorkerRpcForwarder;
 pub use types::*;
-pub use cli::{RethConfig, RethCommand, init_txpool_defaults, TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER};
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
@@ -2170,7 +2167,6 @@ mod tests {
         BlsSignature, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
         Encodable2718 as _, NodeP2pInfo, ReputationScores, SignatureVerificationState,
     };
-
 
     /// Helper function for creating a consensus output for tests.
     fn consensus_output_for_tests(

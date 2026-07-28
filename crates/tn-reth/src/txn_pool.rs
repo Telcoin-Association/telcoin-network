@@ -27,7 +27,7 @@ use tn_types::{
 };
 use tracing::{debug, info, trace};
 
-use crate::{PoolTxn, PoolTxnId, error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode};
+use crate::{error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode, PoolTxn, PoolTxnId};
 
 pub use reth_primitives_traits::InMemorySize as TxnSize;
 
