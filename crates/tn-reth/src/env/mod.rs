@@ -8,10 +8,11 @@ use reth_db_common::init::init_genesis;
 use reth_node_builder::NodeConfig;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    ProviderFactory,
+    ProviderFactory, ProviderResult, StateProviderBox, StateProviderFactory as _,
 };
+use reth_revm::{database::StateProviderDatabase, State};
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_types::{gas_accumulator::RewardsCounter, Address, TaskManager, TaskSpawner};
+use tn_types::{gas_accumulator::RewardsCounter, Address, TaskManager, TaskSpawner, B256};
 use tracing::{debug, info};
 
 use crate::{
@@ -160,6 +161,22 @@ impl RethEnv {
     // TODO: doc comment
     pub(crate) fn evm_config(&self) -> &TnEvmConfig {
         &self.inner.evm_config
+    }
+
+    /// Build the read-only database stack over the state at `block_hash`: state provider →
+    /// [`StateProviderDatabase`] → [`State`] with bundle updates enabled.
+    ///
+    /// This is the shared construction for every pinned, non-committing contract read. Callers
+    /// create their own EVM over the returned stack and keep their site-specific mapping of the
+    /// [`ProviderResult`] error (node-local provider faults classify differently per caller).
+    /// Block-building paths use a different, cached DB stack and must not switch to this one.
+    pub(crate) fn read_only_state_db(
+        &self,
+        block_hash: B256,
+    ) -> ProviderResult<State<StateProviderDatabase<StateProviderBox>>> {
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(block_hash)?;
+        let state = StateProviderDatabase::new(state_provider);
+        Ok(State::builder().with_database(state).with_bundle_update().build())
     }
 
     /// todo: doc comment

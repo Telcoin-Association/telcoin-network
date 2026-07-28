@@ -14,13 +14,9 @@ use reth_evm::{ConfigureEvm as _, Evm as _, EvmFactory as _};
 use reth_provider::{
     providers::BlockchainProvider, BlockIdReader as _, BlockNumReader as _,
     ChainStateBlockReader as _, ChainStateBlockWriter as _, DBProvider as _,
-    DatabaseProviderFactory as _, HeaderProvider as _, StateProviderFactory as _,
+    DatabaseProviderFactory as _, HeaderProvider as _,
 };
-use reth_revm::{
-    context::result::{EVMError, ExecutionResult, ResultAndState},
-    database::StateProviderDatabase,
-    State,
-};
+use reth_revm::context::result::{EVMError, ExecutionResult, ResultAndState};
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_types::{
@@ -203,9 +199,7 @@ impl RethEnv {
     /// could yield a silently empty range if finality ever lags the canonical tip.
     pub fn epoch_state_at_header(&self, header: &SealedHeader) -> eyre::Result<EpochState> {
         // create EVM with the state at the pinned header
-        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut db = self.read_only_state_db(header.hash())?;
         debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state at header");
         let mut tn_evm = self
             .inner
@@ -357,9 +351,7 @@ impl RethEnv {
         let header = self
             .sealed_header_by_hash(block_hash)?
             .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
-        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut db = self.read_only_state_db(header.hash())?;
         let mut tn_evm = self
             .inner
             .evm_config
@@ -412,12 +404,9 @@ impl RethEnv {
         &self,
         header: &SealedHeader,
     ) -> StateReadResult<(usize, Vec<WorkerFeeConfig>)> {
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(header.hash()).map_err(|e| {
-                StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
-            })?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut db = self.read_only_state_db(header.hash()).map_err(|e| {
+            StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
+        })?;
         let evm_env = self.inner.evm_config.evm_env(header).map_err(|e| {
             StateReadError::ChainGlobal(format!("evm env for {}: {e}", header.hash()))
         })?;
@@ -574,13 +563,9 @@ impl RethEnv {
         // `HistoryInfo::MaybeInPlainState`, silently falling back to TIP state for this
         // "pinned" read — exactly the nondeterminism pinning exists to prevent. Revisit every
         // pinned registry read before enabling pruning.
-        let state_provider = self
-            .inner
-            .blockchain_provider
-            .state_by_block_hash(header.hash())
+        let mut db = self
+            .read_only_state_db(header.hash())
             .map_err(|e| EvmReadError::Internal(e.to_string()))?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
         let evm_env = self
             .inner
             .evm_config
@@ -663,12 +648,9 @@ impl RethEnv {
         &self,
         header: &SealedHeader,
     ) -> StateReadResult<(Epoch, ConsensusRegistry::EpochInfo)> {
-        let state_provider =
-            self.inner.blockchain_provider.state_by_block_hash(header.hash()).map_err(|e| {
-                StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
-            })?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut db = self.read_only_state_db(header.hash()).map_err(|e| {
+            StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
+        })?;
         let evm_env = self.inner.evm_config.evm_env(header).map_err(|e| {
             StateReadError::ChainGlobal(format!("evm env for {}: {e}", header.hash()))
         })?;
@@ -829,7 +811,9 @@ mod tests {
     };
     use alloy::primitives::utils::parse_ether;
     use rand::{rngs::StdRng, SeedableRng as _};
-    use reth_revm::{cached::CachedReads, DatabaseCommit as _};
+    use reth_revm::{
+        cached::CachedReads, database::StateProviderDatabase, DatabaseCommit as _, State,
+    };
     use tempfile::TempDir;
     use tn_config::NodeInfo;
     use tn_types::{
