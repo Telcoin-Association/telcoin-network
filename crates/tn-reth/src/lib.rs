@@ -3598,10 +3598,10 @@ mod tests {
     /// committee arrays for the current and both future epochs shrink via swap-and-pop (the
     /// last element moves into the ejected slot — order is NOT preserved), the next committee
     /// size auto-decrements to the eligible count, the validator is permanently retired with
-    /// its stake confiscated, and the epoch still closes cleanly on-chain (`concludeEpoch` +
-    /// `applyIncentives` system calls succeed over the shrunken committee). A direct
-    /// `applyIncentives` call afterwards exercises the `isRetired` skip branch: the burned
-    /// validator earns nothing while a surviving validator accrues rewards.
+    /// its stake confiscated, and the epoch still closes cleanly on-chain (the unified
+    /// `concludeEpoch` system call succeeds over the shrunken committee). A direct
+    /// `concludeEpoch` call afterwards exercises the `isRetired` skip branch in the rewards
+    /// stage: the burned validator earns nothing while a surviving validator accrues rewards.
     #[tokio::test]
     async fn test_burn_ejects_current_committee_validator_mid_epoch() -> eyre::Result<()> {
         let genesis = test_genesis_with_consensus_registry(5);
@@ -3716,11 +3716,16 @@ mod tests {
         assert_eq!(shuffled.len(), 4);
         assert!(!shuffled.contains(&target_bls));
 
-        // direct applyIncentives with rewards for the burned + a surviving validator: the
-        // isRetired branch skips the burned validator while the survivor accrues rewards
+        // concludeEpoch with rewards for the burned + a surviving validator: the isRetired
+        // branch in the rewards stage skips the burned validator while the survivor accrues
+        // rewards
         let alive = committee[0].validatorAddress;
         let mut tn_evm = reth_env.tn_evm(canonical_header.hash())?;
-        let calldata = ConsensusRegistry::applyIncentivesCall {
+        let mut new_committee: Vec<Address> =
+            committee.iter().map(|v| v.validatorAddress).collect();
+        new_committee.sort();
+        let calldata = ConsensusRegistry::concludeEpochCall {
+            newCommittee: new_committee,
             rewardInfos: vec![
                 ConsensusRegistry::RewardInfo {
                     validatorAddress: target,
@@ -3731,12 +3736,13 @@ mod tests {
                     consensusHeaderCount: U256::from(5),
                 },
             ],
+            slashes: vec![],
         }
         .abi_encode()
         .into();
         let mut res =
             tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
-        assert!(res.result.is_success(), "applyIncentives succeeds: {:?}", res.result);
+        assert!(res.result.is_success(), "concludeEpoch succeeds: {:?}", res.result);
         res.state.remove(&SYSTEM_ADDRESS);
         tn_evm.db_mut().commit(res.state);
         let burned_rewards = reth_env.call_consensus_registry::<_, U256>(
@@ -3747,7 +3753,7 @@ mod tests {
             &mut tn_evm,
             ConsensusRegistry::getRewardsCall { validatorAddress: alive }.abi_encode().into(),
         )?;
-        assert!(burned_rewards.is_zero(), "retired validator skipped by applyIncentives");
+        assert!(burned_rewards.is_zero(), "retired validator skipped by the rewards stage");
         assert!(alive_rewards > U256::ZERO, "surviving validator accrues rewards");
 
         Ok(())
