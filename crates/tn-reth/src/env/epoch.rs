@@ -208,10 +208,16 @@ impl RethEnv {
             .create_evm(&mut db, self.inner.evm_config.evm_env(header)?);
 
         // current epoch number
-        let epoch = self.get_current_epoch_number(&mut tn_evm)?;
+        let epoch = self.call_consensus_registry::<_, u32>(
+            &mut tn_evm,
+            ConsensusRegistry::getCurrentEpochCall {}.abi_encode().into(),
+        )?;
 
         // current epoch info
-        let epoch_info = self.get_current_epoch_info(&mut tn_evm)?;
+        let epoch_info = self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(
+            &mut tn_evm,
+            ConsensusRegistry::getCurrentEpochInfoCall {}.abi_encode().into(),
+        )?;
         debug!(target: "engine", ?epoch, ?epoch_info, "retrieved epoch info at header");
 
         // retrieve closing timestamp for previous epoch
@@ -221,8 +227,14 @@ impl RethEnv {
             .timestamp;
 
         // retrieve the committee
-        let validators = self.get_committee_validators_by_epoch(epoch, &mut tn_evm)?;
-        let bls_pubkeys = self.get_committee_bls_pubkeys_by_epoch(epoch, &mut tn_evm)?;
+        let validators = self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
+            &mut tn_evm,
+            ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into(),
+        )?;
+        let bls_pubkeys = self.call_consensus_registry::<_, Vec<alloy::primitives::Bytes>>(
+            &mut tn_evm,
+            ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into(),
+        )?;
         let epoch_state = EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start };
         debug!(target: "engine", ?epoch_state, "returning epoch state at header");
 
@@ -586,52 +598,6 @@ impl RethEnv {
         (nonce >> 32) as u32
     }
 
-    /// Read the curret epoch number from the [ConsensusRegistry] on-chain.
-    fn get_current_epoch_number<DB>(&self, evm: &mut TNEvm<DB>) -> EvmReadResult<u32>
-    where
-        DB: alloy_evm::Database,
-    {
-        let calldata = ConsensusRegistry::getCurrentEpochCall {}.abi_encode().into();
-        self.call_consensus_registry::<_, u32>(evm, calldata)
-    }
-
-    /// Read the curret epoch info from the [ConsensusRegistry] on-chain.
-    fn get_current_epoch_info<DB>(
-        &self,
-        evm: &mut TNEvm<DB>,
-    ) -> EvmReadResult<ConsensusRegistry::EpochInfo>
-    where
-        DB: alloy_evm::Database,
-    {
-        let calldata = ConsensusRegistry::getCurrentEpochInfoCall {}.abi_encode().into();
-        self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(evm, calldata)
-    }
-
-    /// Retrieve all `ValidatorInfo` in the committee for the provided epoch.
-    fn get_committee_validators_by_epoch<DB>(
-        &self,
-        epoch: Epoch,
-        evm: &mut TNEvm<DB>,
-    ) -> EvmReadResult<Vec<ConsensusRegistry::ValidatorInfo>>
-    where
-        DB: alloy_evm::Database,
-    {
-        let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
-        self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(evm, calldata)
-    }
-
-    /// Retrieve BLS pubkeys for the committee of the provided epoch.
-    fn get_committee_bls_pubkeys_by_epoch<DB>(
-        &self,
-        epoch: Epoch,
-        evm: &mut TNEvm<DB>,
-    ) -> EvmReadResult<Vec<alloy::primitives::Bytes>>
-    where
-        DB: alloy_evm::Database,
-    {
-        let calldata = ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into();
-        self.call_consensus_registry::<_, Vec<alloy::primitives::Bytes>>(evm, calldata)
-    }
     /// Read the CURRENT epoch number and [`EpochInfo`](ConsensusRegistry::EpochInfo) from the
     /// [`ConsensusRegistry`] at `header`, with failures classified per [`StateReadError`].
     ///
