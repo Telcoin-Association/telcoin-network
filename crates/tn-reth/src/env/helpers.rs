@@ -1,4 +1,32 @@
 //! Helper methods for retrieving state.
+//!
+//! # Read consistency: two families of reads
+//!
+//! Two families of read methods coexist on `RethEnv`, and they DISAGREE about which blocks
+//! "exist" while a consensus output is mid-canonicalization. The engine advances the canonical
+//! in-memory state block-by-block as it executes an output (speculatively, before anything is
+//! durable — see `execute_payload` in `tn-engine`'s payload builder), and only afterwards
+//! commits the whole output's blocks to the database in a single transaction
+//! (`finish_executing_output`). Between those two points:
+//!
+//! - **In-memory-tip-aware** reads call `blockchain_provider` directly, which overlays the
+//!   canonical in-memory chain on the database (reth's `ConsistentProvider`, or the in-memory head
+//!   state for `latest`). Verified members: `sealed_header_by_hash`, `header`, `blocks_for_range`,
+//!   `canonical_tip`, `latest`. These already see the in-flight blocks of the output being
+//!   executed.
+//!
+//! - **Committed-DB-only** reads go through `database_provider_ro()`, a raw read transaction with
+//!   no in-memory overlay. Verified members: `sealed_header_by_number`, `header_by_number`,
+//!   `last_block_number`, `last_finalized_block_number`. These see the in-flight blocks only once
+//!   the output commits. `lookup_head` also belongs here: reth's `NodeConfig::lookup_head` resolves
+//!   the head *number* from the `Finish` stage checkpoint via `database_provider_ro()`, so it
+//!   tracks the committed database even though the follow-up header fetch is in-memory-aware.
+//!
+//! Concretely: `sealed_header_by_hash` can return a header whose number exceeds
+//! `last_block_number()`, and `header_by_number(canonical_tip().number)` can return `None`,
+//! without anything being wrong. Unifying the two families behind one provider path was
+//! deliberately deferred during the env reorg — when adding a read here, pick a family
+//! intentionally and mind which one existing callers assume.
 
 use std::{ops::RangeInclusive, sync::Arc};
 
@@ -162,7 +190,12 @@ impl RethEnv {
         Ok(Some(Arc::new(Chain::new(vec![block], execution_outcome, Default::default()))))
     }
 
-    /// Return the head header from the reth db.
+    /// Return the head header per the database's `Finish` stage checkpoint.
+    ///
+    /// Committed-DB read (see the module docs): reth's `NodeConfig::lookup_head` resolves the
+    /// head number from the committed database, not the in-memory tip; the sealed header is
+    /// then fetched by that number. If that header cannot be found, this returns a
+    /// `ProviderError::HeaderNotFound` error rather than panicking.
     pub fn lookup_head(&self) -> TnRethResult<SealedHeader> {
         let head = self.node_config().lookup_head(&self.inner.blockchain_provider)?;
         let header = self
@@ -173,12 +206,22 @@ impl RethEnv {
         Ok(header)
     }
 
-    /// If a dubug max round is set then return it.
+    /// If a debug max round is set then return it.
+    ///
+    /// Despite the "round" name, this reads `debug.max_block` from the node config: a block
+    /// number used as a debug stopping point.
     pub fn get_debug_max_round(&self) -> Option<u64> {
         self.node_config().debug.max_block
     }
 
-    /// Helper to get the gas price based on the provider's latest header.
+    /// Helper to get a gas price estimate based on the head header.
+    ///
+    /// RPC-style convenience only: this computes an ETHEREUM next-block base fee
+    /// (`BaseFeeParams::ethereum()`, mainnet's EIP-1559 schedule), which is NOT how TN derives
+    /// base fees — TN worker base fees come from the on-chain `WorkerConfigs` contract, applied
+    /// per epoch (see `worker_fee_configs_inner` in `env/epoch.rs`). Do not use this value for
+    /// fee enforcement. The header it prices from is the committed-DB head
+    /// ([`Self::lookup_head`]).
     pub fn get_gas_price(&self) -> TnRethResult<u128> {
         let header = self.lookup_head()?;
         Ok(header.next_block_base_fee(BaseFeeParams::ethereum()).unwrap_or_default().into())
@@ -208,7 +251,11 @@ impl RethEnv {
         self.sealed_header_by_hash(finalized_num_hash.hash)
     }
 
-    /// Return the latest canonical block number.
+    /// Return the latest block number committed to the database.
+    ///
+    /// Committed-DB read (see the module docs): blocks of an in-flight consensus output are not
+    /// counted until the output commits, so this can lag [`Self::canonical_tip`]. Provider
+    /// errors propagate — there is no fallback value.
     pub fn last_block_number(&self) -> TnRethResult<u64> {
         Ok(self.inner.blockchain_provider.database_provider_ro()?.last_block_number()?)
     }
@@ -227,7 +274,12 @@ impl RethEnv {
         Ok(self.inner.blockchain_provider.finalized_block_num_hash()?)
     }
 
-    /// Returns the block number of the last finialized block.
+    /// Returns the block number of the last finalized block per the database marker.
+    ///
+    /// Committed-DB read (see the module docs). A database without a finalized marker (no
+    /// consensus output committed yet) yields `Ok(0)`: the `Option` is deliberately collapsed,
+    /// so callers cannot distinguish "never finalized" from "finalized at genesis (block 0)".
+    /// This is not an error swallow — provider errors still propagate.
     pub fn last_finalized_block_number(&self) -> TnRethResult<u64> {
         Ok(self
             .inner
@@ -248,12 +300,24 @@ impl RethEnv {
     /// `eth_call`-like semantics: caller is the zero address, value 0, gas price 0, nonce and
     /// base fee checks disabled, 30M gas; no state is committed. Callers decode the returned
     /// bytes themselves (e.g. with `SolCall::abi_decode_returns`).
+    ///
+    /// # Errors
+    ///
+    /// - [`EvmReadError::Revert`]: the call reverted on-chain. Carries the raw ABI-encoded revert
+    ///   bytes plus a best-effort decoded reason string.
+    /// - [`EvmReadError::Internal`]: every non-revert failure — state-provider/database faults, EVM
+    ///   environment construction, transact-level errors, or the call halting.
     pub fn read_contract(&self, contract: Address, calldata: Bytes) -> EvmReadResult<Bytes> {
         self.read_contract_inner(&self.canonical_tip(), Address::ZERO, contract, calldata)
     }
 
     /// Same as [`Self::read_contract`], but pinned to the state of the block identified by
     /// `block_hash`.
+    ///
+    /// # Errors
+    ///
+    /// Same split as [`Self::read_contract`]; additionally, `block_hash` failing to resolve to
+    /// a known sealed header is an [`EvmReadError::Internal`].
     pub fn read_contract_at_block(
         &self,
         block_hash: B256,
@@ -273,6 +337,12 @@ impl RethEnv {
 
     /// Build an EVM against `header`'s state and execute one read-only call, returning raw
     /// output bytes on success and mapping Revert/Halt like the registry read path.
+    ///
+    /// # Errors
+    ///
+    /// On-chain reverts surface as [`EvmReadError::Revert`] (raw output + decoded reason);
+    /// everything else — state-db construction, EVM env construction, transact errors, and
+    /// `Halt` — collapses into [`EvmReadError::Internal`].
     fn read_contract_inner(
         &self,
         header: &SealedHeader,

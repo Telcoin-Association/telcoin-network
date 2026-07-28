@@ -1,4 +1,49 @@
 //! Methods used for chain genesis.
+//!
+//! # The pre-genesis ceremony
+//!
+//! `create_consensus_registry_genesis_accounts` builds the system-contract accounts for the
+//! REAL genesis by first executing their constructors on a throwaway chain:
+//!
+//! 1. Spin up a temporary `RethEnv` over a `TempDir` via `new_for_temp_chain` (whose 2 GiB MDBX
+//!    map-size ceiling exists so many temp envs can coexist in one test process without exhausting
+//!    the address space — see the consts inside that fn).
+//! 2. CREATE-deploy `ConsensusRegistry`, then `WorkerConfigs`, from the owner address via
+//!    `transact_pre_genesis_create` (tx nonce 0 with nonce checks disabled, zero gas price).
+//! 3. Merge the transitions and harvest each contract's constructor-written storage from the
+//!    resulting `BundleState`.
+//! 4. Splice each artifact's `deployedBytecode` plus the harvested storage into the real `Genesis`
+//!    alloc at the fixed production addresses.
+//!
+//! Exactly four accounts are written into genesis:
+//!
+//! - `BLS_G1_PRECOMPILE_ADDRESS`: a single `0xfe` (INVALID) byte (`PRECOMPILE_GENESIS_BYTECODE`),
+//!   mirroring the TEL precompile's genesis account. The nonzero code exempts the account from
+//!   EIP-158 state clearing, and any call that bypasses precompile dispatch executes INVALID and
+//!   reverts instead of silently succeeding against an empty account.
+//! - `CONSENSUS_REGISTRY_ADDRESS`: registry runtime code, harvested constructor storage, and a
+//!   balance of `stakeAmount * validator count` backing the genesis validators' stakes.
+//! - `ISSUANCE_ADDRESS`: issuance runtime code only. It is never constructed in the ceremony, so no
+//!   storage (or balance) is spliced for it.
+//! - `WORKER_CONFIGS_ADDRESS`: worker-configs runtime code and harvested constructor storage.
+//!
+//! ## Sharp edges
+//!
+//! - **Address derivation is NONCE-POSITIONAL.** Harvested storage is looked up in the bundle at
+//!   `owner_address.create(0)` (registry) and `owner_address.create(1)` (worker configs) — the
+//!   owner's first and second creates on the temp chain. Inserting any create before or between
+//!   them silently shifts both computed addresses off the actual deployments, and the storage
+//!   harvest comes up empty (or wrong) without any error.
+//! - **EIP-170 is relaxed only for the registry's temp-chain deploy**: its deployed code (~28.8 KB)
+//!   exceeds the 24,576-byte limit, so `limit_contract_code_size` is raised for that one create.
+//!   The `WorkerConfigs` deploy runs with the default limit, and the real genesis splices runtime
+//!   code straight into the alloc, where no CREATE-time size check applies.
+//! - **Two fail-loud gates** protect the splice: the `__$..$__` library-link placeholder check on
+//!   the registry initcode (stale-artifact guard — the registry calls the BLS precompile at a fixed
+//!   address and links no library), and `ensure_pre_genesis_create_success` after each create.
+//!   Without the latter, a constructor Revert/Halt would still ship the contract's runtime code but
+//!   with EMPTY storage, which downstream fail-open reads mask as defaults (e.g. an ownerless,
+//!   zero-worker `WorkerConfigs`).
 
 use std::{path::Path, sync::Arc};
 
@@ -308,7 +353,7 @@ impl RethEnv {
     ///
     /// If a key is specified, return the corresponding nested object.
     /// Otherwise return the entire JSON
-    /// With a generic this could be adjused to handle YAML also
+    /// With a generic this could be adjusted to handle YAML also
     pub fn fetch_value_from_json_str(json_content: &str, key: Option<&str>) -> eyre::Result<Value> {
         let json: Value = serde_json::from_str(json_content)?;
         let result = match key {

@@ -1,4 +1,25 @@
-//! Transaction factory to create legit transactions for execution.
+//! Test-support toolkit for `tn-reth`, compiled only with the `test-utils` feature or
+//! `cfg(test)`. Despite the historical name, this is much more than a transaction factory.
+//! Grouped by role:
+//!
+//! - [`TransactionFactory`]: deterministic keypair plus nonce tracking to create, sign, and submit
+//!   EIP-1559, legacy, and EIP-4844 transactions.
+//! - `RethEnv` test constructors and read helpers: `new_for_test`, `state_by_block_hash`, `tn_evm`,
+//!   `execution_outcome_for_tests`, and `ConsensusRegistry` reads (`get_validator_rewards`,
+//!   `get_bls_pubkey`, `get_validator_info`, `validators_for_epoch_at_block`,
+//!   `get_worker_fee_configs`).
+//! - Batch fixtures: `transaction`, `batch`, `batches`, `fixture_batch_with_transactions`,
+//!   `batch_with_transactions`.
+//! - Genesis builders: `seeded_genesis_from_random_batch(es)`, and the
+//!   `test_genesis_with_consensus_registry*` family, which runs the real pre-genesis ceremony (see
+//!   `env/genesis.rs`) so the registry/worker-configs state matches the current bytecode.
+//! - Governance and committee helpers: `governance_owner_factory`, `governance_burn_tx`,
+//!   `create_committee_from_state`.
+//! - Consensus/payload-execution helpers: `consensus_output_for_tests`, and
+//!   `execute_payload_and_update_canonical_chain`, which builds a block and commits it as the
+//!   canonical tip, standing in for the engine's payload builder.
+//! - [`plant_finalized_marker`]: writes the finalized/safe database markers directly — a test-only
+//!   backdoor into storage state for reconstructing pre-fix crash layouts.
 
 use crate::{
     error::{StateReadResult, TnRethResult},
@@ -232,11 +253,11 @@ impl RethEnv {
         self.read_consensus_registry_at_header(&header, calldata).map_err(Into::into)
     }
 
-    /// Read worker fee configs from the [`WorkerConfigs`] contract at the canonical tip.
+    /// Read worker fee configs from the `WorkerConfigs` contract at the canonical tip.
     ///
     /// The returned `Vec`'s length is the on-chain `numWorkers()` at the canonical tip (the
     /// arity between the count and the per-worker arrays is validated in
-    /// [`Self::worker_fee_configs_inner`]). Callers size their in-memory worker state (e.g. the
+    /// `Self::worker_fee_configs_inner`). Callers size their in-memory worker state (e.g. the
     /// `GasAccumulator`) to match, rather than asserting a preconceived count.
     pub fn get_worker_fee_configs(&self) -> StateReadResult<Vec<WorkerFeeConfig>> {
         let canonical_tip = self.canonical_tip();
@@ -563,7 +584,7 @@ impl TransactionFactory {
         Ok(signer)
     }
 
-    /// Create and submit the next transaction to the provided [TransactionPool].
+    /// Create and submit the next transaction to the provided [`WorkerTxPool`].
     pub async fn create_and_submit_eip1559_pool_tx(
         &mut self,
         chain: Arc<RethChainSpec>,

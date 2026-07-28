@@ -1,5 +1,27 @@
 //! Implement an abstraction around the Reth transaction pool.
-//! This should insolate from shifting Reth internals, etc.
+//! This should isolate from shifting Reth internals, etc.
+//!
+//! TN-specific pool behavior worth knowing:
+//!
+//! - [`WorkerTxPool::new`] spawns a CRITICAL task consuming the provider's
+//!   `canonical_state_stream()`, applying each `Commit` notification to the pool (mined
+//!   transactions removed, changed accounts refreshed). A `Reorg` notification is skipped with a
+//!   warning: TN never reorgs — consensus output only extends the canonical chain — and aborting
+//!   the critical task would take down the whole node.
+//! - [`TxPool::get_pending_base_fee`] currently returns `MIN_PROTOCOL_BASE_FEE` (7 wei)
+//!   unconditionally; issue 114 tracks computing a real per-round base fee. Both callers (the task
+//!   above and the batch builder's maintenance path) use it only as the fallback when a tip header
+//!   carries no `base_fee_per_gas` — otherwise the pool's pending base fee tracks the new tip's.
+//! - [`new_pool_txn`] hard-codes `propagate: false` (reth's flag for devp2p tx gossip): transaction
+//!   distribution happens via the worker batch protocol, and observer nodes forward RPC submissions
+//!   to committee validators over JSON-RPC (see `forward.rs`) — never via devp2p gossip.
+//! - The per-sender slot default is 256 (`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER` in `src/cli.rs`,
+//!   seeded process-wide by `init_txpool_defaults`) instead of reth's 16.
+//! - Blob (EIP-4844) transactions are unsupported in batches: the batch builder strips them via
+//!   [`TxPool::remove_eip4844_txs`] (removes descendants and deletes sidecars from the blob store),
+//!   and every canonical pool update — `process_canon_state_update` here and the batch builder's
+//!   equivalent — passes `pending_block_blob_fee: Some(u128::MAX)`, pricing all blob transactions
+//!   out of the pending set.
 
 use futures::StreamExt as _;
 use reth::transaction_pool::{
@@ -32,6 +54,10 @@ use crate::{error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode, PoolTxn,
 pub use reth_primitives_traits::InMemorySize as TxnSize;
 
 /// Generate a new pooled transaction from an eth transaction and id.
+///
+/// Hard-codes `propagate: false`: reth's `propagate` flag drives devp2p tx gossip, which TN
+/// does not use — transactions move between nodes through the worker batch protocol and the
+/// observer JSON-RPC forwarder (`forward.rs`).
 pub fn new_pool_txn(transaction: EthPooledTransaction, transaction_id: PoolTxnId) -> PoolTxn {
     ValidPoolTransaction {
         transaction,
