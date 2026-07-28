@@ -116,7 +116,7 @@ impl ExecutionNodeInner {
             worker_id,
             base_fee,
             epoch,
-        );
+        )?;
 
         // spawn batch builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {

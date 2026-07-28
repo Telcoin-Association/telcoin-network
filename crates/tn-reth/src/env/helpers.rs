@@ -210,7 +210,7 @@ impl RethEnv {
 
     /// Return the latest canonical block number.
     pub fn last_block_number(&self) -> TnRethResult<u64> {
-        Ok(self.inner.blockchain_provider.database_provider_ro()?.last_block_number().unwrap_or(0))
+        Ok(self.inner.blockchain_provider.database_provider_ro()?.last_block_number()?)
     }
 
     /// Return the block number and hash for the current canonical tip.

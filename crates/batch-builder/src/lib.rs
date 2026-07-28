@@ -107,14 +107,14 @@ impl BatchBuilder {
         worker_id: WorkerId,
         base_fee: u64,
         epoch: Epoch,
-    ) -> Self {
+    ) -> BatchBuilderResult<Self> {
         let max_delay_interval = tokio::time::interval(max_delay);
         let state_changed = reth_env.canonical_block_stream();
-        let last_canonical_update = Self::latest_canon_block(reth_env);
+        let last_canonical_update = Self::latest_canon_block(reth_env)?;
         let metrics = BatchBuilderMetrics::new_for_worker(worker_id);
         // constant per epoch
         metrics.base_fee.set(base_fee as f64);
-        Self {
+        Ok(Self {
             pending_task: None,
             pool,
             to_worker,
@@ -127,7 +127,7 @@ impl BatchBuilder {
             base_fee,
             epoch,
             metrics,
-        }
+        })
     }
 
     /// Spawns a task to build the batch and propose to peers.
@@ -230,12 +230,12 @@ impl BatchBuilder {
         done
     }
 
-    fn latest_canon_block(reth_env: &RethEnv) -> SealedBlock {
-        let num = reth_env.last_block_number().unwrap_or_default();
-        if let Ok(Some(header)) = reth_env.sealed_block_by_number(num) {
-            header
-        } else {
-            reth_env.chainspec().sealed_genesis_block()
+    fn latest_canon_block(reth_env: &RethEnv) -> BatchBuilderResult<SealedBlock> {
+        let num = reth_env.last_block_number()?;
+        match reth_env.sealed_block_by_number(num)? {
+            Some(block) => Ok(block),
+            // the empty-chain window: genesis lives in the chain spec before any block persists
+            None => Ok(reth_env.chainspec().sealed_genesis_block()),
         }
     }
 }
@@ -429,7 +429,8 @@ mod tests {
             0,
             MIN_PROTOCOL_BASE_FEE,
             0,
-        );
+        )
+        .expect("batch builder");
 
         let gas_price = reth_env.get_gas_price().unwrap();
         let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
@@ -583,7 +584,8 @@ mod tests {
             0,
             MIN_PROTOCOL_BASE_FEE,
             0,
-        );
+        )
+        .expect("batch builder");
 
         // expected to be 7 wei for first block
         let gas_price = reth_env.get_gas_price().unwrap();
@@ -751,7 +753,8 @@ mod tests {
             0,
             MIN_PROTOCOL_BASE_FEE,
             0,
-        );
+        )
+        .expect("batch builder");
 
         // expected to be 7 wei for first block
         let gas_price = reth_env.get_gas_price().unwrap();
