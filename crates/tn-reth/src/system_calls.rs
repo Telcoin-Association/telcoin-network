@@ -285,9 +285,9 @@ mod tests {
     use super::*;
     use alloy::{primitives::keccak256, sol_types::SolCall};
 
-    /// The hand-written `delegationDigest` binding must track the on-chain 4-argument selector. If the
-    /// contract selector changes and this binding does not, `tn_delegationDigest` reverts at runtime
-    /// instead of failing to compile, so pin the selector here.
+    /// The hand-written `delegationDigest` binding must track the on-chain 4-argument selector. If
+    /// the contract selector changes and this binding does not, `tn_delegationDigest` reverts
+    /// at runtime instead of failing to compile, so pin the selector here.
     #[test]
     fn delegation_digest_binding_selector_is_current() {
         let expected: [u8; 4] =
