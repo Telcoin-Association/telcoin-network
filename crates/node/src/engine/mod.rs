@@ -52,6 +52,8 @@ pub struct TnBuilder {
     /// healthcheck service responds unconditionally. This reads from `HEALTHCHECK_TCP_PORT` env
     /// var.
     pub healthcheck: Option<u16>,
+    /// Export each epoch's final execution state to a snapshot pack when set.
+    pub enable_state_export: bool,
     /// A reference to the long lived reth DB for the node.
     pub reth_db: RethDb,
     /// Registered ExEx install functions.
