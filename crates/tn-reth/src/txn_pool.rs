@@ -16,7 +16,6 @@ use reth_provider::{
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
     error::{Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError},
-    identifier::TransactionId,
     AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, EthPooledTransaction,
     PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
     TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
@@ -28,14 +27,7 @@ use tn_types::{
 };
 use tracing::{debug, info, trace};
 
-use crate::{error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode};
-
-/// A pooled transaction id.
-pub type PoolTxnId = TransactionId;
-/// A pooled transaction.
-pub type PoolTxn = ValidPoolTransaction<EthPooledTransaction>;
-/// A recovered pooled transaction.
-pub type RecoveredPoolTxn = Recovered<EthPooledTransaction>;
+use crate::{PoolTxn, PoolTxnId, error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode};
 
 pub use reth_primitives_traits::InMemorySize as TxnSize;
 
@@ -217,12 +209,12 @@ impl WorkerTxPool {
     }
 
     /// Return the current status of the pool.
-    pub fn block_info(&self) -> BlockInfo {
+    pub fn block_info(&self) -> RethBlockInfo {
         self.0.block_info()
     }
 
     /// Set the current status of the pool.
-    pub fn set_block_info(&self, block_info: BlockInfo) {
+    pub fn set_block_info(&self, block_info: RethBlockInfo) {
         self.0.set_block_info(block_info);
     }
 
@@ -285,9 +277,6 @@ impl WorkerTxPool {
         self.0.pool_size()
     }
 }
-
-/// Block info defining a transaction pool status.
-pub type BlockInfo = RethBlockInfo;
 
 impl TxPool for WorkerTxPool {
     fn best_transactions(&self) -> BestTxns {

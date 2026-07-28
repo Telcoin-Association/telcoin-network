@@ -28,7 +28,7 @@ use crate::{
     evm::TNEvm,
     metrics::RETH_METRICS,
     system_calls::PRECOMPILE_GENESIS_BYTECODE,
-    traits::{DefaultEthPayloadTypes, TNExecution},
+    traits::TNExecution,
 };
 use alloy::{
     hex,
@@ -58,7 +58,6 @@ use reth::{
     rpc::{
         builder::{
             config::RethRpcServerConfig, RethRpcModule, RpcModuleBuilder, RpcModuleSelection,
-            TransportRpcModules,
         },
         eth::EthApi,
         server_types::eth::utils::recover_raw_transaction as reth_recover_raw_transaction,
@@ -68,10 +67,6 @@ use reth_chainspec::{BaseFeeParams, EthChainSpec};
 use reth_db::init_db;
 use reth_db_common::init::init_genesis;
 use reth_discv4::NatResolver;
-use reth_engine_tree::{
-    engine::{EngineApiRequest, FromEngine},
-    tree::EngineApiTreeHandler,
-};
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use reth_eth_wire::BlockHashNumber;
 use reth_evm::{
@@ -123,12 +118,12 @@ use tn_types::{
     deconstruct_nonce,
     gas_accumulator::{RewardsCounter, WorkerFeeConfig},
     Account, Address, BlockBody, BlockHashOrNumber, BlockNumHash, BlockNumber, ConsensusNumHash,
-    EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount, Receipt, Recovered, RecoveredBlock,
+    EngineUpdate, Epoch, ExecHeader, Genesis, GenesisAccount, Receipt, Recovered,
     Round, SealedBlock, SealedHeader, TaskManager, TaskSpawner, TransactionMeta, TransactionSigned,
     TxHash, TxNumber, B256, ETHEREUM_BLOCK_GAS_LIMIT_30M, U256,
 };
 use tracing::{debug, error, info, warn};
-use traits::{TNPrimitives, TelcoinNode};
+use traits::TelcoinNode;
 
 // Reth stuff we are just re-exporting.  Need to reduce this over time.
 pub use alloy::primitives::FixedBytes;
@@ -177,6 +172,7 @@ mod metrics;
 pub mod rpc_server_args;
 pub mod snapshot;
 pub mod system_calls;
+mod types;
 pub mod worker;
 #[cfg(feature = "faucet")]
 pub use evm::faucet_mint_role_slot;
@@ -188,6 +184,7 @@ pub use evm::{
     BLS_G1_PRECOMPILE_ADDRESS, TELCOIN_PRECOMPILE_ADDRESS,
 };
 pub use forward::WorkerRpcForwarder;
+pub use types::*;
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
@@ -209,33 +206,6 @@ fn set_basefee_address(address: Option<Address>) {
     // Ignore the error. Should probably panic on error but this will break some test environments.
     let _ = BASEFEE_ADDRESS.set(address.unwrap_or(GOVERNANCE_SAFE_ADDRESS));
 }
-
-/// Rpc Server type, used for getting the node started.
-pub type RpcServer = TransportRpcModules<()>;
-
-/// The type to receive executed blocks from the engine and update canonical/finalized block state.
-pub type TnEngineApiTreeHandler = EngineApiTreeHandler<
-    TNPrimitives,
-    BlockchainProvider<TelcoinNode>,
-    DefaultEthPayloadTypes,
-    TNExecution,
-    TnEvmConfig,
->;
-
-/// The type to send to the blockchain tree (make blocks canonical/final).
-pub type ToTree = std::sync::mpsc::Sender<
-    FromEngine<
-        EngineApiRequest<DefaultEthPayloadTypes, TNPrimitives>,
-        alloy::consensus::Block<TransactionSigned>,
-    >,
->;
-
-// replace deprecated reth name with this type
-/// Type alias to replace deprecated reth struct with new generic type:
-/// A block with senders recovered from the block’s transactions.
-///
-/// This type is a SealedBlock with a list of senders that match the transactions in the block.
-pub type BlockWithSenders = RecoveredBlock<reth_ethereum_primitives::Block>;
 
 /// One transaction in the chain-wide sequential transaction feed.
 ///
@@ -656,11 +626,6 @@ impl ChainSpec {
         self.0.chain_id()
     }
 }
-
-/// Type wrapper for a Reth DB.
-/// Used primary as a opaque type to allow
-/// the node launcher to create the DB upfront and reuse.
-pub type RethDb = Arc<DatabaseEnv>;
 
 /// Report sampled reth database metrics (table sizes, page usage, freelist).
 ///

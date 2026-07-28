@@ -19,10 +19,9 @@ use reth_primitives_traits::Block;
 use reth_provider::{BlockExecutionResult, EthStorage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tn_types::{EthPrimitives, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
+use tn_types::{NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader};
 
-/// Type for primitives.
-pub type TNPrimitives = EthPrimitives;
+use crate::TNPrimitives;
 
 /// Empty struct that implements Reth traits to supply GATs and functionality for Reth integration.
 #[derive(Clone, Debug)]

@@ -3,7 +3,7 @@
 //! Inspired by: crates/ethereum/evm/src/lib.rs
 
 use super::{TNBlockAssembler, TNBlockExecutionCtx, TNBlockExecutorFactory, TNEvmFactory};
-use crate::{error::TnRethError, payload::TNPayload, traits::TNPrimitives};
+use crate::{TNPrimitives, error::TnRethError, payload::TNPayload};
 use reth_chainspec::{ChainSpec, EthChainSpec as _};
 use reth_evm::{ConfigureEvm, EvmEnv, EvmEnvFor, ExecutionCtxFor};
 use reth_evm_ethereum::RethReceiptBuilder;
