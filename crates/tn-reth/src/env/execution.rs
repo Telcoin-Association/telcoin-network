@@ -1,4 +1,39 @@
-//! Methods that execute transactions.
+//! Execution and ATOMIC CANONICALIZATION of consensus output.
+//!
+//! This module owns the path from certified consensus output to the canonical chain:
+//! executing a worker batch's payload into a block
+//! ([`RethEnv::build_block_from_batch_payload`]), committing a round's blocks to the
+//! database ([`RethEnv::finish_executing_output`]), and updating the in-memory
+//! finalized/safe watches ([`RethEnv::finalize_block`]). Consensus output is the ONLY
+//! source of canonical blocks: there is no fork choice and no reorg path, and every
+//! committed block is final by construction.
+//!
+//! # Deliberate transaction drops (fork safety)
+//!
+//! Block building silently drops transactions on exactly two paths:
+//!
+//! 1. unrecoverable signers — a transaction whose signer cannot be recovered is dropped (and
+//!    counted) instead of failing the block, because a certified sub-DAG is fixed: erroring would
+//!    deterministically halt — and crash-loop on restart replay — every honest node over one
+//!    undecodable transaction (issue #933);
+//! 2. execution-level `BlockValidationError::InvalidTx` — expected in normal operation (e.g. two
+//!    workers' batches carrying the same transaction); skipped and counted.
+//!
+//! Dropping instead of halting is fork-safe because both paths are deterministic
+//! functions of the certified bytes: every honest node recovers, drops, and skips the
+//! exact same transactions, so all nodes still build byte-identical blocks. Any other
+//! execution error fails the attempt instead.
+//!
+//! # Atomicity contract
+//!
+//! [`RethEnv::finish_executing_output`] persists the blocks and the finalized/safe
+//! block-number markers in ONE `provider_rw` transaction with a single commit — a
+//! crash can never leave the persisted tip and the markers out of sync. Only after
+//! that commit does it report the new tip over the engine update channel
+//! (`blocking_send`) and then broadcast the canonical-state notification
+//! (`notify_canon_state`). [`RethEnv::finalize_block`] is in-memory only (the
+//! finalized/safe watches plus pruning persisted blocks from the in-memory state);
+//! its database half happens inside the atomic commit above.
 
 use std::sync::Arc;
 
@@ -32,6 +67,12 @@ use super::RethEnv;
 
 impl RethEnv {
     /// Construct a canonical block from a worker's block that reached consensus.
+    ///
+    /// The returned block may contain FEWER transactions than the certified batch:
+    /// transactions with unrecoverable signers and transactions failing execution
+    /// validation (`InvalidTx`, e.g. duplicates across workers' batches) are dropped
+    /// deterministically — see the module docs for why dropping is fork-safe. Any
+    /// other execution error fails the whole attempt.
     pub fn build_block_from_batch_payload(
         &self,
         payload: TNPayload,
@@ -175,15 +216,21 @@ impl RethEnv {
         Ok(())
     }
 
-    /// This makes all blocks canonical, commits them to the database,
-    /// broadcasts new chain on `canon_state_notification_sender`
-    /// and set last executed header as the tracked header.
+    /// Atomically persist an executed round of consensus output and announce the new
+    /// canonical tip.
     ///
-    /// The finalized/safe markers commit in the same database transaction as the blocks, so a
-    /// crash can never leave the persisted marker behind the persisted tip. The in-memory
+    /// The blocks AND the finalized/safe markers commit in the same database
+    /// transaction (one `provider_rw` commit), so a crash can never leave the
+    /// persisted marker behind the persisted tip — every block here comes from
+    /// committed consensus output and is final by construction. The in-memory
     /// finalized/safe watches are updated afterwards by [`Self::finalize_block`].
     ///
-    /// It also clears the canonical in-memory state.
+    /// Ordering after the commit: first the new tip is reported over the engine
+    /// update channel (`blocking_send`, feeding the consensus layer's `recent_blocks`
+    /// watch — so this method must run on a blocking thread, and a closed channel
+    /// errors out before any broadcast); only then is the canonical-state
+    /// notification broadcast via `notify_canon_state` to in-process subscribers such
+    /// as the worker's pool maintenance task.
     pub fn finish_executing_output(
         &self,
         blocks: Vec<ExecutedBlock>,

@@ -1,4 +1,19 @@
-//! The `RethEnv` for telcoin network internal API.
+//! The [`RethEnv`] for telcoin network internal API.
+//!
+//! This module owns the facade every other TN crate uses to reach reth. The facade's
+//! methods are split across submodules: `epoch` (epoch boundaries and ConsensusRegistry
+//! reads), `execution` (block building and atomic canonicalization of consensus
+//! output), `genesis` (chain genesis and temp chains), `helpers` (read APIs), and
+//! `rpc` (RPC server support).
+//!
+//! # Construction invariants
+//!
+//! - [`RethEnv::new`] MUST run inside a tokio runtime: `init_provider_factory` captures
+//!   `tokio::runtime::Handle::current()`, which panics outside one.
+//! - Opening an env initializes genesis in the database when absent (`init_genesis`), always from
+//!   the LOCAL chain spec in the supplied config — genesis is never fetched from the network.
+//! - [`RethEnv::new`] has two process-global side effects (base-fee address pinning and metrics
+//!   registration) — see its docs.
 
 use std::{path::Path, sync::Arc};
 
@@ -73,7 +88,22 @@ fn set_basefee_address(address: Option<Address>) {
 impl RethEnv {
     /// Produce a new wrapped Reth environment from a config, DB path and task manager.
     ///
-    /// This method MUST be called from within a tokio runtime.
+    /// This method MUST be called from within a tokio runtime: `init_provider_factory`
+    /// captures `tokio::runtime::Handle::current()` for the provider's task runtime,
+    /// which panics outside one. Construction also initializes genesis in the database
+    /// when it is absent, from the LOCAL chain spec inside `reth_config` — never from
+    /// the network.
+    ///
+    /// # Process-global side effects
+    ///
+    /// 1. Pins the base-fee recipient: the FIRST call in the process writes the `BASEFEE_ADDRESS`
+    ///    `OnceLock` (passing `None` pins `GOVERNANCE_SAFE_ADDRESS`); on every later call
+    ///    `basefee_address` is silently ignored. See the static's docs in `lib.rs` for why a
+    ///    `None`-first ordering forks the node.
+    /// 2. Registers this crate's block-building metric series (`crate::metrics::init`) with
+    ///    whatever global metrics recorder is installed right now; the series bind to that recorder
+    ///    on first use, so this must run after `tn_metrics::install_recorder` (see `metrics.rs`) or
+    ///    the counters stay on the noop recorder.
     pub fn new(
         reth_config: &RethConfig,
         task_manager: &TaskManager,
@@ -149,17 +179,29 @@ impl RethEnv {
         )
     }
 
-    // TODO: doc comment
+    /// Return the reth [`NodeConfig`] this env was built from: chain spec, datadir,
+    /// and the database/RPC/pool settings reth derives its helpers from.
     pub(crate) fn node_config(&self) -> &NodeConfig<RethChainSpec> {
         &self.inner.node_config
     }
 
-    // TODO: doc comment
+    /// Return the blockchain provider: the full read stack that layers the canonical
+    /// in-memory state (recently executed blocks, canonical head, finalized/safe
+    /// tracking) over the committed MDBX + static-file state.
+    ///
+    /// Contrast with reads through its `database_provider_ro()`, which see one
+    /// consistent snapshot of COMMITTED state only and never the in-memory blocks.
+    /// The read APIs in `env/helpers.rs` pick between the two per call (e.g. the
+    /// canonical head comes from the in-memory state while `last_block_number` is
+    /// committed-only), and `heal_finalized_to_persisted_tip` in `env/epoch.rs`
+    /// depends on the committed-only view to read the persisted tip.
     pub(crate) fn blockchain_provider(&self) -> &BlockchainProvider<TelcoinNode> {
         &self.inner.blockchain_provider
     }
 
-    // TODO: doc comment
+    /// Return the EVM config used to build and execute TN blocks: the chain spec plus
+    /// the rewards counter, wiring the TN handler (base-fee redirection, gas-limit
+    /// penalty) and the TN precompiles.
     pub(crate) fn evm_config(&self) -> &TnEvmConfig {
         &self.inner.evm_config
     }
@@ -180,7 +222,9 @@ impl RethEnv {
         Ok(State::builder().with_database(state).with_bundle_update().build())
     }
 
-    /// todo: doc comment
+    /// Return the task spawner taken from the `TaskManager` passed to
+    /// [`RethEnv::new`]; components built on this env (e.g. the worker transaction
+    /// pool) use it so their tasks run under the node's task manager.
     pub fn get_task_spawner(&self) -> &TaskSpawner {
         &self.inner.task_spawner
     }
