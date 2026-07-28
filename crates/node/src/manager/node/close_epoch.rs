@@ -341,7 +341,9 @@ where
         let tmp_dir = export_root.join(format!("epoch-{epoch}.tmp"));
         if tmp_dir.exists() {
             if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
-                warn!(target: "tn::snapshot", epoch, error = %e, "failed to clear stale temp export dir");
+                // Since generating snapshots is a caliteral duty just log an error.
+                // But this will leave trash around and may be indicative of a bigger problem
+                error!(target: "tn::snapshot", epoch, error = %e, "failed to clear stale temp export dir");
             }
         }
 

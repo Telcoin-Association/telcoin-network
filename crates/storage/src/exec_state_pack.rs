@@ -973,10 +973,11 @@ mod test {
 
     #[test]
     fn account_code_bytes_encodes_like_vec() {
-        // `AccountRecord.code` is stored as `Option<Bytes>` (avoiding a per-account `to_vec`), where
-        // it used to be `Option<Vec<u8>>`. Under the pack's BCS codec both encode identically —
-        // (Option tag) + (ULEB128 len) + (raw bytes) — so the wire format is unchanged and
-        // `EXEC_STATE_PACK_VERSION` need not bump. This test locks that invariant.
+        // `AccountRecord.code` is stored as `Option<Bytes>` (avoiding a per-account `to_vec`),
+        // where it used to be `Option<Vec<u8>>`. Under the pack's BCS codec both encode
+        // identically — (Option tag) + (ULEB128 len) + (raw bytes) — so the wire format is
+        // unchanged and `EXEC_STATE_PACK_VERSION` need not bump. This test locks that
+        // invariant.
         let raw = vec![0x60u8, 0x00, 0x2a, 0xff, 0x01];
         let as_bytes: Option<Bytes> = Some(Bytes::from(raw.clone()));
         let as_vec: Option<Vec<u8>> = Some(raw);

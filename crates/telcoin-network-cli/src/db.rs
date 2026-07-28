@@ -1107,11 +1107,11 @@ mod tests {
         assert!(db.cert_by_digest(records[2].digest()).await.is_some());
     }
 
-    /// A bundle whose records chain from a DIFFERENT genesis committee than the local one (the trust
-    /// root loaded from `--chain`) is rejected: a bundle from the wrong chain cannot be imported.
-    /// Epoch 0 carries a cert (real bundles do — it is aggregated at epoch 1's start), so it goes
-    /// through the with-cert path and `validate_downloaded_record` finds its committee incompatible
-    /// with the seeded local genesis committee.
+    /// A bundle whose records chain from a DIFFERENT genesis committee than the local one (the
+    /// trust root loaded from `--chain`) is rejected: a bundle from the wrong chain cannot be
+    /// imported. Epoch 0 carries a cert (real bundles do — it is aggregated at epoch 1's
+    /// start), so it goes through the with-cert path and `validate_downloaded_record` finds its
+    /// committee incompatible with the seeded local genesis committee.
     #[tokio::test]
     async fn verify_and_save_rejects_wrong_genesis_committee() {
         let dir = TempDir::with_prefix("verify_wrong_genesis").expect("temp dir");
@@ -1139,9 +1139,10 @@ mod tests {
         }
 
         let db = EpochRecordDb::open(dir.path()).expect("open db");
-        let err = super::verify_and_save_epoch_records(&db, genesis_keys_b, &records, &cert_by_hash)
-            .await
-            .expect_err("a bundle from a different genesis committee must be rejected");
+        let err =
+            super::verify_and_save_epoch_records(&db, genesis_keys_b, &records, &cert_by_hash)
+                .await
+                .expect_err("a bundle from a different genesis committee must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("epoch 0 record failed certificate verification"),

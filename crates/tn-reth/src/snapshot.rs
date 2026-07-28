@@ -1441,8 +1441,8 @@ mod tests {
         let pack_dir = TempDir::new()?;
         export_pack(&source, state_root, &[header_b.header().clone()], pack_dir.path());
 
-        // Corrupt the pack: drop the tail of the `state_data` stream (the End footer and part of the
-        // account run). The meta + header records at the front are untouched.
+        // Corrupt the pack: drop the tail of the `state_data` stream (the End footer and part of
+        // the account run). The meta + header records at the front are untouched.
         let data_path = pack_dir.path().join("state_data");
         let len = std::fs::metadata(&data_path)?.len();
         assert!(len > 24, "pack data should be larger than the truncation amount");

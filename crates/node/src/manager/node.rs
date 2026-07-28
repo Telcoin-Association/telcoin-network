@@ -782,7 +782,8 @@ where
         };
 
         // Spawn the state exporter once, only when the feature is enabled.
-        let exec_state_exporter = builder.enable_state_export.then(ExecStateExporter::spawn);
+        let exec_state_exporter =
+            builder.enable_state_export.then(ExecStateExporter::spawn).transpose()?;
 
         Ok(Self {
             builder,

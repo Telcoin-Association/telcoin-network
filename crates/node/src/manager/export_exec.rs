@@ -86,13 +86,13 @@ pub struct ExecStateExporter {
 impl ExecStateExporter {
     /// Spawn the background export worker. Each export supplies its own [`RethEnv`] (the node's
     /// execution engine — and its `RethEnv` — is recreated per epoch), so the worker holds none.
-    pub fn spawn() -> Self {
+    pub fn spawn() -> eyre::Result<Self> {
         let (tx, rx) = mpsc::channel(REQUEST_QUEUE);
         let worker = std::thread::Builder::new()
             .name("evm-state-exporter".to_string())
             .spawn(move || run_worker(rx))
-            .expect("failed to spawn evm-state-exporter thread");
-        Self { tx, worker: Arc::new(Mutex::new(Some(worker))) }
+            .map_err(|e| eyre::eyre!("failed to spawn evm-state-exporter thread: {e}"))?;
+        Ok(Self { tx, worker: Arc::new(Mutex::new(Some(worker))) })
     }
 
     /// Trigger an export of the execution state at `block` (read through `reth_env`) into
@@ -293,7 +293,7 @@ mod tests {
         let (genesis_root, genesis_block) =
             (genesis.state_root, BlockNumHash::new(0, genesis.hash()));
 
-        let exporter = ExecStateExporter::spawn();
+        let exporter = ExecStateExporter::spawn().expect("exporter to spawn");
 
         // trigger an export of the (genesis) tip on the background thread and await its result
         let out = TempDir::new()?;
