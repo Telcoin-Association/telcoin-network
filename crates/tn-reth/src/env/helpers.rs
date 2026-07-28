@@ -6,6 +6,7 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use reth_chain_state::CanonicalInMemoryState;
 use reth_chainspec::BaseFeeParams;
 use reth_errors::ProviderError;
+use reth_evm::{ConfigureEvm as _, EvmFactory as _};
 use reth_primitives_traits::SignerRecoverable as _;
 use reth_provider::{
     AccountReader as _, BlockBodyIndicesProvider as _, BlockIdReader as _, BlockNumReader as _,
@@ -14,6 +15,7 @@ use reth_provider::{
     HeaderProvider as _, ReceiptProvider as _, StateProviderBox, StateProviderFactory as _,
     TransactionVariant, TransactionsProvider as _,
 };
+use reth_revm::context::result::ExecutionResult;
 use tn_types::{
     Account, Address, BlockHashOrNumber, BlockNumHash, BlockNumber, Bytes, ExecHeader, Receipt,
     Recovered, SealedBlock, SealedHeader, TransactionMeta, TransactionSigned, TxHash, TxNumber,
@@ -21,7 +23,7 @@ use tn_types::{
 };
 
 use crate::{
-    error::{TnRethError, TnRethResult},
+    error::{EvmReadError, EvmReadResult, TnRethError, TnRethResult},
     BlockWithSenders, ChainSpec, RethEnv,
 };
 
@@ -238,6 +240,68 @@ impl RethEnv {
     /// Provide the state for the latest block in this instance.
     pub fn latest(&self) -> TnRethResult<StateProviderBox> {
         Ok(self.inner.blockchain_provider.latest()?)
+    }
+
+    /// Execute a read-only contract call at the canonical tip and return the raw ABI-encoded
+    /// output bytes.
+    ///
+    /// `eth_call`-like semantics: caller is the zero address, value 0, gas price 0, nonce and
+    /// base fee checks disabled, 30M gas; no state is committed. Callers decode the returned
+    /// bytes themselves (e.g. with `SolCall::abi_decode_returns`).
+    pub fn read_contract(&self, contract: Address, calldata: Bytes) -> EvmReadResult<Bytes> {
+        self.read_contract_inner(&self.canonical_tip(), Address::ZERO, contract, calldata)
+    }
+
+    /// Same as [`Self::read_contract`], but pinned to the state of the block identified by
+    /// `block_hash`.
+    pub fn read_contract_at_block(
+        &self,
+        block_hash: B256,
+        contract: Address,
+        calldata: Bytes,
+    ) -> EvmReadResult<Bytes> {
+        let header = self
+            .sealed_header_by_hash(block_hash)
+            .map_err(|e| EvmReadError::Internal(e.to_string()))?
+            .ok_or_else(|| {
+                EvmReadError::Internal(format!(
+                    "sealed header not found for block hash {block_hash:?}"
+                ))
+            })?;
+        self.read_contract_inner(&header, Address::ZERO, contract, calldata)
+    }
+
+    /// Build an EVM against `header`'s state and execute one read-only call, returning raw
+    /// output bytes on success and mapping Revert/Halt like the registry read path.
+    fn read_contract_inner(
+        &self,
+        header: &SealedHeader,
+        caller: Address,
+        contract: Address,
+        calldata: Bytes,
+    ) -> EvmReadResult<Bytes> {
+        let mut db = self
+            .read_only_state_db(header.hash())
+            .map_err(|e| EvmReadError::Internal(e.to_string()))?;
+        let evm_env =
+            self.evm_config().evm_env(header).map_err(|e| EvmReadError::Internal(e.to_string()))?;
+        let mut tn_evm = self.evm_config().evm_factory().create_evm(&mut db, evm_env);
+
+        let result = self
+            .read_state_on_chain(&mut tn_evm, caller, contract, calldata)
+            .map_err(|e| EvmReadError::Internal(e.to_string()))?;
+
+        // surface user-triggerable reverts distinctly from internal node faults
+        match result.result {
+            ExecutionResult::Success { output, .. } => Ok(output.into_data()),
+            ExecutionResult::Revert { output, .. } => Err(EvmReadError::Revert {
+                reason: alloy::sol_types::decode_revert_reason(&output),
+                output,
+            }),
+            ExecutionResult::Halt { reason, gas_used } => Err(EvmReadError::Internal(format!(
+                "contract call halted: {reason:?} (gas {gas_used})"
+            ))),
+        }
     }
 
     /// Look up a transaction by hash, returning it with its sender and block metadata

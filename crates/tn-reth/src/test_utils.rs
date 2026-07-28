@@ -1,7 +1,7 @@
 //! Transaction factory to create legit transactions for execution.
 
 use crate::{
-    error::{EvmReadError, EvmReadResult, StateReadResult, TnRethResult},
+    error::{StateReadResult, TnRethResult},
     evm::TNEvm,
     payload::TNPayload,
     recover_raw_transaction,
@@ -25,11 +25,9 @@ use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
-    DatabaseProviderFactory as _, StateProvider, StateProviderBox, StateProviderFactory,
+    DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory,
 };
-use reth_revm::{
-    context::result::ExecutionResult, database::StateProviderDatabase, db::BundleState, State,
-};
+use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
@@ -63,7 +61,7 @@ pub use alloy::eips::{
 pub use reth_primitives_traits::proofs::calculate_withdrawals_root;
 
 /// Typedef for a complex type to make clippy happy (and be a bit more readable?).
-pub type TNEvmTestType = TNEvm<State<StateProviderDatabase<Box<dyn StateProvider>>>>;
+pub type TNEvmTestType = TNEvm<State<StateProviderDatabase<StateProviderBox>>>;
 
 // methods for tests
 impl RethEnv {
@@ -84,11 +82,7 @@ impl RethEnv {
     /// Create an EVM-environment from state provider.
     pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
         let header = self.header(hash)?.expect("provided hash in header table");
-        let state: Box<dyn reth_provider::StateProvider> = self.state_by_block_hash(hash)?;
-        let db = State::builder()
-            .with_database(StateProviderDatabase::new(state))
-            .with_bundle_update()
-            .build();
+        let db = self.read_only_state_db(hash)?;
         Ok(self.evm_config().evm_factory().create_evm(db, self.evm_config().evm_env(&header)?))
     }
 
@@ -217,71 +211,6 @@ impl RethEnv {
             calldata,
         )?;
         Ok(info)
-    }
-
-    /// Execute a read-only contract call at the canonical tip and return the raw ABI-encoded
-    /// output bytes.
-    ///
-    /// `eth_call`-like semantics: caller is the zero address, value 0, gas price 0, nonce and
-    /// base fee checks disabled, 30M gas; no state is committed. Callers decode the returned
-    /// bytes themselves (e.g. with `SolCall::abi_decode_returns`).
-    pub fn read_contract(&self, contract: Address, calldata: Bytes) -> EvmReadResult<Bytes> {
-        self.read_contract_inner(&self.canonical_tip(), Address::ZERO, contract, calldata)
-    }
-
-    /// Same as [`Self::read_contract`], but pinned to the state of the block identified by
-    /// `block_hash`.
-    pub fn read_contract_at_block(
-        &self,
-        block_hash: B256,
-        contract: Address,
-        calldata: Bytes,
-    ) -> EvmReadResult<Bytes> {
-        let header = self
-            .sealed_header_by_hash(block_hash)
-            .map_err(|e| EvmReadError::Internal(e.to_string()))?
-            .ok_or_else(|| {
-                EvmReadError::Internal(format!(
-                    "sealed header not found for block hash {block_hash:?}"
-                ))
-            })?;
-        self.read_contract_inner(&header, Address::ZERO, contract, calldata)
-    }
-
-    /// Build an EVM against `header`'s state and execute one read-only call, returning raw
-    /// output bytes on success and mapping Revert/Halt like the registry read path.
-    fn read_contract_inner(
-        &self,
-        header: &SealedHeader,
-        caller: Address,
-        contract: Address,
-        calldata: Bytes,
-    ) -> EvmReadResult<Bytes> {
-        let state_provider = self
-            .blockchain_provider()
-            .state_by_block_hash(header.hash())
-            .map_err(|e| EvmReadError::Internal(e.to_string()))?;
-        let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
-        let evm_env =
-            self.evm_config().evm_env(header).map_err(|e| EvmReadError::Internal(e.to_string()))?;
-        let mut tn_evm = self.evm_config().evm_factory().create_evm(&mut db, evm_env);
-
-        let result = self
-            .read_state_on_chain(&mut tn_evm, caller, contract, calldata)
-            .map_err(|e| EvmReadError::Internal(e.to_string()))?;
-
-        // surface user-triggerable reverts distinctly from internal node faults
-        match result.result {
-            ExecutionResult::Success { output, .. } => Ok(output.into_data()),
-            ExecutionResult::Revert { output, .. } => Err(EvmReadError::Revert {
-                reason: alloy::sol_types::decode_revert_reason(&output),
-                output,
-            }),
-            ExecutionResult::Halt { reason, gas_used } => Err(EvmReadError::Internal(format!(
-                "contract call halted: {reason:?} (gas {gas_used})"
-            ))),
-        }
     }
 
     /// Read the committee validators for the provided epoch from the [ConsensusRegistry], pinned
