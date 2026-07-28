@@ -5,7 +5,7 @@ use reth::rpc::{builder::error::RpcError, server_types::eth::EthApiError};
 use reth_errors::BlockExecutionError;
 use reth_provider::ProviderError;
 
-/// Result alias for [`TNRethError`].
+/// Result alias for [`TnRethError`].
 pub type TnRethResult<T> = Result<T, TnRethError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.

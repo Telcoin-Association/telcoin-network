@@ -2,6 +2,17 @@
 //!
 //! These are used to spawn execution components for the node and maintain compatibility with reth's
 //! API.
+//!
+//! # Trust boundary: reth-side validation is intentionally bypassed
+//!
+//! Telcoin Network only executes output that Bullshark consensus has already finalized, so the
+//! blocks reaching execution are BFT-final and reth's beacon-engine validation machinery is never
+//! driven. [`TNExecution`] therefore implements reth's consensus/payload-validation traits by
+//! returning an `Err` from every validation method. This is INTENTIONAL fail-loud behavior, not a
+//! skipped check: none of these methods is reachable on a correctly wired node, and an error from
+//! one of them means reth's engine or validation machinery was mistakenly connected to TN (see
+//! issue #1048 and the [`TNExecution`] docs). Researchers auditing block validation should look at
+//! consensus-side certification and the TN execution path, not these stubs.
 
 use alloy::rpc::types::engine::ExecutionPayload;
 use reth::{
@@ -41,9 +52,9 @@ impl NodeTypesWithDB for TelcoinNode {
 /// Compatibility type that stands in for reth's beacon-engine consensus and payload machinery.
 ///
 /// Telcoin Network never drives this machinery: TN runs its own consensus and canonicalizes blocks
-/// directly (see `finish_executing_output` in `lib.rs`), so no header, body, or payload ever flows
-/// through the trait methods below. The impls exist only to satisfy reth's trait bounds when wiring
-/// the RPC stack; they are not part of any driven code path on current `main`.
+/// directly (see `finish_executing_output` in `env/execution.rs`), so no header, body, or payload
+/// ever flows through the trait methods below. The impls exist only to satisfy reth's trait
+/// bounds when wiring the RPC stack; they are not part of any driven code path on current `main`.
 ///
 /// For that reason every method fails loudly instead of silently accepting (or, for the payload
 /// methods, fabricating) data. None is reachable today, so a call means reth's engine or

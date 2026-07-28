@@ -1,4 +1,9 @@
 //! Convenience types for execution.
+//!
+//! Type aliases over reth internals, re-exported at the crate root (`pub use types::*`) so
+//! downstream crates name TN types instead of reth's directly. When reth moves, renames, or
+//! deprecates one of these types, only this file has to change — callers keep compiling against
+//! the alias.
 
 use std::sync::Arc;
 
@@ -27,5 +32,8 @@ pub type RethDb = Arc<DatabaseEnv>;
 pub type PoolTxnId = TransactionId;
 /// A pooled transaction.
 pub type PoolTxn = ValidPoolTransaction<EthPooledTransaction>;
-/// Type for primitives.
+/// The node's primitive types (block, transaction, receipt, header).
+///
+/// TN executes standard Ethereum primitives; this alias is what generic reth machinery
+/// (`NodeTypes`, `ConfigureEvm`) is instantiated with throughout the crate.
 pub type TNPrimitives = EthPrimitives;

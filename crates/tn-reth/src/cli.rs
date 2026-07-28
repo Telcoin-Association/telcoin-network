@@ -1,4 +1,24 @@
 //! Configure reth environment through CLI.
+//!
+//! This is the only reth CLI/config surface TN exposes: [`RethCommand`] narrows reth's full
+//! argument set to RPC, transaction-pool, and database args, and [`RethConfig::new`] fills in
+//! the rest of reth's `NodeConfig` with pinned values — reth networking/discovery fully
+//! disabled (TN runs its own libp2p stack), no reth payload builder, no dev/debug options, and
+//! reth's metrics server never launched (the prometheus endpoint is owned by `tn-metrics`).
+//!
+//! Security/operational policies enforced here:
+//! - RPC namespace allowlist: only the modules in `ALL_MODULES` (eth, net, web3, debug, trace, rpc)
+//!   can be enabled. `admin` and `txpool` are stripped from any selection with a warning, and a
+//!   `--http.api all` style selection is rewritten to the allowlist (see
+//!   `RethConfig::validate_rpc_modules`).
+//! - Pruning is disabled: every `PruningArgs` field is off, so nodes keep full history (archive
+//!   mode). Other code relies on this — e.g. ExEx replay treats missing receipts for an existing
+//!   block as database corruption (`TnRethError::ReplayReceiptsMissing`), which is only sound
+//!   because receipts are never pruned.
+//! - The per-sender transaction-pool slot default is raised to
+//!   [`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`] (256, vs reth's 16) by seeding reth's global pool
+//!   defaults via [`init_txpool_defaults`], which must run before any [`TxPoolArgs`] is parsed or
+//!   default-constructed.
 
 use std::{
     collections::HashSet,
