@@ -22,7 +22,6 @@ mod epoch;
 mod execution;
 mod genesis;
 mod helpers;
-mod rpc;
 
 /// This is a wrapped abstraction around Reth.
 ///

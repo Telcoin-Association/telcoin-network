@@ -238,10 +238,11 @@ where
     fn consensus_registry_runtime_code() -> &'static (reth_revm::bytecode::Bytecode, B256) {
         use reth_revm::bytecode::Bytecode;
         use std::sync::LazyLock;
+        use tn_config::CONSENSUS_REGISTRY_JSON;
 
         static CODE: LazyLock<(Bytecode, B256)> = LazyLock::new(|| {
             let value = crate::RethEnv::fetch_value_from_json_str(
-                crate::CONSENSUS_REGISTRY_JSON,
+                CONSENSUS_REGISTRY_JSON,
                 Some("deployedBytecode.object"),
             )
             .expect("embedded consensus registry artifact json is valid");

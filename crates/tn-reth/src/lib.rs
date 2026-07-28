@@ -24,23 +24,12 @@ mod clippy {
     use tn_reth as _;
 }
 
-use alloy::{
-    primitives::ChainId,
-    sol_types::{SolCall, SolConstructor},
-};
-use alloy_evm::Evm;
+use alloy::primitives::ChainId;
 use reth_chainspec::EthChainSpec;
-use reth_provider::DBProvider;
 use std::sync::{Arc, OnceLock};
 use system_calls::SYSTEM_ADDRESS;
-use tn_config::{
-    CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS,
-};
-use tn_types::{
-    Address, BlockBody, Genesis,
-    SealedBlock, SealedHeader,
-};
-use tracing::warn;
+use tn_config::GOVERNANCE_SAFE_ADDRESS;
+use tn_types::{Address, BlockBody, Genesis, SealedBlock, SealedHeader};
 
 // Reth stuff we are just re-exporting.  Need to reduce this over time.
 pub use alloy::primitives::FixedBytes;
