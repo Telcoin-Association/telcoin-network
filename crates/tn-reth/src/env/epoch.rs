@@ -1,23 +1,14 @@
 //! Methods for node startup and epoch boundaries.
 
-use std::sync::Arc;
-
 use eyre::OptionExt as _;
-use jsonrpsee::Methods;
-use reth::rpc::{
-    builder::{config::RethRpcServerConfig as _, RpcModuleBuilder, RpcServerHandle},
-    eth::EthApi,
-};
 use reth_errors::ProviderError;
 use reth_eth_wire::BlockHashNumber;
 use reth_evm::{ConfigureEvm as _, Evm as _, EvmFactory as _};
 use reth_provider::{
-    providers::BlockchainProvider, BlockIdReader as _, BlockNumReader as _,
-    ChainStateBlockReader as _, ChainStateBlockWriter as _, DBProvider as _,
-    DatabaseProviderFactory as _, HeaderProvider as _,
+    BlockIdReader as _, BlockNumReader as _, ChainStateBlockReader as _,
+    ChainStateBlockWriter as _, DBProvider as _, DatabaseProviderFactory as _, HeaderProvider as _,
 };
 use reth_revm::context::result::{EVMError, ExecutionResult, ResultAndState};
-use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_types::{
     gas_accumulator::WorkerFeeConfig, Address, Bytes, Epoch, ExecHeader, SealedHeader,
@@ -29,11 +20,9 @@ use crate::{
     error::{
         EvmReadError, EvmReadResult, StateReadError, StateReadResult, TnRethError, TnRethResult,
     },
-    evm::{TNEvm, TnEvmConfig},
+    evm::TNEvm,
     system_calls::{ConsensusRegistry, EpochState, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS},
-    traits::{TNExecution, TelcoinNode},
-    worker::WorkerNetwork,
-    RethEnv, RpcServer, WorkerTxPool, SYSTEM_ADDRESS,
+    RethEnv, SYSTEM_ADDRESS,
 };
 
 impl RethEnv {
@@ -124,52 +113,6 @@ impl RethEnv {
             .unwrap_or_else(|| self.node_config().chain.sealed_genesis_header().hash());
         let number = self.inner.blockchain_provider.finalized_block_number()?.unwrap_or_default();
         Ok(BlockHashNumber { hash, number })
-    }
-
-    /// Build and return the RPC server for the instance.
-    /// This probably needs better abstraction.
-    pub fn get_rpc_server(
-        &self,
-        transaction_pool: WorkerTxPool,
-        network: WorkerNetwork,
-        other: impl Into<Methods>,
-    ) -> RpcServer {
-        let transaction_pool: EthTransactionPool<
-            BlockchainProvider<TelcoinNode>,
-            DiskFileBlobStore,
-            TnEvmConfig,
-        > = transaction_pool.into();
-        let tn_execution = Arc::new(TNExecution);
-        let rpc_builder = RpcModuleBuilder::default()
-            .with_provider(self.inner.blockchain_provider.clone())
-            .with_pool(transaction_pool.clone())
-            .with_network(network.clone())
-            .with_executor(Box::new(self.inner.task_spawner.clone()))
-            .with_evm_config(self.inner.evm_config.clone())
-            .with_consensus(tn_execution.clone());
-
-        let modules_config = self.node_config().rpc.transport_rpc_module_config();
-        let eth_api = EthApi::builder(
-            self.inner.blockchain_provider.clone(),
-            transaction_pool,
-            network,
-            self.inner.evm_config.clone(),
-        )
-        .build();
-
-        let engine_events = reth_tokio_util::EventSender::default();
-        let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
-        if let Err(e) = server.merge_configured(other) {
-            tracing::error!(target: "tn::execution", "Error merging TN rpc module: {e:?}");
-        }
-
-        server
-    }
-
-    /// Start running the RPC server for this instance.
-    pub async fn start_rpc(&self, server: &RpcServer) -> TnRethResult<RpcServerHandle> {
-        let server_config = self.node_config().rpc.rpc_server_config();
-        Ok(server_config.start(server).await?)
     }
 
     /// Read the latest committee and epoch information from the [ConsensusRegistry] on-chain.
@@ -780,6 +723,7 @@ mod tests {
     use reth_revm::{
         cached::CachedReads, database::StateProviderDatabase, DatabaseCommit as _, State,
     };
+    use std::sync::Arc;
     use tempfile::TempDir;
     use tn_config::NodeInfo;
     use tn_types::{
