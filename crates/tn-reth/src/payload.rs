@@ -84,8 +84,8 @@ impl TNPayload {
         mix_hash: B256,
         worker_id: WorkerId,
     ) -> Self {
-        // include the committee-shuffle seed (keccak of the leader's deterministic epoch-close
-        // seed signature) if this is the last payload for the epoch
+        // include the committee-shuffle seed (the epoch seed chain value as of the closing
+        // commit) if this is the last payload for the epoch
         let close_epoch = output
             .close_epoch_for_last_batch(batch_index)
             .is_some_and(|last_batch| last_batch)

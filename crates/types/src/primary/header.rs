@@ -29,11 +29,14 @@ struct HeaderInner {
     /// execution result in a signed and validated structure which validates
     /// this execution block as well.
     latest_execution_block: BlockNumHash,
-    /// The author's deterministic BLS signature over the canonical per-epoch
-    /// [`EpochSeedMessage`](crate::EpochSeedMessage). Constant for a given `(author, epoch)`,
-    /// verified by voters before voting, and hashed into the epoch-close committee-shuffle
-    /// randomness when this header is the closing leader. Covered by the header digest (and so
-    /// by votes and the certificate aggregate), which makes the shuffle seed unforkable.
+    /// The author's deterministic BLS signature over the canonical per-`(author, round)`
+    /// [`EpochSeedMessage`](crate::EpochSeedMessage). The message binds this header's round, so
+    /// the signature is constant for a given `(author, epoch, round)` and cannot exist before
+    /// the author proposes at that round. Verified by voters before voting, and folded into the
+    /// epoch seed chain ([`EpochSeedChainValue`](crate::EpochSeedChainValue)) when this header
+    /// is a committing leader, which is what the epoch-close committee shuffle reads. Covered by
+    /// the header digest (and so by votes and the certificate aggregate), which makes the
+    /// shuffle seed unforkable.
     seed_signature: BlsSignature,
     /// The [HeaderDigest].
     /// This is cached to avoid calculating frequently (but not serialized).
@@ -235,7 +238,7 @@ pub struct HeaderBuilder {
     parents: BTreeSet<HeaderDigest>,
     /// Hash and number of the latest known execution block when this Header was build.
     latest_execution_block: BlockNumHash,
-    /// The author's deterministic BLS signature over the canonical per-epoch
+    /// The author's deterministic BLS signature over the canonical per-`(author, round)`
     /// [`EpochSeedMessage`](crate::EpochSeedMessage).
     seed_signature: BlsSignature,
 }
@@ -444,7 +447,7 @@ mod test {
         /// execution result in a signed and validated structure which validates
         /// this execution block as well.
         pub latest_execution_block: BlockNumHash,
-        /// The author's deterministic BLS signature over the canonical per-epoch seed message.
+        /// The author's deterministic BLS signature over the canonical round-bound seed message.
         /// Mirrors `HeaderInner::seed_signature` - a DELIBERATE wire-format change (#1032).
         pub seed_signature: BlsSignature,
     }

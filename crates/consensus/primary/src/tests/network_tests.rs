@@ -1221,7 +1221,7 @@ async fn test_vote_recast_different_digest_fails_closed() -> eyre::Result<()> {
 }
 
 /// A header whose epoch-close seed signature does not verify against the author's protocol key
-/// over the canonical per-epoch seed message must be refused with
+/// over the canonical seed message for its `(epoch, round)` must be refused with
 /// `HeaderError::InvalidSeedSignature` (no vote), while a header carrying a valid seed
 /// signature earns a vote (#1032). Refusing to vote is what guarantees any certified header's
 /// seed - and so the epoch-close committee-shuffle randomness - carries at least f+1 honest

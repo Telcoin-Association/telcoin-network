@@ -61,8 +61,8 @@ pub enum IntentScope {
     EpochBoundary = 1,     // Used for authority signature on a checkpoint at epochs boundaries.
     ConsensusDigest = 2,   // Used for authority signature on consensus digests.
     SystemMessage = 3,     // Used for signing system messages.
-    /// Used for the proposer's deterministic signature over the canonical per-epoch seed message
-    /// that derives the epoch-close committee-shuffle randomness.
+    /// Used for the proposer's deterministic signature over the canonical per-`(epoch, round)`
+    /// seed message that the epoch seed chain folds into the committee-shuffle randomness.
     EpochCloseSeed = 4,
 }
 

@@ -434,7 +434,7 @@ where
 
         debug!(target: "engine",  "validators pre-shuffle {:?}", all_active_validators);
 
-        // create seed from the keccak of the leader's deterministic epoch-close seed signature
+        // create seed from the epoch seed chain value as of the closing commit
         let mut seed = [0; 32];
         seed.copy_from_slice(randomness.as_slice());
         trace!(target: "engine", ?seed, "seed after");
