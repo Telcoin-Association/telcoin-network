@@ -427,6 +427,10 @@ where
     }
 
     /// Read eligible validators from latest state and shuffle the committee deterministically.
+    ///
+    /// The deterministic assembly, trim, and undersized-committee check live in the pure
+    /// [`assemble_new_committee`] free function; this method only performs the on-chain reads and
+    /// seeds the RNG so that the assembly logic stays unit-testable without a live EVM state.
     fn shuffle_new_committee(&mut self, randomness: B256) -> TnRethResult<Vec<Address>> {
         let new_committee_size = self.next_committee_size()?;
 
@@ -442,44 +446,7 @@ where
         // used as deterministic randomness
         let mut rng = StdRng::from_seed(seed);
 
-        // 1) separate active and pending validators
-        // 2) check if active length is sufficient
-        // 3) if missing, randomly select from the pending validators
-        let (pending_exit, mut active_validators): (Vec<_>, Vec<_>) = all_active_validators
-            .into_iter()
-            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
-
-        let active_validator_count = active_validators.len();
-        let mut validators_for_shuffle = if active_validator_count >= new_committee_size {
-            // enough active validators for next committee
-            active_validators
-        } else {
-            // NOTE: already checked if active_validator_count >= new_committee_size above
-            let num_missing = new_committee_size - active_validator_count;
-
-            // randomly take enough pending exit validators to reach new committee size
-            let random_pending = pending_exit.into_iter().choose_multiple(&mut rng, num_missing);
-            active_validators.extend(random_pending);
-            active_validators
-        };
-
-        // simple Fisher-Yates shuffle
-        for i in (1..validators_for_shuffle.len()).rev() {
-            let j = rng.random_range(0..=i);
-            validators_for_shuffle.swap(i, j);
-        }
-
-        debug!(target: "engine",  "validators post-shuffle {:?}", validators_for_shuffle);
-
-        let mut new_committee =
-            validators_for_shuffle.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
-
-        // trim the shuffled committee to maintain correct size
-        new_committee.truncate(new_committee_size);
-
-        trace!(target: "engine",  ?new_committee_size, ?new_committee, "truncated shuffle for new committee");
-
-        Ok(new_committee)
+        assemble_new_committee(new_committee_size, all_active_validators, &mut rng)
     }
 
     /// Read the committee-eligible validator pool from the consensus registry.
@@ -1005,5 +972,183 @@ where
             header,
             body: BlockBody { transactions, ommers: Default::default(), withdrawals },
         })
+    }
+}
+
+/// Deterministically assemble the next committee from the eligible validator pool.
+///
+/// Given `randomness`-seeded `rng`, this partitions the pool into active and pending-exit
+/// validators, folds in randomly chosen pending-exit validators only when the active set is short
+/// of `new_committee_size`, runs an in-place Fisher-Yates shuffle, and trims the result to the
+/// target size.
+///
+/// [`Vec::truncate`] caps the length at `new_committee_size` but is a silent no-op when the
+/// assembled pool is already smaller, so a pool below the target would otherwise flow through as an
+/// undersized committee. The registry invariant `nextCommitteeSize <= eligibleValidatorCount` makes
+/// that unreachable in practice, and the on-chain `concludeEpoch` guard rejects a wrong-length
+/// committee, but the final client-side check fails here with the exact counts
+/// ([`TnRethError::UndersizedCommittee`]) instead of forwarding calldata that can only revert
+/// on-chain.
+///
+/// Split out of [`TNBlockExecutor::shuffle_new_committee`] as a pure function so the
+/// assembly/trim/validate logic is unit-testable without a live EVM state. The RNG draw sequence is
+/// preserved verbatim from the historical implementation, so committees stay byte-identical to the
+/// chain's replayed history.
+fn assemble_new_committee(
+    new_committee_size: usize,
+    eligible_pool: Vec<ConsensusRegistry::ValidatorInfo>,
+    rng: &mut StdRng,
+) -> TnRethResult<Vec<Address>> {
+    // 1) separate active and pending validators
+    // 2) check if active length is sufficient
+    // 3) if missing, randomly select from the pending validators
+    let (pending_exit, mut active_validators): (Vec<_>, Vec<_>) =
+        eligible_pool.into_iter().partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
+
+    let active_validator_count = active_validators.len();
+    let mut validators_for_shuffle = if active_validator_count >= new_committee_size {
+        // enough active validators for next committee
+        active_validators
+    } else {
+        // NOTE: already checked if active_validator_count >= new_committee_size above
+        let num_missing = new_committee_size - active_validator_count;
+
+        // randomly take enough pending exit validators to reach new committee size
+        let random_pending = pending_exit.into_iter().choose_multiple(rng, num_missing);
+        active_validators.extend(random_pending);
+        active_validators
+    };
+
+    // simple Fisher-Yates shuffle; the draw order is consensus-critical, so it is preserved
+    // verbatim as a `for_each` over the same reversed range rather than rewritten in a way that
+    // would reorder the RNG draws.
+    (1..validators_for_shuffle.len()).rev().for_each(|i| {
+        let j = rng.random_range(0..=i);
+        validators_for_shuffle.swap(i, j);
+    });
+
+    debug!(target: "engine",  "validators post-shuffle {:?}", validators_for_shuffle);
+
+    let mut new_committee =
+        validators_for_shuffle.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
+
+    // trim the shuffled committee to maintain correct size
+    new_committee.truncate(new_committee_size);
+
+    trace!(target: "engine",  ?new_committee_size, ?new_committee, "truncated shuffle for new committee");
+
+    // truncate only ever shrinks, so a length mismatch here means the eligible pool was undersized.
+    let committee_len = new_committee.len();
+    (committee_len == new_committee_size).then_some(new_committee).ok_or(
+        TnRethError::UndersizedCommittee { expected: new_committee_size, got: committee_len },
+    )
+}
+
+/// Unit tests for the deterministic committee-assembly logic.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal [`ConsensusRegistry::ValidatorInfo`] for committee-assembly tests.
+    ///
+    /// Only `validatorAddress` and `currentStatus` steer [`assemble_new_committee`]; the remaining
+    /// fields are irrelevant to shuffling and trimming, so they are zeroed.
+    fn validator(last_byte: u8, status: ValidatorStatus) -> ConsensusRegistry::ValidatorInfo {
+        ConsensusRegistry::ValidatorInfo {
+            validatorAddress: Address::with_last_byte(last_byte),
+            activationEpoch: 0,
+            exitEpoch: 0,
+            currentStatus: status,
+            isRetired: false,
+            stakeVersion: 0,
+            region: 0,
+        }
+    }
+
+    /// An eligible pool smaller than the target size must surface
+    /// [`TnRethError::UndersizedCommittee`] with the exact counts instead of silently returning a
+    /// short committee.
+    #[test]
+    fn assemble_rejects_undersized_pool() {
+        let pool =
+            vec![validator(1, ValidatorStatus::Active), validator(2, ValidatorStatus::Active)];
+        let mut rng = StdRng::from_seed([7u8; 32]);
+
+        let result = assemble_new_committee(5, pool, &mut rng);
+
+        assert!(matches!(result, Err(TnRethError::UndersizedCommittee { expected: 5, got: 2 })));
+    }
+
+    /// A pool at least as large as the target yields a committee of exactly the target size drawn
+    /// only from the eligible pool.
+    #[test]
+    fn assemble_trims_oversized_pool_to_target() {
+        let pool_addrs: Vec<Address> = (1u8..=5).map(Address::with_last_byte).collect();
+        let pool = pool_addrs
+            .iter()
+            .map(|address| ConsensusRegistry::ValidatorInfo {
+                validatorAddress: *address,
+                activationEpoch: 0,
+                exitEpoch: 0,
+                currentStatus: ValidatorStatus::Active,
+                isRetired: false,
+                stakeVersion: 0,
+                region: 0,
+            })
+            .collect();
+        let mut rng = StdRng::from_seed([7u8; 32]);
+
+        let committee = assemble_new_committee(3, pool, &mut rng).ok();
+
+        assert!(committee
+            .is_some_and(|c| c.len() == 3 && c.iter().all(|address| pool_addrs.contains(address))));
+    }
+
+    /// A pool with too few active validators fills the committee from pending-exit validators and
+    /// still reaches the exact target size (the folding branch of the assembly).
+    #[test]
+    fn assemble_fills_from_pending_exit_when_active_is_short() {
+        let pool = vec![
+            validator(1, ValidatorStatus::Active),
+            validator(2, ValidatorStatus::PendingExit),
+            validator(3, ValidatorStatus::PendingExit),
+        ];
+        let mut rng = StdRng::from_seed([7u8; 32]);
+
+        let result = assemble_new_committee(3, pool, &mut rng);
+
+        assert!(matches!(&result, Ok(committee) if committee.len() == 3));
+    }
+
+    /// At the exact-size boundary (active validator count == target) the committee is drawn only
+    /// from the active set, with pending-exit validators ignored, and its deterministic order is
+    /// pinned to a golden value. This locks the RNG draw sequence: any change to the shuffle path,
+    /// or a `>=`-to-`>` slip in the active-vs-target comparison (which would perturb the draws via
+    /// `choose_multiple(rng, 0)`), reorders the committee and fails here rather than silently
+    /// diverging into a different same-length committee that the on-chain length guard cannot
+    /// catch.
+    #[test]
+    fn assemble_at_exact_size_boundary_pins_deterministic_active_only_committee() {
+        let pool = vec![
+            validator(1, ValidatorStatus::Active),
+            validator(2, ValidatorStatus::Active),
+            validator(3, ValidatorStatus::Active),
+            validator(4, ValidatorStatus::PendingExit),
+            validator(5, ValidatorStatus::PendingExit),
+        ];
+        let mut rng = StdRng::from_seed([42u8; 32]);
+
+        let committee = assemble_new_committee(3, pool, &mut rng).ok();
+
+        // Golden order for seed [42; 32]; regenerate only when the shuffle algorithm changes on
+        // purpose. All three addresses are from the active set, proving pending-exit is ignored.
+        assert_eq!(
+            committee,
+            Some(vec![
+                Address::with_last_byte(2),
+                Address::with_last_byte(1),
+                Address::with_last_byte(3),
+            ])
+        );
     }
 }
