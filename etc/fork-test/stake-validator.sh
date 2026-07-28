@@ -141,10 +141,19 @@ send "fund ${NAME} EOA with ${FUND} wei" "$EOA_ADDR" --value "$FUND" --private-k
 send "mint ConsensusNFT for ${EOA_ADDR}" "$REG" "mint(address)" "$EOA_ADDR" --private-key "$LOCAL_PK"
 
 # ---- 4. stake (operator EOA sends BLS args + stakeAmount as value) --------------------------
-CALLDATA="$("$BIN" keytool export-staking-args --node-info "$DATADIR" --calldata)"
+# `keytool export-staking-args` writes an INFO "Loading configuration" line to STDOUT (reth's
+# tracing layer logs to stdout at the default verbosity) ahead of the calldata println!, so a raw
+# capture is contaminated with log noise. Pull the line that is entirely 0x-hex (the calldata);
+# keep the full output so a real failure still surfaces.
+STAKING_OUT="$("$BIN" keytool export-staking-args --node-info "$DATADIR" --calldata 2>&1)"
+CALLDATA="$(printf '%s\n' "$STAKING_OUT" | grep -E '^0x[0-9a-fA-F]+$' | tail -n1)"
 case "$CALLDATA" in
     0x*) : ;;
-    *) echo "export-staking-args did not return calldata: ${CALLDATA}"; exit 1 ;;
+    *)
+        echo "export-staking-args did not return calldata:"
+        printf '%s\n' "$STAKING_OUT" | sed 's/^/     /'
+        exit 1
+        ;;
 esac
 send "stake ${STAKE} wei" "$REG" "$CALLDATA" --value "$STAKE" --private-key "$EOA_PK"
 

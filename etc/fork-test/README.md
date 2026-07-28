@@ -37,7 +37,12 @@ matches and consensus holds.
 ## Prerequisites
 
 - **Foundry `cast`** — https://book.getfoundry.sh/getting-started/installation
-- **python3 + ruamel.yaml** — `pip install ruamel.yaml`
+- **Docker, with the daemon running** — the genesis patch needs `ruamel.yaml`, so
+  `patch-genesis.sh` runs `patch-genesis.py` inside a small container (`patch.Dockerfile`) instead
+  of requiring a host `pip install`. Start Docker Desktop (or `colima start`) before
+  `local-testnet.sh`; the prereq gate fails fast if the daemon is unreachable. Only this one step
+  is containerized — the six nodes, `cargo build`, and `cast` all run natively.
+- **python3** — stdlib only, for the JSON helpers in `stake-validator.sh` / `sanity-check.sh`.
 - **`.env`** providing `LOCAL_ADDRESS` (dev/governance account, funded 1B TEL at genesis) and
   `LOCAL_PK` (its private key). `source .env` before running.
 

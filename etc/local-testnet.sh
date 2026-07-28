@@ -84,15 +84,17 @@ LENGTH="${#VALIDATORS[@]}"
 # Use RELEASE="debug" below and remove the --release to use a debug build
 RELEASE="release"
 
-# This fork-test harness patches genesis with Python (ruamel.yaml) and drives staking with Foundry
-# `cast`. Check those up front -- only when generating fresh config -- so a missing dep fails BEFORE
-# the (slow) adiri release build rather than after it.
+# This fork-test harness patches genesis via Docker (etc/fork-test/patch-genesis.sh runs ruamel.yaml
+# in a container so it need not be installed on the host), drives staking with Foundry `cast`, and
+# uses host python3 for the stdlib-only JSON helpers in stake-validator.sh / sanity-check.sh. Check
+# those up front -- only when generating fresh config -- so a missing dep fails BEFORE the (slow)
+# adiri release build rather than after it.
 if [ ! -d "${ROOTDIR}" ]; then
     if ! command -v python3 >/dev/null 2>&1; then
         echo "python3 is required."; exit 1
     fi
-    if ! python3 -c 'import ruamel.yaml' >/dev/null 2>&1; then
-        echo "python3 module 'ruamel.yaml' is required: pip install ruamel.yaml"; exit 1
+    if ! ./etc/fork-test/patch-genesis.sh --check; then
+        exit 1
     fi
     if ! command -v cast >/dev/null 2>&1; then
         echo "Foundry 'cast' is required: https://book.getfoundry.sh/getting-started/installation"; exit 1
@@ -123,7 +125,7 @@ else
         exit 1
     fi
 
-    # Prereqs (python3/ruamel.yaml/cast) were verified before the build above.
+    # Prereqs (python3/docker/cast) were verified before the build above.
     CONFIG_GENERATED=true
 
     # make local directory for all validators
@@ -178,7 +180,7 @@ else
     # keeping the freshly-generated storage. Every node is fed this one patched copy below, so all
     # nodes compute an identical genesis hash and consensus holds.
     echo "patching genesis with pre-fork ConsensusRegistry code + BlsG1 library"
-    python3 etc/fork-test/patch-genesis.py \
+    ./etc/fork-test/patch-genesis.sh \
         chain-configs/testnet/genesis.yaml \
         "${ROOTDIR}/${GENESISDIR}/genesis.yaml"
 

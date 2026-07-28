@@ -29,6 +29,18 @@ struct HeaderInner {
     /// execution result in a signed and validated structure which validates
     /// this execution block as well.
     latest_execution_block: BlockNumHash,
+    // // VRF: sign(epoch+round+parent_hash+domain_separator)
+    // // 	 	- parent hash to minimize early grinding
+    // // - disincentivize grinding
+    // // - carrot instead ?
+    // //
+    // // - keccak(take all values in the commit)
+    // // - leader's own bls_sig() for certificate
+    // // 	- easy to gameify (withhold batches, propose different batches, etc.)
+    // // - byzantine for last epoch, automatically excluded from validator shuffle ?
+    // //
+    // // - needs audit
+    // entropy: Vec<u8>,
     /// The [HeaderDigest].
     /// This is cached to avoid calculating frequently (but not serialized).
     /// Note, this struct is private and this field MUST always be set on creation in this module.
