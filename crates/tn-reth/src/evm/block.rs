@@ -783,7 +783,11 @@ where
     }
 
     fn set_state_hook(&mut self, _hook: Option<Box<dyn OnStateHook>>) {
-        unimplemented!("not using SystemCaller - nothing to set hook on")
+        // TN does not use reth's SystemCaller, so there is nothing to attach a hook to. The
+        // trait returns `()`, leaving no way to refuse: log loudly and drop the hook instead of
+        // panicking mid-block. A caller that relied on hook callbacks silently degrades — the
+        // error line is the only signal.
+        error!(target: "engine", "set_state_hook called but TN has no SystemCaller; dropping hook");
     }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
