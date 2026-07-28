@@ -26,6 +26,7 @@ mod clippy {
 
 use crate::{
     evm::TNEvm,
+    metrics::RETH_METRICS,
     system_calls::PRECOMPILE_GENESIS_BYTECODE,
     traits::{DefaultEthPayloadTypes, TNExecution},
 };
@@ -172,6 +173,7 @@ use worker::WorkerNetwork;
 pub mod error;
 mod evm;
 pub mod forward;
+mod metrics;
 pub mod rpc_server_args;
 pub mod snapshot;
 pub mod system_calls;
@@ -700,6 +702,9 @@ impl RethEnv {
         let blockchain_provider = BlockchainProvider::new(provider_factory.clone())?;
         let task_spawner = task_manager.get_spawner();
         set_basefee_address(basefee_address);
+        // baseline the block-building counters at zero now, while the recorder is known to be
+        // installed, so a node that never drops a transaction still exports both series
+        crate::metrics::init();
 
         Ok(Self {
             inner: Arc::new(RethEnvInner {
@@ -829,6 +834,19 @@ impl RethEnv {
             })
             .collect::<Vec<_>>();
 
+        // Recovery failures are the signal that a batch carrying undecodable transaction bytes
+        // was certified, so make them alertable instead of log-only. Count once, after the
+        // parallel phase: incrementing inside the rayon closure would contend a single atomic on
+        // every transaction, and the batch width that sets the cost of that contention is
+        // attacker-chosen. The difference is exact because `filter_map` is the only thing above
+        // that removes elements. Unconditional, including the overwhelmingly common zero: one
+        // relaxed atomic add per block is free next to executing the block, and a guard here
+        // would leave the series unregistered on a healthy node.
+        let unrecoverable = transactions.len().saturating_sub(recovered_txs.len());
+        RETH_METRICS
+            .unrecoverable_txs_dropped_total
+            .increment(u64::try_from(unrecoverable).unwrap_or(u64::MAX));
+
         // Phase 2: Execute recovered transactions sequentially.
         for recovered in recovered_txs {
             // forks are impossible
@@ -842,6 +860,8 @@ impl RethEnv {
                     //
                     // it's possible that another worker's batch included this transaction
                     warn!(target: "engine", %error,  "skipping invalid transaction: {:#?}", recovered);
+                    // expected in normal operation - see the field docs, this is not an alert
+                    RETH_METRICS.invalid_txs_skipped_total.increment(1);
                     continue;
                 }
                 // this is an error that we should treat as fatal for this attempt

@@ -1419,6 +1419,15 @@
           "expr": "rate(tn_executor_protocol_violations_total[5m])",
           "refId": "B",
           "legendFormat": "protocol violations"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(tn_reth_unrecoverable_txs_dropped_total[5m])",
+          "refId": "C",
+          "legendFormat": "unrecoverable txs dropped"
         }
       ],
       "fieldConfig": {
