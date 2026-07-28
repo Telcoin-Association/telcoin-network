@@ -115,9 +115,10 @@ pub fn basefee_address() -> Address {
 pub struct ChainSpec(Arc<RethChainSpec>);
 
 impl ChainSpec {
-    /// Return the contained Reth ChainSpec.
-    pub(crate) fn reth_chain_spec(&self) -> RethChainSpec {
-        (*self.0).clone()
+    /// Return the contained Reth ChainSpec behind its `Arc` (refcount bump, no deep clone of
+    /// the genesis alloc).
+    pub(crate) fn reth_chain_spec(&self) -> Arc<RethChainSpec> {
+        self.0.clone()
     }
 
     /// Return a reference to the ChainSpec's genesis.

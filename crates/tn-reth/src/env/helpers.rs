@@ -83,7 +83,7 @@ impl RethEnv {
                 BlockHashOrNumber::Number(number),
                 TransactionVariant::NoHash,
             )?
-            .map(|b| b.clone_sealed_block()))
+            .map(|b| b.into_sealed_block()))
     }
 
     /// Look up and return the sealed header (with senders) for hash.

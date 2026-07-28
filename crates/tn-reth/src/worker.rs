@@ -66,7 +66,7 @@ impl WorkerComponents {
 #[non_exhaustive]
 pub struct WorkerNetwork {
     /// Chainspec
-    chain_spec: RethChainSpec,
+    chain_spec: Arc<RethChainSpec>,
     /// Track our peer count for queries.
     peer_count: Arc<RwLock<usize>>,
     /// App version.
