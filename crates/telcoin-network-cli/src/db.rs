@@ -347,9 +347,9 @@ const STREAM_IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
 /// closed epoch's consensus pack is stream-imported (rebuilding `epoch-{N}/` + its idx/hash/bhash).
 ///
 /// A complete bundle carries a certificate for every record through the tip epoch N (the exporter
-/// waits for N's cert before writing the bundle), so every epoch `>= 1` is fully verified against
-/// its cert. The only record that may lack a cert is the epoch-0 genesis anchor, which is verified
-/// against the seeded genesis committee by its `parent_hash` rather than a cert.
+/// waits for N's cert before writing the bundle), so every epoch — including the epoch-0 genesis
+/// anchor — is fully verified against its cert. Epoch 0 is additionally checked for committee
+/// compatibility with the seeded genesis committee, binding the bundle to the local chain.
 fn restore_consensus_and_records(
     epochs_dir: &Path,
     genesis_committee: &Committee,
@@ -369,9 +369,8 @@ fn restore_consensus_and_records(
         bail!("bundle epoch_records contains no records");
     }
     // Certificates are matched to records by digest (`cert.epoch_hash == record.digest()`). A
-    // complete bundle carries one for every record through the tip epoch N; only the epoch-0
-    // genesis anchor may lack one (it is verified against the seeded genesis committee, not a
-    // cert).
+    // complete bundle carries one for every record through the tip epoch N, including the epoch-0
+    // genesis anchor.
     let certs = EpochRecordDb::read_certs_from_pack(bundle_certs).map_err(|e| {
         eyre!("failed to read epoch certificates from {}: {e}", bundle_certs.display())
     })?;
@@ -480,11 +479,11 @@ fn restore_consensus_and_records(
 /// `validate_downloaded_record` anchors epoch 0 to the seeded committee and epoch k to the
 /// already-saved record k-1.
 ///
-/// Every epoch `>= 1` must carry a certificate in `cert_by_hash`; a missing one is a hard error,
-/// because a complete bundle exports a cert for every record through the tip epoch N and a record
-/// cannot be trusted without one. Epoch 0 is the genesis anchor: it is verified against its cert
-/// when present, or — preserving the from-genesis bootstrap — accepted on a default `parent_hash`
-/// against the seeded genesis committee when absent.
+/// Every epoch — including epoch 0 — must carry a certificate in `cert_by_hash`; a missing one is a
+/// hard error, because a complete bundle exports a cert for every record through the tip epoch N
+/// and a record cannot be trusted without one. Epoch 0 is verified against the seeded genesis
+/// committee (its cert plus committee compatibility with `genesis_keys`); every later epoch k is
+/// verified against the already-saved record k-1.
 async fn verify_and_save_epoch_records(
     db: &EpochRecordDb,
     genesis_keys: std::collections::BTreeSet<BlsPublicKey>,
@@ -492,59 +491,31 @@ async fn verify_and_save_epoch_records(
     cert_by_hash: &HashMap<EpochDigest, EpochCertificate>,
 ) -> eyre::Result<()> {
     // Seed the dummy epoch-0 anchor with the genesis committee.
-    let genesis_keys: Vec<_> = genesis_keys.into_iter().collect();
+    let genesis_keys_vec: Vec<_> = genesis_keys.iter().copied().collect();
     db.save_dummy_epoch0(EpochRecord {
         epoch: 0,
-        committee: genesis_keys.clone(),
-        next_committee: genesis_keys,
+        committee: genesis_keys_vec.clone(),
+        next_committee: genesis_keys_vec,
         ..Default::default()
     })
     .await
     .map_err(|e| eyre!("failed to seed genesis committee: {e}"))?;
 
     for record in records.iter() {
-        let cert = cert_by_hash.get(&record.digest());
-        // Epoch 0 is the genesis anchor. If the bundle carries its cert, verify it against the
-        // seeded genesis committee like any other record; if not, verify only that it chains to
-        // genesis (default parent hash) and store it against the seeded committee. Genesis is the
-        // trust root, so it does not need a cert — but every later epoch does, and once epoch 0 is
-        // saved, epoch 1 verifies against its `next_committee`.
-        if record.epoch == 0 {
-            match cert {
-                Some(cert) => {
-                    match db.validate_downloaded_record(0, record, cert).await {
-                        EpochRecordValidation::Valid => {}
-                        other => {
-                            bail!("epoch 0 record failed certificate verification: {other:?}")
-                        }
-                    }
-                    db.save(record.clone(), cert.clone())
-                        .await
-                        .map_err(|e| eyre!("failed to save epoch 0 record: {e}"))?;
-                }
-                None => {
-                    if record.parent_hash != EpochDigest::default() {
-                        bail!("epoch 0 record does not chain to genesis (non-default parent hash)");
-                    }
-                    db.save_record(record.clone())
-                        .await
-                        .map_err(|e| eyre!("failed to save epoch 0 record: {e}"))?;
-                }
-            }
-            continue;
-        }
-
-        // Every epoch >= 1 must carry a certificate: a complete bundle exports one for every record
+        // Every epoch must carry a certificate: a complete bundle exports one for every record
         // through the tip epoch N, so a missing cert means the bundle is incomplete or stale. Fully
         // verify each record against its cert, anchored to the trusted chain (the sequential loop
         // saved k-1 before verifying k, so once N's cert is present it verifies against N-1).
-        let Some(cert) = cert else {
+        let Some(cert) = cert_by_hash.get(&record.digest()) else {
             bail!(
                 "epoch {} record has no certificate in the bundle; a complete bundle must carry a \
                  cert for every epoch through N — re-export with the current version",
                 record.epoch
             );
         };
+
+        // A single path validates every epoch: epoch 0 anchors to the seeded dummy (the local
+        // genesis committee), every later epoch to the already-saved previous record.
         match db.validate_downloaded_record(record.epoch, record, cert).await {
             EpochRecordValidation::Valid => {}
             other => {
@@ -1062,7 +1033,7 @@ mod tests {
         let db = EpochRecordDb::open(dir.path()).expect("open db");
         let err = super::verify_and_save_epoch_records(&db, genesis_keys, &records, &cert_by_hash)
             .await
-            .expect_err("a tip epoch >= 1 without a cert must be rejected");
+            .expect_err("a tip epoch without a cert must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("epoch 2 record has no certificate in the bundle"),
@@ -1070,10 +1041,10 @@ mod tests {
         );
     }
 
-    /// The epoch-0 genesis anchor is still accepted without a cert (from-genesis bootstrap), as
-    /// long as every later epoch carries one.
+    /// Epoch 0 must carry a cert like every other epoch: a bundle whose epoch-0 record has no cert
+    /// is rejected, even when every later epoch carries one.
     #[tokio::test]
-    async fn verify_and_save_allows_genesis_without_cert() {
+    async fn verify_and_save_rejects_genesis_without_cert() {
         let dir = TempDir::with_prefix("verify_genesis_no_cert").expect("temp dir");
         let mut rng = StdRng::seed_from_u64(3);
         let signers: Vec<TestSigner> = (0..4)
@@ -1096,15 +1067,14 @@ mod tests {
         }
 
         let db = EpochRecordDb::open(dir.path()).expect("open db");
-        super::verify_and_save_epoch_records(&db, genesis_keys, &records, &cert_by_hash)
+        let err = super::verify_and_save_epoch_records(&db, genesis_keys, &records, &cert_by_hash)
             .await
-            .expect("epoch 0 may lack a cert when every later epoch has one");
-
-        // Epoch 0 is stored (from the seeded genesis anchor) but has no cert; epochs 1 and 2 do.
-        assert!(db.record_by_epoch(0).await.is_some());
-        assert!(db.cert_by_digest(records[0].digest()).await.is_none());
-        assert!(db.cert_by_digest(records[1].digest()).await.is_some());
-        assert!(db.cert_by_digest(records[2].digest()).await.is_some());
+            .expect_err("epoch 0 without a cert must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("epoch 0 record has no certificate in the bundle"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// A bundle whose records chain from a DIFFERENT genesis committee than the local one (the

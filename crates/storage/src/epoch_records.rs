@@ -513,10 +513,9 @@ impl EpochRecordDb {
     /// indexes) that round-trip through [`read_records_from_pack`](Self::read_records_from_pack) /
     /// [`read_certs_from_pack`](Self::read_certs_from_pack).
     ///
-    /// A certificate is required for every epoch `>= 1`; a missing one is an error, because an
-    /// importer must fully verify each record against its cert and cannot for a record it does not
-    /// have. Epoch 0 is the genesis anchor and may legitimately lack a cert (the seeded genesis
-    /// committee is the importer's trust root for it), so its cert is written only when present.
+    /// A certificate is required for every epoch, including epoch 0: the importer fully verifies
+    /// each record against its cert — epoch 0 against the seeded genesis committee — so a missing
+    /// cert would make the bundle unverifiable. A missing cert is therefore a hard error.
     pub async fn export_bounded_bundle(
         &self,
         through_epoch: Epoch,
@@ -538,9 +537,6 @@ impl EpochRecordDb {
                 .ok_or(EpochDbError::EpochOutOfOrder(through_epoch, epoch))?;
             match cert {
                 Some(cert) => certs.push(cert),
-                // epoch 0 is the genesis anchor and may lack a cert; every later epoch must have
-                // one so the importer can fully verify it.
-                None if epoch == 0 => {}
                 None => return Err(EpochDbError::MissingCertificate(epoch)),
             }
             records.push(record);
@@ -1775,9 +1771,9 @@ mod test {
     }
 
     #[tokio::test]
-    async fn export_bounded_bundle_tolerates_missing_genesis_cert() {
-        // Epoch 0 is the genesis anchor and may lack a cert; the bundle is still written, carrying
-        // one fewer cert than records.
+    async fn export_bounded_bundle_errors_on_missing_genesis_cert() {
+        // Epoch 0 must carry a cert like every other epoch, so an exporter missing epoch 0's cert
+        // must error rather than write a bundle the importer would reject.
         let temp_dir = TempDir::with_prefix("export_bundle_genesis").expect("temp dir");
         let bundle_dir = TempDir::with_prefix("export_bundle_genesis_out").expect("bundle dir");
         let mut rng = StdRng::from_os_rng();
@@ -1790,14 +1786,14 @@ mod test {
         let (rec1, cert1) = make_test_pair(1, &signers, rec0.digest());
         db.save(rec1, cert1).await.expect("save epoch 1");
 
-        let records_path = bundle_dir.path().join("epoch_records");
-        let certs_path = bundle_dir.path().join("epoch_certs");
-        db.export_bounded_bundle(1, &records_path, &certs_path).await.expect("export bundle");
-
-        let got_records =
-            EpochRecordDb::read_records_from_pack(&records_path).expect("read records");
-        assert_eq!(got_records.len(), 2, "records 0 and 1 present");
-        let got_certs = EpochRecordDb::read_certs_from_pack(&certs_path).expect("read certs");
-        assert_eq!(got_certs.len(), 1, "only epoch 1's cert is present; epoch 0 has none");
+        let err = db
+            .export_bounded_bundle(
+                1,
+                &bundle_dir.path().join("epoch_records"),
+                &bundle_dir.path().join("epoch_certs"),
+            )
+            .await
+            .expect_err("export must fail when epoch 0's cert is missing");
+        assert!(matches!(err, EpochDbError::MissingCertificate(0)), "unexpected error: {err}");
     }
 }
