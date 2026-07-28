@@ -518,7 +518,7 @@ impl ConsensusChain {
                 let base_dir = self.base_path.join(format!("epoch-{epoch}"));
                 let path_base_dir = path.join(format!("epoch-{epoch}"));
                 pack.persist().await?;
-                match pack.latest_consensus_header().await {
+                match pack.latest_consensus_header().await? {
                     Some(last_header) => {
                         // The chain was verified as it was streamed.  So if the final block matches
                         // the expected final_consensus then the entire pack
@@ -582,7 +582,7 @@ impl ConsensusChain {
     ) -> Result<Box<dyn ReadStream>, ConsensusChainError> {
         if let Ok(pack) = self.get_static(epoch).await {
             if let Some((epoch_record, _)) = self.epochs().get_epoch_by_number(epoch).await {
-                match pack.latest_consensus_header().await {
+                match pack.latest_consensus_header().await? {
                     Some(last_header) => {
                         let epoch_final_hash = epoch_record.final_consensus.hash;
                         if epoch_record.final_consensus.number == last_header.number
@@ -680,7 +680,7 @@ impl ConsensusChain {
         pack.persist().await?;
         // The chain was verified link-by-link as it streamed; confirm the prefix ends exactly at
         // the requested final consensus so the staged data is trustworthy.
-        match pack.latest_consensus_header().await {
+        match pack.latest_consensus_header().await? {
             Some(last)
                 if last.number == final_number
                     && last.digest() == epoch_record.final_consensus.hash => {}
@@ -1045,22 +1045,31 @@ impl ConsensusChain {
     /// Return the latest consensus header for `epoch` by reading directly from the pack index,
     /// bypassing the slot files (LatestConsensus). This is always consistent with
     /// read_last_committed and should be used during startup recovery.
+    ///
+    /// A pack that cannot be opened is an error, never `None`. `None` means "this epoch has
+    /// committed nothing", which seeds the epoch seed chain at its root, so collapsing a failed
+    /// open into `None` would silently re-root the chain and fork execution permanently (see
+    /// [`EpochSeedChainValue`](tn_types::EpochSeedChainValue)). Callers that legitimately probe an
+    /// epoch this node may not hold locally - state sync's partial-pack catch-up - degrade the
+    /// error themselves at the call site, where "not held" is the intended reading.
     pub async fn latest_consensus_header_from_pack(
         &self,
         epoch: Epoch,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         let pack = &self.current_pack();
         if pack.epoch() == epoch {
-            return Ok(pack.latest_consensus_header().await);
+            return Ok(pack.latest_consensus_header().await?);
         }
-        if let Ok(pack) = self.get_static(epoch).await {
-            Ok(pack.latest_consensus_header().await)
-        } else {
-            Ok(None)
-        }
+        self.get_static(epoch).await?.latest_consensus_header().await.map_err(Into::into)
     }
 
     /// Read the last committed rounds for authorities from an epoch.
+    ///
+    /// A pack that cannot be opened is an error, never an empty map, for the same reason as
+    /// [`Self::latest_consensus_header_from_pack`]: an empty map is indistinguishable from "this
+    /// epoch has committed nothing", and startup recovery reads both cursors from this same pack.
+    /// Swallowing the open failure in both made them fail open together, which reproduces one layer
+    /// down exactly the silent re-root the fallible recovery path exists to prevent.
     pub async fn read_last_committed(
         &self,
         epoch: Epoch,
@@ -1069,11 +1078,7 @@ impl ConsensusChain {
         if pack.epoch() == epoch {
             return Ok(pack.read_last_committed().await?);
         }
-        if let Ok(pack) = self.get_static(epoch).await {
-            Ok(pack.read_last_committed().await?)
-        } else {
-            Ok(HashMap::new())
-        }
+        self.get_static(epoch).await?.read_last_committed().await.map_err(Into::into)
     }
 
     /// Read the final committed sub dag with final reputation scores.
@@ -2265,7 +2270,11 @@ mod test {
 
             // The imported epoch-0 pack must be complete and readable after all the racing.
             let pack = target.get_static(0).await.expect("epoch-0 pack readable after race");
-            let header = pack.latest_consensus_header().await.expect("epoch-0 has a final header");
+            let header = pack
+                .latest_consensus_header()
+                .await
+                .expect("epoch-0 pack readable")
+                .expect("epoch-0 has a final header");
             assert_eq!(header.number, epoch_record.final_consensus.number, "final header number");
             assert_eq!(header.digest(), epoch_record.final_consensus.hash, "final header digest");
         }

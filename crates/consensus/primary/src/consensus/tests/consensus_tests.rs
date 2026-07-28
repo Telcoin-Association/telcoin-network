@@ -1,5 +1,6 @@
 //! Consensus tests
 
+use super::resolve_seed_chain_anchor;
 use crate::{
     consensus::{
         Bullshark, Consensus, ConsensusError, ConsensusState, LeaderSchedule, LeaderSwapTable,
@@ -12,11 +13,98 @@ use tempfile::TempDir;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    Certificate, ConsensusHeaderDigest, ConsensusNumHash, ExecHeader, Hash as _, Header,
-    HeaderDigest, ReputationScores, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
+    keccak256, BlsSignature, Certificate, CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash,
+    Epoch, EpochSeedChainError, EpochSeedChainValue, ExecHeader, Hash as _, Header, HeaderDigest,
+    ReputationScores, Round, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::fs::create_dir_all;
+
+/// The fold domain separator, duplicated here on purpose (see [`independent_fold`]).
+const FOLD_DOMAIN: &[u8] = b"TN_EPOCH_SEED_FOLD_V1";
+
+/// The root domain separator, duplicated here on purpose (see [`independent_fold`]).
+const ROOT_DOMAIN: &[u8] = b"TN_EPOCH_SEED_ROOT_V1";
+
+/// Recompute one seed chain fold step INDEPENDENTLY of [`EpochSeedChainValue::fold`].
+///
+/// Spelling the preimage out from literal domain bytes is what gives the chain assertions in
+/// [`test_consensus_recovery_with_bullshark`] force: an expectation built by calling the production
+/// helper would move with any mutation *inside* that helper and stay green.
+fn independent_fold(anchor: B256, leader_round: Round, signature: &BlsSignature) -> B256 {
+    let preimage: Vec<u8> = FOLD_DOMAIN
+        .iter()
+        .copied()
+        .chain(anchor.as_slice().iter().copied())
+        .chain(leader_round.to_le_bytes())
+        .chain(signature.to_bytes())
+        .collect();
+    keccak256(preimage)
+}
+
+/// Recompute the per-epoch chain root INDEPENDENTLY of [`EpochSeedChainValue::epoch_root`], for the
+/// same reason as [`independent_fold`].
+fn independent_root(epoch: Epoch) -> B256 {
+    let preimage: Vec<u8> = ROOT_DOMAIN.iter().copied().chain(epoch.to_le_bytes()).collect();
+    keccak256(preimage)
+}
+
+/// Assert that `sub_dags` form an unbroken seed chain rooted at `epoch`'s root.
+///
+/// This is the pin for the PRODUCTION commit loop's chain wiring in
+/// [`Bullshark::process_certificate`](crate::consensus::Bullshark), which nothing else exercises:
+/// the sub-dags handed in must have come off the real `sequence` channel, in commit order.
+///
+/// Catches both ways the loop can collapse the chain back to a per-commit constant:
+///
+/// - deleting `state.set_seed_chain(sub_dag.seed_chain_value())`, so every commit folds the same
+///   stale anchor - the `assert_eq!` for the second commit fails, and the trailing `assert_ne!`
+///   names the resulting re-rooted value directly;
+/// - replacing `state.seed_chain()` with a fixed value such as
+///   [`EpochSeedChainValue::genesis_placeholder`], which breaks the first commit's fold over the
+///   epoch root.
+fn assert_seed_chain_advances(sub_dags: &[CommittedSubDag], epoch: Epoch) {
+    assert!(
+        sub_dags.len() >= 2,
+        "the chain assertions need at least two commits, got {}",
+        sub_dags.len()
+    );
+
+    let first = sub_dags.first().expect("checked non-empty above");
+    assert_eq!(
+        first.randomness(),
+        independent_fold(
+            independent_root(epoch),
+            first.leader().round(),
+            first.leader().seed_signature()
+        ),
+        "the epoch's first commit must fold the epoch root"
+    );
+
+    sub_dags.windows(2).for_each(|pair| {
+        let (previous, current) = (&pair[0], &pair[1]);
+        assert_eq!(
+            current.randomness(),
+            independent_fold(
+                previous.randomness(),
+                current.leader().round(),
+                current.leader().seed_signature()
+            ),
+            "commit at leader round {} must fold the previous commit's chain value",
+            current.leader().round()
+        );
+        assert_ne!(
+            current.randomness(),
+            independent_fold(
+                independent_root(epoch),
+                current.leader().round(),
+                current.leader().seed_signature()
+            ),
+            "commit at leader round {} must not re-root the chain",
+            current.leader().round()
+        );
+    });
+}
 
 /// This test is trying to compare the output of the Consensus algorithm when:
 /// (1) running without any crash for certificates processed from round 1 to 5 (inclusive)
@@ -104,12 +192,17 @@ async fn test_consensus_recovery_with_bullshark() {
     // without any crash.
     let mut committed_output_no_crash: Vec<Header> = Vec::new();
     let mut score_no_crash: ReputationScores = ReputationScores::default();
+    // Every sub-dag the PRODUCTION commit loop emitted, in commit order, for the seed chain pin
+    // below. Collected here rather than in a separate test because nothing else in the suite drives
+    // more than one commit through the real `Bullshark` loop.
+    let mut committed_sub_dags_no_crash: Vec<CommittedSubDag> = Vec::new();
 
     let mut idx = 1;
     'main: while let Some(sub_dag) = rx_output.recv().await {
         score_no_crash = sub_dag.reputation_scores().clone();
         assert_eq!(sub_dag.leader().round(), consensus_index_counter);
         consensus_chain.write_subdag_for_test(idx, sub_dag.clone()).await;
+        committed_sub_dags_no_crash.push(sub_dag.clone());
         idx += 1;
         for output in sub_dag.headers() {
             assert!(output.round() <= 6);
@@ -124,6 +217,11 @@ async fn test_consensus_recovery_with_bullshark() {
         }
         consensus_index_counter += 2;
     }
+
+    // AND the seed chain advanced across those commits: every commit folded the PREVIOUS commit's
+    // value, and the epoch's first commit folded the epoch root. This is the only assertion in the
+    // suite that covers the chain wiring inside the real commit loop.
+    assert_seed_chain_advances(&committed_sub_dags_no_crash, config.epoch());
 
     // AND the last committed store should be updated correctly
     let last_committed = consensus_chain.read_last_committed(config.epoch()).await.unwrap();
@@ -516,4 +614,200 @@ async fn test_dag_rejects_certificate_with_missing_parent_round() {
         Ok(_) => panic!("Should reject certificate with missing parent round!"),
         Err(e) => panic!("Unexpected error: {:?}", e),
     }
+}
+
+/// Startup recovery of the epoch seed chain anchor must FAIL LOUDLY on every inconsistent pair of
+/// recovered cursors, never fall back to the epoch root.
+///
+/// This is the direct test of the fallible recovery function over all four
+/// `(latest_sub_dag, last_committed_round > 0)` combinations. A genuine pack read-error injection
+/// is impractical here: the reader is behind `ConsensusChainReader`, a 21-method trait with a
+/// single implementor, so a failing mock would be pure boilerplate. The `(None, true)` case below
+/// IS the read-error shape - the read produced no sub-dag while the commit cursor says this epoch
+/// has committed - and it is the case the old `unwrap_or_default()` collapsed into "fresh epoch".
+///
+/// Catches: reintroducing any fallback on the three error arms. The final assertion shows why that
+/// matters: the value the old code silently produced (the epoch root) is not the value the chain
+/// is actually at, so a node taking that branch forks execution permanently.
+#[tokio::test]
+async fn test_seed_chain_recovery_fails_closed_on_inconsistent_cursors() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let epoch = committee.epoch();
+
+    let genesis: BTreeSet<_> = fixture.genesis().collect();
+    let (_, headers) = fixture.headers_round(0, &genesis);
+    let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
+    let leader = certificates.last().cloned().expect("fixture builds certificates");
+    let leader_round = leader.round();
+    let sub_dag = CommittedSubDag::new(
+        certificates.clone(),
+        leader,
+        0,
+        ReputationScores::new(&committee),
+        None,
+        EpochSeedChainValue::epoch_root(epoch),
+    );
+
+    // (Some, cursor agrees): the only sound recovery. Continue from the recovered commit.
+    assert_eq!(
+        resolve_seed_chain_anchor(Some(&sub_dag), leader_round, epoch),
+        Ok(EpochSeedChainValue::from_committed(sub_dag.randomness())),
+        "a consistent cursor pair must continue the chain from the recovered commit"
+    );
+
+    // (Some, cursor disagrees): one of the two cursors is stale.
+    assert_eq!(
+        resolve_seed_chain_anchor(Some(&sub_dag), leader_round + 1, epoch),
+        Err(EpochSeedChainError::LeaderRoundMismatch {
+            sub_dag_leader_round: leader_round,
+            last_committed_round: leader_round + 1
+        }),
+        "a leader round that disagrees with the commit cursor must fail closed"
+    );
+
+    // (None, cursor > 0): the read-error shape. This is the branch the old `unwrap_or_default()`
+    // turned into a silent re-root.
+    assert_eq!(
+        resolve_seed_chain_anchor(None, leader_round, epoch),
+        Err(EpochSeedChainError::MissingSubDagForCommittedRound {
+            last_committed_round: leader_round
+        }),
+        "an unreadable commit must fail closed, never re-root the chain"
+    );
+
+    // (Some, cursor == 0): a commit with no cursor pointing at it.
+    assert_eq!(
+        resolve_seed_chain_anchor(Some(&sub_dag), 0, epoch),
+        Err(EpochSeedChainError::SubDagWithoutCommittedRound {
+            sub_dag_leader_round: leader_round
+        }),
+        "a commit with no committed round must fail closed"
+    );
+
+    // (None, cursor == 0): the genuine first commit of an epoch starts from the epoch root.
+    assert_eq!(
+        resolve_seed_chain_anchor(None, 0, epoch),
+        Ok(EpochSeedChainValue::epoch_root(epoch)),
+        "an epoch that has committed nothing must start from its root"
+    );
+
+    // Why failing closed matters: the value the old fallback produced is NOT the value the chain
+    // is at after a commit, so a node that took it would fold a different `prev` forever.
+    assert_ne!(
+        EpochSeedChainValue::epoch_root(epoch),
+        EpochSeedChainValue::from_committed(sub_dag.randomness()),
+        "re-rooting mid-epoch would diverge from the network"
+    );
+}
+
+/// A node restarted mid-epoch recovers the identical seed chain value from its pack and produces
+/// the identical next `randomness`.
+///
+/// The sub-dag is written to a real `ConsensusChain`, the handle is dropped, and a fresh handle is
+/// opened on the same path - the same reader startup recovery uses. The next commit is then built
+/// twice, once from the in-memory chain value and once from the recovered one, and the two must
+/// agree byte for byte.
+///
+/// Catches: any recovery path that does not round-trip the chain value exactly - dropping
+/// `randomness` from `CommittedSubDagInner`'s serialization, anchoring recovery on something other
+/// than the recovered commit, or re-rooting at startup. Any of those makes the restarted node fold
+/// a different `prev` into every later commit, and because the value reaches
+/// `parent_beacon_block_root` the resulting execution fork is permanent.
+#[tokio::test]
+async fn test_seed_chain_survives_restart() {
+    let temp_dir = TempDir::new().unwrap();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let epoch = committee.epoch();
+
+    let genesis: BTreeSet<_> = fixture.genesis().collect();
+    let (_, headers) = fixture.headers_round(0, &genesis);
+    let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
+    let leader = certificates.last().cloned().expect("fixture builds certificates");
+    let leader_round = leader.round();
+
+    // The epoch's first commit, folded onto the epoch root.
+    let first_commit = CommittedSubDag::new(
+        certificates.clone(),
+        leader,
+        0,
+        ReputationScores::new(&committee),
+        None,
+        EpochSeedChainValue::epoch_root(epoch),
+    );
+
+    // Persist it, then drop the handle: this is the crash.
+    {
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+        // Consensus output number 1: `save_consensus_output` ignores anything at or below the
+        // chain's current number, and a fresh chain starts at 0.
+        consensus_chain.write_subdag_for_test(1, first_commit.clone()).await;
+        consensus_chain.persist_current().await.unwrap();
+    }
+
+    // Restart: a fresh handle on the same path, read the way startup recovery reads. `new` (not
+    // `new_for_test`) is what a restarting node calls, so the existing epoch pack is reopened
+    // rather than recreated.
+    let recovered_sub_dag = {
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain
+            .latest_consensus_header_from_pack(epoch)
+            .await
+            .expect("pack is readable after restart")
+            .expect("the persisted commit is present after restart")
+            .sub_dag
+    };
+
+    assert_eq!(
+        recovered_sub_dag.randomness(),
+        first_commit.randomness(),
+        "the chain value must round-trip through the pack unchanged"
+    );
+
+    let recovered_anchor = resolve_seed_chain_anchor(Some(&recovered_sub_dag), leader_round, epoch)
+        .expect("a consistent cursor pair recovers an anchor");
+    assert_eq!(
+        recovered_anchor,
+        first_commit.seed_chain_value(),
+        "recovery must resolve exactly the chain value the live node held"
+    );
+
+    // The next commit of the epoch, built from the live anchor and from the recovered one.
+    let (_, next_headers) =
+        fixture.headers_round(leader_round, &certificates.iter().map(|c| c.digest()).collect());
+    let next_certificates: Vec<_> = next_headers.iter().map(|h| fixture.certificate(h)).collect();
+    let next_leader = next_certificates.last().cloned().expect("fixture builds certificates");
+
+    let without_restart = CommittedSubDag::new(
+        next_certificates.clone(),
+        next_leader.clone(),
+        1,
+        ReputationScores::new(&committee),
+        Some(first_commit.clone()),
+        first_commit.seed_chain_value(),
+    );
+    let after_restart = CommittedSubDag::new(
+        next_certificates,
+        next_leader,
+        1,
+        ReputationScores::new(&committee),
+        Some(recovered_sub_dag),
+        recovered_anchor,
+    );
+
+    assert_eq!(
+        after_restart.randomness(),
+        without_restart.randomness(),
+        "a restarted node must produce the identical next randomness"
+    );
+    assert_ne!(
+        after_restart.randomness(),
+        first_commit.randomness(),
+        "the chain must still advance after the restart"
+    );
 }

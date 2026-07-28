@@ -124,6 +124,7 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
             sequence_number,
             ReputationScores::new(&committee),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
@@ -148,7 +149,14 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
         }
 
         let cert = Certificate::default();
-        let sub_dag = CommittedSubDag::new(vec![cert.clone()], cert, sequence_number, scores, None);
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            sequence_number,
+            scores,
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }

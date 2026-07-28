@@ -497,6 +497,7 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
             0,
             ReputationScores::default(),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         )
         .into(),
         ConsensusHeaderDigest::default(),

@@ -7,14 +7,27 @@
 //! if not directly participating in consesus.
 
 use super::{CommittedSubDag, ConsensusOutput};
-use crate::{crypto, BlsPublicKey, BlsSignature, Certificate, Digest, Epoch, Hash, Round, B256};
+use crate::{crypto, BlsPublicKey, BlsSignature, Digest, Epoch, Hash, Round, B256};
 use serde::{Deserialize, Serialize};
 
 /// Header for the consensus chain.
 ///
 /// The consensus chain records consensus output used to extend the execution chain.
 /// All hashes are Keccak 256.
-#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
+///
+/// # The `Default` value is the pre-genesis anchor
+///
+/// [`Default`] is derived rather than hand written so the epoch seed chain anchor it carries has
+/// exactly ONE definition, [`CommittedSubDag::default`], which pins it to
+/// [`EpochSeedChainValue::genesis_placeholder`](crate::EpochSeedChainValue::genesis_placeholder).
+/// This default is reached on non-test paths (state sync uses it as the pre-genesis consensus
+/// header), so a second, independently written expression here could drift from that one and give
+/// nodes different genesis anchors, forking the seed chain at its first link. The anchor is a fixed
+/// constant and is never derived from node-local epoch state, for the same reason.
+///
+/// NOTE: the anchor is the pinned placeholder itself rather than a fold over it, so this header's
+/// digest differs from the pre-#1032 value.
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ConsensusHeader {
     /// The hash of the previous ConsesusHeader in the chain.
     pub parent_hash: ConsensusHeaderDigest,
@@ -52,25 +65,6 @@ impl ConsensusHeader {
         // Not using this yet but include the default in the hash in prep when we do.
         hasher.update(B256::default().as_slice());
         ConsensusHeaderDigest(Digest { digest: hasher.finalize().into() })
-    }
-}
-
-impl Default for ConsensusHeader {
-    fn default() -> Self {
-        let cert = Certificate::default();
-        let sub_dag = CommittedSubDag::new(
-            vec![cert.clone()],
-            cert,
-            0,
-            crate::ReputationScores::default(),
-            None,
-        );
-        Self {
-            parent_hash: ConsensusHeaderDigest::default(),
-            sub_dag,
-            number: 0,
-            extra: B256::default(),
-        }
     }
 }
 

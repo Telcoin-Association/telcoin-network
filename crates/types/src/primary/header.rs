@@ -183,8 +183,9 @@ impl Header {
         self.inner.latest_execution_block
     }
 
-    /// The author's deterministic BLS signature over the canonical per-epoch
-    /// [`EpochSeedMessage`](crate::EpochSeedMessage) - the epoch-close committee-shuffle seed.
+    /// The author's deterministic BLS signature over the canonical per-`(author, round)`
+    /// [`EpochSeedMessage`](crate::EpochSeedMessage) - this header's contribution to the epoch
+    /// seed chain that seeds the epoch-close committee shuffle.
     pub fn seed_signature(&self) -> &BlsSignature {
         &self.inner.seed_signature
     }

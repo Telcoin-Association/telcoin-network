@@ -237,12 +237,16 @@ impl Bullshark {
             // We resolve the reputation score that should be stored alongside with this sub dag.
             let reputation_score = self.resolve_reputation_score(state, &sequence, sub_dag_index);
 
+            // The seed chain folds in the existing oldest-first `pop_front` commit order, which is
+            // the same order the sub-dags are sent on the `sequence` channel and the same order the
+            // consensus header chain records them, so every honest node folds identical inputs.
             let sub_dag: CommittedSubDag = CommittedSubDag::new(
                 sequence,
                 leader.clone(),
                 sub_dag_index,
                 reputation_score.clone(),
                 state.last_committed_sub_dag.clone(),
+                state.seed_chain(),
             );
 
             // Metric: subdag_committed - tracks subdag commits with key metrics
@@ -258,6 +262,8 @@ impl Bullshark {
 
             // Update the last sub dag
             state.last_committed_sub_dag = Some(sub_dag.clone());
+            // Advance the seed chain so the next commit of this epoch folds on top of this one.
+            state.set_seed_chain(sub_dag.seed_chain_value());
 
             committed_sub_dags.push(sub_dag);
 

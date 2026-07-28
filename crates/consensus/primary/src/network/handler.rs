@@ -708,16 +708,22 @@ where
             HeaderError::TooManyParents(num_parents, committee.size()).into()
         );
 
-        // Verify the author's epoch-close seed signature over the canonical per-epoch seed
-        // message before any blocking wait or state mutation. A certificate needs 2f+1 votes, so
-        // refusing to vote here guarantees every certified header carries at least f+1 honest
-        // attestations that its seed signature is valid - the committee-shuffle randomness
-        // derived from the closing leader's seed cannot be forked or forged (#1032).
+        // Verify the author's seed signature over the canonical per-`(author, round)` seed message
+        // before any blocking wait or state mutation. A certificate needs 2f+1 votes, so refusing
+        // to vote here guarantees every certified header carries at least ONE honest attestation
+        // that its seed signature is valid: with an honest author the 2f+1 can be the author's own
+        // self-vote (see `certifier.rs`, which bypasses `vote_inner`) plus f Byzantine voters plus
+        // f honest voters, so f+1 honest attestations are not guaranteed. One honest attestation is
+        // enough for the property that matters - the epoch seed chain the closing leader feeds
+        // cannot be forked or forged (#1032).
         let author = committee
             .authority(header.author())
             .ok_or_else(|| HeaderError::UnknownAuthority(header.author().to_string()))?;
-        let seed_message =
-            EpochSeedMessage::new(committee.epoch(), self.consensus_config.prior_epoch_record());
+        let seed_message = EpochSeedMessage::new(
+            committee.epoch(),
+            header.round(),
+            self.consensus_config.prior_epoch_record(),
+        );
         ensure!(
             seed_message.verify(header.seed_signature(), author.protocol_key()),
             HeaderError::InvalidSeedSignature.into()

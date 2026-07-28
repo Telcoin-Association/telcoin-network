@@ -109,7 +109,7 @@ enum PackMessage {
     ContainsBatch(B256, oneshot::Sender<bool>),
     Batch(B256, oneshot::Sender<Option<Batch>>),
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
-    LatestConsensusHeader(oneshot::Sender<Option<ConsensusHeader>>),
+    LatestConsensusHeader(oneshot::Sender<Result<Option<ConsensusHeader>, PackError>>),
     Shutdown,
     // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
     /// become visible to other file handles on the same file (visibility, not durability).
@@ -575,12 +575,15 @@ impl ConsensusPack {
     /// Return the latest consensus header by reading directly from the pack index.
     /// Unlike consensus_header_latest on ConsensusChain, this does not rely on the
     /// slot files (LatestConsensus) and is always consistent with read_last_committed.
-    pub async fn latest_consensus_header(&self) -> Option<ConsensusHeader> {
+    ///
+    /// Fails closed: a read or channel failure is returned, never reported as "no header". See the
+    /// note on the inner reader.
+    pub async fn latest_consensus_header(&self) -> Result<Option<ConsensusHeader>, PackError> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::LatestConsensusHeader(tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
+            rx.await.unwrap_or(Err(PackError::SendFailed))
         } else {
-            None
+            Err(PackError::SendFailed)
         }
     }
 
@@ -1199,13 +1202,18 @@ impl Inner {
     /// Return the latest consensus header by reading directly from the pack index,
     /// bypassing the slot file (LatestConsensus). Used during startup recovery to
     /// get a ground-truth latest header consistent with read_last_committed.
-    fn latest_consensus_header(&mut self) -> Option<ConsensusHeader> {
+    ///
+    /// A read failure is propagated rather than reported as "no header". Recovery uses this
+    /// header's sub-dag as the epoch seed chain anchor, and an absent anchor means "start a fresh
+    /// chain", so collapsing an error into `None` would silently re-root the chain and fork
+    /// execution permanently.
+    fn latest_consensus_header(&mut self) -> Result<Option<ConsensusHeader>, PackError> {
         if self.consensus_pos_idx.is_empty() {
-            return None;
+            return Ok(None);
         }
         let latest_number =
             self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 - 1;
-        self.consensus_header_by_number(latest_number).ok()
+        self.consensus_header_by_number(latest_number).map(Some)
     }
 
     fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
@@ -2039,6 +2047,7 @@ pub(crate) mod test {
             1,
             ReputationScores::default(),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         ConsensusOutput::new(
             sub_dag,
@@ -2089,6 +2098,7 @@ pub(crate) mod test {
             sub_dag_index_1,
             reputation_scores,
             previous_sub_dag,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         ConsensusOutput::new(
             subdag_1.clone(),
@@ -2145,6 +2155,7 @@ pub(crate) mod test {
             1,
             ReputationScores::default(),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         let batch_digests: VecDeque<BlockHash> =
             [batch_0.digest(), batch_1.digest(), batch_1.digest(), batch_2.digest()]

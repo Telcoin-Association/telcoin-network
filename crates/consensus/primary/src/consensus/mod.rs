@@ -12,7 +12,7 @@ pub use crate::consensus::{
 };
 use thiserror::Error;
 use tn_storage::StoreError;
-use tn_types::{Certificate, HeaderDigest};
+use tn_types::{Certificate, EpochSeedChainError, HeaderDigest};
 
 /// The default channel size used in the consensus and subscriber logic.
 pub const DEFAULT_CHANNEL_SIZE: usize = 1_000;
@@ -36,6 +36,13 @@ pub enum ConsensusError {
 
     #[error("Parent round not found in DAG for {0:?}!")]
     MissingParentRound(Box<Certificate>),
+
+    /// Recovery could not resolve a sound epoch seed chain anchor.
+    ///
+    /// Fatal on purpose: continuing would re-root or mis-anchor the seed chain, which forks
+    /// execution permanently because the chain value reaches `parent_beacon_block_root`.
+    #[error("Epoch seed chain recovery failed: {0}")]
+    SeedChain(#[from] EpochSeedChainError),
 }
 
 #[derive(Debug, PartialEq, Eq)]

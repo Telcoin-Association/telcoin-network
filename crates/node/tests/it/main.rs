@@ -430,6 +430,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
                 synthetic_number,
                 ReputationScores::default(),
                 None,
+                tn_types::EpochSeedChainValue::genesis_placeholder(),
             );
             let empty_output = ConsensusOutput::new(
                 empty_subdag.clone(),
@@ -893,6 +894,7 @@ fn manual_consensus_output(
         number,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     ConsensusOutput::new(
         sub_dag,
@@ -1873,8 +1875,14 @@ async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<
     leader.update_header_epoch_for_test(0);
     leader.update_header_created_at_for_test(tn_types::now());
     leader.update_header_author_for_test(leader_id);
-    let sub_dag =
-        CommittedSubDag::new(vec![leader.clone()], leader, 0, ReputationScores::default(), None);
+    let sub_dag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        0,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
     let output = ConsensusOutput::new(
         sub_dag,
         ConsensusHeaderDigest::default(),

@@ -29,6 +29,7 @@ use tn_storage::{
     consensus_pack::PackError,
     mem_db::MemDatabase,
     tables::Votes,
+    CertificateStore,
 };
 use tn_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
@@ -488,6 +489,7 @@ async fn test_retrieve_consensus_output() {
             number,
             ReputationScores::new(&committee_obj),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
     }
@@ -1232,7 +1234,7 @@ async fn test_vote_rejects_invalid_seed_signature() -> eyre::Result<()> {
 
     // A wrong seed signature: valid BLS bytes from the right author, but signed over a DIFFERENT
     // epoch's seed message, so it cannot verify against this epoch's canonical message.
-    let wrong_message_sig = committee.last_authority().seed_signature(42);
+    let wrong_message_sig = committee.last_authority().seed_signature(42, 1);
     let header = committee
         .header_builder_last_authority()
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
@@ -1294,8 +1296,9 @@ async fn test_vote_seed_signature_uses_configured_prior_epoch_record() -> eyre::
     let other_anchor = EpochRecord { epoch: 9, ..Default::default() }.digest();
     assert_ne!(other_anchor, anchor, "D' must differ from D");
     let author_config = committee.last_authority().consensus_config();
+    // The fixture builder proposes at round 1, so bind that round and vary only the anchor.
     let mismatched_sig =
-        EpochSeedMessage::new(epoch, other_anchor).sign(author_config.key_config());
+        EpochSeedMessage::new(epoch, 1, other_anchor).sign(author_config.key_config());
     let mismatched_header = committee
         .header_builder_last_authority()
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
@@ -1326,6 +1329,132 @@ async fn test_vote_seed_signature_uses_configured_prior_epoch_record() -> eyre::
         res,
         PrimaryResponse::Vote(_),
         "a seed signature over the configured prior_epoch_record must earn a vote"
+    );
+
+    // The same pair again at round 3, so the anchor and the round are exercised jointly rather
+    // than only at the builder's default round 1. A sign or verify site hardcoded to
+    // `EpochDigest::default()` still breaks the positive case here, and one hardcoded to round 1
+    // breaks it too.
+    let store = committee.first_authority().consensus_config().node_storage().clone();
+    let parents = seed_round_two_quorum(&committee, &store)?;
+    let round_three = |a: &AuthorityFixture<MemDatabase>, seed_signature| {
+        a.header_builder(&committee.committee())
+            .round(3)
+            .parents(parents.clone())
+            .created_at(2)
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .seed_signature(seed_signature)
+            .build()
+    };
+
+    // Round 3 signed over `D'`: refused.
+    let mismatched_author =
+        committee.authority_fixture_by_idx(2).expect("4 authorities in fixture");
+    let mismatched_round_three = round_three(
+        mismatched_author,
+        EpochSeedMessage::new(epoch, 3, other_anchor)
+            .sign(mismatched_author.consensus_config().key_config()),
+    );
+    let mismatched_peer = *mismatched_author.authority().protocol_key();
+    assert_matches!(
+        handler.vote(mismatched_peer, mismatched_round_three, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidSeedSignature)),
+        "a round-3 seed signature over a different prior_epoch_record must refuse the vote"
+    );
+
+    // Round 3 signed over `D` (the fixture's configured anchor): earns a vote.
+    let anchored_author = committee.last_authority();
+    let anchored_round_three =
+        round_three(anchored_author, anchored_author.seed_signature(epoch, 3));
+    let anchored_peer = *anchored_author.authority().protocol_key();
+    assert_matches!(
+        handler.vote(anchored_peer, anchored_round_three, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a round-3 seed signature over the configured prior_epoch_record must earn a vote"
+    );
+
+    Ok(())
+}
+
+/// Seed `store` with a full round-2 certificate quorum for `committee` and return the parent
+/// digest set a round-3 header must reference.
+///
+/// The round-2 headers carry no batches and a fixed `created_at`, so a round-3 header built on
+/// them reaches a real vote decision with nothing to sync from a worker and no wall-clock
+/// dependence.
+fn seed_round_two_quorum<DB: Database + CertificateStore>(
+    committee: &CommitteeFixture<DB>,
+    store: &DB,
+) -> eyre::Result<BTreeSet<HeaderDigest>> {
+    let committee_obj = committee.committee();
+    let epoch = committee_obj.epoch();
+    let certs: Vec<_> = committee
+        .authorities()
+        .map(|a| {
+            let header = a
+                .header_builder(&committee_obj)
+                .round(2)
+                .created_at(1)
+                .seed_signature(a.seed_signature(epoch, 2))
+                .build();
+            committee.certificate(&header)
+        })
+        .collect();
+    store.write_all(certs.iter())?;
+    Ok(certs.iter().map(|c| c.digest()).collect())
+}
+
+/// The vote path verifies a header's seed signature against THAT HEADER'S round, never a fixed
+/// one (#1032 / rolling commit seed).
+///
+/// Catches two mutations at `vote_inner`'s verify site:
+/// - Verifying against a hardcoded or config-sourced round instead of `header.round()`. Every
+///   fixture header defaults to round 1, so a verifier pinned to round 1 stays green on the rest of
+///   the suite; here it refuses the correctly-signed round-3 header and fails the positive half.
+/// - Deleting the seed-signature check. The negative half - a round-3 header carrying its author's
+///   round-1 signature - would then be voted on.
+#[tokio::test]
+async fn test_vote_rejects_seed_signature_for_wrong_round() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let epoch = committee_obj.epoch();
+
+    // The voter is the fixture's first authority, so its store is the one the vote path reads.
+    let store = committee.first_authority().consensus_config().node_storage().clone();
+    let parents = seed_round_two_quorum(&committee, &store)?;
+
+    let round_three = |a: &AuthorityFixture<MemDatabase>, seed_signature| {
+        a.header_builder(&committee_obj)
+            .round(3)
+            .parents(parents.clone())
+            .created_at(2)
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .seed_signature(seed_signature)
+            .build()
+    };
+
+    // Negative half: a round-3 header carrying the author's round-1 signature. Valid BLS bytes
+    // from the right author over the right epoch and prior record - only the round is stale.
+    let stale_author = committee.last_authority();
+    let stale_header = round_three(stale_author, stale_author.seed_signature(epoch, 1));
+    let stale_peer = *stale_author.authority().protocol_key();
+    assert_matches!(
+        handler.vote(stale_peer, stale_header, vec![]).await,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidSeedSignature)),
+        "a round-3 header signed for round 1 must refuse the vote"
+    );
+
+    // Positive half: a round-3 header signed for round 3 earns a vote. A different authority is
+    // used so the per-authority equivocation guard plays no part in the outcome.
+    let valid_author = committee.authority_fixture_by_idx(1).expect("4 authorities in fixture");
+    let valid_header = round_three(valid_author, valid_author.seed_signature(epoch, 3));
+    let valid_peer = *valid_author.authority().protocol_key();
+    assert_matches!(
+        handler.vote(valid_peer, valid_header, vec![]).await?,
+        PrimaryResponse::Vote(_),
+        "a header signed for its own round must earn a vote"
     );
 
     Ok(())
@@ -1622,6 +1751,7 @@ async fn test_sync_partial_epoch_pack_over_stream() {
             number,
             ReputationScores::new(&committee_obj),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         handler.consensus_chain().write_subdag_for_test(number, sub_dag).await;
     }

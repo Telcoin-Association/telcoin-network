@@ -1049,6 +1049,7 @@ mod tests {
             1,
             ReputationScores::default(),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         let output = ConsensusOutput::new_closed_with_subdag(
             sub_dag,

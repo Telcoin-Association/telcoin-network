@@ -207,9 +207,17 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::WrongNumberOfParents(_, _)
         | HeaderError::TooOld { .. } => Some(Penalty::Medium),
         // severe
-        HeaderError::InvalidTimestamp { .. } | HeaderError::InvalidParentRound => {
-            Some(Penalty::Severe)
-        }
+        //
+        // `InvalidSeedSignature` is severe rather than fatal because it has a reachable honest
+        // cause. The seed message is anchored to the verifier's local `prior_epoch_record`, which
+        // comes from a locally-built, first-write-wins `EpochRecord` store. A node whose record
+        // diverged signs an anchor no peer accepts and rejects every honest peer's header, so a
+        // fatal penalty would make the ban mutual, total and non-self-healing: neither side can
+        // ever repair the record from the other once both have banned. A severe penalty still
+        // suppresses a genuinely bad signer while leaving the divergent node a path back.
+        HeaderError::InvalidTimestamp { .. }
+        | HeaderError::InvalidParentRound
+        | HeaderError::InvalidSeedSignature => Some(Penalty::Severe),
         // fatal
         HeaderError::AlreadyVotedForLaterRound { .. }
         | HeaderError::AlreadyVoted(_, _)
@@ -221,7 +229,6 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidGenesisParent(_)
         | HeaderError::InvalidRound(_)
         | HeaderError::ParentMissingSignature
-        | HeaderError::InvalidSeedSignature
         | HeaderError::InvalidParentTimestamp { .. }
         | HeaderError::UnkownWorkerId
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),

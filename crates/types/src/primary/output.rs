@@ -4,10 +4,9 @@
 use super::ConsensusHeader;
 use crate::{
     crypto, encode, Address, Batch, BlockHash, Certificate, ConsensusHeaderDigest,
-    ConsensusNumHash, Digest, Epoch, Hash, Header, ReputationScores, Round, SealedHeader,
-    TimestampSec, B256,
+    ConsensusNumHash, Digest, Epoch, EpochSeedChainValue, Hash, Header, ReputationScores, Round,
+    SealedHeader, TimestampSec, B256,
 };
-use alloy::primitives::keccak256;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -256,12 +255,14 @@ impl ConsensusOutput {
     }
 
     /// The source of randomness used to shuffle future committees at the epoch boundary: the
-    /// keccak hash of the leader's deterministic BLS `seed_signature` over the canonical
-    /// per-epoch [`EpochSeedMessage`](crate::EpochSeedMessage).
+    /// epoch seed chain value as of this commit (see
+    /// [`EpochSeedChainValue`](crate::EpochSeedChainValue)).
     ///
-    /// The seed signature is part of the leader's header, so it is covered by the header digest,
-    /// the votes, and the certificate aggregate - every certificate for the leader's header
-    /// carries the same seed, making this value unforkable by the leader.
+    /// The seed signature folded in at each step is part of that step's leader header, so it is
+    /// covered by the header digest, the votes, and the certificate aggregate - every certificate
+    /// for a leader's header carries the same seed contribution, making this value unforkable by
+    /// the leader. Because it also folds every earlier commit of the epoch, no authority can
+    /// compute it before the immediately preceding commit is published.
     pub fn committee_shuffle_seed(&self) -> B256 {
         self.inner.sub_dag.inner.randomness
     }
@@ -307,8 +308,10 @@ struct CommittedSubDagInner {
     /// Property is explicitly private so the method commit_timestamp() should be used instead
     /// which bears additional resolution logic.
     commit_timestamp: TimestampSec,
-    /// Randomness derived from the leader's deterministic BLS seed signature over the canonical
-    /// per-epoch [`EpochSeedMessage`](crate::EpochSeedMessage).
+    /// The epoch seed chain value as of this commit: the previous commit's value folded with this
+    /// leader's round and its deterministic BLS seed signature over the canonical per-`(author,
+    /// round)` [`EpochSeedMessage`](crate::EpochSeedMessage). See
+    /// [`EpochSeedChainValue`](crate::EpochSeedChainValue).
     randomness: B256,
 }
 
@@ -343,13 +346,20 @@ impl<'de> Deserialize<'de> for CommittedSubDag {
 
 impl Default for CommittedSubDag {
     fn default() -> Self {
+        // The pinned genesis placeholder, used raw rather than folded.
+        //
+        // This is THE definition of the pre-genesis chain anchor: [`ConsensusHeader::default`]
+        // builds its sub-dag from this one (state sync uses that header as the pre-genesis anchor),
+        // so the two cannot drift apart into expressions that merely happen to agree. Using the
+        // placeholder directly also keeps the anchor a value no node derives from local state.
+        let randomness = EpochSeedChainValue::genesis_placeholder().into_inner();
         // Override default so we have one default header (the leader)
         // so a default value won't panic when used.
         let inner = Arc::new(CommittedSubDagInner {
             headers: vec![Header::default()],
             reputation_scores: Default::default(),
             commit_timestamp: Default::default(),
-            randomness: Default::default(),
+            randomness,
         });
         Self { inner }
     }
@@ -358,12 +368,19 @@ impl Default for CommittedSubDag {
 impl CommittedSubDag {
     /// Create a new CommittedSubDag.
     /// Note that leader MUST be the first element or certificates or this will panic.
+    ///
+    /// `previous_sub_dag` resolves the monotonic `commit_timestamp` only. `seed_chain` is the epoch
+    /// seed chain value this commit folds into and is deliberately a separate, non-optional
+    /// argument: the two must never be conflated, because an absent previous sub-dag is a normal
+    /// first-commit condition while an absent chain anchor is unrepresentable (see
+    /// [`EpochSeedChainValue`]).
     pub fn new(
         certificates: Vec<Certificate>,
         leader: Certificate,
         sub_dag_index: SequenceNumber,
         reputation_scores: ReputationScores,
         previous_sub_dag: Option<CommittedSubDag>,
+        seed_chain: EpochSeedChainValue,
     ) -> Self {
         // Narwhal enforces some invariants on the header.created_at, so we can use it as a
         // timestamp.
@@ -378,12 +395,17 @@ impl CommittedSubDag {
         // Make sure the leader is the LAST certificate.
         //
         assert_eq!(leader.digest(), certificates.last().map(|c| c.digest()).unwrap_or_default());
-        // Derive the committee-shuffle randomness from the leader's deterministic seed signature.
-        // The seed signature is a mandatory header field covered by the header digest, so every
-        // certificate for this leader header carries identical bytes - unlike the certificate's
-        // aggregate signature, which varies with the 2f+1 signer subset and would let a Byzantine
-        // leader fork the shuffle (#1032).
-        let randomness = keccak256(leader.header().seed_signature().to_bytes());
+        // Extend the epoch seed chain with this commit. Two properties hold together:
+        //
+        // - The folded signature bytes are digest-pinned: `seed_signature` is a mandatory header
+        //   field covered by the header digest, so every certificate for this leader header carries
+        //   identical bytes - unlike the certificate's aggregate signature, which varies with the
+        //   2f+1 signer subset and would let a Byzantine leader fork the shuffle (#1032).
+        // - The value is a fold over the epoch's committed prefix, not a per-leader constant:
+        //   `seed_chain` is the previous commit's value (or the epoch root at the first commit), so
+        //   no authority can compute this commit's seed before the preceding commit is published.
+        let randomness =
+            seed_chain.fold(leader.round(), leader.header().seed_signature()).into_inner();
         let headers = certificates.into_iter().map(|c| c.into_header()).collect();
         let inner = Arc::new(CommittedSubDagInner {
             headers,
@@ -396,13 +418,24 @@ impl CommittedSubDag {
 
     /// Make a default with just headers for testing.
     pub fn new_with_headers_for_test(headers: Vec<Header>) -> Self {
+        // Anchor the fold on the pinned genesis placeholder rather than a defaulted chain value:
+        // `EpochSeedChainValue` has no `Default` precisely so no path can silently re-root the
+        // chain, and test fixtures are explicitly allowed to use the placeholder.
+        let randomness = headers.last().map_or_else(
+            || EpochSeedChainValue::genesis_placeholder().into_inner(),
+            |leader| {
+                EpochSeedChainValue::genesis_placeholder()
+                    .fold(leader.round(), leader.seed_signature())
+                    .into_inner()
+            },
+        );
         // Override default so we have one default header (the leader)
         // so a default value won't panic when used.
         let inner = Arc::new(CommittedSubDagInner {
             headers,
             reputation_scores: Default::default(),
             commit_timestamp: Default::default(),
-            randomness: Default::default(),
+            randomness,
         });
         Self { inner }
     }
@@ -453,10 +486,17 @@ impl CommittedSubDag {
         &self.inner.headers
     }
 
-    /// The committee-shuffle randomness: keccak of the leader's deterministic epoch-close seed
-    /// signature over the canonical per-epoch [`EpochSeedMessage`](crate::EpochSeedMessage).
+    /// The committee-shuffle randomness: the epoch seed chain value as of this commit.
     pub fn randomness(&self) -> B256 {
         self.inner.randomness
+    }
+
+    /// This commit's epoch seed chain value, to be folded by the next commit of the same epoch.
+    ///
+    /// Returned as an [`EpochSeedChainValue`] rather than a raw `B256` so the anchor threaded from
+    /// one commit to the next can only come from a commit that actually happened.
+    pub fn seed_chain_value(&self) -> EpochSeedChainValue {
+        EpochSeedChainValue::from_committed(self.inner.randomness)
     }
 
     pub fn reputation_scores(&self) -> &ReputationScores {

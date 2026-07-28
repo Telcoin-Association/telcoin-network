@@ -24,10 +24,10 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
 };
-use tn_config::ConsensusConfig;
+use tn_config::{ConsensusConfig, KeyConfig};
 use tn_storage::{tables::LastProposed, ProposerStore};
 use tn_types::{
-    now, AuthorityIdentifier, BlockHash, BlsSignature, Certificate, Committee, Database, Epoch,
+    now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, EpochDigest,
     EpochSeedMessage, Hash as _, Header, Noticer, Round, TaskManager, TaskSpawner, TnReceiver,
     TnSender, WorkerId,
 };
@@ -128,10 +128,14 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     advance_round: bool,
     /// Spawner for our tasks- want to confine them to the current epoch.
     task_spawner: TaskSpawner,
-    /// This authority's deterministic BLS signature over the canonical per-epoch
-    /// [`EpochSeedMessage`]. The message is constant per `(authority, epoch)`, so it is signed
-    /// once here and stamped on every header this proposer builds for the epoch.
-    seed_signature: BlsSignature,
+    /// The cross-epoch anchor of the [`EpochSeedMessage`]: the digest of the previous epoch's
+    /// [`EpochRecord`](tn_types::EpochRecord), resolved once when the epoch's primary spawns.
+    prior_epoch_record: EpochDigest,
+    /// Handle used to sign this authority's per-`(author, round)` [`EpochSeedMessage`].
+    ///
+    /// The seed message binds the header's round, so it cannot be signed once for the epoch; the
+    /// signer handle is carried instead and used immediately before each [`Header::new`].
+    key_config: KeyConfig,
 }
 
 /// The identity a proposer stamps on a header it authors.
@@ -146,9 +150,14 @@ struct HeaderIdentity {
     epoch: Epoch,
     /// This authority's identifier, recorded as the header's author.
     author: AuthorityIdentifier,
-    /// This authority's deterministic BLS signature over the canonical per-epoch
-    /// [`EpochSeedMessage`], which seeds the committee shuffle when this header closes the epoch.
-    seed_signature: BlsSignature,
+    /// The cross-epoch anchor of this header's [`EpochSeedMessage`].
+    prior_epoch_record: EpochDigest,
+    /// Handle used to sign this header's [`EpochSeedMessage`].
+    ///
+    /// [`Proposer::propose_header`] is a free-standing task with no signer in scope, and the seed
+    /// message binds the header's round, so the signer travels with the identity and the signature
+    /// is produced immediately before [`Header::new`].
+    key_config: KeyConfig,
 }
 
 impl<DB: Database> Proposer<DB> {
@@ -206,12 +215,6 @@ impl<DB: Database> Proposer<DB> {
             .filter(|round| *round > consensus_bus.app().primary_round())
             .map_or(0, |round| round.saturating_sub(1));
 
-        // Sign the canonical per-epoch seed message once; every header this proposer builds for
-        // the epoch carries the same deterministic signature (see [`EpochSeedMessage`]).
-        let seed_signature =
-            EpochSeedMessage::new(config.committee().epoch(), config.prior_epoch_record())
-                .sign(config.key_config());
-
         Self {
             authority_id,
             committee: config.committee().clone(),
@@ -233,7 +236,8 @@ impl<DB: Database> Proposer<DB> {
             leader_schedule,
             advance_round: true,
             task_spawner,
-            seed_signature,
+            prior_epoch_record: config.prior_epoch_record(),
+            key_config: config.key_config().clone(),
         }
     }
 
@@ -251,8 +255,13 @@ impl<DB: Database> Proposer<DB> {
         parents: Vec<Certificate>,
         digests: VecDeque<ProposerDigest>,
     ) -> ProposerResult<Header> {
-        let HeaderIdentity { round: current_round, epoch: current_epoch, author, seed_signature } =
-            identity;
+        let HeaderIdentity {
+            round: current_round,
+            epoch: current_epoch,
+            author,
+            prior_epoch_record,
+            key_config,
+        } = identity;
         // check that the included timestamp is consistent with the parent's timestamp
         //
         // ie) the current time is *after* the timestamp in all included headers
@@ -270,6 +279,14 @@ impl<DB: Database> Proposer<DB> {
             );
             sleep(Duration::from_secs(drift_sec)).await;
         }
+
+        // Sign the seed message for exactly this `(epoch, round)`. It is signed here, immediately
+        // before the header is built, because the message binds the round: a signature for round
+        // `r` must not exist before this authority proposes at `r`, or every future seed
+        // contribution would be publicly derivable in advance.
+        let seed_signature =
+            EpochSeedMessage::new(current_epoch, current_round, prior_epoch_record)
+                .sign(&key_config);
 
         let header = Header::new(
             author,
@@ -698,7 +715,8 @@ impl<DB: Database> Proposer<DB> {
                 let digests: VecDeque<_> = self.digests.drain(..num_of_digests).collect();
                 let parents = std::mem::take(&mut self.last_parents);
                 let authority_id = self.authority_id.clone();
-                let seed_signature = self.seed_signature;
+                let prior_epoch_record = self.prior_epoch_record;
+                let key_config = self.key_config.clone();
 
                 let consensus_bus = self.consensus_bus.clone();
                 // spawn tokio task to create, store, and send new header to certifier
@@ -707,7 +725,8 @@ impl<DB: Database> Proposer<DB> {
                         round: current_round,
                         epoch: current_epoch,
                         author: authority_id,
-                        seed_signature,
+                        prior_epoch_record,
+                        key_config,
                     };
                     let proposal = Proposer::propose_header(
                         identity,

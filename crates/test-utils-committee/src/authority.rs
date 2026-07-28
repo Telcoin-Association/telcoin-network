@@ -71,32 +71,42 @@ impl<DB: Database> AuthorityFixture<DB> {
     }
 
     /// Create a [Header] with a default payload based on the [Committee] and [Round] arguments.
+    ///
+    /// The seed signature is re-stamped for `round`: the seed message binds the header's round, so
+    /// carrying the round-1 signature from [`Self::header_builder`] would produce a header every
+    /// honest voter refuses.
     pub fn header_with_round(&self, committee: &Committee, round: Round) -> Header {
-        self.header_builder(committee).payload(Default::default()).round(round).build()
+        self.header_builder(committee)
+            .payload(Default::default())
+            .round(round)
+            .seed_signature(self.seed_signature(committee.epoch(), round))
+            .build()
     }
 
     /// Return a [HeaderV1Builder] for round 1. The builder is constructed
     /// with a genesis certificate as the parent.
     ///
-    /// The builder is seeded with this authority's valid epoch-close seed signature (anchored to
+    /// The builder is seeded with this authority's valid seed signature for round 1 (anchored to
     /// this authority's configured prior-epoch digest), so fixture-built headers pass the vote
-    /// path's seed-signature verification against a config carrying the same anchor.
+    /// path's seed-signature verification against a config carrying the same anchor. Any caller
+    /// that changes the builder's round MUST also re-stamp the signature for the new round with
+    /// [`Self::seed_signature`], because the seed message binds the round.
     pub fn header_builder(&self, committee: &Committee) -> HeaderBuilder {
         HeaderBuilder::default()
             .author(self.id())
             .round(1)
             .epoch(committee.epoch())
             .parents(Certificate::genesis(committee).iter().map(|x| x.digest()).collect())
-            .seed_signature(self.seed_signature(committee.epoch()))
+            .seed_signature(self.seed_signature(committee.epoch(), 1))
     }
 
-    /// This authority's deterministic BLS signature over the canonical seed message for `epoch`,
-    /// anchored to this authority's configured prior-epoch digest (see
-    /// [`ConsensusConfig::prior_epoch_record`]). Defaults to [`EpochDigest::default`] unless the
-    /// [`CommitteeFixture`](crate::CommitteeFixture) builder was given a non-default anchor, so a
-    /// fixture header verifies against a voter configured with the same anchor.
-    pub fn seed_signature(&self, epoch: Epoch) -> BlsSignature {
-        EpochSeedMessage::new(epoch, self.consensus_config.prior_epoch_record())
+    /// This authority's deterministic BLS signature over the canonical seed message for
+    /// `(epoch, round)`, anchored to this authority's configured prior-epoch digest (see
+    /// [`ConsensusConfig::prior_epoch_record`]). The anchor defaults to [`EpochDigest::default`]
+    /// unless the [`CommitteeFixture`](crate::CommitteeFixture) builder was given a non-default
+    /// one, so a fixture header verifies against a voter configured with the same anchor.
+    pub fn seed_signature(&self, epoch: Epoch, round: Round) -> BlsSignature {
+        EpochSeedMessage::new(epoch, round, self.consensus_config.prior_epoch_record())
             .sign(self.consensus_config.key_config())
     }
 

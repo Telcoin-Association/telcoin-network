@@ -153,6 +153,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output =
         ConsensusOutput::new_with_subdag(sub_dag, ConsensusHeaderDigest::default(), 0);
@@ -262,6 +263,7 @@ async fn test_queued_outputs_bounded_with_backpressure() -> eyre::Result<()> {
             round as u64,
             ReputationScores::default(),
             previous_sub_dag.clone(),
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         let output = ConsensusOutput::new_with_subdag(sub_dag.clone(), parent_hash, i as u64 + 1);
         parent_hash = output.consensus_header_hash();
@@ -370,6 +372,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         subdag,
@@ -550,6 +553,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         subdag,
@@ -839,6 +843,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
@@ -865,6 +870,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     )
     .into();
     let consensus_output_2 = ConsensusOutput::new(
@@ -1352,6 +1358,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
@@ -1380,6 +1387,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2.clone(),
@@ -1734,6 +1742,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
@@ -1759,6 +1768,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2,
@@ -1969,6 +1979,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
@@ -2277,6 +2288,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
@@ -2455,6 +2467,7 @@ async fn test_partial_output_failure_rolls_back_in_memory_state() -> eyre::Resul
         sub_dag_index,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         sub_dag,

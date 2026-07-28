@@ -656,6 +656,7 @@ async fn test_subscriber_dup_batch_across_certs() -> eyre::Result<()> {
         1,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     // expected digests in subdag iteration order (contains the duplicate)
     let expected_digests: Vec<BlockHash> =

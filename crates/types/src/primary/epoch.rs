@@ -9,7 +9,7 @@
 use crate::{
     crypto, encode, serde::RoaringBitmapSerde, BlsAggregateSignature, BlsPublicKey, BlsSignature,
     BlsSigner, ConsensusNumHash, Epoch, Intent, IntentMessage, IntentScope, ProtocolSignature as _,
-    ValidatorAggregateSignature as _,
+    Round, ValidatorAggregateSignature as _,
 };
 use alloy::eips::BlockNumHash;
 use serde::{Deserialize, Serialize};
@@ -225,34 +225,53 @@ crate::crypto::digest_newtype! {
     pub struct EpochDigest;
 }
 
-/// The canonical per-epoch message a proposer signs to seed the epoch-close committee shuffle.
+/// The canonical per-`(author, round)` message a proposer signs to feed the epoch seed chain.
 ///
-/// The signature over this message is stamped on every [`Header`](crate::Header) a proposer
-/// builds for the epoch and, for the epoch's closing leader, is hashed into the committee-shuffle
-/// randomness. The message satisfies four properties that make the derived randomness
-/// unforkable and grind-resistant:
+/// The signature over this message is a mandatory field of every [`Header`](crate::Header) a
+/// proposer builds, and the committing leader's signature is folded into the epoch seed chain (see
+/// [`EpochSeedChainValue`](crate::EpochSeedChainValue)) whose value at the epoch's closing commit
+/// seeds the committee shuffle. The message satisfies three properties that make the derived
+/// randomness unforkable:
 ///
-/// - **Canonical**: both fields are part of the chain-anchored epoch state every node syncs, so
-///   every honest node derives byte-identical message bytes for a given `(authority, epoch)`.
+/// - **Canonical**: all three fields are pinned per header - the epoch and round are covered by the
+///   header digest and cross-checked by `Header::validate`, and the prior epoch record is
+///   chain-anchored epoch state every node syncs - so every honest node derives byte-identical
+///   message bytes for a given `(authority, epoch, round)`.
 /// - **Not leader-controllable**: the prior epoch record is sealed by the previous committee before
-///   the current epoch starts; a leader cannot vary it to grind the shuffle.
-/// - **Fixed before proposal**: the prior epoch record is resolved before the primary spawns for
-///   the epoch, so the message exists before any epoch-N header is proposed.
+///   the current epoch starts, and a header's round is fixed by the DAG, so a leader cannot vary
+///   either input to search for a message it prefers.
 /// - **Reachable**: it depends only on the epoch record (never the asynchronously-arriving epoch
 ///   record *certificate*), so signing it can never block header proposal.
+///
+/// The message is deliberately **not** fixed for the epoch. Binding the round means an authority's
+/// signature for round `r` first becomes public when it proposes at round `r`, so no observer can
+/// enumerate any authority's *future* contributions from the headers it has already seen.
+///
+/// What round binding does NOT provide is last-actor resistance, and the claim here is deliberately
+/// narrow. The epoch's closing leader can evaluate the seed its own commit would produce before
+/// deciding whether to broadcast: the preceding commit's chain value is public once that commit
+/// lands, and BLS signing is deterministic, so its own contribution for its own round is something
+/// it can compute at will. It can therefore withhold or delay a proposal whose resulting seed it
+/// dislikes, at the cost of forfeiting that commit. That residual last-actor bias is accepted. What
+/// is removed is cheap offline grinding: no participant can enumerate other authorities' future
+/// contributions, and no candidate value can be evaluated at all until the preceding commit is
+/// published (see [`EpochSeedChainValue`](crate::EpochSeedChainValue)).
 #[derive(PartialEq, Eq, Serialize, Deserialize, Copy, Clone, Debug)]
 pub struct EpochSeedMessage {
-    /// The epoch whose committee shuffle this seed is for.
+    /// The epoch whose committee shuffle this seed feeds.
     epoch: Epoch,
+    /// The round of the header this signature is stamped on.
+    round: Round,
     /// Digest of the previous epoch's [`EpochRecord`] ([`EpochDigest::default`] for epoch 0,
     /// which has no prior record - matching the repo's epoch-0 filler convention).
     prior_epoch_record: EpochDigest,
 }
 
 impl EpochSeedMessage {
-    /// Create the canonical seed message for `epoch` anchored to the prior epoch's record digest.
-    pub fn new(epoch: Epoch, prior_epoch_record: EpochDigest) -> Self {
-        Self { epoch, prior_epoch_record }
+    /// Create the canonical seed message for `(epoch, round)` anchored to the prior epoch's record
+    /// digest.
+    pub fn new(epoch: Epoch, round: Round, prior_epoch_record: EpochDigest) -> Self {
+        Self { epoch, round, prior_epoch_record }
     }
 
     /// The domain-separated intent message this seed commits to.
@@ -265,7 +284,8 @@ impl EpochSeedMessage {
     /// Sign the domain-separated seed message with the proposer's BLS key.
     ///
     /// BLS signatures are deterministic, so signing the same message with the same key always
-    /// yields byte-identical output - the proposer signs once per epoch and stamps every header.
+    /// yields byte-identical output - exactly one valid signature exists per `(key, message)`, and
+    /// therefore per `(authority, epoch, round)`.
     pub fn sign<S: BlsSigner>(&self, signer: &S) -> BlsSignature {
         signer.request_signature_direct(&encode(&self.intent_message()))
     }
@@ -461,13 +481,13 @@ mod test {
 
     /// Pin: BLS signing of the epoch-close seed message is deterministic (#1032).
     ///
-    /// The proposer signs the message once per epoch and stamps every header - the whole design
-    /// rests on the same `(key, epoch, prior record)` always yielding byte-identical signatures,
-    /// while any change to the epoch or the prior record yields a different signature.
+    /// The proposer signs one message per header - the whole design rests on the same
+    /// `(key, epoch, round, prior record)` always yielding byte-identical signatures, while any
+    /// change to the epoch or the prior record yields a different signature.
     #[test]
     fn test_epoch_seed_signature_deterministic() {
         let signer = TestBlsKeypair::new(&mut StdRng::seed_from_u64(1032));
-        let message = EpochSeedMessage::new(7, EpochDigest::default());
+        let message = EpochSeedMessage::new(7, 3, EpochDigest::default());
 
         let first = message.sign(&signer);
         let second = message.sign(&signer);
@@ -476,7 +496,7 @@ mod test {
         assert!(message.verify(&first, &signer.public_key()), "signature must verify");
 
         // A different epoch yields a different signature (and cross-verification fails).
-        let other_epoch = EpochSeedMessage::new(8, EpochDigest::default());
+        let other_epoch = EpochSeedMessage::new(8, 3, EpochDigest::default());
         let other_epoch_sig = other_epoch.sign(&signer);
         assert_ne!(first, other_epoch_sig, "different epoch must yield a different signature");
         assert!(
@@ -486,7 +506,7 @@ mod test {
 
         // A different prior epoch record yields a different signature.
         let record = EpochRecord { epoch: 6, ..Default::default() };
-        let other_record_sig = EpochSeedMessage::new(7, record.digest()).sign(&signer);
+        let other_record_sig = EpochSeedMessage::new(7, 3, record.digest()).sign(&signer);
         assert_ne!(
             first, other_record_sig,
             "different prior epoch record must yield a different signature"
@@ -503,7 +523,7 @@ mod test {
     fn test_epoch_seed_domain_separation() {
         let seed_encoding = encode(&IntentMessage::new(
             Intent::consensus(IntentScope::EpochCloseSeed),
-            EpochSeedMessage::new(1, EpochDigest::default()),
+            EpochSeedMessage::new(1, 1, EpochDigest::default()),
         ));
         assert_eq!(seed_encoding.first(), Some(&4u8), "seed intent must start with scope byte 4");
 
