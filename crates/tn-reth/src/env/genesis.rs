@@ -95,7 +95,7 @@ impl RethEnv {
         // create temporary reth env for execution
         let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
         let task_manager = TaskManager::new("Temp Task Manager");
-        let tmp_dir = TempDir::new().unwrap();
+        let tmp_dir = TempDir::new()?;
         let reth_env =
             RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager, None)?;
 

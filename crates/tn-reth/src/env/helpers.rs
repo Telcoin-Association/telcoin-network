@@ -169,7 +169,7 @@ impl RethEnv {
             .inner
             .blockchain_provider
             .sealed_header(head.number)?
-            .expect("Failed to retrieve sealed header from head's block number");
+            .ok_or(ProviderError::HeaderNotFound(head.number.into()))?;
         Ok(header)
     }
 
