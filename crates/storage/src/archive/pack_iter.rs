@@ -11,12 +11,9 @@ use serde::{de::DeserializeOwned, Serialize};
 use tn_types::try_decode;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
-use crate::{
-    archive::{
-        error::{fetch::FetchError, load_header::LoadHeaderError},
-        pack::{DataHeader, PackCompression},
-    },
-    consensus_pack::PACK_VERSION,
+use crate::archive::{
+    error::{fetch::FetchError, load_header::LoadHeaderError},
+    pack::{DataHeader, PackCompression},
 };
 
 /// Provide an upper bound on a record size.
@@ -37,6 +34,7 @@ where
     buffer: Vec<u8>,
     decompress_buffer: Vec<u8>,
     compression: PackCompression,
+    version: u16,
 }
 
 impl<V, R> PackIter<V, R>
@@ -49,9 +47,6 @@ where
     /// are returned in insert order.
     pub fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header(&mut reader, uid_idx)?;
-        if header.version() > PACK_VERSION {
-            return Err(LoadHeaderError::InvalidVersion);
-        }
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
         }
@@ -62,7 +57,13 @@ where
             buffer: Vec::new(),
             decompress_buffer: Vec::new(),
             compression: header.compression(),
+            version: header.version(),
         })
+    }
+
+    /// Return the version of the underlying data.
+    pub fn version(&self) -> u16 {
+        self.version
     }
 
     /// Return the current position of the data file.
@@ -180,9 +181,6 @@ where
         // Mirror PackIter::open / PackInner::open_data_file: reject unexpected version/appnum
         // so the (peer-facing) async path rejects future/foreign formats instead of parsing
         // them with current-format logic.
-        if header.version() > PACK_VERSION {
-            return Err(LoadHeaderError::InvalidVersion);
-        }
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
         }

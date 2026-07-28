@@ -240,13 +240,13 @@ impl ExecutionNodeInner {
     /// This returns the hash of the last executed ConsensusHeader on the consensus chain.
     /// since the execution layer is confirming the last executing block.
     pub(super) fn last_executed_output(&self) -> eyre::Result<ConsensusHeaderDigest> {
-        // The payload builder commits an output's blocks and the finalized marker in separate
-        // transactions; a crash between them leaves the marker lagging the persisted tip.
-        // Startup heals that lag (`RethEnv::heal_finalized_to_persisted_tip`) before anything
-        // reads the marker, so the finalized block read here is the last block of the last
-        // consensus output whose execution was fully committed — the digest recovered below
-        // names exactly the last executed output, and the primary re-requests everything after
-        // it.
+        // The payload builder commits an output's blocks and the finalized marker in ONE
+        // transaction, so a crash can no longer leave the marker lagging the persisted tip.
+        // Startup additionally heals databases written by pre-fix versions that committed the
+        // marker separately (`RethEnv::heal_finalized_to_persisted_tip`) before anything reads
+        // the marker, so the finalized block read here is the last block of the last consensus
+        // output whose execution was fully committed — the digest recovered below names
+        // exactly the last executed output, and the primary re-requests everything after it.
         //
         // recover finalized block's nonce: this is the last subdag index from consensus (round)
         let finalized_block_num = self.reth_env.last_finalized_block_number()?;
@@ -383,16 +383,24 @@ impl ExecutionNodeInner {
     }
 
     /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
+    /// On-chain BLS key bytes are decoded here; a decode failure is a hard error, mirroring the
+    /// epoch-entry committee read.
     pub(super) fn validators_for_epoch_at_block(
         &self,
         epoch: u32,
         block_hash: B256,
     ) -> eyre::Result<Vec<BlsPublicKey>> {
-        Ok(self
-            .reth_env
+        self.reth_env
             .bls_pubkeys_for_epoch_at_block(epoch, block_hash)?
             .iter()
-            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
-            .collect())
+            .map(|bls| {
+                BlsPublicKey::from_literal_bytes(bls.as_ref()).map_err(|err| {
+                    eyre::eyre!(
+                        "failed to create bls key from on-chain bytes for epoch {epoch} at block \
+                         {block_hash:?}: {err:?}"
+                    )
+                })
+            })
+            .collect()
     }
 }

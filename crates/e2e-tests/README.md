@@ -4,7 +4,8 @@
 
 The heavy e2e tests (restart and epoch tests) are `#[ignore]`d and each needs the
 `telcoin-network` node binary. When `TN_BIN_PATH` is unset, the first test builds that binary
-in-process via `escargot`, which at `opt-level = 0` is a multi-minute compile. Under `nextest`'s
+in-process via `escargot`, which under the `e2e` profile (`opt-level = 2`) is a multi-minute
+compile. Under `nextest`'s
 default output capture that build is buffered, so the first test looks frozen for several minutes
 before it does anything.
 
@@ -17,8 +18,8 @@ make test-e2e          # builds the binary once, then runs the suite with TN_BIN
 or run the raw command yourself (for example from an IDE test runner):
 
 ```
-cargo build --bin telcoin-network --features tn-storage/test-utils
-TN_BIN_PATH="$(pwd)/target/debug/telcoin-network" \
+cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils
+TN_BIN_PATH="$(pwd)/target/e2e/telcoin-network" \
   cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features
 ```
 

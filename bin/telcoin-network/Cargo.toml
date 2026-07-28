@@ -25,5 +25,11 @@ adiri = ["telcoin-network-cli/adiri", "tn-node/adiri"]
 # compiling the RocksDB C++ engine. Must be enabled before any storage-v2 experimentation.
 rocksdb = ["telcoin-network-cli/rocksdb", "tn-node/rocksdb"]
 
+# Faucet build (devnet). Propagates `faucet` down to `tn-reth`, the only crate with faucet-gated
+# code (the unrestricted `mint` precompile used by faucets). Enabled for the `docker-devnet` image
+# via a Docker build arg; default/mainnet builds omit it. `adiri` already implies faucet at the
+# `tn-reth` level, so this is only needed for a faucet-without-adiri build. See `make test-faucet`.
+faucet = ["tn-node/faucet"]
+
 [lints]
 workspace = true

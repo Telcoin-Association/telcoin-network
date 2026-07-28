@@ -102,8 +102,8 @@ cargo nextest run --workspace --no-fail-fast
 # Prebuild the node binary once into the shared target tree and hand it to the e2e tests via
 # TN_BIN_PATH (mirroring `make test-e2e`), so the ignored suite reuses it instead of cold-building
 # the binary inside the first test, which nextest capture would otherwise hide as a multi-minute hang.
-cargo build --bin telcoin-network --features tn-storage/test-utils --target-dir "$(pwd)/target"
-TN_BIN_PATH="$(pwd)/target/debug/telcoin-network" \
+cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir "$(pwd)/target"
+TN_BIN_PATH="$(pwd)/target/e2e/telcoin-network" \
     cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features
 
 echo "all checks passed - submitting attestation on-chain..."

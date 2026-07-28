@@ -14,7 +14,7 @@
 //! next epoch starts from a clean slate. Historic data survives in the
 //! `ConsensusChain` store; only the per-epoch working tables are cleared.
 
-use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
+use crate::{engine::ExecutionNode, manager::EpochManager};
 use eyre::eyre;
 use std::collections::BTreeSet;
 use tn_config::TelcoinDirs;
@@ -112,7 +112,10 @@ where
     ///
     /// Returns the [`ConsensusHeaderDigest`] of the first output committed at or
     /// past the epoch boundary, signalling that an epoch-boundary output was
-    /// reached; `None` if no such output was found.
+    /// reached; `None` if no such output was found. That boundary output's header
+    /// is also stashed in `last_consensus_header` so the caller's close-and-write
+    /// sequence (`close_epoch`, then `write_epoch_record`) can commit the epoch's
+    /// record.
     pub(super) async fn send_leftover_consensus_output_to_engine(
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
@@ -121,6 +124,8 @@ where
         // Phase 1: Drain broadcast channel (existing behavior)
         while let Ok(output) = consensus_output.try_recv() {
             let result = if output.committed_at() >= self.epoch_boundary {
+                // stash the boundary header for the caller's close-and-write sequence
+                self.last_consensus_header = Some(output.clone().into());
                 Some(output.consensus_header_hash())
             } else {
                 None
@@ -143,6 +148,8 @@ where
                 match self.consensus_chain.get_consensus_output_current(number).await {
                     Ok(output) => {
                         let result = if output.committed_at() >= self.epoch_boundary {
+                            // stash the boundary header for the caller's close-and-write sequence
+                            self.last_consensus_header = Some(output.clone().into());
                             Some(output.consensus_header_hash())
                         } else {
                             None
@@ -165,7 +172,10 @@ where
 
     /// Persist the finalized [`EpochRecord`] for the just-completed epoch and
     /// publish it on `epoch_record_watch` for downstream signing or signature
-    /// collection.
+    /// collection. The record is flushed durably to disk before returning: the
+    /// certificate-quorum path persists asynchronously, so without the explicit
+    /// flush a crash between this write and that persist would lose the record —
+    /// fatal for epoch 0, which has no peer-fetch anchor to heal from.
     ///
     /// Epoch 0 is a special case: it starts with an unsigned "dummy" record so
     /// the initial committee is available before any certificate exists. Once a
@@ -179,11 +189,9 @@ where
     /// inconsistent and is treated as an error rather than silently recorded.
     pub(super) async fn write_epoch_record(
         &mut self,
-        primary: &PrimaryNode<DB>,
+        epoch: Epoch,
         engine: &ExecutionNode,
     ) -> eyre::Result<()> {
-        let committee = primary.current_committee().await;
-        let epoch = committee.epoch();
         if epoch == 0 {
             // Epoch 0 will have a "dummy" epoch record to make the initial committee avaliable to
             // code using these records. In this case there will not be a cert so we
@@ -218,11 +226,12 @@ where
         // commits as `final_state`. `parent_state` is the bus's `recent_blocks` watch value,
         // not the reth canonical tip: the engine publishes each executed output's last block
         // and its consensus hash in ONE watch write, so the bus can lag the true tip
-        // mid-execution but never lead it. At the only call site (the live boundary arm of
-        // `run_epoch`, after `close_epoch`'s `wait_for_consensus_execution`) the wait resolved
-        // on the exact write that carries the closing block, so this read IS that block; the
-        // pin makes the record's committee reads and its `final_state` derive from the same
-        // header by construction instead of by timing.
+        // mid-execution but never lead it. At every call site (the live boundary arm and the
+        // two replay-and-close recovery arms of `run_epoch`, each running after `close_epoch`'s
+        // `wait_for_consensus_execution`) the wait resolved on the exact write that carries the
+        // closing block, so this read IS that block; the pin makes the record's committee reads
+        // and its `final_state` derive from the same header by construction instead of by
+        // timing.
         let parent_state = self.consensus_bus.latest_execution_block_num_hash();
         let committee_keys = engine.validators_for_epoch_at_block(epoch, parent_state.hash).await?;
         let next_committee_keys =
@@ -232,10 +241,9 @@ where
         } else {
             self.consensus_chain.epochs().record_by_epoch(epoch - 1).await
         };
-        let last_consensus_header = self
-            .last_consensus_header
-            .take()
-            .expect("epoch was finished with last consensus header");
+        let last_consensus_header = self.last_consensus_header.take().ok_or_else(|| {
+            eyre!("epoch {epoch} reached write_epoch_record without its boundary consensus header")
+        })?;
         let target_hash = last_consensus_header.digest();
 
         let epoch_rec = build_epoch_record(
@@ -248,6 +256,10 @@ where
         )?;
 
         self.consensus_chain.epochs().save_record(epoch_rec.clone()).await?;
+        // the cert-quorum path persists asynchronously; a crash before that flush would lose
+        // the record just saved — fatal for epoch 0, which has no peer-fetch anchor — so
+        // flush it durably here before publishing
+        self.consensus_chain.epochs().persist().await?;
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
         Ok(())
     }

@@ -56,11 +56,6 @@ pub enum PrimaryRequest {
         /// missing them. The peer requires parent certs in order to vote.
         parents: Vec<Certificate>,
     },
-    /// Request for missing certificates.
-    MissingCertificates {
-        /// Inner type with specific helper methods for requesting missing certificates.
-        inner: MissingCertificatesRequest,
-    },
     /// Exchange peer information.
     ///
     /// This "request" is sent to peers when this node disconnects
@@ -77,35 +72,6 @@ pub enum PrimaryRequest {
         epoch: Option<Epoch>,
         /// Block hash requesting if not None.
         hash: Option<EpochDigest>,
-    },
-    /// Request to stream a pack file of the consensus data for epoch.
-    StreamEpoch {
-        /// The epoch we are requesting consensus data for.
-        epoch: Epoch,
-    },
-    /// Request to stream the raw (serialized) consensus output bytes for a consensus chain number.
-    ///
-    /// Unlike [`Self::ConsensusHeader`], this returns the full pack-file encoded output
-    /// (batches + consensus header) rather than just the header, so a peer can reconstruct
-    /// the [`tn_types::ConsensusOutput`] without separately fetching its batches.
-    ///
-    /// The output is streamed (rather than returned via request/response) because a single
-    /// output can exceed the request/response codec's message size limit.
-    StreamConsensusOutput {
-        /// The consensus chain number being requested.
-        number: u64,
-    },
-    /// Request to stream a verifiable PREFIX of an epoch's pack file, stopping after the consensus
-    /// output with `last_consensus_number`.
-    ///
-    /// Unlike [`Self::StreamEpoch`] (which streams a complete epoch), this streams the in-progress
-    /// current epoch up to an already-committed, verifiable point. The number is a chain consensus
-    /// header number, not a pack-relative index.
-    StreamEpochPartial {
-        /// The epoch we are requesting consensus data for.
-        epoch: Epoch,
-        /// The final (inclusive) consensus header number to stream up to.
-        last_consensus_number: u64,
     },
 }
 
@@ -289,8 +255,6 @@ impl From<PeerExchangeMap> for PrimaryRequest {
 pub enum PrimaryResponse {
     /// The peer's vote if the peer considered the proposed header valid.
     Vote(Vote),
-    /// The requested certificates requested by a peer.
-    RequestedCertificates(Vec<Certificate>),
     /// Missing certificates in order to vote.
     ///
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
@@ -309,15 +273,6 @@ pub enum PrimaryResponse {
     /// This is an application-layer error response.
     /// This error is likely to succeed in the future and can be retried.
     RecoverableError(PrimaryRPCError),
-    /// Response to a stream-based request (epoch pack or single consensus output).
-    ///
-    /// If `ack` is true, the requestor should open a stream with the
-    /// request digest in the header. The responder will send the requested
-    /// data over that stream.
-    StreamRequestAck {
-        /// Whether the request is accepted.
-        ack: bool,
-    },
 }
 
 impl PrimaryResponse {

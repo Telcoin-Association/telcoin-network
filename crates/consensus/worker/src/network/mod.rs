@@ -43,7 +43,7 @@ pub(crate) type Res = WorkerResponse;
 /// so this bounds the true concurrent count—not just the pending map size.
 pub const MAX_CONCURRENT_BATCH_STREAMS: usize = 5;
 
-/// Maximum batch digests allowed per `RequestBatchesStream` request.
+/// Maximum batch digests allowed per sync batch request (`WorkerSyncRequest::Batches`).
 ///
 /// Derivation: 10 committee nodes * 6 max commit rounds * 5 batches per cert = 300.
 /// We use 500 for forward-compatibility headroom (committee growth, parameter changes).
@@ -195,9 +195,6 @@ where
                 WorkerRequest::ReportBatch { sealed_batch } => {
                     self.process_report_batch(peer, sealed_batch, channel, cancel);
                 }
-                WorkerRequest::RequestBatchesStream { .. } => {
-                    self.process_request_batches_stream(peer, channel, cancel);
-                }
                 WorkerRequest::PeerExchange { .. } => {
                     // expect this is intercepted by network layer
                     warn!(target: "worker::network", "worker application received unexpected peer exchange message");
@@ -291,33 +288,6 @@ where
             } else {
                 Ok(())
             }
-        });
-    }
-
-    /// Answer a legacy request-response `RequestBatchesStream` request.
-    ///
-    /// Item 9c (#739) removed the raw `/tn-stream` batch path, so peers fetch batches over
-    /// the `/tn-worker-{id}-sync` protocol. The request variant is retained for wire
-    /// compatibility (BCS variant indices stay until the coordinated `/0.0.2` bump); a legacy
-    /// requester is answered with a typed error rather than served.
-    fn process_request_batches_stream(
-        &self,
-        peer: BlsPublicKey,
-        channel: ResponseChannel<WorkerResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("BatchStreamDeprecated-{peer}");
-        let response = WorkerResponse::Error(message::WorkerRPCError(
-            "batches are served over the sync protocol only".to_string(),
-        ));
-        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            tokio::select! {
-                _ = network_handle.inner_handle().send_response(response, channel) => (),
-                // cancel notification from network layer
-                _ = cancel => (),
-            }
-            Ok(())
         });
     }
 

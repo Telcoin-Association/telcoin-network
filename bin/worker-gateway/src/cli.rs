@@ -140,6 +140,13 @@ pub(crate) struct Cli {
     )]
     pub(crate) graceful_shutdown_timeout: Duration,
 
+    /// Address to expose Prometheus metrics on (`GET /metrics`), on a listener
+    /// separate from the client JSON-RPC port. Unset (the default) disables the
+    /// metrics endpoint entirely; bind it to an internal interface, not the
+    /// public edge. Named `--metrics` to match the node's flag.
+    #[arg(long = "metrics", env = "WORKER_GATEWAY_METRICS_ADDR")]
+    pub(crate) metrics_addr: Option<SocketAddr>,
+
     /// Tracing filter directive (e.g. `info,worker_gateway=debug`).
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub(crate) log_filter: String,
@@ -172,6 +179,9 @@ pub(crate) struct Settings {
     pub(crate) rate_limit_global: Option<RateLimit>,
     /// Graceful-shutdown drain deadline.
     pub(crate) graceful_shutdown_timeout: Duration,
+    /// Address to expose the Prometheus scrape endpoint on, or `None` when
+    /// metrics are disabled.
+    pub(crate) metrics_addr: Option<SocketAddr>,
 }
 
 impl Cli {
@@ -205,6 +215,7 @@ impl Cli {
                 self.rate_limit_global_burst,
             ),
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
+            metrics_addr: self.metrics_addr,
         })
     }
 

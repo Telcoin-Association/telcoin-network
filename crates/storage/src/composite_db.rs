@@ -130,10 +130,6 @@ impl<DB: Database> Database for CompositeDatabase<DB> {
         self.get_db(T::HINT).persist::<T>()
     }
 
-    fn persist_durable<T: Table>(&self) -> impl Future<Output = ()> + Send {
-        self.get_db(T::HINT).persist_durable::<T>()
-    }
-
     fn sync_persist(&self) {
         self.inner.epoch_db.sync_persist();
         self.inner.kad_db.sync_persist();

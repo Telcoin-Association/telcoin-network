@@ -15,6 +15,7 @@ mod proxy;
 mod ratelimit;
 mod readiness;
 mod server;
+mod telemetry;
 
 use clap::Parser as _;
 

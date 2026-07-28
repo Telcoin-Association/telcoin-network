@@ -214,6 +214,19 @@ impl NodeMode {
     }
 }
 
+/// Convert the consensus-layer [`NodeMode`] into the serializable [`tn_types::NodeMode`] used at
+/// the RPC boundary. Exhaustive over every variant so a new mode fails to compile until it is
+/// mapped here.
+impl From<NodeMode> for tn_types::NodeMode {
+    fn from(mode: NodeMode) -> Self {
+        match mode {
+            NodeMode::CvvActive => tn_types::NodeMode::CvvActive,
+            NodeMode::CvvInactive => tn_types::NodeMode::CvvInactive,
+            NodeMode::Observer => tn_types::NodeMode::Observer,
+        }
+    }
+}
+
 /// The thread-safe inner type that holds all the channels for inner-consensus
 /// communication between different tasks.
 /// This contains things that exist for the app lifetime.

@@ -42,7 +42,7 @@
 //!   epoch records, and committed sub-DAGs by number or digest.
 //!
 //! Both handles are for reads only, and **neither** is mutation-free at the type
-//! level: `reth_env` exposes DB-writing methods (e.g. `finish_executing_output`,
+//! level: `reth_env` exposes state-writing methods (e.g. `finish_executing_output`,
 //! `finalize_block`) and `consensus_chain` exposes consensus-DB writers. An ExEx
 //! must treat both as read handles and never call their writing methods — doing
 //! so would corrupt the follower's state. The read-only contract is by
@@ -86,7 +86,7 @@ mod notification;
 /// Historical block replay for ExEx catch-up.
 pub mod replay;
 
-pub use context::TnExExContext;
+pub use context::{FinishedHeightReporter, ReplaySubscribeStream, TnExExContext};
 pub use event::TnExExEvent;
 pub use manager::{
     exex_channel_capacity, resolve_exex_channel_capacity, TnExExManager, TnExExManagerHandle,
