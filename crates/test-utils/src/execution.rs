@@ -6,7 +6,7 @@ use std::{path::Path, str::FromStr, sync::Arc};
 use telcoin_network_cli::{node::NodeCommand, NoArgs};
 use tn_config::Config;
 use tn_node::engine::{ExecutionNode, TnBuilder};
-use tn_reth::{RethChainSpec, RethCommand, RethConfig, RethEnv};
+use tn_reth::{init_txpool_defaults, RethChainSpec, RethCommand, RethConfig, RethEnv};
 use tn_types::{
     gas_accumulator::RewardsCounter, Address, TaskManager, TimestampSec, Withdrawals, B256,
 };
@@ -64,7 +64,9 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         default_args.to_vec()
     };
 
-    // use same approach as telcoin-network binary
+    // use same approach as telcoin-network binary, including seeding reth's pool defaults before
+    // the parse resolves `--txpool.max-account-slots`
+    init_txpool_defaults();
     let command = NodeCommand::<CliExt>::try_parse_from(cli_args)?;
 
     let NodeCommand { instance, ext, reth, healthcheck, .. } = command;

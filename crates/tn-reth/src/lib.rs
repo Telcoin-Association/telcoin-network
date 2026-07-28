@@ -46,9 +46,9 @@ use jsonrpsee::Methods;
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use reth::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, DiscoveryArgs, EngineArgs, EraArgs,
-        EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, StaticFilesArgs,
-        StorageArgs, TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DefaultTxPoolValues, DevArgs, DiscoveryArgs,
+        EngineArgs, EraArgs, EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs,
+        PruningArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     builder::NodeConfig,
     network::transactions::{
@@ -98,9 +98,7 @@ use reth_revm::{
     db::{states::bundle_state::BundleRetention, BundleState},
     DatabaseCommit, State,
 };
-use reth_transaction_pool::{
-    blobstore::DiskFileBlobStore, EthTransactionPool, TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
-};
+use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use rpc_server_args::RpcServerArgs;
 use serde_json::Value;
 use std::{
@@ -274,6 +272,50 @@ pub struct RethCommand {
     pub db: DatabaseArgs,
 }
 
+/// Telcoin Network's per-sender transaction pool slot default.
+///
+/// Reth's own default is 16 (`TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`). The limit is an
+/// admission-time anti-spam gate: once a sender already holds this many slots pool-wide, reth
+/// rejects further externally-submitted transactions from it. TN raises the default because
+/// its expected traffic is dominated by a small number of high-volume senders.
+///
+/// This is a default, not a floor. Operators override it with `--txpool.max-account-slots`,
+/// including back down to reth's 16.
+pub const TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER: usize = 256;
+
+/// Seed reth's global transaction pool defaults with [`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`].
+///
+/// Must run before any [`TxPoolArgs`] is parsed or default-constructed. Reth resolves the
+/// `--txpool.max-account-slots` clap default out of a process-wide `OnceLock`, and the first
+/// read of that lock fixes it for the life of the process, so a late call cannot take effect.
+/// Both the clap default and `TxPoolArgs::default()` read it.
+///
+/// Seeding is what makes an explicit `--txpool.max-account-slots 16` reachable: the value clap
+/// injects when the flag is absent becomes 256, so an operator-supplied 16 is no longer
+/// indistinguishable from an unset flag and needs no sentinel to detect.
+///
+/// Idempotent, and safe to call from more than one entry point. A call that loses the race, or
+/// that arrives after some other code has already read the lock, warns only when the effective
+/// default actually differs from TN's, so repeat calls are silent.
+pub fn init_txpool_defaults() {
+    if DefaultTxPoolValues::default()
+        .with_max_account_slots(TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER)
+        .try_init()
+        .is_err()
+    {
+        // The lock is already taken, so reading it back cannot change the outcome.
+        let effective = TxPoolArgs::default().max_account_slots;
+        if effective != TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER {
+            warn!(
+                target: "tn::reth",
+                effective,
+                expected = TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
+                "reth transaction pool defaults already initialized; TN per-sender slot default not applied"
+            );
+        }
+    }
+}
+
 /// A wrapper abstraction around a Reth node config.
 #[derive(Clone, Debug)]
 pub struct RethConfig(NodeConfig<RethChainSpec>);
@@ -329,13 +371,10 @@ impl RethConfig {
     ) -> Self {
         // create a reth DatadirArgs from tn datadir
         let datadir = path_to_datadir(datadir.as_ref());
-        let RethCommand { mut rpc, mut txpool, db } = reth_config;
-
-        // TN default: 256 slots per sender (Reth default is 16).
-        // Only apply if user hasn't explicitly set a custom value via --txpool.max-account-slots.
-        if txpool.max_account_slots == TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER {
-            txpool.max_account_slots = 256;
-        }
+        // TN's per-sender slot default is seeded into reth's global pool defaults by
+        // `init_txpool_defaults` before parsing, so `txpool` already carries either that default
+        // or the operator's explicit value. Nothing to override here.
+        let RethCommand { mut rpc, txpool, db } = reth_config;
 
         Self::validate_rpc_modules(&mut rpc.http_api);
         Self::validate_rpc_modules(&mut rpc.ws_api);
@@ -1446,6 +1485,12 @@ impl RethEnv {
         /// (reth pairs its 8 TB default with a 4 GiB step; mirror reth's `test()` 4 MiB step).
         const TEMP_CHAIN_DB_GROWTH_STEP: usize = 4 * 1024 * 1024; // 4 MiB
 
+        // `NodeConfig::default` reads reth's process-wide pool defaults through
+        // `TxPoolArgs::default`, which locks them. Seed first so a temp chain built before any
+        // command is parsed does not fix the per-sender slot default at reth's 16 for the rest of
+        // the process, which would then also apply to every node parsed later.
+        init_txpool_defaults();
+
         let node_config = NodeConfig {
             datadir: DatadirArgs {
                 datadir: MaybePlatformPath::from(db_path.as_ref().to_path_buf()),
@@ -2480,6 +2525,40 @@ mod tests {
         BlsSignature, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput,
         Encodable2718 as _, NodeP2pInfo, ReputationScores, SignatureVerificationState,
     };
+
+    /// Reth's own per-sender slot default, spelled out rather than imported.
+    ///
+    /// Hard-coding it keeps the assertion below honest if TN's default is ever changed to
+    /// coincide with reth's, which is the condition that made 16 unreachable in the first place.
+    const RETH_MAX_ACCOUNT_SLOTS_PER_SENDER: usize = 16;
+
+    /// An operator-supplied per-sender slot limit must reach the node config untouched.
+    ///
+    /// [`RethConfig::new`] used to raise reth's default to TN's by sentinel equality against
+    /// reth's constant, so an explicit `--txpool.max-account-slots 16` was indistinguishable from
+    /// an absent flag and was silently rewritten to 256. The default now arrives through
+    /// [`init_txpool_defaults`], leaving nothing for this function to override. Restoring that
+    /// guard fails this test.
+    ///
+    /// Only the explicit case is asserted here. What an *absent* flag resolves to depends on
+    /// which test in this binary reached reth's process-wide `OnceLock` first, so it is pinned in
+    /// the `telcoin-network-cli` integration test that owns its process instead.
+    #[test]
+    fn explicit_max_account_slots_survives_reth_config_new() {
+        assert_ne!(TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER, RETH_MAX_ACCOUNT_SLOTS_PER_SENDER);
+
+        let tmp_dir = TempDir::new().expect("tempdir created");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_command = RethCommand::parse_from([
+            "tn",
+            "--txpool.max-account-slots",
+            &RETH_MAX_ACCOUNT_SLOTS_PER_SENDER.to_string(),
+        ]);
+
+        let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain);
+
+        assert_eq!(config.0.txpool.max_account_slots, RETH_MAX_ACCOUNT_SLOTS_PER_SENDER);
+    }
 
     /// Helper function for creating a consensus output for tests.
     fn consensus_output_for_tests(
