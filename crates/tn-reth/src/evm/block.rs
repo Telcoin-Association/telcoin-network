@@ -1,4 +1,71 @@
 //! The types that build blocks for EVM execution.
+//!
+//! `TNBlockExecutionCtx` carries the consensus-derived inputs for one EVM block (one batch of a
+//! `ConsensusOutput`), `TNBlockExecutor` executes transactions plus the TN system calls, and
+//! `TNBlockAssembler` seals the results into a header. The TN-specific, consensus-critical
+//! behavior lives in two places: the pre-block system calls and the epoch-close sequence in
+//! `TNBlockExecutor::finish`.
+//!
+//! # Pre-execution order (`apply_pre_execution_changes`)
+//!
+//! 1. Set the EIP-161 state-clear flag per the Spurious Dragon activation.
+//! 2. EIP-4788 beacon-root call — runs only on the FIRST batch of a consensus output
+//!    (`TNBlockExecutionCtx::first_batch`), writing the parent `ConsensusHeader` digest once per
+//!    output rather than once per block.
+//! 3. EIP-2935 blockhashes call — runs on every block, recording the parent block hash.
+//!
+//! Both calls are additionally subject to the usual hardfork and genesis gates.
+//!
+//! # The epoch-close sequence (`finish`)
+//!
+//! When `ctx.close_epoch` is `Some(randomness)`, `finish` closes the epoch with system calls in
+//! this exact order:
+//!
+//! 1. (`adiri` builds only) `apply_consensus_registry_fork` — fires only when the concluding epoch
+//!    (`deconstruct_nonce(ctx.nonce).0`) satisfies `concluding_epoch + 1 ==
+//!    CONSENSUS_REGISTRY_FORK_EPOCH` (checked addition): swaps the registry's runtime bytecode in
+//!    place, then runs the one-time `migrateValidatorSets()`.
+//! 2. `apply_consensus_block_rewards` — `applyIncentives(RewardInfo[])`, distributing the
+//!    concluding epoch's issuance to validators weighted by stake and the leader counts in
+//!    `ctx.rewards_counter`.
+//! 3. `apply_closing_epoch_contract_call` — `concludeEpoch(address[])` with the new committee:
+//!    membership is drawn by the `randomness`-seeded Fisher-Yates shuffle, and the resulting list
+//!    is sorted by address before encoding.
+//! 4. `merge_transitions(BundleRetention::Reverts)` — folds the transaction and system-call
+//!    transitions into the bundle state, retaining revert data.
+//!
+//! The order is load-bearing. The fork must lead: the code swap flips the code-hash gate in
+//! `read_committee_eligible_pool` so the shuffle's committee-pool reads use the post-fork ABI
+//! for the remainder of this very block, and the post-fork `concludeEpoch` validates the
+//! committee size against the cached `eligibleValidatorCount` that only `migrateValidatorSets()`
+//! populates. `applyIncentives` must precede `concludeEpoch` (a contract requirement — see the
+//! binding docs in `system_calls.rs`) so rewards are paid for the epoch being concluded.
+//!
+//! Every step is fatal on failure: the error aborts execution of the consensus output and
+//! propagates out of the engine loop, so the node stops executing rather than committing a
+//! block whose state diverges from the rest of the fleet.
+//!
+//! Note for auditors: `applySlashes` is declared in the `ConsensusRegistry` sol! bindings and
+//! implemented on-chain behind `onlySystemCall`, but no Rust code path ever invokes it —
+//! protocol-side slashing is not live.
+//!
+//! # System-call state hygiene
+//!
+//! `SYSTEM_ADDRESS` is a caller convention, not a real account mutation; it must never enter a
+//! block's changeset. Every commit of a system-call result in this file strips it first:
+//! `transact_and_commit_system_call` removes `SYSTEM_ADDRESS` from the result state, and the
+//! EIP-4788/EIP-2935 pre-block calls `retain` only their target contract (also dropping the
+//! touched beneficiary). Committing a system-call result without this cleanup places a spurious
+//! touched account into the bundle and diverges the state root across nodes.
+//!
+//! # Randomness
+//!
+//! The epoch-close `randomness` (`ctx.close_epoch`) is the keccak256 of the leader
+//! certificate's aggregate BLS signature, computed in `CommittedSubDag::new` and carried through
+//! the payload. It seeds the deterministic committee shuffle AND is stored as the block's
+//! `extra_data`, which is how the replay path (`context_for_block`) rebuilds an identical ctx
+//! from the sealed header. The RNG draw order inside the shuffle is consensus-critical: any
+//! refactor that reorders the draws selects a different committee.
 
 use crate::{
     error::{TnRethError, TnRethResult},
@@ -61,11 +128,15 @@ pub struct TNBlockExecutionCtx {
     /// This is the batch that was validated by consensus and executed
     /// to produce the EVM block.
     pub ommers_hash: B256,
-    /// Keccak hash of the bls signature for the leader certificate.
+    /// Keccak256 hash of the leader certificate's aggregate BLS signature. `Some` only for the
+    /// final batch of the epoch's last `ConsensusOutput`.
     ///
-    /// Executor makes closing epoch system call when this if included.
-    /// The hash is stored in the `extra_data` field so clients know when the
-    /// closing epoch call was made.
+    /// When included, the executor runs the epoch-closing system calls (see the module docs) and
+    /// seeds the deterministic committee shuffle with this hash. It is computed in
+    /// `CommittedSubDag::new` (with a logged `BlsSignature::default()` fallback if the leader
+    /// signature is missing) and is also stored in the block's `extra_data` — both the marker
+    /// clients use to recognize an epoch-closing block and the value the replay path
+    /// (`context_for_block`) reads back to rebuild an identical ctx from the sealed header.
     pub close_epoch: Option<B256>,
     /// Difficulty- this contains the worker id and batch index:
     /// `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
@@ -93,7 +164,7 @@ impl TNBlockExecutionCtx {
     /// zero-check without extracting the actual batch_index value.
     ///
     /// # Example
-    /// ```
+    /// ```text
     /// // If difficulty = 0x00001234, then:
     /// // - worker_id = 0x1234 (bits 0-15)
     /// // - batch_index = 0x0000 (bits 16+)
@@ -151,7 +222,9 @@ where
     ///
     /// [`SYSTEM_ADDRESS`] is removed from the result state before commit: it is only touched as
     /// the system caller, not a real state change — leaving it in the changeset would put a
-    /// spurious account into the bundle and diverge the state root.
+    /// spurious account into the bundle and diverge the state root. Every commit of a
+    /// system-call result must uphold this invariant; the EIP-4788/EIP-2935 pre-block calls do
+    /// so with a `retain` of their target contract, which also drops the touched beneficiary.
     fn transact_and_commit_system_call(
         &mut self,
         contract: Address,
@@ -261,6 +334,12 @@ where
     /// `ConsensusOutput`, and this routine is a pure function of the committed state plus the
     /// embedded artifact, so every node re-derives a byte-identical `state_root`.
     ///
+    /// Fail-closed gate: the swap proceeds only if the registry account's current code hash
+    /// equals the pinned `CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`; any other deployment aborts the
+    /// block. Aborting cannot split the network: the check is a pure function of committed
+    /// state, so every fork-capable node evaluates it identically and fails (or passes) in
+    /// lockstep.
+    ///
     /// Fatal on failure — a partial or failed migration diverges state across the fleet.
     #[cfg(feature = "adiri")]
     fn apply_consensus_registry_fork(&mut self) -> TnRethResult<()> {
@@ -357,6 +436,10 @@ where
     }
 
     /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
+    ///
+    /// The seeded shuffle decides committee membership; the shuffled addresses are then sorted
+    /// ascending, so the encoded committee list is order-normalized while membership remains a
+    /// pure function of the RNG draws.
     fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> TnRethResult<Bytes> {
         // shuffle all validators for new committee
         let mut new_committee = self.shuffle_new_committee(randomness)?;
@@ -401,6 +484,11 @@ where
     /// The deterministic assembly, trim, and undersized-committee check live in the pure
     /// [`assemble_new_committee`] free function; this method only performs the on-chain reads and
     /// seeds the RNG so that the assembly logic stays unit-testable without a live EVM state.
+    ///
+    /// `randomness` is `ctx.close_epoch` — the keccak256 of the leader certificate's aggregate
+    /// BLS signature — used verbatim as the `StdRng` seed, so every node derives the same RNG
+    /// stream. The downstream draw order is consensus-critical: the draws decide which
+    /// validators survive the truncation to committee size.
     fn shuffle_new_committee(&mut self, randomness: B256) -> TnRethResult<Vec<Address>> {
         let new_committee_size = self.next_committee_size()?;
 
@@ -709,13 +797,13 @@ where
             self.spec.is_spurious_dragon_active_at_block(self.evm.block().number().saturating_to());
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
 
-        // apply system calls and cleanup state
+        // pre-block system calls; each commit retains only the target contract's state
         if self.ctx.first_batch() {
-            // only write consensus root once per output
+            // EIP-4788: write the consensus header digest only once per output (first batch)
             self.apply_consensus_root_contract_call()?;
         }
 
-        // apply blockhashes cleanup state after
+        // EIP-2935: record the parent block hash on every block
         self.apply_blockhashes_contract_call()?;
 
         Ok(())
@@ -758,6 +846,8 @@ where
                 })?;
             }
 
+            // `applyIncentives` must run before `concludeEpoch` (contract requirement): it
+            // distributes the concluding epoch's issuance before the epoch transition.
             self.apply_consensus_block_rewards(self.ctx.rewards_counter.get_address_counts())
                 .map_err(|e| {
                     BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
@@ -806,6 +896,13 @@ where
 
         // The sum of the transaction's gas limit, Tg, and the gas utilized in this block prior,
         // must be no greater than the block's gasLimit.
+        //
+        // The subtraction cannot underflow: `gas_used` only grows in `commit_transaction`, by a
+        // result whose gas consumption is capped by its transaction's gas limit — which this
+        // check proved fits in the remaining budget. Under the execute-then-commit-per-tx
+        // protocol (the trait's provided `execute_transaction*` methods and reth's
+        // `BasicBlockBuilder` both pair each execution with its commit before the next), the
+        // invariant `gas_used <= gas_limit` therefore holds at every entry.
         let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
 
         if recovered.tx().gas_limit() > block_available_gas {
