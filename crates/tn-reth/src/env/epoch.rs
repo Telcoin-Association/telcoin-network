@@ -1,4 +1,54 @@
 //! Methods for node startup and epoch boundaries.
+//!
+//! Two families live here: startup marker maintenance
+//! ([`RethEnv::heal_finalized_to_persisted_tip`],
+//! [`RethEnv::finalized_block_hash_number_for_startup`]) and read-only reads of on-chain state
+//! from the [`ConsensusRegistry`] and [`WorkerConfigs`] contracts.
+//!
+//! Every contract read executes as a read-only EVM system call: `transact_system_call` (see
+//! `evm/mod.rs`) from `SYSTEM_ADDRESS`, each call under its own fresh 30M gas budget, with gas
+//! price 0 and the nonce check disabled. Nothing commits — the returned data is decoded and the
+//! touched state discarded.
+//!
+//! # Pinned reads vs tip reads
+//!
+//! Contract reads come in two flavors, and picking the wrong one is a consensus hazard:
+//!
+//! - **Tip reads** — [`RethEnv::epoch_state_from_canonical_tip`],
+//!   [`RethEnv::validators_for_epoch`], [`RethEnv::bls_pubkeys_for_epoch`],
+//!   [`RethEnv::read_consensus_registry`] and its batch form — run against the MUTABLE canonical
+//!   tip. Point-in-time only: two nodes (or one node at two moments) may decode different answers,
+//!   so they are unsafe for consensus decisions.
+//! - **Pinned reads** — the `*_at_header` / `*_at_block` variants — run against one explicit block;
+//!   every node issuing the same read at the same block decodes identical bytes.
+//! - [`RethEnv::epoch_state_at_epoch_start`] pins to the entered epoch's start state: the previous
+//!   epoch's closing block (`epoch_info.blockHeight - 1`), or genesis for epoch 0.
+//!
+//! Pinning matters because the registry's committee arrays mutate MID-epoch: a governance
+//! `burn` swap-and-pops the ejected validator out of the CURRENT epoch's stored committee
+//! arrays immediately, so tip reads before and after the burn disagree (see
+//! [`RethEnv::epoch_state_from_canonical_tip`]). Epoch-scoped consensus reads — committee
+//! construction, rewards seeding, quorum — must use a pinned read.
+//!
+//! # Archive-mode assumption (every pinned read)
+//!
+//! A pinned read is only as deterministic as the history under it. This node never constructs
+//! a pruner — `PruningArgs` in `cli.rs` is built with every field disabled — so historical
+//! state always resolves fully indexed. If pruning were ever enabled, reth's historical
+//! provider could silently fall back to TIP state for a pruned block, turning a "pinned" read
+//! into exactly the nondeterminism pinning exists to prevent. See the ARCHIVE-MODE note in
+//! [`RethEnv::read_consensus_registry_batch_at_header`]; revisit every pinned read here before
+//! enabling pruning.
+//!
+//! # Error classification
+//!
+//! Methods returning [`StateReadResult`] classify failures by committee determinism:
+//! [`StateReadError::Provider`] is a node-local fault (this node's provider/database — peers
+//! reading the same block may succeed; retry or halt, never fail open), while
+//! [`StateReadError::ChainGlobal`] is a deterministic product of the pinned block and calldata
+//! (revert, halt, decode failure, absent contract — identical on every node, so failing open
+//! stays fleet-consistent). The boundary lives in the private `classified_system_call` helper:
+//! `EVMError::Database` maps to `Provider`; every other transact failure maps to `ChainGlobal`.
 
 use eyre::OptionExt as _;
 use reth_errors::ProviderError;
@@ -204,6 +254,11 @@ impl RethEnv {
     /// node entering (or re-entering) the same epoch — fresh boundary crossing, crash-restart
     /// replay, or ModeChange re-entry, before or after a mid-epoch burn — derives an IDENTICAL
     /// epoch view (committee membership included).
+    ///
+    /// Tripwire: `concludeEpoch` runs INSIDE the closing block, so the pinned read must already
+    /// report the entered epoch. If the pinned epoch disagrees with the tip's, the registry's
+    /// `blockHeight == closing block + 1` convention broke; this method fails hard rather than
+    /// return a possibly-stale committee.
     pub fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
         // boundary-written-once identity read: deterministic at any tip
         let (epoch, epoch_info) = self.get_current_epoch_info_at_header(&self.canonical_tip())?;
@@ -252,7 +307,14 @@ impl RethEnv {
         Ok((state, pin_header))
     }
 
-    /// Read the latest committee and epoch information from the [ConsensusRegistry] on-chain.
+    /// Read the committee validators for `epoch` from the [ConsensusRegistry] at the MUTABLE
+    /// canonical tip.
+    ///
+    /// WARNING: point-in-time only — a mid-epoch governance `burn` swap-and-pops the stored
+    /// committee arrays, so two nodes (or one node at two moments) can decode different
+    /// committees. Unsafe for consensus-critical use; pin the read instead via the block-pinned
+    /// sibling `validators_for_epoch_at_block` (`test-utils`-gated today, in `test_utils.rs`) or
+    /// take the whole committee from [`Self::epoch_state_at_epoch_start`].
     pub fn validators_for_epoch(
         &self,
         epoch: u32,
@@ -263,7 +325,11 @@ impl RethEnv {
     }
 
     /// Read the BLS pubkeys for the committee of the provided epoch from the [ConsensusRegistry]
-    /// on-chain.
+    /// at the MUTABLE canonical tip.
+    ///
+    /// WARNING: point-in-time only — a mid-epoch governance `burn` swap-and-pops the stored
+    /// committee arrays, so this read is unsafe for consensus-critical use. Pin the read with
+    /// [`Self::bls_pubkeys_for_epoch_at_block`] instead.
     pub fn bls_pubkeys_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
         let calldata = ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into();
         self.read_consensus_registry(calldata).map_err(Into::into)
@@ -322,7 +388,7 @@ impl RethEnv {
     /// `block_hash`.
     ///
     /// Returns the on-chain worker count and one [`WorkerFeeConfig`] per worker. Failures are
-    /// classified per [`StateReadError`] (see [`Self::worker_fee_configs_inner`]); `block_hash`
+    /// classified per [`StateReadError`] (see `worker_fee_configs_inner`); `block_hash`
     /// failing to resolve to a sealed header is [`StateReadError::Provider`] — the pinned block
     /// exists on the committee by construction, so a miss reflects this node's local view, not a
     /// chain-global fact.
@@ -355,6 +421,11 @@ impl RethEnv {
     /// data), revert, halt, ABI decode, arity mismatch — plus EVM environment construction is
     /// [`StateReadError::ChainGlobal`] (a deterministic product of the pinned block, identical on
     /// every node).
+    ///
+    /// Fail-open on unknown strategy ids: a strategy this node does not recognize (only possible
+    /// when a future contract version introduces one before this node is upgraded) is NOT an
+    /// error — it falls back to [`WorkerFeeConfig::Eip1559`] with a warning, preserving liveness
+    /// instead of halting all validators on the unrecognized id.
     pub(crate) fn worker_fee_configs_inner(
         &self,
         header: &SealedHeader,
