@@ -1,7 +1,7 @@
 //! Transaction factory to create legit transactions for execution.
 
 use crate::{
-    error::TnRethResult,
+    error::{EvmReadError, EvmReadResult, StateReadResult, TnRethResult},
     evm::TNEvm,
     payload::TNPayload,
     recover_raw_transaction,
@@ -27,7 +27,9 @@ use reth_provider::{
     CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
     DatabaseProviderFactory as _, StateProvider, StateProviderBox, StateProviderFactory,
 };
-use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
+use reth_revm::{
+    context::result::ExecutionResult, database::StateProviderDatabase, db::BundleState, State,
+};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
@@ -36,7 +38,8 @@ use secp256k1::{
 use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
 use tn_config::NodeInfo;
 use tn_types::{
-    address, calculate_transaction_root, gas_accumulator::RewardsCounter,
+    address, calculate_transaction_root,
+    gas_accumulator::{RewardsCounter, WorkerFeeConfig},
     generate_proof_of_possession_bls_for_test, keccak256, now, test_chain_spec_arc, test_genesis,
     AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsKeypair,
     BlsPublicKey, Bytes, Committee, CommitteeBuilder, Encodable2718, EthSignature, ExecHeader,
@@ -45,6 +48,7 @@ use tn_types::{
     EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M,
     MIN_PROTOCOL_BASE_FEE, U256,
 };
+use tracing::debug;
 // re-exports for tests
 pub use crate::evm::precompile_test_utils;
 pub use alloy::eips::{
@@ -68,7 +72,7 @@ impl RethEnv {
 
     /// Retrieve the state at the provided block hash.
     pub fn state_by_block_hash(&self, hash: BlockHash) -> TnRethResult<StateProviderBox> {
-        Ok(self.inner.blockchain_provider.state_by_block_hash(hash)?)
+        Ok(self.blockchain_provider().state_by_block_hash(hash)?)
     }
 
     /// Create an EVM-environment from state provider.
@@ -79,11 +83,7 @@ impl RethEnv {
             .with_database(StateProviderDatabase::new(state))
             .with_bundle_update()
             .build();
-        Ok(self
-            .inner
-            .evm_config
-            .evm_factory()
-            .create_evm(db, self.inner.evm_config.evm_env(&header)?))
+        Ok(self.evm_config().evm_factory().create_evm(db, self.evm_config().evm_env(&header)?))
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -159,7 +159,7 @@ impl RethEnv {
             self.latest()
                 .map_err(|e| eyre::eyre!("provider retrieves latest for test batch: {e:?}"))?,
         );
-        let executor = self.inner.evm_config.executor(&mut db);
+        let executor = self.evm_config().executor(&mut db);
         let res = executor
             .execute(&RecoveredBlock::new_unhashed(block, signers))
             .map_err(|e| eyre::eyre!("execute one block for test: {e:?}"))?;
@@ -211,6 +211,102 @@ impl RethEnv {
             calldata,
         )?;
         Ok(info)
+    }
+
+    /// Execute a read-only contract call at the canonical tip and return the raw ABI-encoded
+    /// output bytes.
+    ///
+    /// `eth_call`-like semantics: caller is the zero address, value 0, gas price 0, nonce and
+    /// base fee checks disabled, 30M gas; no state is committed. Callers decode the returned
+    /// bytes themselves (e.g. with `SolCall::abi_decode_returns`).
+    pub fn read_contract(&self, contract: Address, calldata: Bytes) -> EvmReadResult<Bytes> {
+        self.read_contract_inner(&self.canonical_tip(), Address::ZERO, contract, calldata)
+    }
+
+    /// Same as [`Self::read_contract`], but pinned to the state of the block identified by
+    /// `block_hash`.
+    pub fn read_contract_at_block(
+        &self,
+        block_hash: B256,
+        contract: Address,
+        calldata: Bytes,
+    ) -> EvmReadResult<Bytes> {
+        let header = self
+            .sealed_header_by_hash(block_hash)
+            .map_err(|e| EvmReadError::Internal(e.to_string()))?
+            .ok_or_else(|| {
+                EvmReadError::Internal(format!(
+                    "sealed header not found for block hash {block_hash:?}"
+                ))
+            })?;
+        self.read_contract_inner(&header, Address::ZERO, contract, calldata)
+    }
+
+    /// Build an EVM against `header`'s state and execute one read-only call, returning raw
+    /// output bytes on success and mapping Revert/Halt like the registry read path.
+    fn read_contract_inner(
+        &self,
+        header: &SealedHeader,
+        caller: Address,
+        contract: Address,
+        calldata: Bytes,
+    ) -> EvmReadResult<Bytes> {
+        let state_provider = self
+            .blockchain_provider()
+            .state_by_block_hash(header.hash())
+            .map_err(|e| EvmReadError::Internal(e.to_string()))?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let evm_env =
+            self.evm_config().evm_env(header).map_err(|e| EvmReadError::Internal(e.to_string()))?;
+        let mut tn_evm = self.evm_config().evm_factory().create_evm(&mut db, evm_env);
+
+        let result = self
+            .read_state_on_chain(&mut tn_evm, caller, contract, calldata)
+            .map_err(|e| EvmReadError::Internal(e.to_string()))?;
+
+        // surface user-triggerable reverts distinctly from internal node faults
+        match result.result {
+            ExecutionResult::Success { output, .. } => Ok(output.into_data()),
+            ExecutionResult::Revert { output, .. } => Err(EvmReadError::Revert {
+                reason: alloy::sol_types::decode_revert_reason(&output),
+                output,
+            }),
+            ExecutionResult::Halt { reason, gas_used } => Err(EvmReadError::Internal(format!(
+                "contract call halted: {reason:?} (gas {gas_used})"
+            ))),
+        }
+    }
+
+    /// Read the committee validators for the provided epoch from the [ConsensusRegistry], pinned
+    /// to the state of the block identified by `block_hash`.
+    ///
+    /// Unlike [`Self::validators_for_epoch`], which reads the mutable canonical tip, every node
+    /// issuing this read at the same block decodes the identical committee — even after a
+    /// mid-epoch governance `burn` swap-and-pops the stored committee arrays.
+    pub fn validators_for_epoch_at_block(
+        &self,
+        epoch: u32,
+        block_hash: B256,
+    ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
+        debug!(target: "engine", ?block_hash, "retrieving validators for epoch {epoch} at pinned block");
+        let header = self
+            .sealed_header_by_hash(block_hash)?
+            .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+        let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
+        self.read_consensus_registry_at_header(&header, calldata).map_err(Into::into)
+    }
+
+    /// Read worker fee configs from the [`WorkerConfigs`] contract at the canonical tip.
+    ///
+    /// The returned `Vec`'s length is the on-chain `numWorkers()` at the canonical tip (the
+    /// arity between the count and the per-worker arrays is validated in
+    /// [`Self::worker_fee_configs_inner`]). Callers size their in-memory worker state (e.g. the
+    /// `GasAccumulator`) to match, rather than asserting a preconceived count.
+    pub fn get_worker_fee_configs(&self) -> StateReadResult<Vec<WorkerFeeConfig>> {
+        let canonical_tip = self.canonical_tip();
+        let (_num_workers, configs) = self.worker_fee_configs_inner(&canonical_tip)?;
+        Ok(configs)
     }
 }
 
@@ -734,7 +830,7 @@ pub fn execute_payload_and_update_canonical_chain(
         reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
     // update chain state - normally handled by tn_engine::payload_builder
     let canonical_header = block.recovered_block.clone_sealed_header();
-    let canonical_in_memory_state = reth_env.inner.blockchain_provider.canonical_in_memory_state();
+    let canonical_in_memory_state = reth_env.blockchain_provider().canonical_in_memory_state();
     canonical_in_memory_state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
     canonical_in_memory_state.set_canonical_head(canonical_header.clone());
     reth_env.finish_executing_output(vec![block.clone()], None)?;
@@ -751,14 +847,14 @@ pub fn execute_payload_and_update_canonical_chain(
 /// Current versions commit both atomically in `RethEnv::finish_executing_output`, so tests use
 /// this direct write to construct the pre-fix state.
 pub fn plant_finalized_marker(reth_env: &RethEnv, header: SealedHeader) -> eyre::Result<()> {
-    let provider = reth_env.inner.blockchain_provider.database_provider_rw()?;
+    let provider = reth_env.blockchain_provider().database_provider_rw()?;
     provider.save_finalized_block_number(header.number)?;
     provider.save_safe_block_number(header.number)?;
     provider.commit()?;
     // a restarting node seeds the finalized/safe watches from the (stale) database rows at
     // provider construction; mirror that so watch readers see the planted marker
-    reth_env.inner.blockchain_provider.set_finalized(header.clone());
-    reth_env.inner.blockchain_provider.set_safe(header);
+    reth_env.blockchain_provider().set_finalized(header.clone());
+    reth_env.blockchain_provider().set_safe(header);
     Ok(())
 }
 

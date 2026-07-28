@@ -3,6 +3,8 @@
 use reth_metrics::{metrics::Counter, Metrics};
 use std::sync::LazyLock;
 
+use crate::RethDb;
+
 /// Process-wide metrics for [`crate::RethEnv`].
 ///
 /// A `LazyLock` static is justified here for the same reason as the engine's
@@ -56,6 +58,15 @@ pub(crate) struct RethEnvMetrics {
     /// second copy is skipped as a duplicate. A steady nonzero rate is normal operation. The
     /// alertable counter is [`RethEnvMetrics::unrecoverable_txs_dropped_total`].
     pub(crate) invalid_txs_skipped_total: Counter,
+}
+
+/// Report sampled reth database metrics (table sizes, page usage, freelist).
+///
+/// Intended as a pre-scrape hook for the prometheus metrics endpoint. Lives here to keep
+/// reth-db types out of the node crate.
+pub fn report_db_metrics(db: &RethDb) {
+    use reth_db::database_metrics::DatabaseMetrics;
+    db.report_metrics();
 }
 
 #[cfg(test)]

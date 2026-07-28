@@ -238,8 +238,7 @@ impl RethEnv {
         // view only carries what it needs (the plain-state tables all live in mdbx, not static
         // files, so no provider/static-file handle has to be kept alive alongside it)
         let tx = self
-            .inner
-            .blockchain_provider
+            .blockchain_provider()
             .database_provider_ro()?
             .disable_long_read_transaction_safety()
             .into_tx();
@@ -399,7 +398,7 @@ impl SnapshotRestorer {
             }
         }
 
-        let provider_rw = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
+        let provider_rw = self.reth_env.blockchain_provider().database_provider_rw()?;
 
         // drop the genesis alloc so an on-chain-zeroed genesis slot cannot survive the import
         {
@@ -509,7 +508,7 @@ impl SnapshotRestorer {
             .map(|res| res.map(|a| (a.address, a.account)))
             .collect::<Result<_, _>>()?;
 
-        let provider = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
+        let provider = self.reth_env.blockchain_provider().database_provider_rw()?;
 
         // write plain + hashed + history state, mirroring reth's private `dump_state` sequence but
         // driven from the pack's accounts rather than a JSONL reader.
@@ -619,7 +618,7 @@ impl SnapshotRestorer {
         let b = final_state.number;
 
         {
-            let provider = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
+            let provider = self.reth_env.blockchain_provider().database_provider_rw()?;
             provider.save_finalized_block_number(b)?;
             provider.save_safe_block_number(b)?;
             provider.commit()?;
@@ -700,7 +699,7 @@ mod tests {
         slot: B256,
         value: U256,
     ) -> eyre::Result<()> {
-        let provider = reth_env.inner.blockchain_provider.database_provider_rw()?;
+        let provider = reth_env.blockchain_provider().database_provider_rw()?;
         {
             let tx = provider.tx_ref();
             let mut cursor = tx.cursor_dup_write::<PlainStorageState>()?;

@@ -1,0 +1,329 @@
+//! Methods used for chain genesis.
+
+use std::{path::Path, sync::Arc};
+
+use alloy::{hex, sol_types::SolConstructor as _};
+use eyre::OptionExt as _;
+use reth::{
+    args::{DatabaseArgs, DatadirArgs},
+    dirs::MaybePlatformPath,
+};
+use reth_chainspec::ChainSpec as RethChainSpec;
+use reth_evm::{ConfigureEvm as _, Evm as _, EvmFactory as _};
+use reth_node_builder::NodeConfig;
+use reth_revm::{
+    cached::CachedReads,
+    context::result::{ExecutionResult, ResultAndState},
+    database::StateProviderDatabase,
+    db::{states::bundle_state::BundleRetention, BundleState},
+    DatabaseCommit as _, State,
+};
+use serde_json::Value;
+use tempfile::TempDir;
+use tn_config::{
+    NodeInfo, CONSENSUS_REGISTRY_JSON, ISSUANCE_ADDRESS, ISSUANCE_JSON, WORKER_CONFIGS_ADDRESS,
+    WORKER_CONFIGS_JSON,
+};
+use tn_types::{
+    gas_accumulator::RewardsCounter, Address, Genesis, GenesisAccount, TaskManager, U256,
+};
+use tracing::debug;
+
+use crate::{
+    init_txpool_defaults,
+    system_calls::{
+        ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS, PRECOMPILE_GENESIS_BYTECODE,
+    },
+    RethConfig, RethEnv, BLS_G1_PRECOMPILE_ADDRESS,
+};
+
+impl RethEnv {
+    /// Create a new temp RethEnv using a specified chain spec.
+    pub fn new_for_temp_chain<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        rewards: Option<RewardsCounter>,
+    ) -> eyre::Result<Self> {
+        /// MDBX map-size ceiling for throwaway temp-chain envs. reth defaults to 8 TB per
+        /// environment; `cargo test` runs a test binary as threads in ONE process, so N
+        /// concurrent 8 TB virtual reservations exhaust the address space and MDBX aborts
+        /// env-open with ENOMEM ("Cannot allocate memory (12)"). A temp chain never holds a
+        /// full node's history, so a small ceiling is safe and lets many envs coexist.
+        const TEMP_CHAIN_DB_MAX_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+        /// Grow the temp DB file in small increments so throwaway DBs stay tiny on disk
+        /// (reth pairs its 8 TB default with a 4 GiB step; mirror reth's `test()` 4 MiB step).
+        const TEMP_CHAIN_DB_GROWTH_STEP: usize = 4 * 1024 * 1024; // 4 MiB
+
+        // `NodeConfig::default` reads reth's process-wide pool defaults through
+        // `TxPoolArgs::default`, which locks them. Seed first so a temp chain built before any
+        // command is parsed does not fix the per-sender slot default at reth's 16 for the rest of
+        // the process, which would then also apply to every node parsed later.
+        init_txpool_defaults();
+
+        let node_config = NodeConfig {
+            datadir: DatadirArgs {
+                datadir: MaybePlatformPath::from(db_path.as_ref().to_path_buf()),
+                // default static path should resolve to: `DEFAULT_ROOT_DIR/<CHAIN_ID>/static_files`
+                static_files_path: None,
+                rocksdb_path: None,
+                pprof_dumps_path: None,
+            },
+            chain,
+            // Bound the MDBX geometry for throwaway temp chains (see const docs).
+            db: DatabaseArgs {
+                max_size: Some(TEMP_CHAIN_DB_MAX_SIZE),
+                growth_step: Some(TEMP_CHAIN_DB_GROWTH_STEP),
+                ..Default::default()
+            },
+            ..NodeConfig::default()
+        };
+        let reth_config = RethConfig(node_config);
+        let database = Self::new_database(&reth_config, db_path)?;
+        Self::new(&reth_config, task_manager, database, None, rewards.unwrap_or_default())
+    }
+
+    /// Convenience method for compiling storage and bytecode to include consensus registry
+    /// configuration in genesis.
+    pub fn create_consensus_registry_genesis_accounts(
+        validators: Vec<NodeInfo>,
+        genesis: Genesis,
+        initial_stake_config: ConsensusRegistry::StakeConfig,
+        owner_address: Address,
+        worker_configs: Vec<(u8, u64)>,
+    ) -> eyre::Result<Genesis> {
+        // create temporary reth env for execution
+        let tmp_chain: Arc<RethChainSpec> = Arc::new(genesis.clone().into());
+        let task_manager = TaskManager::new("Temp Task Manager");
+        let tmp_dir = TempDir::new().unwrap();
+        let reth_env =
+            RethEnv::new_for_temp_chain(tmp_chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let state = StateProviderDatabase::new(reth_env.latest()?);
+        let mut cached_reads = CachedReads::default();
+        let mut db = State::builder()
+            .with_database(cached_reads.as_db_mut(state))
+            .with_bundle_update()
+            .build();
+
+        // prepare registry deployment
+        let (validators, (bls_pubkeys, proofs)): (Vec<_>, (Vec<_>, Vec<_>)) = validators
+            .iter()
+            .map(|v| {
+                let validator = ConsensusRegistry::ValidatorInfo {
+                    validatorAddress: v.execution_address,
+                    activationEpoch: 0,
+                    exitEpoch: 0,
+                    currentStatus: ConsensusRegistry::ValidatorStatus::Active,
+                    isRetired: false,
+                    stakeVersion: 0,
+                    region: 0,
+                };
+                let bls_pubkey: tn_types::Bytes = v.bls_public_key.to_bytes().into();
+                let proof = ConsensusRegistry::ProofOfPossession {
+                    signature: v.proof_of_possession.to_bytes().into(),
+                };
+
+                (validator, (bls_pubkey, proof))
+            })
+            .unzip();
+
+        let total_stake_balance = initial_stake_config
+            .stakeAmount
+            .checked_mul(U256::from(validators.len()))
+            .ok_or_eyre("Failed to calculate total stake for consensus registry at genesis")?;
+        debug!(target: "engine", ?initial_stake_config, "calling constructor for consensus registry");
+
+        let constructor_args = ConsensusRegistry::constructorCall {
+            genesisConfig_: initial_stake_config,
+            initialValidators_: validators,
+            blsPubkeys_: bls_pubkeys,
+            proofsOfPossession: proofs,
+            owner_: owner_address,
+        }
+        .abi_encode();
+
+        // generate calldata for creation
+        let registry_initcode_binding =
+            Self::fetch_value_from_json_str(CONSENSUS_REGISTRY_JSON, Some("bytecode.object"))?;
+        let registry_initcode_str =
+            registry_initcode_binding.as_str().ok_or_eyre("invalid registry json")?;
+        // The registry calls the BLS precompile directly at `BLS_G1_ADDRESS` (no linked library),
+        // so its bytecode carries no link placeholder; deploy it as-is. Guard against a
+        // stale artifact that still contains an unresolved `__$..$__` placeholder.
+        if registry_initcode_str.contains("__$") {
+            eyre::bail!(
+                "ConsensusRegistry initcode has an unresolved library link placeholder; regenerate tn-contracts artifacts"
+            );
+        }
+        let mut create_registry = hex::decode(registry_initcode_str)?;
+        create_registry.extend(constructor_args);
+
+        // after adding bls proof of possession, registry precompile exceeds size limit so disable
+        // it for tmp chain
+        let mut tmp_evm_no_eip170 =
+            reth_env.inner.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?;
+        tmp_evm_no_eip170.cfg_env.limit_contract_code_size = Some(0x12000000);
+
+        // deploy registry now that it can use the previously deployed blsg1 lib
+        let tmp_registry_address = {
+            let mut tn_evm =
+                reth_env.inner.evm_config.evm_factory().create_evm(&mut db, tmp_evm_no_eip170);
+            let ResultAndState { result, state } =
+                tn_evm.transact_pre_genesis_create(owner_address, create_registry.into())?;
+            debug!(target: "engine", "create consensus registry result:\n{:#?}", result);
+            Self::ensure_pre_genesis_create_success("ConsensusRegistry", &result)?;
+
+            tn_evm.db_mut().commit(state);
+
+            // With BlsG1 now a precompile (no genesis deploy), the registry is the owner's first
+            // create tx on the tmp chain.
+            owner_address.create(0)
+        };
+
+        // deploy WorkerConfigs contract
+        let tmp_worker_configs_address = {
+            let mut tn_evm = reth_env.inner.evm_config.evm_factory().create_evm(
+                &mut db,
+                reth_env.inner.evm_config.evm_env(&tmp_chain.sealed_genesis_header())?,
+            );
+
+            let (strategies, values): (Vec<u8>, Vec<u64>) = worker_configs.iter().copied().unzip();
+            let datas = vec![0u128; strategies.len()];
+            let constructor_args =
+                WorkerConfigs::constructorCall { strategies, values, datas, owner_: owner_address }
+                    .abi_encode();
+
+            let initcode_binding =
+                Self::fetch_value_from_json_str(WORKER_CONFIGS_JSON, Some("bytecode.object"))?;
+            let initcode =
+                hex::decode(initcode_binding.as_str().ok_or_eyre("invalid worker configs json")?)?;
+            let mut create_worker_configs = initcode;
+            create_worker_configs.extend(constructor_args);
+
+            let ResultAndState { result, state } =
+                tn_evm.transact_pre_genesis_create(owner_address, create_worker_configs.into())?;
+            debug!(target: "engine", "create worker configs result:\n{:#?}", result);
+            Self::ensure_pre_genesis_create_success("WorkerConfigs", &result)?;
+
+            tn_evm.db_mut().commit(state);
+
+            // Second create tx on tmp chain (registry at nonce 0, worker configs at nonce 1).
+            owner_address.create(1)
+        };
+
+        // execute the transactions to get final bundle state
+        db.merge_transitions(BundleRetention::PlainState);
+        let BundleState { state, contracts, reverts, state_size, reverts_size } = db.take_bundle();
+
+        debug!(target: "engine", "contracts:\n{:#?}", contracts);
+        debug!(target: "engine", "reverts:\n{:#?}", reverts);
+        debug!(target: "engine", "state_size:{:#?}", state_size);
+        debug!(target: "engine", "reverts_size:{:#?}", reverts_size);
+
+        // construct real genesis using known values & tmp chain storage result
+        let tmp_registry_storage = state.get(&tmp_registry_address).map(|account| {
+            account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
+        });
+        let registry_runtimecode_binding = Self::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let registry_runtimecode_str =
+            registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?;
+        let registry_runtimecode = hex::decode(registry_runtimecode_str)?;
+
+        let tmp_worker_configs_storage = state.get(&tmp_worker_configs_address).map(|account| {
+            account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
+        });
+        let worker_configs_runtimecode_binding =
+            Self::fetch_value_from_json_str(WORKER_CONFIGS_JSON, Some("deployedBytecode.object"))?;
+        let worker_configs_runtimecode = hex::decode(
+            worker_configs_runtimecode_binding
+                .as_str()
+                .ok_or_eyre("invalid worker configs json")?,
+        )?;
+
+        let issuance_json_binding =
+            Self::fetch_value_from_json_str(ISSUANCE_JSON, Some("deployedBytecode.object"))?;
+        let issuance_runtimecode =
+            hex::decode(issuance_json_binding.as_str().ok_or_eyre("invalid issuance json")?)?;
+        let genesis = genesis.extend_accounts([
+            // The BLS proof-of-possession precompile lives at `BLS_G1_PRECOMPILE_ADDRESS`
+            // (`BLS_G1_PRECOMPILE_ADDRESS`). Mirror the TEL precompile and give it a single `0xfe`
+            // (INVALID) byte of code so the account is non-empty (never state-pruned) and any call
+            // that bypasses precompile dispatch reverts instead of succeeding against an EOA.
+            (
+                BLS_G1_PRECOMPILE_ADDRESS,
+                GenesisAccount::default().with_code(Some(PRECOMPILE_GENESIS_BYTECODE.into())),
+            ),
+            (
+                CONSENSUS_REGISTRY_ADDRESS,
+                GenesisAccount::default()
+                    .with_balance(U256::from(total_stake_balance))
+                    .with_code(Some(registry_runtimecode.into()))
+                    .with_storage(tmp_registry_storage),
+            ),
+            (
+                ISSUANCE_ADDRESS,
+                GenesisAccount::default().with_code(Some(issuance_runtimecode.into())),
+            ),
+            (
+                WORKER_CONFIGS_ADDRESS,
+                GenesisAccount::default()
+                    .with_code(Some(worker_configs_runtimecode.into()))
+                    .with_storage(tmp_worker_configs_storage),
+            ),
+        ]);
+
+        Ok(genesis)
+    }
+
+    /// Bail unless a pre-genesis constructor transaction succeeded.
+    ///
+    /// Pre-genesis creates are committed straight into genesis storage. An unchecked
+    /// Revert/Halt would still ship the contract's runtime code but with EMPTY storage
+    /// (e.g. an ownerless, zero-worker `WorkerConfigs`), which downstream fail-open reads
+    /// mask as defaults — so the ceremony must fail loudly here instead.
+    fn ensure_pre_genesis_create_success(
+        contract: &str,
+        result: &ExecutionResult,
+    ) -> eyre::Result<()> {
+        match result {
+            ExecutionResult::Success { .. } => Ok(()),
+            ExecutionResult::Revert { output, .. } => {
+                let reason = alloy::sol_types::decode_revert_reason(output)
+                    .unwrap_or_else(|| "<undecodable revert reason>".to_string());
+                eyre::bail!(
+                    "{contract} constructor reverted during pre-genesis create: {reason} (revert output: {output})"
+                )
+            }
+            ExecutionResult::Halt { reason, gas_used } => eyre::bail!(
+                "{contract} constructor halted during pre-genesis create: {reason:?} (gas used: {gas_used})"
+            ),
+        }
+    }
+
+    /// Fetches json info from the given string
+    ///
+    /// If a key is specified, return the corresponding nested object.
+    /// Otherwise return the entire JSON
+    /// With a generic this could be adjused to handle YAML also
+    pub fn fetch_value_from_json_str(json_content: &str, key: Option<&str>) -> eyre::Result<Value> {
+        let json: Value = serde_json::from_str(json_content)?;
+        let result = match key {
+            Some(path) => {
+                let key: Vec<&str> = path.split('.').collect();
+                let mut current_value = &json;
+                for &k in &key {
+                    current_value =
+                        current_value.get(k).ok_or_else(|| eyre::eyre!("key '{}' not found", k))?;
+                }
+                current_value.clone()
+            }
+            None => json,
+        };
+
+        Ok(result)
+    }
+}
