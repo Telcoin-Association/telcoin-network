@@ -3272,10 +3272,9 @@ mod tests {
             committee: expected_new_committee,
             blockHeight: 0,
             epochId: (expected_epoch + 1) as u32,
-            // epoch duration set at the start
-            epochDuration: Default::default(),
-            // values should remain the same
-            epochIssuance: Default::default(),
+            // future epoch info is projected from the latest stake config
+            epochDuration: epoch_duration,
+            epochIssuance: initial_stake_config.epochIssuance,
             stakeVersion: 0,
         };
 
