@@ -424,3 +424,242 @@ impl RethEnv {
         Ok(self.latest()?.account_code(address)?.map(|code| code.original_bytes()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        error::EvmReadError,
+        payload::TNPayload,
+        test_utils::{
+            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
+            TransactionFactory,
+        },
+        RethChainSpec,
+    };
+    use tempfile::TempDir;
+    use tn_types::{
+        keccak256, test_genesis, Encodable2718 as _, GenesisAccount, TaskManager, U256,
+    };
+
+    /// Exercise the tx/receipt/feed read API against a persisted three-block chain:
+    /// block 1 holds two transfers, block 2 is empty, block 3 holds one transfer.
+    #[tokio::test]
+    async fn test_read_api_tx_receipts_and_feed() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Test Task Manager");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let mut factory = TransactionFactory::new();
+        let recipient = Address::from_slice(&[0xcc; 20]);
+        let value = U256::from(1_000_000);
+        let tx1 =
+            factory.create_eip1559(chain.clone(), None, 100, Some(recipient), value, Bytes::new());
+        let tx2 =
+            factory.create_eip1559(chain.clone(), None, 100, Some(recipient), value, Bytes::new());
+        let tx3 =
+            factory.create_eip1559(chain.clone(), None, 100, Some(recipient), value, Bytes::new());
+
+        // block 1: two transfers
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(
+            &reth_env,
+            payload,
+            vec![tx1.encoded_2718(), tx2.encoded_2718()],
+        )?;
+        let block1_header = block1.recovered_block.clone_sealed_header();
+
+        // block 2: empty
+        let consensus_output = consensus_output_for_tests(2, 0, 2, false);
+        let payload = TNPayload::new_for_test(block1_header.clone(), &consensus_output);
+        let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let block2_header = block2.recovered_block.clone_sealed_header();
+
+        // block 3: one transfer
+        let consensus_output = consensus_output_for_tests(2, 0, 3, false);
+        let payload = TNPayload::new_for_test(block2_header, &consensus_output);
+        let block3 = execute_payload_and_update_canonical_chain(
+            &reth_env,
+            payload,
+            vec![tx3.encoded_2718()],
+        )?;
+        let block3_header = block3.recovered_block.clone_sealed_header();
+
+        // tx-by-hash roundtrip for the second transaction in block 1
+        let tx2_hash = *tx2.hash();
+        let (recovered, meta) = reth_env
+            .transaction_by_hash_with_meta(tx2_hash)?
+            .expect("mined transaction found by hash");
+        assert_eq!(recovered.signer(), factory.address());
+        assert_eq!(*recovered.hash(), tx2_hash);
+        assert_eq!(meta.block_number, 1);
+        assert_eq!(meta.index, 1);
+        assert_eq!(meta.block_hash, block1_header.hash());
+        assert_eq!(meta.timestamp, block1_header.timestamp);
+        // unknown hash is Ok(None), not an error
+        assert!(reth_env.transaction_by_hash_with_meta(TxHash::random())?.is_none());
+
+        // receipts by hash: cumulative gas is block-wide, per-tx gas is the delta
+        let receipt = reth_env.receipt_by_hash(tx2_hash)?.expect("receipt for mined tx");
+        assert!(receipt.success);
+        let (receipt, gas_used) = reth_env
+            .receipt_by_hash_with_gas_used(tx2_hash)?
+            .expect("receipt with gas for mined tx");
+        assert_eq!(gas_used, 21_000);
+        assert_eq!(receipt.cumulative_gas_used, 42_000);
+        // first-in-block transaction: per-tx gas equals its cumulative gas
+        let (receipt, gas_used) = reth_env
+            .receipt_by_hash_with_gas_used(*tx3.hash())?
+            .expect("receipt with gas for mined tx");
+        assert_eq!(gas_used, 21_000);
+        assert_eq!(receipt.cumulative_gas_used, 21_000);
+
+        // receipts by block: number- and hash-based reads agree
+        let by_number =
+            reth_env.receipts_by_block(BlockHashOrNumber::Number(1))?.expect("block 1 receipts");
+        let by_hash = reth_env
+            .receipts_by_block(BlockHashOrNumber::Hash(block1_header.hash()))?
+            .expect("block 1 receipts by hash");
+        assert_eq!(by_number.len(), 2);
+        assert_eq!(by_number, by_hash);
+        // known-but-empty block returns Some(empty); unknown block returns None
+        assert_eq!(reth_env.receipts_by_block(BlockHashOrNumber::Number(2))?, Some(vec![]));
+        assert!(reth_env.receipts_by_block(BlockHashOrNumber::Number(99))?.is_none());
+
+        // chain-wide feed: three transactions total
+        assert_eq!(reth_env.total_transactions()?, 3);
+        let feed = reth_env.transactions_by_tx_range_with_meta(0..=2)?;
+        assert_eq!(feed.len(), 3);
+        let tx_numbers: Vec<_> = feed.iter().map(|entry| entry.tx_number).collect();
+        assert_eq!(tx_numbers, vec![0, 1, 2]);
+        for (entry, tx) in feed.iter().zip([&tx1, &tx2, &tx3]) {
+            assert_eq!(*entry.transaction.hash(), *tx.hash());
+            assert_eq!(entry.transaction.signer(), factory.address());
+        }
+        // entries 0-1 come from block 1
+        assert_eq!(feed[0].block_number, 1);
+        assert_eq!(feed[0].index, 0);
+        assert_eq!(feed[0].block_hash, block1_header.hash());
+        assert_eq!(feed[1].block_number, 1);
+        assert_eq!(feed[1].index, 1);
+        // entry 2 comes from block 3 — the empty block 2 is skipped entirely
+        assert_eq!(feed[2].block_number, 3);
+        assert_eq!(feed[2].index, 0);
+        assert_eq!(feed[2].block_hash, block3_header.hash());
+        assert_eq!(feed[2].timestamp, block3_header.timestamp);
+
+        // ranges past the newest transaction clamp to what exists
+        assert_eq!(reth_env.transactions_by_tx_range_with_meta(0..=99)?.len(), 3);
+        // empty range yields an empty vec
+        assert!(reth_env.transactions_by_tx_range_with_meta(RangeInclusive::new(1, 0))?.is_empty());
+
+        // newest-first page of two: read a descending window and reverse it
+        let total = reth_env.total_transactions()?;
+        let mut page = reth_env.transactions_by_tx_range_with_meta(total - 2..=total - 1)?;
+        page.reverse();
+        let hashes: Vec<_> = page.iter().map(|entry| *entry.transaction.hash()).collect();
+        assert_eq!(hashes, vec![*tx3.hash(), *tx2.hash()]);
+
+        Ok(())
+    }
+
+    /// Minimal runtime bytecode: `PUSH1 42, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN` —
+    /// returns `uint256(42)` for any calldata.
+    const RETURN_42: &[u8] = &[0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+    /// Minimal runtime bytecode: `PUSH1 0, PUSH1 0, REVERT` — reverts with empty output.
+    const ALWAYS_REVERT: &[u8] = &[0x60, 0x00, 0x60, 0x00, 0xfd];
+
+    /// Exercise account/code reads and the generic read-only contract call against two
+    /// bytecode fixtures deployed in genesis.
+    #[tokio::test]
+    async fn test_read_api_account_code_and_contract_read() -> eyre::Result<()> {
+        let return_42_addr = Address::from_slice(&[0xaa; 20]);
+        let always_revert_addr = Address::from_slice(&[0xbb; 20]);
+        let genesis = test_genesis().extend_accounts([
+            (
+                return_42_addr,
+                GenesisAccount::default().with_code(Some(Bytes::from_static(RETURN_42))),
+            ),
+            (
+                always_revert_addr,
+                GenesisAccount::default().with_code(Some(Bytes::from_static(ALWAYS_REVERT))),
+            ),
+        ]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Test Task Manager");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+        let genesis_hash = chain.sealed_genesis_header().hash();
+
+        let mut factory = TransactionFactory::new();
+        let genesis_balance = reth_env
+            .retrieve_account(&factory.address())?
+            .expect("factory funded in genesis")
+            .balance;
+
+        // execute one transfer so the factory's nonce and balance move
+        let recipient = Address::from_slice(&[0xcc; 20]);
+        let transfer = factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(recipient),
+            U256::from(1_000_000),
+            Bytes::new(),
+        );
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![transfer])?;
+
+        // account state reflects the executed transfer
+        let factory_account =
+            reth_env.retrieve_account(&factory.address())?.expect("factory account exists");
+        assert_eq!(factory_account.nonce, 1);
+        assert!(factory_account.balance < genesis_balance);
+
+        // genesis contract account carries the bytecode hash; unknown account is None
+        let contract_account =
+            reth_env.retrieve_account(&return_42_addr)?.expect("genesis contract account exists");
+        assert_eq!(contract_account.bytecode_hash, Some(keccak256(RETURN_42)));
+        assert!(reth_env.retrieve_account(&Address::from_slice(&[0xdd; 20]))?.is_none());
+
+        // eth_getCode semantics: byte-exact for contracts, None for EOAs and unknowns
+        assert_eq!(reth_env.account_code(&return_42_addr)?, Some(Bytes::from_static(RETURN_42)));
+        assert!(reth_env.account_code(&factory.address())?.is_none());
+        assert!(reth_env.account_code(&Address::from_slice(&[0xdd; 20]))?.is_none());
+
+        // read-only contract call at the canonical tip
+        let output = reth_env
+            .read_contract(return_42_addr, Bytes::default())
+            .expect("read-only call succeeds");
+        assert_eq!(output.len(), 32);
+        assert_eq!(U256::from_be_slice(&output), U256::from(42));
+
+        // on-chain revert surfaces as EvmReadError::Revert with the raw output bytes
+        let err = reth_env
+            .read_contract(always_revert_addr, Bytes::default())
+            .expect_err("reverting call must error");
+        match err {
+            EvmReadError::Revert { output, reason } => {
+                assert!(output.is_empty());
+                // alloy's `decode_revert_reason` treats any valid-UTF-8 output as a raw-string
+                // reason (Vyper convention), so empty revert data yields `Some("")` rather than
+                // `None`; assert there is no *meaningful* reason either way
+                assert!(reason.as_deref().unwrap_or_default().is_empty());
+            }
+            other => panic!("expected revert error, got: {other:?}"),
+        }
+
+        // historical pinning: the same read against the genesis block's state
+        let output = reth_env
+            .read_contract_at_block(genesis_hash, return_42_addr, Bytes::default())
+            .expect("read-only call at genesis succeeds");
+        assert_eq!(U256::from_be_slice(&output), U256::from(42));
+
+        Ok(())
+    }
+}

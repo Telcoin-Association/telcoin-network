@@ -374,6 +374,7 @@ pub fn recover_pooled_transaction(
 mod tests {
     use super::*;
     use crate::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
+    use rand::{rngs::StdRng, SeedableRng as _};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tn_types::{test_genesis, Address, Bytes, Encodable2718 as _, TaskManager, U256};
@@ -464,5 +465,56 @@ mod tests {
             assert!(result.is_ok());
         }
         assert_eq!(pool.pool_size().pending, 3);
+    }
+
+    #[test]
+    fn test_parallel_recovery_preserves_order() {
+        use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+        use tn_types::Encodable2718;
+
+        // Create 20 transactions from different random signers so each tx is unique.
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let num_txs = 20;
+        let mut encoded_txs = Vec::with_capacity(num_txs);
+        for i in 0..num_txs {
+            let mut factory =
+                TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(i as u64));
+            let tx = factory.create_eip1559(
+                chain.clone(),
+                None,
+                100_000,
+                Some(Address::ZERO),
+                U256::from(1),
+                Default::default(),
+            );
+            encoded_txs.push(tx.encoded_2718());
+        }
+
+        // Recover sequentially
+        let sequential: Vec<_> = encoded_txs
+            .iter()
+            .map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .expect("sequential recovery")
+            })
+            .collect();
+
+        // Recover in parallel (using rayon, same as production code)
+        let parallel: Vec<_> = encoded_txs
+            .par_iter()
+            .map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .expect("parallel recovery")
+            })
+            .collect();
+
+        // Assert same length
+        assert_eq!(sequential.len(), parallel.len());
+
+        // Assert same order by comparing tx hashes and recovered signer addresses
+        for (seq, par) in sequential.iter().zip(parallel.iter()) {
+            assert_eq!(seq.hash(), par.hash(), "transaction hashes must match in order");
+            assert_eq!(seq.signer(), par.signer(), "recovered signers must match in order");
+        }
     }
 }

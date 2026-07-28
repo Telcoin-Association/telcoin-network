@@ -327,3 +327,86 @@ impl RethEnv {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::utils::parse_ether;
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_types::{generate_proof_of_possession_bls_for_test, BlsKeypair, NodeP2pInfo};
+
+    /// Regression: a `WorkerConfigs` constructor revert must FAIL genesis creation.
+    ///
+    /// Strategy 2 exceeds the contract's `MAX_STRATEGY` (= 1), so the constructor reverts
+    /// `InvalidStrategy`. Before the fix the reverted state was committed anyway, shipping
+    /// runtime code with empty storage: `numWorkers() = 0` and `owner() = address(0)` —
+    /// permanently unownable and masked downstream by fail-open defaults.
+    #[tokio::test]
+    async fn genesis_ceremony_rejects_invalid_worker_config_strategy() {
+        let err = crate::test_utils::try_test_genesis_with_consensus_registry_and_workers(
+            4,
+            vec![(2u8, 30_000_000u64)],
+        )
+        .expect_err("strategy 2 exceeds the contract's MAX_STRATEGY and must fail genesis");
+        assert!(
+            format!("{err:#}").contains("WorkerConfigs constructor reverted"),
+            "error must name the WorkerConfigs revert, got: {err:#}"
+        );
+    }
+
+    /// Regression: an EMPTY worker config set must FAIL genesis creation (the
+    /// `WorkerConfigs` constructor reverts `NumWorkersBelowMinimum`). See
+    /// [`genesis_ceremony_rejects_invalid_worker_config_strategy`] for the pre-fix failure mode.
+    #[tokio::test]
+    async fn genesis_ceremony_rejects_empty_worker_configs() {
+        let err =
+            crate::test_utils::try_test_genesis_with_consensus_registry_and_workers(4, vec![])
+                .expect_err("empty worker configs must fail genesis");
+        assert!(
+            format!("{err:#}").contains("WorkerConfigs constructor reverted"),
+            "error must name the WorkerConfigs revert, got: {err:#}"
+        );
+    }
+
+    /// Regression: the `ConsensusRegistry` pre-genesis create is guarded by
+    /// the same success check. A proof of possession generated for the WRONG address fails the
+    /// constructor's BLS precompile verification (`InvalidProofOfPossession`), which must fail
+    /// genesis creation instead of committing a half-initialized registry.
+    #[tokio::test]
+    async fn genesis_ceremony_rejects_invalid_consensus_registry_pop() {
+        let validator_address = Address::from_slice(&[0x11; 20]);
+        let wrong_address = Address::from_slice(&[0x22; 20]);
+        let mut rng = StdRng::seed_from_u64(0);
+        let bls = BlsKeypair::generate(&mut rng);
+        // sign the proof of possession over the wrong address
+        let pop = generate_proof_of_possession_bls_for_test(&bls, &wrong_address)
+            .expect("pop generation failed");
+        let validator = NodeInfo {
+            name: "validator-0".to_string(),
+            bls_public_key: *bls.public(),
+            p2p_info: NodeP2pInfo::default(),
+            execution_address: validator_address,
+            proof_of_possession: pop,
+        };
+
+        let initial_stake_config = ConsensusRegistry::StakeConfig {
+            stakeAmount: U256::from(parse_ether("1_000_000").expect("parse stake amount")),
+            minWithdrawAmount: U256::from(parse_ether("1_000").expect("parse min withdraw")),
+            epochIssuance: U256::from(parse_ether("25_806").expect("parse epoch issuance")),
+            epochDuration: 60 * 60 * 8,
+        };
+
+        let err = RethEnv::create_consensus_registry_genesis_accounts(
+            vec![validator],
+            tn_types::test_genesis(),
+            initial_stake_config,
+            Address::from_slice(&[0x99; 20]),
+            vec![(0u8, 30_000_000u64)],
+        )
+        .expect_err("invalid proof of possession must fail genesis");
+        assert!(
+            format!("{err:#}").contains("ConsensusRegistry constructor reverted"),
+            "error must name the ConsensusRegistry revert, got: {err:#}"
+        );
+    }
+}

@@ -1049,6 +1049,24 @@ fn assemble_new_committee(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        payload::TNPayload,
+        system_calls::EpochState,
+        test_utils::{
+            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
+            TransactionFactory,
+        },
+        RethChainSpec, RethEnv,
+    };
+    use alloy::primitives::utils::parse_ether;
+    use tempfile::TempDir;
+    use tn_config::NodeInfo;
+    #[cfg(feature = "adiri")]
+    use tn_config::CONSENSUS_REGISTRY_JSON;
+    use tn_types::{
+        generate_proof_of_possession_bls_for_test, BlsKeypair, GenesisAccount, NodeP2pInfo,
+        TaskManager,
+    };
 
     /// Build a minimal [`ConsensusRegistry::ValidatorInfo`] for committee-assembly tests.
     ///
@@ -1151,5 +1169,204 @@ mod tests {
                 Address::with_last_byte(3),
             ])
         );
+    }
+
+    /// The `ConsensusRegistry` fork must fail closed over an unexpected pre-fork deployment.
+    ///
+    /// The swap + `migrateValidatorSets()` assume the exact storage layout of the pinned
+    /// pre-fork registry code. Here the genesis fixture's registry account is overwritten with
+    /// the post-fork artifact bytes (any hash other than
+    /// `CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH` — a stand-in for an unknown deployment), and the
+    /// fork-boundary block must abort with the fail-closed gate error instead of silently
+    /// migrating over an unverified layout. (Without the gate this block would execute: the
+    /// migration is idempotent on the new code, making this test the discriminating check.)
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_consensus_registry_fork_fails_closed_on_unexpected_code() -> eyre::Result<()> {
+        // overwrite the registry's code (keeping balance + storage) with the post-fork artifact
+        let mut genesis = tn_types::test_genesis();
+        let v2_value = RethEnv::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let v2_code: Bytes =
+            alloy::hex::decode(v2_value.as_str().expect("deployedBytecode.object is a string"))?
+                .into();
+        genesis
+            .alloc
+            .get_mut(&CONSENSUS_REGISTRY_ADDRESS)
+            .expect("testnet genesis must allocate the ConsensusRegistry account")
+            .code = Some(v2_code);
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+
+        // drive the fork boundary: the concluding epoch + 1 == CONSENSUS_REGISTRY_FORK_EPOCH
+        let concluding_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH - 1;
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("fail closed test");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        let err = execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect_err("fork over an unexpected registry deployment must abort the block");
+        assert!(
+            format!("{err:#}").contains("failing closed"),
+            "abort must come from the fail-closed code-hash gate, got: {err:#}"
+        );
+
+        Ok(())
+    }
+
+    /// Guards the committee backfill path in `block.rs::shuffle_new_committee`: when there are
+    /// fewer strictly-active validators than the committee size, the shuffle must backfill from
+    /// the `PendingExit` pool so the next committee still reaches the required size. Five
+    /// genesis validators form a committee of 5; two begin exiting, leaving 3 active + 2
+    /// pending-exit. Since `committeeSize (5) > active (3)`, every subsequent committee must
+    /// include the two exiting validators - otherwise `concludeEpoch` would revert on its
+    /// committee-size check.
+    #[tokio::test]
+    async fn test_committee_backfill_from_pending_exit() -> eyre::Result<()> {
+        // the two validators that begin exiting need EOAs to sign their `beginExit` txns
+        let mut exit_a_eoa =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(101));
+        let exit_a = exit_a_eoa.address();
+        let mut exit_b_eoa =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(102));
+        let exit_b = exit_b_eoa.address();
+
+        let all_validators = [
+            Address::from_slice(&[0x11; 20]),
+            Address::from_slice(&[0x33; 20]),
+            Address::from_slice(&[0x44; 20]),
+            exit_a,
+            exit_b,
+        ];
+        let validators: Vec<_> = all_validators
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                let mut rng = StdRng::seed_from_u64(i as u64);
+                let bls = BlsKeypair::generate(&mut rng);
+                let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                    .expect("pop generation failed");
+                NodeInfo {
+                    name: format!("validator-{i}"),
+                    bls_public_key: *bls.public(),
+                    p2p_info: NodeP2pInfo::default(),
+                    execution_address: *addr,
+                    proof_of_possession: pop,
+                }
+            })
+            .collect();
+
+        let epoch_duration = 60 * 60 * 24;
+        let initial_stake_config = ConsensusRegistry::StakeConfig {
+            stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+            minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+            epochIssuance: U256::from(parse_ether("20_000_000").unwrap())
+                .checked_div(U256::from(28))
+                .expect("u256 div checked"),
+            epochDuration: epoch_duration,
+        };
+
+        let governance_multisig =
+            TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+        let governance = governance_multisig.address();
+        let tmp_genesis = tn_types::test_genesis().extend_accounts([
+            (
+                governance,
+                GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)),
+            ),
+            (exit_a, GenesisAccount::default().with_balance(U256::from(parse_ether("1_000")?))),
+            (exit_b, GenesisAccount::default().with_balance(U256::from(parse_ether("1_000")?))),
+        ]);
+
+        let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+            validators.clone(),
+            tmp_genesis,
+            initial_stake_config.clone(),
+            governance,
+            vec![(0u8, 30_000_000u64)],
+        )?;
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Backfill Test Task Manager");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+
+        // sanity: genesis committee is the full set of 5 validators
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 0);
+        assert_eq!(committee.len(), 5);
+
+        // two validators begin exiting (Active -> PendingExit)
+        let begin_exit_a = exit_a_eoa.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            U256::ZERO,
+            ConsensusRegistry::beginExitCall {}.abi_encode().into(),
+        );
+        let begin_exit_b = exit_b_eoa.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(CONSENSUS_REGISTRY_ADDRESS),
+            U256::ZERO,
+            ConsensusRegistry::beginExitCall {}.abi_encode().into(),
+        );
+
+        // execute the exits in the first block (no epoch close yet)
+        let mut expected_epoch = 0u32;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(
+            &reth_env,
+            payload,
+            vec![begin_exit_a, begin_exit_b],
+        )?;
+        let mut canonical_header = block1.recovered_block.clone_sealed_header();
+
+        // close several epochs so the post-exit committees (computed 2 epochs ahead by the shuffle)
+        // become current. If the backfill is broken, `concludeEpoch` reverts on the size check.
+        for round in 2..=6u64 {
+            expected_epoch += 1;
+            let consensus_output = consensus_output_for_tests(2, expected_epoch, round, true);
+            let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+            let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+            canonical_header = block.recovered_block.clone_sealed_header();
+
+            // the committee must stay full at every close: active(3) < committeeSize(5) forces the
+            // shuffle to backfill from the pending-exit pool each epoch
+            let EpochState { validators: committee, .. } =
+                reth_env.epoch_state_from_canonical_tip()?;
+            assert_eq!(committee.len(), 5, "committee stays full via pending-exit backfill");
+        }
+
+        // with active(3) < committeeSize(5), the backfill must keep every committee full and
+        // include the two pending-exit validators
+        let EpochState { validators: committee, .. } = reth_env.epoch_state_from_canonical_tip()?;
+        let committee_addrs: Vec<Address> = committee.iter().map(|v| v.validatorAddress).collect();
+        assert_eq!(committee_addrs.len(), 5, "committee stays full via pending-exit backfill");
+        assert!(committee_addrs.contains(&exit_a), "pending-exit validator A backfilled");
+        assert!(committee_addrs.contains(&exit_b), "pending-exit validator B backfilled");
+
+        // the backfilled validators remain PendingExit (still serving, not yet exited)
+        for exiting in [exit_a, exit_b] {
+            let info = reth_env.get_validator_info(canonical_header.hash(), exiting)?;
+            assert_eq!(
+                info.currentStatus,
+                ConsensusRegistry::ValidatorStatus::PendingExit,
+                "backfilled validator stays PendingExit"
+            );
+        }
+
+        Ok(())
     }
 }

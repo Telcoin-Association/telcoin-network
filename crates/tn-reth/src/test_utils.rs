@@ -35,18 +35,24 @@ use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
     SECP256K1,
 };
-use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+};
 use tn_config::NodeInfo;
 use tn_types::{
     address, calculate_transaction_root,
     gas_accumulator::{RewardsCounter, WorkerFeeConfig},
     generate_proof_of_possession_bls_for_test, keccak256, now, test_chain_spec_arc, test_genesis,
     AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsKeypair,
-    BlsPublicKey, Bytes, Committee, CommitteeBuilder, Encodable2718, EthSignature, ExecHeader,
-    ExecutionKeypair, Genesis, GenesisAccount, NodeP2pInfo, RecoveredBlock, SealedHeader,
-    TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256,
-    EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M,
-    MIN_PROTOCOL_BASE_FEE, U256,
+    BlsPublicKey, BlsSignature, Bytes, Certificate, CommittedSubDag, Committee, CommitteeBuilder,
+    ConsensusHeader, ConsensusOutput, Encodable2718, EthSignature, ExecHeader, ExecutionKeypair,
+    Genesis, GenesisAccount, NodeP2pInfo, RecoveredBlock, ReputationScores, SealedHeader,
+    SignatureVerificationState, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash,
+    TxKind, WorkerId, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
+    ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::debug;
 // re-exports for tests
@@ -949,5 +955,39 @@ pub fn try_test_genesis_with_consensus_registry_and_workers(
         initial_stake_config,
         governance,
         worker_configs,
+    )
+}
+
+/// Helper function for creating a consensus output for tests.
+pub fn consensus_output_for_tests(
+    round: u32,
+    epoch: u32,
+    subdag_index: u64,
+    close_epoch: bool,
+) -> ConsensusOutput {
+    let mut leader = Certificate::default();
+    // set signature for deterministic test results
+    leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        BlsSignature::default(),
+    ));
+    leader.update_header_created_at_for_test(tn_types::now());
+    leader.update_header_round_for_test(round);
+    leader.update_header_epoch_for_test(epoch);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        subdag_index,
+        reputation_scores,
+        previous_sub_dag,
+    );
+    ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeader::default().digest(),
+        subdag_index,
+        close_epoch,
+        VecDeque::new(),
+        Vec::new(),
     )
 }
