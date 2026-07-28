@@ -43,6 +43,14 @@ pub use tel_precompile::{
 };
 pub use utils::calculate_gas_penalty;
 
+/// Gas budget for a single protocol system call.
+///
+/// System calls run at `gas_price: 0` and do not count toward the block gas limit, so this
+/// bound exists only to stop runaway execution. It is sized well above the block gas limit to
+/// give the epoch-closing `concludeEpoch` call headroom: that call applies rewards, slashes,
+/// and queued stake settlement across the full validator set in one transaction.
+pub(crate) const SYSTEM_CALL_GAS_LIMIT: u64 = 100_000_000;
+
 /// TN EVM implementation.
 ///
 /// This is a wrapper type around the `revm` ethereum evm with optional [`Inspector`] (tracing)
@@ -172,7 +180,7 @@ where
             kind: TxKind::Call(contract),
             // Explicitly set nonce to 0 so revm does not do any nonce checks
             nonce: 0,
-            gas_limit: 30_000_000,
+            gas_limit: SYSTEM_CALL_GAS_LIMIT,
             value: U256::ZERO,
             data,
             // Setting the gas price to zero enforces that no value is transferred as part of the

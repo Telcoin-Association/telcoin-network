@@ -1964,9 +1964,9 @@ impl RethEnv {
     ///
     /// All calls observe ONE pinned state snapshot, so a multi-call query (e.g. unioning
     /// per-status validator sets) cannot straddle a block commit and double-count or drop a
-    /// validator that changes status between reads. Each call still runs under its own fresh 30M
-    /// gas budget (`transact_system_call`), so splitting a large query across calls keeps gas
-    /// bounded per call.
+    /// validator that changes status between reads. Each call still runs under its own fresh
+    /// system-call gas budget (`transact_system_call`), so splitting a large query across calls
+    /// keeps gas bounded per call.
     pub fn read_consensus_registry_batch_at_header<T>(
         &self,
         header: &SealedHeader,
@@ -2013,8 +2013,8 @@ impl RethEnv {
     /// output bytes.
     ///
     /// `eth_call`-like semantics: caller is the zero address, value 0, gas price 0, nonce and
-    /// base fee checks disabled, 30M gas; no state is committed. Callers decode the returned
-    /// bytes themselves (e.g. with `SolCall::abi_decode_returns`).
+    /// base fee checks disabled, gas capped at the system-call budget; no state is committed.
+    /// Callers decode the returned bytes themselves (e.g. with `SolCall::abi_decode_returns`).
     pub fn read_contract(&self, contract: Address, calldata: Bytes) -> EvmReadResult<Bytes> {
         self.read_contract_inner(&self.canonical_tip(), Address::ZERO, contract, calldata)
     }
