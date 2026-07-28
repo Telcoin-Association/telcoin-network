@@ -52,13 +52,6 @@ pub trait IntoRpcError<E> {
     fn into_error(error: E) -> Self;
 }
 
-/// The topic for NVVs to subscribe to for published worker batches.
-pub const WORKER_BATCH_TOPIC: &str = "tn_batches";
-/// The topic for NVVs to subscribe to for published primary certificates.
-pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
-/// The topic for NVVs to subscribe to for published consensus chain.
-pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
-
 /// The role of a consensus network instance: primary or worker.
 ///
 /// A node runs both as fully isolated libp2p swarms in one process. This is the
