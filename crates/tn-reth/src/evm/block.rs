@@ -142,6 +142,47 @@ where
         Self { evm, ctx, receipts: Vec::new(), gas_used: 0, spec, receipt_builder }
     }
 
+    /// Execute a system call from [`SYSTEM_ADDRESS`] to `contract` and commit its state changes.
+    ///
+    /// Shared implementation for the epoch system calls (`applyIncentives`, `concludeEpoch`,
+    /// `migrateValidatorSets`). Any failure — the call itself erroring or the execution result
+    /// being unsuccessful — is fatal to the block; `description` names the call in the log and
+    /// error strings.
+    ///
+    /// [`SYSTEM_ADDRESS`] is removed from the result state before commit: it is only touched as
+    /// the system caller, not a real state change — leaving it in the changeset would put a
+    /// spurious account into the bundle and diverge the state root.
+    fn transact_and_commit_system_call(
+        &mut self,
+        contract: Address,
+        calldata: Bytes,
+        description: &str,
+    ) -> TnRethResult<()> {
+        let mut res = match self.evm.transact_system_call(SYSTEM_ADDRESS, contract, calldata) {
+            Ok(res) => res,
+            Err(e) => {
+                // fatal error
+                error!(target: "engine", "error executing {description} contract call: {:?}", e);
+                return Err(TnRethError::EVMCustom(format!("{description} failed: {e}")));
+            }
+        };
+
+        // return error if the call executed but did not succeed
+        if !res.result.is_success() {
+            // execution failed
+            error!(target: "engine", "failed {description} call: {:?}", res.result);
+            return Err(TnRethError::EVMCustom(format!("failed {description}")));
+        }
+        trace!(target: "engine", ?res, "{description}");
+
+        // clean up SYSTEM_ADDRESS — only touched as the system caller, not a real state change
+        res.state.remove(&SYSTEM_ADDRESS);
+        // commit the changes
+        self.evm.db_mut().commit(res.state);
+
+        Ok(())
+    }
+
     /// Increase the beneficiary account balance and withdraw from governance safe.
     ///
     /// This must be called once per epoch, before the conclude epoch call.
@@ -155,38 +196,11 @@ where
 
         trace!(target: "engine", ?calldata, "apply incentives calldata");
 
-        // execute system call to consensus registry
-        let mut res = match self.evm.transact_system_call(
-            SYSTEM_ADDRESS,
+        self.transact_and_commit_system_call(
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
-        ) {
-            Ok(res) => res,
-            Err(e) => {
-                // fatal error
-                error!(target: "engine", "error applying consensus block rewards contract call: {:?}", e);
-                return Err(TnRethError::EVMCustom(format!(
-                    "applying consensus block rewards failed: {e}"
-                )));
-            }
-        };
-
-        // return error if closing epoch call failed
-        if !res.result.is_success() {
-            // execution failed
-            error!(target: "engine", "failed applying consensus block rewards call: {:?}", res.result);
-            return Err(TnRethError::EVMCustom(
-                "failed applying consensus block rewards".to_string(),
-            ));
-        }
-        trace!(target: "engine", ?res, "applying consensus block rewards");
-
-        // clean up SYSTEM_ADDRESS — only touched as the system caller, not a real state change
-        res.state.remove(&SYSTEM_ADDRESS);
-        // commit the changes
-        self.evm.db_mut().commit(res.state);
-
-        Ok(())
+            "applying consensus block rewards",
+        )
     }
 
     /// Apply the closing epoch call to ConsensusRegistry.
@@ -195,36 +209,7 @@ where
         let calldata = self.generate_conclude_epoch_calldata(randomness)?;
         trace!(target: "engine", ?calldata, "close epoch calldata");
 
-        // execute system call to consensus registry
-        let mut res = match self.evm.transact_system_call(
-            SYSTEM_ADDRESS,
-            CONSENSUS_REGISTRY_ADDRESS,
-            calldata,
-        ) {
-            Ok(res) => res,
-            Err(e) => {
-                // fatal error
-                error!(target: "engine", "error executing closing epoch contract call: {:?}", e);
-                return Err(TnRethError::EVMCustom(format!("epoch closing execution failed: {e}")));
-            }
-        };
-
-        trace!(target: "engine", ?res, "transact system call for conclude epoch");
-
-        // return error if closing epoch call failed
-        if !res.result.is_success() {
-            // execution failed
-            error!(target: "engine", "failed to apply closing epoch call: {:?}", res.result);
-            return Err(TnRethError::EVMCustom("failed to close epoch".to_string()));
-        }
-
-        trace!(target: "engine", "closing epoch logs:\n{:?}", res.result.logs());
-
-        // clean up SYSTEM_ADDRESS — only touched as the system caller, not a real state change
-        res.state.remove(&SYSTEM_ADDRESS);
-        // commit the changes
-        self.evm.db_mut().commit(res.state);
-        Ok(())
+        self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
     }
 
     /// The upgraded `ConsensusRegistry` runtime bytecode and its code hash, sourced from the same
@@ -347,27 +332,11 @@ where
 
         // Run the one-time migration. Dispatches to the just-swapped new code.
         let calldata = ConsensusRegistry::migrateValidatorSetsCall {}.abi_encode().into();
-        let mut res = match self.evm.transact_system_call(
-            SYSTEM_ADDRESS,
+        self.transact_and_commit_system_call(
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
-        ) {
-            Ok(res) => res,
-            Err(e) => {
-                error!(target: "engine", "error executing consensus registry migration: {:?}", e);
-                return Err(TnRethError::EVMCustom(format!(
-                    "consensus registry migration failed: {e}"
-                )));
-            }
-        };
-        if !res.result.is_success() {
-            error!(target: "engine", "failed consensus registry migration: {:?}", res.result);
-            return Err(TnRethError::EVMCustom("failed consensus registry migration".to_string()));
-        }
-
-        // clean up SYSTEM_ADDRESS — only touched as the system caller, not a real state change
-        res.state.remove(&SYSTEM_ADDRESS);
-        self.evm.db_mut().commit(res.state);
+            "consensus registry migration",
+        )?;
 
         // Read back the rebuilt eligible count for an operational confirmation log. Best-effort and
         // deliberately non-fatal: the migration is already committed above, so a hiccup on this
