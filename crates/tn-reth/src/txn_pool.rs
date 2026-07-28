@@ -25,7 +25,7 @@ use tn_types::{
     Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned,
     TxHash, MIN_PROTOCOL_BASE_FEE,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::{error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode, PoolTxn, PoolTxnId};
 
@@ -124,7 +124,15 @@ impl WorkerTxPool {
                     CanonStateNotification::Commit { new } => {
                         txn_pool_clone.process_canon_state_update(new);
                     }
-                    _ => unreachable!("TN reorgs are impossible"),
+                    // TN never reorgs: consensus output only extends the canonical chain, so a
+                    // Reorg notification here is a bug upstream. Skip it rather than panic —
+                    // this runs inside a critical task, and aborting it would take down the
+                    // whole node over a pool-maintenance miss.
+                    _ => warn!(
+                        target: "txpool",
+                        "unexpected canonical state notification (TN never reorgs); skipping \
+                         transaction pool update"
+                    ),
                 }
             }
             Err(TaskError::from_message(
