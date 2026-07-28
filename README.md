@@ -17,7 +17,7 @@ Check out the repo and update the submodules:
 ### Run an observer against testnet
 
 Build a release version of the node software:
-`cargo build --bin telcoin-network --release`
+`cargo build -p telcoin-network --bin telcoin-network --release`
 
 Generate a config and keys for your observer node:
 `target/release/telcoin-network keytool generate observer --datadir DATADIR --address 0x4444444444444444444444444444444444444444 --bls-passphrase-source ask`

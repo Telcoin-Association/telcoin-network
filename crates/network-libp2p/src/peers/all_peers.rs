@@ -20,7 +20,6 @@ use crate::{
 use libp2p::{Multiaddr, PeerId};
 use rand::seq::SliceRandom as _;
 use std::{
-    cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
     net::IpAddr,
     time::{Duration, Instant},
@@ -225,12 +224,15 @@ impl AllPeers {
         // `bls_by_peer_id` entry derived from its previous network key
         let rotated = (current != confirmed).then(|| self.evict(&confirmed)).flatten();
         // migrate any record reachable from the new peer id (anonymous-inbound promotion or a
-        // repeat upsert); a rotated record it displaces releases its counter bookkeeping
-        // NOTE: when the anonymous record wins this merge it keeps its fresh score, so a banned
-        // peer that reconnects anonymously before its kad record arrives sheds its ban here
-        // (pre-existing semantics); carrying reputation across the merge is a possible follow-up
-        let migrated = self.peers.remove(&current);
-        if let (Some(_), Some(displaced)) = (migrated.as_ref(), rotated.as_ref()) {
+        // repeat upsert). when such a record collides with a rotated record already stored under
+        // the confirmed identity, the promoted record wins the merge - but reputation belongs to
+        // the confirmed identity, not to the transport key, so carry the worse of the two
+        // reputations onto the promoted record before releasing the displaced record's counter
+        // bookkeeping. Otherwise a banned peer could shed its ban by reconnecting anonymously under
+        // a fresh network key before its kad record arrives (issue #998).
+        let mut migrated = self.peers.remove(&current);
+        if let (Some(promoted), Some(displaced)) = (migrated.as_mut(), rotated.as_ref()) {
+            promoted.retain_worse_reputation(displaced);
             self.release_displaced_record(displaced);
         }
         // otherwise the rotated record carries forward (same domain peer, new transport key),
@@ -241,11 +243,13 @@ impl AllPeers {
         let mut peer = migrated
             .or(rotated)
             .unwrap_or_else(|| Peer::new(bls_public_key, network_key.clone(), Vec::new()));
-        // apply the rotated-to keys and addresses before normalizing: when a carried record is
-        // mid-ban (`Disconnecting { banned: true }`), `normalize_carried_status` completes the ban
-        // through `add_banned_peer`, which reads the record's `known_ip_addresses`. `update_net`
-        // extends (does not replace) the address set, so updating first records the address the
-        // peer presents on the rotated-to key against the ban, not just the rotated-away one
+        // apply the rotated-to keys and advertised addresses to the carried record. when the
+        // record is mid-ban (`Disconnecting { banned: true }`), `normalize_carried_status` then
+        // completes the ban through `add_banned_peer`, which reads `known_ip_addresses` - the IPs
+        // this node has *observed* the peer connecting from. Those observed IPs live on the carried
+        // record and survive the rotation regardless of this call; the addresses merged here are
+        // self-advertised and feed dialing / peer exchange only, never the per-IP ban counter
+        // (GHSA-6qcj-p42p-779j).
         peer.update_net(bls_public_key, network_key, addrs);
         if carried {
             self.normalize_carried_status(&mut peer);
@@ -384,6 +388,14 @@ impl AllPeers {
         // disconnect peers
         for peer_id in peers_to_disconnect {
             self.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+
+            // these peers exceeded `dial_timeout` while still `Dialing`, so the genuine cause
+            // is a timeout. Report it to the caller (the disconnect transition no longer
+            // notifies; the dialer's reply channel is only consumed here or in `on_dial_failure`).
+            self.notify_dial_result(
+                &peer_id,
+                Err(NetworkError::Dial("dial attempt timedout".to_string())),
+            );
         }
 
         // update scores for all other peers
@@ -621,11 +633,11 @@ impl AllPeers {
                     });
                 }
 
-                // notify caller of dial error if present
-                self.notify_dial_result(
-                    peer_id,
-                    Err(NetworkError::Dial("dial attempt timedout".to_string())),
-                );
+                // NOTE: the dial result (if any) is notified by the caller that knows the real
+                // cause: `on_dial_failure` delivers the genuine `DialError`, and
+                // `heartbeat_maintenance` reports a timeout. This transition must not report a
+                // hardcoded cause, which previously consumed the reply channel before the real
+                // error could be sent.
             }
         }
 
@@ -984,32 +996,36 @@ impl AllPeers {
         (action, pruned_peers)
     }
 
-    /// Filter peers based on connection status.
+    /// Filter peers by connection status and return the `excess` OLDEST of them to prune.
     ///
-    /// This creates a min-heap with the excess number of peers.
+    /// Builds a bounded max-heap keyed by `instant`, so the heap's top is the NEWEST collected
+    /// peer. Once the heap is full, a candidate replaces that top only when the candidate is
+    /// older, so the heap converges on the `excess` oldest peers. Callers evict exactly these
+    /// entries, which keeps the freshest bans/disconnects and drops only stale ones (issue #799).
     /// Used by Self::prune_banned_peers and Self::prune_disconnected_peers.
     fn collect_excess_peers<F>(
         &self,
         excess: usize,
         filter: F,
-    ) -> BinaryHeap<(Reverse<Instant>, PeerIdentity, Vec<IpAddr>)>
+    ) -> BinaryHeap<(Instant, PeerIdentity, Vec<IpAddr>)>
     where
         F: Fn(&ConnectionStatus) -> Option<Instant>,
     {
-        // collection of peers to prune
+        // collection of peers to prune (the oldest `excess`)
         let mut excess_peers = BinaryHeap::with_capacity(excess);
 
         for (id, peer) in &self.peers {
             if let Some(instant) = filter(peer.connection_status()) {
-                // min-heap sorted by instant (oldest first)
-                let entry = (Reverse(instant), *id, peer.known_ip_addresses().collect::<Vec<_>>());
+                // max-heap by instant: the heap's top (peek) is the NEWEST collected peer
+                let entry = (instant, *id, peer.known_ip_addresses().collect::<Vec<_>>());
 
                 if excess_peers.len() < excess {
                     // fill the heap until `excess` elements
                     excess_peers.push(entry);
-                } else if let Some(current_max) = excess_peers.peek() {
-                    // if peer's banned instant is older, replace it
-                    if entry.0 < current_max.0 {
+                } else if let Some(current_newest) = excess_peers.peek() {
+                    // retain the OLDEST `excess`: drop the newest held entry whenever an older
+                    // candidate appears, so recently banned/disconnected peers survive pruning
+                    if entry.0 < current_newest.0 {
                         excess_peers.pop();
                         excess_peers.push(entry);
                     }
@@ -1125,6 +1141,25 @@ impl AllPeers {
         self.apply_committee_membership(committee)
     }
 
+    /// The current committee slot, as set from authoritative epoch state by
+    /// [`Self::update_committees`].
+    pub(super) fn current_committee(&self) -> &HashSet<BlsPublicKey> {
+        &self.current_committee
+    }
+
+    /// Whether `bls_key` sits in any tracked committee slot (previous, current, or next).
+    ///
+    /// Committee membership is set every epoch from authoritative consensus state, so this is the
+    /// authority on whether a peer record is worth retaining: a key in no slot is neither a
+    /// current, outgoing, nor incoming validator. Used to bound the peer manager's `known_peers`
+    /// cache against records for arbitrary keys (see
+    /// [`super::manager::PeerManager::add_discovered_peer`]).
+    pub(super) fn is_committee_member(&self, bls_key: &BlsPublicKey) -> bool {
+        self.previous_committee.contains(bls_key)
+            || self.current_committee.contains(bls_key)
+            || self.next_committee.contains(bls_key)
+    }
+
     /// Lazily apply committee membership to a single member the moment its network identity is
     /// learned.
     ///
@@ -1138,10 +1173,7 @@ impl AllPeers {
         &mut self,
         bls_key: BlsPublicKey,
     ) -> Vec<(PeerId, PeerAction)> {
-        if self.previous_committee.contains(&bls_key)
-            || self.current_committee.contains(&bls_key)
-            || self.next_committee.contains(&bls_key)
-        {
+        if self.is_committee_member(&bls_key) {
             self.apply_committee_membership(std::iter::once(bls_key))
         } else {
             Vec::new()

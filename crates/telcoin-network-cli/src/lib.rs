@@ -18,6 +18,7 @@ pub mod genesis;
 pub mod keytool;
 pub mod node;
 mod open_telemetry;
+pub mod passphrase;
 pub mod version;
 
 /// No Additional arguments

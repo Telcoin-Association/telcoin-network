@@ -94,7 +94,7 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 ```
 Install: `sudo apt install mold` (or see [mold releases](https://github.com/rui314/mold))
 
-These are not required -- the project builds without them. The project `.cargo/config.toml` already includes optimized profile settings (dependency opt-level=2, reduced debuginfo) that benefit all developers automatically.
+These are not required -- the project builds without them. The project `.cargo/config.toml` already includes optimized profile settings (dependency opt-level=1, reduced debuginfo) that benefit all developers automatically.
 
 #### Commits
 

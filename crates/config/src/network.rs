@@ -32,9 +32,32 @@ impl NetworkConfig {
         &self.sync_config
     }
 
+    /// Return a mutable reference to the [SyncConfig].
+    pub fn sync_config_mut(&mut self) -> &mut SyncConfig {
+        &mut self.sync_config
+    }
+
     /// Return a reference to the [LibP2pConfig].
     pub fn libp2p_config(&self) -> &LibP2pConfig {
         &self.libp2p_config
+    }
+
+    /// The chain id used to namespace this node's wire protocols and gossip topics.
+    ///
+    /// Sourced from genesis and stamped via [`Self::set_chain_id`] at node startup.
+    /// Defaults to `0` until set; every protocol and topic reads this one value, so
+    /// an unset id yields a self-consistent `0` namespace rather than a mismatch.
+    pub fn chain_id(&self) -> u64 {
+        self.libp2p_config.chain_id
+    }
+
+    /// Stamp the genesis chain id onto this config.
+    ///
+    /// Called once during node startup so wire protocols and gossip topics read a
+    /// single, genesis-derived source. Genesis is authoritative: this overwrites
+    /// whatever the (non-persisted) field held.
+    pub fn set_chain_id(&mut self, chain_id: u64) {
+        self.libp2p_config.chain_id = chain_id;
     }
 
     /// Return a mutable reference to the [LibP2pConfig].
@@ -77,18 +100,28 @@ impl NetworkConfig {
     }
 }
 
+/// The maximum size, in bytes, of a gossip message payload (`GossipMessage::data`).
+///
+/// This is a protocol constant, not a per-node tunable, and is deliberately identical on every
+/// node. The gossip reject path Fatal-bans the *relaying* peer for delivering an oversized payload
+/// (`RejectReason::TooLarge` -> `RejectPenalty::FatalRelayer`), and that attribution is sound only
+/// if every honest node applies the identical bound: under gossipsub `Strict` validation a peer
+/// that deems a message `TooLarge` reports `Reject` and never forwards it, so a delivered oversized
+/// payload is genuine relayer misbehavior. The bound is enforced symmetrically on both the publish
+/// path (the network layer refuses to originate a larger message) and the receive path, so an
+/// honest node never emits one for its peers to reject. A per-node bound would instead let an
+/// honest relayer configured with a larger limit be Fatal-banned for forwarding a payload that is
+/// under its own limit but over ours, so the bound is fixed here network-wide rather than read from
+/// operator config. The largest legitimate gossip message is a `Certificate`; 12,000 bytes is sized
+/// to accommodate it.
+pub const MAX_GOSSIP_MESSAGE_SIZE: usize = 12_000;
+
 /// Configurations for libp2p library.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(default)]
 pub struct LibP2pConfig {
     /// Maximum message size between request/response network messages in bytes.
     pub max_rpc_message_size: usize,
-    /// Maximum message size for gossipped network messages in bytes.
-    ///
-    /// The largest gossip message is likely a `Certificate`.
-    /// The default of 12,000 bytes should be enough for legit gossip.
-    /// Large messages should not be gossipped
-    pub max_gossip_message_size: usize,
     /// The maximum duration to keep an idle connection alive between peers.
     ///
     /// The strategy for TN is to rely on QUIC to send keep alive messages instead of adding
@@ -120,32 +153,37 @@ pub struct LibP2pConfig {
     /// Must be < `kad_record_ttl`, otherwise records expire before they are
     /// refreshed.
     pub kad_publication_interval: Duration,
+    /// The chain id, used to namespace every libp2p wire protocol and gossip
+    /// topic so nodes on different chains never negotiate a connection or share
+    /// a gossip mesh.
+    ///
+    /// Sourced from `genesis.config.chain_id` and stamped onto this config at
+    /// node startup (see `NetworkConfig::set_chain_id`). It is not an operator
+    /// tunable, so it is intentionally skipped during (de)serialization and
+    /// never written to the config file; genesis is the single source of truth.
+    #[serde(skip)]
+    pub chain_id: u64,
 }
 
 impl LibP2pConfig {
-    /// Return topics for primary.
-    pub fn primary_topic() -> String {
-        String::from("tn-primary")
+    /// Return the primary gossip topic for `chain_id`.
+    pub fn primary_topic(chain_id: u64) -> String {
+        format!("tn-primary-{chain_id}")
     }
 
-    /// Return topics for primary.
-    pub fn consensus_output_topic() -> String {
-        String::from("tn-consensus-output")
+    /// Return the consensus-output gossip topic for `chain_id`.
+    pub fn consensus_output_topic(chain_id: u64) -> String {
+        format!("tn-consensus-output-{chain_id}")
     }
 
-    /// Return topics for epoch votes.
-    pub fn epoch_vote_topic() -> String {
-        String::from("tn-epoch-vote")
+    /// Return the epoch-vote gossip topic for `chain_id`.
+    pub fn epoch_vote_topic(chain_id: u64) -> String {
+        format!("tn-epoch-vote-{chain_id}")
     }
 
-    /// Return topics for worker.
-    pub fn worker_batch_topic() -> String {
-        String::from("tn-worker")
-    }
-
-    /// Return topics for worker.
-    pub fn worker_txn_topic() -> String {
-        String::from("tn-txn")
+    /// Return the worker-batch gossip topic for `chain_id`.
+    pub fn worker_batch_topic(chain_id: u64) -> String {
+        format!("tn-worker-{chain_id}")
     }
 }
 
@@ -153,13 +191,14 @@ impl Default for LibP2pConfig {
     fn default() -> Self {
         Self {
             max_rpc_message_size: 1024 * 1024,                    // 1 MiB
-            max_gossip_message_size: 12_000,                      // 12kb
             max_idle_connection_timeout: Duration::from_secs(65), // same as quic handshake
             max_px_disconnects: 10,
             px_disconnect_timeout: Duration::from_secs(3),
             k_bucket_size: K_VALUE,
             kad_record_ttl: Duration::from_secs(48 * 60 * 60),
             kad_publication_interval: Duration::from_secs(12 * 60 * 60),
+            // Overwritten from genesis at node startup via `NetworkConfig::set_chain_id`.
+            chain_id: 0,
         }
     }
 }
@@ -218,6 +257,19 @@ pub struct SyncConfig {
     ///
     /// This value is used by `CertificateValidator::requires_direct_verification`
     pub certificate_verification_chunk_size: usize,
+    /// How long the observer's consensus-header catch-up loop waits between polls of local
+    /// storage while a missing range is being fetched.
+    ///
+    /// Used by `state_sync::spawn_stream_consensus_headers`. Only affects nodes that follow
+    /// consensus (CVV-inactive / observer), not active CVVs.
+    pub consensus_header_catch_up_poll_interval: Duration,
+    /// Number of consecutive no-progress catch-up polls the observer tolerates before it
+    /// re-drives a state-sync request for the missing consensus-header range.
+    ///
+    /// At the default poll interval this bounds a single passive wait to roughly
+    /// `consensus_header_catch_up_poll_interval * consensus_header_catch_up_max_no_progress`
+    /// before the observer actively re-requests the range instead of waiting for gossip.
+    pub consensus_header_catch_up_max_no_progress: u32,
 }
 
 impl Default for SyncConfig {
@@ -232,6 +284,9 @@ impl Default for SyncConfig {
             max_num_missing_certs_within_gc_round: 50,
             certificate_verification_round_interval: 50,
             certificate_verification_chunk_size: 50,
+            // 600 * 100ms = 60 seconds of passive polling before actively re-driving a request.
+            consensus_header_catch_up_poll_interval: Duration::from_millis(100),
+            consensus_header_catch_up_max_no_progress: 600,
         }
     }
 }
@@ -318,6 +373,14 @@ pub struct PeerConfig {
     pub max_banned_peers: usize,
     /// The maximum number of disconnected peers to maintain before pruning.
     pub max_disconnected_peers: usize,
+    /// The maximum number of entries retained in the temporarily-banned reconnection cache.
+    ///
+    /// This bounds the `temporarily_banned` cache (`BannedPeerCache`), which is keyed by `PeerId`
+    /// and otherwise grows only with the reputation-ban rate between heartbeats. On overflow the
+    /// oldest entry is evicted, so the cache never exceeds this size regardless of ban admission
+    /// rate. This is distinct from `max_banned_peers`, which bounds the reputation-ban table in
+    /// `AllPeers`; this knob bounds the swarm-level reconnection-timeout cache.
+    pub max_temporarily_banned_peers: usize,
     /// The config for scoring peers.
     pub score_config: ScoreConfig,
 }
@@ -338,6 +401,7 @@ impl Default for PeerConfig {
             excess_peers_reconnection_timeout: Duration::from_secs(600),
             max_banned_peers: 100,
             max_disconnected_peers: 100,
+            max_temporarily_banned_peers: 100,
             score_config: ScoreConfig::default(),
         }
     }
@@ -441,6 +505,52 @@ impl ScoreConfig {
     pub fn halflife_decay(&self) -> f64 {
         -(2.0f64.ln()) / self.score_halflife
     }
+
+    /// Reject a score configuration that would panic or silently disable peer reputation.
+    ///
+    /// Every field here is read live on the peer-scoring path, so a bad value crashes or
+    /// corrupts scoring at an unpredictable later moment rather than at config load:
+    ///
+    /// - `Score::add` clamps the aggregate score into `[min_score, max_score]` with `f64::clamp`,
+    ///   which panics if `min_score > max_score` or if either bound is `NaN`.
+    /// - `min_score_before_disconnect` / `min_score_before_ban` gate every reputation decision; a
+    ///   `NaN` there makes each `score <= threshold` comparison false, so a misbehaving peer is
+    ///   never disconnected or banned (a silent DoS-tolerance failure).
+    /// - `default_score` seeds every new peer's score; a `NaN` there poisons the same comparisons
+    ///   for that peer.
+    /// - `Self::halflife_decay` divides `-ln(2)` by `score_halflife`; a `0.0` yields `-inf` and a
+    ///   negative value flips exponential decay into unbounded growth.
+    ///
+    /// Validate at startup, on the same footing as `Parameters::validate`, so a bad score
+    /// config fails fast with a field-named error rather than halting the running swarm at
+    /// the first peer penalty.
+    pub fn validate(&self) -> eyre::Result<()> {
+        [
+            ("default_score", self.default_score),
+            ("max_score", self.max_score),
+            ("min_score", self.min_score),
+            ("min_score_before_disconnect", self.min_score_before_disconnect),
+            ("min_score_before_ban", self.min_score_before_ban),
+            ("score_halflife", self.score_halflife),
+        ]
+        .into_iter()
+        .try_for_each(|(name, value)| {
+            eyre::ensure!(value.is_finite(), "ScoreConfig.{name} must be finite, got {value}");
+            Ok(())
+        })?;
+        eyre::ensure!(
+            self.min_score <= self.max_score,
+            "ScoreConfig.min_score ({}) must be <= max_score ({})",
+            self.min_score,
+            self.max_score,
+        );
+        eyre::ensure!(
+            self.score_halflife > 0.0,
+            "ScoreConfig.score_halflife must be > 0, got {}",
+            self.score_halflife,
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -467,13 +577,34 @@ mod tests {
     }
 
     #[test]
+    fn temporarily_banned_cap_has_valid_default() {
+        // The temporarily-banned cache cap must ship with a sane, positive default so the cache is
+        // bounded out of the box, parallel to `max_banned_peers`.
+        let default = PeerConfig::default();
+        assert!(
+            default.max_temporarily_banned_peers > 0,
+            "max_temporarily_banned_peers default must be positive"
+        );
+        assert_eq!(
+            default.max_temporarily_banned_peers, 100,
+            "default should mirror the sibling max_banned_peers cap"
+        );
+
+        // an empty config falls back to the default, so operators inherit the bound automatically.
+        let parsed: NetworkConfig = serde_yaml::from_str("{}").expect("empty mapping deserializes");
+        assert_eq!(
+            parsed.peer_config.max_temporarily_banned_peers,
+            default.max_temporarily_banned_peers,
+        );
+    }
+
+    #[test]
     fn partial_yaml_uses_defaults_for_missing_fields() {
         // libp2p_config provided with only a subset of fields; the two new kad
         // fields (and others) are absent and must fall back to defaults.
         let yaml = r#"
 libp2p_config:
   max_rpc_message_size: 2097152
-  max_gossip_message_size: 12000
   max_idle_connection_timeout:
     secs: 65
     nanos: 0
@@ -528,5 +659,127 @@ hostname: "my-validator"
         assert_eq!(parsed.kad_publication_interval, default.kad_publication_interval);
         assert_eq!(parsed.max_rpc_message_size, default.max_rpc_message_size);
         assert_eq!(parsed.k_bucket_size, default.k_bucket_size);
+    }
+
+    #[test]
+    fn gossip_topics_are_chain_namespaced() {
+        // Every gossip topic embeds the chain id so two chains never share a mesh
+        // (issue #765).
+        assert_eq!(LibP2pConfig::primary_topic(2017), "tn-primary-2017");
+        assert_eq!(LibP2pConfig::consensus_output_topic(2017), "tn-consensus-output-2017");
+        assert_eq!(LibP2pConfig::epoch_vote_topic(2017), "tn-epoch-vote-2017");
+        assert_eq!(LibP2pConfig::worker_batch_topic(2017), "tn-worker-2017");
+        // a different chain id yields a different topic
+        assert_ne!(LibP2pConfig::primary_topic(1), LibP2pConfig::primary_topic(2));
+    }
+
+    #[test]
+    fn set_chain_id_is_read_back() {
+        let mut config = NetworkConfig::default();
+        assert_eq!(config.chain_id(), 0, "defaults to 0 until stamped from genesis");
+        config.set_chain_id(2017);
+        assert_eq!(config.chain_id(), 2017);
+        assert_eq!(config.libp2p_config().chain_id, 2017);
+    }
+
+    #[test]
+    fn chain_id_is_never_persisted() {
+        // chain_id is genesis-derived, not operator-configurable: it must never be
+        // written to (or read from) the config file, so genesis stays authoritative.
+        let libp2p = LibP2pConfig { chain_id: 2017, ..Default::default() };
+        let yaml = serde_yaml::to_string(&libp2p).expect("serialize libp2p config");
+        assert!(!yaml.contains("chain_id"), "chain_id must not be serialized: {yaml}");
+
+        // The load-bearing guard: a config file that *does* contain an explicit
+        // chain_id (hand-edited by an operator) must ignore it on read, so genesis
+        // stays the only source and cannot be overridden from disk.
+        let from_disk: LibP2pConfig =
+            serde_yaml::from_str("max_rpc_message_size: 1\nchain_id: 999\n")
+                .expect("deserialize libp2p config with an explicit chain_id");
+        assert_eq!(from_disk.chain_id, 0, "an on-disk chain_id must be ignored on read");
+        assert_eq!(from_disk.max_rpc_message_size, 1, "other fields still load");
+    }
+
+    #[test]
+    fn default_score_config_validates() {
+        // Mirrors `Parameters::default().validate()` must succeed: the shipped default must
+        // never be the thing that trips the startup guard.
+        ScoreConfig::default().validate().expect("default score config must validate");
+    }
+
+    #[test]
+    fn score_config_rejects_min_greater_than_max() {
+        // Pins the `min_score <= max_score` invariant: without it, `Score::add`'s `f64::clamp`
+        // panics on the first non-fatal peer penalty. Confirmed by mutation: deleting that
+        // `ensure!` makes `validate()` return `Ok` for this config, so this test (asserting
+        // `is_err`) fails.
+        let config = ScoreConfig { min_score: 1.0, max_score: -1.0, ..Default::default() };
+        assert!(config.validate().is_err(), "min_score greater than max_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_accepts_min_equal_to_max() {
+        // The clamp precondition is `min <= max`, so equal bounds are valid and must not be
+        // rejected (guards against an over-tight `<` check).
+        let config = ScoreConfig { min_score: 5.0, max_score: 5.0, ..Default::default() };
+        config.validate().expect("min_score == max_score must validate");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_max_score() {
+        // A `NaN` bound panics `f64::clamp` regardless of ordering.
+        let config = ScoreConfig { max_score: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN max_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_min_score() {
+        let config = ScoreConfig { min_score: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN min_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_default_score() {
+        // `default_score` seeds every new peer's score; a NaN there poisons every later
+        // threshold comparison for that peer.
+        let config = ScoreConfig { default_score: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN default_score must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_disconnect_threshold() {
+        // A NaN disconnect/ban threshold makes `score <= threshold` always false, so no peer
+        // is ever disconnected or banned: a silent reputation-enforcement failure.
+        let config = ScoreConfig { min_score_before_disconnect: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN disconnect threshold must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_ban_threshold() {
+        let config = ScoreConfig { min_score_before_ban: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN ban threshold must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_zero_halflife() {
+        // `halflife_decay` divides by `score_halflife`; `0.0` yields a `-inf` decay constant.
+        // Pins the `score_halflife > 0.0` invariant.
+        let config = ScoreConfig { score_halflife: 0.0, ..Default::default() };
+        assert!(config.validate().is_err(), "a zero score_halflife must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_negative_halflife() {
+        // A negative halflife flips exponential decay into unbounded growth.
+        let config = ScoreConfig { score_halflife: -1.0, ..Default::default() };
+        assert!(config.validate().is_err(), "a negative score_halflife must be rejected");
+    }
+
+    #[test]
+    fn score_config_rejects_nan_halflife() {
+        // A NaN halflife is caught by the finite check before the `> 0.0` comparison (which a
+        // NaN would fail anyway); pin it explicitly so the ordering of the two checks is safe.
+        let config = ScoreConfig { score_halflife: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err(), "a NaN score_halflife must be rejected");
     }
 }

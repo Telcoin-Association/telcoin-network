@@ -1,8 +1,10 @@
 //! Epoch-start setup driven by `run_epoch` in [`super`].
 //!
 //! Everything here runs once per epoch, before consensus begins voting. The
-//! committee and epoch-start info are read from the canonical execution tip,
-//! then turned into a [`Committee`] and a per-epoch [`ConsensusConfig`]. From
+//! committee and epoch-start info are read pinned to the previous epoch's
+//! closing block — the closing block rules the entire epoch, so every entry
+//! shape derives the identical committee no matter when it runs — then turned
+//! into a [`Committee`] and a per-epoch [`ConsensusConfig`]. From
 //! that the node's mode is identified (CVV, CVV-inactive, or observer) and the
 //! [`PrimaryNode`] and [`WorkerNode`] are created together with their per-epoch
 //! [`PrimaryNetwork`]/[`WorkerNetwork`] interfaces.
@@ -34,15 +36,19 @@ use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
     ConsensusBus, NodeMode, StateSynchronizer,
 };
-use tn_reth::system_calls::{
-    ConsensusRegistry::{self, EpochInfo},
-    EpochState,
+use tn_reth::{
+    system_calls::{
+        ConsensusRegistry::{self, EpochInfo},
+        EpochState,
+    },
+    WorkerRpcForwarder,
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
     CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    Multiaddr, NetworkPublicKey, P2pNode, TaskManager, TaskSpawner, DEFAULT_WORKER_ID,
+    Multiaddr, NetworkPublicKey, P2pNode, SealedHeader, TaskManager, TaskSpawner,
+    DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -64,7 +70,8 @@ where
     /// different leader epoch means execution fell behind across an epoch boundary, which this
     /// recovery path cannot reason about, so it errors rather than replay across the boundary.
     /// If a replayed output is itself the epoch close, the returned [`super::ReplayResult`]
-    /// reports its hash and replay stops there.
+    /// reports its hash, the boundary header is stashed in `last_consensus_header` for the
+    /// caller's close-and-write sequence, and replay stops there.
     pub(super) async fn replay_missed_consensus(
         &mut self,
         committee: Committee,
@@ -94,6 +101,9 @@ where
             self.metrics.replayed_outputs_total.increment(1);
             last_replayed_hash = Some(output_hash);
             if is_epoch_close {
+                // stash the boundary header (digest-identical to `output_hash`) for the caller's
+                // close-and-write sequence
+                self.last_consensus_header = Some(consensus_header);
                 return Ok(ReplayResult {
                     epoch_close_hash: Some(output_hash),
                     last_replayed_hash,
@@ -103,18 +113,26 @@ where
         Ok(ReplayResult { epoch_close_hash: None, last_replayed_hash })
     }
 
-    /// Read the canonical execution tip once and derive the current [`Committee`].
+    /// Derive the current [`Committee`] from state pinned to the previous epoch's closing block.
     ///
-    /// The single `epoch_state_from_canonical_tip` read also yields the `EpochInfo` and
-    /// epoch-start timestamp, which are returned alongside the committee so [`configure_consensus`]
-    /// can compute the epoch boundary without issuing a second system call against the same tip.
+    /// The single atomic `epoch_state_at_epoch_start` read yields the committee, the `EpochInfo`,
+    /// the epoch-start timestamp, and the pin header (the previous epoch's closing block; genesis
+    /// for epoch 0), returned together so the caller (`run_epoch`) can compute the epoch boundary
+    /// and thread the committee and pin into [`configure_consensus`] and [`create_consensus`] for
+    /// further pinned reads without a second system call. The pin is what makes every
+    /// entry shape — fresh boundary crossing, crash-restart replay, or ModeChange re-entry, before
+    /// or after a mid-epoch governance `burn` — derive the IDENTICAL committee; the
+    /// `EpochInfo`/epoch-start scalars are unchanged by the pin, since `concludeEpoch` writes them
+    /// exactly once at the boundary.
     /// On-chain BLS key bytes are decoded here and a decode failure aborts committee construction.
     pub(super) async fn get_committee_with_epoch_start_info(
         &self,
         engine: &ExecutionNode,
-    ) -> eyre::Result<(Committee, EpochInfo, u64)> {
-        let EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start } =
-            engine.epoch_state_from_canonical_tip().await?;
+    ) -> eyre::Result<(Committee, EpochInfo, u64, SealedHeader)> {
+        let (
+            EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start },
+            epoch_start_header,
+        ) = engine.epoch_state_at_epoch_start().await?;
         let validators = validators
             .iter()
             .zip(bls_pubkeys.iter())
@@ -125,20 +143,26 @@ where
             .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
 
-        Ok((self.create_committee_from_state(epoch, validators).await?, epoch_info, epoch_start))
+        Ok((
+            self.create_committee_from_state(epoch, validators).await?,
+            epoch_info,
+            epoch_start,
+            epoch_start_header,
+        ))
     }
 
     /// Build the epoch's [`PrimaryNode`] and [`WorkerNode`] and their per-epoch networks.
     ///
     /// These components are short-lived: they exist only for the current epoch and are torn
     /// down at its close. The node mode is (re)identified first, and the previous epoch's
-    /// committee is read from on-chain state so peers from the outgoing committee are not
-    /// banned during the handover. `initial_epoch` is threaded down to gate the one-time
-    /// per-process network setup (see [`init_network_for_epoch`]).
+    /// committee is read from on-chain state at `epoch_start_header` so peers from the outgoing
+    /// committee are not banned during the handover. `initial_epoch` is threaded down to gate
+    /// the one-time per-process network setup (see [`init_network_for_epoch`]).
     ///
     /// After both nodes are up, the next two committees' validator keys are prefetched through
     /// the primary and worker network handles so their network info is already resolved when
     /// those epochs arrive — a best-effort warm-up whose failure is intentionally ignored.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn create_consensus(
         &mut self,
         engine: &ExecutionNode,
@@ -147,16 +171,25 @@ where
         gas_accumulator: GasAccumulator,
         consensus_bus: ConsensusBus,
         consensus_config: ConsensusConfig<DB>,
+        epoch_start_header: &SealedHeader,
     ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>)> {
         // create config for consensus
         let _mode = self.identify_node_mode(&consensus_config, &consensus_bus).await?;
         let epoch = consensus_config.committee().epoch();
 
-        // previous committee from on-chain state - canonical source of truth
+        // Previous committee from on-chain state - canonical source of truth. The previous
+        // epoch's committee array is frozen once this epoch starts (a mid-epoch burn mutates
+        // the current and future epochs' arrays, never a past epoch's), so this pinned read is
+        // value-identical to a tip read — pinned purely so every epoch-scoped read in this
+        // path derives from the one epoch-start header.
         let previous_committee_keys: HashSet<BlsPublicKey> = if epoch == 0 {
             HashSet::new() // no previous committee
         } else {
-            engine.validators_for_epoch(epoch - 1).await?.into_iter().collect()
+            engine
+                .validators_for_epoch_at_block(epoch - 1, epoch_start_header.hash())
+                .await?
+                .into_iter()
+                .collect()
         };
 
         let consensus_bus_app = consensus_bus.app().clone();
@@ -211,9 +244,21 @@ where
         let primary_handle = primary.network_handle().await;
         let committee = consensus_config.committee();
         let mut prefetches = committee.bls_keys().clone();
-        let next_committee_keys = engine.validators_for_epoch(committee.epoch() + 1).await?;
-        prefetches.extend(next_committee_keys.iter());
-        prefetches.extend(engine.validators_for_epoch(committee.epoch() + 2).await?);
+        // At the previous epoch's closing header the registry already serves the two future
+        // epochs' committees (genesis seeds epochs 0-2; the `concludeEpoch` that seats epoch N
+        // writes epoch N+2's committee inside that same closing block), and pinning keeps a
+        // post-burn re-entry prefetching the same sets an on-time entry prefetched. The
+        // prefetch is a best-effort network warm-up: the next committee's keys are reused from
+        // the config (already read at the pin — no second chain read to fail), and a failed
+        // epoch + 2 read is logged and skipped rather than aborting epoch start.
+        prefetches.extend(consensus_config.next_committee_keys().iter());
+        match engine
+            .validators_for_epoch_at_block(committee.epoch() + 2, epoch_start_header.hash())
+            .await
+        {
+            Ok(keys) => prefetches.extend(keys),
+            Err(e) => warn!(target: "epoch-manager", ?e, "skipping epoch + 2 committee prefetch"),
+        }
         // Attempt to pre-load the next couple of committee's network info.
         let _ = primary_handle
             .inner_handle()
@@ -226,28 +271,31 @@ where
         Ok((primary, worker))
     }
 
-    /// Assemble the per-epoch [`ConsensusConfig`] from the canonical execution tip.
+    /// Assemble the per-epoch [`ConsensusConfig`] from state pinned to the previous epoch's
+    /// closing block.
     ///
-    /// Reads the committee and epoch-start info from the tip, resets `epoch_boundary` to
-    /// `epoch_start + epochDuration` (the timestamp at which this epoch closes, used elsewhere
-    /// to detect the boundary), and folds in the next committee's keys so the network can
-    /// pre-resolve the successor committee. Produces a config scoped to this epoch only.
+    /// `committee` and `epoch_start_header` are threaded in from `run_epoch`'s single entry
+    /// read ([`Self::get_committee_with_epoch_start_info`]) — this method issues no epoch-start
+    /// read of its own, so the config cannot derive from a different pin than the rest of the
+    /// entry path. It folds in the next committee's keys — read at the same pin — so the
+    /// network can pre-resolve the successor committee. Produces a config scoped to this epoch
+    /// only.
     pub(super) async fn configure_consensus(
-        &mut self,
+        &self,
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
+        committee: Committee,
+        epoch_start_header: &SealedHeader,
     ) -> eyre::Result<ConsensusConfig<DB>> {
-        // retrieve epoch information from canonical tip
-        let (committee, epoch_info, epoch_start) =
-            self.get_committee_with_epoch_start_info(engine).await?;
         let validators = committee.bls_keys();
-
-        self.epoch_boundary = epoch_start + epoch_info.epochDuration as u64;
-        debug!(target: "epoch-manager", new_epoch_boundary=self.epoch_boundary, "resetting epoch boundary");
-
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
 
-        let next_committee_keys = engine.validators_for_epoch(committee.epoch() + 1).await?;
+        // Pinned like every other epoch-scoped read in this path: the registry at the pin
+        // already serves the next epoch's committee, and a post-burn re-entry folds the same
+        // next-committee keys into the config as an on-time entry.
+        let next_committee_keys = engine
+            .validators_for_epoch_at_block(committee.epoch() + 1, epoch_start_header.hash())
+            .await?;
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -370,7 +418,10 @@ where
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now (with id 0) - otherwise, loop here
         let worker_id = DEFAULT_WORKER_ID;
-        let base_fee = gas_accumulator.base_fee(worker_id);
+        // u64 snapshot of the worker's base fee, used by both the transaction pool and the batch
+        // validator. Base fee is constant within an epoch, so a snapshot taken at epoch start is
+        // valid for the whole epoch.
+        let base_fee = gas_accumulator.base_fee(worker_id).base_fee();
 
         // update the network handle's task spawner for reporting batches in the epoch
         {
@@ -392,6 +443,7 @@ where
                         worker_id,
                         network_handle.clone(),
                         engine_to_primary,
+                        base_fee,
                     )
                     .await?;
             } else {
@@ -400,6 +452,11 @@ where
                 engine.respawn_worker_network_tasks(network_handle.clone()).await;
             }
         }
+
+        // Ensure the worker's transaction pool charges the accumulator's base fee for this epoch.
+        // On the init path above the pool was created with this value; this call additionally
+        // covers the respawn path, where initialization is skipped.
+        engine.set_worker_base_fee(worker_id, base_fee).await?;
 
         let network_handle = self
             .worker_network_handle
@@ -421,11 +478,18 @@ where
         )
         .await?;
 
+        // Observer transaction forwarding: a non-committee worker forwards each transaction it
+        // accepts to the JSON-RPC endpoint of the validator that owns it, discovered over
+        // kademlia (issue #804).
+        let forwarder =
+            Arc::new(WorkerRpcForwarder::new(network_handle.get_task_spawner().clone()));
+
         let worker = WorkerNode::new(
             worker_id,
             consensus_config.clone(),
             network_handle.clone(),
             validator,
+            forwarder,
             self.consensus_chain.clone(),
         );
 
@@ -436,8 +500,12 @@ where
     ///
     /// This operates on the per-epoch interface, not the swarm itself. Every epoch refreshes
     /// the previous/current/next committee membership (via [`init_network_for_epoch`]) and the
-    /// gossip publisher set so the network bans and routes against the current committee. The
-    /// listener is bound only on the initial epoch.
+    /// gossip publisher sets so the network bans and routes against the current committee. The
+    /// `primary_topic` (certificates) is restricted to the current committee, while the
+    /// `consensus_output_topic` and `epoch_vote_topic` are restricted to the previous/current/next
+    /// committee window (issue #912): both carry epoch-boundary traffic from validators rotating
+    /// out or in, so their publisher set must span the same window the peer manager exempts from
+    /// penalties. The listener is bound only on the initial epoch.
     ///
     /// Peers are dialed when this node is a CVV (it must reach the other CVVs) or when it has no
     /// connected peers; a non-committee node that already has peers does not pester the
@@ -474,6 +542,25 @@ where
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
+        // Publishers authorized for the epoch-boundary topics (`epoch_vote_topic`,
+        // `consensus_output_topic`): the previous/current/next committee window. This gossip is
+        // exactly the traffic that crosses an epoch boundary. Epoch-close votes and an epoch's
+        // final consensus output are authored by the OUTGOING committee and gossipped into the
+        // next epoch, so a current-committee-only allowlist would reject those in-flight boundary
+        // messages during rotation (and stop re-propagating them), stalling certification of the
+        // just-closed epoch; a validator rotating in may likewise start publishing early. This is
+        // the same window the peer manager already derives validator penalty-exemption from via
+        // `update_committees` (the previous/current/next slots, issue #715), so the
+        // propagation-authorization window and the penalty-exemption window agree rather than
+        // dropping gossip from a peer the scoring layer already trusts. Never-committee peers are
+        // still excluded. Built here, before the committee sets are moved into
+        // `init_network_for_epoch`. See issues #898 and #912.
+        let boundary_publishers: HashSet<BlsPublicKey> = previous_committee_keys
+            .iter()
+            .chain(committee_keys.iter())
+            .chain(next_committee_keys.iter())
+            .copied()
+            .collect();
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
             bootstrap_peers,
@@ -495,12 +582,34 @@ where
             network_handle.inner_handle().start_listening(primary_address).await?;
         }
 
-        // update the authorized publishers for gossip every epoch
+        // Update the authorized publishers for gossip every epoch. `primary_topic`,
+        // `epoch_vote_topic` and `consensus_output_topic` are all committee-only publish topics:
+        // restricting the publisher set makes the network layer (`verify_gossip`) drop messages
+        // from non-committee sources before re-propagation, and re-subscribing here every epoch
+        // refreshes the allowlist across committee rotation (the swarm overwrites the previous
+        // set). `primary_topic` uses the current committee; the two boundary topics use the wider
+        // previous/current/next window (see `boundary_publishers` above) so late gossip from a
+        // rotated-out validator and early gossip from a rotating-in one are still relayed. See
+        // issues #898 and #912.
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                tn_config::LibP2pConfig::primary_topic(),
-                committee_keys.into_iter().collect(),
+                tn_config::LibP2pConfig::primary_topic(consensus_config.chain_id()),
+                committee_keys,
+            )
+            .await?;
+        network_handle
+            .inner_handle()
+            .subscribe_with_publishers(
+                tn_config::LibP2pConfig::epoch_vote_topic(consensus_config.chain_id()),
+                boundary_publishers.clone(),
+            )
+            .await?;
+        network_handle
+            .inner_handle()
+            .subscribe_with_publishers(
+                tn_config::LibP2pConfig::consensus_output_topic(consensus_config.chain_id()),
+                boundary_publishers,
             )
             .await?;
 
@@ -524,6 +633,11 @@ where
         }
 
         Self::wait_for_network_peers(network_handle.inner_handle(), "primary network").await?;
+
+        // re-probe each peer's epoch-pack sync capability this epoch: committees
+        // rotate and binaries are upgraded at the boundary, so a peer that could
+        // only speak legacy last epoch may now serve the sync protocol (739, step 6)
+        network_handle.clear_sync_capability();
 
         // spawn primary network
         PrimaryNetwork::new(
@@ -598,8 +712,9 @@ where
     /// committee peers — the peer manager drops dials to peers already connected — then waits
     /// for peers before spawning the network on the epoch-scoped spawner.
     ///
-    /// Two topics are subscribed: the worker transaction topic, and the batch topic restricted to
-    /// committee publishers so non-CVVs can prefetch batches (harmless for CVVs).
+    /// The batch topic is subscribed, restricted to committee publishers so non-CVVs can
+    /// prefetch batches (harmless for CVVs). Non-CVVs push the transactions they accept to
+    /// the committee over RPC rather than gossiping them (issue #804).
     #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_network_for_epoch(
         &mut self,
@@ -669,17 +784,12 @@ where
 
         Self::wait_for_network_peers(network_handle.inner_handle(), "worker network").await?;
 
-        // update the authorized publishers for gossip every epoch
-        network_handle
-            .inner_handle()
-            .subscribe(tn_config::LibP2pConfig::worker_txn_topic())
-            .await?;
-        // Get gossip from committee members about batches.
+        // Get gossip from committee members about batches every epoch.
         // Useful for non-CVVs to prefetch and harmless for CVVs.
         network_handle
             .inner_handle()
             .subscribe_with_publishers(
-                tn_config::LibP2pConfig::worker_batch_topic(),
+                tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id()),
                 committee_keys.into_iter().collect(),
             )
             .await?;

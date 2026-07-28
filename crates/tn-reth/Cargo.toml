@@ -16,6 +16,7 @@ clap = { workspace = true, features = ["derive", "env"] }
 tn-config = { workspace = true }
 tn-types = { workspace = true }
 tn-worker = { workspace = true }
+tn-storage = { workspace = true }
 dirs-next = "2.0.0"
 parking_lot = { workspace = true }
 
@@ -37,6 +38,9 @@ reth-evm = { workspace = true }
 reth-node-builder = { workspace = true }
 reth-provider = { workspace = true }
 reth-primitives-traits = { workspace = true }
+reth-stages-types = { workspace = true }
+reth-trie = { workspace = true }
+reth-trie-db = { workspace = true }
 reth-transaction-pool = { workspace = true }
 
 reth-errors = { workspace = true }
@@ -69,13 +73,19 @@ secp256k1 = { workspace = true, optional = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 secp256k1 = { workspace = true }
 proptest = { workspace = true }
+rand = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = []
 faucet = []
 test-utils = ["dep:secp256k1"]
-adiri = ["faucet"]
+adiri = ["faucet", "tn-types/adiri"]
+# Opt back in to reth's RocksDB storage backend (librocksdb-sys, the RocksDB C++ engine).
+# Off by default: storage is MDBX-only today, so `RocksDBProvider` resolves to reth's
+# zero-size stub and the 332-translation-unit native compile is skipped entirely.
+# Required before any storage-v2 / `StorageSettings` experimentation.
+rocksdb = ["reth/rocksdb"]
 
 [lints]
 workspace = true

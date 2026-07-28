@@ -106,6 +106,16 @@ pub struct GenesisArgs {
     /// Min delay for a node to produce a new header.
     #[arg(long)]
     pub min_header_delay_ms: Option<u64>,
+    /// Max time a worker waits before sealing a batch of pending transactions. Paces block
+    /// production under transaction load; it does not seal empty batches, so it does not
+    /// gate idle round advance (the header delays do that).
+    #[arg(long)]
+    pub max_batch_delay_ms: Option<u64>,
+    /// Garbage-collection depth in DAG rounds. Lowering it demotes a lagging CVV to
+    /// `CvvInactive` after fewer rounds of downtime (the follow/state-sync path). Test-only
+    /// knob; when unset, `Parameters::default` uses the `MAX_GC_DEPTH` protocol default.
+    #[arg(long)]
+    pub gc_depth: Option<u32>,
     /// Numeric chain id that will go in the genesis.
     /// Default is 0xde7e1 (911329).  Used mostly for testing.
     #[arg(long, default_value_t = 911329, value_parser=maybe_hex)]
@@ -157,6 +167,19 @@ impl GenesisArgs {
     ///
     /// The worker id is validated to match the index position (0, 1, 2, ...).
     fn parse_worker_fee_configs(&self) -> eyre::Result<Vec<(u8, u64)>> {
+        /// Highest strategy id the `WorkerConfigs` contract accepts; mirrors
+        /// `WorkerConfigs.sol`'s `MAX_STRATEGY` (0 = EIP-1559, 1 = static fee).
+        const MAX_STRATEGY: u8 = 1;
+
+        // `WorkerConfigs.sol` reverts `NumWorkersBelowMinimum()` on an empty config set. The
+        // clap default guarantees one entry when the flag is absent, but guard programmatic
+        // construction too so the ceremony fails at parse time, not at the pre-genesis deploy.
+        if self.worker_fee_configs.is_empty() {
+            eyre::bail!(
+                "at least one --worker-fee-config is required: WorkerConfigs deploys with numWorkers >= 1"
+            );
+        }
+
         let mut configs: Vec<(u16, u8, u64)> = self
             .worker_fee_configs
             .iter()
@@ -173,6 +196,13 @@ impl GenesisArgs {
                 let strategy: u8 = parts[1].parse().map_err(|e| {
                     eyre::eyre!("invalid strategy '{}' in --worker-fee-config: {e}", parts[1])
                 })?;
+                // reject strategies the contract's constructor would revert on
+                // (`InvalidStrategy`) so a ceremony typo fails loudly at parse time
+                if strategy > MAX_STRATEGY {
+                    eyre::bail!(
+                        "invalid strategy {strategy} in --worker-fee-config '{s}': accepted strategies are 0 (EIP-1559) and 1 (static fee)"
+                    );
+                }
                 let value: u64 = parts[2].parse().map_err(|e| {
                     eyre::eyre!("invalid value '{}' in --worker-fee-config: {e}", parts[2])
                 })?;
@@ -282,6 +312,12 @@ impl GenesisArgs {
         if let Some(min_header_delay_ms) = self.min_header_delay_ms {
             parameters.min_header_delay = Duration::from_millis(min_header_delay_ms);
         }
+        if let Some(max_batch_delay_ms) = self.max_batch_delay_ms {
+            parameters.max_batch_delay = Duration::from_millis(max_batch_delay_ms);
+        }
+        if let Some(gc_depth) = self.gc_depth {
+            parameters.gc_depth = gc_depth;
+        }
         parameters.basefee_address = Some(self.basefee_address);
 
         // write genesis and config to file
@@ -318,6 +354,8 @@ mod tests {
             dev_funded_account: None,
             max_header_delay_ms: None,
             min_header_delay_ms: None,
+            max_batch_delay_ms: None,
+            gc_depth: None,
             chain_id: 2017,
             worker_fee_configs: configs.into_iter().map(String::from).collect(),
             accounts: None,
@@ -364,5 +402,45 @@ mod tests {
         let args = args_with_configs(vec!["bad"]);
         let result = args.parse_worker_fee_configs();
         assert!(result.is_err());
+    }
+
+    /// Regression: strategies above `WorkerConfigs.sol`'s `MAX_STRATEGY` (= 1) must fail at
+    /// parse time with a message naming the offending entry, instead of reverting the
+    /// pre-genesis constructor.
+    #[test]
+    fn test_parse_worker_fee_configs_rejects_strategy_above_max() {
+        let args = args_with_configs(vec!["0:0:30000000", "1:2:500"]);
+        let err = args.parse_worker_fee_configs().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid strategy 2 in --worker-fee-config '1:2:500'"),
+            "error must name the offending entry, got: {msg}"
+        );
+        assert!(
+            msg.contains("accepted strategies are 0 (EIP-1559) and 1 (static fee)"),
+            "error must state the accepted range, got: {msg}"
+        );
+    }
+
+    /// The exact `default_value` clap injects when `--worker-fee-config` is absent must keep
+    /// parsing (flag absent means one worker with the EIP-1559 strategy).
+    #[test]
+    fn test_parse_worker_fee_configs_clap_default() {
+        let args = args_with_configs(vec!["0:0:18446744073709551615"]);
+        let result = args.parse_worker_fee_configs().unwrap();
+        assert_eq!(result, vec![(0, u64::MAX)]);
+    }
+
+    /// Regression: an empty config list (only reachable programmatically — clap's default
+    /// guarantees one entry) must fail at parse time; the contract constructor would revert
+    /// `NumWorkersBelowMinimum`.
+    #[test]
+    fn test_parse_worker_fee_configs_empty_errors() {
+        let args = args_with_configs(vec![]);
+        let err = args.parse_worker_fee_configs().unwrap_err();
+        assert!(
+            err.to_string().contains("at least one --worker-fee-config is required"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -55,13 +55,19 @@ impl PendingCertificateManager {
     /// Attempts to insert a new pending certificate.
     ///
     /// Callers must ensure certificates are verified before inserting into pending state.
+    /// The sole caller only admits certificates above `gc_round + 1`, so the round is expected
+    /// to be >= 2; the parent-round key below floors at 0 regardless, so this helper stays
+    /// underflow-safe independent of that caller-side gate (see #887).
     pub(super) fn insert_pending(
         &mut self,
         certificate: Certificate,
         missing_parents: HashSet<HeaderDigest>,
     ) -> CertManagerResult<()> {
         let digest = certificate.digest();
-        let parent_round = certificate.round() - 1;
+        // `saturating_sub` keeps this helper underflow-safe on its own: a round-0 certificate
+        // must not wrap to `u32::MAX`, a key `next_for_gc_round` would never collect
+        // (see #887, the pending-path sibling of #789).
+        let parent_round = certificate.round().saturating_sub(1);
         debug!(target: "primary::pending_certs", ?digest, "Processing certificate with missing parents");
 
         // track pending certificate

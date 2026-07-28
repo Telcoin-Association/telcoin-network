@@ -38,7 +38,8 @@ All sites live in `crates/network-libp2p/src/consensus.rs`. `NetworkCommand::Rep
 
 | Location                                     | Trigger (immediate guard)                                                     | Severity |
 | -------------------------------------------- | ----------------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:828` | `verify_gossip` rejected (`!valid`) — invalid topic or unauthorized publisher | `Fatal`  |
+| `crates/network-libp2p/src/consensus.rs:1004` | `verify_gossip` rejected `TooLarge` (oversized payload) **and** the relaying peer's BLS has resolved (`RejectPenalty::FatalRelayer`) — the size bound is a compile-time protocol constant (`MAX_GOSSIP_MESSAGE_SIZE`) identical on every honest node, so under `Strict` validation a peer that forwards an oversized payload is itself misbehaving | `Fatal`  |
+| `crates/network-libp2p/src/consensus.rs:1030` | `verify_gossip` rejected `UnauthorizedAuthor` (author absent / unresolved / unauthorized), or `TooLarge` from an unresolved relayer (`RejectPenalty::Skip`) — author-attributable or unattributable, so the forwarder is not penalized (issues #801/#819) | `None`   |
 | `crates/network-libp2p/src/consensus.rs:839` | `GossipEvent::GossipsubNotSupported { peer_id }`                              | `Fatal`  |
 | `crates/network-libp2p/src/consensus.rs:843` | `GossipEvent::SlowPeer { peer_id, failed_messages }`                          | `Mild`   |
 
@@ -50,10 +51,10 @@ All sites live in `crates/network-libp2p/src/consensus.rs`. `NetworkCommand::Rep
 | `crates/network-libp2p/src/consensus.rs:946` | `OutboundFailure::Io(e)` with transport-flap `e.kind()` (Reset/Aborted/Timed/EOF/Pipe/Interrupted) | `None`   |
 | `crates/network-libp2p/src/consensus.rs:946` | `OutboundFailure::Io(e)` other kinds (codec violation, e.g. `io::Error::other`)                    | `Medium` |
 | `crates/network-libp2p/src/consensus.rs:961` | `OutboundFailure::Timeout`                                                                         | `Mild`   |
-| `crates/network-libp2p/src/consensus.rs:973` | `OutboundFailure::UnsupportedProtocols`                                                            | `Severe` |
+| `crates/network-libp2p/src/consensus.rs:1071` | `OutboundFailure::UnsupportedProtocols` (honest version/role skew — warn only) | `None` |
 | `crates/network-libp2p/src/consensus.rs:973` | `InboundFailure::Io(e)` with transport-flap `e.kind()`                                             | `None`   |
 | `crates/network-libp2p/src/consensus.rs:973` | `InboundFailure::Io(e)` other kinds (codec violation)                                              | `Medium` |
-| `crates/network-libp2p/src/consensus.rs:992` | `InboundFailure::UnsupportedProtocols`                                                             | `Severe` |
+| `crates/network-libp2p/src/consensus.rs:1112` | `InboundFailure::UnsupportedProtocols` (honest version/role skew — warn only) | `None` |
 | `crates/network-libp2p/src/consensus.rs:995` | `InboundFailure::Timeout` / `InboundFailure::ConnectionClosed`                                     | `None`   |
 
 `InboundFailure::ResponseOmission` is explicitly a no-op (local error). See restraint invariants below.
@@ -91,7 +92,6 @@ ban itself was applied elsewhere.
 | ------------------------------------------------ | ------------------------------------------------------ | ----------------------------------------------- |
 | `crates/consensus/worker/src/network/mod.rs:246` | `process_report_batch`                                 | `WorkerNetworkError::into() -> Option<Penalty>` |
 | `crates/consensus/worker/src/network/mod.rs:271` | `process_gossip`                                       | `WorkerNetworkError::penalty()`                 |
-| `crates/consensus/worker/src/network/mod.rs:379` | `process_request_batches_stream` response-error branch | `WorkerNetworkError::into() -> Option<Penalty>` |
 | `crates/consensus/worker/src/network/mod.rs:435` | `process_inbound_stream`                               | `WorkerNetworkError::penalty()`                 |
 
 ### 4.2 `WorkerNetworkError::penalty()` mapping
@@ -140,7 +140,6 @@ Source: `crates/consensus/worker/src/network/error.rs:76-138`.
 | `crates/consensus/primary/src/network/mod.rs:682` | `retrieve_missing_certs`                   | `(&PrimaryNetworkError).into() -> Option<Penalty>` |
 | `crates/consensus/primary/src/network/mod.rs:719` | `retrieve_consensus_header`                | `(&PrimaryNetworkError).into()` — only reachable variant `UnknownConsensusHeaderDigest` → `None` |
 | `crates/consensus/primary/src/network/mod.rs:751` | `retrieve_epoch_record`                    | `(&PrimaryNetworkError).into()`                    |
-| `crates/consensus/primary/src/network/mod.rs:835` | `process_epoch_stream` response-err branch | `(&PrimaryNetworkError).into()`                    |
 | `crates/consensus/primary/src/network/mod.rs:863` | `process_gossip`                           | `(&PrimaryNetworkError).into()`                    |
 | `crates/consensus/primary/src/network/mod.rs:912` | `process_inbound_stream`                   | `(&PrimaryNetworkError).into()`                    |
 
@@ -197,6 +196,7 @@ Source: `crates/consensus/primary/src/error/network.rs:137-171`.
 | `AlreadyVoted(_, _)`               | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
 | `DuplicateParents`                 | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
 | `TooManyParents(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
+| `TooManyBatches(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
 | `UnknownNetworkKey(_)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
 | `PeerNotAuthor`                    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
 | `InvalidGenesisParent(_)`          | `Fatal`  | `crates/consensus/primary/src/error/network.rs:153-164` |
@@ -251,6 +251,8 @@ These are deliberate tolerances for benign failures. Changing any of these from
 - All `PackError` IO/load/persist/internal variants — local failures. `crates/consensus/primary/src/network/mod.rs:460-476`.
 - `ConsensusChainError::StreamUnavailable` / `NoCurrentEpoch` / `EpochDbError` / `IO` — local failures during epoch pack streaming. `crates/consensus/primary/src/network/mod.rs:484-487`.
 - A rejected kad put record from a banned source/publisher with `record.publisher.is_some()` — no extra penalty is stacked on top of the existing ban. `crates/network-libp2p/src/consensus.rs:1375-1388`.
+- `OutboundFailure::UnsupportedProtocols` / `InboundFailure::UnsupportedProtocols` — honest version/role skew (multistream-select found no common protocol), not misbehavior; warn only, no penalty. Precondition for the #765 chain-id protocol split, which intentionally makes old/new nodes fail to peer. `crates/network-libp2p/src/consensus.rs:1071,1112`. The stream-path mirror (`StreamFailure::UnsupportedProtocol`) is likewise `None`. `crates/network-libp2p/src/stream/upgrade.rs`.
+- The node's own peer id — `PeerManager::process_penalty` short-circuits before the score model when the target is the local identity, so a self-connection (e.g. a learned hairpin address routed back to our own id) can never ban the node's own worker. `crates/network-libp2p/src/peers/manager.rs` (`is_local_peer`). Self-connections are also denied earlier on the dial/discovery/connection paths so they do not reach the penalty path at all.
 
 ## 7. Ban Lifecycle
 

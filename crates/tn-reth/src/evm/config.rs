@@ -14,7 +14,7 @@ use reth_revm::{
 };
 use std::sync::Arc;
 use tn_types::{
-    gas_accumulator::RewardsCounter, BlockHeader as _, Bytes, SealedBlock, SealedHeader, B256, U256,
+    gas_accumulator::RewardsCounter, BlockHeader as _, SealedBlock, SealedHeader, B256, U256,
 };
 
 /// TN-related EVM configuration.
@@ -151,11 +151,19 @@ impl ConfigureEvm for TnEvmConfig {
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-        // extra data is default otherwise it contains the hashed bls signature
-        let close_epoch = if block.extra_data == Bytes::default() {
-            None
-        } else {
-            Some(B256::from_slice(block.extra_data.as_ref()))
+        // `extra_data` is empty for a normal block; an epoch-closing block carries the 32-byte
+        // keccak of the leader's aggregate BLS signature (see `TNBlockAssembler::assemble_block`).
+        // Any other length is a malformed header — error instead of panicking in `from_slice`.
+        let close_epoch = match block.extra_data.len() {
+            0 => None,
+            32 => Some(B256::from_slice(block.extra_data.as_ref())),
+            len => {
+                return Err(TnRethError::EVMCustom(format!(
+                    "invalid extra_data length {len} in block {}: expected empty or a 32-byte \
+                     closing-epoch digest",
+                    block.hash(),
+                )))
+            }
         };
 
         Ok(TNBlockExecutionCtx {
@@ -183,5 +191,40 @@ impl ConfigureEvm for TnEvmConfig {
             difficulty: U256::from(payload.batch_index << 16 | payload.worker_id as usize),
             rewards_counter: self.rewards_counter.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tn_types::{Block, Bytes, ExecHeader};
+
+    /// Replay-path `extra_data` decode: empty → no epoch close, 32 bytes → the closing-epoch
+    /// digest, anything else → an error rather than a `B256::from_slice` panic.
+    #[test]
+    fn test_context_for_block_extra_data_lengths() {
+        let chain: ChainSpec = tn_types::test_genesis().into();
+        let config = TnEvmConfig::new(Arc::new(chain), RewardsCounter::default());
+        let block_with_extra = |extra_data: Bytes| {
+            SealedBlock::seal_slow(Block {
+                header: ExecHeader { extra_data, ..Default::default() },
+                body: Default::default(),
+            })
+        };
+
+        // normal block: empty extra_data
+        let block = block_with_extra(Bytes::default());
+        let ctx = config.context_for_block(&block).expect("empty extra_data is valid");
+        assert!(ctx.close_epoch.is_none());
+
+        // epoch-closing block: 32-byte digest
+        let digest = B256::repeat_byte(7);
+        let block = block_with_extra(digest.to_vec().into());
+        let ctx = config.context_for_block(&block).expect("32-byte extra_data is valid");
+        assert_eq!(ctx.close_epoch, Some(digest));
+
+        // malformed header: any other length errors instead of panicking
+        let block = block_with_extra(Bytes::from_static(b"bad"));
+        assert!(config.context_for_block(&block).is_err());
     }
 }

@@ -57,6 +57,12 @@ where
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
     ) -> eyre::Result<Self> {
+        // Production entry point: enforce the operational floors that the shared, test-facing
+        // `new_with_committee` deliberately skips so DAG test fixtures may use small `gc_depth`
+        // values. The protocol ceilings are still validated for every constructor inside
+        // `new_with_committee`.
+        config.parameters.validate_operational_floors()?;
+
         // load committee from file
         let committee: Committee =
             Config::load_from_path_or_default(tn_datadir.committee_path(), ConfigFmt::YAML)?;
@@ -105,6 +111,11 @@ where
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
     ) -> eyre::Result<Self> {
+        // Production entry point: enforce the operational floors (see
+        // [`Parameters::validate_operational_floors`]); the shared test-facing constructor skips
+        // them so DAG fixtures may use small `gc_depth` values.
+        config.parameters.validate_operational_floors()?;
+
         Self::new_with_committee(
             config,
             node_storage,
@@ -130,6 +141,17 @@ where
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
     ) -> eyre::Result<Self> {
+        // Reject a configuration whose consensus parameters exceed the protocol ceilings the
+        // consensus-pack reader relies on, so a node can never commit an output it cannot later
+        // reconstruct.
+        config.parameters.validate()?;
+
+        // Reject a peer-score configuration whose bounds would panic `Score::add`'s `f64::clamp`
+        // (a `min_score > max_score` or `NaN` bound) or silently disable reputation enforcement,
+        // on the same startup footing as the consensus parameters above, long before the first
+        // peer penalty routes the config through the running swarm.
+        network_config.peer_config().score_config.validate()?;
+
         let local_network = LocalNetwork::new(key_config.primary_public_key());
 
         let primary_public_key = key_config.primary_public_key();
@@ -236,6 +258,15 @@ where
     /// Contains p2p settings and connectivity parameters for libp2p.
     pub fn network_config(&self) -> &NetworkConfig {
         &self.inner.network_config
+    }
+
+    /// The chain id used to namespace this node's wire protocols and gossip topics.
+    ///
+    /// Reads the value stamped onto the network config from genesis at node startup,
+    /// so the gossip-validation side (here) and the publish/subscribe side share one
+    /// source. See [`NetworkConfig::set_chain_id`].
+    pub fn chain_id(&self) -> u64 {
+        self.inner.network_config.chain_id()
     }
 
     /// The current epoch for [Committee].

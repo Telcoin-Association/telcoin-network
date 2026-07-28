@@ -29,7 +29,7 @@ Software:
 Build from source:
 
 ```bash
-cargo build --bin telcoin-network --release
+cargo build -p telcoin-network --bin telcoin-network --release
 ```
 
 The binary lands at `target/release/telcoin-network`.
@@ -59,6 +59,7 @@ telcoin-network keytool generate observer \
 | `--address`, `--execution-address` | required                   | EVM address for fee recipient. Pass `0` for the zero address. Env: `EXECUTION_ADDRESS`                                |
 | `--workers`                        | `1`                        | Number of workers for the primary (range: 1-4, must be 1 currently)                                                   |
 | `--force`, `--overwrite`           | `false`                    | Overwrite existing keys. Existing keys are lost permanently                                                           |
+| `--name`                           | auto-derived               | Human-readable node name written to `node-info.yaml` (logging/RPC only). Defaults to `node-<bs58 of BLS key>`         |
 | `--external-primary-addr`          | localhost with random port | External multiaddr for the primary P2P network. Format: `/ip4/HOST/udp/PORT/quic-v1`. Env: `TN_EXTERNAL_PRIMARY_ADDR` |
 | `--external-worker-addrs`          | localhost with random port | Comma-separated multiaddrs for worker P2P networks. Env: `TN_EXTERNAL_WORKER_ADDRS`                                   |
 
@@ -117,6 +118,50 @@ execution_address: "0xefaacf04b92298a88200aa50aa6bb7bfce587b17"
 proof_of_possession: "kFa9r..."
 ```
 
+### Rotating the execution address
+
+To stake or earn rewards under a different execution address, the proof of possession has to be re-signed. The PoP commits to the execution address, so the original signature fails on-chain `stake()` verification once the address changes (the symptom is a "proof of possession is incorrect" revert).
+
+`keytool generate pop` re-signs the proof of possession for a new address using the node's *existing* keys. It never generates or overwrites keys — the BLS key, network identity keys, p2p peer IDs, and node name stay byte-for-byte identical. Only `execution_address` and `proof_of_possession` in `node-info.yaml` change.
+
+```bash
+telcoin-network keytool generate pop \
+    --datadir /var/lib/telcoin \
+    --address 0xNEW_EXECUTION_ADDRESS
+```
+
+The command requires existing keys and a `node-info.yaml` under `--datadir`; it errors if either is missing (run `keytool generate validator|observer` first). When the new address differs from the current one it logs a warning, re-signs, and prints the new proof of possession. The `proof-of-possession` alias and the `EXECUTION_ADDRESS` env var both work, mirroring `generate validator|observer`.
+
+After rotating, re-export the staking arguments for the new address (see [Staking registration](#staking-registration)):
+
+```bash
+telcoin-network keytool export-staking-args \
+    --node-info /var/lib/telcoin/node-info.yaml
+```
+
+### Advertising a JSON-RPC endpoint
+
+A node can advertise an optional JSON-RPC endpoint to peers over Kademlia so wallets and dapps can discover where to submit transactions. The endpoint is stored in `node-info.yaml` under `p2p_info.worker.rpc` and advertised by the worker network when the node runs.
+
+`keytool set-rpc` sets or clears that endpoint. It is a config-only edit — no keys are read and the BLS passphrase is ignored — so it requires an existing `node-info.yaml` under `--datadir`; run `keytool generate validator|observer` first (it errors with that hint otherwise).
+
+```bash
+telcoin-network keytool set-rpc \
+    --datadir /var/lib/telcoin \
+    --http https://validator.example.com:8545/ \
+    --ws wss://validator.example.com:8546/
+```
+
+`--http` is the required HTTP/HTTPS endpoint; `--ws` is the optional WebSocket endpoint. Both are validated with the same check node startup applies — `--http` must use the `http` or `https` scheme and `--ws` must use `ws` or `wss` — so a bad scheme fails immediately instead of being advertised and rejected by peers.
+
+Remove a previously-advertised endpoint with `--clear`:
+
+```bash
+telcoin-network keytool set-rpc --datadir /var/lib/telcoin --clear
+```
+
+`--clear` conflicts with `--http`/`--ws`, and omitting all flags is an error (`--http` is required unless `--clear`).
+
 ## Genesis ceremony
 
 The genesis ceremony runs once per network. One coordinator collects all validators' `node-info.yaml` files, runs the `genesis` command, and distributes the output to every participant.
@@ -161,6 +206,7 @@ telcoin-network genesis \
 | `--epoch-duration-in-secs`, `--epoch_length`         | `86400`        | Epoch duration in seconds (default: 24 hours)                                             |
 | `--max-header-delay-ms`                              | none           | Max delay between header proposals (milliseconds)                                         |
 | `--min-header-delay-ms`                              | none           | Min delay between header proposals (milliseconds)                                         |
+| `--max-batch-delay-ms`                               | none           | Max delay before a worker seals a batch of pending transactions (milliseconds)            |
 | `--dev-funded-account`                               | none           | Fund a deterministic test account. Never use in production                                |
 | `--accounts`                                         | none           | Path to a YAML file mapping addresses to genesis accounts                                 |
 
@@ -598,8 +644,7 @@ JSON (`--json`):
 ```json
 {
 	"blsPubkey": "0x...",
-	"uncompressedPubkey": "0x...",
-	"uncompressedSignature": "0x..."
+	"signature": "0x..."
 }
 ```
 
@@ -616,12 +661,11 @@ function stake(
 ) public
 
 struct ProofOfPossession {
-    bytes uncompressedPubkey;    // 192 bytes
-    bytes uncompressedSignature; // 96 bytes
+    bytes signature; // 48 bytes (compressed G1)
 }
 ```
 
-The compressed BLS public key is 96 bytes. The proof of possession binds the BLS key to the validator's execution address.
+The compressed BLS public key is 96 bytes and the proof-of-possession signature is 48 bytes. The proof of possession binds the BLS key to the validator's execution address; the native precompile verifies the signature directly against the compressed `blsPubkey`.
 
 ## Observer mode
 

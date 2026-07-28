@@ -3,9 +3,8 @@
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use tn_reth::{recover_raw_transaction, recover_signed_transaction, RethEnv, WorkerTxPool};
 use tn_types::{
-    gas_accumulator::BaseFeeContainer, max_batch_gas, max_batch_size, BatchValidation,
-    BatchValidationError, BlockHash, Epoch, SealedBatch, TransactionSigned, TransactionTrait as _,
-    WorkerId,
+    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, BlockHash, Epoch,
+    SealedBatch, TransactionSigned, TransactionTrait as _, WorkerId,
 };
 
 /// Type convenience for implementing block validation errors.
@@ -24,8 +23,11 @@ pub struct BatchValidator {
     tx_pool: Option<WorkerTxPool>,
     /// Worker id for this validator.
     worker_id: WorkerId,
-    /// Current base fee for this validators worker.
-    base_fee: BaseFeeContainer,
+    /// Base fee for this validator's worker for the current epoch.
+    ///
+    /// Base fee is constant within an epoch and the validator is recreated each epoch, so this is
+    /// a plain `u64` snapshot taken at epoch start rather than a shared container.
+    base_fee: u64,
     /// Epoch we are validating for.
     epoch: Epoch,
 }
@@ -110,7 +112,7 @@ impl BatchValidator {
         reth_env: RethEnv,
         tx_pool: Option<WorkerTxPool>,
         worker_id: WorkerId,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> Self {
         Self { reth_env, tx_pool, worker_id, base_fee, epoch }
@@ -184,7 +186,7 @@ impl BatchValidator {
 
     /// Validate the block's basefee
     fn validate_basefee(&self, base_fee: u64) -> BatchValidationResult<()> {
-        let expected_base_fee = self.base_fee.base_fee();
+        let expected_base_fee = self.base_fee;
         if base_fee != expected_base_fee {
             Err(BatchValidationError::InvalidBaseFee { expected_base_fee, base_fee })
         } else {
@@ -234,6 +236,7 @@ mod tests {
     use std::{path::Path, str::FromStr, sync::Arc};
     use tempfile::TempDir;
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
+    use tn_test_utils::wait_until;
     use tn_types::{
         max_batch_gas, test_genesis, Address, Batch, Bytes, Encodable2718 as _, FromHex,
         GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
@@ -305,7 +308,7 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), path, task_manager, None).unwrap();
         let tx_pool = reth_env.init_txn_pool().unwrap();
         let validator =
-            BatchValidator::new(reth_env, Some(tx_pool.clone()), 0, BaseFeeContainer::default(), 0);
+            BatchValidator::new(reth_env, Some(tx_pool.clone()), 0, MIN_PROTOCOL_BASE_FEE, 0);
         let valid_batch = next_valid_sealed_batch(chain);
 
         // block validator
@@ -671,7 +674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_submit_txn_if_mine_routes_to_correct_slot() {
+    async fn test_submit_txn_if_mine_routes_to_correct_slot() -> eyre::Result<()> {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let TestTools { validator, tx_pool, .. } = test_tools(tmp_dir.path(), &task_manager).await;
@@ -693,12 +696,13 @@ mod tests {
         validator.submit_txn_if_mine(&encoded, committee_size, expected_slot);
 
         // Poll for the spawned task to complete
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tx_pool.pool_size().pending == 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            assert!(tokio::time::Instant::now() < deadline, "timeout waiting for tx in pool");
-        }
+        wait_until(std::time::Duration::from_secs(5), "txs inserted into pool", || async {
+            Ok(tx_pool.pool_size().pending >= 1)
+        })
+        .await?;
         assert_eq!(tx_pool.pool_size().pending, 1);
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -730,7 +734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_submit_txn_if_mine_same_sender_same_slot() {
+    async fn test_submit_txn_if_mine_same_sender_same_slot() -> eyre::Result<()> {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let TestTools { validator, tx_pool, .. } = test_tools(tmp_dir.path(), &task_manager).await;
@@ -754,12 +758,13 @@ mod tests {
         }
 
         // Poll for all 3 spawned tasks to complete
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tx_pool.pool_size().pending < 3 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            assert!(tokio::time::Instant::now() < deadline, "timeout waiting for txs in pool");
-        }
+        wait_until(std::time::Duration::from_secs(5), "txs inserted into pool", || async {
+            Ok(tx_pool.pool_size().pending >= 3)
+        })
+        .await?;
         assert_eq!(tx_pool.pool_size().pending, 3);
+
+        Ok(())
     }
 
     #[test]

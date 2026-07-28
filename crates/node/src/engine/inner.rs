@@ -3,7 +3,7 @@
 //! This module contains the logic for execution.
 
 use crate::error::ExecutionError;
-use eyre::OptionExt;
+use eyre::{eyre, OptionExt};
 use jsonrpsee::http_client::HttpClient;
 use std::{net::SocketAddr, sync::Arc};
 use tn_batch_builder::BatchBuilder;
@@ -17,14 +17,13 @@ use tn_reth::{
 };
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
-    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, ConsensusHeaderDigest,
-    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
-    MIN_PROTOCOL_BASE_FEE,
+    gas_accumulator::GasAccumulator, Address, BatchSender, BatchValidation, BlockHeader,
+    BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer,
+    SealedHeader, TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Inner type for holding execution layer types.
 #[derive(Debug)]
@@ -75,7 +74,7 @@ impl ExecutionNodeInner {
         // spawn tn engine
         self.reth_env.get_task_spawner().spawn_critical_task("consensus engine", async move {
             info!("Engine stated from block {block_num}/{block_hash}, consensus output {consensus_header:?}");
-            let res = tn_engine.await;
+            let res = tn_engine.run().await;
             match &res {
                 Ok(_) => {
                     info!(target: "engine", "TN Engine exited gracefully");
@@ -121,7 +120,7 @@ impl ExecutionNodeInner {
 
         // spawn batch builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
-            let res = batch_builder.await;
+            let res = batch_builder.run().await;
             info!(target: "tn::execution", ?res, "batch builder task exited");
             Ok(res?)
         });
@@ -137,6 +136,7 @@ impl ExecutionNodeInner {
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
+        base_fee: u64,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
@@ -146,7 +146,7 @@ impl ExecutionNodeInner {
         let network =
             WorkerNetwork::new(self.reth_env.chainspec(), network_handle, self.tn_config.version);
         let mut tx_pool_latest = transaction_pool.block_info();
-        tx_pool_latest.pending_basefee = MIN_PROTOCOL_BASE_FEE;
+        tx_pool_latest.pending_basefee = base_fee;
         let last_seen = self.reth_env.finalized_block_hash_number_for_startup()?;
         tx_pool_latest.last_seen_block_hash = last_seen.hash;
         tx_pool_latest.last_seen_block_number = last_seen.number;
@@ -175,6 +175,39 @@ impl ExecutionNodeInner {
         Ok(())
     }
 
+    /// Update the pending base fee on a worker's transaction pool.
+    ///
+    /// Called every epoch so the pool charges the base fee the accumulator currently holds for
+    /// the worker. This covers the respawn path, where `initialize_worker_components` is skipped
+    /// but the base fee for the new epoch must still take effect. If the worker's components have
+    /// not been initialized, the update is dropped with a warning and forces node shutdown: the
+    /// worker's pool would keep charging the previous epoch's base fee, admitting underpriced
+    /// transactions into batches that are rejected by peers.
+    pub(super) fn set_worker_base_fee(
+        &self,
+        worker_id: WorkerId,
+        base_fee: u64,
+    ) -> eyre::Result<()> {
+        if let Some(worker) = self.workers.get(worker_id as usize) {
+            let pool = worker.pool();
+            let mut block_info = pool.block_info();
+            block_info.pending_basefee = base_fee;
+            pool.set_block_info(block_info);
+        } else {
+            warn!(
+                target: "tn::execution",
+                worker_id,
+                initialized_workers = self.workers.len(),
+                "set_worker_base_fee: dropping base-fee update for uninitialized worker"
+            );
+            return Err(eyre!(
+                "set_worker_base_fee: worker {worker_id} uninitialized ({} workers initialized)",
+                self.workers.len()
+            ));
+        }
+        Ok(())
+    }
+
     /// Respawn any tasks on the worker network when we get a new epoch task manager.
     ///
     /// This method should be called on epoch rollover.
@@ -189,7 +222,7 @@ impl ExecutionNodeInner {
     pub(super) fn new_batch_validator(
         &self,
         worker_id: &WorkerId,
-        base_fee: BaseFeeContainer,
+        base_fee: u64,
         epoch: Epoch,
     ) -> Arc<dyn BatchValidation> {
         // retrieve handle to transaction pool to submit gossip transactions to validators
@@ -207,13 +240,13 @@ impl ExecutionNodeInner {
     /// This returns the hash of the last executed ConsensusHeader on the consensus chain.
     /// since the execution layer is confirming the last executing block.
     pub(super) fn last_executed_output(&self) -> eyre::Result<ConsensusHeaderDigest> {
-        // NOTE: The payload_builder only extends canonical tip and sets finalized after
-        // entire output is successfully executed. This ensures consistent recovery state.
-        //
-        // For example: consensus round 8 sends an output with 5 blocks, but only 2 blocks are
-        // executed before the node restarts. The provider never finalized the round, so the
-        // `finalized_block_number` would point to the last block of round 7. The primary
-        // would then re-send consensus output for round 8.
+        // The payload builder commits an output's blocks and the finalized marker in ONE
+        // transaction, so a crash can no longer leave the marker lagging the persisted tip.
+        // Startup additionally heals databases written by pre-fix versions that committed the
+        // marker separately (`RethEnv::heal_finalized_to_persisted_tip`) before anything reads
+        // the marker, so the finalized block read here is the last block of the last consensus
+        // output whose execution was fully committed — the digest recovered below names
+        // exactly the last executed output, and the primary re-requests everything after it.
         //
         // recover finalized block's nonce: this is the last subdag index from consensus (round)
         let finalized_block_num = self.reth_env.last_finalized_block_number()?;
@@ -343,13 +376,31 @@ impl ExecutionNodeInner {
         self.reth_env.epoch_state_from_canonical_tip()
     }
 
-    /// Read committee validator keys for epoch.
-    pub(super) fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
-        Ok(self
-            .reth_env
-            .bls_pubkeys_for_epoch(epoch)?
+    /// Read the current epoch's [EpochState] pinned to the previous epoch's closing block
+    /// (genesis for epoch 0), returning the pin header alongside it.
+    pub(super) fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
+        self.reth_env.epoch_state_at_epoch_start()
+    }
+
+    /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
+    /// On-chain BLS key bytes are decoded here; a decode failure is a hard error, mirroring the
+    /// epoch-entry committee read.
+    pub(super) fn validators_for_epoch_at_block(
+        &self,
+        epoch: u32,
+        block_hash: B256,
+    ) -> eyre::Result<Vec<BlsPublicKey>> {
+        self.reth_env
+            .bls_pubkeys_for_epoch_at_block(epoch, block_hash)?
             .iter()
-            .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
-            .collect())
+            .map(|bls| {
+                BlsPublicKey::from_literal_bytes(bls.as_ref()).map_err(|err| {
+                    eyre::eyre!(
+                        "failed to create bls key from on-chain bytes for epoch {epoch} at block \
+                         {block_hash:?}: {err:?}"
+                    )
+                })
+            })
+            .collect()
     }
 }

@@ -9,56 +9,9 @@ use std::{
 };
 use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
 use tn_types::{
-    error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
-    ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochCertificate, EpochDigest, EpochRecord,
-    EpochVote, Header, HeaderDigest, Round, Vote, B256,
+    error::HeaderError, AuthorityIdentifier, Certificate, ConsensusResult, Epoch, EpochCertificate,
+    EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest, Round, Vote,
 };
-
-/// Info that is published (via gossip) by validators once they reach consensus.
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
-pub struct ConsensusResult {
-    // epoch for this result (i.e. the current epoch)
-    pub epoch: Epoch,
-    // reound for epoch that consensus was reached on
-    pub round: Round,
-    /// the consensus header block number
-    pub number: u64,
-    /// hash of the consensus header that was reached
-    pub hash: ConsensusHeaderDigest,
-    /// the validator that produced this result
-    pub validator: BlsPublicKey,
-    /// the signature of the validator publishing this record
-    /// see digest() below, this is a signature over the hash of the epoch, round, number and hash
-    /// fields
-    pub signature: BlsSignature,
-}
-
-impl ConsensusResult {
-    /// Return the digest of the data fields (epoch, round, number and hash).
-    /// This will be the same for all validadors and is what signature signs
-    /// (verifying all the data fields not just the hash).
-    pub fn digest(&self) -> BlockHash {
-        Self::digest_data(self.epoch, self.round, self.number, self.hash)
-    }
-
-    /// Return the digest of the data fields (epoch, round, number and hash).
-    /// Used for generating the signature of the raw data.
-    /// This will be the same for all validadors and is what signature signs
-    /// (verifying all the data fields not just the hash).
-    pub fn digest_data(
-        epoch: Epoch,
-        round: Round,
-        number: u64,
-        hash: ConsensusHeaderDigest,
-    ) -> BlockHash {
-        let mut hasher = tn_types::DefaultHashFunction::new();
-        hasher.update(&epoch.to_be_bytes());
-        hasher.update(&round.to_be_bytes());
-        hasher.update(&number.to_be_bytes());
-        hasher.update(hash.as_ref());
-        B256::from_slice(hasher.finalize().as_bytes())
-    }
-}
 
 /// Primary messages on the gossip network.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -103,20 +56,6 @@ pub enum PrimaryRequest {
         /// missing them. The peer requires parent certs in order to vote.
         parents: Vec<Certificate>,
     },
-    /// Request for missing certificates.
-    MissingCertificates {
-        /// Inner type with specific helper methods for requesting missing certificates.
-        inner: MissingCertificatesRequest,
-    },
-    /// Request a consensus chain header with consensus output.
-    ///
-    /// Both number and hash should match (set them both).
-    ConsensusHeader {
-        /// Block number requesting if not None.
-        number: u64,
-        /// Block hash requesting if not None.
-        hash: ConsensusHeaderDigest,
-    },
     /// Exchange peer information.
     ///
     /// This "request" is sent to peers when this node disconnects
@@ -133,11 +72,6 @@ pub enum PrimaryRequest {
         epoch: Option<Epoch>,
         /// Block hash requesting if not None.
         hash: Option<EpochDigest>,
-    },
-    /// Request to stream a pack file of the consensus data for epoch.
-    StreamEpoch {
-        /// The epoch we are requesting consensus data for.
-        epoch: Epoch,
     },
 }
 
@@ -160,17 +94,73 @@ pub struct MissingCertificatesRequest {
 impl MissingCertificatesRequest {
     /// Deserialize the [RoaringBitmap] representing the difference between the requesting peer's
     /// lower boundary and their GC round.
+    ///
+    /// Every skip-round entry is attacker-controlled, so three request-shaped allocations are
+    /// bounded here, each rejected before it happens:
+    /// - `max_authorities` (the caller passes the committee size) bounds the number of
+    ///   `skip_rounds` entries (GHSA-wwqq-q2xx-4jf9). One bitmap per committee authority is the
+    ///   invariant; nothing else limits how many entries a peer can name in a single request, and
+    ///   each accepted entry costs a decode plus a retained `BTreeSet`.
+    /// - `max_skip_rounds_per_authority` (the committee's `max_skip_rounds_for_missing_certs`)
+    ///   bounds each bitmap twice (GHSA-4ggp-fcpj-g9f3): once on the container count read straight
+    ///   from the serialized header *before* [`RoaringBitmap::deserialize_from`] allocates anything
+    ///   (a few hundred KiB of run-encoded bitmap would otherwise decompress to hundreds of MiB of
+    ///   heap during deserialization -- roaring 0.10 has no run store, so every run container is
+    ///   expanded into an array/bitmap store), and once on the decoded cardinality *before* the
+    ///   `O(cardinality)` collect below.
     pub(crate) fn get_bounds(
         &self,
+        max_skip_rounds_per_authority: usize,
+        max_authorities: usize,
     ) -> PrimaryNetworkResult<(Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>)> {
+        // One skip-round bitmap per committee authority is the documented invariant; reject a
+        // request naming more authorities than the committee has before decoding anything.
+        (self.skip_rounds.len() <= max_authorities).then_some(()).ok_or_else(|| {
+            PrimaryNetworkError::InvalidRequest(format!(
+                "skip_rounds authority count exceeds committee size: {} > {max_authorities}",
+                self.skip_rounds.len()
+            ))
+        })?;
+
+        let max_cardinality = u64::try_from(max_skip_rounds_per_authority).unwrap_or(u64::MAX);
         let skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>> = self
             .skip_rounds
             .iter()
             .map(|(k, serialized)| {
-                let rounds = RoaringBitmap::deserialize_from(&serialized[..])?
+                // Reject a decompression bomb *before* `deserialize_from` materializes it: the
+                // header declares the container count, and a genuine bitmap of cardinality N spans
+                // at most N containers, so the cardinality limit doubles as a sound container-count
+                // limit that never rejects a well-formed request while capping the ~8 KiB-per-
+                // container heap that deserialization would otherwise allocate.
+                let containers = roaring_container_count(serialized)?;
+                (containers <= max_cardinality).then_some(()).ok_or_else(|| {
+                    PrimaryNetworkError::InvalidRequest(format!(
+                        "skip_rounds bitmap declares too many containers: {containers} > {max_cardinality}"
+                    ))
+                })?;
+
+                let bitmap = RoaringBitmap::deserialize_from(&serialized[..])?;
+
+                // Reject on cardinality *before* the `O(cardinality)` collect: the container bound
+                // still admits up to `max_cardinality` full (65_536-round) containers.
+                let cardinality = bitmap.len();
+                (cardinality <= max_cardinality).then_some(()).ok_or_else(|| {
+                    PrimaryNetworkError::InvalidRequest(format!(
+                        "skip_rounds bitmap too large: {cardinality} > {max_cardinality}"
+                    ))
+                })?;
+
+                let rounds = bitmap
                     .into_iter()
-                    .map(|r| self.exclusive_lower_bound + r as Round)
-                    .collect::<BTreeSet<Round>>();
+                    .map(|r| {
+                        // r: u32 == Round; reject rather than wrap (release) or panic (debug)
+                        self.exclusive_lower_bound.checked_add(r).ok_or_else(|| {
+                            PrimaryNetworkError::InvalidRequest(
+                                "skip round exceeds u32 round space".into(),
+                            )
+                        })
+                    })
+                    .collect::<PrimaryNetworkResult<BTreeSet<Round>>>()?;
                 Ok((k.clone(), rounds))
             })
             .collect::<PrimaryNetworkResult<BTreeMap<_, _>>>()?;
@@ -210,6 +200,44 @@ impl MissingCertificatesRequest {
     }
 }
 
+/// Cookie prefixing a serialized [`RoaringBitmap`] with no run containers: a `u32` container count
+/// follows it. (roaring 0.10.12, `bitmap/serialization.rs`.)
+const ROARING_SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
+/// Cookie (low 16 bits) prefixing a serialized [`RoaringBitmap`] that may contain run containers:
+/// the container count minus one is packed into the high 16 bits of the cookie word.
+const ROARING_SERIAL_COOKIE: u32 = 12347;
+
+/// Number of containers declared in a serialized [`RoaringBitmap`] header, read without
+/// materializing the bitmap.
+///
+/// Roaring's portable format opens with either [`ROARING_SERIAL_COOKIE_NO_RUNCONTAINER`] followed
+/// by a `u32` count or [`ROARING_SERIAL_COOKIE`] with `count - 1` packed into the cookie word's
+/// high 16 bits; this reads only that count so a caller can bound a bitmap's size before allocating
+/// its containers. Mirrors `RoaringBitmap::deserialize_from`. Errors on a truncated header or an
+/// unrecognized cookie (both of which `deserialize_from` would also reject).
+fn roaring_container_count(serialized: &[u8]) -> PrimaryNetworkResult<u64> {
+    let le_u32 = |start: usize| -> PrimaryNetworkResult<u32> {
+        serialized
+            .get(start..start.saturating_add(4))
+            .and_then(|word| <[u8; 4]>::try_from(word).ok())
+            .map(u32::from_le_bytes)
+            .ok_or_else(|| {
+                PrimaryNetworkError::InvalidRequest("skip_rounds bitmap header truncated".into())
+            })
+    };
+
+    let cookie = le_u32(0)?;
+    if cookie == ROARING_SERIAL_COOKIE_NO_RUNCONTAINER {
+        le_u32(4).map(u64::from)
+    } else if cookie & 0xFFFF == ROARING_SERIAL_COOKIE {
+        Ok(u64::from(cookie >> 16) + 1)
+    } else {
+        Err(PrimaryNetworkError::InvalidRequest(
+            "skip_rounds bitmap has an unrecognized roaring cookie".into(),
+        ))
+    }
+}
+
 impl From<PeerExchangeMap> for PrimaryRequest {
     fn from(value: PeerExchangeMap) -> Self {
         Self::PeerExchange { peers: value }
@@ -227,15 +255,11 @@ impl From<PeerExchangeMap> for PrimaryRequest {
 pub enum PrimaryResponse {
     /// The peer's vote if the peer considered the proposed header valid.
     Vote(Vote),
-    /// The requested certificates requested by a peer.
-    RequestedCertificates(Vec<Certificate>),
     /// Missing certificates in order to vote.
     ///
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
     MissingParents(Vec<HeaderDigest>),
-    /// The requested consensus header.
-    ConsensusHeader(Arc<ConsensusHeader>),
     /// The requested epoch record and certificate.
     EpochRecord { record: EpochRecord, certificate: EpochCertificate },
     /// Exchange peer information.
@@ -249,15 +273,6 @@ pub enum PrimaryResponse {
     /// This is an application-layer error response.
     /// This error is likely to succeed in the future and can be retried.
     RecoverableError(PrimaryRPCError),
-    /// Response to stream-based epoch request.
-    ///
-    /// If `ack` is true, the requestor should open a stream with the
-    /// request digest in the header. The responder will send the epoch pack
-    /// over that stream.
-    RequestEpochStream {
-        /// Whether the request is accepted.
-        ack: bool,
-    },
 }
 
 impl PrimaryResponse {
@@ -285,11 +300,10 @@ impl PrimaryResponse {
             | PrimaryNetworkError::UnavailableEpoch(_)
             | PrimaryNetworkError::UnavailableEpochDigest(_)
             | PrimaryNetworkError::InvalidTopic
-            | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
+            | PrimaryNetworkError::UnknownConsensusOutput(_)
             | PrimaryNetworkError::Timeout(_)
-            | PrimaryNetworkError::UnknownStreamRequest(_)
-            | PrimaryNetworkError::StreamUnavailable(_)
+            | PrimaryNetworkError::ConsensusChainError(_)
             | PrimaryNetworkError::InvalidEpochRequest => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }

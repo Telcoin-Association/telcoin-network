@@ -807,7 +807,7 @@ mod tests {
     fn test_archive_hdx_index() {
         let tmp_dir = TempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
         let tmp_path = tmp_dir.path();
-        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd);
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut idx: HdxIndex =
             HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
@@ -869,7 +869,7 @@ mod tests {
     fn test_archive_hdx_index_geometry_mismatch() {
         let tmp_dir = TempDir::with_prefix("test_archive_hdx_geometry").expect("temp dir");
         let tmp_path = tmp_dir.path();
-        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd);
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
 
         // Create an index with the default 32-byte keys.
         {

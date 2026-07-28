@@ -3,15 +3,16 @@
 use crate::{
     error::TnRethResult,
     evm::TNEvm,
+    payload::TNPayload,
     recover_raw_transaction,
-    system_calls::{ConsensusRegistry, EpochState},
-    RethEnv, WorkerTxPool,
+    system_calls::{ConsensusRegistry, EpochState, CONSENSUS_REGISTRY_ADDRESS},
+    ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool,
 };
 use alloy::{
     consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant, TxLegacy},
     eips::eip7594::BlobTransactionSidecarVariant,
     hex,
-    primitives::ChainId,
+    primitives::{utils::parse_ether, ChainId},
     signers::{
         k256::sha2::{Digest as _, Sha256},
         local::PrivateKeySigner,
@@ -20,26 +21,29 @@ use alloy::{
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
-use reth_primitives::{sign_message, Account};
+use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
-use reth_provider::{AccountReader as _, StateProvider, StateProviderBox, StateProviderFactory};
-use reth_revm::{
-    context::result::ResultAndState, database::StateProviderDatabase, db::BundleState, State,
+use reth_provider::{
+    CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
+    DatabaseProviderFactory as _, StateProvider, StateProviderBox, StateProviderFactory,
 };
+use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
-    Secp256k1,
+    SECP256K1,
 };
 use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
+use tn_config::NodeInfo;
 use tn_types::{
-    address, calculate_transaction_root, gas_accumulator::RewardsCounter, keccak256, now,
-    test_chain_spec_arc, test_genesis, AccessList, Address, Batch, BlobTransactionSidecar, Block,
-    BlockBody, BlockHash, BlsPublicKey, Bytes, Committee, CommitteeBuilder, Encodable2718,
-    EthSignature, ExecHeader, ExecutionKeypair, Genesis, GenesisAccount, RecoveredBlock,
-    SealedHeader, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId,
-    B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
-    ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
+    address, calculate_transaction_root, gas_accumulator::RewardsCounter,
+    generate_proof_of_possession_bls_for_test, keccak256, now, test_chain_spec_arc, test_genesis,
+    AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsKeypair,
+    BlsPublicKey, Bytes, Committee, CommitteeBuilder, Encodable2718, EthSignature, ExecHeader,
+    ExecutionKeypair, Genesis, GenesisAccount, NodeP2pInfo, RecoveredBlock, SealedHeader,
+    TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256,
+    EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 // re-exports for tests
 pub use crate::evm::precompile_test_utils;
@@ -67,11 +71,6 @@ impl RethEnv {
         Ok(self.inner.blockchain_provider.state_by_block_hash(hash)?)
     }
 
-    /// Retrieve the account balance.
-    pub fn retrieve_account(&self, address: &Address) -> TnRethResult<Option<Account>> {
-        Ok(self.inner.blockchain_provider.basic_account(address)?)
-    }
-
     /// Create an EVM-environment from state provider.
     pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
         let header = self.header(hash)?.expect("provided hash in header table");
@@ -87,21 +86,6 @@ impl RethEnv {
             .create_evm(db, self.inner.evm_config.evm_env(&header)?))
     }
 
-    /// Execute a read-only system call against a contract and return the result.
-    ///
-    /// Useful for integration tests that need to read precompile state after
-    /// block execution without importing the `Evm` trait.
-    pub fn read_contract_state(
-        &self,
-        block_hash: BlockHash,
-        contract: Address,
-        calldata: Bytes,
-    ) -> eyre::Result<ResultAndState> {
-        use reth_evm::Evm;
-        let mut evm = self.tn_evm(block_hash)?;
-        Ok(evm.transact_system_call(crate::system_calls::SYSTEM_ADDRESS, contract, calldata)?)
-    }
-
     /// Test utility to execute batch and return execution outcome.
     ///
     /// This is useful for simulating execution results for account state changes.
@@ -111,7 +95,7 @@ impl RethEnv {
         &self,
         txs: Vec<Vec<u8>>,
         parent: &SealedHeader,
-    ) -> BundleState {
+    ) -> eyre::Result<BundleState> {
         // create "empty" header with default values
         let mut header = ExecHeader {
             parent_hash: parent.hash(),
@@ -137,16 +121,21 @@ impl RethEnv {
             requests_hash: None,
         };
 
-        // decode transactions
-        let mut decoded_txs = Vec::with_capacity(txs.len());
-        let mut signers = Vec::with_capacity(txs.len());
-        for tx_bytes in &txs {
-            let tx = recover_raw_transaction(tx_bytes)
-                .expect("raw transaction recovered for test")
-                .into_inner();
-            signers.push(tx.recover_signer().expect("recover signer for test tx"));
-            decoded_txs.push(tx);
-        }
+        // decode transactions and recover their signers
+        let (decoded_txs, signers): (Vec<_>, Vec<_>) = txs
+            .iter()
+            .map(|tx_bytes| {
+                let tx = recover_raw_transaction(tx_bytes)
+                    .map_err(|e| eyre::eyre!("recover raw test transaction: {e:?}"))?
+                    .into_inner();
+                let signer = tx
+                    .recover_signer()
+                    .map_err(|e| eyre::eyre!("recover signer for test tx: {e:?}"))?;
+                Ok::<_, eyre::Report>((tx, signer))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?
+            .into_iter()
+            .unzip();
 
         // update header's transactions root
         header.transactions_root = if txs.is_empty() {
@@ -167,14 +156,22 @@ impl RethEnv {
 
         // create execution db
         let mut db = StateProviderDatabase::new(
-            self.latest().expect("provider retrieves latest during test batch execution"),
+            self.latest()
+                .map_err(|e| eyre::eyre!("provider retrieves latest for test batch: {e:?}"))?,
         );
         let executor = self.inner.evm_config.executor(&mut db);
         let res = executor
             .execute(&RecoveredBlock::new_unhashed(block, signers))
-            .expect("execute one block");
+            .map_err(|e| eyre::eyre!("execute one block for test: {e:?}"))?;
 
-        res.state
+        // a reverted tx still commits (with a failed receipt), silently yielding bundle
+        // state that is missing the tx's intended effects; fail loudly with the receipts
+        // so the offending tx is identifiable instead of surfacing later as missing
+        // genesis state (see #863)
+        let all_succeeded = res.result.receipts.iter().all(|receipt| receipt.success);
+        all_succeeded.then_some(res.state).ok_or_else(|| {
+            eyre::eyre!("setup tx reverted during simulated execution: {:?}", res.result.receipts)
+        })
     }
 
     /// Retrieve validator rewards.
@@ -239,25 +236,22 @@ impl TransactionFactory {
     /// Secret: 9bf49a6a0755f953811fce125f2683d50429c3bb49e074147e0089a52eae155f
     pub fn new() -> Self {
         let mut rng = StdRng::from_seed([0; 32]);
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(&mut rng);
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
+        let (secret_key, _public_key) = SECP256K1.generate_keypair(&mut rng);
+        let keypair = ExecutionKeypair::from_secret_key(SECP256K1, &secret_key);
         Self { keypair, nonce: 0 }
     }
 
     /// create a new instance of self from a provided seed.
     pub fn new_random_from_seed<R: Rng + ?Sized>(rand: &mut R) -> Self {
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(rand);
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
+        let (secret_key, _public_key) = SECP256K1.generate_keypair(rand);
+        let keypair = ExecutionKeypair::from_secret_key(SECP256K1, &secret_key);
         Self { keypair, nonce: 0 }
     }
 
     /// create a new instance of self from a random seed.
     pub fn new_random() -> Self {
-        let secp = Secp256k1::new();
-        let (secret_key, _public_key) = secp.generate_keypair(&mut StdRng::from_os_rng());
-        let keypair = ExecutionKeypair::from_secret_key(&secp, &secret_key);
+        let (secret_key, _public_key) = SECP256K1.generate_keypair(&mut StdRng::from_os_rng());
+        let keypair = ExecutionKeypair::from_secret_key(SECP256K1, &secret_key);
         Self { keypair, nonce: 0 }
     }
 
@@ -698,4 +692,166 @@ pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Resul
     }
     let committee = committee_builder.build();
     Ok(committee)
+}
+
+/// The deterministic governance owner wallet (seed 33) that owns the `ConsensusRegistry` in
+/// test genesis fixtures (see [`test_genesis_with_consensus_registry`] and the close-epoch
+/// tests), funded there to sign owner-gated transactions like `mint` and `burn`.
+pub fn governance_owner_factory() -> TransactionFactory {
+    TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33))
+}
+
+/// Create a signed, encoded governance `ConsensusRegistry::burn(validator)` transaction.
+///
+/// Burning a validator's ConsensusNFT forcibly ejects it from the current and both future
+/// committees. The caller supplies the governance factory (see [`governance_owner_factory`])
+/// so nonces stay sequential across multiple governance transactions.
+pub fn governance_burn_tx(
+    governance: &mut TransactionFactory,
+    chain: Arc<RethChainSpec>,
+    validator: Address,
+) -> Vec<u8> {
+    let calldata = ConsensusRegistry::burnCall { validatorAddress: validator }.abi_encode().into();
+    governance.create_eip1559_encoded(
+        chain,
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    )
+}
+
+/// Build a block from a [`TNPayload`] and transactions, then commit it as the new canonical
+/// tip (chain-state update + finalization normally handled by `tn_engine`'s payload builder).
+pub fn execute_payload_and_update_canonical_chain(
+    reth_env: &RethEnv,
+    payload: TNPayload,
+    transactions: Vec<Vec<u8>>,
+) -> eyre::Result<ExecutedBlock> {
+    let anchor_hash = payload.parent_header.hash();
+    let block =
+        reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
+    // update chain state - normally handled by tn_engine::payload_builder
+    let canonical_header = block.recovered_block.clone_sealed_header();
+    let canonical_in_memory_state = reth_env.inner.blockchain_provider.canonical_in_memory_state();
+    canonical_in_memory_state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
+    canonical_in_memory_state.set_canonical_head(canonical_header.clone());
+    reth_env.finish_executing_output(vec![block.clone()], None)?;
+    reth_env.finalize_block(canonical_header.clone())?;
+    Ok(block)
+}
+
+/// Plant the persisted finalized/safe markers at `header` and seed the in-memory watches to
+/// match, simulating a restart on a database written by a pre-fix node version.
+///
+/// Pre-fix versions committed blocks and the finalized/safe markers in separate database
+/// transactions, so a crash between the two commits restarted the node with the marker lagging
+/// the persisted canonical tip — the state `RethEnv::heal_finalized_to_persisted_tip` repairs.
+/// Current versions commit both atomically in `RethEnv::finish_executing_output`, so tests use
+/// this direct write to construct the pre-fix state.
+pub fn plant_finalized_marker(reth_env: &RethEnv, header: SealedHeader) -> eyre::Result<()> {
+    let provider = reth_env.inner.blockchain_provider.database_provider_rw()?;
+    provider.save_finalized_block_number(header.number)?;
+    provider.save_safe_block_number(header.number)?;
+    provider.commit()?;
+    // a restarting node seeds the finalized/safe watches from the (stale) database rows at
+    // provider construction; mirror that so watch readers see the planted marker
+    reth_env.inner.blockchain_provider.set_finalized(header.clone());
+    reth_env.inner.blockchain_provider.set_safe(header);
+    Ok(())
+}
+
+/// Build a test genesis whose `ConsensusRegistry` is freshly deployed from the current artifact
+/// (so the new ABI surface like `getValidatorsInfo` exists) and seeded with `num_validators`
+/// active validators forming the genesis committee.
+///
+/// Unlike [`test_genesis`], which embeds the committed testnet `genesis.yaml` verbatim and can
+/// therefore drift from the compiled contract, this deploys the registry at test runtime so the
+/// genesis state always matches the current bytecode. Use it for close-epoch tests that run
+/// system calls reading the registry (e.g. committee shuffling), which revert against the stale
+/// embedded registry.
+///
+/// NOTE: this is sync but must be called from within a tokio runtime (e.g. a `#[tokio::test]`),
+/// because deploying the registry spins up a temporary `RethEnv`.
+pub fn test_genesis_with_consensus_registry(num_validators: usize) -> Genesis {
+    test_genesis_with_consensus_registry_and_workers(num_validators, vec![(0u8, 30_000_000u64)])
+}
+
+/// [`test_genesis_with_consensus_registry`] with explicit `WorkerConfigs` deployment parameters.
+///
+/// `worker_configs` is one `(strategy, value)` pair per worker (strategy 0 = EIP-1559 with
+/// `value` as the gas target, strategy 1 = static with `value` as the fee), so its length is the
+/// genesis `numWorkers()`. Use this for tests that need a multi-worker `WorkerConfigs` contract;
+/// the single-worker default above matches the canonical testnet genesis.
+pub fn test_genesis_with_consensus_registry_and_workers(
+    num_validators: usize,
+    worker_configs: Vec<(u8, u64)>,
+) -> Genesis {
+    try_test_genesis_with_consensus_registry_and_workers(num_validators, worker_configs)
+        .expect("create consensus registry genesis accounts")
+}
+
+/// Fallible [`test_genesis_with_consensus_registry_and_workers`]: returns the genesis-creation
+/// error instead of panicking, so tests can assert that a ceremony with contract-illegal
+/// `worker_configs` (strategy > `MAX_STRATEGY`, empty list) fails loudly instead of committing
+/// a reverted constructor's empty storage.
+pub fn try_test_genesis_with_consensus_registry_and_workers(
+    num_validators: usize,
+    worker_configs: Vec<(u8, u64)>,
+) -> eyre::Result<Genesis> {
+    // deterministic committee-eligible validator addresses (0x11.., 0x22.., ...)
+    let all_validators: Vec<Address> = (1..=num_validators)
+        .map(|i| Address::from_slice(&[(i as u8).wrapping_mul(0x11); 20]))
+        .collect();
+
+    // build active validator info with deterministic BLS keys + proofs of possession
+    let validators: Vec<NodeInfo> = all_validators
+        .iter()
+        .enumerate()
+        .map(|(i, addr)| {
+            let mut rng = StdRng::seed_from_u64(i as u64);
+            let bls = BlsKeypair::generate(&mut rng);
+            let bls_pubkey = bls.public();
+            let pop = generate_proof_of_possession_bls_for_test(&bls, addr)
+                .expect("pop generation failed");
+            NodeInfo {
+                name: format!("validator-{i}"),
+                bls_public_key: *bls_pubkey,
+                p2p_info: NodeP2pInfo::default(),
+                execution_address: *addr,
+                proof_of_possession: pop,
+            }
+        })
+        .collect();
+
+    // Mirror the canonical testnet `StakeConfig` (the CLI genesis defaults that built the embedded
+    // testnet genesis) so this drop-in registry matches what `test_genesis` provided before its
+    // bytecode went stale. NOTE: `epochIssuance` (25_806 TEL) is even, so a closed epoch's rewards
+    // split exactly between leaders (close-epoch reward assertions compare against `div_ceil(2)`).
+    let initial_stake_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: U256::from(parse_ether("1_000_000").expect("parse stake amount")),
+        minWithdrawAmount: U256::from(parse_ether("1_000").expect("parse min withdraw amount")),
+        epochIssuance: U256::from(parse_ether("25_806").expect("parse epoch issuance")),
+        epochDuration: 60 * 60 * 8, // 8hrs (testnet default)
+    };
+
+    // deterministic, funded governance owner
+    let governance_multisig = governance_owner_factory();
+    let governance = governance_multisig.address();
+    let base_genesis = test_genesis().extend_accounts([(
+        governance,
+        GenesisAccount::default()
+            .with_balance(U256::from(parse_ether("50_000_000").expect("parse governance balance"))),
+    )]);
+
+    // overwrite the embedded registry account at `CONSENSUS_REGISTRY_ADDRESS` with a freshly
+    // deployed registry seeded with the active validators above
+    RethEnv::create_consensus_registry_genesis_accounts(
+        validators,
+        base_genesis,
+        initial_stake_config,
+        governance,
+        worker_configs,
+    )
 }

@@ -35,16 +35,13 @@ impl ExportStakingArgs {
     /// and proof of possession, matching what `--calldata` prints.
     pub fn stake_calldata(&self) -> eyre::Result<Vec<u8>> {
         let node_info = self.load_node_info()?;
-        let compressed = node_info.bls_public_key.to_bytes();
-        let uncompressed_pk = node_info.bls_public_key.serialize();
-        let uncompressed_sig = node_info.proof_of_possession.serialize();
+        let compressed_pubkey = node_info.bls_public_key.to_bytes();
+        let compressed_sig = node_info.proof_of_possession.to_bytes();
 
-        let proof = ConsensusRegistry::ProofOfPossession {
-            uncompressedPubkey: uncompressed_pk.to_vec().into(),
-            uncompressedSignature: uncompressed_sig.to_vec().into(),
-        };
+        let proof =
+            ConsensusRegistry::ProofOfPossession { signature: compressed_sig.to_vec().into() };
         let call = ConsensusRegistry::stakeCall {
-            blsPubkey: compressed.to_vec().into(),
+            blsPubkey: compressed_pubkey.to_vec().into(),
             proofOfPossession: proof,
         };
 
@@ -61,33 +58,26 @@ impl ExportStakingArgs {
 
         let node_info = self.load_node_info()?;
 
-        // compressed BLS pubkey (96 bytes) - used as blsPubkey param
-        let compressed = node_info.bls_public_key.to_bytes();
+        // compressed BLS pubkey (96 bytes) - the blsPubkey param
+        let compressed_pubkey = node_info.bls_public_key.to_bytes();
 
-        // uncompressed BLS pubkey (192 bytes) - used as ProofOfPossession.uncompressedPubkey
-        let uncompressed_pk = node_info.bls_public_key.serialize();
-
-        // uncompressed PoP signature (96 bytes) - used as ProofOfPossession.uncompressedSignature
-        let uncompressed_sig = node_info.proof_of_possession.serialize();
-        let compressed_hex = format!("0x{}", hex::encode(compressed));
-        let uncompressed_pk_hex = format!("0x{}", hex::encode(uncompressed_pk));
-        let uncompressed_sig_hex = format!("0x{}", hex::encode(uncompressed_sig));
+        // compressed PoP signature (48 bytes) - the ProofOfPossession.signature
+        let compressed_sig = node_info.proof_of_possession.to_bytes();
+        let compressed_pubkey_hex = format!("0x{}", hex::encode(compressed_pubkey));
+        let compressed_sig_hex = format!("0x{}", hex::encode(compressed_sig));
 
         if self.json {
             let output = serde_json::json!({
-                "blsPubkey": compressed_hex,
-                "uncompressedPubkey": uncompressed_pk_hex,
-                "uncompressedSignature": uncompressed_sig_hex,
+                "blsPubkey": compressed_pubkey_hex,
+                "signature": compressed_sig_hex,
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
             println!("Staking arguments for ConsensusRegistry.stake():\n");
-            println!("blsPubkey (compressed, {} bytes):", compressed.len());
-            println!("{compressed_hex}\n");
-            println!("proofOfPossession.uncompressedPubkey ({} bytes):", uncompressed_pk.len());
-            println!("{uncompressed_pk_hex}\n");
-            println!("proofOfPossession.uncompressedSignature ({} bytes):", uncompressed_sig.len());
-            println!("{uncompressed_sig_hex}");
+            println!("blsPubkey (compressed, {} bytes):", compressed_pubkey.len());
+            println!("{compressed_pubkey_hex}\n");
+            println!("proofOfPossession.signature (compressed, {} bytes):", compressed_sig.len());
+            println!("{compressed_sig_hex}");
         }
 
         Ok(())

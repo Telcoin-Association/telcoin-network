@@ -5,13 +5,21 @@ use std::{future::Future, sync::Arc};
 
 use tn_types::{Database, DbTx, DbTxMut, Table, TableHint};
 
-use crate::layered_db::{LayeredDatabase, LayeredDbTxMut};
+use crate::layered_db::{LayeredDatabase, LayeredDbStats, LayeredDbTxMut};
 
 #[derive(Clone, Debug)]
 struct Inner<DB: Database> {
     epoch_db: LayeredDatabase<DB>,
     kad_db: LayeredDatabase<DB>,
     cache_db: LayeredDatabase<DB>,
+}
+
+/// Per-layer [`LayeredDbStats`] for each database in a [`CompositeDatabase`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompositeDbStats {
+    pub epoch: LayeredDbStats,
+    pub kad: LayeredDbStats,
+    pub cache: LayeredDbStats,
 }
 
 /// A composite DB that is composed of multiple [`LayeredDatabase`]s.
@@ -34,6 +42,15 @@ impl<DB: Database> CompositeDatabase<DB> {
             TableHint::Kad => &self.inner.kad_db,
             TableHint::Cache => &self.inner.cache_db,
         }
+    }
+
+    /// Snapshot the background-thread counters of every layered DB, for leak observability.
+    pub fn stats(&self) -> eyre::Result<CompositeDbStats> {
+        Ok(CompositeDbStats {
+            epoch: self.inner.epoch_db.stats()?,
+            kad: self.inner.kad_db.stats()?,
+            cache: self.inner.cache_db.stats()?,
+        })
     }
 }
 
@@ -431,6 +448,29 @@ mod test {
         }
         let db = open_mdbx(&temp_dir.path().join("mdbx_multi_remove_1"));
         test_multi_remove(db);
+    }
+
+    #[test]
+    fn test_compositedb_dropped_txn_recovers() {
+        use tn_types::DbTxMut as _;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx(&temp_dir.path().join("mdbx_dropped_txn_1"));
+
+        // drop a composite txn without committing — the underlying layered txn must be
+        // ended so later commits still persist
+        let mut dropped = db.write_txn().expect("write txn");
+        dropped.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        drop(dropped);
+
+        let mut txn = db.write_txn().expect("write txn");
+        txn.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+        txn.commit().expect("commit");
+        db.sync_persist();
+
+        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
+        assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
+        let stats = db.stats().expect("stats");
+        assert_eq!(stats, super::CompositeDbStats::default());
     }
 
     #[test]

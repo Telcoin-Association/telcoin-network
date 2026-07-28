@@ -3,7 +3,7 @@ use crate::manager::WORKER_TASK_BASE;
 use std::sync::Arc;
 use tn_config::ConsensusConfig;
 use tn_storage::consensus::ConsensusChain;
-use tn_types::{BatchValidation, Database as ConsensusDatabase, WorkerId};
+use tn_types::{BatchValidation, Database as ConsensusDatabase, TxnForwarder, WorkerId};
 use tn_worker::{new_worker, quorum_waiter::QuorumWaiter, Worker, WorkerNetworkHandle};
 use tokio::sync::RwLock;
 
@@ -18,6 +18,9 @@ pub struct WorkerNodeInner<CDB> {
     network_handle: WorkerNetworkHandle,
     /// The batch validator.
     validator: Arc<dyn BatchValidation>,
+    /// Forwards accepted transactions to committee validators' JSON-RPC endpoints when this
+    /// node is not a committee voting validator.
+    forwarder: Arc<dyn TxnForwarder>,
     /// The consensus chain.
     consensus_chain: ConsensusChain,
 }
@@ -34,6 +37,7 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
             self.validator.clone(),
             self.consensus_config.clone(),
             self.network_handle.clone(),
+            self.forwarder.clone(),
             self.consensus_chain.clone(),
         );
 
@@ -52,10 +56,17 @@ impl<CDB: ConsensusDatabase> WorkerNode<CDB> {
         consensus_config: ConsensusConfig<CDB>,
         network_handle: WorkerNetworkHandle,
         validator: Arc<dyn BatchValidation>,
+        forwarder: Arc<dyn TxnForwarder>,
         consensus_chain: ConsensusChain,
     ) -> WorkerNode<CDB> {
-        let inner =
-            WorkerNodeInner { id, consensus_config, network_handle, validator, consensus_chain };
+        let inner = WorkerNodeInner {
+            id,
+            consensus_config,
+            network_handle,
+            validator,
+            forwarder,
+            consensus_chain,
+        };
 
         Self { internal: Arc::new(RwLock::new(inner)) }
     }

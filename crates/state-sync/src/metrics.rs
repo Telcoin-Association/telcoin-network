@@ -21,6 +21,8 @@ pub(crate) struct StateSyncMetrics {
     pub(crate) headers_fetched_total: Counter,
     /// Epoch pack file fetches started.
     pub(crate) epoch_pack_fetches_total: Counter,
+    /// State-sync requests re-driven after a catch-up stall (issue #836).
+    pub(crate) catch_up_redrives_total: Counter,
 }
 
 #[cfg(test)]
@@ -38,6 +40,7 @@ mod tests {
             metrics.no_progress_total.increment(1);
             metrics.headers_fetched_total.increment(5);
             metrics.epoch_pack_fetches_total.increment(1);
+            metrics.catch_up_redrives_total.increment(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -52,5 +55,6 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(5)));
         find("tn_state_sync.no_progress_total");
         find("tn_state_sync.epoch_pack_fetches_total");
+        find("tn_state_sync.catch_up_redrives_total");
     }
 }

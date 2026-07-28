@@ -14,17 +14,26 @@ retries = 2
 fail-fast = true
 test-threads = "num-cpus"
 
-# E2E tests use dynamic ports and can run in parallel.
-# Limit concurrency since each test spawns 4-6 node processes.
+# E2E tests each spawn 4-6 node processes, and the heavy (ignored) ones run for minutes.
+# Running two at once puts 12+ node processes on the box and inflated wall time ~3.5-4x,
+# so cap the whole e2e group at one test at a time (was max-threads = 2). Using a single
+# group rather than a name-matched "heavy" subset also covers heavy tests added later
+# (basefee, metrics, ...) without enumerating them, and avoids two groups overlapping.
 [test-groups.e2e]
-max-threads = 2
+max-threads = 1
 
 [[profile.default.overrides]]
 filter = "package(e2e-tests)"
 test-group = "e2e"
 slow-timeout = { period = "720s", terminate-after = 3 }
 
+# The cross-process slot allocator (tn_types::helpers) closes the ephemeral-port race,
+# so e2e tests no longer need retries to mask it. Real regressions now surface instead of
+# being silently retried away. The allocator's degraded edges (window exhausted, slot
+# beyond the band's capacity) announce themselves on stderr, so a failure they cause is
+# attributable in the captured output. Other packages keep the profile-wide retries = 2.
 [[profile.ci.overrides]]
 filter = "package(e2e-tests)"
 test-group = "e2e"
+retries = 0
 slow-timeout = { period = "720s", terminate-after = 3 }

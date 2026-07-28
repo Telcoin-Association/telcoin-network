@@ -31,6 +31,14 @@ impl NetworkBehaviour for PeerManager {
         //
         // ensure PeerId isn't banned if known and register dial attempt
         if let Some(peer_id) = maybe_peer {
+            // refuse to dial our own identity. Kademlia can auto-dial an address
+            // it learned for a peer id (e.g. our own record re-learned via a
+            // hairpin address); if that id is ours, deny it here before a
+            // self-connection is established.
+            if self.is_local_peer(&peer_id) {
+                debug!(target: "peer-manager", ?peer_id, "denying outbound connection to local peer id");
+                return Err(ConnectionDenied::new("refusing to dial self"));
+            }
             // PeerManager and Kad may initiate dials
             // intercept kad dial attempts, sanitize, and register
             if self.dial_attempt_already_registered(&peer_id) {
@@ -84,6 +92,13 @@ impl NetworkBehaviour for PeerManager {
         remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         trace!(target: "peer-manager", ?peer, ?remote_addr, "inbound connection established");
+        // drop a self-connection (loopback/hairpin back to our own id) without
+        // scoring it. The inbound peer id is only known at this stage, so this is
+        // the earliest point an inbound self-connection can be rejected.
+        if self.is_local_peer(&peer) {
+            debug!(target: "peer-manager", ?peer, ?remote_addr, "denying inbound self-connection");
+            return Err(ConnectionDenied::new("self-connection: remote peer id is our own"));
+        }
         // ensure banned peers are not accepted
         if self.peer_banned(&peer) {
             return Err(ConnectionDenied::new("peer is banned"));
@@ -101,6 +116,12 @@ impl NetworkBehaviour for PeerManager {
         _port_use: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         trace!(target: "peer-manager", ?peer, ?addr, "outbound connection established");
+        // drop a self-connection without scoring it (backstop for the pending
+        // guard in case a self-dial still reaches the established stage).
+        if self.is_local_peer(&peer) {
+            debug!(target: "peer-manager", ?peer, ?addr, "denying outbound self-connection");
+            return Err(ConnectionDenied::new("self-connection: remote peer id is our own"));
+        }
         if self.peer_banned(&peer) {
             error!(target: "peer-manager", ?peer, ?addr, "established outbound connection with banned peer - disconnecting...");
             return Err(ConnectionDenied::new("peer is banned"));
@@ -290,14 +311,16 @@ impl PeerManager {
     ///
     /// NOTE: `AllPeers` is only updated if the peer is _not_ already connected. It's possible that
     /// an outgoing dial attempt fails because the peer connected during the dial.
-    fn on_dial_failure(&mut self, peer_id: Option<PeerId>, error: &DialError) {
+    pub(super) fn on_dial_failure(&mut self, peer_id: Option<PeerId>, error: &DialError) {
         self.metrics.record_dial_failure();
         if let Some(peer_id) = peer_id {
             if !self.is_connected(&peer_id) {
                 self.register_disconnected(&peer_id);
             }
 
-            // return error to dialer
+            // return the genuine dial error to the dialer. `register_disconnected` no longer
+            // consumes the reply channel with a hardcoded cause, so the real `DialError`
+            // (wrong key, refused, firewall, timeout) reaches the caller.
             self.notify_dial_result(&peer_id, Err(error.into()));
         }
     }

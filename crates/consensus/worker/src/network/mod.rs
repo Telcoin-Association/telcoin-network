@@ -1,7 +1,7 @@
 //! Worker network implementation.
 
-use error::WorkerNetworkError;
-use futures::AsyncReadExt as _;
+use futures::AsyncWriteExt as _;
+use handle::max_sync_frame_size;
 pub use handle::WorkerNetworkHandle;
 use handler::RequestHandler;
 pub use message::{WorkerRequest, WorkerResponse};
@@ -9,14 +9,17 @@ use parking_lot::Mutex;
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_libp2p::{types::NetworkEvent, GossipMessage, ResponseChannel, Stream};
+use tn_network_libp2p::{
+    read_frame, types::NetworkEvent, write_frame, DenyReason, GossipMessage, ResponseChannel,
+    Stream, SyncFrame, SyncFrameError, WorkerSyncRequest,
+};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    BatchValidation, BlockHash, BlsPublicKey, Database, Epoch, SealedBatch, TaskError, TaskSpawner,
-    TnReceiver, WorkerId, B256,
+    BatchValidation, BlsPublicKey, Database, SealedBatch, TaskError, TaskSpawner, TnReceiver,
+    WorkerId, B256,
 };
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
@@ -40,69 +43,81 @@ pub(crate) type Res = WorkerResponse;
 /// so this bounds the true concurrent count—not just the pending map size.
 pub const MAX_CONCURRENT_BATCH_STREAMS: usize = 5;
 
-/// Timeout for pending batch requests before cleanup.
-pub const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Interval for pruning pending batch requests (awaiting peer to open stream).
-const PENDING_REQUEST_PRUNE_INTERVAL: Duration = Duration::from_secs(15);
-
-/// Maximum batch digests allowed per `RequestBatchesStream` request.
+/// Maximum batch digests allowed per sync batch request (`WorkerSyncRequest::Batches`).
 ///
 /// Derivation: 10 committee nodes * 6 max commit rounds * 5 batches per cert = 300.
 /// We use 500 for forward-compatibility headroom (committee growth, parameter changes).
 /// This is 66x smaller than the ~33k digests that fit in the 1MB RPC limit.
 pub const MAX_BATCH_DIGESTS_PER_REQUEST: usize = 500;
 
-/// Maximum number of concurrent pending batch requests from a single peer.
+/// Maximum number of concurrent in-flight sync batch streams from a single peer.
 ///
-/// Prevents a single malicious peer from filling all global slots.
+/// Counts a peer's in-flight sync streams, so no single peer can fill all global
+/// slots ([`MAX_CONCURRENT_BATCH_STREAMS`]) and starve its peers.
 pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 
-/// Tracks a pending batch stream request awaiting stream establishment.
-// pub for IT
+/// Maximum number of concurrent gossip-triggered batch prefetches.
+///
+/// When a committee worker gossips an accepted batch digest, a peer that is missing
+/// the batch prefetches it, and that fetch fans out to every connected peer (see
+/// [`handle::WorkerNetworkHandle::request_batches`]). Prefetching is a best-effort
+/// optimization: a genuinely needed batch is still fetched on demand later. Capping
+/// the number in flight (and deduplicating by digest) stops a Byzantine author from
+/// amplifying bandwidth/connection load across the worker mesh by gossiping many
+/// distinct (possibly forged) digests. Load beyond the cap is shed, not queued.
+pub const MAX_CONCURRENT_GOSSIP_PREFETCHES: usize = 8;
+
+/// Timeout for reading the opening request frame of an inbound sync stream.
+///
+/// A peer that opens a sync stream but never sends its request frame trips this
+/// and the stream is dropped, so it cannot hold an admission slot indefinitely.
+const SYNC_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// RAII guard for an admitted sync batch stream.
+///
+/// Holds a global concurrency permit and counts toward the peer's per-peer
+/// in-flight total. Dropping it releases the global slot and decrements the
+/// per-peer count, so a finished or aborted exchange frees capacity for the next
+/// sync stream.
 #[derive(Debug)]
-pub struct PendingBatchStream {
-    /// The batch digests requested (looked up from DB when stream arrives).
-    batch_digests: BTreeSet<BlockHash>,
-    /// The epoch which produced these batches.
-    epoch: Epoch,
-    /// When this request was created (for timeout cleanup).
-    created_at: Instant,
-    /// Semaphore permit held for the lifetime of this request (pending + active).
-    /// Dropping the permit frees a global concurrency slot.
+struct SyncStreamPermit {
+    /// Global concurrency permit, released on drop.
     _permit: OwnedSemaphorePermit,
+    /// Shared per-peer in-flight counter, decremented on drop.
+    peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    /// The peer whose count this permit holds.
+    peer: BlsPublicKey,
 }
 
-/// Key for pending requests: (peer_bls, request_digest)
-type PendingBatchRequestKey = (BlsPublicKey, B256);
-
-impl PendingBatchStream {
-    /// Create a new pending batch stream.
-    pub fn new(
-        batch_digests: BTreeSet<BlockHash>,
-        epoch: Epoch,
-        permit: OwnedSemaphorePermit,
-    ) -> Self {
-        Self { batch_digests, epoch, created_at: Instant::now(), _permit: permit }
+impl Drop for SyncStreamPermit {
+    fn drop(&mut self) {
+        let mut peers = self.peers.lock();
+        if let Some(count) = peers.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                peers.remove(&self.peer);
+            }
+        }
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-impl PendingBatchStream {
-    /// Create a pending batch stream with a custom `created_at` for testing stale cleanup.
-    pub fn new_with_created_at(
-        batch_digests: BTreeSet<BlockHash>,
-        epoch: Epoch,
-        permit: OwnedSemaphorePermit,
-        created_at: Instant,
-    ) -> Self {
-        Self { batch_digests, epoch, created_at, _permit: permit }
-    }
-
-    /// Read the `created_at` timestamp for testing the cleanup / replacement behavior.
-    pub fn created_at(&self) -> Instant {
-        self.created_at
-    }
+/// Try to admit one inbound sync batch stream for `peer`.
+///
+/// Acquires a global permit and admits only if the peer's in-flight sync-stream
+/// count is below [`MAX_PENDING_REQUESTS_PER_PEER`]. Returns `None` (shedding the
+/// global permit) when either cap is hit.
+fn try_admit_sync(
+    semaphore: &Arc<Semaphore>,
+    sync_peers: &Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    peer: BlsPublicKey,
+) -> Option<SyncStreamPermit> {
+    let permit = semaphore.clone().try_acquire_owned().ok()?;
+    let mut sync_guard = sync_peers.lock();
+    let sync_count = sync_guard.get(&peer).copied().unwrap_or(0);
+    (sync_count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
+        *sync_guard.entry(peer).or_insert(0) += 1;
+        SyncStreamPermit { _permit: permit, peers: sync_peers.clone(), peer }
+    })
 }
 
 /// Handle inter-node communication between primaries.
@@ -114,13 +129,17 @@ pub struct WorkerNetwork<DB, Events> {
     network_handle: WorkerNetworkHandle,
     /// Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
-    /// Pending batch requests awaiting stream from requestor.
+    /// Semaphore bounding total concurrent sync batch stream operations.
     ///
-    /// Wrapped in `Arc<Mutex>` so spawned stream tasks can look up the matching
-    /// request after reading the correlation digest from the stream.
-    pending_batch_requests: Arc<Mutex<HashMap<PendingBatchRequestKey, PendingBatchStream>>>,
-    /// Semaphore bounding total concurrent batch stream operations (pending + active).
+    /// A permit is held from admission through stream completion, so the global
+    /// concurrency cap of [`MAX_CONCURRENT_BATCH_STREAMS`] bounds the true
+    /// in-flight count.
     batch_stream_semaphore: Arc<Semaphore>,
+    /// Per-peer count of in-flight sync batch streams.
+    ///
+    /// Admission checks this count against [`MAX_PENDING_REQUESTS_PER_PEER`], the
+    /// sole per-peer cap now that every batch fetch rides the typed sync protocol.
+    sync_stream_peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
     /// Access to the consensus chain.
     consensus_chain: ConsensusChain,
 }
@@ -145,8 +164,8 @@ where
             network_events,
             network_handle,
             request_handler,
-            pending_batch_requests: Arc::new(Mutex::new(HashMap::new())),
             batch_stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS)),
+            sync_stream_peers: Arc::new(Mutex::new(HashMap::new())),
             consensus_chain,
         }
     }
@@ -154,25 +173,14 @@ where
     /// Run the network for the epoch.
     pub fn spawn(mut self, epoch_task_spawner: &TaskSpawner) {
         epoch_task_spawner.spawn_critical_task("worker network events", async move {
-            // start interval for pruning stale stream requests
-            let mut prune_requests = tokio::time::interval(PENDING_REQUEST_PRUNE_INTERVAL);
             loop {
-                tokio::select! {
-                    // process network events
-                    next = self.network_events.recv() => {
-                        match next {
-                            Some(event) => {
-                                self.process_network_event(event);
-                            }
-                            None => {
-                                warn!(target: "worker::network", "critical worker network events channel dropped");
-                                break Err(TaskError::from_message("critical worker network events channel dropped"));
-                            }
-                        }
+                match self.network_events.recv().await {
+                    Some(event) => {
+                        self.process_network_event(event);
                     }
-                    // periodically prune stale stream requests
-                    _ = prune_requests.tick() => {
-                        self.cleanup_stale_pending_requests();
+                    None => {
+                        warn!(target: "worker::network", "critical worker network events channel dropped");
+                        break Err(TaskError::from_message("critical worker network events channel dropped"));
                     }
                 }
             }
@@ -187,22 +195,13 @@ where
                 WorkerRequest::ReportBatch { sealed_batch } => {
                     self.process_report_batch(peer, sealed_batch, channel, cancel);
                 }
-                WorkerRequest::RequestBatchesStream { batch_digests, epoch } => {
-                    self.process_request_batches_stream(
-                        peer,
-                        batch_digests,
-                        epoch,
-                        channel,
-                        cancel,
-                    );
-                }
                 WorkerRequest::PeerExchange { .. } => {
                     // expect this is intercepted by network layer
                     warn!(target: "worker::network", "worker application received unexpected peer exchange message");
                 }
             },
-            NetworkEvent::Gossip(msg, propagation_source) => {
-                self.process_gossip(msg, propagation_source);
+            NetworkEvent::Gossip(gossip) => {
+                self.process_gossip(gossip.message, gossip.relayer, gossip.author);
             }
             NetworkEvent::Error(msg, channel) => {
                 let err = WorkerResponse::Error(message::WorkerRPCError(msg));
@@ -216,7 +215,7 @@ where
                 );
             }
             NetworkEvent::InboundStream { peer, stream } => {
-                self.process_inbound_stream(peer, stream);
+                self.process_inbound_sync_stream(peer, stream)
             }
         }
     }
@@ -241,11 +240,14 @@ where
                     let response = match res {
                         Ok(()) => WorkerResponse::ReportBatch,
                         Err(err) => {
-                            let error = err.to_string();
+                            // classify transient responder-side conditions as
+                            // recoverable so the requester retries instead of
+                            // treating this as a permanent rejection
+                            let response = WorkerResponse::into_error_ref(&err);
                             if let Some(penalty) = err.into() {
                                 network_handle.report_penalty(peer, penalty).await;
                             }
-                            WorkerResponse::Error(message::WorkerRPCError(error))
+                            response
                         }
                     };
                     let _ = network_handle.inner_handle().send_response(response, channel).await;
@@ -258,17 +260,29 @@ where
     }
 
     /// Process gossip from a worker.
-    fn process_gossip(&self, msg: GossipMessage, propagation_source: BlsPublicKey) {
+    fn process_gossip(
+        &self,
+        msg: GossipMessage,
+        relayer: Option<BlsPublicKey>,
+        author: Option<BlsPublicKey>,
+    ) {
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("process-gossip-{propagation_source}");
+        let relayer_label =
+            relayer.as_ref().map_or_else(|| "unresolved".to_string(), |bls| bls.to_string());
+        let task_name = format!("process-gossip-{relayer_label}");
         self.network_handle.get_task_spawner().spawn_task(task_name, async move {
             if let Err(e) = request_handler.process_gossip(&msg).await {
                 warn!(target: "worker::network", ?e, "process_gossip");
-                // convert error into penalty to lower peer score
-                if let Some(penalty) = e.penalty() {
-                    network_handle.report_penalty(propagation_source, penalty).await;
+                // Charge the accountable peer, and only once its BLS identity has resolved: the
+                // author for a content-determined fault (#819, guaranteed resolved on the
+                // restricted batch topic), the relaying peer for every other fault (#801).
+                // `is_author_content_fault` is the shared classifier; `zip` skips the penalty when
+                // that peer is unresolved or the error carries no penalty.
+                let charged = if e.is_author_content_fault() { author } else { relayer };
+                if let Some((peer, penalty)) = charged.zip(e.penalty()) {
+                    network_handle.report_penalty(peer, penalty).await;
                 }
                 Err(e.into())
             } else {
@@ -277,175 +291,170 @@ where
         });
     }
 
-    /// Process a stream-based batch request.
+    /// Process an inbound sync-protocol batch stream.
     ///
-    /// This negotiates a stream transfer. If we can fulfill the request,
-    /// we store the pending request and return an ack. The requestor will
-    /// then open a stream with the request digest for correlation.
-    fn process_request_batches_stream(
-        &self,
-        peer: BlsPublicKey,
-        batch_digests: BTreeSet<B256>,
-        epoch: Epoch,
-        channel: ResponseChannel<WorkerResponse>,
-        cancel: oneshot::Receiver<()>,
-    ) {
-        // cap batch digests to node's max — process as many as possible
-        let batch_digests: BTreeSet<B256> = if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
-            warn!(
-                target: "worker::network",
-                %peer,
-                requested = batch_digests.len(),
-                max = MAX_BATCH_DIGESTS_PER_REQUEST,
-                "truncating oversized batch request"
-            );
-            batch_digests.into_iter().take(MAX_BATCH_DIGESTS_PER_REQUEST).collect()
-        } else {
-            batch_digests
-        };
+    /// The request travels in the opening [`SyncFrame::Req`] frame (no prior
+    /// request-response ack), so admission against the per-peer concurrency cap
+    /// happens here on stream open. A shedding responder writes
+    /// [`DenyReason::AtCapacity`] without reading, so the requester gives up
+    /// immediately and tries elsewhere. Once admitted, the opening request frame
+    /// is read (bounded by [`SYNC_REQUEST_READ_TIMEOUT`]) and the batches are
+    /// served by [`RequestHandler::process_sync_batches_stream`]. The admission
+    /// permit is held for the lifetime of the spawned task.
+    fn process_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
+        // admit against the per-peer cap before spawning; the permit (if any) moves
+        // into the task and frees capacity on drop
+        let permit = try_admit_sync(&self.batch_stream_semaphore, &self.sync_stream_peers, peer);
+        let request_handler = self.request_handler.clone();
+        let consensus_chain = self.consensus_chain.clone();
+        let epoch = self.network_handle.epoch();
+        let task_name = format!("sync-batches-{peer}");
+        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
+            let mut stream = stream;
+            let max_frame = max_sync_frame_size(epoch);
+            let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
 
-        // validate pending batch request
-        let response = if batch_digests.is_empty() {
-            debug!(target: "worker::network", "batch request empty");
-            Err(WorkerNetworkError::InvalidRequest("Empty batch digests".into()))
-        } else {
-            // acquire semaphore permit (non-blocking) for global concurrency
-            let ack = match self.batch_stream_semaphore.clone().try_acquire_owned() {
-                Ok(permit) => {
-                    let mut pending_map = self.pending_batch_requests.lock();
+            // shed load: deny without reading so the requester retries elsewhere
+            let Some(_permit) = permit else {
+                debug!(target: "worker::network", %peer, "denying inbound sync stream: at capacity");
+                // bound the best-effort shed write: a peer that applies receive
+                // backpressure and never reads must not stall this task (no permit
+                // is held here, but the spawned task would otherwise linger).
+                let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
+                    let _ = write_frame(
+                        &mut stream,
+                        &SyncFrame::<WorkerSyncRequest>::Deny(DenyReason::AtCapacity),
+                        &mut encode_buffer,
+                        &mut compressed_buffer,
+                        max_frame,
+                    )
+                    .await;
+                    let _ = stream.close().await;
+                })
+                .await;
+                return Ok(());
+            };
 
-                    // check per-peer capacity
-                    let peer_count = pending_map.keys().filter(|(p, _)| *p == peer).count();
-                    if peer_count >= MAX_PENDING_REQUESTS_PER_PEER {
-                        debug!(
-                            target: "worker::network",
-                            %peer,
-                            peer_count,
-                            "rejecting batch stream request: per-peer limit reached"
-                        );
-                        // permit drops here, freeing the slot
-                        false
-                    } else {
-                        let request_digest =
-                            self.network_handle.generate_batch_request_id(&batch_digests);
-                        // If the same peer re-requests the same batch set while a prior
-                        // entry is still pending, preserve the original `created_at` so
-                        // the cleanup timer is not rearmed. Without this, a peer could
-                        // hold a slot indefinitely by re-requesting before the 30s
-                        // timeout. A second stream open is still punished as a protocol
-                        // violation.
-                        let created_at = pending_map
-                            .get(&(peer, request_digest))
-                            .map(|p| p.created_at)
-                            .unwrap_or_else(Instant::now);
-                        let pending = PendingBatchStream {
-                            batch_digests,
-                            epoch,
-                            created_at,
-                            _permit: permit,
-                        };
-                        if pending_map.insert((peer, request_digest), pending).is_some() {
-                            debug!(
+            // read the opening request frame; a peer that never sends one (timeout)
+            // or sends a malformed one (io error) is dropped after releasing the
+            // permit. Collapse the timeout/io results rather than nesting matches.
+            let (mut decode_buffer, mut decompress_buffer) = (Vec::new(), Vec::new());
+            let request = tokio::time::timeout(
+                SYNC_REQUEST_READ_TIMEOUT,
+                read_frame::<_, WorkerSyncRequest>(
+                    &mut stream,
+                    &mut decode_buffer,
+                    &mut decompress_buffer,
+                    max_frame,
+                ),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            let Some(request) = request else {
+                warn!(target: "worker::network", %peer, "no readable sync request frame");
+                // bound the best-effort close so a peer that sent no readable frame
+                // and then stops reading cannot pin the held admission permit on the
+                // FIN flush; mirrors the shed/malformed bounded closes above.
+                let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
+                return Ok(());
+            };
+
+            match request {
+                SyncFrame::Req(WorkerSyncRequest::Batches { batch_digests, epoch: req_epoch }) => {
+                    // cap to the node's max
+                    let batch_digests: BTreeSet<B256> =
+                        if batch_digests.len() > MAX_BATCH_DIGESTS_PER_REQUEST {
+                            warn!(
                                 target: "worker::network",
                                 %peer,
-                                ?request_digest,
-                                "pending batch stream request replaced with identical batch request"
+                                requested = batch_digests.len(),
+                                max = MAX_BATCH_DIGESTS_PER_REQUEST,
+                                "truncating oversized sync batch request"
                             );
-                        }
-                        debug!(
-                            target: "worker::network",
-                            %peer,
-                            ?request_digest,
-                            "pending batch stream request accepted"
-                        );
-                        true
-                    }
+                            batch_digests.into_iter().take(MAX_BATCH_DIGESTS_PER_REQUEST).collect()
+                        } else {
+                            batch_digests
+                        };
+                    request_handler
+                        .process_sync_batches_stream(
+                            peer,
+                            stream,
+                            batch_digests,
+                            req_epoch,
+                            &consensus_chain,
+                        )
+                        .await?;
                 }
-                Err(_) => false,
-            };
-
-            Ok(WorkerResponse::RequestBatchesStream { ack })
-        };
-
-        // send response
-        let network_handle = self.network_handle.clone();
-        let task_name = format!("process-request-batches-{peer}");
-        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            let msg = match response {
-                Ok(msg) => msg,
-                Err(err) => {
-                    let error = err.to_string();
-                    if let Some(penalty) = err.into() {
-                        network_handle.report_penalty(peer, penalty).await;
-                    }
-
-                    WorkerResponse::Error(message::WorkerRPCError(error))
+                // a well-behaved requester always opens with `Req`; anything else
+                // is malformed. Signal it and drop (metrics-only, no penalty).
+                SyncFrame::Ack
+                | SyncFrame::Deny(_)
+                | SyncFrame::Data(_)
+                | SyncFrame::End
+                | SyncFrame::Err(_) => {
+                    warn!(target: "worker::network", %peer, "unexpected opening sync frame from requester");
+                    // bound the best-effort error write so a non-reading peer
+                    // cannot pin the held admission permit on an unbounded write.
+                    let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
+                        let _ = write_frame(
+                            &mut stream,
+                            &SyncFrame::<WorkerSyncRequest>::Err(SyncFrameError::Malformed),
+                            &mut encode_buffer,
+                            &mut compressed_buffer,
+                            max_frame,
+                        )
+                        .await;
+                        let _ = stream.close().await;
+                    })
+                    .await;
                 }
-            };
-
-            // send response or cancel
-            tokio::select! {
-                _ = network_handle.inner_handle().send_response(msg, channel) => (),
-                _ = cancel => (),
             }
             Ok(())
         });
     }
+}
 
-    /// Process an inbound stream for batch transfer.
-    ///
-    /// Reads the request digest from the stream and validates against pending requests.
-    fn process_inbound_stream(&self, peer: BlsPublicKey, mut stream: Stream) {
-        let request_handler = self.request_handler.clone();
-        let network_handle = self.network_handle.clone();
-        let pending_map = self.pending_batch_requests.clone();
-        let task_name = format!("stream-requested-batches-{peer}");
-        let consensus_chain = self.consensus_chain.clone();
-        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-            // read the request digest (32-bytes) from the stream with timeout
-            let mut digest_buf = [0u8; tn_types::DIGEST_LENGTH];
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                stream.read_exact(&mut digest_buf),
-            ).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(target: "worker::network", %peer, ?e, "failed to read request digest from stream");
-                    return Err(e.into());
-                }
-                Err(e) => {
-                    warn!(target: "worker::network", %peer, "timeout reading request digest from stream");
-                    return Err(e.into());
-                }
-            }
-            let request_digest = B256::from(digest_buf);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-            // look up and remove the matching pending request
-            let opt_pending_req = pending_map
-                .lock()
-                .remove(&(peer, request_digest));
-
-            // process stream
-            if let Err(err) = request_handler
-                .process_request_batches_stream(peer, opt_pending_req, stream, request_digest, &consensus_chain)
-                .await {
-                    // apply applicable penalty for error
-                    warn!(target: "worker::network", ?err, "error processing request batches stream");
-                    if let Some(penalty) = err.penalty() {
-                        network_handle.report_penalty(peer, penalty).await;
-                    }
-                    Err(err.into())
-                } else {
-                    Ok(())
-                }
-        });
+    // A single fixed peer suffices: every case exercises the per-peer cap for one
+    // peer. `BlsPublicKey::default()` is the same key the crate's other unit tests
+    // use for this purpose.
+    fn peer() -> BlsPublicKey {
+        BlsPublicKey::default()
     }
 
-    /// Clean up stale pending requests that have timed out.
-    fn cleanup_stale_pending_requests(&mut self) {
-        let now = Instant::now();
-        self.pending_batch_requests
-            .lock()
-            .retain(|_, pending| now.duration_since(pending.created_at) < PENDING_REQUEST_TIMEOUT);
+    // Admitting sync streams up to the per-peer cap succeeds; the next is rejected
+    // (shedding its global permit), and dropping an admitted permit frees both the
+    // global slot and the per-peer count.
+    #[test]
+    fn sync_admit_enforces_per_peer_cap_and_frees_on_drop() {
+        let p = peer();
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS));
+        let sync = Arc::new(Mutex::new(HashMap::new()));
+
+        // admit up to the per-peer cap
+        let permits: Vec<_> = (0..MAX_PENDING_REQUESTS_PER_PEER)
+            .map(|_| try_admit_sync(&semaphore, &sync, p).expect("admit below the per-peer cap"))
+            .collect();
+        assert_eq!(sync.lock().get(&p).copied(), Some(MAX_PENDING_REQUESTS_PER_PEER));
+        assert_eq!(
+            semaphore.available_permits(),
+            MAX_CONCURRENT_BATCH_STREAMS - MAX_PENDING_REQUESTS_PER_PEER
+        );
+
+        // at the cap: the next admit is rejected and its global permit is shed
+        assert!(try_admit_sync(&semaphore, &sync, p).is_none());
+        assert_eq!(
+            semaphore.available_permits(),
+            MAX_CONCURRENT_BATCH_STREAMS - MAX_PENDING_REQUESTS_PER_PEER
+        );
+
+        // dropping the admitted permits frees the global slots and the per-peer count
+        drop(permits);
+        assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_BATCH_STREAMS);
+        assert!(sync.lock().get(&p).is_none());
     }
 }

@@ -4,7 +4,8 @@
 //! have reached quorum.
 
 use crate::{
-    crypto, encode, Address, BlockHash, Epoch, ExecHeader, TimestampSec, MIN_PROTOCOL_BASE_FEE,
+    crypto, encode, Address, BlockHash, BlsPublicKey, Epoch, ExecHeader, RpcInfo, TimestampSec,
+    MIN_PROTOCOL_BASE_FEE,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -209,6 +210,51 @@ pub trait BatchValidation: Send + Sync + Debug {
     /// Submit a transaction (as bytes) for inclusion in a batch.
     /// Will only submit if the txn hash fits the provided committee slot.
     fn submit_txn_if_mine(&self, tx_bytes: &[u8], committee_size: u64, committee_slot: u64);
+}
+
+/// Forwards accepted transactions to committee validators over their advertised JSON-RPC
+/// endpoints.
+///
+/// A non-committee ("observer") worker cannot include the transactions it accepts in a batch
+/// itself, so it forwards them to the committee. Instead of pushing over the libp2p worker
+/// protocol, the observer forwards each transaction to the JSON-RPC endpoint the owning
+/// validator advertised on its worker record (issue #804), so the submitter gets the same RPC
+/// experience they would get talking to a validator directly.
+///
+/// Implementations are best-effort and must not block: forwarding runs on a background task so
+/// batch production is never stalled by a slow or unreachable validator.
+pub trait TxnForwarder: Send + Sync + Debug {
+    /// Forward `transactions` to the validators that own them.
+    ///
+    /// `committee_slots` holds the committee's BLS public keys in slot order (index = committee
+    /// slot); a transaction is routed to the validator whose slot owns the sender, matching
+    /// [`BatchValidation::submit_txn_if_mine`] so all transactions from one account converge on a
+    /// single validator and nonce ordering is preserved. `validator_rpcs` is the set of
+    /// currently-known advertised endpoints; a validator that has not advertised an endpoint is
+    /// skipped in favor of one that has.
+    fn forward_txns(
+        &self,
+        transactions: Vec<Vec<u8>>,
+        committee_slots: Vec<BlsPublicKey>,
+        validator_rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+    );
+}
+
+/// A [`TxnForwarder`] that drops every transaction.
+///
+/// Committee voting validators never forward (they include transactions directly), so they can
+/// be constructed with this; it is also convenient in tests that do not exercise forwarding.
+#[derive(Clone, Debug, Default)]
+pub struct NoopTxnForwarder;
+
+impl TxnForwarder for NoopTxnForwarder {
+    fn forward_txns(
+        &self,
+        _transactions: Vec<Vec<u8>>,
+        _committee_slots: Vec<BlsPublicKey>,
+        _validator_rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+    ) {
+    }
 }
 
 /// Block validation error types

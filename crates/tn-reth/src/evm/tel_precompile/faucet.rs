@@ -201,9 +201,11 @@ pub(super) fn handle_has_mint_role(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evm::tel_precompile::{
-        burnable::{burnCall, claimCall, grantMintRoleCall, hasMintRoleCall, revokeMintRoleCall},
-        test_utils::*,
+    use crate::evm::{
+        precompile_test_utils::*,
+        tel_precompile::burnable::{
+            burnCall, claimCall, grantMintRoleCall, hasMintRoleCall, revokeMintRoleCall,
+        },
     };
     use alloy::sol_types::SolCall;
     use reth_revm::{

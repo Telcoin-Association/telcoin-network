@@ -1,7 +1,7 @@
 //! Certificate tests
 
 use rand::{rngs::StdRng, SeedableRng};
-use std::num::NonZeroUsize;
+use std::{cell::RefCell, collections::HashMap, num::NonZeroUsize, rc::Rc};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{AuthorityIdentifier, BlsKeypair, Certificate, SignatureVerificationState, Vote};
@@ -113,14 +113,29 @@ fn test_unknown_signature_in_certificate() {
     assert!(Certificate::new_unverified(&committee, header, signatures).is_err());
 }
 
+// Proptest runs every case for this test on the single libtest thread (no fork is
+// configured), so a thread_local cache is sound. Memoizing one CommitteeFixture per
+// committee size avoids regenerating BLS keypairs for every case; reusing the same keys
+// across cases changes neither the generated input range nor any assertion.
+thread_local! {
+    static FIXTURE_CACHE: RefCell<HashMap<usize, Rc<CommitteeFixture<MemDatabase>>>> =
+        RefCell::new(HashMap::new());
+}
+
 proptest::proptest! {
     #[test]
     fn test_certificate_verification(
         committee_size in 4..35_usize
     ) {
-        let fixture = CommitteeFixture::builder(MemDatabase::default)
-            .committee_size(NonZeroUsize::new(committee_size).unwrap())
-            .build();
+        let fixture = FIXTURE_CACHE.with(|cache| {
+            Rc::clone(cache.borrow_mut().entry(committee_size).or_insert_with(|| {
+                Rc::new(
+                    CommitteeFixture::builder(MemDatabase::default)
+                        .committee_size(NonZeroUsize::new(committee_size).unwrap())
+                        .build(),
+                )
+            }))
+        });
         let committee = fixture.committee();
         let header = fixture.header_from_last_authority();
 

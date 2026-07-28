@@ -166,6 +166,21 @@ pub trait TNMessage:
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap>;
 }
 
+/// The codec for the dedicated peer-exchange goodbye protocol.
+///
+/// Both directions carry a bare [`PeerExchangeMap`]: the request is the disconnecting
+/// node's exchange map and the response is an ack (empty today, though the symmetric
+/// shape leaves room for a reciprocal exchange). Reuses the hardened length-prefixed
+/// snappy codec, so the goodbye path keeps the same bounded-read guarantees as the
+/// consensus RPCs.
+pub(crate) type PeerExchangeCodec = TNCodec<PeerExchangeMap, PeerExchangeMap>;
+
+impl TNMessage for PeerExchangeMap {
+    fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
+        Some(self.clone())
+    }
+}
+
 /// The Telcoin Network request/response codec for consensus messages between peers.
 ///
 /// The codec reuses pre-allocated buffers to asynchronously read messages per the libp2p [Codec]

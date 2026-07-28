@@ -5,7 +5,6 @@
 //! signature recovery, block building, state persistence, and finalization.
 
 use alloy::sol_types::SolCall;
-use reth_revm::context::result::{ExecutionResult, Output};
 use secp256k1::rand::{rngs::StdRng, SeedableRng as _};
 use std::{
     collections::VecDeque,
@@ -332,23 +331,15 @@ impl PipelineTestEnv {
         self.read_precompile_u256(calldata)
     }
 
-    /// Execute a read-only system call to the precompile and decode a U256 result.
+    /// Execute a read-only contract call to the precompile and decode a U256 result.
     fn read_precompile_u256(&self, calldata: Vec<u8>) -> U256 {
         let hash = self.canonical_header.hash();
-        let result = self
+        let bytes = self
             .reth_env
-            .read_contract_state(hash, TELCOIN_PRECOMPILE_ADDRESS, Bytes::from(calldata))
-            .expect("read_contract_state");
-        match result.result {
-            ExecutionResult::Success { output, .. } => match output {
-                Output::Call(bytes) => {
-                    assert!(bytes.len() >= 32, "output too short for U256");
-                    U256::from_be_slice(&bytes[..32])
-                }
-                _ => panic!("unexpected output type"),
-            },
-            other => panic!("expected Success, got {other:?}"),
-        }
+            .read_contract_at_block(hash, TELCOIN_PRECOMPILE_ADDRESS, Bytes::from(calldata))
+            .expect("read contract");
+        assert!(bytes.len() >= 32, "output too short for U256");
+        U256::from_be_slice(&bytes[..32])
     }
 
     /// Check if a transaction in the most recent block succeeded.

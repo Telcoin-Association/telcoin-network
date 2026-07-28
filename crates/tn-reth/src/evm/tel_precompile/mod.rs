@@ -57,7 +57,7 @@ mod faucet;
 mod helpers;
 /// In-memory EVM test harness (available in tests and with `test-utils` feature).
 #[cfg(any(test, feature = "test-utils"))]
-pub mod test_utils;
+pub(crate) mod test_utils;
 
 // --- Re-exports for external consumers ---
 
@@ -83,6 +83,21 @@ pub use faucet::mintCall;
 /// bytecode.
 pub const TELCOIN_PRECOMPILE_ADDRESS: Address =
     address!("00000000000000000000000000000000000007e1");
+
+/// Storage slot under [`TELCOIN_PRECOMPILE_ADDRESS`] holding `addr`'s faucet mint role.
+///
+/// Seeding this slot to `1` in genesis authorizes `addr` to call the faucet
+/// `mint(address, uint256)`, mirroring what a runtime [`grantMintRoleCall`] from the
+/// governance safe writes.
+///
+/// When seeding, extend the canonical precompile genesis account rather than replacing
+/// it: its nonzero code (`0xfe`) exempts the account from EIP-158 state clearing. A
+/// storage-only (empty) account is deleted at the end of the first block that touches
+/// the precompile, silently wiping this slot and the total supply.
+#[cfg(feature = "faucet")]
+pub fn faucet_mint_role_slot(addr: Address) -> U256 {
+    faucet::mint_role_slot(addr)
+}
 
 /// Fixed storage slot (100) that holds the total circulating supply of TEL.
 ///
@@ -151,7 +166,7 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
 
 #[cfg(test)]
 mod tests {
-    use super::test_utils::*;
+    use crate::evm::precompile_test_utils::*;
     use tn_config::GOVERNANCE_SAFE_ADDRESS;
 
     #[test]

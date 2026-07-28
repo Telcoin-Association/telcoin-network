@@ -111,18 +111,55 @@ jobs:
       - name: Run tests
         run: cargo nextest run --locked --workspace --exclude tn-faucet --no-fail-fast --profile ci
 
+  # Guard: rocksdb (librocksdb-sys, the entire RocksDB C++ engine and the single largest
+  # native compile in the tree) must stay out of the default feature graph. It is gated
+  # behind the off-by-default `rocksdb` feature; this catches a future reth bump whose
+  # default set silently re-introduces it. Resolves the graph only - nothing is compiled.
+  rocksdb-gate:
+    needs: skip-maintainers
+    if: >-
+      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
+      github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          shared-key: rocksdb-gate-cache
+          cache-on-failure: "true"
+
+      - name: Assert rocksdb absent from default feature graph
+        run: |
+          # Structured check: count rocksdb packages in the feature-resolved metadata
+          # graph instead of scraping cargo's error wording. A cargo/jq failure fails
+          # the assignment (bash -e -o pipefail), so infrastructure errors fail closed.
+          hits=$(cargo metadata --locked --format-version 1 \
+            | jq '[.resolve.nodes[].id | select(test("[/#]rocksdb@"))] | length')
+          if [[ "$hits" -ne 0 ]]; then
+            echo "librocksdb-sys re-entered the default dependency graph ($hits rocksdb package(s) resolved):"
+            cargo tree --locked -e features -i rocksdb || true
+            exit 1
+          fi
+          echo "rocksdb absent from the default feature graph"
+
   # Gate job for branch protection - depends on all checks
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, clippy, test]
+    needs: [fmt, clippy, test, rocksdb-gate]
     steps:
       - name: Check all jobs passed
         run: |
           if [[ "${{ needs.fmt.result }}" == "failure" || \
                 "${{ needs.clippy.result }}" == "failure" || \
-                "${{ needs.test.result }}" == "failure" ]]; then
+                "${{ needs.test.result }}" == "failure" || \
+                "${{ needs.rocksdb-gate.result }}" == "failure" ]]; then
             echo "One or more checks failed"
             exit 1
           fi

@@ -2,38 +2,33 @@
 
 use crate::common::get_block;
 
-use super::common::ProcessGuard;
-use alloy::{
-    primitives::utils::parse_ether,
-    providers::{Provider, ProviderBuilder},
-    sol_types::SolCall,
+use super::common::{
+    create_genesis_for_test, fetch_verified_epoch_record, generate_new_validator_txs, loop_epochs,
+    start_nodes, ProcessGuard, NEW_VALIDATOR,
 };
-use clap::Parser as _;
-use e2e_tests::{create_validator_info, setup_log_dir, NodeEndpoints};
+use alloy::providers::{Provider, ProviderBuilder};
+use e2e_tests::NodeEndpoints;
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{path::Path, process::Child, sync::Arc, time::Duration};
-use telcoin_network_cli::genesis::GenesisArgs;
-use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
+use std::{path::Path, sync::Arc, time::Duration};
 use tn_reth::{
     system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
     RethChainSpec,
 };
-use tn_types::{
-    get_available_tcp_port, test_utils::CommandParser, Address, EpochCertificate, EpochRecord,
-    Genesis, GenesisAccount, U256,
-};
-use tokio::time::{timeout, Instant};
-use tracing::{debug, info};
+use tn_test_utils::wait_until;
+use tn_types::{Address, EpochCertificate, EpochRecord, Genesis};
+use tokio::time::timeout;
+use tracing::debug;
 
-const NEW_VALIDATOR: &str = "new-validator";
-const NODE_PASSWORD: &str = "sup3rsecuur";
-const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
 const MIN_EPOCHS_TO_TEST: usize = 6;
 // Epoch init creates HDX index files per epoch (open_epoch_pack → new_epoch →
 // ConsensusPack::open_append). With test-utils, these are ~1.3MB each (vs ~130MB in prod).
-// 10s provides margin for parallel test execution and CI load variance.
-const EPOCH_DURATION: u64 = 10;
+// 5s is the consensus minimum epoch duration; halving it from 10s roughly halves the
+// wall time of each epoch test. The two `tn_epochRecord` certificate-availability polls
+// below are floored to an absolute minimum (`.max(..)`) rather than scaling with this
+// constant, because certificate production is a fixed async quorum-voting cost that does
+// not shrink with the epoch cadence.
+const EPOCH_DURATION: u64 = 5;
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
@@ -88,9 +83,7 @@ async fn test_epoch_boundary_inner(
     // track the number of times the new validator was in the epoch committee
     let mut new_validator_in_committee_count = 0;
 
-    // sleep for first epoch with 1s offset and begin assertions loop
-    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
-
+    // No pre-pad sleep is needed here: the loop's first poll waits for the epoch to change.
     let mut shuffled = false;
     let mut latest_epoch = 0u32;
     // the new validator has a 1/6 chance of being selected for the new committee
@@ -103,19 +96,11 @@ async fn test_epoch_boundary_inner(
     // n ~= 25 iterations
     for i in 0..25 {
         // poll until the epoch changes, with a generous timeout for parallel test load
-        let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 4);
-        let new_epoch_info = loop {
-            let info = consensus_registry.getCurrentEpochInfo().call().await?;
-            if info != current_epoch_info {
-                break info;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Epoch did not change within {}s on iteration {i}",
-                EPOCH_DURATION * 4
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        };
+        wait_until(Duration::from_secs(EPOCH_DURATION * 4), "epoch to change", || async {
+            Ok(consensus_registry.getCurrentEpochInfo().call().await? != current_epoch_info)
+        })
+        .await?;
+        let new_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
 
         assert!(new_epoch_info.blockHeight > last_epoch_block_height);
         assert_eq!(new_epoch_info.epochDuration as u64, EPOCH_DURATION);
@@ -145,30 +130,20 @@ async fn test_epoch_boundary_inner(
         // after epoch boundaries via quorum voting.
         // TODO issue 375, should use tn_latestConsensusHeader RPC for this when fixed.
         for ep in endpoints {
-            let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
             for epoch in 0..=latest_epoch {
-                let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 3);
-                let (epoch_rec, cert) = loop {
-                    match provider
-                        .raw_request::<_, (EpochRecord, EpochCertificate)>(
-                            "tn_epochRecord".into(),
-                            (epoch,),
-                        )
-                        .await
-                    {
-                        Ok(result) => break result,
-                        Err(_) if Instant::now() < deadline => {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                        Err(e) => {
-                            return Err(eyre::eyre!(
-                                "epoch record not available for epoch {epoch} on {}: {e}",
-                                ep.http_url
-                            ));
-                        }
-                    }
-                };
-                assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
+                // This poll runs only after the new validator has been shuffled into the
+                // committee, so it can be waiting on the new-validator epoch record. That
+                // epoch has zero quorum redundancy: super_quorum = (committee * 2) / 3 + 1 = 4,
+                // exactly the established validators that remain once the new one joins. If a
+                // single established vote is slow to reach the freshly-joined node, that node
+                // falls back to its own vote-collection loop, which can run its full timeout
+                // (25 x 2.5s = ~62.5s) before the failed-quorum record collector back-fills the
+                // cert on its 5s cadence. Floor the deadline above that window (65s) rather
+                // than letting it shrink with EPOCH_DURATION. (The sync test's analogous poll
+                // is floored at 60s but is not exposed to this window: it kills/restarts a
+                // node rather than adding one to the committee.)
+                fetch_verified_epoch_record(&ep.http_url, epoch, (EPOCH_DURATION * 3).max(65))
+                    .await?;
             }
         }
         Ok(())
@@ -208,6 +183,56 @@ async fn assert_tn_registry_endpoints<P: Provider>(provider: &P) -> eyre::Result
     let validators: Vec<ConsensusRegistry::ValidatorInfo> =
         provider.raw_request("tn_getValidators".into(), ("Any",)).await?;
     assert!(!validators.is_empty(), "tn_getValidators(\"Any\") returned no validators");
+
+    // `"Any"` must equal the union of the five concrete status sets, read at one pinned tip.
+    // The five internal reads can no longer straddle a block commit, so a validator that changes
+    // status mid-read is never double-counted or dropped. The dedup check below is the direct
+    // regression guard; the length check confirms union completeness. The per-status sets are
+    // fetched as separate requests, so an epoch boundary between them could move a validator
+    // between sets; retry until all reads land in one epoch (mirrors the convergence loop above).
+    let statuses = ["Staked", "PendingActivation", "Active", "PendingExit", "Exited"];
+    let mut set_attempts = 0;
+    let (any_set, per_status_total) = loop {
+        let epoch_before: u32 = provider.raw_request("tn_getCurrentEpoch".into(), ()).await?;
+        let any_set: Vec<ConsensusRegistry::ValidatorInfo> =
+            provider.raw_request("tn_getValidators".into(), ("Any",)).await?;
+        let mut per_status_total = 0usize;
+        for status in statuses {
+            let set: Vec<ConsensusRegistry::ValidatorInfo> =
+                provider.raw_request("tn_getValidators".into(), (status,)).await?;
+            per_status_total += set.len();
+        }
+        let epoch_after: u32 = provider.raw_request("tn_getCurrentEpoch".into(), ()).await?;
+        if epoch_before == epoch_after {
+            break (any_set, per_status_total);
+        }
+        set_attempts += 1;
+        assert!(set_attempts < 3, "validator-set reads never landed in a single epoch");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+
+    // union completeness (best-effort): "Any" holds exactly as many entries as the five status
+    // sets combined. The `epoch_before == epoch_after` guard rules out epoch-boundary transitions,
+    // but this still assumes no mid-epoch status change (e.g. a `stake`/`activate` tx) lands
+    // between the separate per-status RPC requests — true in this quiescent test. The no-duplicate
+    // `HashSet` check below is the load-bearing regression guard: it operates on the single atomic
+    // "Any" response and needs no such assumption.
+    assert_eq!(
+        any_set.len(),
+        per_status_total,
+        "tn_getValidators(\"Any\") length must equal the sum of the five per-status sets"
+    );
+
+    // no double-count: each validator lives in exactly one status set, so the pinned "Any" union
+    // must contain each validator address at most once
+    let mut seen = std::collections::HashSet::new();
+    for info in &any_set {
+        assert!(
+            seen.insert(info.validatorAddress),
+            "tn_getValidators(\"Any\") double-counted validator {}",
+            info.validatorAddress
+        );
+    }
 
     // `Undefined` (0) reverts on-chain: expect an eth_call-style error (code 3 with revert
     // bytes in `data`) rather than a leaked internal error string
@@ -253,41 +278,6 @@ async fn assert_tn_registry_endpoints<P: Provider>(provider: &P) -> eyre::Result
     Ok(())
 }
 
-async fn loop_epochs(start: u32, iterations: u32, rpc_url: &str) -> eyre::Result<u32> {
-    // create rpc client for node1 default rpc address
-    let rpc_url = rpc_url.to_string();
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    // retrieve current committee
-    let consensus_registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
-    let mut current_epoch_info = consensus_registry.getCurrentEpochInfo().call().await?;
-
-    let mut last_epoch_block_height = current_epoch_info.blockHeight;
-    for i in start..start + iterations {
-        // poll until the epoch changes, with a generous timeout for parallel test load
-        let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 4);
-        let new_epoch_info = loop {
-            let info = consensus_registry.getCurrentEpochInfo().call().await?;
-            if info != current_epoch_info {
-                break info;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Epoch did not change within {}s on iteration {i}",
-                EPOCH_DURATION * 4
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        };
-
-        assert!(new_epoch_info.blockHeight > last_epoch_block_height);
-        assert_eq!(new_epoch_info.epochDuration as u64, EPOCH_DURATION);
-
-        // store the last seen epoch info that is expected to change every epoch
-        last_epoch_block_height = new_epoch_info.blockHeight;
-        current_epoch_info = new_epoch_info;
-    }
-    Ok(current_epoch_info.epochId)
-}
-
 async fn test_epoch_sync_inner(
     guard: &mut ProcessGuard,
     kill_idx: usize,
@@ -305,7 +295,7 @@ async fn test_epoch_sync_inner(
         let mut result = provider.get_chain_id().await;
         while let Err(e) = result {
             debug!(target: "epoch-test", "provider error getting chain id: {e:?}");
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
             // make next request
             result = provider.get_chain_id().await;
@@ -313,11 +303,9 @@ async fn test_epoch_sync_inner(
     })
     .await?;
 
-    // sleep for first epoch with 1s offset and begin assertions loop
-    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION + 1)).await;
-
-    // Go through at least 5 epochs.
-    loop_epochs(0, 5, &endpoints[0].http_url).await?;
+    // No pre-pad sleep is needed here: loop_epochs polls until the epoch changes.
+    // Go through at least 3 epochs.
+    loop_epochs(0, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
     // Kill a node
     if let Some(mut taken) = guard.take(kill_idx) {
         super::common::kill_child(&mut taken);
@@ -328,7 +316,7 @@ async fn test_epoch_sync_inner(
     let killed_provider = ProviderBuilder::new().connect_http(killed_url.parse()?);
     assert!(killed_provider.get_chain_id().await.is_err(), "Node not down!");
 
-    loop_epochs(5, 5, &endpoints[0].http_url).await?;
+    loop_epochs(3, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
     // Restart the node
     let (mut new_children, mut new_endpoints) =
         start_nodes(temp_path, nodes_to_start, "epoch_sync", 2)?;
@@ -336,7 +324,7 @@ async fn test_epoch_sync_inner(
     guard.replace(kill_idx, new_child);
     // Update the endpoint for the restarted node (new dynamic ports)
     endpoints[kill_idx] = new_endpoints.pop().expect("endpoint");
-    let current_epoch = loop_epochs(10, 5, &endpoints[0].http_url).await?;
+    let current_epoch = loop_epochs(6, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
 
     // Verify all nodes have valid (certified) Epoch Records.
     // The node that was down should also have all these records after syncing.
@@ -345,7 +333,6 @@ async fn test_epoch_sync_inner(
     // TODO issue 375, should use tn_latestConsensusHeader RPC for this when fixed.
     let latest_epoch = current_epoch - 1;
     for (i, ep) in endpoints.iter().enumerate() {
-        let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
         for epoch in 0..=latest_epoch {
             let val_name = committee[i].0;
             let file_test = temp_path
@@ -356,39 +343,18 @@ async fn test_epoch_sync_inner(
                 .join("data");
             let pack_file_exists = std::fs::exists(file_test).unwrap_or_default();
             assert!(pack_file_exists, "Missing an epoch pack file for {val_name} on epoch {epoch}");
-            // Use 6× epoch duration: when a new validator joins the committee mid-test,
-            // its epoch vote quorum collection can time out (25 × 2.5s = ~62s) before the
-            // failed-quorum P2P fallback runs. The spawn_epoch_record_collector retries
-            // every 5s independently, so 60s gives enough time for it to succeed.
-            let deadline = Instant::now() + Duration::from_secs(EPOCH_DURATION * 6);
-            let (epoch_rec, cert) = loop {
-                match provider
-                    .raw_request::<_, (EpochRecord, EpochCertificate)>(
-                        "tn_epochRecord".into(),
-                        (epoch,),
-                    )
+            // A node was killed and restarted earlier in this test, so it must back-fill the
+            // epoch certificates it missed while down. That recovery is a fixed async cost:
+            // the restarted node re-collects each missing cert from its peers via the
+            // 5s-cadence record collector (spawn_epoch_record_collector), independent of
+            // EPOCH_DURATION. Floor the deadline at 60s rather than letting it shrink with the
+            // epoch cadence. (Unlike test_epoch_boundary, this test never adds a validator to
+            // the committee, so it is not exposed to the ~62.5s new-validator vote-quorum
+            // window.)
+            let epoch_rec =
+                fetch_verified_epoch_record(&ep.http_url, epoch, (EPOCH_DURATION * 6).max(60))
                     .await
-                {
-                    Ok(result) => break result,
-                    Err(_) if Instant::now() < deadline => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                    Err(e) => {
-                        return Err(eyre::eyre!(
-                            "epoch record not available for validator {val_name} epoch {epoch} on {}: {e}",
-                            ep.http_url
-                        ));
-                    }
-                }
-            };
-            assert!(
-                epoch_rec.verify_with_cert(&cert),
-                "invalid epoch record: {} {}/{} {}!",
-                ep.http_url,
-                epoch_rec.epoch,
-                epoch_rec.digest(),
-                cert.epoch_hash
-            );
+                    .map_err(|e| eyre::eyre!("validator {val_name}: {e}"))?;
             // Make sure we have executed the final block from the epoch record.
             // This should prove we have the consensus output as well (i.e. verify the pack data).
             get_block(&ep.http_url, Some(epoch_rec.final_state.number)).expect(&format!(
@@ -424,9 +390,10 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
     let genesis = create_genesis_for_test(
         temp_path,
-        new_validator.address(),
+        (NEW_VALIDATOR, new_validator.address()),
         governance_wallet.address(),
         &committee,
+        EPOCH_DURATION,
     )?;
 
     // start nodes (committee + new validator)
@@ -462,9 +429,10 @@ async fn test_epoch_sync() -> eyre::Result<()> {
         TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
     let _genesis = create_genesis_for_test(
         temp_path,
-        new_validator.address(),
+        (NEW_VALIDATOR, new_validator.address()),
         governance_wallet.address(),
         &committee,
+        EPOCH_DURATION,
     )?;
 
     // start nodes (committee + new validator)
@@ -482,258 +450,4 @@ async fn test_epoch_sync() -> eyre::Result<()> {
         &mut endpoints,
     )
     .await
-}
-
-/// Create genesis for this test.
-///
-/// Funds a new validator and the governance wallet to issue NFTs.
-/// This method also configures the initial committee to start the network.
-fn create_genesis_for_test(
-    temp_path: &Path,
-    new_validator: Address,
-    governance_wallet: Address,
-    committee: &Vec<(&str, Address)>,
-) -> eyre::Result<Genesis> {
-    // use same passphrase for all nodes
-    let passphrase = Some(NODE_PASSWORD.to_string());
-
-    // create validator info for "new" validator to join
-    let new_validator_path = temp_path.join(NEW_VALIDATOR);
-    create_validator_info(&new_validator_path, &new_validator.to_string(), passphrase.clone())?;
-
-    // fund governance to issue NFT and new validator to stake
-    let accounts = vec![
-        (
-            governance_wallet,
-            GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)), /* 50mil TEL */
-        ),
-        (
-            new_validator,
-            GenesisAccount::default().with_balance(U256::from(parse_ether("2_000_000")?)), /* double stake */
-        ),
-    ];
-
-    let shared_genesis_dir = temp_path.join("shared-genesis");
-
-    // create the initial committee of validators and create genesis
-    let genesis = config_committee(
-        temp_path,
-        &shared_genesis_dir,
-        passphrase,
-        governance_wallet,
-        accounts,
-        committee,
-    )?;
-
-    // copy genesis for new validator
-    std::fs::create_dir_all(new_validator_path.join("genesis"))?;
-    std::fs::copy(
-        shared_genesis_dir.join("genesis/committee.yaml"),
-        new_validator_path.join("genesis/committee.yaml"),
-    )?;
-    std::fs::copy(
-        shared_genesis_dir.join("genesis/genesis.yaml"),
-        new_validator_path.join("genesis/genesis.yaml"),
-    )?;
-    std::fs::copy(
-        shared_genesis_dir.join("parameters.yaml"),
-        new_validator_path.join("parameters.yaml"),
-    )?;
-
-    Ok(genesis)
-}
-
-/// Configure the initial committee and fund accounts for network genesis.
-///
-/// All data is written to file.
-fn config_committee(
-    temp_path: &Path,
-    shared_genesis_dir: &Path,
-    passphrase: Option<String>,
-    consensus_registry_owner: Address,
-    accounts: Vec<(Address, GenesisAccount)>,
-    validators: &Vec<(&str, Address)>,
-) -> eyre::Result<Genesis> {
-    // create shared genesis dir
-    let copy_path = shared_genesis_dir.join("genesis/validators");
-    std::fs::create_dir_all(&copy_path)?;
-    // create validator info and copy to shared genesis dir
-    for (v, addr) in validators.iter() {
-        let dir = temp_path.join(v);
-        // init genesis ceremony to create committee files
-        create_validator_info(&dir, &addr.to_string(), passphrase.clone())?;
-
-        // copy to shared genesis dir
-        std::fs::copy(dir.join("node-info.yaml"), copy_path.join(format!("{v}.yaml")))?;
-    }
-
-    // configuration for ConesnsusRegistry to pass through CLI
-    let min_withdrawal = "1_000";
-    let epoch_rewards = "1000";
-
-    info!(target: "epoch-test", "creating committee!");
-
-    // create committee from shared genesis dir
-    let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
-        "tn",
-        "--basefee-address",
-        "0x9999999999999999999999999999999999999999",
-        "--consensus-registry-owner",
-        &consensus_registry_owner.to_string(),
-        "--initial-stake-per-validator",
-        INITIAL_STAKE_AMOUNT,
-        "--min-withdraw-amount",
-        min_withdrawal,
-        "--epoch-block-rewards",
-        epoch_rewards,
-        "--epoch-duration-in-secs",
-        &EPOCH_DURATION.to_string(),
-        "--dev-funded-account",
-        "test-source",
-        "--max-header-delay-ms",
-        "1000",
-        "--min-header-delay-ms",
-        "500",
-    ]);
-    create_committee_command.args.execute(shared_genesis_dir.to_path_buf())?;
-
-    // update genesis with funded accounts
-    let data_dir = shared_genesis_dir.join("genesis/genesis.yaml");
-    let genesis: Genesis = Config::load_from_path(&data_dir, ConfigFmt::YAML)?;
-    let genesis = genesis.extend_accounts(accounts);
-    Config::write_to_path(&data_dir, &genesis, ConfigFmt::YAML)?;
-
-    // distribute updated genesis to all validators
-    for (v, _addr) in validators.iter() {
-        let dir = temp_path.join(v);
-        std::fs::create_dir_all(dir.join("genesis"))?;
-        // copy genesis files back to validator dirs
-        std::fs::copy(
-            shared_genesis_dir.join("genesis/committee.yaml"),
-            dir.join("genesis/committee.yaml"),
-        )?;
-        std::fs::copy(
-            shared_genesis_dir.join("genesis/genesis.yaml"),
-            dir.join("genesis/genesis.yaml"),
-        )?;
-        std::fs::copy(shared_genesis_dir.join("parameters.yaml"), dir.join("parameters.yaml"))?;
-    }
-
-    Ok(genesis)
-}
-
-/// Start the network using the node cli command.
-fn start_nodes(
-    temp_path: &Path,
-    validators: &[(&str, Address)],
-    test: &str,
-    run: u32,
-) -> eyre::Result<(Vec<Child>, Vec<NodeEndpoints>)> {
-    let bin = e2e_tests::get_telcoin_network_binary();
-
-    let mut children = Vec::new();
-    let mut endpoints = Vec::new();
-    for (v, _) in validators.iter() {
-        let dir = temp_path.join(v);
-
-        if *v == "new-validator" {
-            info!(target: "epoch-test", ?v, "starting new validator");
-        }
-
-        // Get dynamic ports for RPC - OS assigns ports, no instance compensation needed
-        let rpc_port = get_available_tcp_port("127.0.0.1").expect("available tcp port");
-        let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
-
-        // IPC - unique path under temp dir to avoid cross-test conflicts
-        let ipc_path = temp_path.join(format!("{v}.ipc"));
-
-        let mut command = bin.command();
-        command
-            .env("TN_BLS_PASSPHRASE", NODE_PASSWORD)
-            .arg("--bls-passphrase-source")
-            .arg("env")
-            .arg("node")
-            .arg("--datadir")
-            .arg(&*dir.to_string_lossy())
-            .arg("--http")
-            .arg("--http.port")
-            .arg(rpc_port.to_string())
-            .arg("--ws")
-            .arg("--ws.port")
-            .arg(ws_port.to_string())
-            .arg("--ipcpath")
-            .arg(ipc_path.to_string_lossy().as_ref());
-
-        setup_log_dir(&mut command, v, test, run);
-
-        children.push(command.spawn().expect("failed to execute"));
-        endpoints.push(NodeEndpoints {
-            http_url: format!("http://127.0.0.1:{rpc_port}"),
-            ws_url: format!("ws://127.0.0.1:{ws_port}"),
-            ipc_path: ipc_path.to_string_lossy().to_string(),
-        });
-    }
-
-    Ok((children, endpoints))
-}
-
-/// Generate all the transactions needed for the new validator to be shuffled into the committee.
-fn generate_new_validator_txs(
-    temp_path: &Path,
-    chain: Arc<RethChainSpec>,
-    new_validator: &mut TransactionFactory,
-    governance_wallet: &mut TransactionFactory,
-) -> eyre::Result<Vec<Vec<u8>>> {
-    // read bls public key from fs for new validator
-    let new_validator_path = temp_path.join(NEW_VALIDATOR);
-    let new_validator_info = Config::load_from_path_or_default::<NodeInfo>(
-        new_validator_path.join("node-info.yaml").as_path(),
-        ConfigFmt::YAML,
-    )?;
-
-    // governance issue nft to new validator tx
-    let calldata = ConsensusRegistry::mintCall { validatorAddress: new_validator.address() }
-        .abi_encode()
-        .into();
-    let mint_nft = governance_wallet.create_eip1559_encoded(
-        chain.clone(),
-        None,
-        100,
-        Some(CONSENSUS_REGISTRY_ADDRESS),
-        U256::ZERO,
-        calldata,
-    );
-
-    // stake tx
-    let proof = ConsensusRegistry::ProofOfPossession {
-        uncompressedPubkey: new_validator_info.bls_public_key.serialize().into(),
-        uncompressedSignature: new_validator_info.proof_of_possession.serialize().into(),
-    };
-    let calldata = ConsensusRegistry::stakeCall {
-        blsPubkey: new_validator_info.bls_public_key.compress().into(),
-        proofOfPossession: proof,
-    }
-    .abi_encode()
-    .into();
-    let stake_tx = new_validator.create_eip1559_encoded(
-        chain.clone(),
-        None,
-        100,
-        Some(CONSENSUS_REGISTRY_ADDRESS),
-        parse_ether(INITIAL_STAKE_AMOUNT)?,
-        calldata,
-    );
-
-    // activation tx
-    let calldata = ConsensusRegistry::activateCall {}.abi_encode().into();
-    let activate_tx = new_validator.create_eip1559_encoded(
-        chain.clone(),
-        None,
-        100,
-        Some(CONSENSUS_REGISTRY_ADDRESS),
-        U256::ZERO,
-        calldata,
-    );
-
-    Ok(vec![mint_nft, stake_tx, activate_tx])
 }

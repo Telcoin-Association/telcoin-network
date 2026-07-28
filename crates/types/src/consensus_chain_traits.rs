@@ -58,6 +58,18 @@ pub trait ConsensusChainReader: Send + Sync + Clone + 'static {
         number: u64,
     ) -> impl Future<Output = eyre::Result<Option<ConsensusHeader>>> + Send;
 
+    /// Retrieve the raw consensus output bytes by global number.
+    fn consensus_output_bytes_by_number(
+        &self,
+        number: u64,
+    ) -> impl Future<Output = eyre::Result<Option<Vec<u8>>>> + Send;
+
+    /// Retrieve a full consensus output (with batches) by global number.
+    fn consensus_output_by_number(
+        &self,
+        number: u64,
+    ) -> impl Future<Output = eyre::Result<Option<ConsensusOutput>>> + Send;
+
     /// Retrieve the most recent consensus header that was executed.
     fn consensus_header_latest(
         &self,
@@ -139,7 +151,7 @@ pub trait ConsensusChainWriter: ConsensusChainReader {
     fn save_consensus_output(
         &self,
         consensus: ConsensusOutput,
-    ) -> impl Future<Output = eyre::Result<()>> + Send;
+    ) -> impl Future<Output = eyre::Result<u64>> + Send;
 
     /// Rotate the current pack file to a new epoch.  The previous pack is
     /// persisted and moved into the recent-packs cache before the new pack

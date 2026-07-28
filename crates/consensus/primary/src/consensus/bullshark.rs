@@ -32,7 +32,7 @@ pub struct Bullshark {
     pub num_sub_dags_per_schedule: u32,
     /// The leader election schedule to be used when need to find a round's leader
     pub leader_schedule: LeaderSchedule,
-    /// The bad node stake threshold for [LeaderSwapBoard].
+    /// The bad node stake threshold for [`LeaderSwapTable`].
     pub bad_nodes_stake_threshold: u64,
 }
 

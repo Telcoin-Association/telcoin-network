@@ -150,16 +150,23 @@ fn test_upsert_peer_seeds_multiaddrs_for_new_peer() {
     let bls = *BlsKeypair::generate(&mut rng).public();
     all_peers.upsert_peer(bls, network_key, vec![addr.clone()]);
 
-    // the fresh record carries the addr through to peer exchange and ip-ban association,
-    // even though the peer has never connected
+    // the fresh record carries the addr through to peer exchange and dialing, even though the peer
+    // has never connected
     let peer = all_peers.get_peer(&peer_id).expect("peer exists after upsert");
     assert!(peer.exchange_info().unwrap().1.iter().any(|a| a == &addr));
-    let expected_ip = addr.iter().find_map(|p| match p {
+
+    // but a purely self-advertised address is never treated as an observed connection IP, so it
+    // must not feed the per-IP ban counter: otherwise an attacker could advertise an honest peer's
+    // IP and have it banned (GHSA-6qcj-p42p-779j)
+    let advertised_ip = addr.iter().find_map(|p| match p {
         libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::from(ip)),
         libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::from(ip)),
         _ => None,
     });
-    assert!(peer.known_ip_addresses().any(|ip| Some(ip) == expected_ip));
+    assert!(
+        !peer.known_ip_addresses().any(|ip| Some(ip) == advertised_ip),
+        "a self-advertised, never-observed IP must not enter the ban-counter source"
+    );
 }
 
 /// Build a peer with a bls key and two network keys for rotation scenarios:
@@ -407,7 +414,7 @@ fn test_upsert_peer_rotation_normalizes_carried_pending_ban_status() {
 }
 
 #[test]
-fn test_upsert_peer_rotation_pending_ban_records_rotated_address() {
+fn test_upsert_peer_rotation_pending_ban_records_observed_rotated_address() {
     let mut all_peers = create_all_peers(None);
     let (bls, net1, peer_id_1, net2, _peer_id_2) = rotation_keys(36);
 
@@ -427,19 +434,92 @@ fn test_upsert_peer_rotation_pending_ban_records_rotated_address() {
     all_peers.update_connection_status(&other, NewConnectionStatus::Disconnected);
     assert!(!all_peers.ip_banned(&rotated_ip), "a single ban is below the per-ip threshold");
 
-    // the rotating peer is mid-ban under its first network key, presenting a different address
-    let old_addr = create_multiaddr(Some(IpAddr::V4("10.0.0.1".parse().unwrap())));
-    all_peers.upsert_peer(bls, net1, vec![old_addr]);
+    // the rotating peer is confirmed under its first network key and has actually connected from
+    // the shared address (an observed connection IP recorded on the record), then goes mid-ban
+    all_peers.upsert_peer(bls, net1, vec![]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: rotated_addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
     all_peers
         .update_connection_status(&peer_id_1, NewConnectionStatus::Disconnecting { banned: true });
 
-    // it rotates and presents the shared address: normalizing the carried pending ban must record
-    // the rotated-to address (not just the rotated-away one), pushing the shared ip over the
-    // threshold; with the ban recorded before the address update the ip would stay below it
-    all_peers.upsert_peer(bls, net2, vec![rotated_addr]);
+    // it rotates to a new network key: normalizing the carried pending ban records the *observed*
+    // shared address carried on the record, pushing the shared ip over the threshold. an address
+    // it had merely advertised (never connected from) would not count (GHSA-6qcj-p42p-779j).
+    all_peers.upsert_peer(bls, net2, vec![create_multiaddr(None)]);
     assert!(
         all_peers.ip_banned(&rotated_ip),
-        "the rotated-to address must be banned when the carried pending ban is normalized"
+        "the observed rotated-to address must be banned when the carried pending ban is normalized"
+    );
+}
+
+#[test]
+fn test_upsert_peer_rotation_pending_ban_ignores_advertised_rotated_address() {
+    // Security regression (GHSA-6qcj-p42p-779j): the rotation-carry path must bank the address the
+    // rotating peer was actually observed connecting from, but NOT an address it merely
+    // self-advertised. The rotating peer connects from its own attacker IP and only advertises the
+    // victim IP, so normalizing the carried pending ban must push the observed attacker IP over the
+    // block threshold while leaving the advertised victim IP below it.
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, _peer_id_2) = rotation_keys(36);
+
+    let victim_ip = IpAddr::V4("192.168.77.1".parse().unwrap());
+    let victim_addr = create_multiaddr(Some(victim_ip));
+    let attacker_ip = IpAddr::V4("10.0.0.1".parse().unwrap());
+    let attacker_addr = create_multiaddr(Some(attacker_ip));
+
+    // seed BOTH the victim IP and the attacker IP one ban short of the block threshold, each via a
+    // separate peer that genuinely connected from it
+    for (seed_peer, seed_addr) in
+        [(PeerId::random(), &victim_addr), (PeerId::random(), &attacker_addr)]
+    {
+        all_peers.update_connection_status(
+            &seed_peer,
+            NewConnectionStatus::Connected {
+                multiaddr: seed_addr.clone(),
+                direction: ConnectionDirection::Incoming,
+            },
+        );
+        all_peers.update_connection_status(
+            &seed_peer,
+            NewConnectionStatus::Disconnecting { banned: true },
+        );
+        all_peers.update_connection_status(&seed_peer, NewConnectionStatus::Disconnected);
+    }
+    assert!(!all_peers.ip_banned(&victim_ip), "a single ban is below the per-ip threshold");
+    assert!(!all_peers.ip_banned(&attacker_ip), "a single ban is below the per-ip threshold");
+
+    // the rotating peer connects from its OWN address (observed) and goes mid-ban, while merely
+    // advertising the victim's address in its record
+    all_peers.upsert_peer(bls, net1, vec![victim_addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: attacker_addr,
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers
+        .update_connection_status(&peer_id_1, NewConnectionStatus::Disconnecting { banned: true });
+
+    // rotate and keep advertising the victim address; normalizing the carried ban records only the
+    // observed attacker IP
+    all_peers.upsert_peer(bls, net2, vec![victim_addr]);
+
+    // positive control: the carried ban really fired and counted the OBSERVED attacker IP, pushing
+    // it over the threshold - so a green result cannot mean the ban path silently did nothing
+    assert!(
+        all_peers.ip_banned(&attacker_ip),
+        "the observed attacker IP must be banned once the carried pending ban is normalized"
+    );
+    // the advertised-only victim IP stays one ban short of the threshold
+    assert!(
+        !all_peers.ip_banned(&victim_ip),
+        "an address the rotating peer only advertised must not be banned"
     );
 }
 
@@ -456,9 +536,12 @@ fn test_upsert_peer_merge_releases_displaced_banned_record() {
     all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
     assert_eq!(all_peers.banned_peers.total(), 1);
 
-    // the peer reconnects anonymously with its rotated key, then its kad record arrives;
-    // the anonymous record wins the merge and the displaced banned record releases its
-    // bookkeeping as it is dropped (the ban itself is shed: pre-existing merge semantics)
+    // this record was banned purely at the connection-status layer (`Disconnecting { banned }`);
+    // its *score* was never lowered, so it carries no reputation ban. the peer reconnects
+    // anonymously with its rotated key, then its kad record arrives: the anonymous record wins the
+    // merge and the displaced record releases its `banned_peers` counter as it is dropped. because
+    // there is no reputation ban to carry (issue #998), the merged record stays Trusted - the
+    // reputation-ban case is covered by `test_upsert_peer_anonymous_inbound_merge_retains_ban`.
     let addr2 = create_multiaddr(None);
     all_peers.update_connection_status(
         &peer_id_2,
@@ -475,6 +558,163 @@ fn test_upsert_peer_merge_releases_displaced_banned_record() {
     assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
     let peer = all_peers.get_peer(&peer_id_2).expect("promoted peer resolves");
     assert!(matches!(peer.connection_status(), ConnectionStatus::Connected { .. }));
+    assert_eq!(peer.reputation(), Reputation::Trusted);
+}
+
+#[test]
+fn test_upsert_peer_anonymous_inbound_merge_retains_ban() {
+    // Regression (issue #998): a peer must not shed a *reputation* ban by reconnecting anonymously
+    // under a fresh network key before its kad record arrives. The anonymous-inbound record wins
+    // the merge in `upsert_peer`, but it must inherit the worse (banned) reputation of the record
+    // it displaces instead of resetting to a default (Trusted) score. On unpatched code the
+    // promoted record keeps its fresh score and the final `reputation()`/`peer_banned` assertions
+    // fail.
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(37);
+    let addr = create_multiaddr(None);
+
+    // establish a real reputation ban under the first network key: connect, then a Fatal penalty
+    // drops the score below the ban threshold; the follow-up disconnect completes the ban
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.process_penalty(&peer_id_1, Penalty::Fatal);
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
+    assert_eq!(
+        all_peers.get_peer(&peer_id_1).map(|p| p.reputation()),
+        Some(Reputation::Banned),
+        "precondition: the peer is reputation-banned under its first network key",
+    );
+    assert!(all_peers.peer_banned(&peer_id_1));
+    assert_eq!(all_peers.banned_peers.total(), 1);
+
+    // the banned peer reconnects anonymously under a fresh network key (new peer id), creating a
+    // live inbound record, then publishes its self-signed kad record so `upsert_peer` merges the
+    // anonymous record onto the confirmed identity
+    let addr2 = create_multiaddr(None);
+    all_peers.update_connection_status(
+        &peer_id_2,
+        NewConnectionStatus::Connected {
+            multiaddr: addr2.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.upsert_peer(bls, net2, vec![addr2]);
+
+    // the merged record keeps the worse (banned) reputation: the ban survives the rotation and
+    // `peer_banned` still reports it under the new peer id
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    let peer = all_peers.get_peer(&peer_id_2).expect("promoted peer resolves");
+    assert_eq!(
+        peer.reputation(),
+        Reputation::Banned,
+        "the anonymous-inbound merge must retain the displaced record's reputation ban",
+    );
+    assert!(
+        all_peers.peer_banned(&peer_id_2),
+        "the reputation ban must survive a network-key rotation via anonymous inbound",
+    );
+}
+
+#[test]
+fn test_upsert_peer_cold_rotation_preserves_reputation_ban() {
+    // Regression (issue #998): the ordinary "cold" network-key rotation, where there is NO live
+    // anonymous-inbound record. `migrated` is None, so the new `(migrated, rotated)` merge arm is
+    // NOT exercised; the banned record carries forward via `migrated.or(rotated)` = rotated and
+    // `normalize_carried_status` re-applies its ban. This pins that the fix leaves cold-rotation
+    // ban preservation intact. The over-correction guard - that the merge does not drag a worse
+    // promoted record UP to a better displaced score - is
+    // `test_upsert_peer_anonymous_inbound_merge_keeps_promoted_worse_ban`, which does run the new
+    // arm's no-op branch.
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(38);
+    let addr = create_multiaddr(None);
+
+    // establish a real reputation ban under the first network key
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.process_penalty(&peer_id_1, Penalty::Fatal);
+    all_peers.update_connection_status(&peer_id_1, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.get_peer(&peer_id_1).map(|p| p.reputation()), Some(Reputation::Banned),);
+
+    // rotate the network key with NO live anonymous inbound record present: `migrated` is None, so
+    // the banned record carries forward wholesale and normalizes its transport status
+    all_peers.upsert_peer(bls, net2, vec![addr]);
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    let peer = all_peers.get_peer(&peer_id_2).expect("rotated peer resolves");
+    assert_eq!(peer.reputation(), Reputation::Banned);
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Banned { .. }));
+    assert!(all_peers.peer_banned(&peer_id_2));
+    assert_eq!(all_peers.banned_peers.total(), 1);
+}
+
+#[test]
+fn test_upsert_peer_anonymous_inbound_merge_keeps_promoted_worse_ban() {
+    // Over-correction guard (issue #998): the merge must retain the WORSE of the two reputations in
+    // BOTH directions. Here the promoted anonymous-inbound record is itself banned while the
+    // record it displaces under the confirmed identity is better-behaved (Trusted). The
+    // `retain_worse_reputation` no-op branch (`other.score < self.score` is false) must leave the
+    // promoted record's ban intact and NOT drag it up to the displaced record's Trusted score. This
+    // is the direction that kills the "always copy the displaced score" mutation, which the
+    // same-direction retains-ban test cannot detect.
+    let mut all_peers = create_all_peers(None);
+    let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(39);
+    let addr = create_multiaddr(None);
+
+    // a Trusted, better-behaved record under the confirmed identity via the first network key (its
+    // score is never lowered), which will become the displaced `rotated` record in the merge
+    all_peers.upsert_peer(bls, net1, vec![addr.clone()]);
+    assert_eq!(all_peers.get_peer(&peer_id_1).map(|p| p.reputation()), Some(Reputation::Trusted));
+
+    // the peer connects anonymously under a fresh network key and misbehaves BEFORE its kad record
+    // arrives, so the anonymous record (still `Unidentified`, not yet resolved to `bls`) is itself
+    // reputation-banned by a Fatal penalty
+    let addr2 = create_multiaddr(None);
+    all_peers.update_connection_status(
+        &peer_id_2,
+        NewConnectionStatus::Connected {
+            multiaddr: addr2.clone(),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    all_peers.process_penalty(&peer_id_2, Penalty::Fatal);
+    assert_eq!(
+        all_peers.get_peer(&peer_id_2).map(|p| p.reputation()),
+        Some(Reputation::Banned),
+        "precondition: the anonymous inbound record is itself banned before its kad record arrives",
+    );
+
+    // the kad record arrives and binds the banned anonymous record to `bls`, whose confirmed record
+    // is merely Trusted: the promoted (banned) record must keep its own worse reputation
+    all_peers.upsert_peer(bls, net2, vec![addr2]);
+    assert_eq!(all_peers.peers.len(), 1);
+    assert!(all_peers.bls_for_peer(&peer_id_1).is_none());
+    assert_eq!(all_peers.bls_for_peer(&peer_id_2), Some(bls));
+    let peer = all_peers.get_peer(&peer_id_2).expect("promoted peer resolves");
+    assert_eq!(
+        peer.reputation(),
+        Reputation::Banned,
+        "the merge must not upgrade a banned promoted record to a better displaced score",
+    );
+    assert!(
+        all_peers.peer_banned(&peer_id_2),
+        "the promoted record's own ban must survive binding to a better-behaved identity",
+    );
 }
 
 #[test]
@@ -633,6 +873,36 @@ fn test_heartbeat_maintenance() {
     assert_eq!(all_peers.disconnected_peers, 1);
 }
 
+// Regression for #745: when a dial exceeds `dial_timeout` and is reaped by the heartbeat,
+// the caller must still be told it was a timeout. This is the one path where "dial attempt
+// timedout" is the genuine cause; the disconnect transition no longer hardcodes it, so the
+// heartbeat is now responsible for notifying the dialer.
+#[test]
+fn test_heartbeat_dial_timeout_notifies_caller() {
+    let mut all_peers = create_all_peers(None);
+    let peer_id = PeerId::random();
+
+    // register a dial with a live reply channel, then age it past the timeout
+    let (sender, mut receiver) = oneshot::channel();
+    all_peers.register_dial_attempt(peer_id, Some(sender));
+    all_peers
+        .get_peer_mut(&peer_id)
+        .expect("peer must exist after register_dial_attempt")
+        .set_connection_status(ConnectionStatus::Dialing {
+            instant: Instant::now() - Duration::from_secs(10),
+        }); // Older than the 5s timeout
+
+    let _ = all_peers.heartbeat_maintenance();
+
+    // the caller is notified of the genuine timeout
+    let result = receiver.try_recv().expect("heartbeat must notify the dialer of the timeout");
+    let err = result.expect_err("dial timeout must be reported as an error");
+    assert_eq!(
+        err.to_string(),
+        NetworkError::Dial("dial attempt timedout".to_string()).to_string()
+    );
+}
+
 #[test]
 fn test_pruning_logic() {
     let config = PeerConfig::default();
@@ -703,6 +973,99 @@ fn test_pruning_logic() {
     assert_eq!(all_peers.banned_peers.total(), config.max_banned_peers);
     let expected = peer_num - config.max_banned_peers;
     assert_eq!(pruned.len(), expected); // 1 peer should be pruned
+}
+
+/// Regression guard for issue #799: overflow pruning must evict the OLDEST bans and keep the
+/// NEWEST. The heap previously stored `Reverse(instant)`, so it retained and then evicted the
+/// freshest bans instead. That let a peer banned moments ago be dropped from the ban set and
+/// reconnect (ban evasion). `test_pruning_logic` only asserts the pruned *count*, so it cannot
+/// catch the inverted direction; this test pins down exactly *which* peers survive.
+#[test]
+fn test_prune_banned_evicts_oldest_not_newest() {
+    let config = PeerConfig::default();
+    let excess = 5;
+    let peer_num = config.max_banned_peers + excess;
+    let mut all_peers = create_all_peers(None);
+
+    // rank 1..=peer_num: a larger rank is an OLDER ban (instant further in the past), so the
+    // `excess` largest ranks are the oldest bans and must be the ones pruned.
+    let mut banned = Vec::with_capacity(peer_num);
+    for rank in 1..=peer_num {
+        let peer_id = PeerId::random();
+        all_peers.update_connection_status(
+            &peer_id,
+            NewConnectionStatus::Disconnecting { banned: true },
+        );
+        all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+        all_peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
+
+        if let Some(peer) = all_peers.get_peer_mut(&peer_id) {
+            if matches!(peer.connection_status(), ConnectionStatus::Banned { .. }) {
+                peer.set_connection_status(ConnectionStatus::Banned {
+                    instant: Instant::now() - Duration::from_secs(rank as u64),
+                });
+            }
+        }
+        banned.push((rank, peer_id));
+    }
+    assert_eq!(all_peers.banned_peers.total(), peer_num);
+
+    // the triggering peer is disconnected (not banned), so it does not affect the banned count:
+    // exactly `excess` bans are pruned, down to `max_banned_peers`.
+    all_peers.register_disconnected(&PeerId::random());
+    assert_eq!(all_peers.banned_peers.total(), config.max_banned_peers);
+
+    // the `excess` OLDEST bans (rank > max_banned_peers) are gone; every newer ban survives.
+    for (rank, peer_id) in &banned {
+        let still_banned = all_peers.peer_banned(peer_id);
+        if *rank > config.max_banned_peers {
+            assert!(!still_banned, "oldest ban (rank {rank}) should have been pruned");
+        } else {
+            assert!(still_banned, "recent ban (rank {rank}) must survive pruning");
+        }
+    }
+}
+
+/// Companion to `test_prune_banned_evicts_oldest_not_newest`: the disconnected caller shares the
+/// same `collect_excess_peers` helper, so it must likewise keep the newest disconnected peers and
+/// evict the oldest. Guards against the two prune callers diverging in future refactors.
+#[test]
+fn test_prune_disconnected_evicts_oldest_not_newest() {
+    let config = PeerConfig::default();
+    let excess = 5;
+    let peer_num = config.max_disconnected_peers + excess;
+    let mut all_peers = create_all_peers(None);
+
+    // rank 1..=peer_num: a larger rank is an OLDER disconnect.
+    let mut disconnected = Vec::with_capacity(peer_num);
+    for rank in 1..=peer_num {
+        let peer_id = PeerId::random();
+        all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+
+        if let Some(peer) = all_peers.get_peer_mut(&peer_id) {
+            if matches!(peer.connection_status(), ConnectionStatus::Disconnected { .. }) {
+                peer.set_connection_status(ConnectionStatus::Disconnected {
+                    instant: Instant::now() - Duration::from_secs(rank as u64),
+                });
+            }
+        }
+        disconnected.push((rank, peer_id));
+    }
+    assert_eq!(all_peers.disconnected_peers, peer_num);
+
+    // the triggering peer is itself disconnected (instant ~now, the newest), so it joins the set
+    // and `excess + 1` of the oldest are pruned: ranks >= max_disconnected_peers.
+    all_peers.register_disconnected(&PeerId::random());
+    assert_eq!(all_peers.disconnected_peers, config.max_disconnected_peers);
+
+    for (rank, peer_id) in &disconnected {
+        let retained = all_peers.get_peer(peer_id).is_some();
+        if *rank >= config.max_disconnected_peers {
+            assert!(!retained, "oldest disconnect (rank {rank}) should have been pruned");
+        } else {
+            assert!(retained, "recent disconnect (rank {rank}) must survive pruning");
+        }
+    }
 }
 
 #[test]

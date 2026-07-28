@@ -19,7 +19,11 @@ mod manager;
 mod metrics;
 pub mod primary;
 pub mod worker;
-pub use manager::catchup_accumulator;
+pub use manager::{
+    build_epoch_record, catchup_accumulator, derive_base_fees_for_entered_epoch,
+    derive_idle_worker_fee, fold_next_epoch_base_fees, sync_num_workers_from_chain,
+    DerivedBaseFees,
+};
 
 #[cfg(test)]
 use tempfile as _;
@@ -47,7 +51,13 @@ where
     tokio::spawn(async move {
         // create the epoch manager
         let mut epoch_manager =
-            EpochManager::new(builder, tn_datadir, consensus_db, key_config, version).await;
+            match EpochManager::new(builder, tn_datadir, consensus_db, key_config, version).await {
+                Ok(epoch_manager) => epoch_manager,
+                Err(err) => {
+                    tracing::error!("Error running node (creating EpochManager): {err}");
+                    return Err(err);
+                }
+            };
         let result = epoch_manager.run().await;
         if let Err(err) = &result {
             tracing::error!("Error running node: {err}");
@@ -116,6 +126,10 @@ impl EngineToPrimary for EngineToPrimaryRpc {
 
     fn node_info(&self) -> &tn_rpc::RpcNodeInfo {
         &self.node_info
+    }
+
+    fn node_mode(&self) -> tn_types::NodeMode {
+        self.consensus_bus.current_node_mode().into()
     }
 }
 

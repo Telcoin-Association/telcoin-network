@@ -71,9 +71,9 @@ LENGTH="${#VALIDATORS[@]}"
 
 # Use RELEASE="debug" below and remove the --release to use a debug build
 RELEASE="release"
-cargo build --bin telcoin-network --release
+cargo build -p telcoin-network --bin telcoin-network --release
 # Example of using redb for the consensus DB
-#cargo build --bin telcoin-network --features redb --release
+#cargo build -p telcoin-network --bin telcoin-network --features redb --release
 
 if [ -d "${ROOTDIR}" ]; then
     echo "The directory ${ROOTDIR} already exists -- skipping configuration"

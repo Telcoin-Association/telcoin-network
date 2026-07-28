@@ -444,6 +444,35 @@ impl<DB: Database> Certifier<DB> {
                             error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate: {e}");
                             return Err(TaskError::from_message(e.to_string()));
                         }
+
+                        // Release the proposal lock now that the guard record is written.
+                        //
+                        // The lock exists to make the already-certified check at the top of this
+                        // method atomic with the insert above, and that pair is now complete: the
+                        // insert updates the in-memory layer synchronously, so any later proposal
+                        // reaching that check already observes this certificate. Nothing below
+                        // needs the exclusion.
+                        //
+                        // Holding it across the barrier would be actively harmful, because
+                        // `persist` is a *whole-DB* barrier - the table parameter is unused
+                        // and only selects which of the three DBs to target - so it defers while
+                        // any write txn on the epoch DB is open and drains only at refcount zero,
+                        // with no timeout. Under catch-up or epoch close that is tens to hundreds
+                        // of milliseconds during which every other proposal would queue behind this
+                        // lock. Do not widen this critical section back out.
+                        drop(_guard);
+
+                        // Wait for the `ProposedCertificates` record to be durable before
+                        // externalizing. The epoch DB persists asynchronously, so the insert above
+                        // returns before the record hits disk; `process_own_certificate` below already
+                        // externalizes (it forwards the certificate on the parents bus and triggers
+                        // fetching), and the gossip publish follows. A crash in that window loses the
+                        // record, so on restart the guard at the top of this method misses and the
+                        // certifier re-proposes the same header, re-collecting votes over an unordered
+                        // channel, which can aggregate a different 2f+1 subset into a distinct aggregate
+                        // signature and thereby perturb the leader-signature randomness. See #934, #963.
+                        self.config.node_storage().persist::<ProposedCertificates>().await;
+
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");

@@ -2,7 +2,7 @@ use crate::{
     crypto, encode,
     error::{HeaderError, HeaderResult},
     now, AuthorityIdentifier, Batch, BlockHash, BlockNumHash, Committee, Digest, Epoch, Hash,
-    Round, TimestampSec, VoteDigest, WorkerId,
+    Round, TimestampSec, VoteDigest, WorkerId, MAX_HEADER_NUM_OF_BATCHES,
 };
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,20 @@ impl Header {
         // Ensure we don't have too many parents.
         if self.inner.parents.len() > committee.size() {
             return Err(HeaderError::TooManyParents(self.inner.parents.len(), committee.size()));
+        }
+
+        // Ensure the header does not reference more batches than the protocol permits.  The
+        // proposer already caps its own headers at the configured
+        // `max_header_num_of_batches` (validated to be <= MAX_HEADER_NUM_OF_BATCHES by
+        // `Parameters::validate`); rejecting oversized inbound headers keeps the per-header
+        // batch count a genuine consensus invariant, which bounds how many unique batches a
+        // committed sub-DAG can reference and so keeps every committed output reconstructable
+        // from pack storage.
+        if self.inner.payload.len() > MAX_HEADER_NUM_OF_BATCHES {
+            return Err(HeaderError::TooManyBatches(
+                self.inner.payload.len(),
+                MAX_HEADER_NUM_OF_BATCHES,
+            ));
         }
 
         // Note that self.digest() MUST be set correctly so no need to check.  We could add a panic

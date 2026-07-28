@@ -8,10 +8,15 @@ use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tn_reth::{error::RegistryReadError, system_calls::ConsensusRegistry, RethEnv};
+use tn_reth::{
+    error::{EvmReadError, EvmReadResult},
+    system_calls::ConsensusRegistry,
+    RethEnv,
+};
 use tn_types::{
-    Address, Bytes, ConsensusHeader, Epoch, EpochCertificate, EpochDigest, EpochRecord, Genesis,
-    SolCall, SolType, SolValue, B256, U256,
+    construct_proof_of_possession_message, Address, BlsPublicKey, Bytes, ConsensusHeader, Epoch,
+    EpochCertificate, EpochDigest, EpochRecord, Genesis, NodeMode, SolCall, SolType, SolValue,
+    B256, U256,
 };
 use tokio::sync::{oneshot, Semaphore};
 
@@ -39,6 +44,12 @@ pub trait TelcoinNetworkRpcExtApi {
     /// This should be all the publicly available information to identify and connect to this node.
     #[method(name = "info")]
     async fn info(&self) -> TelcoinNetworkRpcResult<RpcNodeInfo>;
+    /// Return the node's current consensus participation mode.
+    ///
+    /// Read live at call time (not part of the static `tn_info` response), so callers can observe
+    /// transient modes such as `CvvInactive` while a restarted node catches up.
+    #[method(name = "nodeMode")]
+    async fn node_mode(&self) -> TelcoinNetworkRpcResult<NodeMode>;
     /// Return the latest consensus header.
     #[method(name = "latestConsensusHeader")]
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader>;
@@ -136,13 +147,14 @@ pub trait TelcoinNetworkRpcExtApi {
         delegator: Address,
         deadline: U256,
     ) -> TelcoinNetworkRpcResult<B256>;
-    /// Return the BLS12-381 proof of possession message: `blsPubkey || validatorAddress`.
+    /// Return the BLS12-381 proof-of-possession message a validator signs:
+    /// `intentPrefix(3) || compressedBlsPubkey(96) || validatorAddress(20)`.
     ///
-    /// Expects the 192-byte uncompressed BLS public key.
+    /// Expects the 96-byte compressed BLS public key.
     #[method(name = "proofOfPossessionMessage")]
     async fn proof_of_possession_message(
         &self,
-        bls_pubkey_uncompressed: Bytes,
+        bls_pubkey: Bytes,
         validator_address: Address,
     ) -> TelcoinNetworkRpcResult<Bytes>;
     /// Return the committee size for the next epoch.
@@ -192,6 +204,10 @@ where
 {
     async fn info(&self) -> TelcoinNetworkRpcResult<RpcNodeInfo> {
         Ok(self.inner_node_network.node_info().clone())
+    }
+
+    async fn node_mode(&self) -> TelcoinNetworkRpcResult<NodeMode> {
+        Ok(self.inner_node_network.node_mode())
     }
     async fn latest_consensus_header(&self) -> TelcoinNetworkRpcResult<ConsensusHeader> {
         Ok(self.inner_node_network.get_latest_consensus_block())
@@ -243,9 +259,42 @@ where
         &self,
         status: ConsensusRegistry::ValidatorStatus,
     ) -> TelcoinNetworkRpcResult<Vec<ConsensusRegistry::ValidatorInfo>> {
-        let calldata =
-            ConsensusRegistry::getValidatorsCall { status: status as u8 }.abi_encode().into();
-        self.registry_read(calldata).await
+        use ConsensusRegistry::ValidatorStatus;
+
+        // `getValidatorsInfo` returns exactly one status set and reverts on the `Undefined`/`Any`
+        // sentinels (the registry no longer folds statuses on-chain). Emulate the documented
+        // `"Any"` => "all validators" behavior by unioning every concrete status set. The five
+        // reads run against ONE pinned canonical tip (`read_consensus_registry_batch`), so a
+        // validator that changes status between block commits cannot be double-counted or dropped.
+        // Each validator lives in exactly one set, so the union is a plain concatenation (no
+        // dedup); retired validators intentionally appear in no set, matching the old scan. Any
+        // other status (including `Undefined`) is passed straight through, so `Undefined` still
+        // surfaces the on-chain revert that callers rely on.
+        if status == ValidatorStatus::Any {
+            let calldatas = [
+                ValidatorStatus::Staked,
+                ValidatorStatus::PendingActivation,
+                ValidatorStatus::Active,
+                ValidatorStatus::PendingExit,
+                ValidatorStatus::Exited,
+            ]
+            .into_iter()
+            .map(|s| {
+                ConsensusRegistry::getValidatorsInfoCall { status: s as u8 }.abi_encode().into()
+            })
+            .collect::<Vec<Bytes>>();
+
+            // one permit, one blocking task, one pinned EVM for all five status reads
+            let sets: Vec<Vec<ConsensusRegistry::ValidatorInfo>> = self
+                .spawn_registry_read(move |evm| evm.read_consensus_registry_batch(calldatas))
+                .await?;
+            Ok(sets.into_iter().flatten().collect())
+        } else {
+            let calldata = ConsensusRegistry::getValidatorsInfoCall { status: status as u8 }
+                .abi_encode()
+                .into();
+            self.registry_read(calldata).await
+        }
     }
 
     async fn get_committee_validators(
@@ -338,16 +387,17 @@ where
 
     async fn proof_of_possession_message(
         &self,
-        bls_pubkey_uncompressed: Bytes,
+        bls_pubkey: Bytes,
         validator_address: Address,
     ) -> TelcoinNetworkRpcResult<Bytes> {
-        let calldata = ConsensusRegistry::proofOfPossessionMessageCall {
-            blsPubkey: bls_pubkey_uncompressed,
-            validatorAddress: validator_address,
-        }
-        .abi_encode()
-        .into();
-        self.registry_read(calldata).await
+        // As of the compressed-bytes pivot the registry's `proofOfPossessionMessage` is an internal
+        // helper (not externally callable), so build the message natively from the same `tn_types`
+        // routine the validator signs and the registry reproduces on-chain byte-for-byte:
+        // `intent || compressed pubkey || address`.
+        let pubkey = BlsPublicKey::from_literal_bytes(&bls_pubkey).map_err(|e| {
+            TNRpcError::InvalidParams(format!("invalid 96-byte compressed BLS pubkey: {e:?}"))
+        })?;
+        Ok(construct_proof_of_possession_message(&pubkey, &validator_address).into())
     }
 
     async fn get_next_committee_size(&self) -> TelcoinNetworkRpcResult<u16> {
@@ -378,20 +428,37 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
 
     /// Execute a read-only [`ConsensusRegistry`] call at the canonical tip and decode the result.
     ///
+    /// Thin wrapper over [`Self::spawn_registry_read`] for the common single-read endpoints.
+    async fn registry_read<T>(&self, calldata: Bytes) -> TelcoinNetworkRpcResult<T>
+    where
+        T: SolValue + Send + 'static,
+        T: From<<<T as SolValue>::SolType as SolType>::RustType>,
+    {
+        self.spawn_registry_read(move |evm| evm.read_consensus_registry::<T>(calldata)).await
+    }
+
+    /// Run a read-only [`ConsensusRegistry`] closure on the blocking pool and map its result to
+    /// an RPC response.
+    ///
     /// EVM reads are synchronous database/CPU work, so they run on the protocol [`TaskSpawner`]'s
     /// blocking pool to avoid stalling the async runtime on a public endpoint. A
     /// [`MAX_CONCURRENT_REGISTRY_READS`] permit is acquired before spawning and moved into the
     /// blocking task, so it is released only when the work finishes — bounding blocking-pool
     /// occupancy even if a client disconnects mid-read.
     ///
+    /// The closure receives an owned [`RethEnv`] and may issue one read
+    /// ([`RethEnv::read_consensus_registry`]) or several pinned reads
+    /// ([`RethEnv::read_consensus_registry_batch`]); both single- and multi-read endpoints share
+    /// this permit/spawn/revert-mapping path.
+    ///
     /// On-chain reverts surface to the client eth_call-style (code 3 with revert bytes in
     /// `data`); internal failures are logged server-side and return a generic error.
     ///
     /// [`TaskSpawner`]: tn_types::TaskSpawner
-    async fn registry_read<T>(&self, calldata: Bytes) -> TelcoinNetworkRpcResult<T>
+    async fn spawn_registry_read<R, F>(&self, read: F) -> TelcoinNetworkRpcResult<R>
     where
-        T: SolValue + Send + 'static,
-        T: From<<<T as SolValue>::SolType as SolType>::RustType>,
+        R: Send + 'static,
+        F: FnOnce(RethEnv) -> EvmReadResult<R> + Send + 'static,
     {
         // bound concurrent blocking reads; queues (does not reject) at capacity, mirroring
         // reth's eth_call guard. acquire only fails if the semaphore is closed, which never
@@ -406,7 +473,7 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
         self.evm_state.get_task_spawner().spawn_blocking_task("tn-rpc-registry-read", move || {
             // hold the permit until the blocking read completes
             let _permit = permit;
-            if tx.send(evm.read_consensus_registry::<T>(calldata)).is_err() {
+            if tx.send(read(evm)).is_err() {
                 tracing::debug!(target: "tn::rpc", "registry read receiver dropped before result");
             }
             Ok(())
@@ -417,14 +484,14 @@ impl<N: EngineToPrimary> TelcoinNetworkRpcExt<N> {
                 tracing::warn!(target: "tn::rpc", error = %e, "registry read result channel closed");
                 TNRpcError::Internal
             })?
-            .map_err(|report| match report.downcast_ref::<RegistryReadError>() {
-                Some(RegistryReadError::Revert { output, .. }) => {
-                    TNRpcError::Revert { message: report.to_string(), output: output.clone() }
+            .map_err(|err| match &err {
+                EvmReadError::Revert { output, .. } => {
+                    TNRpcError::Revert { message: err.to_string(), output: output.clone() }
                 }
-                _ => {
+                EvmReadError::Internal(_) => {
                     tracing::debug!(
                         target: "tn::rpc",
-                        error = ?report,
+                        error = ?err,
                         "consensus registry read failed"
                     );
                     TNRpcError::Internal

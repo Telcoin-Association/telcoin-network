@@ -2,8 +2,10 @@
 members = [
     # common
     "bin/telcoin-network",
+    "bin/worker-gateway",
     "crates/config",
     "crates/engine",
+    "crates/exex",
     "crates/node",
     "crates/storage",
     "crates/test-utils",
@@ -22,6 +24,10 @@ members = [
     "crates/consensus/executor",
     "crates/consensus/primary",
     "crates/consensus/worker",
+
+    # examples
+    "examples/exex-indexer",
+    "examples/exex-lifecycle",
 
     # execution
     "crates/batch-builder",
@@ -90,7 +96,24 @@ secp256k1 = { version = "0.31", default-features = false, features = [
 rpassword = "7.4.0"
 
 # execution
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+#
+# Default features minus `rocksdb`: librocksdb-sys (the entire RocksDB C++ engine, 332
+# translation units, the single largest native compile in the tree) enters the graph only
+# through reth's default set, and our storage is MDBX-only (`RocksDBProvider` resolves to
+# reth's zero-size stub with the feature off). Re-enable explicitly via the off-by-default
+# `rocksdb` feature on tn-reth / tn-node / telcoin-network-cli / telcoin-network.
+# `reth-revm/portable` (a dependency-feature, not nameable in this list) is re-enabled on
+# the `reth-revm` entry below and reaches reth's copy through feature unification.
+# NOTE: reth's `edge` feature implies `rocksdb`; do not enable it while this gate is off.
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false, features = [
+    "jemalloc",
+    "otlp",
+    "otlp-logs",
+    "js-tracer",
+    "keccak-cache-global",
+    "asm-keccak",
+    "min-debug-logs",
+] }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
@@ -109,12 +132,18 @@ reth-network-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3
 reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+# `portable` replaces the `reth-revm/portable` entry dropped from the curated `reth`
+# feature list above (dependency-features cannot appear in a dependency's `features` key);
+# tn-reth depends on reth-revm directly, so unification applies it to reth's copy too.
+reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", features = ["portable"] }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-stages-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
+reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-tokio-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
@@ -136,6 +165,7 @@ alloy-evm = { version = "0.27.2" }
 
 tn-batch-validator = { path = "crates/batch-validator" }
 tn-engine = { path = "crates/engine" }
+tn-exex = { path = "crates/exex" }
 
 # batch maker
 tn-batch-builder = { path = "crates/batch-builder" }
@@ -195,7 +225,7 @@ ouroboros = "0.17"
 proc-macro2 = "1.0.47"
 uint = "0.10"
 cfg-if = "1.0.0"
-lru = "0.10"
+lru = "0.16"
 tokio-stream = { version = "0.1.14", features = ["sync", "net"] }
 serde_yaml = "0.8.26"
 byteorder = "1.4.3"
@@ -209,6 +239,18 @@ escargot = "0.5"
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",
+] }
+# worker-gateway http server (bin/worker-gateway)
+axum = { version = "0.8.6", default-features = false }
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = [
+    "http1",
+    "server-graceful",
+    "service",
+    "tokio",
+] }
+tower-http = { version = "0.6", default-features = false, features = [
+    "timeout",
 ] }
 const-str = "0.5.6"
 opentelemetry = { version = "0.31.0", default-features = false }

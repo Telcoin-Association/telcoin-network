@@ -74,25 +74,104 @@ pub enum NetworkType {
 }
 
 impl NetworkType {
-    /// Request-response wire protocol, isolated per role (and per worker).
-    pub(crate) fn req_res_protocol(&self) -> StreamProtocol {
+    /// Request-response wire protocol, isolated per role (and per worker) and
+    /// namespaced by `chain_id` so nodes on different chains never negotiate a
+    /// connection.
+    ///
+    /// Bumped to `/0.0.2` by the #739 legacy-variant deletion: the migration
+    /// removed the dead-but-positional request/response variants that were kept
+    /// on the wire during the rollout (`StreamEpoch`, `StreamEpochPartial`,
+    /// `StreamConsensusOutput`, `MissingCertificates`, the worker
+    /// `RequestBatchesStream`, and their acks/replies). Deleting them shifts BCS
+    /// variant discriminants, so the protocol version is bumped in the same
+    /// change: a `/0.0.2` node never negotiates request-response with a
+    /// not-yet-upgraded `/0.0.1` peer, so the two never exchange a stale
+    /// discriminant. Only this protocol changed; kad, sync, and peer-exchange
+    /// stay at `/0.0.1`.
+    pub(crate) fn req_res_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
         match self {
-            Self::Primary => StreamProtocol::new("/tn-primary/0.0.1"),
-            Self::Worker(id) => StreamProtocol::try_from_owned(format!("/tn-worker-{id}/0.0.1"))
-                .expect("worker req-res protocol name starts with '/'"),
+            Self::Primary => owned_protocol(format!("/tn-primary-{chain_id}/0.0.2")),
+            Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-{chain_id}/0.0.2")),
         }
     }
 
-    /// Kademlia wire protocol, isolated per role (and per worker).
-    pub(crate) fn kad_protocol(&self) -> StreamProtocol {
+    /// Kademlia wire protocol, isolated per role (and per worker) and namespaced
+    /// by `chain_id`.
+    pub(crate) fn kad_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
         match self {
-            Self::Primary => StreamProtocol::new("/tn-primary-kad/0.0.1"),
+            Self::Primary => owned_protocol(format!("/tn-primary-kad-{chain_id}/0.0.1")),
+            Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-kad-{chain_id}/0.0.1")),
+        }
+    }
+
+    /// Bulk-sync streaming wire protocol, isolated per role (and per worker) and
+    /// namespaced by `chain_id` so nodes on different chains never negotiate it.
+    ///
+    /// The stream behaviour registers this as its sole upgrade; the typed
+    /// [`SyncFrame`](crate::sync::SyncFrame) layer rides on streams negotiated
+    /// with this protocol.
+    pub(crate) fn sync_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        match self {
+            Self::Primary => owned_protocol(format!("/tn-primary-sync-{chain_id}/0.0.1")),
+            Self::Worker(id) => owned_protocol(format!("/tn-worker-{id}-sync-{chain_id}/0.0.1")),
+        }
+    }
+
+    /// Peer-exchange goodbye wire protocol, isolated per role (and per worker) and
+    /// namespaced by `chain_id` so nodes on different chains never negotiate it.
+    ///
+    /// A dedicated request-response protocol for the [`PeerExchangeMap`](crate::PeerExchangeMap)
+    /// a node shares when it gracefully disconnects. Goodbyes prefer this protocol and fall
+    /// back to the variant embedded in the consensus request enums when the peer has not
+    /// upgraded yet (`UnsupportedProtocols` is penalty-exempt).
+    pub(crate) fn peer_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        match self {
+            Self::Primary => owned_protocol(format!("/tn-primary-peer-exchange-{chain_id}/0.0.1")),
             Self::Worker(id) => {
-                StreamProtocol::try_from_owned(format!("/tn-worker-{id}-kad/0.0.1"))
-                    .expect("worker kad protocol name starts with '/'")
+                owned_protocol(format!("/tn-worker-{id}-peer-exchange-{chain_id}/0.0.1"))
             }
         }
     }
+}
+
+/// The chain-namespaced stream protocol a node advertises on the stream
+/// behaviour: the per-role sync protocol the typed
+/// [`SyncFrame`](crate::sync::SyncFrame) layer rides on. It carries the chain id,
+/// so the stream subsystem isolates chains the same way req-res and kad do.
+pub(crate) fn stream_protocol(
+    network_type: NetworkType,
+    chain_id: u64,
+) -> NetworkResult<StreamProtocol> {
+    network_type.sync_protocol(chain_id)
+}
+
+/// libp2p gossipsub protocol-id prefix, namespaced by `chain_id` so nodes on
+/// different chains can never negotiate a `/meshsub` gossip substream.
+///
+/// Gossipsub negotiates its own protocol id (libp2p's default `/meshsub/1.1.0`
+/// and `/meshsub/1.0.0`), independent of the req-res/kad/stream names above, so
+/// without folding the chain id in it is the one wire protocol two chains still
+/// share. Feeding this prefix to
+/// [`gossipsub::ConfigBuilder::protocol_id_prefix`](libp2p::gossipsub::ConfigBuilder::protocol_id_prefix)
+/// makes the advertised ids `/tn-meshsub-{chain_id}/1.1.0` and
+/// `/tn-meshsub-{chain_id}/1.0.0` (the builder appends the `/1.1.0` and `/1.0.0`
+/// version suffixes), so cross-chain peers fail multistream-select on gossip the
+/// same way they do on the other families.
+///
+/// The leading `/` is required: `protocol_id_prefix` does not prepend one, and a
+/// prefix without it is a malformed [`StreamProtocol`] that makes
+/// `ConfigBuilder::build` fail.
+pub(crate) fn gossip_protocol_id_prefix(chain_id: u64) -> String {
+    format!("/tn-meshsub-{chain_id}")
+}
+
+/// Build an owned [`StreamProtocol`] from a runtime name, surfacing a malformed
+/// name (one that does not start with `/`) as a [`NetworkError`] instead of a panic.
+///
+/// The names this crate builds are always well formed, so the error path is not
+/// expected to fire; returning a result keeps the construction panic-free.
+fn owned_protocol(name: String) -> NetworkResult<StreamProtocol> {
+    StreamProtocol::try_from_owned(name).map_err(|e| NetworkError::ProtocolError(e.to_string()))
 }
 
 /// A channel for sending the response to an inbound RPC, bound to the peer that
@@ -145,20 +224,51 @@ pub enum NetworkEvent<Req, Res> {
         /// The oneshot channel if the request gets cancelled at the network level.
         cancel: oneshot::Receiver<()>,
     },
-    /// Gossip message received and propagation source.
-    Gossip(GossipMessage, BlsPublicKey),
+    /// Gossip message received, with the relaying peer's and the author's BLS identities
+    /// when they have resolved.
+    ///
+    /// Both identities are `Option` because a peer is `Connected` — and can relay or author
+    /// gossip — before its signed `NodeRecord` (which carries the BLS key) has been resolved.
+    /// The payload is delivered regardless, because the message author is already authenticated
+    /// during gossip verification; the identities are used only for penalty attribution and a
+    /// log label, never for the payload itself.
+    ///
+    /// `relayer` (the forwarding `propagation_source`) and `author` (the publishing
+    /// `GossipMessage::source`) are distinct peers, and charging a content fault to the wrong
+    /// one bans honest peers (see issues #801/#819); they are named rather than positional so
+    /// the two cannot be transposed.
+    ///
+    /// The payload is boxed as [`GossipPayload`] so this variant does not size the whole enum.
+    Gossip(Box<GossipPayload>),
     /// Send an error back the requester.
     Error(String, ResponseChannel<Res>),
     /// An inbound stream was established by a peer.
     ///
-    /// The application is responsible for reading any correlation data
-    /// (e.g. request digest) from the raw stream.
+    /// Every stream negotiates the per-role sync protocol and carries the typed
+    /// [`SyncFrame`](crate::sync::SyncFrame) layer, with the request in its first
+    /// frame.
     InboundStream {
         /// The peer that opened the stream.
         peer: BlsPublicKey,
         /// The established raw p2p stream for reading data.
         stream: Stream,
     },
+}
+
+/// Boxed payload of [`NetworkEvent::Gossip`].
+///
+/// Held behind a `Box` in the variant so `NetworkEvent` is not sized to two inline
+/// `BlsPublicKey`s (288 B each); that indirection is what lets `NetworkEvent` carry no
+/// `#[allow(clippy::large_enum_variant)]`. See [`NetworkEvent::Gossip`] for the relayer
+/// and author identity semantics.
+#[derive(Debug)]
+pub struct GossipPayload {
+    /// The gossip message payload.
+    pub message: GossipMessage,
+    /// BLS identity of the relaying peer (`propagation_source`), when resolved.
+    pub relayer: Option<BlsPublicKey>,
+    /// BLS identity of the message author (`GossipMessage::source`), when resolved.
+    pub author: Option<BlsPublicKey>,
 }
 
 // ============================================================================
@@ -379,8 +489,10 @@ where
     },
     /// Open a raw stream to a peer for bulk data transfer.
     ///
-    /// Called after a successful request-response negotiation. The caller
-    /// is responsible for writing any correlation data to the stream.
+    /// The open negotiates the per-role sync protocol and the caller writes a
+    /// [`SyncFrame`](crate::sync::SyncFrame) request as the first frame. An open
+    /// that fails negotiation is penalty-exempt (honest version/role skew), so
+    /// the caller can retry another peer.
     OpenStream {
         /// The peer to open the stream to.
         peer: BlsPublicKey,
@@ -394,7 +506,8 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Option<RpcInfo>>,
     },
-    /// Snapshot of all known authority RPCs.
+    /// Snapshot of the current committee's advertised RPCs; triggers kad discovery
+    /// for members with no known record.
     GetAllValidatorRpcs {
         /// The reply to caller.
         reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
@@ -667,9 +780,10 @@ where
 
     /// Open a raw stream to a peer for bulk data transfer.
     ///
-    /// Called after a successful request-response negotiation. The caller is
-    /// responsible for writing any application-layer correlation data (e.g.
-    /// request digest) to the stream after it is established.
+    /// The open negotiates the per-role sync protocol; the caller then writes a
+    /// [`SyncFrame`](crate::sync::SyncFrame) request as the first frame. An open
+    /// that fails negotiation returns an error without penalizing the peer
+    /// (honest version/role skew), so the caller can retry another peer.
     pub async fn open_stream(&self, peer: BlsPublicKey) -> NetworkResult<NetworkResult<Stream>> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::OpenStream { peer, reply }).await?;
@@ -693,11 +807,13 @@ where
         rx.await.map_err(Into::into)
     }
 
-    /// Snapshot of all known authority RPCs.
+    /// Snapshot of the current committee's advertised RPCs.
     ///
-    /// Returns the RPC info for every known authority that has advertised it.
-    /// Callers that need fresh data should call [`Self::find_authorities`] first
-    /// and wait for discovery to complete.
+    /// Returns the RPC info for every current-committee validator that has
+    /// advertised it. Pinned operator peers and previous/next committee members
+    /// never appear. The call itself (re)triggers kad discovery for current
+    /// members whose node records are still unknown, so a polling caller picks
+    /// up their entries on a later call once the records arrive.
     ///
     /// Only worker [`NodeRecord`]s carry RPC info, so this returns entries on a
     /// worker network handle and an empty list on a primary handle. This is the

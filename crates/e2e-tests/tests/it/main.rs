@@ -3,7 +3,9 @@
 // ignore for lib
 #![allow(unused_crate_dependencies)]
 
+mod basefee;
 mod common;
+mod eject;
 mod epochs;
 #[cfg(feature = "faucet")]
 mod faucet;

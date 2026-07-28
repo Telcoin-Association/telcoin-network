@@ -13,14 +13,16 @@ use std::{
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_engine::{ExecutorEngine, TnEngineError};
+use tn_engine::{execute_consensus_output, ExecutorEngine, TnEngineError, MAX_QUEUED_OUTPUTS};
 use tn_reth::{
-    calculate_gas_penalty, recover_signed_transaction,
+    calculate_gas_penalty,
+    payload::BuildArguments,
+    recover_signed_transaction,
     system_calls::EpochState,
     test_utils::{
         calculate_withdrawals_root, create_committee_from_state,
-        seeded_genesis_from_random_batches, TransactionFactory, BEACON_ROOTS_ADDRESS,
-        EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
+        seeded_genesis_from_random_batches, test_genesis_with_consensus_registry,
+        TransactionFactory, BEACON_ROOTS_ADDRESS, EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
     },
     FixedBytes, RethChainSpec, RethEnv,
 };
@@ -187,7 +189,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -215,12 +217,123 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
     Ok(())
 }
 
+/// The engine must stop draining the consensus stream once its execution backlog reaches
+/// [`MAX_QUEUED_OUTPUTS`], then drain to completion (executing every output exactly once, in
+/// order) as completed executions re-open the gate.
+#[tokio::test]
+async fn test_queued_outputs_bounded_with_backpressure() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus
+    //
+    // build a chain of empty outputs. Pre-fill one more than the bound: the loop immediately
+    // pops one output into the in-flight execution slot, so MAX_QUEUED_OUTPUTS + 1 leaves the
+    // queue exactly at the bound (gate closed) when the stream is first polled.
+    const STREAMED: usize = 2;
+    let prefill = MAX_QUEUED_OUTPUTS + 1;
+    let total = prefill + STREAMED;
+    let timestamp = now();
+    let mut outputs = Vec::with_capacity(total);
+    let mut parent_hash = ConsensusHeaderDigest::default();
+    let mut previous_sub_dag: Option<CommittedSubDag> = None;
+    for i in 0..total {
+        let round = i as u32 + 1;
+        let mut leader = Certificate::default();
+        leader.update_header_round_for_test(round);
+        leader.update_header_created_at_for_test(timestamp);
+        leader.update_header_author_for_test(leader_id.clone());
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            round as u64,
+            ReputationScores::default(),
+            previous_sub_dag.clone(),
+        );
+        let output = ConsensusOutput::new_with_subdag(sub_dag.clone(), parent_hash, i as u64 + 1);
+        parent_hash = output.consensus_header_hash();
+        previous_sub_dag = Some(sub_dag);
+        outputs.push(output);
+    }
+
+    //=== Execution
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(STREAMED);
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(total + 1);
+    let mut engine = ExecutorEngine::new(
+        reth_env.clone(),
+        None,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        engine_update_tx,
+    );
+
+    // pre-fill the queue past the bound and fill the channel behind it
+    let mut outputs_iter = outputs.iter();
+    for output in outputs_iter.by_ref().take(prefill) {
+        engine.push_back_queued_for_test(output.clone());
+    }
+    for output in outputs_iter {
+        to_engine.send(output.clone()).await?;
+    }
+    assert_eq!(to_engine.capacity(), 0, "test setup: channel must start full");
+
+    // first poll: the queue is at the bound, so the engine must leave the stream untouched
+    // (an unbounded engine drains the whole channel on this poll)
+    let mut engine_fut = Box::pin(engine.run());
+    assert!(futures::poll!(&mut engine_fut).is_pending());
+    assert_eq!(
+        to_engine.capacity(),
+        0,
+        "engine drained the consensus stream past MAX_QUEUED_OUTPUTS"
+    );
+
+    // as executions complete the gate re-opens: everything drains and the engine shuts
+    // down once the (dropped) stream is exhausted
+    drop(to_engine);
+    let res = timeout(Duration::from_secs(30), engine_fut).await?;
+    assert_matches!(res, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // every output was executed exactly once, in order
+    for (i, output) in outputs.iter().enumerate() {
+        let (leader_round, consensus_num_hash, _tip) =
+            engine_update_rx.try_recv().unwrap_or_else(|e| {
+                panic!("missing engine update for output {}: {e}", i + 1);
+            });
+        assert_eq!(leader_round, i as u32 + 1, "output executed out of order");
+        assert_eq!(consensus_num_hash, output.num_hash());
+    }
+    assert!(engine_update_rx.try_recv().is_err(), "extra engine update: output executed twice");
+
+    Ok(())
+}
+
 /// This tests that a single empty block IS executed when consensus output contains
 /// no batches but close_epoch is true.
 #[tokio::test]
 async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()> {
     let _guard = IT_TEST_GUARD.lock();
-    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
     let tmp_dir = TempDir::new().expect("temp dir");
     // execution node components
     let gas_accumulator = GasAccumulator::new(1); // 1 worker
@@ -300,7 +413,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -480,7 +593,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
 
     // spawn engine task
     task_manager.spawn_task("Test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -539,7 +652,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     let mut batches_2 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
 
     // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
-    let genesis = test_genesis();
+    let genesis = test_genesis_with_consensus_registry(4);
     let mut tx_factory = TransactionFactory::new_random();
     let encoded_tx_priority_fee_1 = tx_factory
         .create_explicit_eip1559(
@@ -816,7 +929,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1017,7 +1130,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     let mut batches_2 = tn_reth::test_utils::batches(chain, 4); // create 4 batches
 
     // add eip1559 transactions to set max priority fee per gas so batch producer earns fees
-    let genesis = test_genesis();
+    let genesis = test_genesis_with_consensus_registry(4);
     let mut tx_factory = TransactionFactory::new_random();
     let encoded_tx_priority_fee_1 = tx_factory
         .create_explicit_eip1559(
@@ -1325,7 +1438,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1692,7 +1805,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -1910,7 +2023,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     //
     // one output already queued up, one output waiting in broadcast stream
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -2202,7 +2315,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
 
     let (tx, rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {
-        let res = engine.await;
+        let res = engine.run().await;
         let _ = tx.send(res);
         Ok(())
     });
@@ -2252,6 +2365,151 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
         expected_governance_revenue, actual_governance_revenue,
         "governance revenue mismatch — penalty may be using post-refund gas instead of pre-refund gas"
     );
+
+    Ok(())
+}
+
+/// Regression test for issue #989: a later-block build failure inside a single consensus output
+/// must not leave the earlier blocks' eager in-memory canonical advance un-rolled-back (a transient
+/// "phantom" canonical head visible to RPC until the node restarts).
+///
+/// Drives `execute_consensus_output` with a two-batch output where the first block executes and
+/// advances the in-memory state, and the second block carries a single transaction whose gas limit
+/// exceeds the block gas limit. That is a fatal, non-`InvalidTx` build error, so the output fails
+/// after the first block already advanced. The test asserts the in-memory canonical state is
+/// reverted to the pre-output (genesis) tip, nothing was committed durably, and no canon-state
+/// notification or engine update was emitted for the failed output.
+///
+/// Confirm-by-mutation: with the `rollback_in_memory_output` compensation removed from
+/// `execute_consensus_output`, the first block's advance survives and the
+/// `canonical_chain().count() == 0` and `canonical_tip == genesis` assertions below fail — so this
+/// test genuinely pins the post-error in-memory contract rather than passing vacuously.
+#[tokio::test]
+async fn test_partial_output_failure_rolls_back_in_memory_state() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let mut batches = tn_reth::test_utils::batches(chain.clone(), 2);
+
+    // Craft the poison transaction for the second block: a gas limit strictly greater than the
+    // block gas limit (`max_batch_gas`). The block-gas check fires before any balance/nonce
+    // validation, so the sender does not need to be funded; the transaction only needs to be
+    // decodable and signer-recoverable.
+    let genesis = test_genesis_with_consensus_registry(4);
+    let mut tx_factory = TransactionFactory::new_random();
+    let poison_gas_limit = max_batch_gas(0) + 1;
+    let poison_tx = tx_factory
+        .create_explicit_eip1559(
+            Some(genesis.config.chain_id),
+            None, // nonce
+            None, // max_priority_fee_per_gas
+            Some(MAX_FEE_PER_GAS as u128),
+            Some(poison_gas_limit), // gas_limit > block gas limit -> fatal build error
+            Some(Address::random()), // to
+            None,                   // value
+            None,                   // input
+            None,                   // access_list
+        )
+        .encoded_2718();
+
+    // Replace the second block's transactions with only the poison transaction.
+    if let Some(second) = batches.get_mut(1) {
+        let txs = second.transactions_mut();
+        txs.clear();
+        txs.push(poison_tx);
+    }
+
+    // Seed genesis from the first block's transactions only, so the first block executes and
+    // advances the in-memory state before the second block fails.
+    let batch_1 = batches.first().cloned().expect("two batches");
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, std::iter::once(&batch_1));
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.rewards_counter()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // pre-conditions: nothing has advanced yet
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    // subscribe before execution to prove no canon-state notification is emitted for the failure
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+    })
+    .await?;
+
+    // the output fails: the second block's oversized-gas transaction is a fatal build error
+    assert_matches!(result, Err(_), "output with an oversized-gas block must fail to build");
+
+    //=== the phantom head must not survive: in-memory state is rolled back to genesis
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        0,
+        "the first block's in-memory advance must be rolled back after the later block failed"
+    );
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        genesis_header.hash(),
+        "the canonical head must be reset to the pre-output (genesis) tip"
+    );
+
+    // no durable write: persisted tip and finalized marker stay at genesis
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 0, "no block was finalized");
+
+    // no external observer saw the phantom advance
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "a failed output must not broadcast a canon-state notification"
+    );
+    assert!(engine_update_rx.try_recv().is_err(), "a failed output must not send an engine update");
 
     Ok(())
 }

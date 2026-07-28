@@ -33,17 +33,55 @@ mod peer_manager;
 
 /// The type to manage peers.
 pub(crate) struct PeerManager {
+    /// This swarm's own peer id.
+    ///
+    /// Used to recognise and ignore the node's own identity on the dial,
+    /// discovery, connection, and penalty paths so a self-connection (e.g. a
+    /// learned hairpin address routed back to our own id) is never dialed or
+    /// scored. Primary and each worker run separate swarms with distinct
+    /// keypairs, so each `PeerManager` holds exactly one local id.
+    local_peer_id: PeerId,
     /// Config
     config: PeerConfig,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
     /// All peers for the manager.
     peers: AllPeers,
-    /// The collection of bls public keys to known peers.
-    /// This should incude the current and next couple of committee members network info.
-    /// This is used for bootstrapping and to make sure we know the network settings of committee
-    /// members.
+    /// The validated read-model of kad discovery: resolves a committee member's
+    /// [`BlsPublicKey`] to its [`NetworkInfo`] on the hot send path. [`Self::auth_to_peer`] is
+    /// a synchronous map probe on the swarm loop for every outbound BLS-addressed request;
+    /// resolving through the kad store instead would cost a key hash, a db get, and a decode
+    /// per call.
+    ///
+    /// The kad store is NOT a superset of this map: `get_record` query results are promoted
+    /// straight into this cache (`close_kad_query` in consensus.rs) and are deliberately never
+    /// written back to the store, so replacing this map with store reads would lose data.
+    ///
+    /// The lifecycles also differ. Store records lazily expire (the configured kad record TTL)
+    /// and can be evicted (max-records cap, ban-triggered removal); entries here have NO TTL by
+    /// design, because a committee member must stay resolvable for its whole committee window —
+    /// an expiry-driven resolution failure would be a consensus liveness bug.
+    ///
+    /// Values are post-validation — BLS signature verified and publisher-checked
+    /// (`peer_record_valid` in consensus.rs), committee-gated per issue #827, malformed
+    /// advertised RPC info stripped in [`Self::cache_known_peer`] — while the store holds raw
+    /// signed record bytes.
+    ///
+    /// Bounded to pinned operator peers plus the tracked committee slots
+    /// ([`Self::prune_known_peers`]); kad-sourced updates are timestamp-monotonic
+    /// ([`Self::kad_record_is_stale`]), mirroring the store-side `is_newer_record` rule.
     known_peers: HashMap<BlsPublicKey, NetworkInfo>,
+    /// BLS keys whose `known_peers` entry is pinned and never evicted by committee rotation.
+    ///
+    /// Populated only by the operator-provisioned insertion paths — trusted/bootstrap/explicit
+    /// peers — whose count is bounded by node configuration. Records restored from persistence
+    /// at startup are NOT pinned: the persisted kad store holds peer-fillable third-party records
+    /// (stored as the node's DHT storage duty), so restored entries stay subject to
+    /// committee-rotation pruning. Every other `known_peers` entry is a kad-discovered committee
+    /// record kept only while its key sits in a tracked committee slot, so
+    /// [`Self::prune_known_peers`] can drop rotated-out members without touching
+    /// operator-provisioned peers.
+    pinned_peers: HashSet<BlsPublicKey>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
     /// A queue of peers to dial.
@@ -78,7 +116,11 @@ pub(crate) struct PeerManager {
 
 impl PeerManager {
     /// Create a new instance of Self.
-    pub(crate) fn new(config: &PeerConfig, metrics: PeerManagerMetrics) -> Self {
+    pub(crate) fn new(
+        local_peer_id: PeerId,
+        config: &PeerConfig,
+        metrics: PeerManagerMetrics,
+    ) -> Self {
         let heartbeat =
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
@@ -87,16 +129,21 @@ impl PeerManager {
             config.max_banned_peers,
             config.max_disconnected_peers,
         );
-        let temporarily_banned = BannedPeerCache::new(config.excess_peers_reconnection_timeout);
+        let temporarily_banned = BannedPeerCache::new(
+            config.excess_peers_reconnection_timeout,
+            config.max_temporarily_banned_peers,
+        );
 
         // initialize global score config
         init_peer_score_config(config.score_config);
 
         Self {
+            local_peer_id,
             config: *config,
             heartbeat,
             peers,
             known_peers: Default::default(),
+            pinned_peers: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
             temporarily_banned,
@@ -123,6 +170,8 @@ impl PeerManager {
         if self.temporarily_banned.remove(&peer_id) {
             warn!(target: "peer-manager", ?peer_id, "removed trusted peer from temporarily banned list");
         }
+        // trusted peers are operator-provisioned; pin so committee rotation never evicts them
+        self.pinned_peers.insert(bls_key);
         self.known_peers.insert(bls_key, info);
 
         self.dial_peer(peer_id, multiaddr, Some(reply));
@@ -135,6 +184,17 @@ impl PeerManager {
         multiaddrs: Vec<Multiaddr>,
         reply: Option<oneshot::Sender<NetworkResult<()>>>,
     ) {
+        // never dial our own identity (e.g. a self entry that reached the
+        // discovery/dial path via a learned hairpin address). Report success so
+        // retrying callers (`dial_peer_bls`) treat it as a no-op, not a failure
+        // to back off on.
+        if self.is_local_peer(&peer_id) {
+            debug!(target: "peer-manager", ?peer_id, "skipping dial request for local peer id");
+            if let Some(reply) = reply {
+                send_or_log_error!(reply, Ok(()), "DialPeer- Self", peer = peer_id);
+            }
+            return;
+        }
         // return early if peer is banned, connected, or currently being dialed
         if let Some(peer) = self.peers.get_peer(&peer_id) {
             match peer.connection_status() {
@@ -286,6 +346,19 @@ impl PeerManager {
         self.discovery_heartbeat();
     }
 
+    /// Temporarily ban `peer_id` in the bounded reconnection-timeout cache.
+    ///
+    /// If admitting the peer pushes the cache past its size cap, the oldest entry is evicted and a
+    /// [`PeerEvent::Unbanned`] is emitted for it, so dependent state (such as the gossipsub
+    /// blacklist maintained via `Banned`/`Unbanned`) stays in sync with the removal. This mirrors
+    /// the age-based eviction in [`Self::unban_temp_banned_peers`], which unbans each dropped peer.
+    fn temporarily_ban(&mut self, peer_id: PeerId) {
+        let (_is_new, evicted) = self.temporarily_banned.insert(peer_id);
+        if let Some(evicted_peer) = evicted {
+            self.push_event(PeerEvent::Unbanned(evicted_peer));
+        }
+    }
+
     /// Apply a [PeerAction].
     ///
     /// Actions on peers happen when their reputation or connection status changes.
@@ -293,18 +366,18 @@ impl PeerManager {
         match action {
             PeerAction::Ban(ip_addrs) => {
                 debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in ban");
-                self.temporarily_banned.insert(peer_id);
+                self.temporarily_ban(peer_id);
                 self.process_ban(&peer_id);
             }
             PeerAction::Disconnect => {
                 debug!(target: "peer-manager", ?peer_id, "reputation update results in disconnect");
-                self.temporarily_banned.insert(peer_id);
+                self.temporarily_ban(peer_id);
                 self.push_event(PeerEvent::DisconnectPeer(peer_id));
             }
             PeerAction::DisconnectWithPX => {
                 debug!(target: "peer-manager", ?peer_id, "reputation update results in temp ban with PX");
                 // prevent immediate reconnection attempts
-                self.temporarily_banned.insert(peer_id);
+                self.temporarily_ban(peer_id);
                 let exchange = self.peers.peer_exchange();
                 self.events.push_back(PeerEvent::DisconnectPeerX(peer_id, exchange));
             }
@@ -345,6 +418,15 @@ impl PeerManager {
         })
     }
 
+    /// Whether `peer_id` is this swarm's own identity.
+    ///
+    /// A self-connection (the node dialing its own peer id, e.g. via a learned
+    /// hairpin address) is not a real peer: it must never be dialed, registered
+    /// for discovery, accepted as a connection, or penalized.
+    pub(super) fn is_local_peer(&self, peer_id: &PeerId) -> bool {
+        &self.local_peer_id == peer_id
+    }
+
     /// Check if the peer id is banned or associated with any banned ip addresses.
     ///
     /// This is called before accepting new connections. Also checks that the peer
@@ -383,6 +465,14 @@ impl PeerManager {
     /// Some reports are propagated to libp2p network layer. Caller is responsible
     /// for specifying the severity of the penalty to apply.
     pub(crate) fn process_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
+        // Never penalize our own identity. A self-connection (e.g. a learned
+        // hairpin address routed back to our own peer id) must not feed the
+        // score model and ban the node's own worker. Guard before recording the
+        // metric so a self-event does not pollute penalty counts.
+        if self.is_local_peer(&peer_id) {
+            debug!(target: "peer-manager", ?peer_id, "skipping penalty for local peer id");
+            return;
+        }
         self.metrics.record_penalty(&penalty);
         let action = self.peers.process_penalty(&peer_id, penalty);
 
@@ -644,6 +734,10 @@ impl PeerManager {
         self.forgive_temporarily_banned(&next);
         let unban_actions = self.peers.update_committees(previous, current, next);
         self.apply_unban_actions(unban_actions);
+        // bound `known_peers`: with the new committee slots in place, drop every entry that is
+        // neither pinned nor a current committee member so rotated-out members and stale discovered
+        // records cannot accumulate across epochs (issue #827).
+        self.prune_known_peers();
     }
 
     /// Pre-dial recovery: forgive bans for a committee so a subsequent dial loop can connect,
@@ -655,6 +749,21 @@ impl PeerManager {
         self.forgive_temporarily_banned(&committee);
         let unban_actions = self.peers.mark_committee_for_dial(committee);
         self.apply_unban_actions(unban_actions);
+    }
+
+    /// Drop cached network info for peers no longer worth tracking, bounding `known_peers`.
+    ///
+    /// Run after every committee rotation. An entry survives only if it is pinned (an
+    /// operator-provisioned trusted/bootstrap/explicit peer) or its key still sits in a tracked
+    /// committee slot, so members that rotated out — and any stale kad-discovered records — cannot
+    /// accumulate across epochs. `known_peers` is thereby bounded by the operator-configured set
+    /// plus the three committee slots. Evicting a still-relevant peer only forces a fresh kad
+    /// lookup if it becomes a committee member again, which is the intended discovery flow.
+    fn prune_known_peers(&mut self) {
+        let pinned = &self.pinned_peers;
+        let peers = &self.peers;
+        self.known_peers
+            .retain(|bls_key, _| pinned.contains(bls_key) || peers.is_committee_member(bls_key));
     }
 
     /// Lift any already-known committee members out of the manager's temporary-ban cache.
@@ -690,9 +799,167 @@ impl PeerManager {
         }
     }
 
-    /// Add a known peer to the known list.
-    /// Used for bootstrap servers or possibly committee members.
-    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
+    /// Add a locally provisioned known peer and pin it against eviction.
+    ///
+    /// Used for operator-driven entries only — trusted/explicit peers (bootstrap peers go through
+    /// [`Self::add_bootstrap_peer`]) — whose count is bounded by node configuration. Pinned
+    /// entries survive committee rotation (see [`Self::prune_known_peers`]). Records restored
+    /// from local persistence at startup do NOT use this method precisely because they must not
+    /// pin — they go through [`Self::add_restored_peer`]. The attacker-reachable kad discovery
+    /// path must instead use [`Self::add_discovered_peer`], which is bounded to committee
+    /// membership.
+    pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.pinned_peers.insert(bls_key);
+        self.cache_known_peer(bls_key, info);
+    }
+
+    /// Add a peer record restored from the persisted kad store at startup, WITHOUT pinning it.
+    ///
+    /// Restored records are kad-discovered cache, not operator-provisioned peers: the persisted
+    /// store's contents are peer-fillable because the node stores arbitrary signature-valid
+    /// third-party records as its DHT storage duty. Pinning them would let a restart convert
+    /// attacker-fillable store entries into permanently pinned `known_peers` entries, so restored
+    /// entries are deliberately NOT pinned — they survive only until the first
+    /// [`Self::update_committees`] prunes non-members, restoring the issue #827 committee bound.
+    pub(crate) fn add_restored_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.cache_known_peer(bls_key, info);
+    }
+
+    /// Add an operator-configured bootstrap peer: always pin it, but never overwrite an existing
+    /// `known_peers` record.
+    ///
+    /// Bootstrap peers are operator-provisioned and bounded by node configuration, so they must
+    /// always be pinned — under unpinned restore, skipping keys that already resolve (the old
+    /// handler pattern) would leave a bootstrap peer with a restored record unpinned, and it
+    /// would be pruned at the first committee rotation. An existing `known_peers` entry (e.g. a
+    /// richer record restored from persistence, which may carry fresher multiaddrs/rpc info) is
+    /// not overwritten by the config-derived stub, preserving the don't-overwrite contract of
+    /// the [`AddBootstrapPeers`](crate::types::NetworkCommand) command.
+    pub(crate) fn add_bootstrap_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.pinned_peers.insert(bls_key);
+        if !self.known_peers.contains_key(&bls_key) {
+            self.cache_known_peer(bls_key, info);
+        }
+    }
+
+    /// Add a peer learned from the kad discovery DHT, but only if it is a tracked committee member.
+    ///
+    /// Unlike [`Self::add_known_peer`], this path is reachable by any remote peer: a
+    /// signature-valid kad record only proves the publisher owns the network key it advertises,
+    /// not that the advertised [`BlsPublicKey`] belongs to any committee. Caching every such
+    /// record would let a peer grow `known_peers` without bound by publishing records for endless
+    /// fresh keys (issue #827). `known_peers` exists solely to resolve committee members' network
+    /// info, so a record whose key is in no tracked committee slot is dropped: it is either stale
+    /// (a member that already rotated out) or forged, and is never read. Legitimate discovery is
+    /// unaffected because kad lookups are only ever triggered for current/next committee members
+    /// whose info is missing (see [`Self::trigger_missing_authorities`]).
+    pub(crate) fn add_discovered_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        if !self.peers.is_committee_member(&bls_key) {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                "dropping discovered peer record for non-committee key"
+            );
+            return;
+        }
+        if self.kad_record_is_stale(&bls_key, &info) {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                "dropping stale discovered peer record"
+            );
+            return;
+        }
+        self.cache_known_peer(bls_key, info);
+    }
+
+    /// Admit a peer record pushed to us over the peer's own authenticated connection (a kad PUT
+    /// whose `source` is the sending peer).
+    ///
+    /// A committee member is cached in `known_peers` exactly as via [`Self::add_discovered_peer`].
+    /// A non-committee peer that advertises its OWN record - the authenticated kad-put `source`
+    /// equals the record's advertised network identity, so libp2p has already proven the sender
+    /// owns that transport key - has only its `bls_key <-> peer_id` identity confirmed in the peer
+    /// store, so a live connection (for example an nvv joining the gossip mesh) is retained. It is
+    /// deliberately NOT inserted into the committee-only `known_peers` cache. Because
+    /// [`AllPeers::upsert_peer`] re-keys by peer id, a peer can only ever hold ONE confirmed
+    /// identity for its own connection, so this is bounded by the live connection count and keeps
+    /// the issue #827 bound against unbounded record injection intact. A relayed record (`source`
+    /// != the advertised identity) cannot confirm an identity the sender does not control and is
+    /// dropped, so this never lets a peer displace another peer's identity.
+    pub(crate) fn add_self_advertised_peer(
+        &mut self,
+        source: PeerId,
+        bls_key: BlsPublicKey,
+        info: NetworkInfo,
+    ) {
+        let advertised: PeerId = info.pubkey.clone().into();
+        if self.peers.is_committee_member(&bls_key) {
+            if self.kad_record_is_stale(&bls_key, &info) {
+                trace!(
+                    target: "peer-manager",
+                    ?bls_key,
+                    ?source,
+                    "dropping stale self-advertised record for committee member"
+                );
+                return;
+            }
+            self.cache_known_peer(bls_key, info);
+        } else if source == advertised {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                ?source,
+                "confirming self-advertised connected peer identity"
+            );
+            self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);
+        } else {
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                ?source,
+                "dropping non-committee relayed peer record"
+            );
+        }
+    }
+
+    /// Number of distinct multiaddrs currently retained for `peer_id`, if it is tracked.
+    #[cfg(test)]
+    pub(crate) fn peer_multiaddr_count(&self, peer_id: &PeerId) -> Option<usize> {
+        self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
+    }
+
+    /// Check whether a kad-sourced record's timestamp fails to advance the cached entry.
+    ///
+    /// Mirrors the store-side `is_newer_record` monotonicity check (consensus.rs) so kad-sourced
+    /// updates can never regress a fresher `known_peers` entry — `get_record` query results reach
+    /// the cache without passing through the store, so the store-side check alone cannot protect
+    /// it. EQUAL timestamps keep the existing entry (benign replay churn — the same rule as the
+    /// store side). Operator-provisioned paths bypass this guard structurally: they all stamp
+    /// `timestamp: now()` when building the [`NetworkInfo`] (the `AddTrustedPeerAndDial` /
+    /// `AddExplicitPeer` / `AddBootstrapPeers` handlers in consensus.rs), and
+    /// [`Self::add_bootstrap_peer`] never overwrites an existing entry at all.
+    ///
+    /// Pinned (operator-provisioned) entries are exempt from the comparison in the other
+    /// direction too: their timestamp is a local provisioning stamp, not a peer-signed record
+    /// timestamp, and node records are signed once at peer startup — so an operator stub stamped
+    /// after the peer started would otherwise block the peer's real record (fresh multiaddrs,
+    /// advertised rpc) forever. A signed record may therefore always refresh a pinned entry,
+    /// which is the pre-existing upgrade flow for trusted/explicit peers.
+    fn kad_record_is_stale(&self, bls_key: &BlsPublicKey, info: &NetworkInfo) -> bool {
+        !self.pinned_peers.contains(bls_key)
+            && self
+                .known_peers
+                .get(bls_key)
+                .is_some_and(|existing| existing.timestamp >= info.timestamp)
+    }
+
+    /// Validate the advertised endpoint, register the peer's network identity, cache its info, and
+    /// close the committee trust window if it belongs to a tracked slot.
+    ///
+    /// Shared body of the known-peer insertion paths; the caller decides whether the entry is
+    /// pinned or admitted at all.
+    fn cache_known_peer(&mut self, bls_key: BlsPublicKey, mut info: NetworkInfo) {
         // signature verification proves authenticity but not scheme correctness; drop a
         // malformed advertised endpoint so only well-formed RPC info is ever cached in
         // `known_peers`. the rest of the (signed, authentic) record is still usable.
@@ -741,11 +1008,24 @@ impl PeerManager {
         self.known_peers.get(bls_key).and_then(|info| info.rpc.clone())
     }
 
-    /// Return a snapshot of every known authority that has advertised an [RpcInfo].
-    pub(crate) fn all_rpcs(&self) -> Vec<(BlsPublicKey, RpcInfo)> {
-        self.known_peers
+    /// Return the advertised [RpcInfo] for every current-committee validator, and
+    /// chase node records for current members that are still unknown.
+    ///
+    /// Scoped to the current committee: pinned operator peers and previous/next
+    /// committee members never appear, even if they advertised RPC info. For any
+    /// current member with no known record, kad discovery is (re)triggered via
+    /// [`PeerEvent::MissingAuthorities`] — the same path `update_committees` takes at
+    /// epoch start — so a polling caller converges as records arrive. Members whose
+    /// record is known but carries no RPC info did not advertise one and are skipped
+    /// without a re-fetch.
+    pub(crate) fn current_committee_rpcs(&mut self) -> Vec<(BlsPublicKey, RpcInfo)> {
+        let current = self.peers.current_committee().clone();
+        self.trigger_missing_authorities(&current);
+        current
             .iter()
-            .filter_map(|(bls, info)| info.rpc.clone().map(|rpc| (*bls, rpc)))
+            .filter_map(|bls| {
+                self.known_peers.get(bls).and_then(|info| info.rpc.clone()).map(|rpc| (*bls, rpc))
+            })
             .collect()
     }
 
@@ -804,11 +1084,17 @@ impl PeerManager {
     /// Check if peer is eligible for discovery.
     ///
     /// A peer is eligible if:
+    /// - it is not this node's own identity
     /// - it has at least one valid ip address (ipv4/ipv6)
     /// - none of its ip addresses are banned
     /// - it can be dialed (not connected/dialing/banned)
     fn eligible_for_discovery(&self, info: &PeerInfo) -> bool {
-        self.has_valid_unbanned_ips(&info.addrs) && self.peers.can_dial(&info.peer_id)
+        // never add our own identity to the discovery feed; a self entry (learned
+        // via kad closest-peers or peer exchange) would otherwise be selected for
+        // a self-dial during the heartbeat.
+        !self.is_local_peer(&info.peer_id)
+            && self.has_valid_unbanned_ips(&info.addrs)
+            && self.peers.can_dial(&info.peer_id)
     }
 
     /// Process newly discovered peers for potential dial attempts.

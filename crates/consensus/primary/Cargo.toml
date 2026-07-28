@@ -24,7 +24,7 @@ tokio = { workspace = true, features = [
     "time",
     "test-util",
 ] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { version = "0.7", features = ["compat", "io"] }
 tracing = { workspace = true }
 tn-network-types = { workspace = true }
 tn-types = { workspace = true }
@@ -52,6 +52,7 @@ tn-storage = { workspace = true, features = ["test-utils"] }
 assert_matches = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-primary = { workspace = true, features = ["test-utils"] }
+tn-test-utils = { workspace = true }
 tn-test-utils-committee = { workspace = true }
 
 [features]

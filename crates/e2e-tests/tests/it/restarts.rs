@@ -2,26 +2,31 @@
 
 use super::common::{kill_child, ProcessGuard};
 use crate::common::{
-    address_from_word, get_balance, get_balance_above_with_retry, get_block, get_block_number,
-    get_key, get_latest_consensus_header_number, get_node_info, get_positive_balance_with_retry,
-    network_advancing, send_and_confirm, send_tel, start_observer, start_validator, WEI_PER_TEL,
+    address_from_word, advertise_worker_rpc, get_balance, get_balance_above_with_retry, get_block,
+    get_block_number, get_key, get_latest_consensus_header_number, get_node_info, get_node_mode,
+    get_positive_balance_with_retry, network_advancing, send_and_confirm, send_tel, start_observer,
+    start_validator, WEI_PER_TEL,
 };
-use e2e_tests::config_local_testnet;
-use escargot::CargoRun;
+use e2e_tests::{config_local_testnet, config_local_testnet_with_gc_depth, TestBinary};
 use eyre::Report;
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
-use std::{path::Path, process::Child, time::Duration};
-use tn_types::get_available_tcp_port;
+use std::{
+    path::Path,
+    process::Child,
+    time::{Duration, Instant},
+};
+use tn_test_utils::wait_until_blocking;
+use tn_types::{get_available_tcp_port, NodeMode};
 use tracing::{error, info};
 
 /// Run the first part tests, broken up like this to allow more robust node shutdown.
 fn run_restart_tests1(
     client_urls: &[String; 4],
     child2: &mut Child,
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     temp_path: &Path,
     rpc_port2: u16,
     delay_secs: u64,
@@ -31,7 +36,6 @@ fn run_restart_tests1(
         kill_child(child2);
         error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
     })?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
 
     let info = get_node_info(&client_urls[0]).unwrap();
     assert_eq!(
@@ -70,11 +74,11 @@ fn run_restart_tests1(
 
     info!(target: "restart-test", "killing child2...");
     kill_child(child2);
-    info!(target: "restart-test", "child2 dead :D sleeping...");
-    std::thread::sleep(Duration::from_secs(delay_secs));
+    info!(target: "restart-test", "child2 dead :D waiting out downtime...");
+    wait_for_downtime(client_urls, delay_secs)?;
 
     // This validator should be down now, confirm.
-    if get_balance(&client_urls[2], &to_account.to_string(), 5).is_ok() {
+    if get_balance(&client_urls[2], &to_account.to_string(), 0).is_ok() {
         error!(target: "restart-test", "tests1: get_balancer worked for shutdown validator - returning error!");
         return Err(Report::msg("Validator not down!".to_string()));
     }
@@ -82,6 +86,17 @@ fn run_restart_tests1(
     info!(target: "restart-test", "restarting child2...");
     // Restart
     let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test, 2);
+    // Delayed restarts (downtime >= the demotion floor) rejoin via the follow/catch-up path, so
+    // the node passes through the transient `CvvInactive` mode. Observe it now, before
+    // `get_positive_balance_with_retry` below blocks until the node is fully caught up (by which
+    // point it is `CvvActive` again). The short-downtime restart never crosses the GC window and
+    // never demotes, so it is gated out here.
+    if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
+        assert_observed_cvv_inactive(&client_urls[2]).inspect_err(|e| {
+            kill_child(&mut child2);
+            error!(target: "restart-test", ?e, "restarted node never entered CvvInactive during catch-up in restart_tests1");
+        })?;
+    }
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
@@ -113,7 +128,7 @@ fn run_restart_tests1(
 fn run_restart_tests_lagged1(
     client_urls: &[String; 4],
     child2: &mut Child,
-    bin: &'static CargoRun,
+    bin: &'static TestBinary,
     temp_path: &Path,
     rpc_port2: u16,
     delay_secs: u64,
@@ -123,7 +138,6 @@ fn run_restart_tests_lagged1(
         kill_child(child2);
         error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
     })?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
@@ -138,11 +152,11 @@ fn run_restart_tests_lagged1(
 
     info!(target: "restart-test", "killing child2...");
     kill_child(child2);
-    info!(target: "restart-test", "child2 dead :D sleeping...");
-    std::thread::sleep(Duration::from_secs(delay_secs));
+    info!(target: "restart-test", "child2 dead :D waiting out downtime...");
+    wait_for_downtime(client_urls, delay_secs)?;
 
     // This validator should be down now, confirm.
-    if get_balance(&client_urls[2], &to_account.to_string(), 5).is_ok() {
+    if get_balance(&client_urls[2], &to_account.to_string(), 0).is_ok() {
         error!(target: "restart-test", "tests1: get_balancer worked for shutdown validator - returning error!");
         return Err(Report::msg("Validator not down!".to_string()));
     }
@@ -151,11 +165,25 @@ fn run_restart_tests_lagged1(
     let amount = 10 * WEI_PER_TEL; // 10 TEL
     let expected = current + amount;
     send_tel(&client_urls[0], &key, to_account, amount, 250, 21000, 1)?;
-    std::thread::sleep(Duration::from_millis(5000));
+    // Wait for the transfer to settle on the live network before restarting the lagged
+    // node, so it must catch the balance up via sync. Event-driven (polls a live peer
+    // until the balance lands) instead of a fixed 5s sleep.
+    get_balance_above_with_retry(&client_urls[0], &to_account.to_string(), expected - 1)?;
 
     info!(target: "restart-test", "restarting child2...");
     // Restart
     let mut child2 = start_validator(2, bin, temp_path, rpc_port2, test, 2);
+    // Lagged delayed restart: the downtime is past the GC window, so the restarted validator
+    // rejoins via the follow/catch-up path and passes through the transient `CvvInactive` mode
+    // before catching up. Observe it now, before the balance-catch-up waits below (which only
+    // return once the node is `CvvActive` again). This path is only ever exercised with the
+    // delayed downtime, but gate on the floor for parity with `run_restart_tests1`.
+    if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
+        assert_observed_cvv_inactive(&client_urls[2]).inspect_err(|e| {
+            kill_child(&mut child2);
+            error!(target: "restart-test", ?e, "restarted node never entered CvvInactive during catch-up in restart_tests_lagged1");
+        })?;
+    }
     let bal = get_positive_balance_with_retry(&client_urls[2], &to_account.to_string())
         .inspect_err(|e| {
             kill_child(&mut child2);
@@ -180,7 +208,6 @@ fn run_restart_tests_lagged1(
 /// Run the second part of tests, broken up like this to allow more robust node shutdown.
 fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
     network_advancing(client_urls)?;
-    std::thread::sleep(Duration::from_secs(2));
 
     // After full restart, some nodes may still be catching up consensus/execution.
     // Find the highest reported EL block and wait for all nodes to reach it
@@ -225,13 +252,138 @@ fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Wait out a restarted node's downtime, proceeding only once BOTH the wall-clock floor has
+/// elapsed AND the live validators have provably advanced enough consensus rounds to push the
+/// killed node outside the GC window.
+///
+/// A validator that misses more than `gc_depth - 10` consensus rounds during downtime is demoted
+/// to `CvvInactive` and must rejoin via the follow/catch-up path rather than live consensus (see
+/// the primary network handler's `outside_gc_window` check). With the restart tests' lowered
+/// `gc_depth` (`RESTART_TEST_GC_DEPTH`) that threshold is `RESTART_TEST_GC_DEPTH - 10` = 15 DAG
+/// rounds. The `min_secs` floor alone does not guarantee it: at the nominal ~500ms/round cadence a
+/// 25s downtime spans ~50 rounds (safe), but on a loaded runner where idle rounds stretch past
+/// ~1.67s/round a 25s wait covers fewer than 15 rounds, the killed node never demotes, and
+/// `assert_observed_cvv_inactive` flakes. To close that, the delayed tests also gate on peer
+/// progress: each consensus header wraps one committed sub-dag whose leader round strictly exceeds
+/// its predecessor's, so a peer header-number delta of D guarantees the live DAG round climbed by
+/// at least D past the kill point. Requiring `(RESTART_TEST_GC_DEPTH - 10) + 3` = 18 headers thus
+/// guarantees the killed node is strictly more than 15 rounds behind (demotion fires) no matter how
+/// slow CI is. Consensus headers advance on idle rounds (empty sub-dags still commit; that is why
+/// this tracks the consensus chain, not the EVM block height), so the count keeps climbing
+/// throughout the downtime. The time `cap` (`min_secs * 2 + 30`) stays the fail-safe that surfaces
+/// a genuinely wedged network downstream instead of hanging here. The short rejoin test
+/// (`min_secs = 2`) uses `min_round_gap = 1` and intentionally stays inside the GC window (live
+/// rejoin, not demotion). Node index 2 is the killed one; 0/1/3 stay live.
+fn wait_for_downtime(client_urls: &[String; 4], min_secs: u64) -> eyre::Result<()> {
+    // Nodes 0/1/3 stay live (index 2 is the killed one).
+    let peer_height = || {
+        [&client_urls[0], &client_urls[1], &client_urls[3]]
+            .into_iter()
+            .filter_map(|url| get_latest_consensus_header_number(url).ok())
+            .max()
+    };
+
+    let start_height = peer_height();
+    let start = Instant::now();
+    let floor = Duration::from_secs(min_secs);
+    // Fail-safe cap so a genuinely stalled network surfaces downstream instead of hanging here.
+    let cap = Duration::from_secs(min_secs * 2 + 30);
+    // Only the delayed restart tests (min_secs >= RESTART_TEST_DOWNTIME_SECS) must guarantee the
+    // killed node crosses the `gc_depth - 10` demotion threshold; the short rejoin test
+    // (min_secs = 2) intentionally stays inside the GC window, so a single header of progress is
+    // enough to prove the network is still live. Each consensus header wraps one committed sub-dag
+    // whose leader round strictly exceeds its predecessor's, so a header-number delta of D
+    // guarantees the live peers' DAG round climbed by at least D past the kill point; requiring
+    // `(gc_depth - 10) + 3` headers thus keeps the killed node > 15 rounds behind regardless of CI
+    // cadence, with a 3-round margin absorbing kill-instant skew.
+    let min_round_gap: u64 = if min_secs >= RESTART_TEST_DOWNTIME_SECS {
+        (RESTART_TEST_GC_DEPTH as u64).saturating_sub(10).saturating_add(3)
+    } else {
+        1
+    };
+
+    loop {
+        let elapsed = start.elapsed();
+        let advanced = start_height
+            .zip(peer_height())
+            .is_some_and(|(s, now)| now >= s.saturating_add(min_round_gap));
+        if elapsed >= floor && advanced {
+            return Ok(());
+        }
+        if elapsed >= cap {
+            info!(target: "restart-test", ?elapsed, "wait_for_downtime hit fail-safe cap; proceeding");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Garbage-collection depth (DAG rounds) used for the delayed restart tests. Lowering it from the
+/// protocol default (`MAX_GC_DEPTH = 50`) shrinks the `CvvInactive` demotion threshold
+/// (`gc_depth - 10` rounds) so a killed CVV crosses it after a shorter deliberate downtime while
+/// still taking the follow/catch-up path under test. Kept well above the short-rejoin test's
+/// downtime (`do_restarts(2, ..)` ~= a few rounds) so that test still exercises live rejoin, not
+/// demotion. `Parameters::validate` enforces only `gc_depth <= MAX_GC_DEPTH`, so this passes.
+const RESTART_TEST_GC_DEPTH: u32 = 25;
+
+/// Deliberate downtime floor (seconds) for the delayed restart tests, paired with
+/// [`RESTART_TEST_GC_DEPTH`]. At the e2e cadence (~500ms/round) the demotion threshold is
+/// `RESTART_TEST_GC_DEPTH - 10 = 15` rounds (~7.5s); this floor clears it with margin for slower
+/// CI while cutting ~35s per test vs the previous fixed 60s floor.
+const RESTART_TEST_DOWNTIME_SECS: u64 = 25;
+
+/// Number of times [`assert_observed_cvv_inactive`] samples a restarted node's mode (~250ms
+/// apart), bounding the catch-up observation window to ~30s.
+const CVV_INACTIVE_POLL_ATTEMPTS: usize = 120;
+
+/// Assert a restarted validator was observed in [`NodeMode::CvvInactive`] at least once while
+/// catching up.
+///
+/// Only the *delayed* restart tests use this. A validator offline long enough to fall outside the
+/// garbage-collection window (see [`wait_for_downtime`]) cannot rejoin live consensus and instead
+/// takes the follow/catch-up path, which demotes it to `CvvInactive` until it has synced past the
+/// GC window and then promotes it back to `CvvActive`. That `CvvInactive` state is therefore
+/// transient, so we poll the node's mode rapidly right after restart and short-circuit on the
+/// first sighting via [`Iterator::any`]. The window is deliberately generous because the exact
+/// demotion instant races both RPC startup and network sync; a poll that fails while the RPC is
+/// briefly down (mid-restart) counts as "not yet observed" rather than fatal. The check is
+/// non-vacuous: if the node never enters `CvvInactive` (the follow path never ran) every sample
+/// misses and this returns an error instead of silently passing.
+fn assert_observed_cvv_inactive(node: &str) -> eyre::Result<()> {
+    let observed_inactive = (0..CVV_INACTIVE_POLL_ATTEMPTS).any(|attempt| {
+        // Sample immediately on the first attempt (the demotion may already be visible), then pace
+        // subsequent samples ~4x/sec across the catch-up window.
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        matches!(get_node_mode(node), Ok(NodeMode::CvvInactive))
+    });
+    if observed_inactive {
+        info!(target: "restart-test", "observed restarted node {node} in CvvInactive during catch-up");
+        Ok(())
+    } else {
+        Err(Report::msg(format!(
+            "restarted node {node} was never observed in CvvInactive during catch-up window"
+        )))
+    }
+}
+
 fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     info!(target: "restart-test", "do_restarts, delay: {delay}");
     let tmp_guard = tempfile::TempDir::new().expect("tempdir is okay");
     let temp_path = tmp_guard.path().to_path_buf();
     {
-        config_local_testnet(&temp_path, Some("restart_test".to_string()), None)
-            .expect("failed to config");
+        // Restart tests use a lowered garbage-collection depth so a killed CVV crosses the
+        // `CvvInactive` demotion threshold (`gc_depth - 10` DAG rounds) after a shorter downtime,
+        // exercising the follow/catch-up path without the full default-`gc_depth` wait. See
+        // `wait_for_downtime` for the floor that pairs with this.
+        config_local_testnet_with_gc_depth(
+            &temp_path,
+            Some("restart_test".to_string()),
+            None,
+            Some(RESTART_TEST_GC_DEPTH),
+        )
+        .expect("failed to config");
     }
     let bin = e2e_tests::get_telcoin_network_binary();
     let mut guard = ProcessGuard::empty();
@@ -286,10 +438,12 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
     // Make sure we shutdown nodes even if an error in first testing.
     assert!(is_ok, "Phase 1 failed: {assert_str}. Check logs in test_logs/{test}/");
     let to_account = address_from_word("testing");
-    assert!(get_balance(&client_urls[0], &to_account.to_string(), 5).is_err());
-    assert!(get_balance(&client_urls[1], &to_account.to_string(), 5).is_err());
-    assert!(get_balance(&client_urls[2], &to_account.to_string(), 5).is_err());
-    assert!(get_balance(&client_urls[3], &to_account.to_string(), 5).is_err());
+    // These nodes are all shut down, so a dead connection is expected: use retries = 0 so a
+    // known-down node fails immediately instead of burning ~5s of retries per check.
+    assert!(get_balance(&client_urls[0], &to_account.to_string(), 0).is_err());
+    assert!(get_balance(&client_urls[1], &to_account.to_string(), 0).is_err());
+    assert!(get_balance(&client_urls[2], &to_account.to_string(), 0).is_err());
+    assert!(get_balance(&client_urls[3], &to_account.to_string(), 0).is_err());
 
     info!(target: "restart-test", "all nodes shutdown...restarting network");
     // Restart network
@@ -386,6 +540,9 @@ fn test_restarts_observer() -> eyre::Result<()> {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
         client_urls[i].push_str(&format!(":{rpc_port}"));
+        // The observer forwards accepted txns to the committee's advertised RPC
+        // endpoints; without this the forward has no targets and txns are dropped.
+        advertise_worker_rpc(&temp_path, i, rpc_port)?;
         guard.push(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
@@ -403,7 +560,7 @@ fn test_restarts_observer() -> eyre::Result<()> {
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_delayed() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(70, false, "restarts_delayed")
+    do_restarts(RESTART_TEST_DOWNTIME_SECS, false, "restarts_delayed")
 }
 
 /// Test a restart case with a long delay, the stopped node should not rejoin consensus but follow
@@ -412,7 +569,7 @@ fn test_restarts_delayed() -> eyre::Result<()> {
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_restarts_lagged_delayed() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    do_restarts(70, true, "restarts_lagged_delayed")
+    do_restarts(RESTART_TEST_DOWNTIME_SECS, true, "restarts_lagged_delayed")
 }
 
 fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
@@ -505,29 +662,18 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
     guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "late_join", 0));
 
-    // Observer must catch up to at least the validator consensus height we recorded
-    let mut retries = 0;
-    let max_retries = 120; // 120 seconds max
-    let caught_up = loop {
-        if let Ok(obs_consensus_height) = get_latest_consensus_header_number(&obs_url) {
-            if obs_consensus_height >= validator_consensus_height {
-                info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height, "observer caught up");
-                break true;
-            }
-            info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height, retries, "observer still catching up");
-        }
-        retries += 1;
-        if retries >= max_retries {
-            break false;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    };
-
-    // Guard cleanup handles all process shutdown on drop
-    assert!(
-        caught_up,
-        "Observer did not catch up within {max_retries}s. Check logs in test_logs/late_join/"
-    );
+    // Observer must catch up to at least the validator consensus height we recorded.
+    // Guard cleanup handles all process shutdown on drop; on timeout the `?` surfaces the
+    // same effective failure ("observer did not catch up") the old assert produced.
+    wait_until_blocking(
+        Duration::from_secs(120),
+        "observer caught up to validator (test_logs/late_join/)",
+        || {
+            Ok(get_latest_consensus_header_number(&obs_url)
+                .map(|h| h >= validator_consensus_height)
+                .unwrap_or(false))
+        },
+    )?;
     Ok(())
 }
 
@@ -591,24 +737,17 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
     signal::kill(obs_pid, Signal::SIGCONT)?;
     info!(target: "restart-test", "observer resumed, waiting for catchup");
 
-    // Observer must catch up
-    let mut retries = 0;
-    let max_retries = 60;
-    let caught_up = loop {
-        if let Ok(obs_consensus_height) = get_latest_consensus_header_number(&obs_url) {
-            if obs_consensus_height >= validator_consensus_height_during_pause {
-                info!(target: "restart-test", ?obs_consensus_height, ?validator_consensus_height_during_pause, "observer recovered");
-                break true;
-            }
-        }
-        retries += 1;
-        if retries >= max_retries {
-            break false;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    };
-
-    // Guard cleanup handles all process shutdown on drop
-    assert!(caught_up, "Observer did not recover within {max_retries}s after SIGCONT. Check logs in test_logs/reconnect/");
+    // Observer must catch up. Guard cleanup handles all process shutdown on drop; on timeout
+    // the `?` surfaces the same effective failure ("observer did not recover") the old assert
+    // produced.
+    wait_until_blocking(
+        Duration::from_secs(60),
+        "observer recovered after SIGCONT (test_logs/reconnect/)",
+        || {
+            Ok(get_latest_consensus_header_number(&obs_url)
+                .map(|h| h >= validator_consensus_height_during_pause)
+                .unwrap_or(false))
+        },
+    )?;
     Ok(())
 }

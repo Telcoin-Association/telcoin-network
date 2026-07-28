@@ -35,6 +35,7 @@ snap = { workspace = true }
 # peer manager
 rand = { workspace = true }
 serde_with = { workspace = true }
+lru = { workspace = true }
 
 # metrics
 metrics = { workspace = true }

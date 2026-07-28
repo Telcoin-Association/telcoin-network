@@ -34,6 +34,7 @@ where
     buffer: Vec<u8>,
     decompress_buffer: Vec<u8>,
     compression: PackCompression,
+    version: u16,
 }
 
 impl<V, R> PackIter<V, R>
@@ -46,9 +47,6 @@ where
     /// are returned in insert order.
     pub fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header(&mut reader, uid_idx)?;
-        if header.version() != 0 {
-            return Err(LoadHeaderError::InvalidVersion);
-        }
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
         }
@@ -59,7 +57,13 @@ where
             buffer: Vec::new(),
             decompress_buffer: Vec::new(),
             compression: header.compression(),
+            version: header.version(),
         })
+    }
+
+    /// Return the version of the underlying data.
+    pub fn version(&self) -> u16 {
+        self.version
     }
 
     /// Return the current position of the data file.
@@ -161,6 +165,7 @@ where
     buffer: Vec<u8>,
     decompress_buffer: Vec<u8>,
     compression: PackCompression,
+    version: u16,
 }
 
 impl<V, R> AsyncPackIter<V, R>
@@ -176,9 +181,6 @@ where
         // Mirror PackIter::open / PackInner::open_data_file: reject unexpected version/appnum
         // so the (peer-facing) async path rejects future/foreign formats instead of parsing
         // them with current-format logic.
-        if header.version() != 0 {
-            return Err(LoadHeaderError::InvalidVersion);
-        }
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
         }
@@ -188,6 +190,7 @@ where
             buffer: Vec::new(),
             decompress_buffer: Vec::new(),
             compression: header.compression(),
+            version: header.version(),
         })
     }
 
@@ -199,6 +202,7 @@ where
     pub async fn open_partial(
         reader: R,
         compression: PackCompression,
+        version: u16,
     ) -> Result<Self, LoadHeaderError> {
         Ok(AsyncPackIter {
             _val: PhantomData,
@@ -206,7 +210,13 @@ where
             buffer: Vec::new(),
             decompress_buffer: Vec::new(),
             compression,
+            version,
         })
+    }
+
+    /// Return the version of the underlying data.
+    pub fn version(&self) -> u16 {
+        self.version
     }
 
     /// Read the next record or return an error if an overflow bucket.
@@ -277,5 +287,10 @@ where
                 _ => Some(Err(err)),
             },
         }
+    }
+
+    /// Consume the iter and return the underlying reader.
+    pub fn into_reader(self) -> R {
+        self.reader
     }
 }

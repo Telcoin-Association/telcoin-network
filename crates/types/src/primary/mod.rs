@@ -6,6 +6,7 @@ mod certificate;
 mod epoch;
 mod header;
 mod info;
+mod node_mode;
 mod output;
 mod reputation;
 mod vote;
@@ -15,6 +16,7 @@ pub use certificate::*;
 pub use epoch::*;
 pub use header::*;
 pub use info::*;
+pub use node_mode::*;
 pub use output::*;
 pub use reputation::*;
 pub use vote::*;
@@ -30,6 +32,41 @@ pub const DEFAULT_PRIMARY_PORT: u16 = 44894;
 /// having bad connectivity, etc.  Also note that nodes with the same reputation will wind up on the
 /// same list (good or bad) not unfairly be punished while another node is rewarded.
 pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 33;
+
+/// Maximum garbage-collection depth, in consensus rounds, that the protocol supports.
+///
+/// This is the garbage-collection horizon, not the depth a commit actually reaches: `order_dag`
+/// descends only to `gc_round + 1` and additionally skips any round already committed per
+/// authority, so a `CommittedSubDag` is usually only a handful of rounds deep (a leader commits
+/// every couple of rounds).  It serves purely as a safe ceiling: because no certificate at or below
+/// `gc_round` can ever be linked into a commit, no sub-DAG can span more than this many rounds, a
+/// deliberately loose over-estimate that holds regardless of commit cadence.  A node's configured
+/// `gc_depth` is validated against this ceiling by `Parameters::validate`, and the consensus-pack
+/// reconstruction bound (`max_batches_per_output`) is derived from it as a conservative
+/// over-estimate, so raising this value requires re-deriving that bound.
+pub const MAX_GC_DEPTH: Round = 50;
+
+/// Rounds subtracted from a node's configured `gc_depth` when the consensus network handler
+/// computes its "activity window", the number of rounds a node may lag execution before it steps
+/// back as too far behind to be an active voter.
+///
+/// The buffer makes a node go inactive *before* it rides the garbage-collection horizon exactly,
+/// where subtle races live.  Because the window is `gc_depth - GC_ACTIVITY_BUFFER`, a configured
+/// `gc_depth` at or below this buffer collapses the window to zero and wedges the node inactive
+/// during normal operation.  `Parameters::validate_operational_floors` therefore requires
+/// `gc_depth > GC_ACTIVITY_BUFFER` at the production startup entry points, keeping the floor
+/// coupled to the buffer so the two can never drift apart.
+pub const GC_ACTIVITY_BUFFER: Round = 10;
+
+/// Maximum number of batch digests a single primary `Header` may reference.
+///
+/// The proposer caps its own headers at the configured `max_header_num_of_batches`, and
+/// `Header::validate` rejects any inbound header that exceeds this protocol ceiling, so the
+/// per-header batch count is a genuine consensus invariant rather than a proposer-only convention.
+/// Together with [`MAX_GC_DEPTH`] and the committee size it bounds the number of unique batches a
+/// committed `ConsensusOutput` can contain, which the consensus-pack reader relies on to
+/// reconstruct every executed output.
+pub const MAX_HEADER_NUM_OF_BATCHES: usize = 10;
 
 /// The round number.
 /// Becomes the lower 32 bits of a nonce (with epoch the high bits).

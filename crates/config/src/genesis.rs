@@ -16,9 +16,12 @@ use tracing::{info, warn};
 
 /// The validators directory used to create genesis
 pub const GENESIS_VALIDATORS_DIR: &str = "validators";
-/// Precompile info for genesis, read from current submodule commit
+/// Precompile info for genesis, read from current submodule commit.
+/// tn-contracts split its single deployments.json into per-network files (#123); the
+/// genesis-assigned addresses live in deployments-mainnet.json, which is the genesis
+/// source of truth that also generates the precompile-config.yaml read below.
 pub const DEPLOYMENTS_JSON: &str =
-    include_str!("../../../tn-contracts/deployments/deployments.json");
+    include_str!("../../../tn-contracts/deployments/deployments-mainnet.json");
 /// The path to consensus registry json (tn-contracts submodule).
 pub const CONSENSUS_REGISTRY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ConsensusRegistry.json");
@@ -27,8 +30,6 @@ pub const ISSUANCE_JSON: &str = include_str!("../../../tn-contracts/artifacts/Is
 /// The path to erc1967proxy json (tn-contracts submodule).
 pub const ERC1967PROXY_JSON: &str =
     include_str!("../../../tn-contracts/artifacts/ERC1967Proxy.json");
-/// The path to blsg1 json (tn-contracts submodule).
-pub const BLSG1_JSON: &str = include_str!("../../../tn-contracts/artifacts/BlsG1.json");
 /// The path to the configuration yaml for genesis accounts (tn-contracts submodule).
 pub const GENESIS_ACCOUNT_STATE_YAML: &str =
     include_str!("../../../tn-contracts/deployments/genesis/precompile-config.yaml");
