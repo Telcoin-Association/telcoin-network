@@ -7,7 +7,7 @@ use reth_db::DatabaseEnv;
 use reth_transaction_pool::{
     identifier::TransactionId, EthPooledTransaction, ValidPoolTransaction,
 };
-use tn_types::{EthPrimitives, Recovered, RecoveredBlock};
+use tn_types::{EthPrimitives, RecoveredBlock};
 
 /// Rpc Server type, used for getting the node started.
 pub type RpcServer = TransportRpcModules<()>;
@@ -27,7 +27,5 @@ pub type RethDb = Arc<DatabaseEnv>;
 pub type PoolTxnId = TransactionId;
 /// A pooled transaction.
 pub type PoolTxn = ValidPoolTransaction<EthPooledTransaction>;
-/// A recovered pooled transaction.
-pub type RecoveredPoolTxn = Recovered<EthPooledTransaction>;
 /// Type for primitives.
 pub type TNPrimitives = EthPrimitives;

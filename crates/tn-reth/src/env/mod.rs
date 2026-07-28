@@ -83,7 +83,7 @@ impl RethEnv {
         let node_config = reth_config.0.clone();
         let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), rewards_counter);
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
-        let blockchain_provider = BlockchainProvider::new(provider_factory.clone())?;
+        let blockchain_provider = BlockchainProvider::new(provider_factory)?;
         let task_spawner = task_manager.get_spawner();
         set_basefee_address(basefee_address);
         // baseline the block-building counters at zero now, while the recorder is known to be
