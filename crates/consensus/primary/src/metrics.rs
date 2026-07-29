@@ -212,6 +212,8 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_primary.votes_received_total");
         assert!(matches!(value, DebugValue::Counter(3)));
+        let (_, _, _, value) = find("tn_primary.certificates_formed_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
         let (_, _, _, value) = find("tn_primary.round");
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 17.0));
         let (_, _, _, value) = find("tn_primary.committed_round");
@@ -226,7 +228,8 @@ mod tests {
         assert!(matches!(value, DebugValue::Gauge(g) if g.0 == 123.0));
     }
 
-    /// The mirror task must keep the round gauges in sync with the watch channels.
+    /// The mirror task must keep the round gauges in sync with the watch channels, and
+    /// its synchronous prime must register the consensus-height gauge trio by name.
     #[tokio::test]
     async fn test_bus_metrics_mirror() {
         use tn_types::{Notifier, TaskManager};
@@ -239,7 +242,27 @@ mod tests {
 
         let task_manager = TaskManager::default();
         let shutdown = Notifier::new();
-        spawn_bus_metrics_mirror(&bus, &task_manager.get_spawner(), shutdown.subscribe());
+        // the free-form `gauge!` calls in the prime bind at call time, so the spawn must
+        // also run under the local recorder for the trio to be observable here
+        metrics::with_local_recorder(&recorder, || {
+            spawn_bus_metrics_mirror(&bus, &task_manager.get_spawner(), shutdown.subscribe())
+        });
+
+        // a typo or deletion in `set_consensus_height_gauges` compiles clean; only this
+        // name pin (and the e2e scrape) catches it
+        let primed = snapshotter.snapshot().into_vec();
+        [
+            "tn_node.last_executed_consensus_height",
+            "tn_node.latest_gossip_consensus_height",
+            "tn_node.consensus_sync_distance",
+        ]
+        .iter()
+        .for_each(|name| {
+            assert!(
+                primed.iter().any(|(key, ..)| key.key().name() == *name),
+                "prime must register {name}"
+            );
+        });
 
         bus.primary_round_updates().send_replace(42);
         bus.committed_round_updates().send_replace(40);

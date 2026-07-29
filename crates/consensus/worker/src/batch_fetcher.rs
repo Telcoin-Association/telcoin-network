@@ -14,7 +14,7 @@ use std::{
 };
 use tn_storage::{consensus::ConsensusChain, tables::NodeBatchesCache};
 use tn_types::{now, Batch, BlockHash, Database, DbTxMut, Epoch, B256};
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
 /// Minimum delay before retrying a [`BatchFetcher::fetch_for_primary`] pass that
 /// recovered no batches (locally or from a peer).
@@ -30,6 +30,34 @@ const FETCH_RETRY_MIN_BACKOFF: Duration = Duration::from_millis(50);
 /// Caps how long a persistent no-peer condition waits before re-checking, so a
 /// worker peer that (re)connects is still picked up promptly.
 const FETCH_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Number of consecutive no-progress fetch passes in [`BatchFetcher::fetch_for_primary_inner`]
+/// before the first stall warning is emitted.
+///
+/// At [`FETCH_RETRY_MAX_BACKOFF`] (1s) per saturated pass this is roughly ten seconds of a fetch
+/// making no progress, which on a healthy network only happens when the worker cannot reach any
+/// peer holding the batches (a self-recovering eclipse). The warning is purely observational: the
+/// fetch never fails on a stall, because erroring out would shut the node down. A certified batch
+/// is persisted by at least `f + 1` honest peers, so retrying until connectivity returns is the
+/// correct liveness-preserving choice; this log only makes an otherwise silent stall visible.
+const FETCH_STALL_WARN_AFTER: u32 = 10;
+
+/// Once a stall has exceeded [`FETCH_STALL_WARN_AFTER`], re-emit the warning every this many
+/// further consecutive no-progress passes, so a prolonged stall keeps signalling without flooding
+/// the log on every pass.
+const FETCH_STALL_WARN_INTERVAL: u32 = 30;
+
+/// Whether [`BatchFetcher::fetch_for_primary_inner`] should emit a stall warning after
+/// `consecutive_stalls` consecutive no-progress passes: once exactly at [`FETCH_STALL_WARN_AFTER`],
+/// then on every [`FETCH_STALL_WARN_INTERVAL`]th pass beyond it. Kept as a pure function so the
+/// cadence is unit-testable without installing a tracing subscriber. The `> FETCH_STALL_WARN_AFTER`
+/// guard is what stops a reset counter (`0`, which also satisfies `0 % INTERVAL == 0`) from
+/// warning.
+fn should_warn_stall(consecutive_stalls: u32) -> bool {
+    consecutive_stalls == FETCH_STALL_WARN_AFTER
+        || (consecutive_stalls > FETCH_STALL_WARN_AFTER
+            && consecutive_stalls.is_multiple_of(FETCH_STALL_WARN_INTERVAL))
+}
 
 #[derive(Debug)]
 /// The type to fetch batches for the primary.
@@ -170,6 +198,10 @@ impl<DB: Database> BatchFetcher<DB> {
         // all-peers-failed condition backs off instead of spinning (see issue #865)
         let mut backoff = FETCH_RETRY_MIN_BACKOFF;
 
+        // count consecutive passes that recovered nothing, so a prolonged stall (peers holding
+        // these batches unreachable) is surfaced to operators via a rate-limited warning below.
+        let mut consecutive_stalls: u32 = 0;
+
         // loop until `missing_digests` empty
         loop {
             debug!(target: "batch_fetcher", "loop start");
@@ -243,7 +275,18 @@ impl<DB: Database> BatchFetcher<DB> {
             // without delaying a pass that is still fetching batches (see issue #865).
             if missing_digests.len() < missing_before {
                 backoff = FETCH_RETRY_MIN_BACKOFF;
+                consecutive_stalls = 0;
             } else {
+                consecutive_stalls = consecutive_stalls.saturating_add(1);
+                if should_warn_stall(consecutive_stalls) {
+                    warn!(
+                        target: "batch_fetcher",
+                        remaining = missing_digests.len(),
+                        consecutive_stalls,
+                        "batch fetch making no progress; worker peers holding these batches may be \
+                         unreachable (node stays up and keeps retrying)"
+                    );
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = backoff.saturating_mul(2).min(FETCH_RETRY_MAX_BACKOFF);
             }
@@ -317,6 +360,35 @@ mod tests {
     use tn_storage::consensus::ConsensusChain;
     use tn_types::{BlockHash, Committee, TaskManager};
     use tokio::sync::mpsc;
+
+    // ============================================================================
+    // Stall-warning cadence
+    // ============================================================================
+
+    /// The rate-limited stall warning must fire once at the threshold and then only on each
+    /// interval multiple beyond it, and must stay silent for a fresh/reset counter (`0`).
+    #[test]
+    fn stall_warn_fires_at_threshold_then_every_interval() {
+        use super::{should_warn_stall, FETCH_STALL_WARN_AFTER, FETCH_STALL_WARN_INTERVAL};
+
+        // Silent before the threshold, including a reset counter at 0 (which satisfies
+        // `0 % INTERVAL == 0` and would spuriously warn without the `> AFTER` guard).
+        (0..FETCH_STALL_WARN_AFTER)
+            .for_each(|n| assert!(!should_warn_stall(n), "unexpected warn at {n}"));
+
+        // First warning exactly at the threshold.
+        assert!(should_warn_stall(FETCH_STALL_WARN_AFTER), "expected warn at threshold");
+
+        // Silent again between the threshold and the interval multiples above it.
+        ((FETCH_STALL_WARN_AFTER + 1)..(FETCH_STALL_WARN_INTERVAL * 3))
+            .filter(|n| n % FETCH_STALL_WARN_INTERVAL != 0)
+            .for_each(|n| assert!(!should_warn_stall(n), "unexpected warn at {n}"));
+
+        // Re-warns on each interval multiple beyond the threshold.
+        [FETCH_STALL_WARN_INTERVAL, FETCH_STALL_WARN_INTERVAL * 2, FETCH_STALL_WARN_INTERVAL * 3]
+            .into_iter()
+            .for_each(|n| assert!(should_warn_stall(n), "expected warn at {n}"));
+    }
 
     // ============================================================================
     // BatchFetcher Local-Only Tests

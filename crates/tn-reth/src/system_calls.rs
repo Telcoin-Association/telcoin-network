@@ -2,6 +2,20 @@
 //!
 //! These compile into types for interacting with smart contracts through
 //! System Calls.
+//!
+//! The `sol!` block binds two contracts from the tn-contracts submodule:
+//! - `ConsensusRegistry` — validator lifecycle (mint/stake/activate/exit/burn), epoch and committee
+//!   views, and the unified epoch-boundary mutator the protocol invokes as a system call
+//!   (`concludeEpoch`).
+//! - `WorkerConfigs` — per-worker base-fee strategy used for base fee adjustment.
+//!
+//! Two pinned addresses live here: `SYSTEM_ADDRESS` (0xfff...fffe), the reserved caller the EVM
+//! uses for system transactions (the custom handler exempts it from fee/beneficiary
+//! accounting), and `CONSENSUS_REGISTRY_ADDRESS`, the registry's fixed deployment address.
+//!
+//! NOTE: `applySlashes` is declared for ABI completeness but is never called from Rust anywhere
+//! in this repository — slashing is not live (disabled during the MNO pilot). Do not assume
+//! validators can currently be slashed in-protocol.
 
 use alloy::{primitives::address, sol};
 use tn_types::{Address, Epoch};
@@ -271,7 +285,7 @@ sol!(
 pub struct EpochState {
     /// The epoch number.
     pub epoch: Epoch,
-    /// The [EpochInfo].
+    /// The `EpochInfo` read from the registry.
     pub epoch_info: ConsensusRegistry::EpochInfo,
     /// The collection of validator info.
     pub validators: Vec<ConsensusRegistry::ValidatorInfo>,

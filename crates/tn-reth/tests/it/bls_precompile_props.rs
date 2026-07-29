@@ -212,12 +212,7 @@ fn test_valid_uncompressed_inputs_rejected() {
     let mut env = TestEnv::new();
     // the compressed control verifies (the key/proof are otherwise valid)
     assert!(
-        verify(
-            &mut env,
-            &proof.to_bytes().to_vec(),
-            &keypair.public().to_bytes().to_vec(),
-            &message
-        ),
+        verify(&mut env, &proof.to_bytes(), &keypair.public().to_bytes(), &message),
         "compressed control",
     );
     // ...but the valid uncompressed encodings are gated out

@@ -9,6 +9,19 @@
 //! not advertised an endpoint (or is momentarily unreachable) is skipped in favor of one that
 //! has.
 //!
+//! Two properties worth knowing at this boundary:
+//!
+//! - Transport security is whatever the validator advertised. Endpoint validation accepts both `https://`
+//!   and plain `http://` URLs, and the forwarder adds no encryption of its own, so a plain-HTTP
+//!   advertisement carries the signed raw transaction bytes in cleartext, readable by any on-path
+//!   observer. (The bytes are already-signed transactions destined for a public mempool, so
+//!   confidentiality is limited to submission timing, not contents.)
+//! - A considered rejection stops the fallback chain. If a validator's RPC rejects the transaction
+//!   itself (bad nonce, underpriced, invalid), no further validators are tried: all validators
+//!   share consensus state, so the rejection would repeat everywhere. Only endpoint-local failures
+//!   (timeout, transport error, full pool, internal error) fall through to the next advertised
+//!   validator, and "already known" counts as delivered.
+//!
 //! [`submit_txn_if_mine`]: tn_types::BatchValidation::submit_txn_if_mine
 
 use crate::recover_raw_transaction;

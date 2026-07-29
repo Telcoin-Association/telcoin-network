@@ -35,6 +35,20 @@
 //! recompute on a live database just re-reads the already-cached trie tables and proves nothing
 //! about the plain-state rows we actually stream. The restore side is the real check — it rebuilds
 //! the trie from scratch out of the accounts in the pack and hard-fails on any mismatch.
+//!
+//! # Trust boundary: what restore verifies, and what it trusts
+//!
+//! Restore proves internal consistency, not provenance. It verifies that the pack's accounts
+//! rebuild from scratch to both the pack's declared state root and `header(B).state_root`, that
+//! the header window is contiguous by block number and its tip matches the claimed `final_state`
+//! number and hash, and (in [`SnapshotRestorer::finish`]) that the reconstructed tip matches
+//! `final_state`. It does NOT verify that the window headers or `final_state` belong to the
+//! canonical chain: no consensus provenance or signature check happens in this module, and
+//! parent-hash linkage between consecutive window headers is not re-checked here (the window is
+//! validated upstream). The operator-supplied header window and final block hash are therefore
+//! the trusted inputs — a restore against forged-but-self-consistent headers would succeed.
+//! Genesis is never taken from the snapshot; it always comes from the local chain spec, which
+//! remains the trust root.
 
 use crate::{
     error::{TnRethError, TnRethResult},
@@ -238,8 +252,7 @@ impl RethEnv {
         // view only carries what it needs (the plain-state tables all live in mdbx, not static
         // files, so no provider/static-file handle has to be kept alive alongside it)
         let tx = self
-            .inner
-            .blockchain_provider
+            .blockchain_provider()
             .database_provider_ro()?
             .disable_long_read_transaction_safety()
             .into_tx();
@@ -399,7 +412,7 @@ impl SnapshotRestorer {
             }
         }
 
-        let provider_rw = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
+        let provider_rw = self.reth_env.blockchain_provider().database_provider_rw()?;
 
         // drop the genesis alloc so an on-chain-zeroed genesis slot cannot survive the import
         {
@@ -509,7 +522,7 @@ impl SnapshotRestorer {
             .map(|res| res.map(|a| (a.address, a.account)))
             .collect::<Result<_, _>>()?;
 
-        let provider = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
+        let provider = self.reth_env.blockchain_provider().database_provider_rw()?;
 
         // write plain + hashed + history state, mirroring reth's private `dump_state` sequence but
         // driven from the pack's accounts rather than a JSONL reader.
@@ -619,7 +632,7 @@ impl SnapshotRestorer {
         let b = final_state.number;
 
         {
-            let provider = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
+            let provider = self.reth_env.blockchain_provider().database_provider_rw()?;
             provider.save_finalized_block_number(b)?;
             provider.save_safe_block_number(b)?;
             provider.commit()?;
@@ -700,7 +713,7 @@ mod tests {
         slot: B256,
         value: U256,
     ) -> eyre::Result<()> {
-        let provider = reth_env.inner.blockchain_provider.database_provider_rw()?;
+        let provider = reth_env.blockchain_provider().database_provider_rw()?;
         {
             let tx = provider.tx_ref();
             let mut cursor = tx.cursor_dup_write::<PlainStorageState>()?;

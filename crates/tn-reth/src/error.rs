@@ -5,7 +5,7 @@ use reth::rpc::{builder::error::RpcError, server_types::eth::EthApiError};
 use reth_errors::BlockExecutionError;
 use reth_provider::ProviderError;
 
-/// Result alias for [`TNRethError`].
+/// Result alias for [`TnRethError`].
 pub type TnRethResult<T> = Result<T, TnRethError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
@@ -17,9 +17,6 @@ pub enum TnRethError {
     /// Error recovering transaction from bytes.
     #[error(transparent)]
     RecoverTransactionBytes(#[from] EthApiError),
-    /// The block body and senders lengths don't match.
-    #[error("Failed to seal block with senders - lengths don't match")]
-    SealBlockWithSenders,
     /// The executed block failed.
     #[error("Block execution failed: {0}")]
     BlockExecution(#[from] BlockExecutionError),
@@ -38,9 +35,6 @@ pub enum TnRethError {
     /// Error forwarding engine update to consensus.
     #[error("Failed to forward engine update to consensus.")]
     EngineUpdateChannelClosed,
-    /// Executed output must always contain at least one block.
-    #[error("Empty execution output from engine.")]
-    EmptyExecutionOutput,
     /// Receipts are missing for a block that exists (DB inconsistency).
     ///
     /// Surfaced during ExEx replay: returning an empty receipt set would make a
@@ -71,6 +65,22 @@ pub enum TnRethError {
     /// Failure exporting or restoring an EVM state snapshot.
     #[error("snapshot: {0}")]
     Snapshot(String),
+    /// The shuffled committee is smaller than the on-chain target size.
+    ///
+    /// `shuffle_new_committee` trims the shuffled pool to `next_committee_size` with
+    /// [`Vec::truncate`], which is a silent no-op when the eligible pool is already smaller than
+    /// the target. The registry invariant `nextCommitteeSize <= eligibleValidatorCount` makes this
+    /// unreachable in practice, and the on-chain `concludeEpoch` guard rejects a wrong-length
+    /// committee, but assembling an undersized committee client-side is still a protocol fault:
+    /// fail here with the exact counts instead of forwarding calldata that can only revert
+    /// on-chain.
+    #[error("shuffled committee is undersized: expected {expected} validators, assembled {got}")]
+    UndersizedCommittee {
+        /// The target committee size read from the consensus registry (`next_committee_size`).
+        expected: usize,
+        /// The number of validators actually assembled after the shuffle and truncate.
+        got: usize,
+    },
 }
 
 impl From<TnRethError> for EthApiError {
