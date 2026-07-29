@@ -26,10 +26,10 @@
 //!    CONSENSUS_REGISTRY_FORK_EPOCH` (checked addition): swaps the registry's runtime bytecode in
 //!    place, then runs the one-time `migrateValidatorSets()`.
 //! 2. `apply_closing_epoch_contract_call` - the single unified
-//!    `concludeEpoch(address[],RewardInfo[],Slash[])` system call: committee membership is drawn
-//!    by the `randomness`-seeded Fisher-Yates shuffle (sorted by address before encoding) and the
-//!    reward infos carry the leader counts from `ctx.rewards_counter`. The registry distributes
-//!    the concluding epoch's issuance, applies slashes, settles queued stake version changes, and
+//!    `concludeEpoch(address[],RewardInfo[],Slash[])` system call: committee membership is drawn by
+//!    the `randomness`-seeded Fisher-Yates shuffle (sorted by address before encoding) and the
+//!    reward infos carry the leader counts from `ctx.rewards_counter`. The registry distributes the
+//!    concluding epoch's issuance, applies slashes, settles queued stake version changes, and
 //!    rotates the epoch atomically, so the stage-ordering obligation lives on-chain, not here.
 //! 3. `merge_transitions(BundleRetention::Reverts)` - folds the transaction and system-call
 //!    transitions into the bundle state, retaining revert data.
