@@ -11,7 +11,7 @@ use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::{bail, eyre};
 use human_bytes::human_bytes;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -214,38 +214,96 @@ impl DbLoadStateArgs {
             Arc::new(tn_config.chain_spec()),
         );
 
-        let (block, root) = restore_pack(&reth_config, datadir.reth_db_path(), &self.pack)?;
+        // Everything below creates chain data under the datadir (the reth db + its static files,
+        // then the consensus db). `db load-state` targets a FRESH node — `SnapshotRestorer::open`
+        // refuses a datadir that already holds reth chain data — so any chain-data dir this import
+        // creates is ours to remove if it fails. Snapshot which already exist first, so a failure
+        // removes only what we created, never a real node's pre-existing data, and never the
+        // operator's keys/config/genesis (which live in sibling subdirectories).
+        let preexisting: HashSet<PathBuf> =
+            chain_data_dirs(&datadir).into_iter().filter(|dir| dir.exists()).collect();
+
+        let outcome = (|| -> eyre::Result<(BlockNumHash, B256)> {
+            let (block, root) = restore_pack(&reth_config, datadir.reth_db_path(), &self.pack)?;
+
+            // Rebuild the consensus + epoch-records packs from the bundle's data-only files. A
+            // plain copy would not work: these files have no index sidecars and the
+            // packs do not rebuild indexes on open, so we reconstruct fully-indexed,
+            // queryable packs at their datadir homes under `consensus-db/epochs/`,
+            // verifying each epoch record against its certificate as we go. The bundle
+            // was classified complete-and-resumable above.
+            //
+            // The genesis committee is the trust root for record verification; load it exactly as
+            // the node does (its yaml was materialized by the `Config::load_*` step above).
+            let genesis_committee =
+                Config::load_from_path::<Committee>(datadir.committee_path(), ConfigFmt::YAML)
+                    .map_err(|e| {
+                        eyre!(
+                            "failed to load genesis committee from {} (needed to verify epoch \
+                             records): {e}",
+                            datadir.committee_path().display()
+                        )
+                    })?;
+            restore_consensus_and_records(
+                &datadir.epochs_db_path(),
+                &genesis_committee,
+                &bundle_consensus,
+                &bundle_records,
+                &bundle_certs,
+            )?;
+            Ok((block, root))
+        })();
+
+        let (block, root) = match outcome {
+            Ok(ok) => ok,
+            Err(e) => {
+                // Surgically remove only the chain-data dirs this import created; the operator's
+                // keys, node info, and genesis config are left intact so a failed import never
+                // costs them irreplaceable material.
+                clean_created_chain_data(&datadir, &preexisting);
+                return Err(e.wrap_err(format!(
+                    "state import failed; removed the chain data it created under {} (node keys \
+                     and config left intact) — fix the export bundle and re-run `db load-state`",
+                    datadir.display()
+                )));
+            }
+        };
+
         println!(
             "restored execution state at block {} (state root {root:#x}) into {}",
             block.number,
             datadir.reth_db_path().display()
         );
-
-        // Rebuild the consensus + epoch-records packs from the bundle's data-only files. A plain
-        // copy would not work: these files have no index sidecars and the packs do not rebuild
-        // indexes on open, so we reconstruct fully-indexed, queryable packs at their datadir homes
-        // under `consensus-db/epochs/`, verifying each epoch record against its certificate as we
-        // go. The bundle was classified complete-and-resumable above.
-        //
-        // The genesis committee is the trust root for record verification; load it exactly as the
-        // node does (its yaml was materialized by the `Config::load_*` step above).
-        let genesis_committee =
-            Config::load_from_path::<Committee>(datadir.committee_path(), ConfigFmt::YAML)
-                .map_err(|e| {
-                    eyre!(
-                        "failed to load genesis committee from {} (needed to verify epoch \
-                         records): {e}",
-                        datadir.committee_path().display()
-                    )
-                })?;
-        restore_consensus_and_records(
-            &datadir.epochs_db_path(),
-            &genesis_committee,
-            &bundle_consensus,
-            &bundle_records,
-            &bundle_certs,
-        )?;
         Ok(())
+    }
+}
+
+/// The chain-data directories a state import creates under `datadir`: the reth db, its static
+/// files, and the consensus db (which holds `epochs/`). These — and only these — are removed when
+/// an import fails. The operator's irreplaceable material (`node-keys/`, `node-info.yaml`,
+/// `genesis/`) lives in sibling paths and is deliberately excluded, so a failed import never
+/// destroys keys the way a blanket `rm -rf <datadir>` would. Mirrors `TelcoinDirs::reth_db_path` /
+/// `consensus_db_path` (plus reth's sibling `static_files` dir, which has no accessor).
+fn chain_data_dirs(datadir: &Path) -> [PathBuf; 3] {
+    [datadir.join("db"), datadir.join("static_files"), datadir.join("consensus-db")]
+}
+
+/// Best-effort removal of the chain-data dirs a failed import created — every [`chain_data_dirs`]
+/// entry not already present in `preexisting`. Skipping pre-existing dirs is a safety guard: even
+/// if `db load-state` were pointed at a populated datadir, this never deletes data the import did
+/// not create. Removal errors are logged, not fatal (the import is already failing).
+fn clean_created_chain_data(datadir: &Path, preexisting: &HashSet<PathBuf>) {
+    for dir in chain_data_dirs(datadir) {
+        if preexisting.contains(&dir) {
+            continue;
+        }
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("warning: could not remove {} during import cleanup: {e}", dir.display());
+            }
+        }
     }
 }
 
@@ -357,12 +415,9 @@ fn restore_pack(
     // snapshot's epoch has no worker activity to anchor base-fee derivation, a node started from it
     // would walk below the snapshot into state it does not have and halt. Fail here with a clear,
     // worker-naming message instead of letting that surface as a cryptic runtime crash later.
-    restorer.check_resumable_fees(&window).map_err(|e| {
-        eyre!(
-            "{e}; bootstrap from a later epoch's bundle instead (the target datadir now holds \
-             partial chain data and must be recreated before retrying)"
-        )
-    })?;
+    restorer
+        .check_resumable_fees(&window)
+        .map_err(|e| eyre!("{e}; bootstrap from a later epoch's bundle instead"))?;
     restorer.finish(final_state)?;
     Ok((final_state, root))
 }
@@ -1002,6 +1057,35 @@ mod tests {
         let record = EpochRecord { epoch: 3, final_state: meta_final, ..Default::default() };
         super::check_state_pack_matches_record(dir.path(), &record)
             .expect("matching final state must be accepted");
+    }
+
+    #[test]
+    fn clean_created_chain_data_removes_only_created_chain_dirs() {
+        // A failed import must remove only the chain-data dirs it created — never a pre-existing
+        // node's data, and never the operator's irreplaceable keys/config (finding #7).
+        use std::{collections::HashSet, path::PathBuf};
+        let datadir = tempfile::tempdir().unwrap();
+        let d = datadir.path();
+        for sub in ["db", "static_files", "consensus-db", "node-keys", "genesis"] {
+            fs::create_dir_all(d.join(sub)).unwrap();
+        }
+        fs::write(d.join("node-info.yaml"), b"identity").unwrap();
+        fs::write(d.join("node-keys").join("bls.key"), b"secret").unwrap();
+
+        // `db` was present before the import (simulating a real node's data), so it must survive;
+        // the import created `static_files` and `consensus-db`.
+        let preexisting: HashSet<PathBuf> = [d.join("db")].into_iter().collect();
+        super::clean_created_chain_data(d, &preexisting);
+
+        // Chain-data dirs the import created are removed:
+        assert!(!d.join("static_files").exists(), "created static_files must be removed");
+        assert!(!d.join("consensus-db").exists(), "created consensus-db must be removed");
+        // Pre-existing data is never removed:
+        assert!(d.join("db").exists(), "pre-existing db must be preserved");
+        // Keys and config are never touched:
+        assert!(d.join("node-keys").join("bls.key").exists(), "node keys must be preserved");
+        assert!(d.join("node-info.yaml").exists(), "node-info.yaml must be preserved");
+        assert!(d.join("genesis").exists(), "genesis dir must be preserved");
     }
 
     // --- import verification (`verify_and_save_epoch_records`) ---

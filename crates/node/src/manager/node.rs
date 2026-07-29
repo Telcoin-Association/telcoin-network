@@ -1382,9 +1382,11 @@ fn check_restore_consistency(
         let (tip_epoch, _) = deconstruct_nonce(tip.nonce.into());
         return Err(eyre!(
             "datadir is an incomplete state restore: execution is at block {} (epoch {tip_epoch}) \
-             but the consensus store has no record of the consensus that produced it. Recreate the \
-             datadir and re-run `db load-state` with a COMPLETE export bundle, or start from an \
-             empty datadir to sync from genesis.",
+             but the consensus store has no record of the consensus that produced it. Remove the \
+             chain-data directories (`db`, `static_files`, and `consensus-db`) under the datadir \
+             and re-run `db load-state` with a COMPLETE export bundle — do NOT delete the datadir \
+             itself, which holds your node keys. Or start from an empty datadir to sync from \
+             genesis.",
             tip.number
         ));
     }

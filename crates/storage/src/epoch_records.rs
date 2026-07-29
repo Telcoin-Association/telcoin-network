@@ -1128,7 +1128,8 @@ mod test {
         // Simulate a background write failure the actor recorded into the shared error slot.
         db.error.send_replace(Some(EpochDbError::CorruptDb));
 
-        // The export surfaces the pending error (it returns at `peek_error()?` before any disk work).
+        // The export surfaces the pending error (it returns at `peek_error()?` before any disk
+        // work).
         let err = db
             .export_bounded_bundle(0, &temp_dir.path().join("recs"), &temp_dir.path().join("certs"))
             .await

@@ -153,3 +153,4 @@ chains above — instead of replaying from genesis.
   pack (reconstructing it needs a pre-epoch-0 genesis descriptor the bundle does not carry), so no
   resume hint is written. Bootstrap from a later epoch.
 - The target datadir must be fresh, all four bundle files must be present, and `--chain` must match the source network.
+- If an import fails it removes only the chain-data directories it created (`db`, `static_files`, `consensus-db`) and leaves your keys and config intact. Never delete the whole datadir (it holds your node keys) — just fix the bundle and re-run.
