@@ -1647,7 +1647,7 @@ impl RethEnv {
             );
 
             let (strategies, values): (Vec<u8>, Vec<u64>) = worker_configs.iter().copied().unzip();
-            let datas = vec![0u128; strategies.len()];
+            let datas = vec![alloy::primitives::aliases::U184::ZERO; strategies.len()];
             let constructor_args =
                 WorkerConfigs::constructorCall { strategies, values, datas, owner_: owner_address }
                     .abi_encode();
@@ -4459,9 +4459,14 @@ mod tests {
             100,
             Some(WORKER_CONFIGS_ADDRESS),
             U256::ZERO,
-            WorkerConfigs::setWorkerConfigCall { workerId: 1, strategy: 1, value: 500, data: 0 }
-                .abi_encode()
-                .into(),
+            WorkerConfigs::setWorkerConfigCall {
+                workerId: 1,
+                strategy: 1,
+                value: 500,
+                data: alloy::primitives::aliases::U184::ZERO,
+            }
+            .abi_encode()
+            .into(),
         );
         let set_num_workers_tx = governance_multisig.create_eip1559_encoded(
             chain.clone(),

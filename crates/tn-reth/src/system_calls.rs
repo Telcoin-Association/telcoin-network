@@ -236,13 +236,13 @@ sol!(
         constructor(
             uint8[] memory strategies,
             uint64[] memory values,
-            uint128[] memory datas,
+            uint184[] memory datas,
             address owner_,
         );
         /// Get the stored fee config for a worker.
         function getWorkerConfig(uint16 workerId)
             external view
-            returns (uint8 strategy, uint64 value, uint128 data);
+            returns (uint8 strategy, uint64 value, uint184 data);
         /// Get every worker's config in a single call.
         function getAllWorkerConfigs()
             external view
@@ -250,13 +250,26 @@ sol!(
                 uint16 count,
                 uint8[] memory strategies,
                 uint64[] memory values,
-                uint128[] memory datas,
+                uint184[] memory datas,
             );
         /// Set the number of workers for the next epoch.
         function setNumWorkers(uint16 numWorkers_) external;
         /// Set the config for a worker by worker id.
         /// NOTE: this must be called before calling `setNumWorkers`.
-        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value, uint128 data) external;
+        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value, uint184 data) external;
+        /// Update strategy-specific packed data for multiple workers. System call only;
+        /// each worker's strategy and value are preserved, and only previously configured
+        /// workers may be updated.
+        function setWorkerConfigsData(uint16[] calldata workerIds, uint184[] calldata datas) external;
+        /// Update config values for multiple workers. System call only; each worker's
+        /// strategy and data are preserved, and only previously configured workers may be
+        /// updated.
+        function setWorkerConfigsValue(uint16[] calldata workerIds, uint64[] calldata values) external;
+        /// Raise the highest strategy id the contract accepts. Owner only and strictly
+        /// increasing, in lockstep with the protocol release that ships the new strategy.
+        function setMaxStrategy(uint8 newMaxStrategy) external;
+        /// The highest strategy id the contract currently accepts.
+        function MAX_STRATEGY() external view returns (uint8);
         /// Retrieve the number of workers for the protocol.
         function numWorkers() external view returns (uint16);
     }
