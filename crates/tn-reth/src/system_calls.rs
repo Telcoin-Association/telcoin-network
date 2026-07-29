@@ -3,19 +3,20 @@
 //! These compile into types for interacting with smart contracts through
 //! System Calls.
 //!
-//! The `sol!` block binds two contracts from the tn-contracts submodule:
+//! The `sol!` blocks bind three contracts from the tn-contracts submodule:
 //! - `ConsensusRegistry` — validator lifecycle (mint/stake/activate/exit/burn), epoch and committee
 //!   views, and the unified epoch-boundary mutator the protocol invokes as a system call
 //!   (`concludeEpoch`).
+//! - `LegacyConsensusRegistry` — the pre-fork registry's epoch-close surface, frozen so pre-fork
+//!   epoch closes replay byte-identically (see the code-hash gate in `evm/block.rs`).
 //! - `WorkerConfigs` — per-worker base-fee strategy used for base fee adjustment.
 //!
 //! Two pinned addresses live here: `SYSTEM_ADDRESS` (0xfff...fffe), the reserved caller the EVM
 //! uses for system transactions (the custom handler exempts it from fee/beneficiary
 //! accounting), and `CONSENSUS_REGISTRY_ADDRESS`, the registry's fixed deployment address.
 //!
-//! NOTE: `applySlashes` is declared for ABI completeness but is never called from Rust anywhere
-//! in this repository — slashing is not live (disabled during the MNO pilot). Do not assume
-//! validators can currently be slashed in-protocol.
+//! NOTE: slashing is not live — `concludeEpoch` accepts a `slashes` array, but the protocol
+//! always passes it empty. Do not assume validators can currently be slashed in-protocol.
 
 use alloy::{primitives::address, sol};
 use tn_types::{Address, Epoch};
@@ -277,6 +278,31 @@ sol!(
         function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value, uint128 data) external;
         /// Retrieve the number of workers for the protocol.
         function numWorkers() external view returns (uint16);
+    }
+);
+
+// The epoch-close surface of the PRE-fork `ConsensusRegistry` deployment. While the deployed
+// registry still carries the pre-fork code hash, epoch closes must replay this exact two-call
+// ABI (the unified three-argument `concludeEpoch` does not exist on-chain there); the code-hash
+// gate in `evm/block.rs` routes between the two. Frozen: these signatures must stay
+// byte-identical to the calls the historical chain executed.
+sol!(
+    /// Pre-fork `ConsensusRegistry` epoch-close interface.
+    contract LegacyConsensusRegistry {
+        /// The rewards applied before concluding the epoch. Field layout is identical to
+        /// `ConsensusRegistry::RewardInfo`.
+        #[derive(Debug)]
+        struct RewardInfo {
+            /// The validator to receive rewards.
+            address validatorAddress;
+            /// The number of consensus blocks for which they were the leader.
+            uint256 consensusHeaderCount;
+        }
+
+        /// Distribute the concluding epoch's issuance. Runs before `concludeEpoch`.
+        function applyIncentives(RewardInfo[] calldata rewardInfos) external;
+        /// Conclude the current epoch with the new committee.
+        function concludeEpoch(address[] calldata newCommittee) external;
     }
 );
 

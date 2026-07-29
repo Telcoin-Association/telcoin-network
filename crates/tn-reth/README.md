@@ -85,7 +85,10 @@ failure**:
    each validator's consensus-leader count. The registry applies rewards, slashes, and queued
    stake version settlement internally in that order, so the stage-ordering obligation lives
    on-chain. An undersized pool fails client-side with `TnRethError::UndersizedCommittee`
-   instead of submitting calldata that reverts on-chain.
+   instead of submitting calldata that reverts on-chain. While the deployed registry still
+   carries the pre-fork adiri code, the close instead replays the legacy `applyIncentives` +
+   `concludeEpoch(address[])` pair through the same code-hash gate as the committee-pool read,
+   keeping pre-fork history re-executable.
 3. `merge_transitions(BundleRetention::Reverts)` folds the system-call state into the bundle.
 
 System calls execute as `SYSTEM_ADDRESS` → contract with a fixed 100M gas limit, zero gas price,

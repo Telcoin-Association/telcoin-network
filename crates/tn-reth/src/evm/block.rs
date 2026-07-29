@@ -31,6 +31,9 @@
 //!    reward infos carry the leader counts from `ctx.rewards_counter`. The registry distributes the
 //!    concluding epoch's issuance, applies slashes, settles queued stake version changes, and
 //!    rotates the epoch atomically, so the stage-ordering obligation lives on-chain, not here.
+//!    While the deployed registry still carries the pre-fork adiri code, the close instead replays
+//!    the legacy `applyIncentives` + `concludeEpoch(address[])` pair (same code-hash gate as the
+//!    committee-pool read), keeping pre-fork history re-executable.
 //! 3. `merge_transitions(BundleRetention::Reverts)` - folds the transaction and system-call
 //!    transitions into the bundle state, retaining revert data.
 //!
@@ -213,10 +216,10 @@ where
 
     /// Execute a system call from [`SYSTEM_ADDRESS`] to `contract` and commit its state changes.
     ///
-    /// Shared implementation for the epoch system calls (`concludeEpoch`,
-    /// `migrateValidatorSets`). Any failure — the call itself erroring or the execution result
-    /// being unsuccessful — is fatal to the block; `description` names the call in the log and
-    /// error strings.
+    /// Shared implementation for the epoch system calls (`concludeEpoch`, its legacy pre-fork
+    /// pair, `migrateValidatorSets`). Any failure — the call itself erroring or the execution
+    /// result being unsuccessful — is fatal to the block; `description` names the call in the
+    /// log and error strings.
     ///
     /// [`SYSTEM_ADDRESS`] is removed from the result state before commit: it is only touched as
     /// the system caller, not a real state change — leaving it in the changeset would put a
@@ -265,12 +268,65 @@ where
         rewards: BTreeMap<Address, u32>,
     ) -> TnRethResult<()> {
         debug!(target: "engine", ?randomness, "applying closing contract call");
-        let calldata = self.generate_conclude_epoch_calldata(
-            randomness,
-            rewards.iter().map(|(address, count)| (*address, *count)).collect(),
-        )?;
+        let reward_infos: Vec<(Address, u32)> =
+            rewards.iter().map(|(address, count)| (*address, *count)).collect();
+
+        // While the deployed registry still carries the pre-fork adiri code, the unified
+        // three-argument `concludeEpoch` selector does not exist on-chain — close with the
+        // legacy two-call sequence instead, so every pre-fork epoch close (fresh-node
+        // onboarding, full resync) executes byte-identically to the historical chain. At the
+        // fork boundary `apply_consensus_registry_fork` swaps the code first, so this gate
+        // already sees the upgraded hash and takes the unified call below.
+        #[cfg(feature = "adiri")]
+        if self.registry_code_is_pre_fork()? {
+            return self.apply_closing_epoch_contract_call_legacy(randomness, reward_infos);
+        }
+
+        let calldata = self.generate_conclude_epoch_calldata(randomness, reward_infos)?;
         trace!(target: "engine", ?calldata, "close epoch calldata");
 
+        self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
+    }
+
+    /// Close the epoch via the PRE-fork registry ABI: `applyIncentives(RewardInfo[])` followed
+    /// by `concludeEpoch(address[])`.
+    ///
+    /// Byte-exact replay of the two system calls every pre-fork epoch close was produced with,
+    /// in the same order, so re-executed pre-fork blocks derive identical state roots. The
+    /// committee shuffle inside `generate_conclude_epoch_calldata`'s counterpart here routes
+    /// its pool read through the legacy ABI via the same code-hash gate
+    /// (`read_committee_eligible_pool`).
+    #[cfg(feature = "adiri")]
+    fn apply_closing_epoch_contract_call_legacy(
+        &mut self,
+        randomness: B256,
+        reward_infos: Vec<(Address, u32)>,
+    ) -> TnRethResult<()> {
+        use crate::system_calls::LegacyConsensusRegistry;
+
+        let calldata = LegacyConsensusRegistry::applyIncentivesCall {
+            rewardInfos: reward_infos
+                .iter()
+                .map(|(address, count)| LegacyConsensusRegistry::RewardInfo {
+                    validatorAddress: *address,
+                    consensusHeaderCount: U256::from(*count),
+                })
+                .collect(),
+        }
+        .abi_encode()
+        .into();
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "applying consensus block rewards",
+        )?;
+
+        let mut new_committee = self.shuffle_new_committee(randomness)?;
+        new_committee.sort();
+        debug!(target: "engine", ?new_committee, "legacy new committee sorted by address");
+        let calldata = LegacyConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
+            .abi_encode()
+            .into();
         self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
     }
 
