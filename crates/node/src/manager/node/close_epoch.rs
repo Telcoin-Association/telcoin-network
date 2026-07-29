@@ -14,7 +14,7 @@
 //! next epoch starts from a clean slate. Historic data survives in the
 //! `ConsensusChain` store; only the per-epoch working tables are cleared.
 
-use crate::{engine::ExecutionNode, manager::EpochManager};
+use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
 use std::collections::BTreeSet;
 use tn_config::TelcoinDirs;
