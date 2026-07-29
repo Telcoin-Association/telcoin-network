@@ -194,7 +194,14 @@ impl DbLoadStateArgs {
         let bundle_consensus = self.pack.join("consensus_data");
         let bundle_records = self.pack.join("epoch_records");
         let bundle_certs = self.pack.join("epoch_certs");
-        reject_non_resumable_bundle(&bundle_consensus, &bundle_records, &bundle_certs)?;
+        let last_epoch_record =
+            reject_non_resumable_bundle(&bundle_consensus, &bundle_records, &bundle_certs)?;
+
+        // Bind the exec-state pack to the certificate-verified tip record BEFORE any datadir
+        // mutation (the reth DB is created inside `restore_pack`). A mismatch — e.g. `state_data`
+        // and `epoch_records` copied from different exports — is refused while the target is still
+        // untouched, instead of after a multi-GB import has already committed.
+        check_state_pack_matches_record(&self.pack, &last_epoch_record)?;
 
         // `RethConfig::new` is the only public constructor; `RethCommand` has no `Default`, so
         // parse an empty arg list for its defaults (rpc/txpool are irrelevant to a one-shot
@@ -260,16 +267,17 @@ fn reject_non_resumable_bundle(
     bundle_consensus: &Path,
     bundle_records: &Path,
     bundle_certs: &Path,
-) -> eyre::Result<()> {
+) -> eyre::Result<EpochRecord> {
     match (bundle_consensus.exists(), bundle_records.exists(), bundle_certs.exists()) {
         (true, true, true) => {
             let records = EpochRecordDb::read_records_from_pack(bundle_records).map_err(|e| {
                 eyre!("failed to read epoch records from {}: {e}", bundle_records.display())
             })?;
-            let last_epoch = records
+            let last_record = records
                 .last()
                 .ok_or_else(|| eyre!("bundle epoch_records contains no records"))?
-                .epoch;
+                .clone();
+            let last_epoch = last_record.epoch;
             if last_epoch == 0 {
                 bail!(
                     "epoch-0 bundle cannot produce a resumable node (rebuilding the epoch-0 \
@@ -277,7 +285,7 @@ fn reject_non_resumable_bundle(
                      carry); bootstrap from a later epoch's complete bundle instead"
                 );
             }
-            Ok(())
+            Ok(last_record)
         }
         (false, false, false) => bail!(
             "state-only pack cannot produce a resumable node; re-export a complete bundle with \
@@ -288,6 +296,33 @@ fn reject_non_resumable_bundle(
              together (re-export with the current version)"
         ),
     }
+}
+
+/// Bind the exec-state pack to the certificate-verified tip record's `final_state`, returning `Err`
+/// on any mismatch. Opening the pack reads only its meta + headers (cheap), so this runs as a
+/// pre-flight check before any datadir mutation: a mismatch means the pack's `state_data` and
+/// `epoch_records` came from different exports, and refusing here leaves the target untouched.
+///
+/// The record itself is cryptographically verified against its certificate later, in
+/// `verify_and_save_epoch_records`; pinning the exec pack to it here makes the super-quorum
+/// certificate over the record transitively cover the exec pack's identity.
+fn check_state_pack_matches_record(pack: &Path, record: &EpochRecord) -> eyre::Result<()> {
+    let reader = ExecStatePackReader::open(pack)
+        .map_err(|e| eyre!("failed to open state pack {}: {e}", pack.display()))?;
+    let state_final = BlockNumHash::new(reader.meta().block_number, reader.meta().block_hash);
+    if state_final != record.final_state {
+        bail!(
+            "state pack final state {}:{:#x} does not match certified epoch-{} record final_state \
+             {}:{:#x}; the pack's state_data and epoch_records appear to come from different \
+             exports — re-export a single complete bundle",
+            state_final.number,
+            state_final.hash,
+            record.epoch,
+            record.final_state.number,
+            record.final_state.hash,
+        );
+    }
+    Ok(())
 }
 
 /// Build a fresh reth DB from `reth_config` and restore the exec-state pack at `pack` into it,
@@ -915,6 +950,58 @@ mod tests {
             &bundle.path().join("epoch_certs"),
         )
         .expect("complete epoch>=1 bundle must be accepted");
+    }
+
+    #[test]
+    fn reject_state_pack_final_state_mismatch() {
+        // The exec-state pack must name the same final state as the certified tip record. A pack
+        // whose meta disagrees (e.g. state_data and epoch_records copied from different exports) is
+        // refused before any datadir write.
+        use tn_storage::exec_state_pack::ExecStatePackWriter;
+        use tn_types::{BlockNumHash, EpochRecord, ExecHeader, B256};
+        let dir = tempfile::tempdir().unwrap();
+        let root = B256::from([7u8; 32]);
+        let snapshot = ExecHeader { number: 5, state_root: root, ..Default::default() };
+        ExecStatePackWriter::create(dir.path(), root, std::slice::from_ref(&snapshot))
+            .expect("create pack")
+            .finish()
+            .expect("finish pack");
+        // Record names a different block number than the pack's meta (block 5), so it cannot match
+        // regardless of hash.
+        let record = EpochRecord {
+            epoch: 3,
+            final_state: BlockNumHash::new(6, B256::from([1u8; 32])),
+            ..Default::default()
+        };
+        let err = super::check_state_pack_matches_record(dir.path(), &record)
+            .expect_err("mismatched final state must be refused");
+        assert!(
+            err.to_string().contains("does not match certified epoch-3 record final_state"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accept_state_pack_final_state_match() {
+        // Positive control: when the pack's meta equals the record's final_state the binding check
+        // passes, proving the refusal above is specific rather than a blanket reject.
+        use tn_storage::exec_state_pack::{ExecStatePackReader, ExecStatePackWriter};
+        use tn_types::{BlockNumHash, EpochRecord, ExecHeader, B256};
+        let dir = tempfile::tempdir().unwrap();
+        let root = B256::from([7u8; 32]);
+        let snapshot = ExecHeader { number: 5, state_root: root, ..Default::default() };
+        ExecStatePackWriter::create(dir.path(), root, std::slice::from_ref(&snapshot))
+            .expect("create pack")
+            .finish()
+            .expect("finish pack");
+        // Read the pack's own meta so the record's final_state matches it exactly.
+        let meta_final = {
+            let reader = ExecStatePackReader::open(dir.path()).expect("open pack");
+            BlockNumHash::new(reader.meta().block_number, reader.meta().block_hash)
+        };
+        let record = EpochRecord { epoch: 3, final_state: meta_final, ..Default::default() };
+        super::check_state_pack_matches_record(dir.path(), &record)
+            .expect("matching final state must be accepted");
     }
 
     // --- import verification (`verify_and_save_epoch_records`) ---
