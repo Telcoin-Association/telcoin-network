@@ -281,6 +281,15 @@ impl EpochRecordDb {
         }
     }
 
+    /// Return any delayed error recorded by the background thread.
+    /// Does not clear the error.
+    pub fn peek_error(&self) -> Result<(), EpochDbError> {
+        match &*self.error.borrow() {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
     /// Save an [`EpochRecord`] without a certificate.
     /// Returns `Ok(())` idempotently if the record is already stored.
     pub async fn save_dummy_epoch0(&self, record: EpochRecord) -> Result<(), EpochDbError> {
@@ -522,9 +531,8 @@ impl EpochRecordDb {
         records_path: &Path,
         certs_path: &Path,
     ) -> Result<(), EpochDbError> {
-        // Surface any pending background write error before reading, matching the write-path
-        // guards.
-        self.get_error()?;
+        // Surface any pending background write error before reading.
+        self.peek_error()?;
 
         // Collect the bounded record+cert set from the actor first, so the on-disk write below sees
         // a fixed snapshot even if a later epoch is appended concurrently to the live packs.
@@ -1108,6 +1116,31 @@ mod test {
         for (got, want) in got_certs.iter().zip(certs.iter()) {
             assert_eq!(got.epoch_hash, want.epoch_hash);
         }
+    }
+
+    #[tokio::test]
+    async fn export_bundle_peeks_write_error_without_clearing_it() {
+        // Regression test for finding #6: the read-only export must surface a pending background
+        // write error WITHOUT clearing it, so the write path (the acknowledger) still learns of the
+        // failure instead of it being silently consumed by an in-flight export.
+        let temp_dir = TempDir::with_prefix("export_peek_error").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        // Simulate a background write failure the actor recorded into the shared error slot.
+        db.error.send_replace(Some(EpochDbError::CorruptDb));
+
+        // The export surfaces the pending error (it returns at `peek_error()?` before any disk work).
+        let err = db
+            .export_bounded_bundle(0, &temp_dir.path().join("recs"), &temp_dir.path().join("certs"))
+            .await
+            .expect_err("export must surface the pending write error");
+        assert!(matches!(err, EpochDbError::CorruptDb), "unexpected error: {err:?}");
+
+        // ...but must NOT clear it: the write path still learns of the failure (the #6 fix).
+        let latched = db.get_error().expect_err("write path must still see the error");
+        assert!(matches!(latched, EpochDbError::CorruptDb), "unexpected error: {latched:?}");
+
+        // `get_error` is the acknowledger, so the slot is cleared only after it is read there.
+        db.get_error().expect("slot cleared after acknowledgement");
     }
 
     #[tokio::test]
