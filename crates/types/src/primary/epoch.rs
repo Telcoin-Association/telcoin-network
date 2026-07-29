@@ -279,7 +279,7 @@ mod test {
         assert!(vote1.check_signature(), "vote1 failed sig check");
         assert!(vote2.check_signature(), "vote2 failed sig check");
         assert!(vote3.check_signature(), "vote3 failed sig check");
-        let sigs = vec![vote1.signature, vote2.signature, vote3.signature];
+        let sigs = [vote1.signature, vote2.signature, vote3.signature];
         match BlsAggregateSignature::aggregate(&sigs[..], true) {
             Ok(aggregated_signature) => {
                 let signature: BlsSignature = aggregated_signature.to_signature();

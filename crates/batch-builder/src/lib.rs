@@ -659,8 +659,7 @@ mod tests {
         // specify leader for consensus output
         let mut leader_cert = Certificate::default();
         leader_cert.update_header_author_for_test(leader);
-        let mut headers = Vec::new();
-        headers.push(leader_cert.header().clone());
+        let headers = vec![leader_cert.header().clone()];
         let subdag = CommittedSubDag::new_with_headers_for_test(headers);
         let output = ConsensusOutput::new_with_subdag(subdag, ConsensusHeaderDigest::default(), 0);
 

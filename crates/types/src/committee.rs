@@ -880,7 +880,7 @@ mod tests {
         assert!(!json.contains('['), "JSON should not be an array");
 
         // The string should be the bs58 representation
-        let expected = format!("\"{}\"", id.to_string());
+        let expected = format!("\"{id}\"");
         assert_eq!(json, expected);
 
         // Roundtrip

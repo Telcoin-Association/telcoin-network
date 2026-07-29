@@ -1251,7 +1251,7 @@ mod tests {
         debug!(target: "evm", ?epoch, ?epoch_info, ?committee, ?epoch, "new epoch state from canonical tip");
         // assert epoch info updated
         expected_epoch_info.blockHeight = 4;
-        expected_epoch_info.epochId = expected_epoch as u32;
+        expected_epoch_info.epochId = expected_epoch;
         assert_eq!(expected_epoch, epoch);
         assert_eq!(epoch_start, canonical_header.timestamp);
         assert_eq!(epoch_info, expected_epoch_info);
@@ -1285,7 +1285,7 @@ mod tests {
         let expected = ConsensusRegistry::EpochInfo {
             committee: expected_new_committee,
             blockHeight: 0,
-            epochId: (expected_epoch + 1) as u32,
+            epochId: expected_epoch + 1,
             // epoch duration set at the start
             epochDuration: Default::default(),
             // values should remain the same
@@ -1442,7 +1442,7 @@ mod tests {
         // ensure validator 2 has fully exited
         let (pending_exit, active_validators): (Vec<_>, Vec<_>) = eligible_validators
             .into_iter()
-            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit.into());
+            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
 
         assert_eq!(pending_exit.len(), 0);
         assert_eq!(active_validators.len(), 5);

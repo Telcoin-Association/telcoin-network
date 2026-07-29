@@ -500,8 +500,7 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
             0,
             ReputationScores::default(),
             None,
-        )
-        .into(),
+        ),
         ConsensusHeaderDigest::default(),
         0,
         false,
