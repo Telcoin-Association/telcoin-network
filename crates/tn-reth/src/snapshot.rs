@@ -91,7 +91,7 @@ use tn_types::{
     Address, BlockBody, BlockNumHash, Bytes, Epoch, ExecHeader, GenesisAccount, SealedBlock,
     SealedHeader, TaskManager, WorkerId, B256, U256,
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// The pinned read-only MDBX transaction type — reth's `Tx<RO>` with long-read safety disabled.
 type PinnedTx = <DatabaseEnv as RethDatabaseT>::TX;
@@ -900,9 +900,9 @@ pub fn check_fee_precondition(
 /// A no-op when the node would enter epoch 0 or 1: entering epoch 1 stops at the epoch-0 base case
 /// of the base-fee walk (`derive_idle_worker_fee_at`) and never reads state below `B`, so there is
 /// nothing to guard (and an epoch-0 snapshot is not consensus-resumable regardless). The
-/// entered-epoch read is best-effort: a read fault logs a warning and returns `Ok` rather than
-/// blocking on a transient/absent read (the restore side reads it again at startup; the export side
-/// proceeds). An actual idle-epoch violation is a hard error naming the offending worker.
+/// ConsensusRegistry that names the entered epoch is a protocol invariant present at every block,
+/// so a failed read is a hard error and the snapshot is not declared fee-resumable. An actual
+/// idle-epoch violation is likewise a hard error naming the offending worker.
 ///
 /// On the restore side, run AFTER [`SnapshotRestorer::import_state`] (it reads contract state at
 /// `B`). On the export side, run against a candidate bundle's window before writing the pack.
@@ -910,18 +910,18 @@ pub fn check_fees_resumable(reth_env: &RethEnv, window: &[SealedHeader]) -> eyre
     let closing = window.last().ok_or_else(|| {
         eyre!("snapshot restore: cannot check fee resumability over an empty window")
     })?;
-    let entered = match reth_env.get_current_epoch_info_at_header(closing) {
-        Ok((entered, _info)) => entered,
-        Err(e) => {
-            warn!(
-                target: "tn::reth",
-                error = %e,
-                "snapshot restore: could not read the entered epoch at the snapshot block; \
-                 skipping the fee-derivability precheck"
-            );
-            return Ok(());
-        }
-    };
+    // The ConsensusRegistry that names the entered epoch is a protocol invariant present at every
+    // block, so a failed read is a genuine fault (a node-local provider error, or absent/corrupt
+    // registry state) — never a benign "registry-less chain". Fail closed rather than declaring the
+    // snapshot fee-resumable unchecked.
+    let (entered, _info) = reth_env.get_current_epoch_info_at_header(closing).map_err(|e| {
+        eyre!(
+            "snapshot restore: could not read the entered epoch from the ConsensusRegistry at the \
+             snapshot block {} — the registry is a protocol invariant and must be present, so a \
+             failed read is a fault; refusing to declare the snapshot fee-resumable: {e}",
+            closing.number,
+        )
+    })?;
     // Entering epoch 0 or 1 never walks below B (the walk stops at the epoch-0 base case), so there
     // is nothing to verify.
     if entered < 2 {
@@ -1569,7 +1569,7 @@ mod tests {
 
     /// `check_resumable_fees` is a no-op for a snapshot rooted at the genesis block: the node would
     /// enter epoch <= 1, whose base-fee derivation never walks below B, so even an idle window is
-    /// tolerated (either the entered-epoch read returns < 2, or a read fault best-effort skips).
+    /// tolerated (the entered-epoch read returns < 2).
     #[tokio::test]
     async fn check_resumable_fees_tolerates_epoch_zero_snapshot() -> eyre::Result<()> {
         let genesis = crate::test_utils::test_genesis_with_consensus_registry(4);

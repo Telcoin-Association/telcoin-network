@@ -279,13 +279,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tn_reth::{RethChainSpec, RethEnv};
+    use tn_reth::{test_utils::test_genesis_with_consensus_registry, RethChainSpec, RethEnv};
     use tn_storage::exec_state_pack::ExecStatePackReader;
-    use tn_types::{test_genesis, TaskManager};
+    use tn_types::TaskManager;
 
     #[tokio::test]
     async fn triggers_export_on_background_thread() -> eyre::Result<()> {
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
         let db_dir = TempDir::new()?;
         let task_manager = TaskManager::new("export exec test");
         let reth_env = RethEnv::new_for_temp_chain(chain, db_dir.path(), &task_manager, None)?;
@@ -298,8 +298,8 @@ mod tests {
         // trigger an export of the (genesis) tip on the background thread and await its result
         let out = TempDir::new()?;
         let rx = exporter.trigger_export(reth_env, genesis_block, out.path().to_path_buf())?;
-        // With a registry-less test genesis the entered-epoch read is a no-op skip, so the export
-        // still runs; unwrap the `Some` to reach the outcome.
+        // The registry-bearing test genesis reports entered epoch 0 (< 2), so the fee-resumability
+        // precheck passes and the export runs; unwrap the `Some` to reach the outcome.
         let outcome = rx
             .await
             .expect("worker replied")
