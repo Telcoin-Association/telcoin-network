@@ -1,6 +1,23 @@
 //! Contains RPC server args.
 //! This is a subset of args Reth's RPC (mostly taken from Reth) provides to eliminate arguments we
 //! don't support.
+//!
+//! The defaults bound what a single RPC client (or all clients together) can cost the node,
+//! since validator RPC endpoints may be publicly reachable:
+//!
+//! - Transport: at most 500 concurrent connections (`--rpc.max-connections`), 15 MB request and 160
+//!   MB response payloads (`--rpc.max-request-size` / `--rpc.max-response-size`), and 1024
+//!   subscriptions per connection (`--rpc.max-subscriptions-per-connection`). These cap memory held
+//!   per connection and the fan-out of websocket subscriptions.
+//! - Execution work: `eth_call`/tracing gas is capped (`--rpc.gascap`), concurrent tracing requests
+//!   default to a CPU-core-derived limit (`--rpc.max-tracing-requests`, tracing is CPU bound),
+//!   `trace_filter`/log filters have block-scan windows, and `eth_getProof` is bounded by a permit
+//!   count and a historical proof window.
+//! - Spend: transactions submitted through this RPC are refused above a fee cap (`--rpc.txfeecap`,
+//!   default 1.0 in native-token units; 0 disables the cap).
+//!
+//! The HTTP and WS servers are off by default and bind to localhost when enabled; the IPC
+//! server is on unless `--ipcdisable` is passed.
 
 use std::{
     ffi::OsStr,

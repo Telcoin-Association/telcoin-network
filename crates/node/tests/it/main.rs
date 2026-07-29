@@ -2562,7 +2562,7 @@ async fn spawn_consensus(
     batches: HashMap<B256, Batch>,
     config: ConsensusConfig<MemDatabase>,
     task_manager: &TaskManager,
-    mut consensus_chain: ConsensusChain,
+    consensus_chain: ConsensusChain,
 ) {
     // components for tasks
     let committee = fixture.committee();
@@ -2586,7 +2586,7 @@ async fn spawn_consensus(
         task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
 
     // Set up mock worker.
@@ -2595,7 +2595,7 @@ async fn spawn_consensus(
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await

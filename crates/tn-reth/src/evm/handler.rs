@@ -1,6 +1,23 @@
 //! Custom handler to override EVM basefees and implement gas limit penalty.
 //!
 //! Source code in revm.
+//!
+//! [`TNEvmHandler`] overrides two post-execution hooks of revm's default handler:
+//!
+//! - `reward_beneficiary`: the base-fee portion of gas is CREDITED, not burned. The priority fee
+//!   goes to the block beneficiary as on Ethereum, while `basefee * gas_used` is added to the
+//!   chain's basefee address (`crate::basefee_address`, the governance safe unless set per-chain)
+//!   for later off-chain processing.
+//! - `reimburse_caller`: unused gas is refunded minus a quadratic penalty when a transaction uses
+//!   less than 10% of its gas limit (`calculate_gas_penalty`, issue #424). Batch gas cannot be
+//!   validated until after consensus, so wildly over-estimated limits could otherwise DoS batch
+//!   proposals for free; the penalty, priced at the effective gas price, is credited to the same
+//!   basefee address.
+//!
+//! Invariant: both hooks return early when the transaction caller is `SYSTEM_ADDRESS`, so
+//! system calls (which run with zero gas price and zero base fee) never touch the beneficiary
+//! or basefee accounts — otherwise every system call would spuriously mark those accounts
+//! touched in the state diff.
 
 use crate::{basefee_address, calculate_gas_penalty, SYSTEM_ADDRESS};
 use reth_revm::{

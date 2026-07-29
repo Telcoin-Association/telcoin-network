@@ -7,7 +7,7 @@
 //!
 //! Precompile-specific helpers live alongside their precompile: the TEL token helpers
 //! (`mint`, `get_total_supply`, `set_total_supply`, [`GENESIS_SUPPLY`]) are defined in
-//! [`tel_precompile::test_utils`](crate::evm::tel_precompile::test_utils) as an extension of
+//! `tel_precompile::test_utils` as an extension of
 //! [`TestEnv`]. The stateless BLS precompile needs no extra harness.
 
 use crate::evm::{

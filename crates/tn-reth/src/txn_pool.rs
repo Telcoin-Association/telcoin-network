@@ -1,5 +1,27 @@
 //! Implement an abstraction around the Reth transaction pool.
-//! This should insolate from shifting Reth internals, etc.
+//! This should isolate from shifting Reth internals, etc.
+//!
+//! TN-specific pool behavior worth knowing:
+//!
+//! - [`WorkerTxPool::new`] spawns a CRITICAL task consuming the provider's
+//!   `canonical_state_stream()`, applying each `Commit` notification to the pool (mined
+//!   transactions removed, changed accounts refreshed). A `Reorg` notification is skipped with a
+//!   warning: TN never reorgs — consensus output only extends the canonical chain — and aborting
+//!   the critical task would take down the whole node.
+//! - [`TxPool::get_pending_base_fee`] currently returns `MIN_PROTOCOL_BASE_FEE` (7 wei)
+//!   unconditionally; issue 114 tracks computing a real per-round base fee. Both callers (the task
+//!   above and the batch builder's maintenance path) use it only as the fallback when a tip header
+//!   carries no `base_fee_per_gas` — otherwise the pool's pending base fee tracks the new tip's.
+//! - [`new_pool_txn`] hard-codes `propagate: false` (reth's flag for devp2p tx gossip): transaction
+//!   distribution happens via the worker batch protocol, and observer nodes forward RPC submissions
+//!   to committee validators over JSON-RPC (see `forward.rs`) — never via devp2p gossip.
+//! - The per-sender slot default is 256 (`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER` in `src/cli.rs`,
+//!   seeded process-wide by `init_txpool_defaults`) instead of reth's 16.
+//! - Blob (EIP-4844) transactions are unsupported in batches: the batch builder strips them via
+//!   [`TxPool::remove_eip4844_txs`] (removes descendants and deletes sidecars from the blob store),
+//!   and every canonical pool update — `process_canon_state_update` here and the batch builder's
+//!   equivalent — passes `pending_block_blob_fee: Some(u128::MAX)`, pricing all blob transactions
+//!   out of the pending set.
 
 use futures::StreamExt as _;
 use reth::transaction_pool::{
@@ -16,7 +38,6 @@ use reth_provider::{
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
     error::{Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError},
-    identifier::TransactionId,
     AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, EthPooledTransaction,
     PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
     TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
@@ -26,20 +47,17 @@ use tn_types::{
     Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned,
     TxHash, MIN_PROTOCOL_BASE_FEE,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
-use crate::{error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode};
-
-/// A pooled transaction id.
-pub type PoolTxnId = TransactionId;
-/// A pooled transaction.
-pub type PoolTxn = ValidPoolTransaction<EthPooledTransaction>;
-/// A recovered pooled transaction.
-pub type RecoveredPoolTxn = Recovered<EthPooledTransaction>;
+use crate::{error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode, PoolTxn, PoolTxnId};
 
 pub use reth_primitives_traits::InMemorySize as TxnSize;
 
 /// Generate a new pooled transaction from an eth transaction and id.
+///
+/// Hard-codes `propagate: false`: reth's `propagate` flag drives devp2p tx gossip, which TN
+/// does not use — transactions move between nodes through the worker batch protocol and the
+/// observer JSON-RPC forwarder (`forward.rs`).
 pub fn new_pool_txn(transaction: EthPooledTransaction, transaction_id: PoolTxnId) -> PoolTxn {
     ValidPoolTransaction {
         transaction,
@@ -132,7 +150,15 @@ impl WorkerTxPool {
                     CanonStateNotification::Commit { new } => {
                         txn_pool_clone.process_canon_state_update(new);
                     }
-                    _ => unreachable!("TN reorgs are impossible"),
+                    // TN never reorgs: consensus output only extends the canonical chain, so a
+                    // Reorg notification here is a bug upstream. Skip it rather than panic —
+                    // this runs inside a critical task, and aborting it would take down the
+                    // whole node over a pool-maintenance miss.
+                    _ => warn!(
+                        target: "txpool",
+                        "unexpected canonical state notification (TN never reorgs); skipping \
+                         transaction pool update"
+                    ),
                 }
             }
             Err(TaskError::from_message(
@@ -217,12 +243,12 @@ impl WorkerTxPool {
     }
 
     /// Return the current status of the pool.
-    pub fn block_info(&self) -> BlockInfo {
+    pub fn block_info(&self) -> RethBlockInfo {
         self.0.block_info()
     }
 
     /// Set the current status of the pool.
-    pub fn set_block_info(&self, block_info: BlockInfo) {
+    pub fn set_block_info(&self, block_info: RethBlockInfo) {
         self.0.set_block_info(block_info);
     }
 
@@ -285,9 +311,6 @@ impl WorkerTxPool {
         self.0.pool_size()
     }
 }
-
-/// Block info defining a transaction pool status.
-pub type BlockInfo = RethBlockInfo;
 
 impl TxPool for WorkerTxPool {
     fn best_transactions(&self) -> BestTxns {
@@ -385,6 +408,7 @@ pub fn recover_pooled_transaction(
 mod tests {
     use super::*;
     use crate::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
+    use rand::{rngs::StdRng, SeedableRng as _};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tn_types::{test_genesis, Address, Bytes, Encodable2718 as _, TaskManager, U256};
@@ -475,5 +499,56 @@ mod tests {
             assert!(result.is_ok());
         }
         assert_eq!(pool.pool_size().pending, 3);
+    }
+
+    #[test]
+    fn test_parallel_recovery_preserves_order() {
+        use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+        use tn_types::Encodable2718;
+
+        // Create 20 transactions from different random signers so each tx is unique.
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let num_txs = 20;
+        let mut encoded_txs = Vec::with_capacity(num_txs);
+        for i in 0..num_txs {
+            let mut factory =
+                TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(i as u64));
+            let tx = factory.create_eip1559(
+                chain.clone(),
+                None,
+                100_000,
+                Some(Address::ZERO),
+                U256::from(1),
+                Default::default(),
+            );
+            encoded_txs.push(tx.encoded_2718());
+        }
+
+        // Recover sequentially
+        let sequential: Vec<_> = encoded_txs
+            .iter()
+            .map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .expect("sequential recovery")
+            })
+            .collect();
+
+        // Recover in parallel (using rayon, same as production code)
+        let parallel: Vec<_> = encoded_txs
+            .par_iter()
+            .map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .expect("parallel recovery")
+            })
+            .collect();
+
+        // Assert same length
+        assert_eq!(sequential.len(), parallel.len());
+
+        // Assert same order by comparing tx hashes and recovered signer addresses
+        for (seq, par) in sequential.iter().zip(parallel.iter()) {
+            assert_eq!(seq.hash(), par.hash(), "transaction hashes must match in order");
+            assert_eq!(seq.signer(), par.signer(), "recovered signers must match in order");
+        }
     }
 }

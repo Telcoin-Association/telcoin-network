@@ -1,9 +1,22 @@
 //! Provide config and implement traits to bridge protocol extensions to Reth.
 //!
 //! Inspired by: crates/ethereum/evm/src/lib.rs
+//!
+//! [`TnEvmConfig`] is TN's `ConfigureEvm` implementation. It wires three pieces together: the
+//! `TNEvmFactory` (every EVM instance, with TN precompiles installed), the
+//! `TNBlockExecutorFactory` (block-level execution, including the epoch-closing system calls),
+//! and the `TNBlockAssembler` (header assembly), plus the shared `RewardsCounter` threaded into
+//! each block's execution context for leader-reward attribution.
+//!
+//! The epoch-close digest flows through here in both directions. Building a new block,
+//! `context_for_next_block` copies `TNPayload::close_epoch` into the execution context, and the
+//! assembler later records it as the header's `extra_data`. Re-executing a stored block,
+//! `context_for_block` recovers the same value by decoding `extra_data` (empty = normal block,
+//! 32 bytes = the closing-epoch digest, any other length = malformed-header error), so replay
+//! reproduces the identical epoch-boundary execution.
 
 use super::{TNBlockAssembler, TNBlockExecutionCtx, TNBlockExecutorFactory, TNEvmFactory};
-use crate::{error::TnRethError, payload::TNPayload, traits::TNPrimitives};
+use crate::{error::TnRethError, payload::TNPayload, TNPrimitives};
 use reth_chainspec::{ChainSpec, EthChainSpec as _};
 use reth_evm::{ConfigureEvm, EvmEnv, EvmEnvFor, ExecutionCtxFor};
 use reth_evm_ethereum::RethReceiptBuilder;

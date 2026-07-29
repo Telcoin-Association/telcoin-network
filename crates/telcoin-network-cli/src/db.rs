@@ -19,9 +19,9 @@ use std::{
 };
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, TelcoinDirs as _};
 use tn_reth::{
-    iter_static_files, open_db_read_only, snapshot::SnapshotRestorer, traits::TNPrimitives,
-    DatabaseArguments, DatabaseEnv, RethCommand, RethConfig, RethDatabaseT as _, RethEnv,
-    RethMdbxError, StaticFileProvider, Tables,
+    iter_static_files, open_db_read_only, snapshot::SnapshotRestorer, DatabaseArguments,
+    DatabaseEnv, RethCommand, RethConfig, RethDatabaseT as _, RethEnv, RethMdbxError,
+    StaticFileProvider, TNPrimitives, Tables,
 };
 use tn_storage::{
     consensus::ConsensusChain,

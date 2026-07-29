@@ -1,7 +1,22 @@
 //! Prometheus metrics for the reth execution environment.
+//!
+//! Two counter series are exported under the `tn_reth` scope, both counting transactions that
+//! `build_block_from_batch_payload` declines to include in a block:
+//! `tn_reth.unrecoverable_txs_dropped_total` (alertable — a certified batch carried a
+//! transaction whose signer could not be recovered) and `tn_reth.invalid_txs_skipped_total`
+//! (expected — duplicates/invalid transactions across independently-batching workers). See
+//! [`RethEnvMetrics`] for per-series semantics. [`report_db_metrics`] additionally samples reth
+//! database metrics as a pre-scrape hook.
+//!
+//! Everything here binds to the process-global `metrics` recorder, so
+//! `tn_metrics::install_recorder` must run first — the node installs it before opening the
+//! database (`RethEnv::new_database`), and [`init`] (called from `RethEnv::new`) then forces
+//! registration so both counters exist at zero from process start.
 
 use reth_metrics::{metrics::Counter, Metrics};
 use std::sync::LazyLock;
+
+use crate::RethDb;
 
 /// Process-wide metrics for [`crate::RethEnv`].
 ///
@@ -56,6 +71,15 @@ pub(crate) struct RethEnvMetrics {
     /// second copy is skipped as a duplicate. A steady nonzero rate is normal operation. The
     /// alertable counter is [`RethEnvMetrics::unrecoverable_txs_dropped_total`].
     pub(crate) invalid_txs_skipped_total: Counter,
+}
+
+/// Report sampled reth database metrics (table sizes, page usage, freelist).
+///
+/// Intended as a pre-scrape hook for the prometheus metrics endpoint. Lives here to keep
+/// reth-db types out of the node crate.
+pub fn report_db_metrics(db: &RethDb) {
+    use reth_db::database_metrics::DatabaseMetrics;
+    db.report_metrics();
 }
 
 #[cfg(test)]

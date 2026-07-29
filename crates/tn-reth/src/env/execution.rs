@@ -1,0 +1,301 @@
+//! Execution and ATOMIC CANONICALIZATION of consensus output.
+//!
+//! This module owns the path from certified consensus output to the canonical chain:
+//! executing a worker batch's payload into a block
+//! ([`RethEnv::build_block_from_batch_payload`]), committing a round's blocks to the
+//! database ([`RethEnv::finish_executing_output`]), and updating the in-memory
+//! finalized/safe watches ([`RethEnv::finalize_block`]). Consensus output is the ONLY
+//! source of canonical blocks: there is no fork choice and no reorg path, and every
+//! committed block is final by construction.
+//!
+//! # Deliberate transaction drops (fork safety)
+//!
+//! Block building silently drops transactions on exactly two paths:
+//!
+//! 1. unrecoverable signers — a transaction whose signer cannot be recovered is dropped (and
+//!    counted) instead of failing the block, because a certified sub-DAG is fixed: erroring would
+//!    deterministically halt — and crash-loop on restart replay — every honest node over one
+//!    undecodable transaction (issue #933);
+//! 2. execution-level `BlockValidationError::InvalidTx` — expected in normal operation (e.g. two
+//!    workers' batches carrying the same transaction); skipped and counted.
+//!
+//! Dropping instead of halting is fork-safe because both paths are deterministic
+//! functions of the certified bytes: every honest node recovers, drops, and skips the
+//! exact same transactions, so all nodes still build byte-identical blocks. Any other
+//! execution error fails the attempt instead.
+//!
+//! # Atomicity contract
+//!
+//! [`RethEnv::finish_executing_output`] persists the blocks and the finalized/safe
+//! block-number markers in ONE `provider_rw` transaction with a single commit — a
+//! crash can never leave the persisted tip and the markers out of sync. Only after
+//! that commit does it report the new tip over the engine update channel
+//! (`blocking_send`) and then broadcast the canonical-state notification
+//! (`notify_canon_state`). [`RethEnv::finalize_block`] is in-memory only (the
+//! finalized/safe watches plus pruning persisted blocks from the in-memory state);
+//! its database half happens inside the atomic commit above.
+
+use std::sync::Arc;
+
+use alloy::primitives::FixedBytes;
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+use reth_chain_state::{DeferredTrieData, ExecutedBlock, NewCanonicalChain};
+use reth_errors::{BlockExecutionError, BlockValidationError};
+use reth_evm::{
+    execute::{BlockBuilder as _, BlockBuilderOutcome},
+    ConfigureEvm as _,
+};
+use reth_provider::{
+    BlockExecutionOutput, CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
+    DatabaseProviderFactory as _, StateProviderFactory as _,
+};
+use reth_revm::{cached::CachedReads, database::StateProviderDatabase, State};
+use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
+use tn_types::{
+    deconstruct_nonce, ConsensusNumHash, EngineUpdate, Round, SealedHeader, TransactionSigned, B256,
+};
+use tracing::{debug, error, info, warn};
+
+use crate::{
+    error::{TnRethError, TnRethResult},
+    metrics::RETH_METRICS,
+    payload::TNPayload,
+    TNPrimitives,
+};
+
+use super::RethEnv;
+
+impl RethEnv {
+    /// Construct a canonical block from a worker's block that reached consensus.
+    ///
+    /// The returned block may contain FEWER transactions than the certified batch:
+    /// transactions with unrecoverable signers and transactions failing execution
+    /// validation (`InvalidTx`, e.g. duplicates across workers' batches) are dropped
+    /// deterministically — see the module docs for why dropping is fork-safe. Any
+    /// other execution error fails the whole attempt.
+    pub fn build_block_from_batch_payload(
+        &self,
+        payload: TNPayload,
+        transactions: &Vec<Vec<u8>>,
+        anchor_hash: B256,
+        ancestors: &[DeferredTrieData],
+    ) -> TnRethResult<ExecutedBlock> {
+        let parent_header = payload.parent_header.clone();
+        debug!(target: "engine", ?parent_header, "retrieving state for next block");
+        let state_provider =
+            self.inner.blockchain_provider.state_by_block_hash(parent_header.hash())?;
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut cached_reads = CachedReads::default();
+        let mut db = State::builder()
+            .with_database(cached_reads.as_db_mut(state))
+            .with_bundle_update()
+            .build();
+
+        debug!(
+            target: "engine",
+            parent = ?parent_header.num_hash(),
+            "building new payload"
+        );
+
+        // copy in case of error
+        let batch_digest = payload.batch_digest;
+
+        let mut builder =
+            self.inner.evm_config.builder_for_next_block(&mut db, &parent_header, payload)?;
+
+        builder.apply_pre_execution_changes().inspect_err(|err| {
+            warn!(target: "engine", %err, "failed to apply pre-execution changes");
+        })?;
+
+        // Phase 1: Recover all transactions (ECDSA ecrecover) in parallel via rayon.
+        // Always use par_iter — the slight overhead on small batches is negligible
+        // compared to the savings on large ones, and avoids an extra code path.
+        //
+        // A transaction whose signer cannot be recovered cannot be executed, but a
+        // certified sub-DAG is fixed and identical on every honest node, so returning
+        // an error here would deterministically halt (and, on restart-replay,
+        // crash-loop) the whole network on a single undecodable transaction. Instead
+        // drop the unrecoverable transactions and continue, mirroring the `InvalidTx`
+        // tolerance of the execute phase below: every node drops the same
+        // transactions from the same certified bytes, so the resulting block stays
+        // deterministic (issue #933). The primary defense is validating batches before
+        // they can be certified; this only bounds the blast radius if one ever is.
+        let recovered_txs = transactions
+            .par_iter()
+            .filter_map(|tx_bytes| {
+                reth_recover_raw_transaction::<TransactionSigned>(tx_bytes)
+                    .inspect_err(|e| {
+                        error!(
+                            target: "engine",
+                            batch=?batch_digest,
+                            ?tx_bytes,
+                            "failed to recover signer, dropping transaction: {e}"
+                        )
+                    })
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+
+        // Recovery failures are the signal that a batch carrying undecodable transaction bytes
+        // was certified, so make them alertable instead of log-only. Count once, after the
+        // parallel phase: incrementing inside the rayon closure would contend a single atomic on
+        // every transaction, and the batch width that sets the cost of that contention is
+        // attacker-chosen. The difference is exact because `filter_map` is the only thing above
+        // that removes elements. Unconditional, including the overwhelmingly common zero: one
+        // relaxed atomic add per block is free next to executing the block, and a guard here
+        // would leave the series unregistered on a healthy node.
+        let unrecoverable = transactions.len().saturating_sub(recovered_txs.len());
+        RETH_METRICS
+            .unrecoverable_txs_dropped_total
+            .increment(u64::try_from(unrecoverable).unwrap_or(u64::MAX));
+
+        // Phase 2: Execute recovered transactions sequentially.
+        for recovered in recovered_txs {
+            // forks are impossible
+            match builder.execute_transaction(recovered.clone()) {
+                Ok(_gas_used) => (),
+                Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+                    error,
+                    ..
+                })) => {
+                    // allow transaction errors (ie - duplicates)
+                    //
+                    // it's possible that another worker's batch included this transaction
+                    warn!(target: "engine", %error,  "skipping invalid transaction: {:#?}", recovered);
+                    // expected in normal operation - see the field docs, this is not an alert
+                    RETH_METRICS.invalid_txs_skipped_total.increment(1);
+                    continue;
+                }
+                // this is an error that we should treat as fatal for this attempt
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } =
+            builder.finish(&state_provider)?;
+
+        debug!(target: "engine", hash=?block.hash(), "block builder outcome");
+        let block_execution_output =
+            BlockExecutionOutput { result: execution_result, state: db.take_bundle() };
+        let computed_trie_data = DeferredTrieData::sort_and_build_trie_input(
+            Arc::new(hashed_state),
+            Arc::new(trie_updates),
+            anchor_hash,
+            ancestors,
+        );
+        let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
+            Arc::new(block),
+            Arc::new(block_execution_output),
+            computed_trie_data,
+        );
+
+        Ok(res)
+    }
+
+    /// Finalize the block (header) executed from consensus output in memory.
+    ///
+    /// The finalized/safe database markers are persisted atomically with the blocks in
+    /// [`Self::finish_executing_output`]; this method only updates the in-memory
+    /// finalized/safe watches (consumed by components like RPC) and prunes persisted blocks
+    /// from the canonical in-memory state.
+    pub fn finalize_block(&self, header: SealedHeader) -> TnRethResult<()> {
+        let num_hash = header.num_hash();
+        // this clears up old blocks in-memory
+        self.inner.blockchain_provider.set_finalized(header.clone());
+
+        // update safe block last because this is less time sensitive but still needs to happen
+        self.inner.blockchain_provider.set_safe(header);
+
+        // cleanup chain state in memory
+        // this returns the `canonical_chain().count()` back to 0
+        self.inner
+            .blockchain_provider
+            .canonical_in_memory_state()
+            .remove_persisted_blocks(num_hash);
+
+        Ok(())
+    }
+
+    /// Atomically persist an executed round of consensus output and announce the new
+    /// canonical tip.
+    ///
+    /// The blocks AND the finalized/safe markers commit in the same database
+    /// transaction (one `provider_rw` commit), so a crash can never leave the
+    /// persisted marker behind the persisted tip — every block here comes from
+    /// committed consensus output and is final by construction. The in-memory
+    /// finalized/safe watches are updated afterwards by [`Self::finalize_block`].
+    ///
+    /// Ordering after the commit: first the new tip is reported over the engine
+    /// update channel (`blocking_send`, feeding the consensus layer's `recent_blocks`
+    /// watch — so this method must run on a blocking thread, and a closed channel
+    /// errors out before any broadcast); only then is the canonical-state
+    /// notification broadcast via `notify_canon_state` to in-process subscribers such
+    /// as the worker's pool maintenance task.
+    pub fn finish_executing_output(
+        &self,
+        blocks: Vec<ExecutedBlock>,
+        engine_update: Option<(Round, ConsensusNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
+    ) -> TnRethResult<()> {
+        // NOTE: this makes all blocks canonical, commits them to the database,
+        // and broadcasts new chain on `canon_state_notification_sender`
+        //
+        // the canon_state_notifications include every block executed in this round
+        //
+        // the worker's pool maintenance task subcribes to these events
+        debug!(
+            target: "engine",
+            first=?blocks.first().map(|b| b.recovered_block.num_hash()),
+            last=?blocks.last().map(|b| b.recovered_block.num_hash()),
+            "storing range of blocks",
+        );
+
+        // insert blocks to db
+        let provider_rw = self.inner.blockchain_provider.database_provider_rw()?;
+        provider_rw.save_blocks(blocks.clone(), reth_provider::SaveBlocksMode::Full)?;
+        // advance the finalized/safe markers in the same transaction as the blocks: every
+        // canonical block comes from committed consensus output, so the last saved block is
+        // final by construction, and the single commit leaves no crash window where the
+        // persisted tip outruns the marker
+        if let Some(last) = blocks.last() {
+            let last_number = last.recovered_block.number;
+            provider_rw.save_finalized_block_number(last_number)?;
+            provider_rw.save_safe_block_number(last_number)?;
+        }
+        provider_rw.commit()?;
+
+        // process update
+        //
+        // see reth::EngineApiTreeHandler::on_canonical_chain_update
+        let chain_update = NewCanonicalChain::Commit { new: blocks };
+        let canonical_head = chain_update.tip();
+        let (epoch, round) =
+            deconstruct_nonce(<FixedBytes<8> as Into<u64>>::into(canonical_head.nonce));
+        info!(
+            target: "engine",
+            "canonical head for epoch {:?} round {:?}: {:?} - {:?}",
+            epoch,
+            round,
+            canonical_head.number,
+            canonical_head.hash(),
+        );
+
+        if let Some((leader_round, consensus_num_hash, engine_update_tx)) = engine_update {
+            engine_update_tx
+                .blocking_send((
+                    leader_round,
+                    consensus_num_hash,
+                    Some(canonical_head.clone_sealed_header()),
+                ))
+                .map_err(|e| {
+                    error!(target: "engine", ?e, "engine update channel send failed");
+                    TnRethError::EngineUpdateChannelClosed
+                })?;
+        }
+
+        // broadcast canonical update
+        let notification = chain_update.to_chain_notification();
+        self.canonical_in_memory_state().notify_canon_state(notification);
+
+        Ok(())
+    }
+}

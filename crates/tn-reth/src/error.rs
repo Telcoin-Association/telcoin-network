@@ -5,7 +5,7 @@ use reth::rpc::{builder::error::RpcError, server_types::eth::EthApiError};
 use reth_errors::BlockExecutionError;
 use reth_provider::ProviderError;
 
-/// Result alias for [`TNRethError`].
+/// Result alias for [`TnRethError`].
 pub type TnRethResult<T> = Result<T, TnRethError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
@@ -17,9 +17,6 @@ pub enum TnRethError {
     /// Error recovering transaction from bytes.
     #[error(transparent)]
     RecoverTransactionBytes(#[from] EthApiError),
-    /// The block body and senders lengths don't match.
-    #[error("Failed to seal block with senders - lengths don't match")]
-    SealBlockWithSenders,
     /// The executed block failed.
     #[error("Block execution failed: {0}")]
     BlockExecution(#[from] BlockExecutionError),
@@ -38,9 +35,6 @@ pub enum TnRethError {
     /// Error forwarding engine update to consensus.
     #[error("Failed to forward engine update to consensus.")]
     EngineUpdateChannelClosed,
-    /// Executed output must always contain at least one block.
-    #[error("Empty execution output from engine.")]
-    EmptyExecutionOutput,
     /// Receipts are missing for a block that exists (DB inconsistency).
     ///
     /// Surfaced during ExEx replay: returning an empty receipt set would make a

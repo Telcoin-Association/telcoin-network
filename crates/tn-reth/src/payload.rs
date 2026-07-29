@@ -49,7 +49,8 @@ pub struct TNPayload {
     /// This is used as the ommers hash.
     /// The default is `B256::ZERO` (no batches to execute).
     pub batch_digest: B256,
-    /// Hash value for [ConsensusHeader]. Used as the executed block's "parent_beacon_block_root".
+    /// Hash value for the `ConsensusHeader`. Used as the executed block's
+    /// "parent_beacon_block_root".
     pub consensus_header_digest: B256,
     /// The base fee per gas used to construct this block.
     /// The value comes from the proposed batch.
@@ -60,10 +61,13 @@ pub struct TNPayload {
     pub gas_limit: u64,
     /// The mix hash used for prev_randao.
     pub mix_hash: B256,
-    /// Boolean indicating if the payload should use system calls to close the epoch during
-    /// execution.
+    /// Randomness digest carried only by the payload that closes the epoch.
     ///
-    /// This is the last batch for the `ConsensusOutput` if the epoch is closing.
+    /// `Some` for the last batch of an epoch-closing `ConsensusOutput`; `None` otherwise. The
+    /// value is the keccak256 of the leader's aggregate BLS signature (see
+    /// `ConsensusOutput::keccak_leader_sigs`). During execution it seeds the deterministic
+    /// shuffle that selects the next committee, and it is recorded in the executed block
+    /// header's `extra_data` so replay recovers the same seed.
     pub close_epoch: Option<B256>,
     /// Worker that created this payload.
     pub worker_id: WorkerId,
