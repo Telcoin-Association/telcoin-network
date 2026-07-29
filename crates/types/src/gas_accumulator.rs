@@ -56,7 +56,7 @@ use crate::{AuthorityIdentifier, Committee, WorkerId};
 /// Adding a new strategy = new contract constant + new enum variant + match arm in
 /// adjust_base_fees.
 ///
-/// NOTE: these are mapped in `tn-reth/src/lib.rs:worker_fee_configs_inner`
+/// NOTE: these are mapped in `tn-reth/src/env/epoch.rs:worker_fee_configs_inner`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerFeeConfig {
     /// Adjust fee +/-12.5% per epoch based on gas utilization vs target.
