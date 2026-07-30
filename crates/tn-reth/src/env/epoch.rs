@@ -1610,7 +1610,9 @@ mod tests {
         tn_evm.db_mut().commit(res.state);
 
         let conclude_calldata =
-            ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }.abi_encode().into();
+            ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
+                .abi_encode()
+                .into();
         let mut res = tn_evm.transact_system_call(
             SYSTEM_ADDRESS,
             CONSENSUS_REGISTRY_ADDRESS,
