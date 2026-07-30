@@ -474,13 +474,19 @@ impl RethEnv {
     /// the block identified by `block_hash`.
     ///
     /// Builds an EVM pinned to `block_hash`'s state and issues a single `getEpochInfo(uint32)`
-    /// call. The registry keeps a ring buffer of the four most recent epochs and reverts
-    /// (`InvalidEpoch`) for anything outside it, so a successful return is guaranteed to be the
-    /// requested epoch's record. Used by the epoch manager to recover the previous epoch's block
-    /// range from its closing block when deriving next-epoch base fees.
+    /// call. The registry serves the window `[current - 3, current + 2]` and reverts
+    /// (`InvalidEpoch`) outside it — but a FUTURE epoch inside the window does not revert: it
+    /// returns a synthesized projection whose `blockHeight` is 0 (the interface's "not yet
+    /// begun" sentinel) with config fields as they would be stamped if the epoch began now.
+    /// This method exists to recover a *begun* epoch's record (the epoch manager derives the
+    /// previous epoch's block range from its closing block when seeding next-epoch base fees),
+    /// so it rejects non-identity records rather than handing callers a sentinel `blockHeight`
+    /// they would use as a block-scan floor: the returned `epochId` must equal the request
+    /// (re-checked here so a binding drift cannot mislabel a record), and `blockHeight == 0` is
+    /// only legitimate for epoch 0, whose first block is genesis.
     ///
-    /// Fails with a descriptive error if `block_hash` does not resolve to a sealed header or the
-    /// registry call does not succeed.
+    /// Fails with a descriptive error if `block_hash` does not resolve to a sealed header, the
+    /// registry call does not succeed, or the returned record is synthesized/mismatched.
     pub fn get_epoch_info_at_block(
         &self,
         epoch: Epoch,
@@ -493,8 +499,23 @@ impl RethEnv {
         let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
         let calldata = ConsensusRegistry::getEpochInfoCall { epoch }.abi_encode().into();
-        self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)
-            .map_err(Into::into)
+        let info =
+            self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)?;
+
+        if info.epochId != epoch {
+            eyre::bail!(
+                "getEpochInfo({epoch}) at block {block_hash:?} returned a record for epoch {}",
+                info.epochId
+            );
+        }
+        if info.blockHeight == 0 && epoch != 0 {
+            eyre::bail!(
+                "getEpochInfo({epoch}) at block {block_hash:?} returned a not-yet-begun record \
+                 (blockHeight 0): epoch {epoch} had not started as of this block"
+            );
+        }
+
+        Ok(info)
     }
 
     /// Read worker fee configs from the [`WorkerConfigs`] contract at the block identified by
