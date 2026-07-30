@@ -567,8 +567,16 @@ impl EpochRecordDb {
             records.push(record);
         }
 
-        write_bounded_pack(records_path, Inner::PACK_EPOCH, &records)?;
-        write_bounded_pack(certs_path, Inner::CERT_PACK_EPOCH, &certs)?;
+        let records_path = records_path.to_path_buf();
+        let certs_path = certs_path.to_path_buf();
+        // These are blocking calls that may take some time, so don't jamb up an async thread.
+        tokio::task::spawn_blocking(move || -> Result<(), EpochDbError> {
+            write_bounded_pack(&records_path, Inner::PACK_EPOCH, &records)?;
+            write_bounded_pack(&certs_path, Inner::CERT_PACK_EPOCH, &certs)?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| EpochDbError::JoinError)??;
         Ok(())
     }
 
@@ -945,6 +953,7 @@ pub enum EpochDbError {
     ReceiveFailed,
     PersistError(String),
     CorruptDb,
+    JoinError,
 }
 
 impl Error for EpochDbError {}
@@ -971,6 +980,7 @@ impl Display for EpochDbError {
             EpochDbError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             EpochDbError::PersistError(e) => write!(f, "Failed to persist: {e}"),
             EpochDbError::CorruptDb => write!(f, "Epoch records database is corrupt"),
+            EpochDbError::JoinError => write!(f, "Failed to join a background thread for DB"),
         }
     }
 }
