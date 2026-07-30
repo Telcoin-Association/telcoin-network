@@ -865,6 +865,42 @@ mod test {
     }
 
     #[test]
+    fn reader_stops_at_first_footer_ignoring_appended_bytes() {
+        // Safety net for findings #13/#14: `ExecStatePackWriter::create` opens the data file in
+        // APPEND mode, so writing into a dirty dir would produce a "doubled" pack (a full second
+        // pack after the first's `End` footer). The reader must terminate at the FIRST footer, so
+        // trailing prior-attempt bytes are inert and can never contribute wrong state to a
+        // recomputed root.
+        let dir = TempDir::with_prefix("exec_state_doubled").expect("temp dir");
+
+        // First (real) pack: meta + one header + account A + footer.
+        let root1 = B256::from([1u8; 32]);
+        let acct_a = account(0xAA, 1, false);
+        let mut w1 =
+            ExecStatePackWriter::create(dir.path(), root1, &[header(10, root1)]).expect("create 1");
+        w1.append_account(&acct_a).expect("append A");
+        w1.finish().expect("finish 1");
+
+        // Second `create` on the same dir APPENDS a whole second pack after the first's footer.
+        let root2 = B256::from([2u8; 32]);
+        let acct_b = account(0xBB, 1, false);
+        let mut w2 =
+            ExecStatePackWriter::create(dir.path(), root2, &[header(20, root2)]).expect("create 2");
+        w2.append_account(&acct_b).expect("append B");
+        w2.finish().expect("finish 2");
+
+        // The reader reads the FIRST pack only (meta1, its header, account A) and stops at End1.
+        let mut reader = ExecStatePackReader::open(dir.path()).expect("open");
+        assert_eq!(reader.meta().state_root, root1, "reader must read the first pack's meta");
+        let got: Vec<_> = reader.accounts().collect::<Result<_, _>>().expect("accounts");
+        assert_eq!(
+            got,
+            vec![acct_a],
+            "reader must return only the first pack's account; appended bytes are inert"
+        );
+    }
+
+    #[test]
     fn verify_detects_state_root_mismatch() {
         let dir = TempDir::with_prefix("exec_state_pack_srm").expect("temp dir");
         let mut pack = open_raw(dir.path());

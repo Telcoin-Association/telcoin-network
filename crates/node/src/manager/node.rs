@@ -785,6 +785,15 @@ where
         let exec_state_exporter =
             builder.enable_state_export.then(ExecStateExporter::spawn).transpose()?;
 
+        // With export enabled, clean up any orphaned temp export dirs left by a crashed/interrupted
+        // prior run. Safe here (startup) because no export is in flight; the per-epoch export path
+        // only ever clears its own epoch's temp, so it can never delete an in-flight one.
+        if exec_state_exporter.is_some() {
+            close_epoch::sweep_stale_tmp_exports(
+                &tn_datadir.consensus_db_path().join("state_exports"),
+            );
+        }
+
         Ok(Self {
             builder,
             tn_datadir,

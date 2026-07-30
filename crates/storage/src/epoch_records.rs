@@ -975,14 +975,19 @@ impl From<io::Error> for EpochDbError {
 /// Write `values` into a fresh pack `data` stream at `path`, tagged with `uid_idx` and encoded
 /// byte-compatibly with the read paths (`ZStd`, `EPOCH_PACK_VERSION`).
 ///
-/// Opens the pack read-write (which creates the file and writes its header), appends every value in
-/// order, then commits so the file is complete on disk. Keeps the sentinel tags and codec inside
-/// this crate so the export bundle stays readable by `read_records_from_pack` /
-/// `read_certs_from_pack`.
+/// Removes any pre-existing file at `path` first, so a re-run overwrites rather than appends —
+/// `Pack::open` opens read-write in append mode, so writing over a leftover file would otherwise
+/// prepend prior-attempt records. Then opens the pack (which creates the file and writes its
+/// header), appends every value in order, and commits so the file is complete on disk. Keeps the
+/// sentinel tags and codec inside this crate so the export bundle stays readable by
+/// `read_records_from_pack` / `read_certs_from_pack`.
 fn write_bounded_pack<V>(path: &Path, uid_idx: u64, values: &[V]) -> Result<(), EpochDbError>
 where
     V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
 {
+    // Enforce the "fresh" contract: a leftover file (e.g. from a prior failed export attempt) would
+    // be appended to, not replaced. NotFound is the normal case and is ignored.
+    let _ = std::fs::remove_file(path);
     let mut pack =
         Pack::<V>::open(path, uid_idx, false, PackCompression::ZStd, EPOCH_PACK_VERSION)?;
     for value in values {
@@ -1142,6 +1147,33 @@ mod test {
 
         // `get_error` is the acknowledger, so the slot is cleared only after it is read there.
         db.get_error().expect("slot cleared after acknowledgement");
+    }
+
+    #[test]
+    fn write_bounded_pack_overwrites_stale_file() {
+        // Regression test for finding #14: `write_bounded_pack` must produce a FRESH pack. A
+        // leftover file (e.g. from a prior failed export attempt) must be overwritten, not
+        // appended to — otherwise the bundle would carry prior-attempt records prepended to
+        // this attempt's.
+        let dir = TempDir::with_prefix("write_bounded_fresh").expect("temp dir");
+        let path = dir.path().join("epoch_records");
+        let first: Vec<EpochRecord> =
+            (0..3).map(|epoch| EpochRecord { epoch, ..Default::default() }).collect();
+        let second: Vec<EpochRecord> =
+            (0..2).map(|epoch| EpochRecord { epoch, ..Default::default() }).collect();
+
+        super::write_bounded_pack(&path, super::Inner::PACK_EPOCH, &first).expect("first write");
+        super::write_bounded_pack(&path, super::Inner::PACK_EPOCH, &second).expect("second write");
+
+        // Fresh, not append: reading back yields exactly the second write (2 records), not 3+2=5.
+        let got = EpochRecordDb::read_records_from_pack(&path).expect("read records");
+        assert_eq!(
+            got.len(),
+            2,
+            "second write must overwrite, not append (got {} records)",
+            got.len()
+        );
+        assert_eq!(got.iter().map(|r| r.epoch).collect::<Vec<_>>(), vec![0, 1]);
     }
 
     #[tokio::test]

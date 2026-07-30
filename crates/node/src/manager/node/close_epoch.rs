@@ -16,7 +16,7 @@
 
 use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, path::Path, time::Duration};
 use tn_config::TelcoinDirs;
 use tn_reth::{recover_raw_transaction, RethEnv};
 use tn_storage::{
@@ -43,6 +43,48 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 /// full plain-state walk has already elapsed by the time this wait begins, so the cert is normally
 /// present immediately.
 const CERT_WAIT: Duration = Duration::from_secs(30);
+
+/// Remove every `epoch-*.tmp` directory under the exports root — orphaned temp export dirs left by
+/// a crashed or interrupted prior run. Called ONCE at node startup, where it is safe because no
+/// export is in flight; the per-boundary path deliberately clears only its own epoch's temp so it
+/// can never delete another epoch's still-in-flight export working dir. Final `epoch-{N}` dirs have
+/// no extension, so they are never swept.
+///
+/// Best-effort: a missing exports root or a removal failure is logged at warn and otherwise
+/// ignored, since a failure here must never crash the node.
+pub(super) fn sweep_stale_tmp_exports(export_root: &Path) {
+    let entries = match std::fs::read_dir(export_root) {
+        Ok(entries) => entries,
+        // No exports directory yet (nothing exported) — nothing to sweep.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!(target: "tn::snapshot", path = ?export_root, error = %e, "could not read state-exports dir to sweep stale temps");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `epoch-{N}.tmp` (final dirs are `epoch-{N}` with no extension, so they are never swept).
+        if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                warn!(target: "tn::snapshot", path = ?path, error = %e, "failed to remove stale temp export dir");
+            }
+        }
+    }
+}
+
+/// Best-effort removal of an export temp dir, logging at warn on failure so a leftover temp is
+/// observable (the next boundary's [`sweep_stale_tmp_exports`] will retry it). Replaces the silent
+/// `let _ = remove_dir_all(..)` cleanups on the export completion task's failure/skip paths.
+fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
+    match std::fs::remove_dir_all(tmp_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(target: "tn::snapshot", epoch, path = ?tmp_dir, error = %e, "failed to remove temp export dir");
+        }
+    }
+}
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -307,6 +349,7 @@ where
         let block = self.consensus_bus.latest_execution_block_num_hash();
         let export_root = self.tn_datadir.consensus_db_path().join("state_exports");
         let final_dir = export_root.join(format!("epoch-{epoch}"));
+
         // Idempotent: a completed export for this epoch already sits at the final location (e.g.
         // the boundary is re-processed after a restart); nothing to do.
         if final_dir.exists() {
@@ -336,14 +379,20 @@ where
         let consensus_bus = self.consensus_bus.clone();
 
         // Export into a temp sibling and atomically rename it into place on success, so external
-        // tooling only ever observes a complete `epoch-{N}` directory. Clear any leftover temp from
-        // a prior failed attempt first.
+        // tooling only ever observes a complete `epoch-{N}` directory. Clear any leftover temp for
+        // THIS epoch first: a successful export renames its temp to the final dir (and the
+        // idempotency check above already returned for a completed epoch), so a surviving
+        // `epoch-{N}.tmp` is a stale remnant of a prior crashed run. Only this epoch's temp is
+        // touched — never another epoch's, which may still be an in-flight export's working dir.
+        // If it cannot be removed, writing into it would append onto stale bytes and publish a
+        // doubled bundle, so skip this export — NOT fatal, the next epoch boundary retries.
         let tmp_dir = export_root.join(format!("epoch-{epoch}.tmp"));
-        if tmp_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
-                // Since generating snapshots is a caliteral duty just log an error.
-                // But this will leave trash around and may be indicative of a bigger problem
-                error!(target: "tn::snapshot", epoch, error = %e, "failed to clear stale temp export dir");
+        match std::fs::remove_dir_all(&tmp_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                error!(target: "tn::snapshot", epoch, path = ?tmp_dir, error = %e, "could not clear stale temp export dir; skipping export (next epoch retries)");
+                return Ok(());
             }
         }
 
@@ -362,7 +411,7 @@ where
                             // the consensus pack is a per-epoch file, so a plain copy is race-free.
                             if let Err(e) = std::fs::copy(&src_consensus, tmp_dir.join("consensus_data")) {
                                 error!(target: "tn::snapshot", epoch, error = %e, "failed to copy consensus pack into export");
-                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                                remove_tmp_export(&tmp_dir, epoch);
                                 return Ok(());
                             }
 
@@ -377,7 +426,7 @@ where
                             // to store the tip record unverified, so fail the export instead.
                             let Some(record_n) = consensus_chain.epochs().record_by_epoch(epoch).await else {
                                 warn!(target: "tn::snapshot", epoch, "epoch record missing at export time; skipping export");
-                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                                remove_tmp_export(&tmp_dir, epoch);
                                 return Ok(());
                             };
                             if consensus_chain
@@ -387,7 +436,7 @@ where
                                 .is_none()
                             {
                                 warn!(target: "tn::snapshot", epoch, wait_secs = CERT_WAIT.as_secs(), "epoch certificate not aggregated within wait; skipping export (next epoch retries)");
-                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                                remove_tmp_export(&tmp_dir, epoch);
                                 return Ok(());
                             }
 
@@ -403,7 +452,7 @@ where
                                 .await
                             {
                                 error!(target: "tn::snapshot", epoch, error = %e, "failed to write epoch records/certs bundle into export");
-                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                                remove_tmp_export(&tmp_dir, epoch);
                                 return Ok(());
                             }
 
@@ -418,23 +467,23 @@ where
                                 ),
                                 Err(e) => {
                                     error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch bundle into place");
-                                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                                    remove_tmp_export(&tmp_dir, epoch);
                                 }
                             }
                         }
                         // intentional skip: the epoch is not resumable, so no bundle was written.
                         Ok(Ok(None)) => {
                             info!(target: "tn::snapshot", epoch, "skipped state export for epoch: snapshot would not be resumable; no bundle written");
-                            let _ = std::fs::remove_dir_all(&tmp_dir);
+                            remove_tmp_export(&tmp_dir, epoch);
                         }
                         // export failed or the worker went away: drop the partial temp dir.
                         Ok(Err(e)) => {
                             warn!(target: "tn::snapshot", epoch, error = %e, "epoch state export failed");
-                            let _ = std::fs::remove_dir_all(&tmp_dir);
+                            remove_tmp_export(&tmp_dir, epoch);
                         }
                         Err(_) => {
                             warn!(target: "tn::snapshot", epoch, "epoch state export worker dropped the reply");
-                            let _ = std::fs::remove_dir_all(&tmp_dir);
+                            remove_tmp_export(&tmp_dir, epoch);
                         }
                     }
                     Ok(())
@@ -711,5 +760,28 @@ mod tests {
         let five = keys(0..5);
         assert!(build_epoch_record(1, five.clone(), five, None, final_state(), final_consensus())
             .is_err());
+    }
+
+    #[test]
+    fn sweep_removes_only_temp_export_dirs() {
+        // Finding #13: the boundary sweep must clear every `epoch-*.tmp` (this epoch's and orphans
+        // from prior epochs) while leaving completed `epoch-{N}` dirs and unrelated files
+        // untouched.
+        let root = tempfile::tempdir().expect("temp dir");
+        let export_root = root.path();
+        for name in ["epoch-1.tmp", "epoch-2.tmp", "epoch-5"] {
+            std::fs::create_dir_all(export_root.join(name)).expect("mkdir");
+        }
+        std::fs::write(export_root.join("keep.txt"), b"x").expect("write file");
+
+        sweep_stale_tmp_exports(export_root);
+
+        assert!(!export_root.join("epoch-1.tmp").exists(), "orphaned temp dir must be swept");
+        assert!(!export_root.join("epoch-2.tmp").exists(), "orphaned temp dir must be swept");
+        assert!(export_root.join("epoch-5").exists(), "completed export dir must survive");
+        assert!(export_root.join("keep.txt").exists(), "unrelated file must survive");
+
+        // A missing exports root is a no-op (must not panic).
+        sweep_stale_tmp_exports(&export_root.join("does-not-exist"));
     }
 }
