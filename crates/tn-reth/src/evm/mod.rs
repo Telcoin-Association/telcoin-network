@@ -72,6 +72,16 @@ pub use utils::calculate_gas_penalty;
 /// and queued stake settlement across the full validator set in one transaction.
 pub(crate) const SYSTEM_CALL_GAS_LIMIT: u64 = 100_000_000;
 
+/// Gas budget for a single pre-genesis constructor CREATE
+/// (`TNEvm::transact_pre_genesis_create`).
+///
+/// Deliberately 30M — the chain's block gas limit — as a deploy-size ceiling for the genesis
+/// ceremony, NOT a stale copy of the old 30M system-call budget (that constant is
+/// [`SYSTEM_CALL_GAS_LIMIT`] and moved to 100M for epoch-boundary headroom). Pre-genesis
+/// creates run at `gas_price: 0` with the block gas limit raised to match, so the bound exists
+/// to stop runaway constructor execution at the same scale a live block would allow.
+pub(crate) const PRE_GENESIS_CREATE_GAS_LIMIT: u64 = 30_000_000;
+
 /// TN EVM implementation.
 ///
 /// This is a wrapper type around the `revm` ethereum evm with optional [`Inspector`] (tracing)
@@ -317,9 +327,10 @@ where
     /// Deploy a contract during pre-genesis construction (a CREATE, not a call).
     ///
     /// Uses the same relaxed environment as `transact_system_call` — zero gas price and base fee,
-    /// nonce and chain-id checks disabled — under its own fixed 30M gas budget with the block gas
-    /// limit raised to match, but issues a `TxKind::Create` and returns the full result state for
-    /// the caller to commit (no `SYSTEM_ADDRESS` stripping convention here).
+    /// nonce and chain-id checks disabled — under its own [`PRE_GENESIS_CREATE_GAS_LIMIT`]
+    /// budget with the block gas limit raised to match, but issues a `TxKind::Create` and
+    /// returns the full result state for the caller to commit (no `SYSTEM_ADDRESS` stripping
+    /// convention here).
     pub(crate) fn transact_pre_genesis_create(
         &mut self,
         caller: Address,
@@ -330,7 +341,7 @@ where
             kind: TxKind::Create,
             // Explicitly set nonce to 0 so revm does not do any nonce checks
             nonce: 0,
-            gas_limit: 30_000_000,
+            gas_limit: PRE_GENESIS_CREATE_GAS_LIMIT,
             value: U256::ZERO,
             data,
             // Setting the gas price to zero enforces that no value is transferred as part of the
