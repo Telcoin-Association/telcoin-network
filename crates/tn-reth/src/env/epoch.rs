@@ -1633,6 +1633,281 @@ mod tests {
         Ok(())
     }
 
+    /// The epoch-boundary slashing sequence: a slash-to-zero ejection lands mid-sequence and the
+    /// close still succeeds because the committee is assembled from post-slash state.
+    ///
+    /// Drives the exact three-call order the block executor issues - `applyIncentives`, then
+    /// `applySlashes`, then `concludeEpoch` - with a slash that empties a validator's stake.
+    /// Pins the sequencing contract an automated slash producer must uphold: the committee size
+    /// and eligible pool are read AFTER `applySlashes` commits, so the ejection is reflected
+    /// before `concludeEpoch` validates the committee. Also pins the preserved reward economics:
+    /// incentives run before slashes, so the closing epoch's rewards are weighted on pre-slash
+    /// collateral and even the about-to-be-ejected validator collects its final epoch.
+    #[tokio::test]
+    async fn test_slash_to_zero_ejection_with_post_slash_committee() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Slash Ejection Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // close epoch 0 through the production payload path so the sequence below runs at a
+        // realistic mid-chain boundary rather than directly on genesis state
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block1.recovered_block.clone_sealed_header();
+
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 1);
+        assert_eq!(committee.len(), 5);
+        let victim = committee[0].validatorAddress;
+        let survivor = committee[1].validatorAddress;
+
+        let mut tn_evm = reth_env.tn_evm(canonical_header.hash())?;
+
+        // stage 1: incentives, with rewards for the victim and a survivor
+        let calldata = ConsensusRegistry::applyIncentivesCall {
+            rewardInfos: vec![
+                ConsensusRegistry::RewardInfo {
+                    validatorAddress: victim,
+                    consensusHeaderCount: U256::from(5),
+                },
+                ConsensusRegistry::RewardInfo {
+                    validatorAddress: survivor,
+                    consensusHeaderCount: U256::from(5),
+                },
+            ],
+        }
+        .abi_encode()
+        .into();
+        let mut res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        assert!(res.result.is_success(), "applyIncentives succeeds: {:?}", res.result);
+        res.state.remove(&SYSTEM_ADDRESS);
+        tn_evm.db_mut().commit(res.state);
+
+        // the victim collects its final epoch's rewards on pre-slash collateral
+        let victim_rewards = reth_env.call_consensus_registry::<_, U256>(
+            &mut tn_evm,
+            ConsensusRegistry::getRewardsCall { validatorAddress: victim }.abi_encode().into(),
+        )?;
+        assert!(victim_rewards > U256::ZERO, "pre-slash rewards accrue to the victim");
+
+        // stage 2: slash the victim's full outstanding stake, ejecting it at zero balance
+        let (outstanding, _initial, _rewards) = reth_env
+            .call_consensus_registry::<_, (U256, U256, U256)>(
+                &mut tn_evm,
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: victim }
+                    .abi_encode()
+                    .into(),
+            )?;
+        let calldata = ConsensusRegistry::applySlashesCall {
+            slashes: vec![ConsensusRegistry::Slash {
+                validatorAddress: victim,
+                amount: outstanding,
+            }],
+        }
+        .abi_encode()
+        .into();
+        let mut res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        assert!(res.result.is_success(), "applySlashes succeeds: {:?}", res.result);
+        res.state.remove(&SYSTEM_ADDRESS);
+        tn_evm.db_mut().commit(res.state);
+
+        // the ejection is observable BEFORE the close: retired, eligible 5 -> 4, size clamped
+        let retired = reth_env.call_consensus_registry::<_, bool>(
+            &mut tn_evm,
+            ConsensusRegistry::isRetiredCall { validatorAddress: victim }.abi_encode().into(),
+        )?;
+        assert!(retired, "slash-to-zero permanently retires the validator");
+        let eligible = reth_env.call_consensus_registry::<_, U256>(
+            &mut tn_evm,
+            ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(eligible, U256::from(4));
+        let next_size = reth_env.call_consensus_registry::<_, u16>(
+            &mut tn_evm,
+            ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(next_size, 4, "committee size clamps to the post-slash eligible count");
+
+        // stage 3: assemble the committee from POST-slash state, exactly as the client does,
+        // and conclude - the size check validates against the post-ejection state and passes
+        let mut new_committee: Vec<Address> = committee
+            .iter()
+            .map(|v| v.validatorAddress)
+            .filter(|address| *address != victim)
+            .collect();
+        new_committee.sort();
+        let calldata = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
+            .abi_encode()
+            .into();
+        let mut res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        assert!(res.result.is_success(), "concludeEpoch succeeds: {:?}", res.result);
+        res.state.remove(&SYSTEM_ADDRESS);
+        tn_evm.db_mut().commit(res.state);
+
+        let current_epoch = reth_env.call_consensus_registry::<_, u32>(
+            &mut tn_evm,
+            ConsensusRegistry::getCurrentEpochCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(current_epoch, 2, "epoch rotates over the post-slash committee");
+
+        Ok(())
+    }
+
+    /// A committee sized from PRE-slash state makes `concludeEpoch` revert with
+    /// `InvalidCommitteeSize` when a slash-to-zero ejection lands in between.
+    ///
+    /// The registry deliberately validates the committee against post-slash
+    /// `nextCommitteeSize`, so a slash producer that reads the size before `applySlashes`
+    /// commits produces a fatal on-chain revert (a deterministic fleet halt), not a silent
+    /// mis-seat. The block executor's read-after-slash sequencing exists to prevent exactly
+    /// this; the test pins the failure mode so it trips loudly if that ordering regresses.
+    #[tokio::test]
+    async fn test_stale_pre_slash_committee_reverts_close() -> eyre::Result<()> {
+        use reth_revm::context::result::ExecutionResult;
+
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Stale Committee Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let committee = reth_env.validators_for_epoch(0)?;
+        assert_eq!(committee.len(), 5);
+        let victim = committee[0].validatorAddress;
+
+        // the stale view: a full-size committee assembled before the slash commits
+        let mut stale_committee: Vec<Address> =
+            committee.iter().map(|v| v.validatorAddress).collect();
+        stale_committee.sort();
+
+        let mut tn_evm = reth_env.tn_evm(chain.sealed_genesis_header().hash())?;
+
+        let (outstanding, _initial, _rewards) = reth_env
+            .call_consensus_registry::<_, (U256, U256, U256)>(
+                &mut tn_evm,
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: victim }
+                    .abi_encode()
+                    .into(),
+            )?;
+        let calldata = ConsensusRegistry::applySlashesCall {
+            slashes: vec![ConsensusRegistry::Slash {
+                validatorAddress: victim,
+                amount: outstanding,
+            }],
+        }
+        .abi_encode()
+        .into();
+        let mut res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        assert!(res.result.is_success(), "applySlashes succeeds: {:?}", res.result);
+        res.state.remove(&SYSTEM_ADDRESS);
+        tn_evm.db_mut().commit(res.state);
+
+        // the stale five-member committee no longer matches the post-slash size of four
+        let calldata = ConsensusRegistry::concludeEpochCall { newCommittee: stale_committee }
+            .abi_encode()
+            .into();
+        let res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        match res.result {
+            ExecutionResult::Revert { output, .. } => {
+                let selector = &alloy::primitives::keccak256(
+                    "InvalidCommitteeSize(uint256,uint256)".as_bytes(),
+                )[..4];
+                assert_eq!(
+                    &output[..4],
+                    selector,
+                    "stale committee must revert with InvalidCommitteeSize"
+                );
+            }
+            other => panic!("expected InvalidCommitteeSize revert, got: {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    /// A partial slash decrements the outstanding balance without ejection, and the standard
+    /// boundary sequence with the full committee still succeeds.
+    #[tokio::test]
+    async fn test_partial_slash_keeps_validator_eligible() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Partial Slash Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let committee = reth_env.validators_for_epoch(0)?;
+        let victim = committee[0].validatorAddress;
+        let mut tn_evm = reth_env.tn_evm(chain.sealed_genesis_header().hash())?;
+
+        let (outstanding_before, _initial, _rewards) = reth_env
+            .call_consensus_registry::<_, (U256, U256, U256)>(
+                &mut tn_evm,
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: victim }
+                    .abi_encode()
+                    .into(),
+            )?;
+        let slash_amount = outstanding_before.checked_div(U256::from(2)).expect("nonzero divisor");
+        let calldata = ConsensusRegistry::applySlashesCall {
+            slashes: vec![ConsensusRegistry::Slash {
+                validatorAddress: victim,
+                amount: slash_amount,
+            }],
+        }
+        .abi_encode()
+        .into();
+        let mut res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        assert!(res.result.is_success(), "applySlashes succeeds: {:?}", res.result);
+        res.state.remove(&SYSTEM_ADDRESS);
+        tn_evm.db_mut().commit(res.state);
+
+        // balance reduced, but the validator stays eligible and the size is untouched
+        let retired = reth_env.call_consensus_registry::<_, bool>(
+            &mut tn_evm,
+            ConsensusRegistry::isRetiredCall { validatorAddress: victim }.abi_encode().into(),
+        )?;
+        assert!(!retired, "partial slash must not retire the validator");
+        let (outstanding_after, _initial, _rewards) = reth_env
+            .call_consensus_registry::<_, (U256, U256, U256)>(
+                &mut tn_evm,
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: victim }
+                    .abi_encode()
+                    .into(),
+            )?;
+        assert_eq!(outstanding_after, outstanding_before - slash_amount);
+        let next_size = reth_env.call_consensus_registry::<_, u16>(
+            &mut tn_evm,
+            ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(next_size, 5, "partial slash leaves the committee size unchanged");
+
+        // the full five-member committee still concludes the epoch
+        let mut new_committee: Vec<Address> =
+            committee.iter().map(|v| v.validatorAddress).collect();
+        new_committee.sort();
+        let calldata = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
+            .abi_encode()
+            .into();
+        let mut res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+        assert!(res.result.is_success(), "concludeEpoch succeeds: {:?}", res.result);
+        res.state.remove(&SYSTEM_ADDRESS);
+        tn_evm.db_mut().commit(res.state);
+
+        Ok(())
+    }
+
     /// Governance `burn` of a validator seated only in FUTURE committees leaves the current
     /// committee untouched.
     ///
