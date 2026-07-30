@@ -1435,7 +1435,7 @@ mod tests {
         // closing block carries exactly one reverts entry — the wrapper's single post-finish
         // merge (an in-finish merge would push a phantom second entry)
         assert!(
-            block2.execution_output.state.state.get(&SYSTEM_ADDRESS).is_none(),
+            !block2.execution_output.state.state.contains_key(&SYSTEM_ADDRESS),
             "SYSTEM_ADDRESS must not enter the epoch-closing bundle"
         );
         assert_eq!(
