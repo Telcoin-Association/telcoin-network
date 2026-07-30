@@ -2216,6 +2216,61 @@ mod tests {
         Ok(())
     }
 
+    /// Boundary-block determinism at default features: two independent executions of the
+    /// byte-identical epoch-closing payload derive the same `state_root` and install the same
+    /// next-epoch state.
+    ///
+    /// Every node must re-derive the identical boundary block or the fleet forks — the core
+    /// safety property of the epoch close. Until now it was pinned only inside two
+    /// `adiri`-gated tests that CI never compiles, so a default-build regression (e.g. a
+    /// nondeterministic iteration order feeding `applyIncentives`, or an RNG-draw reorder in
+    /// the committee shuffle) had no tripwire.
+    #[tokio::test]
+    async fn test_epoch_close_deterministic_across_envs() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        // one payload, cloned across both executions: `new_for_test` randomizes
+        // beneficiary/mix_hash/digest per call, and mix_hash seeds the committee shuffle
+        let output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+
+        let tmp1 = TempDir::new().unwrap();
+        let tm1 = TaskManager::new("determinism env1");
+        let env1 = RethEnv::new_for_temp_chain(chain.clone(), tmp1.path(), &tm1, None)?;
+        let block1 = execute_payload_and_update_canonical_chain(&env1, payload.clone(), vec![])?;
+        let header1 = block1.recovered_block.clone_sealed_header();
+
+        let tmp2 = TempDir::new().unwrap();
+        let tm2 = TaskManager::new("determinism env2");
+        let env2 = RethEnv::new_for_temp_chain(chain.clone(), tmp2.path(), &tm2, None)?;
+        let block2 = execute_payload_and_update_canonical_chain(&env2, payload, vec![])?;
+        let header2 = block2.recovered_block.clone_sealed_header();
+
+        assert_eq!(
+            header1.state_root, header2.state_root,
+            "epoch-closing state_root must be identical across independent executions"
+        );
+
+        // the installed next-epoch state matches read-for-read: same epoch record, same
+        // shuffled committee (stored at newEpoch + 2), same keys
+        let state1 = env1.epoch_state_from_canonical_tip()?;
+        let state2 = env2.epoch_state_from_canonical_tip()?;
+        assert_eq!(state1.epoch, 1);
+        assert_eq!(state1.epoch, state2.epoch);
+        assert_eq!(state1.epoch_info, state2.epoch_info);
+        assert_eq!(
+            env1.validators_for_epoch_at_block(3, env1.canonical_tip().hash())?,
+            env2.validators_for_epoch_at_block(3, env2.canonical_tip().hash())?
+        );
+        assert_eq!(
+            env1.bls_pubkeys_for_epoch_at_block(3, env1.canonical_tip().hash())?,
+            env2.bls_pubkeys_for_epoch_at_block(3, env2.canonical_tip().hash())?
+        );
+
+        Ok(())
+    }
+
     /// Governance `burn` of a validator seated only in FUTURE committees leaves the current
     /// committee untouched.
     ///
