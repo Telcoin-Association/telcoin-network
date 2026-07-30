@@ -70,7 +70,7 @@ use tn_config::{
     WORKER_CONFIGS_JSON,
 };
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, Genesis, GenesisAccount, TaskManager, U256,
+    gas_accumulator::RewardsCounter, Address, Genesis, GenesisAccount, TaskManager, B256, U256,
 };
 use tracing::debug;
 
@@ -266,10 +266,24 @@ impl RethEnv {
         debug!(target: "engine", "state_size:{:#?}", state_size);
         debug!(target: "engine", "reverts_size:{:#?}", reverts_size);
 
-        // construct real genesis using known values & tmp chain storage result
-        let tmp_registry_storage = state.get(&tmp_registry_address).map(|account| {
-            account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
-        });
+        // construct real genesis using known values & tmp chain storage result. A missing
+        // account or empty storage map here means the ceremony's nonce-derived tmp address no
+        // longer matches where the constructor actually deployed (or the constructor wrote
+        // nothing); flowing that into `with_storage(None)` would ship a deployed-but-
+        // uninitialized contract — unownable, first epoch close reverts — so fail loud instead.
+        let tmp_registry_storage: std::collections::BTreeMap<B256, B256> = state
+            .get(&tmp_registry_address)
+            .map(|account| {
+                account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
+            })
+            .filter(|s: &std::collections::BTreeMap<B256, B256>| !s.is_empty())
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "pre-genesis ceremony harvested no ConsensusRegistry storage at tmp address \
+                     {tmp_registry_address}: constructor deployed elsewhere (nonce-derived \
+                     address drift?) or wrote no slots"
+                )
+            })?;
         let registry_runtimecode_binding = Self::fetch_value_from_json_str(
             CONSENSUS_REGISTRY_JSON,
             Some("deployedBytecode.object"),
@@ -278,9 +292,19 @@ impl RethEnv {
             registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?;
         let registry_runtimecode = hex::decode(registry_runtimecode_str)?;
 
-        let tmp_worker_configs_storage = state.get(&tmp_worker_configs_address).map(|account| {
-            account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
-        });
+        let tmp_worker_configs_storage: std::collections::BTreeMap<B256, B256> = state
+            .get(&tmp_worker_configs_address)
+            .map(|account| {
+                account.storage.iter().map(|(k, v)| ((*k).into(), v.present_value.into())).collect()
+            })
+            .filter(|s: &std::collections::BTreeMap<B256, B256>| !s.is_empty())
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "pre-genesis ceremony harvested no WorkerConfigs storage at tmp address \
+                     {tmp_worker_configs_address}: constructor deployed elsewhere (nonce-derived \
+                     address drift?) or wrote no slots"
+                )
+            })?;
         let worker_configs_runtimecode_binding =
             Self::fetch_value_from_json_str(WORKER_CONFIGS_JSON, Some("deployedBytecode.object"))?;
         let worker_configs_runtimecode = hex::decode(
@@ -307,7 +331,7 @@ impl RethEnv {
                 GenesisAccount::default()
                     .with_balance(U256::from(total_stake_balance))
                     .with_code(Some(registry_runtimecode.into()))
-                    .with_storage(tmp_registry_storage),
+                    .with_storage(Some(tmp_registry_storage)),
             ),
             (
                 ISSUANCE_ADDRESS,
@@ -317,7 +341,7 @@ impl RethEnv {
                 WORKER_CONFIGS_ADDRESS,
                 GenesisAccount::default()
                     .with_code(Some(worker_configs_runtimecode.into()))
-                    .with_storage(tmp_worker_configs_storage),
+                    .with_storage(Some(tmp_worker_configs_storage)),
             ),
         ]);
 
