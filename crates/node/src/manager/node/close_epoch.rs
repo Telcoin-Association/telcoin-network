@@ -357,6 +357,24 @@ where
             return Ok(());
         }
 
+        // Cheap pre-check before the expensive plain-state walk: every HISTORICAL epoch (0..N) must
+        // already have its certificate stored. Epoch N's own cert is aggregated only at the next
+        // epoch's start and is waited for in the completion task, so it is excluded here. A
+        // permanently-missing historical cert (e.g. a network-wide failed-quorum epoch no peer can
+        // supply) would otherwise make every boundary walk the whole state and then fail; skip
+        // early instead. NOT fatal — the next epoch retries, and the record collector keeps
+        // trying to back-fill the cert.
+        if let Some(missing) =
+            self.consensus_chain.epochs().first_missing_historical_cert(epoch).await
+        {
+            warn!(
+                target: "tn::snapshot", epoch, missing_cert_epoch = missing,
+                "skipping state export: certificate for a historical epoch is not yet available; \
+                 retrying next epoch"
+            );
+            return Ok(());
+        }
+
         // Flush the closed epoch's consensus pack so the copy in the completion task captures a
         // complete file. The consensus pack is only persisted by the *next* epoch's `new_epoch`, so
         // persist it here while epoch N is still the current pack. The bounded records/certs bundle

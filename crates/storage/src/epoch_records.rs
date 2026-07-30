@@ -503,6 +503,25 @@ impl EpochRecordDb {
         Some((record, cert))
     }
 
+    /// Scan the historical epochs `0..tip_epoch` and return the first whose certificate (or record)
+    /// is not yet stored, or `None` if every one has a cert. Cheap: record + cert actor lookups, no
+    /// state I/O — the same per-epoch queries
+    /// [`export_bounded_bundle`](Self::export_bounded_bundle) already does, run before the
+    /// export's plain-state walk so it can skip early when a required historical cert is
+    /// permanently missing (e.g. a network-wide failed-quorum epoch no peer can supply) instead
+    /// of walking the whole state and then failing.
+    ///
+    /// `tip_epoch` itself is EXCLUDED: the exported tip's own cert is only aggregated at the next
+    /// epoch's start, so it is normally still pending at export time and is waited for separately.
+    pub async fn first_missing_historical_cert(&self, tip_epoch: Epoch) -> Option<Epoch> {
+        for epoch in 0..tip_epoch {
+            if !matches!(self.get_epoch_by_number(epoch).await, Some((_, Some(_)))) {
+                return Some(epoch);
+            }
+        }
+        None
+    }
+
     /// Retrieve the epoch record and certificate (if available) by record digest.
     pub async fn get_epoch_by_hash(
         &self,
@@ -539,10 +558,8 @@ impl EpochRecordDb {
         let mut records = Vec::with_capacity(through_epoch as usize + 1);
         let mut certs = Vec::with_capacity(through_epoch as usize + 1);
         for epoch in 0..=through_epoch {
-            let (record, cert) = self
-                .get_epoch_by_number(epoch)
-                .await
-                .ok_or(EpochDbError::EpochOutOfOrder(through_epoch, epoch))?;
+            let (record, cert) =
+                self.get_epoch_by_number(epoch).await.ok_or(EpochDbError::MissingRecord(epoch))?;
             match cert {
                 Some(cert) => certs.push(cert),
                 None => return Err(EpochDbError::MissingCertificate(epoch)),
@@ -923,6 +940,7 @@ pub enum EpochDbError {
     EpochAlreadySaved,
     EpochOutOfOrder(Epoch, Epoch),
     MissingCertificate(Epoch),
+    MissingRecord(Epoch),
     SendFailed,
     ReceiveFailed,
     PersistError(String),
@@ -945,6 +963,9 @@ impl Display for EpochDbError {
             }
             EpochDbError::MissingCertificate(epoch) => {
                 write!(f, "Missing certificate for epoch {epoch}")
+            }
+            EpochDbError::MissingRecord(epoch) => {
+                write!(f, "Missing record for epoch {epoch}")
             }
             EpochDbError::SendFailed => write!(f, "Internal channel send failed"),
             EpochDbError::ReceiveFailed => write!(f, "Internal channel receive failed"),
@@ -1174,6 +1195,58 @@ mod test {
             got.len()
         );
         assert_eq!(got.iter().map(|r| r.epoch).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn first_missing_historical_cert_excludes_pending_tip() {
+        // Finding #8: the export pre-check verifies historical certs `0..tip` are present,
+        // EXCLUDING the tip epoch (whose cert is legitimately still pending at export
+        // time).
+        let dir = TempDir::with_prefix("first_missing_tip").expect("temp dir");
+        let db = EpochRecordDb::open(dir.path()).expect("open db");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        // epochs 0..=2 each with a cert; epoch 3's record saved but its cert still pending.
+        let mut parent = EpochDigest::default();
+        for epoch in 0..=2u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            db.save(record, cert).await.expect("save with cert");
+        }
+        let (record3, _cert3) = make_test_pair(3, &signers, parent);
+        db.save_record(record3).await.expect("save record only");
+
+        // tip = 3 scans 0..3 — all have certs — so nothing is missing (tip 3 excluded).
+        assert_eq!(db.first_missing_historical_cert(3).await, None);
+        // tip = 4 scans 0..4 — epoch 3 has no cert — so it is the first missing.
+        assert_eq!(db.first_missing_historical_cert(4).await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn first_missing_historical_cert_detects_middle_gap() {
+        // A historical cert missing in the middle (epoch 1) must be caught before the tip.
+        let dir = TempDir::with_prefix("first_missing_gap").expect("temp dir");
+        let db = EpochRecordDb::open(dir.path()).expect("open db");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let (r0, c0) = make_test_pair(0, &signers, EpochDigest::default());
+        let (r1, _c1) = make_test_pair(1, &signers, r0.digest());
+        let (r2, c2) = make_test_pair(2, &signers, r1.digest());
+        db.save(r0, c0).await.expect("save 0 with cert");
+        db.save_record(r1).await.expect("save 1 record only"); // cert never arrived
+        db.save(r2, c2).await.expect("save 2 with cert");
+
+        // tip = 3 scans 0..3 — epoch 1 has a record but no cert.
+        assert_eq!(db.first_missing_historical_cert(3).await, Some(1));
+    }
+
+    #[test]
+    fn missing_record_error_display() {
+        // The record-absent case in `export_bounded_bundle` uses `MissingRecord`, not the
+        // misleading `EpochOutOfOrder` ("Epochs must be saved in order...").
+        assert_eq!(EpochDbError::MissingRecord(5).to_string(), "Missing record for epoch 5");
     }
 
     #[tokio::test]
