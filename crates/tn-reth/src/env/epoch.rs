@@ -2130,7 +2130,7 @@ mod tests {
                     "InvalidCommitteeSize(uint256,uint256)".as_bytes(),
                 )[..4];
                 assert_eq!(
-                    &output[..4],
+                    output.get(..4).expect("revert output carries at least a 4-byte selector"),
                     selector,
                     "stale committee must revert with InvalidCommitteeSize"
                 );
@@ -2154,6 +2154,7 @@ mod tests {
 
         let committee =
             reth_env.validators_for_epoch_at_block(0, reth_env.canonical_tip().hash())?;
+        assert_eq!(committee.len(), 5);
         let victim = committee[0].validatorAddress;
         let mut tn_evm = reth_env.tn_evm(chain.sealed_genesis_header().hash())?;
 
