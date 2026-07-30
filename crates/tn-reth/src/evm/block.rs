@@ -38,8 +38,6 @@
 //!    committee-pool read), keeping pre-fork history re-executable; the post-fork sequence differs
 //!    only by the interposed `applySlashes` call, and both share byte-identical `applyIncentives`
 //!    and `concludeEpoch(address[])` selectors.
-//! 3. `merge_transitions(BundleRetention::Reverts)` - folds the transaction and system-call
-//!    transitions into the bundle state, retaining revert data.
 //!
 //! The order is load-bearing. The fork must lead: the code swap flips the code-hash gate in
 //! `read_committee_eligible_pool` so the shuffle's committee-pool reads use the post-fork ABI
@@ -110,7 +108,6 @@ use reth_revm::{
         result::{ExecutionResult, ResultAndState},
         Block as _,
     },
-    db::states::bundle_state::BundleRetention,
     DatabaseCommit as _, State,
 };
 use std::{collections::BTreeMap, sync::Arc};
@@ -980,8 +977,9 @@ where
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
 
-            // merge transitions into bundle state
-            self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
+            // deliberately NO merge_transitions here: both reth wrappers merge after finish()
+            // returns, and revm pushes a reverts entry per merge — merging in here too gives
+            // every epoch-closing block a phantom empty bundle.reverts entry (len 2 vs 1)
         }
 
         Ok((
