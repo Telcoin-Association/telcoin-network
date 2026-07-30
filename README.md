@@ -16,8 +16,9 @@ Check out the repo and update the submodules:
 
 ### Run an observer against testnet
 
-Build a release version of the node software:
-`cargo build -p telcoin-network --bin telcoin-network --release`
+Build a release version of the node software with the `adiri` feature (required to join the
+adiri testnet — the node refuses the `--chain adiri` flag at startup without it):
+`cargo build -p telcoin-network --bin telcoin-network --release --features adiri`
 
 Generate a config and keys for your observer node:
 `target/release/telcoin-network keytool generate observer --datadir DATADIR --address 0x4444444444444444444444444444444444444444 --bls-passphrase-source ask`
