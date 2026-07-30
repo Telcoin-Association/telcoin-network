@@ -94,29 +94,37 @@ The snapshot narrows what must be re-derived rather than replacing the trust mod
 
 ### The export bundle
 
-With `--enable-state-export`, at each epoch boundary the node writes a bundle to
-`consensus-db/state_exports/epoch-{N}/` (atomically — the directory only appears once complete)
-containing four files:
+With `--enable-state-export`, at each epoch boundary the node attempts to write a bundle for the
+just-closed epoch to `consensus-db/state_exports/epoch-{N}/` (atomically — the directory only appears
+once the export is complete) containing four files:
 - `state_data` — the EVM state at the epoch's final block (accounts, storage, bytecode, block headers).
 - `consensus_data` — the closed epoch's consensus pack (`data` stream).
 - `epoch_records` — the epoch-records pack (`epochs.pack`).
 - `epoch_certs` — the epoch-certificates pack, which lets the importer verify the records.
 
 The just-closed (tip) epoch's certificate is not aggregated until the next epoch starts (see The Epoch
-Chain above), so the tip record is imported chained-but-unverified (anchored by hash to its verified
-predecessor); every earlier epoch is fully verified.
+Chain above), so at export time the node waits up to 90 s for it and **skips the bundle** if it has not
+arrived (the next epoch's boundary attempts a fresh export instead — a skipped epoch is not retried).
+A bundle is therefore only written once the tip epoch's certificate exists, and on import **every**
+epoch — including the tip — is fully verified against its certificate; a bundle missing any
+certificate is rejected.
 
 ### 1. Enabling export on a running node
 
-Add the global `--enable-state-export` flag to the `node` command:
+Add the `--enable-state-export` flag to the `node` command (it is a flag on the `node` command, not a
+top-level CLI global like `--datadir`):
 
 ```
 telcoin-network node -vvv --http --chain adiri --bls-passphrase-source ask \
   --datadir DATADIR --enable-state-export
 ```
 
-Each completed epoch leaves a new `DATADIR/consensus-db/state_exports/epoch-{N}/`. Copy the `epoch-{N}`
-directory you want to bootstrap from to the new node's machine.
+A `DATADIR/consensus-db/state_exports/epoch-{N}/` directory appears only for epochs whose export
+succeeds — not every epoch produces one. The epoch must be certificate-complete (every epoch `0..=N`
+has its certificate) and fee-resumable, and an export is skipped for several reasons (a still-pending
+tip certificate, an un-resumable snapshot, or a transient I/O error). Watch the `tn::snapshot` log
+target to see which epochs were exported or skipped. Copy the `epoch-{N}` directory you want to
+bootstrap from to the new node's machine.
 
 ### 2. Initializing a new node from a bundle
 
