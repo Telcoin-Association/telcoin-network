@@ -575,7 +575,16 @@ where
                 debug!(target: "engine", "non-fatal eligible-count readback after migration failed: {e}");
             })
             .ok()
-            .and_then(|data| <U256 as alloy::sol_types::SolValue>::abi_decode(&data).ok());
+            .and_then(|data| {
+                <U256 as alloy::sol_types::SolValue>::abi_decode(&data)
+                    .inspect_err(|e| {
+                        debug!(
+                            target: "engine",
+                            "non-fatal eligible-count readback after migration returned undecodable data: {e}"
+                        );
+                    })
+                    .ok()
+            });
 
         tracing::info!(target: "engine", ?eligible, %code_hash, "consensus registry fork applied");
         Ok(())
@@ -1191,6 +1200,15 @@ fn assemble_new_committee(
     eligible_pool: Vec<ConsensusRegistry::ValidatorInfo>,
     rng: &mut StdRng,
 ) -> TnRethResult<Vec<Address>> {
+    // a zero target would sail through the final length check below (`0 == 0`) and forward
+    // `concludeEpoch([])` — an opaque on-chain revert; refuse it here with a distinct message
+    if new_committee_size == 0 {
+        return Err(TnRethError::EVMCustom(
+            "next committee size is zero: refusing to conclude the epoch with an empty committee"
+                .to_string(),
+        ));
+    }
+
     // 1) separate active and pending validators
     // 2) check if active length is sufficient
     // 3) if missing, randomly select from the pending validators
