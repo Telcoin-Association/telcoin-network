@@ -171,6 +171,11 @@ where
     /// is also stashed in `last_consensus_header` so the caller's close-and-write
     /// sequence (`close_epoch`, then `write_epoch_record`) can commit the epoch's
     /// record.
+    ///
+    /// A forwarding failure (the engine channel closed) also returns `None`: the
+    /// caller must not wait on execution of output the engine never received, and
+    /// the dead channel resurfaces as a hard error at the next forwarding attempt
+    /// after re-entry.
     pub(super) async fn send_leftover_consensus_output_to_engine(
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
@@ -185,8 +190,13 @@ where
             } else {
                 None
             };
-            // only forward the output to the engine
-            let _ = self.process_output(to_engine, output).await;
+            // only forward the output to the engine; a send failure means the engine is gone,
+            // so stop draining and report no boundary rather than a hash the caller would
+            // block on forever in wait_for_consensus_execution
+            if let Err(e) = self.process_output(to_engine, output).await {
+                error!(target: "epoch-manager", "error sending leftover consensus output to engine: {}", e);
+                return None;
+            }
             if result.is_some() {
                 return result;
             }
@@ -209,7 +219,13 @@ where
                         } else {
                             None
                         };
-                        let _ = self.process_output(to_engine, output).await;
+                        // stop on a send failure: the engine is gone, and forwarding later
+                        // entries would leave a gap; report no boundary rather than a hash
+                        // the caller would block on forever in wait_for_consensus_execution
+                        if let Err(e) = self.process_output(to_engine, output).await {
+                            error!(target: "epoch-manager", number, "error sending leftover consensus output to engine: {}", e);
+                            return None;
+                        }
                         if result.is_some() {
                             return result;
                         }
