@@ -227,10 +227,12 @@ where
 
     /// Execute a system call from [`SYSTEM_ADDRESS`] to `contract` and commit its state changes.
     ///
-    /// Shared implementation for the epoch system calls (`concludeEpoch`, its legacy pre-fork
-    /// pair, `migrateValidatorSets`). Any failure — the call itself erroring or the execution
-    /// result being unsuccessful — is fatal to the block; `description` names the call in the
-    /// log and error strings.
+    /// Shared implementation for the epoch system calls (`applyIncentives`, `applySlashes`,
+    /// `concludeEpoch`, the legacy pre-fork close pair, `migrateValidatorSets`). Any failure —
+    /// the call itself erroring or the execution result being unsuccessful — is fatal to the
+    /// block; `description` names the call in the log and error strings, and a revert's decoded
+    /// reason (with its selector and raw output in the log) rides along so the deterministic
+    /// fleet halt this causes is diagnosable from the error alone.
     ///
     /// [`SYSTEM_ADDRESS`] is removed from the result state before commit: it is only touched as
     /// the system caller, not a real state change — leaving it in the changeset would put a
@@ -252,11 +254,38 @@ where
             }
         };
 
-        // return error if the call executed but did not succeed
-        if !res.result.is_success() {
-            // execution failed
-            error!(target: "engine", "failed {description} call: {:?}", res.result);
-            return Err(TnRethError::EVMCustom(format!("failed {description}")));
+        // return error if the call executed but did not succeed, keeping Revert (decoded
+        // reason + selector) distinguishable from Halt
+        match &res.result {
+            ExecutionResult::Success { .. } => {}
+            ExecutionResult::Revert { output, gas_used } => {
+                let reason = alloy::sol_types::decode_revert_reason(output)
+                    .unwrap_or_else(|| "<undecodable revert reason>".to_string());
+                let selector = output
+                    .get(..4)
+                    .map(alloy::hex::encode_prefixed)
+                    .unwrap_or_else(|| format!("<{} bytes>", output.len()));
+                error!(
+                    target: "engine",
+                    %selector,
+                    raw_output = %output,
+                    gas_used,
+                    "failed {description} call: reverted: {reason}"
+                );
+                return Err(TnRethError::EVMCustom(format!(
+                    "failed {description}: reverted: {reason}"
+                )));
+            }
+            ExecutionResult::Halt { reason, gas_used } => {
+                error!(
+                    target: "engine",
+                    gas_used,
+                    "failed {description} call: halted: {reason:?}"
+                );
+                return Err(TnRethError::EVMCustom(format!(
+                    "failed {description}: halted: {reason:?} (gas used {gas_used})"
+                )));
+            }
         }
         trace!(target: "engine", ?res, "{description}");
 
