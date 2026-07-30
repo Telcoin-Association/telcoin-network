@@ -32,9 +32,12 @@ use tn_types::{
     gas_accumulator::{GasAccumulator, WorkerFeeConfig},
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier,
-    SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, B256,
-    DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
+    SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
+    MIN_PROTOCOL_BASE_FEE,
 };
+// Canonical worker-attribution helpers live in `tn-types` (one implementation, no drift); re-export
+// so the crate-internal call sites and tests keep referring to them by bare name.
+pub(crate) use tn_types::gas_accumulator::{is_worker_batch_block, worker_id_from_header};
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -324,11 +327,6 @@ pub fn sync_num_workers_from_chain(
     Ok(())
 }
 
-/// Worker id encoded in a header's `difficulty` (low 16 bits of `batch_index << 16 | worker_id`).
-pub(crate) fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
-    (header.difficulty.into_limbs()[0] & 0xffff) as u16
-}
-
 /// Return the most recent on-chain `base_fee_per_gas` for each worker that produced a block in
 /// `headers`.
 ///
@@ -349,24 +347,6 @@ pub(crate) fn latest_base_fee_per_worker(headers: &[SealedHeader]) -> HashMap<Wo
         }
     }
     fees
-}
-
-/// True when `header` is a genuine worker batch block.
-///
-/// Two on-chain block shapes are NOT worker batch blocks and must be excluded from per-worker
-/// fee/gas attribution:
-/// - the genesis block (`number == 0`), which carries no worker payload, and
-/// - the synthetic empty-close block the engine builds when an epoch closes with no batches. That
-///   block is stamped worker 0 and copies its PARENT's base fee (see `tn_engine`'s
-///   `execute_consensus_output`), so attributing it would poison worker 0 with another worker's
-///   fee. It is identified by `ommers_hash == B256::ZERO`: the header's `ommers_hash` carries the
-///   batch digest, and only the synthetic block passes `B256::ZERO` (real batch digests are never
-///   zero).
-///
-/// A non-empty epoch-closing block built from real batches has a non-zero `ommers_hash` and IS a
-/// genuine worker block.
-pub(crate) fn is_worker_batch_block(header: &SealedHeader) -> bool {
-    header.number != 0 && header.ommers_hash != B256::ZERO
 }
 
 /// Sum `gas_used` per worker over `headers`.
@@ -1406,7 +1386,8 @@ fn check_restore_consistency(
 mod tests {
     use super::*;
     use tn_types::{
-        gas_accumulator::compute_next_base_fee_eip1559, ExecHeader, MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::compute_next_base_fee_eip1559, ExecHeader, B256, MIN_PROTOCOL_BASE_FEE,
+        U256,
     };
 
     /// Build a sealed header shaped like an executed worker block for scan tests.
