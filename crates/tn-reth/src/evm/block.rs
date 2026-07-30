@@ -25,29 +25,34 @@
 //!    (`deconstruct_nonce(ctx.nonce).0`) satisfies `concluding_epoch + 1 ==
 //!    CONSENSUS_REGISTRY_FORK_EPOCH` (checked addition): swaps the registry's runtime bytecode in
 //!    place, then runs the one-time `migrateValidatorSets()`.
-//! 2. `apply_consensus_block_rewards` — `applyIncentives(RewardInfo[])`, distributing the
-//!    concluding epoch's issuance to validators weighted by stake and the leader counts in
-//!    `ctx.rewards_counter`.
-//! 3. `apply_closing_epoch_contract_call` — `concludeEpoch(address[])` with the new committee:
-//!    membership is drawn by the `randomness`-seeded Fisher-Yates shuffle, and the resulting list
-//!    is sorted by address before encoding.
-//! 4. `merge_transitions(BundleRetention::Reverts)` — folds the transaction and system-call
+//! 2. `apply_closing_epoch_contract_call` - the three boundary system calls in order:
+//!    `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, then `concludeEpoch(address[])`.
+//!    The reward infos carry the leader counts from `ctx.rewards_counter`; committee membership is
+//!    drawn by the `randomness`-seeded Fisher-Yates shuffle (sorted by address before encoding),
+//!    run AFTER `applySlashes` commits so the eligible-pool read and the committee reflect any
+//!    slash-to-zero ejections. The ordering is a consensus-safety obligation the protocol owns:
+//!    incentives weight on pre-slash collateral, slashes land before the committee is assembled,
+//!    and `concludeEpoch` settles queued stake version changes from post-slash balances. While the
+//!    deployed registry still carries the pre-fork adiri code, the close instead replays the legacy
+//!    `applyIncentives` + `concludeEpoch(address[])` pair (same code-hash gate as the
+//!    committee-pool read), keeping pre-fork history re-executable; the post-fork sequence differs
+//!    only by the interposed `applySlashes` call, and both share byte-identical `applyIncentives`
+//!    and `concludeEpoch(address[])` selectors.
+//! 3. `merge_transitions(BundleRetention::Reverts)` - folds the transaction and system-call
 //!    transitions into the bundle state, retaining revert data.
 //!
 //! The order is load-bearing. The fork must lead: the code swap flips the code-hash gate in
 //! `read_committee_eligible_pool` so the shuffle's committee-pool reads use the post-fork ABI
 //! for the remainder of this very block, and the post-fork `concludeEpoch` validates the
 //! committee size against the cached `eligibleValidatorCount` that only `migrateValidatorSets()`
-//! populates. `applyIncentives` must precede `concludeEpoch` (a contract requirement — see the
-//! binding docs in `system_calls.rs`) so rewards are paid for the epoch being concluded.
+//! populates.
 //!
 //! Every step is fatal on failure: the error aborts execution of the consensus output and
 //! propagates out of the engine loop, so the node stops executing rather than committing a
 //! block whose state diverges from the rest of the fleet.
 //!
-//! Note for auditors: `applySlashes` is declared in the `ConsensusRegistry` sol! bindings and
-//! implemented on-chain behind `onlySystemCall`, but no Rust code path ever invokes it —
-//! protocol-side slashing is not live.
+//! Note for auditors: protocol-side slashing is not live - the `slashes` array passed to
+//! `applySlashes` is always empty.
 //!
 //! # System-call state hygiene
 //!
@@ -215,10 +220,10 @@ where
 
     /// Execute a system call from [`SYSTEM_ADDRESS`] to `contract` and commit its state changes.
     ///
-    /// Shared implementation for the epoch system calls (`applyIncentives`, `concludeEpoch`,
-    /// `migrateValidatorSets`). Any failure — the call itself erroring or the execution result
-    /// being unsuccessful — is fatal to the block; `description` names the call in the log and
-    /// error strings.
+    /// Shared implementation for the epoch system calls (`concludeEpoch`, its legacy pre-fork
+    /// pair, `migrateValidatorSets`). Any failure — the call itself erroring or the execution
+    /// result being unsuccessful — is fatal to the block; `description` names the call in the
+    /// log and error strings.
     ///
     /// [`SYSTEM_ADDRESS`] is removed from the result state before commit: it is only touched as
     /// the system caller, not a real state change — leaving it in the changeset would put a
@@ -256,32 +261,124 @@ where
         Ok(())
     }
 
-    /// Increase the beneficiary account balance and withdraw from governance safe.
+    /// Close the epoch through the three boundary system calls, in order:
+    /// `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`.
     ///
-    /// This must be called once per epoch, before the conclude epoch call.
-    fn apply_consensus_block_rewards(
+    /// The order is a consensus-safety invariant. `applySlashes` commits before the committee is
+    /// assembled, so the `nextCommitteeSize` read and the shuffle below both see any slash-to-zero
+    /// ejections: the committee `concludeEpoch` validates cannot be stale, and an ejected
+    /// validator is never seated in a future committee. Slashing is not live, so the slashes array
+    /// is always empty and `applySlashes` is a no-op today; the call is issued regardless so the
+    /// sequence is correct by construction when slashing ships.
+    fn apply_closing_epoch_contract_call(
         &mut self,
+        randomness: B256,
         rewards: BTreeMap<Address, u32>,
     ) -> TnRethResult<()> {
-        let calldata = self.generate_apply_incentives_calldata(
-            rewards.iter().map(|(address, count)| (*address, *count)).collect(),
+        debug!(target: "engine", ?randomness, "applying closing contract call");
+        let reward_infos: Vec<(Address, u32)> =
+            rewards.iter().map(|(address, count)| (*address, *count)).collect();
+
+        // While the deployed registry still carries the pre-fork adiri code, close with the
+        // legacy two-call sequence instead, so every pre-fork epoch close (fresh-node onboarding,
+        // full resync) executes byte-identically to the historical chain. At the fork boundary
+        // `apply_consensus_registry_fork` swaps the code first, so this gate already sees the
+        // upgraded hash and takes the post-fork sequence below. The post-fork `applyIncentives`
+        // and `concludeEpoch(address[])` selectors are byte-identical to the legacy ones; the
+        // post-fork sequence differs only by the interposed `applySlashes` call.
+        #[cfg(feature = "adiri")]
+        if self.registry_code_is_pre_fork()? {
+            return self.apply_closing_epoch_contract_call_legacy(randomness, reward_infos);
+        }
+
+        // 1. incentives, weighted on pre-slash collateral
+        let calldata = ConsensusRegistry::applyIncentivesCall {
+            rewardInfos: reward_infos
+                .iter()
+                .map(|(address, count)| RewardInfo {
+                    validatorAddress: *address,
+                    consensusHeaderCount: U256::from(*count),
+                })
+                .collect(),
+        }
+        .abi_encode()
+        .into();
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "applying incentives",
         )?;
 
-        trace!(target: "engine", ?calldata, "apply incentives calldata");
+        // 2. slashes, landing before the committee is read
+        let slashes = self.epoch_boundary_slashes();
+        let calldata = ConsensusRegistry::applySlashesCall { slashes }.abi_encode().into();
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "applying slashes",
+        )?;
 
+        // 3. assemble the committee from the post-slash eligible pool, then conclude
+        let calldata = self.generate_conclude_epoch_calldata(randomness)?;
+        trace!(target: "engine", ?calldata, "close epoch calldata");
+        self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
+    }
+
+    /// The slashes to submit at this epoch boundary.
+    ///
+    /// Slashing is not live: this always returns an empty list and `applySlashes` runs as a
+    /// no-op. An automated slash producer plugs in here and nowhere else. The caller sequences
+    /// the returned slashes through `applySlashes` BEFORE the committee size and eligible pool
+    /// are read, so a slash-to-zero ejection is always reflected in the committee that
+    /// `concludeEpoch` validates. Submitting slashes through any other path, or after the
+    /// committee reads, reintroduces the stale-committee revert pinned by
+    /// `test_stale_pre_slash_committee_reverts_close` - a deterministic fleet halt.
+    ///
+    /// Determinism: every node must derive an identical list (content and order) from the same
+    /// certified consensus output, or the boundary block diverges across the fleet.
+    fn epoch_boundary_slashes(&self) -> Vec<ConsensusRegistry::Slash> {
+        Vec::new()
+    }
+
+    /// Close the epoch via the PRE-fork registry ABI: `applyIncentives(RewardInfo[])` followed
+    /// by `concludeEpoch(address[])`.
+    ///
+    /// Byte-exact replay of the two system calls every pre-fork epoch close was produced with,
+    /// in the same order, so re-executed pre-fork blocks derive identical state roots. Pre-fork
+    /// chains never executed `applySlashes` (slashing was never live), so it is absent here. The
+    /// committee shuffle routes its pool read through the legacy ABI via the same code-hash gate
+    /// (`read_committee_eligible_pool`).
+    #[cfg(feature = "adiri")]
+    fn apply_closing_epoch_contract_call_legacy(
+        &mut self,
+        randomness: B256,
+        reward_infos: Vec<(Address, u32)>,
+    ) -> TnRethResult<()> {
+        use crate::system_calls::LegacyConsensusRegistry;
+
+        let calldata = LegacyConsensusRegistry::applyIncentivesCall {
+            rewardInfos: reward_infos
+                .iter()
+                .map(|(address, count)| LegacyConsensusRegistry::RewardInfo {
+                    validatorAddress: *address,
+                    consensusHeaderCount: U256::from(*count),
+                })
+                .collect(),
+        }
+        .abi_encode()
+        .into();
         self.transact_and_commit_system_call(
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "applying consensus block rewards",
-        )
-    }
+        )?;
 
-    /// Apply the closing epoch call to ConsensusRegistry.
-    fn apply_closing_epoch_contract_call(&mut self, randomness: B256) -> TnRethResult<()> {
-        debug!(target: "engine", ?randomness, "applying closing contract call");
-        let calldata = self.generate_conclude_epoch_calldata(randomness)?;
-        trace!(target: "engine", ?calldata, "close epoch calldata");
-
+        let mut new_committee = self.shuffle_new_committee(randomness)?;
+        new_committee.sort();
+        debug!(target: "engine", ?new_committee, "legacy new committee sorted by address");
+        let calldata = LegacyConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
+            .abi_encode()
+            .into();
         self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
     }
 
@@ -325,7 +422,7 @@ where
     ///
     /// Fires exactly once, from the epoch-closing block that concludes
     /// `CONSENSUS_REGISTRY_FORK_EPOCH - 1`, as the FIRST step of that block's close-epoch handling
-    /// — before `applyIncentives`/`concludeEpoch`, which then run on the swapped-in code with
+    /// — before `concludeEpoch`, which then runs on the swapped-in code with
     /// the migrated sets (the new committee read and eligible-count guard require them). From
     /// this block onward every node runs on the new code with populated sets.
     ///
@@ -441,40 +538,17 @@ where
     /// ascending, so the encoded committee list is order-normalized while membership remains a
     /// pure function of the RNG draws.
     fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> TnRethResult<Bytes> {
-        // shuffle all validators for new committee
+        // shuffle all validators for new committee. Runs after `applySlashes` has committed, so
+        // the eligible-pool read reflects any slash-to-zero ejections
         let mut new_committee = self.shuffle_new_committee(randomness)?;
 
         // sort addresses in ascending order (0x0...0xf)
         new_committee.sort();
         debug!(target: "engine", ?new_committee, "new committee sorted by address");
 
-        // encode the call to bytes with method selector and args
         let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
             .abi_encode()
             .into();
-
-        Ok(bytes)
-    }
-
-    /// Generate calldata for applying incentives when concluding the epoch.
-    fn generate_apply_incentives_calldata(
-        &mut self,
-        reward_infos: Vec<(Address, u32)>,
-    ) -> TnRethResult<Bytes> {
-        debug!(target: "engine", ?reward_infos, "applying incentives");
-
-        // encode the call to bytes with method selector and args
-        let bytes = ConsensusRegistry::applyIncentivesCall {
-            rewardInfos: reward_infos
-                .iter()
-                .map(|(address, count)| RewardInfo {
-                    validatorAddress: *address,
-                    consensusHeaderCount: U256::from(*count),
-                })
-                .collect(),
-        }
-        .abi_encode()
-        .into();
 
         Ok(bytes)
     }
@@ -824,7 +898,7 @@ where
             // FORK_EPOCH` makes the swapped code + migrated per-status sets live for
             // the remainder of this very block.
             //
-            // This MUST run BEFORE the rewards/conclude calls below. `shuffle_new_committee`
+            // This MUST run BEFORE the conclude call below. `shuffle_new_committee`
             // (inside `apply_closing_epoch_contract_call`) routes its committee-pool read
             // by the registry's code hash (`read_committee_eligible_pool`): swapping first
             // flips that gate to the post-fork `getValidatorsInfo` union for the remainder
@@ -846,14 +920,11 @@ where
                 })?;
             }
 
-            // `applyIncentives` must run before `concludeEpoch` (contract requirement): it
-            // distributes the concluding epoch's issuance before the epoch transition.
-            self.apply_consensus_block_rewards(self.ctx.rewards_counter.get_address_counts())
-                .map_err(|e| {
-                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
-                })?;
-
-            self.apply_closing_epoch_contract_call(randomness).map_err(|e| {
+            self.apply_closing_epoch_contract_call(
+                randomness,
+                self.ctx.rewards_counter.get_address_counts(),
+            )
+            .map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
 

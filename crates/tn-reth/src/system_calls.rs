@@ -3,19 +3,20 @@
 //! These compile into types for interacting with smart contracts through
 //! System Calls.
 //!
-//! The `sol!` block binds two contracts from the tn-contracts submodule:
+//! The `sol!` blocks bind three contracts from the tn-contracts submodule:
 //! - `ConsensusRegistry` — validator lifecycle (mint/stake/activate/exit/burn), epoch and committee
-//!   views, and the epoch-boundary mutators the protocol invokes as system calls
-//!   (`applyIncentives`, then `concludeEpoch`).
+//!   views, and the three epoch-boundary mutators the protocol invokes as system calls in the
+//!   closing block: `applyIncentives`, then `applySlashes`, then `concludeEpoch`.
+//! - `LegacyConsensusRegistry` — the pre-fork registry's epoch-close surface, frozen so pre-fork
+//!   epoch closes replay byte-identically (see the code-hash gate in `evm/block.rs`).
 //! - `WorkerConfigs` — per-worker base-fee strategy used for base fee adjustment.
 //!
 //! Two pinned addresses live here: `SYSTEM_ADDRESS` (0xfff...fffe), the reserved caller the EVM
 //! uses for system transactions (the custom handler exempts it from fee/beneficiary
 //! accounting), and `CONSENSUS_REGISTRY_ADDRESS`, the registry's fixed deployment address.
 //!
-//! NOTE: `applySlashes` is declared for ABI completeness but is never called from Rust anywhere
-//! in this repository — slashing is not live (disabled during the MNO pilot). Do not assume
-//! validators can currently be slashed in-protocol.
+//! NOTE: slashing is not live — the protocol calls `applySlashes` with an empty array. Do not
+//! assume validators can currently be slashed in-protocol.
 
 use alloy::{primitives::address, sol};
 use tn_types::{Address, Epoch};
@@ -169,12 +170,20 @@ sol!(
             address owner_
         ) external;
 
-        /// Conclude the current epoch. Caller must pass a new committee of eligible validators.
-        function concludeEpoch(address[] calldata newCommittee) external;
-        /// Apply incentives for the epoch. This must be called before `concludeEpoch`.
+        /// Distribute the concluding epoch's issuance to leaders. First of the three
+        /// epoch-boundary system calls; the protocol sequences it before `applySlashes` so
+        /// weights reflect pre-slash collateral. May be empty while issuance is disabled.
         function applyIncentives(RewardInfo[] calldata rewardInfos) external;
-        /// Apply negative incentives for the epoch. This must be called before `concludeEpoch`.
+        /// Apply the concluding epoch's slashes, ejecting validators slashed to zero. Second of
+        /// the three boundary calls; MUST run before `concludeEpoch` so the committee the protocol
+        /// then assembles, and the size it validates against, both reflect any ejections. Always
+        /// empty while slashing is disabled.
         function applySlashes(Slash[] calldata slashes) external;
+        /// Settle queued stake version changes and rotate the epoch, seating `newCommittee`. Final
+        /// boundary call; the protocol reads `nextCommitteeSize` and assembles `newCommittee`
+        /// after `applySlashes`, so the size check here cannot revert against a stale pre-slash
+        /// view and settlement reads post-slash balances.
+        function concludeEpoch(address[] calldata newCommittee) external;
         /// One-time in-protocol fork migration: back-fills the appended per-status `validatorSets`
         /// and the cached `eligibleValidatorCount` from the preserved `currentStatus` source of
         /// truth after the registry bytecode is swapped in place. System-gated and idempotent.
@@ -235,7 +244,7 @@ sol!(
         /// Returns the validator's (outstandingBalance, initialStake, rewards).
         function getBalanceBreakdown(address validatorAddress) external view returns (uint256, uint256, uint256);
         /// Returns the EIP-712 digest a validator signs to accept a delegation.
-        function delegationDigest(bytes memory blsPubkey, address validatorAddress, address delegator) external view returns (bytes32);
+        function delegationDigest(bytes memory blsPubkey, address validatorAddress, address delegator, uint256 deadline) external view returns (bytes32);
         /// Issuance not yet distributed to validators (public variable getter).
         function undistributedIssuance() external view returns (uint256);
         /// Sets the GSMA region identifier for a validator (0=unspecified, 1-255=assigned regions).
@@ -250,13 +259,13 @@ sol!(
         constructor(
             uint8[] memory strategies,
             uint64[] memory values,
-            uint128[] memory datas,
+            uint184[] memory datas,
             address owner_,
         );
         /// Get the stored fee config for a worker.
         function getWorkerConfig(uint16 workerId)
             external view
-            returns (uint8 strategy, uint64 value, uint128 data);
+            returns (uint8 strategy, uint64 value, uint184 data);
         /// Get every worker's config in a single call.
         function getAllWorkerConfigs()
             external view
@@ -264,15 +273,53 @@ sol!(
                 uint16 count,
                 uint8[] memory strategies,
                 uint64[] memory values,
-                uint128[] memory datas,
+                uint184[] memory datas,
             );
         /// Set the number of workers for the next epoch.
         function setNumWorkers(uint16 numWorkers_) external;
         /// Set the config for a worker by worker id.
         /// NOTE: this must be called before calling `setNumWorkers`.
-        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value, uint128 data) external;
+        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value, uint184 data) external;
+        /// Update strategy-specific packed data for multiple workers. System call only;
+        /// each worker's strategy and value are preserved, and only previously configured
+        /// workers may be updated.
+        function setWorkerConfigsData(uint16[] calldata workerIds, uint184[] calldata datas) external;
+        /// Update config values for multiple workers. System call only; each worker's
+        /// strategy and data are preserved, and only previously configured workers may be
+        /// updated.
+        function setWorkerConfigsValue(uint16[] calldata workerIds, uint64[] calldata values) external;
+        /// Raise the highest strategy id the contract accepts. Owner only and strictly
+        /// increasing, in lockstep with the protocol release that ships the new strategy.
+        function setMaxStrategy(uint8 newMaxStrategy) external;
+        /// The highest strategy id the contract currently accepts.
+        function MAX_STRATEGY() external view returns (uint8);
         /// Retrieve the number of workers for the protocol.
         function numWorkers() external view returns (uint16);
+    }
+);
+
+// The epoch-close surface of the PRE-fork `ConsensusRegistry` deployment. While the deployed
+// registry still carries the pre-fork code hash, epoch closes must replay this exact two-call
+// ABI (the unified three-argument `concludeEpoch` does not exist on-chain there); the code-hash
+// gate in `evm/block.rs` routes between the two. Frozen: these signatures must stay
+// byte-identical to the calls the historical chain executed.
+sol!(
+    /// Pre-fork `ConsensusRegistry` epoch-close interface.
+    contract LegacyConsensusRegistry {
+        /// The rewards applied before concluding the epoch. Field layout is identical to
+        /// `ConsensusRegistry::RewardInfo`.
+        #[derive(Debug)]
+        struct RewardInfo {
+            /// The validator to receive rewards.
+            address validatorAddress;
+            /// The number of consensus blocks for which they were the leader.
+            uint256 consensusHeaderCount;
+        }
+
+        /// Distribute the concluding epoch's issuance. Runs before `concludeEpoch`.
+        function applyIncentives(RewardInfo[] calldata rewardInfos) external;
+        /// Conclude the current epoch with the new committee.
+        function concludeEpoch(address[] calldata newCommittee) external;
     }
 );
 
@@ -292,4 +339,20 @@ pub struct EpochState {
     /// This time plus the `EpochInfo::epochDuration` creates the timestamp for the next epoch
     /// boundary.
     pub epoch_start: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::{primitives::keccak256, sol_types::SolCall};
+
+    /// The hand-written `delegationDigest` binding must track the on-chain 4-argument selector. If
+    /// the contract selector changes and this binding does not, `tn_delegationDigest` reverts
+    /// at runtime instead of failing to compile, so pin the selector here.
+    #[test]
+    fn delegation_digest_binding_selector_is_current() {
+        let expected: [u8; 4] =
+            keccak256("delegationDigest(bytes,address,address,uint256)")[..4].try_into().unwrap();
+        assert_eq!(ConsensusRegistry::delegationDigestCall::SELECTOR, expected);
+    }
 }

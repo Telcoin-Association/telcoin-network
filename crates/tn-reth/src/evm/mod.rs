@@ -64,6 +64,14 @@ pub use tel_precompile::{
 };
 pub use utils::calculate_gas_penalty;
 
+/// Gas budget for a single protocol system call.
+///
+/// System calls run at `gas_price: 0` and do not count toward the block gas limit, so this
+/// bound exists only to stop runaway execution. It is sized well above the block gas limit to
+/// give the epoch-closing `concludeEpoch` call headroom: that call applies rewards, slashes,
+/// and queued stake settlement across the full validator set in one transaction.
+pub(crate) const SYSTEM_CALL_GAS_LIMIT: u64 = 100_000_000;
+
 /// TN EVM implementation.
 ///
 /// This is a wrapper type around the `revm` ethereum evm with optional [`Inspector`] (tracing)
@@ -186,8 +194,8 @@ where
     /// outside normal transaction rules.
     ///
     /// Environment for the call, restored afterwards via swaps:
-    /// - fixed 30,000,000 gas budget, with the block gas limit temporarily raised to match so the
-    ///   call never competes with block gas accounting;
+    /// - fixed [`SYSTEM_CALL_GAS_LIMIT`] gas budget, with the block gas limit temporarily raised to
+    ///   match so the call never competes with block gas accounting;
     /// - `gas_price` 0 and the block base fee swapped to 0, so no fee is charged and the caller
     ///   needs no balance (upfront cost is zero; `value` is zero too);
     /// - nonce check disabled (`disable_nonce_check` swapped on; the tx nonce field is 0) and no
@@ -208,7 +216,7 @@ where
             kind: TxKind::Call(contract),
             // Explicitly set nonce to 0 so revm does not do any nonce checks
             nonce: 0,
-            gas_limit: 30_000_000,
+            gas_limit: SYSTEM_CALL_GAS_LIMIT,
             value: U256::ZERO,
             data,
             // Setting the gas price to zero enforces that no value is transferred as part of the
@@ -308,10 +316,10 @@ where
 {
     /// Deploy a contract during pre-genesis construction (a CREATE, not a call).
     ///
-    /// Uses the same relaxed environment as `transact_system_call` — 30M gas budget with the
-    /// block gas limit raised to match, zero gas price and base fee, nonce and chain-id checks
-    /// disabled — but issues a `TxKind::Create` and returns the full result state for the
-    /// caller to commit (no `SYSTEM_ADDRESS` stripping convention here).
+    /// Uses the same relaxed environment as `transact_system_call` — zero gas price and base fee,
+    /// nonce and chain-id checks disabled — under its own fixed 30M gas budget with the block gas
+    /// limit raised to match, but issues a `TxKind::Create` and returns the full result state for
+    /// the caller to commit (no `SYSTEM_ADDRESS` stripping convention here).
     pub(crate) fn transact_pre_genesis_create(
         &mut self,
         caller: Address,
