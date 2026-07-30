@@ -1059,6 +1059,10 @@ impl ConsensusChain {
         slot.seek(SeekFrom::Start(0))?;
         slot.write_all(&buffer)?;
         slot.sync_all()?;
+        // Durably link the (possibly newly-created) `consensus_slot1` entry into `base_path`:
+        // `sync_all` flushes the file, not the parent directory entry that names it, so a crash
+        // right after `db load-state` could otherwise lose the slot and reset resume to genesis.
+        fsync_directory(base_path)?;
         Ok(())
     }
 
