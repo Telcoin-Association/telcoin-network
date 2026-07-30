@@ -975,9 +975,9 @@ mod tests {
         payload::TNPayload,
         system_calls::ConsensusRegistry::ValidatorStatus,
         test_utils::{
-            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
-            governance_burn_tx, governance_owner_factory, test_genesis_with_consensus_registry,
-            TransactionFactory,
+            consensus_output_for_tests, create_committee_from_state,
+            execute_payload_and_update_canonical_chain, governance_burn_tx,
+            governance_owner_factory, test_genesis_with_consensus_registry, TransactionFactory,
         },
         RethChainSpec,
     };
@@ -990,8 +990,8 @@ mod tests {
     use tempfile::TempDir;
     use tn_config::NodeInfo;
     use tn_types::{
-        generate_proof_of_possession_bls_for_test, BlsKeypair, GenesisAccount, NodeP2pInfo,
-        TaskManager, U256,
+        gas_accumulator::RewardsCounter, generate_proof_of_possession_bls_for_test, BlsKeypair,
+        GenesisAccount, NodeP2pInfo, TaskManager, U256,
     };
 
     /// In-protocol `ConsensusRegistry` fork over the PRE-fork testnet registry.
@@ -2298,6 +2298,78 @@ mod tests {
             env1.bls_pubkeys_for_epoch_at_block(3, env1.canonical_tip().hash())?,
             env2.bls_pubkeys_for_epoch_at_block(3, env2.canonical_tip().hash())?
         );
+
+        Ok(())
+    }
+
+    /// Reward accounting through the production close: seeded leader counts flow
+    /// `RewardsCounter` → `applyIncentives(RewardInfo[])` → on-chain balances, with the epoch
+    /// issuance split exactly between equal-count leaders.
+    ///
+    /// Pins the `BTreeMap<Address, u32>` → `RewardInfo[]` mapping in
+    /// `apply_closing_epoch_contract_call` with a NON-empty rewards array at unit level —
+    /// previously exercised only by the engine e2e suite. The fixture's `epochIssuance`
+    /// (25,806 TEL) is even, so two equal-weight leaders each collect exactly half
+    /// (`div_ceil(2)` matches the engine assertions and is exact here).
+    #[tokio::test]
+    async fn test_rewards_counter_flows_through_production_close() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Rewards Close Test");
+        let counter = RewardsCounter::default();
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(counter.clone()),
+        )?;
+
+        // seed the counter exactly as run_epoch does at epoch entry: the genesis committee,
+        // then equal leader tallies for two members
+        let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch_state.validators.len(), 5);
+        let member_addresses: Vec<Address> =
+            epoch_state.validators.iter().map(|v| v.validatorAddress).collect();
+        let issuance = epoch_state.epoch_info.epochIssuance;
+        let committee = create_committee_from_state(epoch_state).await?;
+        counter.set_committee(committee.clone());
+        let authorities: Vec<_> = committee.authorities().into_iter().collect();
+        let (leader_a, leader_b) = (&authorities[0], &authorities[1]);
+        for _ in 0..3 {
+            counter.inc_leader_count(&leader_a.id());
+            counter.inc_leader_count(&leader_b.id());
+        }
+        assert_eq!(counter.get_address_counts().len(), 2);
+
+        // close epoch 0 through the production path; finish() drains the counter into
+        // applyIncentives(RewardInfo[]) with a two-entry array
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+
+        // equal weights split the (even) issuance exactly; non-leaders collect nothing
+        let expected_each = issuance.div_ceil(U256::from(2));
+        assert_eq!(expected_each * U256::from(2), issuance, "fixture issuance splits exactly");
+        for leader in [leader_a, leader_b] {
+            let rewards = reth_env.read_consensus_registry::<U256>(
+                ConsensusRegistry::getRewardsCall { validatorAddress: leader.execution_address() }
+                    .abi_encode()
+                    .into(),
+            )?;
+            assert_eq!(rewards, expected_each, "equal-count leader collects an exact half");
+        }
+        let non_leader = member_addresses
+            .iter()
+            .find(|address| {
+                **address != leader_a.execution_address()
+                    && **address != leader_b.execution_address()
+            })
+            .expect("five members, two leaders");
+        let rewards = reth_env.read_consensus_registry::<U256>(
+            ConsensusRegistry::getRewardsCall { validatorAddress: *non_leader }.abi_encode().into(),
+        )?;
+        assert!(rewards.is_zero(), "non-leader collects nothing");
 
         Ok(())
     }
