@@ -91,10 +91,15 @@ use tn_types::{
     Address, BlockBody, BlockNumHash, Bytes, Epoch, ExecHeader, GenesisAccount, SealedBlock,
     SealedHeader, TaskManager, WorkerId, B256, U256,
 };
-use tracing::debug;
+use tracing::{debug, info};
 
 /// The pinned read-only MDBX transaction type — reth's `Tx<RO>` with long-read safety disabled.
 type PinnedTx = <DatabaseEnv as RethDatabaseT>::TX;
+
+/// Emit a scaffold-progress log every this many blocks. The chain scaffold's cost scales with chain
+/// height (not state size), so on a mature chain the header/body loops churn through millions of
+/// static-file writes; periodic logging makes a long scaffold observable instead of silent.
+const SCAFFOLD_LOG_INTERVAL: u64 = 500_000;
 
 /// A read-consistent view of reth's plain EVM state pinned to the tip at open time.
 ///
@@ -418,6 +423,12 @@ impl SnapshotRestorer {
             }
         }
 
+        info!(
+            target: "tn::reth",
+            blocks = b,
+            "snapshot restore: writing header-only chain scaffold up to block {b}"
+        );
+
         let provider_rw = self.reth_env.blockchain_provider().database_provider_rw()?;
 
         // drop the genesis alloc so an on-chain-zeroed genesis slot cannot survive the import
@@ -453,6 +464,14 @@ impl SnapshotRestorer {
                         headers_writer.append_header(&dummy, &B256::ZERO)?;
                     }
                 }
+                if number.is_multiple_of(SCAFFOLD_LOG_INTERVAL) {
+                    info!(
+                        target: "tn::reth",
+                        block = number,
+                        total = b,
+                        "snapshot restore: scaffolding headers"
+                    );
+                }
             }
         }
 
@@ -470,6 +489,15 @@ impl SnapshotRestorer {
             let mut writer = sf.latest_writer(segment)?;
             for number in 1..b {
                 writer.increment_block(number)?;
+                if number.is_multiple_of(SCAFFOLD_LOG_INTERVAL) {
+                    info!(
+                        target: "tn::reth",
+                        ?segment,
+                        block = number,
+                        total = b,
+                        "snapshot restore: advancing body segments"
+                    );
+                }
             }
         }
 
@@ -505,6 +533,7 @@ impl SnapshotRestorer {
         sf.commit()?;
         provider_rw.commit()?;
 
+        info!(target: "tn::reth", blocks = b, "snapshot restore: chain scaffold written");
         Ok(())
     }
 
