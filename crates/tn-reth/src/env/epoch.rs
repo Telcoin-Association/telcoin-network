@@ -1754,7 +1754,9 @@ mod tests {
 
         // applyIncentives with rewards for the burned + a surviving validator: the isRetired
         // branch skips the burned validator while the survivor accrues rewards. Then
-        // concludeEpoch over the shrunken committee, matching the protocol's boundary sequence.
+        // concludeEpoch over the shrunken committee. (A hand-rolled pair, not the protocol's
+        // boundary sequence - the executor issues three calls with applySlashes interposed; see
+        // test_epoch_boundary_slash_ejects_through_production_close.)
         let alive = committee[0].validatorAddress;
         let mut tn_evm = reth_env.tn_evm(canonical_header.hash())?;
         let mut new_committee: Vec<Address> =
@@ -1813,11 +1815,13 @@ mod tests {
     /// The epoch-boundary slashing sequence: a slash-to-zero ejection lands mid-sequence and the
     /// close still succeeds because the committee is assembled from post-slash state.
     ///
-    /// Drives the exact three-call order the block executor issues - `applyIncentives`, then
-    /// `applySlashes`, then `concludeEpoch` - with a slash that empties a validator's stake.
-    /// Pins the sequencing contract an automated slash producer must uphold: the committee size
-    /// and eligible pool are read AFTER `applySlashes` commits, so the ejection is reflected
-    /// before `concludeEpoch` validates the committee. Also pins the preserved reward economics:
+    /// Hand-rolls the three-call boundary order - `applyIncentives`, then `applySlashes`, then
+    /// `concludeEpoch` - on a raw `tn_evm`, with a slash that empties a validator's stake. Pins
+    /// the CONTRACT-side outcome an automated slash producer relies on: the committee size and
+    /// eligible pool reflect the ejection once `applySlashes` commits, so a post-slash committee
+    /// passes `concludeEpoch` validation. (The ordering as the block executor actually issues it
+    /// is pinned end-to-end by `test_epoch_boundary_slash_ejects_through_production_close`.)
+    /// Also pins the preserved reward economics:
     /// incentives run before slashes, so the closing epoch's rewards are weighted on pre-slash
     /// collateral and even the about-to-be-ejected validator collects its final epoch.
     #[tokio::test]
@@ -1938,6 +1942,107 @@ mod tests {
         Ok(())
     }
 
+    /// The production close path ejects a slash-to-zero validator: a slash injected through the
+    /// `TNPayload` seam rides `finish()`'s boundary sequence and the close succeeds because the
+    /// committee is assembled from post-slash state.
+    ///
+    /// This is the end-to-end pin for the executor's call ordering (`applyIncentives` →
+    /// `applySlashes` → committee reads → `concludeEpoch`), driving the real
+    /// `apply_closing_epoch_contract_call` rather than hand-rolling the sequence like the
+    /// siblings above. Each assertion kills a distinct mis-ordering:
+    /// - the block succeeding at all: the slash landed before the committee reads (a stale
+    ///   five-member committee would revert `InvalidCommitteeSize` on-chain and error the block);
+    /// - `exitEpoch == 1`: the slash landed BEFORE `concludeEpoch` rotated the epoch
+    ///   (`_consensusBurn` records the current epoch at slash time; a slash issued after the
+    ///   rotation would record 2, and close-success alone cannot discriminate that reorder);
+    /// - the shrunken current + shuffled committees: the ejection propagated into committee
+    ///   assembly.
+    ///
+    /// The inverted-order negative variant is deliberately absent: the fixed production path
+    /// cannot issue the calls out of order, and the contract half (stale committee ⇒
+    /// `InvalidCommitteeSize` revert) is already pinned by
+    /// `test_stale_pre_slash_committee_reverts_close`.
+    #[tokio::test]
+    async fn test_epoch_boundary_slash_ejects_through_production_close() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Seam Slash Ejection Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // close epoch 0 through the production payload path so the seam-injected close below
+        // runs at a realistic mid-chain boundary rather than directly on genesis state
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block1.recovered_block.clone_sealed_header();
+
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 1);
+        assert_eq!(committee.len(), 5);
+        let victim = committee[0].validatorAddress;
+
+        // slash sizing: the env runs a default (empty) RewardsCounter, so the boundary's
+        // `applyIncentives` credits nothing and the pre-boundary outstanding balance equals the
+        // balance `applySlashes` compares — a full-outstanding slash is a slash-to-zero
+        let (outstanding, _initial, _rewards) = reth_env
+            .read_consensus_registry::<(U256, U256, U256)>(
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: victim }
+                    .abi_encode()
+                    .into(),
+            )?;
+
+        // close epoch 1 through the PRODUCTION path with the slash injected through the seam:
+        // finish() must sequence it between applyIncentives and the committee reads
+        let consensus_output = consensus_output_for_tests(2, 1, 2, true);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output)
+            .with_epoch_boundary_slashes(vec![ConsensusRegistry::Slash {
+                validatorAddress: victim,
+                amount: outstanding,
+            }]);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+
+        // the slash landed: retired, ejected from the eligible pool, size clamped
+        let retired = reth_env.read_consensus_registry::<bool>(
+            ConsensusRegistry::isRetiredCall { validatorAddress: victim }.abi_encode().into(),
+        )?;
+        assert!(retired, "slash-to-zero through the production close retires the validator");
+        let eligible = reth_env.read_consensus_registry::<U256>(
+            ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(eligible, U256::from(4));
+        let next_size = reth_env.read_consensus_registry::<u16>(
+            ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(next_size, 4);
+
+        // ordering discriminator: `_consensusBurn` → `_exit(validator, currentEpoch)` records
+        // the epoch at slash time. The close rotated 1 → 2, so a slash issued after
+        // `concludeEpoch` would record 2; only the slash-before-conclude order records 1.
+        let victim_info = reth_env.read_consensus_registry::<ConsensusRegistry::ValidatorInfo>(
+            ConsensusRegistry::getValidatorCall { validatorAddress: victim }.abi_encode().into(),
+        )?;
+        assert_eq!(victim_info.exitEpoch, 1, "slash must land before the epoch rotates");
+
+        // the epoch rotated over a post-slash committee that excludes the victim
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 2);
+        assert_eq!(committee.len(), 4);
+        assert!(committee.iter().all(|v| v.validatorAddress != victim));
+
+        // the committee this concludeEpoch installed (stored at newEpoch + 2 = 4) was shuffled
+        // from the post-slash pool: four members, victim absent
+        let shuffled =
+            reth_env.validators_for_epoch_at_block(4, reth_env.canonical_tip().hash())?;
+        assert_eq!(shuffled.len(), 4);
+        assert!(shuffled.iter().all(|v| v.validatorAddress != victim));
+
+        Ok(())
+    }
+
     /// A committee sized from PRE-slash state makes `concludeEpoch` revert with
     /// `InvalidCommitteeSize` when a slash-to-zero ejection lands in between.
     ///
@@ -1945,7 +2050,9 @@ mod tests {
     /// `nextCommitteeSize`, so a slash producer that reads the size before `applySlashes`
     /// commits produces a fatal on-chain revert (a deterministic fleet halt), not a silent
     /// mis-seat. The block executor's read-after-slash sequencing exists to prevent exactly
-    /// this; the test pins the failure mode so it trips loudly if that ordering regresses.
+    /// this; this test pins the CONTRACT half (the revert and its selector), while the
+    /// executor's own ordering is pinned through the production close path by
+    /// `test_epoch_boundary_slash_ejects_through_production_close`.
     #[tokio::test]
     async fn test_stale_pre_slash_committee_reverts_close() -> eyre::Result<()> {
         use reth_revm::context::result::ExecutionResult;
