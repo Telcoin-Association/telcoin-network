@@ -39,10 +39,10 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 ///
 /// Epoch N's certificate is only aggregated at epoch N+1's start, so it is typically absent the
 /// moment N closes. The completion task waits up to this long for the collector to produce it
-/// before failing the export (the next epoch's boundary retries). Generous on purpose: the export's
-/// full plain-state walk has already elapsed by the time this wait begins, so the cert is normally
-/// present immediately.
-const CERT_WAIT: Duration = Duration::from_secs(30);
+/// before failing the export (this epoch's export is abandoned — it is never retried, but future
+/// epochs are still exported). Generous on purpose: the export's full plain-state walk has already
+/// elapsed by the time this wait begins, so the cert is normally present immediately.
+const CERT_WAIT: Duration = Duration::from_secs(90);
 
 /// Remove every `epoch-*.tmp` directory under the exports root — orphaned temp export dirs left by
 /// a crashed or interrupted prior run. Called ONCE at node startup, where it is safe because no
@@ -380,6 +380,10 @@ where
         // persist it here while epoch N is still the current pack. The bounded records/certs bundle
         // is built through the actor (not copied), so no records-pack flush is needed here. A
         // persist hiccup must not crash the node, so log and skip the export.
+        // Note, if we are here the epoch has concluded and no more data will be written to the
+        // current epoch pack file.  This why this is safe to do now, it simply means the
+        // file will be flushed before it is copied without depending on the rest of the
+        // epoch close.
         if let Err(e) = self.consensus_chain.persist_current().await {
             warn!(target: "tn::snapshot", epoch, error = %e, "could not persist consensus pack; skipping export");
             return Ok(());
@@ -426,7 +430,9 @@ where
                         // bundle into place; external tooling watches for the final dir appearing
                         // atomically.
                         Ok(Ok(Some(outcome))) => {
-                            // the consensus pack is a per-epoch file, so a plain copy is race-free.
+                            // Safe: the closed epoch's pack is sealed at export time (see the
+                            // persist note above) — no writer appends to a concluded epoch's pack,
+                            // so this reads a complete, immutable file.
                             if let Err(e) = std::fs::copy(&src_consensus, tmp_dir.join("consensus_data")) {
                                 error!(target: "tn::snapshot", epoch, error = %e, "failed to copy consensus pack into export");
                                 remove_tmp_export(&tmp_dir, epoch);
@@ -453,7 +459,7 @@ where
                                 .await
                                 .is_none()
                             {
-                                warn!(target: "tn::snapshot", epoch, wait_secs = CERT_WAIT.as_secs(), "epoch certificate not aggregated within wait; skipping export (next epoch retries)");
+                                warn!(target: "tn::snapshot", epoch, wait_secs = CERT_WAIT.as_secs(), "epoch certificate not aggregated within wait; skipping export of epoch {epoch}");
                                 remove_tmp_export(&tmp_dir, epoch);
                                 return Ok(());
                             }
