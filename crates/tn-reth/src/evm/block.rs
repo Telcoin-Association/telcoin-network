@@ -309,9 +309,9 @@ where
             "applying incentives",
         )?;
 
-        // 2. slashes (empty while slashing is disabled), landing before the committee is read
-        let calldata =
-            ConsensusRegistry::applySlashesCall { slashes: Vec::new() }.abi_encode().into();
+        // 2. slashes, landing before the committee is read
+        let slashes = self.epoch_boundary_slashes();
+        let calldata = ConsensusRegistry::applySlashesCall { slashes }.abi_encode().into();
         self.transact_and_commit_system_call(
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
@@ -322,6 +322,22 @@ where
         let calldata = self.generate_conclude_epoch_calldata(randomness)?;
         trace!(target: "engine", ?calldata, "close epoch calldata");
         self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
+    }
+
+    /// The slashes to submit at this epoch boundary.
+    ///
+    /// Slashing is not live: this always returns an empty list and `applySlashes` runs as a
+    /// no-op. An automated slash producer plugs in here and nowhere else. The caller sequences
+    /// the returned slashes through `applySlashes` BEFORE the committee size and eligible pool
+    /// are read, so a slash-to-zero ejection is always reflected in the committee that
+    /// `concludeEpoch` validates. Submitting slashes through any other path, or after the
+    /// committee reads, reintroduces the stale-committee revert pinned by
+    /// `test_stale_pre_slash_committee_reverts_close` - a deterministic fleet halt.
+    ///
+    /// Determinism: every node must derive an identical list (content and order) from the same
+    /// certified consensus output, or the boundary block diverges across the fleet.
+    fn epoch_boundary_slashes(&self) -> Vec<ConsensusRegistry::Slash> {
+        Vec::new()
     }
 
     /// Close the epoch via the PRE-fork registry ABI: `applyIncentives(RewardInfo[])` followed
