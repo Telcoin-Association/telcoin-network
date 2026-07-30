@@ -67,9 +67,22 @@ pub use utils::calculate_gas_penalty;
 /// Gas budget for a single protocol system call.
 ///
 /// System calls run at `gas_price: 0` and do not count toward the block gas limit, so this
-/// bound exists only to stop runaway execution. It is sized well above the block gas limit to
-/// give the epoch-closing `concludeEpoch` call headroom: that call applies rewards, slashes,
-/// and queued stake settlement across the full validator set in one transaction.
+/// bound exists only to stop runaway execution. The 100M headroom (vs the historical 30M
+/// budget) is for the one-shot `migrateValidatorSets()` walk at the ConsensusRegistry fork
+/// boundary (see `tn-types` `forks.rs`), which touches every validator in a single call; the
+/// regular boundary calls fit far below it.
+///
+/// LOCKSTEP FLEET-UPGRADE REQUIREMENT: this value participates in consensus.
+/// `transact_system_call` swaps `block.gas_limit` to this value for the call's duration, and a
+/// binary built with the old 30M diverges from a 100M binary on any system call needing more
+/// than 30M — exactly the calls the headroom exists for. Every validator must run a binary
+/// with the same value before any close can depend on it. (Relatedly, the epoch boundary is
+/// now three calls — `applyIncentives`, `applySlashes`, `concludeEpoch` — vs two on `main`;
+/// `applySlashes` is present in the deployed testnet and mainnet genesis bytecode and an
+/// empty-array call is a state-neutral no-op, so existing history replays unchanged.)
+///
+/// Read-path note: contract reads that share the system-call plumbing (including RPC reads via
+/// `read_contract_at_block`) inherit this ceiling — an accepted consequence of the raise.
 pub(crate) const SYSTEM_CALL_GAS_LIMIT: u64 = 100_000_000;
 
 /// Gas budget for a single pre-genesis constructor CREATE

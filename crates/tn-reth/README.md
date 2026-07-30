@@ -46,7 +46,7 @@ TN repurposes several Ethereum header fields for protocol data. Assembly happens
 | `beneficiary` | Execution address of the authority that produced the batch; receives priority fees (`src/payload.rs`, `src/evm/handler.rs`). |
 | `base_fee_per_gas` | Taken from the proposed batch; never recomputed or EIP-1559-adjusted during execution (`next_evm_env` in `src/evm/config.rs` uses `payload.base_fee_per_gas` as-is). Base fees are set per worker per epoch and validated at the worker/batch level, allowing parallel per-worker base fees. |
 | `gas_limit` | Taken from the worker's batch (`payload.gas_limit`). |
-| `withdrawals` / `withdrawals_root` | Empty list / `EMPTY_WITHDRAWALS` on normal blocks. On an epoch-closing block the body carries one `Withdrawal` per rewarded validator whose `amount` is the validator's **consensus-leader count, not wei** (`RewardsCounter::generate_withdrawals` in `tn-types` `gas_accumulator.rs`). This is a record only: the TN block executor never credits withdrawal amounts to balances — rewards move through the `concludeEpoch` system call. |
+| `withdrawals` / `withdrawals_root` | Empty list / `EMPTY_WITHDRAWALS` on normal blocks. On an epoch-closing block the body carries one `Withdrawal` per rewarded validator whose `amount` is the validator's **consensus-leader count, not wei** (`RewardsCounter::generate_withdrawals` in `tn-types` `gas_accumulator.rs`). This is a record only: the TN block executor never credits withdrawal amounts to balances — rewards move through the `applyIncentives` system call. |
 | `blob_gas_used` / `excess_blob_gas` | `Some(sum of tx blob gas)` (effectively 0, see blob handling below) and `Some(0)`. |
 | `requests_hash` | Always `EMPTY_REQUESTS_HASH`; the executor returns `Requests::default()` from `finish()` (`src/evm/block.rs`) — there are no EL-triggered requests (no deposit/withdrawal/consolidation request processing). |
 | `timestamp` | The sub-DAG commit timestamp from consensus, not wall clock at execution time. |
@@ -77,26 +77,35 @@ failure**:
    `concluding_epoch + 1 == CONSENSUS_REGISTRY_FORK_EPOCH`, apply the registry fork
    (`apply_consensus_registry_fork`) — code swap plus one-time `migrateValidatorSets()` — so the
    remaining steps in this same block already run on the upgraded code.
-2. The unified `concludeEpoch(newCommittee, rewardInfos, slashes)` system call
-   (`apply_closing_epoch_contract_call`): the eligible pool (union of `Active`,
-   `PendingActivation`, `PendingExit`) is read from the registry, shuffled by a Fisher-Yates over
-   an `StdRng` seeded with the epoch-close randomness, backfilled from pending-exit validators if
-   the active set is short, and truncated to `getNextCommitteeSize()`; the reward infos carry
-   each validator's consensus-leader count. The registry applies rewards, slashes, and queued
-   stake version settlement internally in that order, so the stage-ordering obligation lives
-   on-chain. An undersized pool fails client-side with `TnRethError::UndersizedCommittee`
-   instead of submitting calldata that reverts on-chain. While the deployed registry still
-   carries the pre-fork adiri code, the close instead replays the legacy `applyIncentives` +
-   `concludeEpoch(address[])` pair through the same code-hash gate as the committee-pool read,
-   keeping pre-fork history re-executable.
-3. `merge_transitions(BundleRetention::Reverts)` folds the system-call state into the bundle.
+2. The three boundary system calls (`apply_closing_epoch_contract_call`), in a client-enforced
+   order that is itself a consensus-safety obligation: `applyIncentives(RewardInfo[])` first
+   (the reward infos carry each validator's consensus-leader count, weighted on pre-slash
+   collateral), then `applySlashes(Slash[])` (the slashes carrier — the protocol passes an
+   empty array today), then `concludeEpoch(address[])` over a committee assembled AFTER the
+   slashes commit: the eligible pool (union of `Active`, `PendingActivation`, `PendingExit`)
+   is read from the registry, shuffled by a Fisher-Yates over an `StdRng` seeded with the
+   epoch-close randomness, backfilled from pending-exit validators if the active set is short,
+   truncated to `getNextCommitteeSize()`, and sorted by address. **The stage-ordering
+   obligation lives in the client** — the registry only enforces the outcome (it validates the
+   committee against post-slash state and reverts `InvalidCommitteeSize` on a stale one). An
+   undersized pool fails client-side with `TnRethError::UndersizedCommittee` instead of
+   submitting calldata that reverts on-chain. While the deployed registry still carries the
+   pre-fork adiri code, the close instead replays the legacy `applyIncentives` +
+   `concludeEpoch(address[])` pair through the same code-hash gate as the committee-pool read
+   (no interposed `applySlashes`; the shared selectors are byte-identical), keeping pre-fork
+   history re-executable.
+
+There is deliberately no in-`finish()` transition merge: reth's block-builder/executor wrappers
+merge once after `finish()` returns, and a second merge would push a phantom empty reverts entry
+for every epoch-closing block.
 
 System calls execute as `SYSTEM_ADDRESS` → contract with a fixed 100M gas limit, zero gas price,
 base-fee and nonce checks disabled (`transact_system_call` in `src/evm/mod.rs`);
 `SYSTEM_ADDRESS` is stripped from the changeset before commit so it never enters the state root.
 
-**Slashing is not live.** `concludeEpoch` accepts a `slashes` array and the registry implements
-it, but the client always passes an empty array.
+**Slashing is not live.** `applySlashes(Slash[])` is the slashes carrier and the registry
+implements it, but the client always passes an empty array (production builds);
+`concludeEpoch` takes only the new committee `address[]`.
 
 ## ConsensusRegistry fork gate (adiri)
 

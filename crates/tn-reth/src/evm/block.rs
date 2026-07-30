@@ -67,9 +67,11 @@
 //! The epoch-close `randomness` (`ctx.close_epoch`) is the keccak256 of the leader
 //! certificate's aggregate BLS signature, computed in `CommittedSubDag::new` and carried through
 //! the payload. It seeds the deterministic committee shuffle AND is stored as the block's
-//! `extra_data`, which is how the replay path (`context_for_block`) rebuilds an identical ctx
-//! from the sealed header. The RNG draw order inside the shuffle is consensus-critical: any
-//! refactor that reorders the draws selects a different committee.
+//! `extra_data`, which is how the replay path (`context_for_block`) rebuilds the ctx from the
+//! sealed header — identical up to `rewards_counter`, which is the live shared counter rather
+//! than header-derived (see the `evm/config.rs` module docs for the replay caveat and the
+//! `block.body.withdrawals` reconstruction follow-up). The RNG draw order inside the shuffle
+//! is consensus-critical: any refactor that reorders the draws selects a different committee.
 
 use crate::{
     error::{TnRethError, TnRethResult},
