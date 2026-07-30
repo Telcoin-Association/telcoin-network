@@ -5,8 +5,8 @@
 //!
 //! The `sol!` blocks bind three contracts from the tn-contracts submodule:
 //! - `ConsensusRegistry` — validator lifecycle (mint/stake/activate/exit/burn), epoch and committee
-//!   views, and the unified epoch-boundary mutator the protocol invokes as a system call
-//!   (`concludeEpoch`).
+//!   views, and the three epoch-boundary mutators the protocol invokes as system calls in the
+//!   closing block: `applyIncentives`, then `applySlashes`, then `concludeEpoch`.
 //! - `LegacyConsensusRegistry` — the pre-fork registry's epoch-close surface, frozen so pre-fork
 //!   epoch closes replay byte-identically (see the code-hash gate in `evm/block.rs`).
 //! - `WorkerConfigs` — per-worker base-fee strategy used for base fee adjustment.
@@ -15,8 +15,8 @@
 //! uses for system transactions (the custom handler exempts it from fee/beneficiary
 //! accounting), and `CONSENSUS_REGISTRY_ADDRESS`, the registry's fixed deployment address.
 //!
-//! NOTE: slashing is not live — `concludeEpoch` accepts a `slashes` array, but the protocol
-//! always passes it empty. Do not assume validators can currently be slashed in-protocol.
+//! NOTE: slashing is not live — the protocol calls `applySlashes` with an empty array. Do not
+//! assume validators can currently be slashed in-protocol.
 
 use alloy::{primitives::address, sol};
 use tn_types::{Address, Epoch};
@@ -170,16 +170,20 @@ sol!(
             address owner_
         ) external;
 
-        /// Conclude the current epoch in one atomic call: distributes the closing epoch's
-        /// rewards, applies its slashes, settles queued stake version changes, and rotates the
-        /// epoch. The registry enforces the internal stage order (rewards, then slashes, then
-        /// version settlement). Caller must pass a new committee of eligible validators;
-        /// `rewardInfos` and `slashes` may be empty while those mechanisms are disabled.
-        function concludeEpoch(
-            address[] calldata newCommittee,
-            RewardInfo[] calldata rewardInfos,
-            Slash[] calldata slashes
-        ) external;
+        /// Distribute the concluding epoch's issuance to leaders. First of the three
+        /// epoch-boundary system calls; the protocol sequences it before `applySlashes` so
+        /// weights reflect pre-slash collateral. May be empty while issuance is disabled.
+        function applyIncentives(RewardInfo[] calldata rewardInfos) external;
+        /// Apply the concluding epoch's slashes, ejecting validators slashed to zero. Second of
+        /// the three boundary calls; MUST run before `concludeEpoch` so the committee the protocol
+        /// then assembles, and the size it validates against, both reflect any ejections. Always
+        /// empty while slashing is disabled.
+        function applySlashes(Slash[] calldata slashes) external;
+        /// Settle queued stake version changes and rotate the epoch, seating `newCommittee`. Final
+        /// boundary call; the protocol reads `nextCommitteeSize` and assembles `newCommittee`
+        /// after `applySlashes`, so the size check here cannot revert against a stale pre-slash
+        /// view and settlement reads post-slash balances.
+        function concludeEpoch(address[] calldata newCommittee) external;
         /// One-time in-protocol fork migration: back-fills the appended per-status `validatorSets`
         /// and the cached `eligibleValidatorCount` from the preserved `currentStatus` source of
         /// truth after the registry bytecode is swapped in place. System-gated and idempotent.

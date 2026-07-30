@@ -194,8 +194,8 @@ where
     /// outside normal transaction rules.
     ///
     /// Environment for the call, restored afterwards via swaps:
-    /// - fixed 30,000,000 gas budget, with the block gas limit temporarily raised to match so the
-    ///   call never competes with block gas accounting;
+    /// - fixed [`SYSTEM_CALL_GAS_LIMIT`] gas budget, with the block gas limit temporarily raised to
+    ///   match so the call never competes with block gas accounting;
     /// - `gas_price` 0 and the block base fee swapped to 0, so no fee is charged and the caller
     ///   needs no balance (upfront cost is zero; `value` is zero too);
     /// - nonce check disabled (`disable_nonce_check` swapped on; the tx nonce field is 0) and no

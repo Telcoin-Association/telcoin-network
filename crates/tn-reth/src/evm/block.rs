@@ -25,15 +25,19 @@
 //!    (`deconstruct_nonce(ctx.nonce).0`) satisfies `concluding_epoch + 1 ==
 //!    CONSENSUS_REGISTRY_FORK_EPOCH` (checked addition): swaps the registry's runtime bytecode in
 //!    place, then runs the one-time `migrateValidatorSets()`.
-//! 2. `apply_closing_epoch_contract_call` - the single unified
-//!    `concludeEpoch(address[],RewardInfo[],Slash[])` system call: committee membership is drawn by
-//!    the `randomness`-seeded Fisher-Yates shuffle (sorted by address before encoding) and the
-//!    reward infos carry the leader counts from `ctx.rewards_counter`. The registry distributes the
-//!    concluding epoch's issuance, applies slashes, settles queued stake version changes, and
-//!    rotates the epoch atomically, so the stage-ordering obligation lives on-chain, not here.
-//!    While the deployed registry still carries the pre-fork adiri code, the close instead replays
-//!    the legacy `applyIncentives` + `concludeEpoch(address[])` pair (same code-hash gate as the
-//!    committee-pool read), keeping pre-fork history re-executable.
+//! 2. `apply_closing_epoch_contract_call` - the three boundary system calls in order:
+//!    `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, then `concludeEpoch(address[])`.
+//!    The reward infos carry the leader counts from `ctx.rewards_counter`; committee membership is
+//!    drawn by the `randomness`-seeded Fisher-Yates shuffle (sorted by address before encoding),
+//!    run AFTER `applySlashes` commits so the eligible-pool read and the committee reflect any
+//!    slash-to-zero ejections. The ordering is a consensus-safety obligation the protocol owns:
+//!    incentives weight on pre-slash collateral, slashes land before the committee is assembled,
+//!    and `concludeEpoch` settles queued stake version changes from post-slash balances. While the
+//!    deployed registry still carries the pre-fork adiri code, the close instead replays the legacy
+//!    `applyIncentives` + `concludeEpoch(address[])` pair (same code-hash gate as the
+//!    committee-pool read), keeping pre-fork history re-executable; the post-fork sequence differs
+//!    only by the interposed `applySlashes` call, and both share byte-identical `applyIncentives`
+//!    and `concludeEpoch(address[])` selectors.
 //! 3. `merge_transitions(BundleRetention::Reverts)` - folds the transaction and system-call
 //!    transitions into the bundle state, retaining revert data.
 //!
@@ -48,7 +52,7 @@
 //! block whose state diverges from the rest of the fleet.
 //!
 //! Note for auditors: protocol-side slashing is not live - the `slashes` array passed to
-//! `concludeEpoch` is always empty.
+//! `applySlashes` is always empty.
 //!
 //! # System-call state hygiene
 //!
@@ -257,11 +261,15 @@ where
         Ok(())
     }
 
-    /// Apply the closing epoch call to ConsensusRegistry.
+    /// Close the epoch through the three boundary system calls, in order:
+    /// `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`.
     ///
-    /// The single epoch-boundary system call: the registry distributes the closing epoch's
-    /// rewards, applies its slashes, settles queued stake version changes, and rotates the
-    /// epoch atomically.
+    /// The order is a consensus-safety invariant. `applySlashes` commits before the committee is
+    /// assembled, so the `nextCommitteeSize` read and the shuffle below both see any slash-to-zero
+    /// ejections: the committee `concludeEpoch` validates cannot be stale, and an ejected
+    /// validator is never seated in a future committee. Slashing is not live, so the slashes array
+    /// is always empty and `applySlashes` is a no-op today; the call is issued regardless so the
+    /// sequence is correct by construction when slashing ships.
     fn apply_closing_epoch_contract_call(
         &mut self,
         randomness: B256,
@@ -271,20 +279,48 @@ where
         let reward_infos: Vec<(Address, u32)> =
             rewards.iter().map(|(address, count)| (*address, *count)).collect();
 
-        // While the deployed registry still carries the pre-fork adiri code, the unified
-        // three-argument `concludeEpoch` selector does not exist on-chain — close with the
-        // legacy two-call sequence instead, so every pre-fork epoch close (fresh-node
-        // onboarding, full resync) executes byte-identically to the historical chain. At the
-        // fork boundary `apply_consensus_registry_fork` swaps the code first, so this gate
-        // already sees the upgraded hash and takes the unified call below.
+        // While the deployed registry still carries the pre-fork adiri code, close with the
+        // legacy two-call sequence instead, so every pre-fork epoch close (fresh-node onboarding,
+        // full resync) executes byte-identically to the historical chain. At the fork boundary
+        // `apply_consensus_registry_fork` swaps the code first, so this gate already sees the
+        // upgraded hash and takes the post-fork sequence below. The post-fork `applyIncentives`
+        // and `concludeEpoch(address[])` selectors are byte-identical to the legacy ones; the
+        // post-fork sequence differs only by the interposed `applySlashes` call.
         #[cfg(feature = "adiri")]
         if self.registry_code_is_pre_fork()? {
             return self.apply_closing_epoch_contract_call_legacy(randomness, reward_infos);
         }
 
-        let calldata = self.generate_conclude_epoch_calldata(randomness, reward_infos)?;
-        trace!(target: "engine", ?calldata, "close epoch calldata");
+        // 1. incentives, weighted on pre-slash collateral
+        let calldata = ConsensusRegistry::applyIncentivesCall {
+            rewardInfos: reward_infos
+                .iter()
+                .map(|(address, count)| RewardInfo {
+                    validatorAddress: *address,
+                    consensusHeaderCount: U256::from(*count),
+                })
+                .collect(),
+        }
+        .abi_encode()
+        .into();
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "applying incentives",
+        )?;
 
+        // 2. slashes (empty while slashing is disabled), landing before the committee is read
+        let calldata =
+            ConsensusRegistry::applySlashesCall { slashes: Vec::new() }.abi_encode().into();
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "applying slashes",
+        )?;
+
+        // 3. assemble the committee from the post-slash eligible pool, then conclude
+        let calldata = self.generate_conclude_epoch_calldata(randomness)?;
+        trace!(target: "engine", ?calldata, "close epoch calldata");
         self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
     }
 
@@ -292,9 +328,9 @@ where
     /// by `concludeEpoch(address[])`.
     ///
     /// Byte-exact replay of the two system calls every pre-fork epoch close was produced with,
-    /// in the same order, so re-executed pre-fork blocks derive identical state roots. The
-    /// committee shuffle inside `generate_conclude_epoch_calldata`'s counterpart here routes
-    /// its pool read through the legacy ABI via the same code-hash gate
+    /// in the same order, so re-executed pre-fork blocks derive identical state roots. Pre-fork
+    /// chains never executed `applySlashes` (slashing was never live), so it is absent here. The
+    /// committee shuffle routes its pool read through the legacy ABI via the same code-hash gate
     /// (`read_committee_eligible_pool`).
     #[cfg(feature = "adiri")]
     fn apply_closing_epoch_contract_call_legacy(
@@ -485,33 +521,18 @@ where
     /// The seeded shuffle decides committee membership; the shuffled addresses are then sorted
     /// ascending, so the encoded committee list is order-normalized while membership remains a
     /// pure function of the RNG draws.
-    fn generate_conclude_epoch_calldata(
-        &mut self,
-        randomness: B256,
-        reward_infos: Vec<(Address, u32)>,
-    ) -> TnRethResult<Bytes> {
-        // shuffle all validators for new committee
+    fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> TnRethResult<Bytes> {
+        // shuffle all validators for new committee. Runs after `applySlashes` has committed, so
+        // the eligible-pool read reflects any slash-to-zero ejections
         let mut new_committee = self.shuffle_new_committee(randomness)?;
 
         // sort addresses in ascending order (0x0...0xf)
         new_committee.sort();
-        debug!(target: "engine", ?new_committee, ?reward_infos, "new committee sorted by address");
+        debug!(target: "engine", ?new_committee, "new committee sorted by address");
 
-        // encode the call to bytes with method selector and args; slashing is not enabled, so
-        // the slashes array is always empty
-        let bytes = ConsensusRegistry::concludeEpochCall {
-            newCommittee: new_committee,
-            rewardInfos: reward_infos
-                .iter()
-                .map(|(address, count)| RewardInfo {
-                    validatorAddress: *address,
-                    consensusHeaderCount: U256::from(*count),
-                })
-                .collect(),
-            slashes: Vec::new(),
-        }
-        .abi_encode()
-        .into();
+        let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
+            .abi_encode()
+            .into();
 
         Ok(bytes)
     }
