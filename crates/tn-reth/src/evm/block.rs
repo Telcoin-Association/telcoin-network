@@ -52,7 +52,8 @@
 //! block whose state diverges from the rest of the fleet.
 //!
 //! Note for auditors: protocol-side slashing is not live - the `slashes` array passed to
-//! `applySlashes` is always empty.
+//! `applySlashes` is always empty (production builds; tests may inject slashes through the
+//! `cfg(test)` seam on `TNPayload`).
 //!
 //! # System-call state hygiene
 //!
@@ -148,6 +149,12 @@ pub struct TNBlockExecutionCtx {
     pub difficulty: U256,
     /// Counter used to allocate rewards for block leaders.
     pub rewards_counter: RewardsCounter,
+    /// Test-only slash injection for the epoch boundary, copied from the payload
+    /// (`context_for_next_block`). Feeds the executor's `epoch_boundary_slashes` seam so a test
+    /// can drive a non-empty slash list through the production close path. Production builds have
+    /// no such field.
+    #[cfg(test)]
+    pub epoch_boundary_slashes: Vec<ConsensusRegistry::Slash>,
 }
 
 impl TNBlockExecutionCtx {
@@ -268,8 +275,8 @@ where
     /// assembled, so the `nextCommitteeSize` read and the shuffle below both see any slash-to-zero
     /// ejections: the committee `concludeEpoch` validates cannot be stale, and an ejected
     /// validator is never seated in a future committee. Slashing is not live, so the slashes array
-    /// is always empty and `applySlashes` is a no-op today; the call is issued regardless so the
-    /// sequence is correct by construction when slashing ships.
+    /// is always empty (production builds) and `applySlashes` is a no-op today; the call is
+    /// issued regardless so the sequence is correct by construction when slashing ships.
     fn apply_closing_epoch_contract_call(
         &mut self,
         randomness: B256,
@@ -326,18 +333,34 @@ where
 
     /// The slashes to submit at this epoch boundary.
     ///
-    /// Slashing is not live: this always returns an empty list and `applySlashes` runs as a
-    /// no-op. An automated slash producer plugs in here and nowhere else. The caller sequences
-    /// the returned slashes through `applySlashes` BEFORE the committee size and eligible pool
-    /// are read, so a slash-to-zero ejection is always reflected in the committee that
-    /// `concludeEpoch` validates. Submitting slashes through any other path, or after the
-    /// committee reads, reintroduces the stale-committee revert pinned by
-    /// `test_stale_pre_slash_committee_reverts_close` - a deterministic fleet halt.
+    /// Slashing is not live: this always returns an empty list (production builds) and
+    /// `applySlashes` runs as a no-op. An automated slash producer plugs in here and nowhere
+    /// else. The caller sequences the returned slashes through `applySlashes` BEFORE the
+    /// committee size and eligible pool are read, so a slash-to-zero ejection is always
+    /// reflected in the committee that `concludeEpoch` validates. That end-to-end ordering is
+    /// pinned by `test_epoch_boundary_slash_ejects_through_production_close`, which injects a
+    /// slash-to-zero through the test seam and drives it through this production close path.
+    ///
+    /// Sizing contract for a future slash producer: amounts must be computed against
+    /// POST-incentive balances. `applyIncentives` credits `balances[validator]` before
+    /// `applySlashes` runs, and the registry ejects only when `balance <= slash.amount`
+    /// (otherwise it decrements and keeps the validator seated) — so an amount sized from the
+    /// pre-boundary balance under-slashes: the validator keeps the incentive delta and is never
+    /// ejected.
     ///
     /// Determinism: every node must derive an identical list (content and order) from the same
     /// certified consensus output, or the boundary block diverges across the fleet.
+    #[cfg(not(test))]
     fn epoch_boundary_slashes(&self) -> Vec<ConsensusRegistry::Slash> {
         Vec::new()
+    }
+
+    /// Test-only body for the epoch-boundary slash seam: yields the slashes injected through
+    /// `TNPayload::with_epoch_boundary_slashes` (carried on the execution ctx). See the
+    /// production body above for the ordering, sizing, and determinism contract.
+    #[cfg(test)]
+    fn epoch_boundary_slashes(&self) -> Vec<ConsensusRegistry::Slash> {
+        self.ctx.epoch_boundary_slashes.clone()
     }
 
     /// Close the epoch via the PRE-fork registry ABI: `applyIncentives(RewardInfo[])` followed

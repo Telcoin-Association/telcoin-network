@@ -187,6 +187,10 @@ impl ConfigureEvm for TnEvmConfig {
             close_epoch,
             difficulty: block.difficulty,
             rewards_counter: self.rewards_counter.clone(),
+            // the header carries no slash list: a replayed block cannot reproduce a
+            // test-injected slash (and does not need to — production lists are always empty)
+            #[cfg(test)]
+            epoch_boundary_slashes: Vec::new(),
         })
     }
 
@@ -203,6 +207,8 @@ impl ConfigureEvm for TnEvmConfig {
             close_epoch: payload.close_epoch,
             difficulty: U256::from(payload.batch_index << 16 | payload.worker_id as usize),
             rewards_counter: self.rewards_counter.clone(),
+            #[cfg(test)]
+            epoch_boundary_slashes: payload.epoch_boundary_slashes,
         })
     }
 }
