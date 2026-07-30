@@ -1430,6 +1430,32 @@ mod tests {
         let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block2.recovered_block.clone_sealed_header();
 
+        // system-call state hygiene through the close: SYSTEM_ADDRESS is a caller convention
+        // and must never enter the bundle (the executor strips it before every commit), and the
+        // closing block carries exactly one reverts entry — the wrapper's single post-finish
+        // merge (an in-finish merge would push a phantom second entry)
+        assert!(
+            block2.execution_output.state.state.get(&SYSTEM_ADDRESS).is_none(),
+            "SYSTEM_ADDRESS must not enter the epoch-closing bundle"
+        );
+        assert_eq!(
+            block2.execution_output.state.reverts.len(),
+            1,
+            "one merged reverts entry per closing block"
+        );
+
+        // a default (empty) RewardsCounter close allocates nothing: the boundary's
+        // applyIncentives ran with an empty rewardInfos array, so every genesis committee
+        // member still reads zero rewards
+        for v in &validators {
+            let rewards = reth_env.read_consensus_registry::<U256>(
+                ConsensusRegistry::getRewardsCall { validatorAddress: v.execution_address }
+                    .abi_encode()
+                    .into(),
+            )?;
+            assert!(rewards.is_zero(), "empty-counter close must allocate no rewards");
+        }
+
         // now close the second epoch so the new validator is active
         expected_epoch += 1;
         let consensus_output = consensus_output_for_tests(2, expected_epoch, 3, true);
@@ -1464,6 +1490,11 @@ mod tests {
         let calldata = ConsensusRegistry::getEpochInfoCall { epoch: epoch + 1 }.abi_encode().into();
         let new_epoch_info = reth_env
             .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)?;
+
+        // replay-critical order normalization: the installed committee is address-sorted
+        // (generate_conclude_epoch_calldata sorts after the shuffle) — asserted as a property,
+        // independent of the exact-membership golden below
+        assert!(new_epoch_info.committee.is_sorted(), "installed committee must be address-sorted");
 
         // ensure validators in increasing order by address
         let expected_new_committee = vec![
