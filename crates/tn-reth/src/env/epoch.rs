@@ -3483,6 +3483,154 @@ mod tests {
         Ok(())
     }
 
+    /// The closing block's own gas is folded into the PRODUCING worker's total only: with two
+    /// EIP-1559 workers and the closing block produced by worker 1 (not the worker-0 default
+    /// every other close test uses), worker 1's recorded fee is priced WITH the closing block's
+    /// user-tx gas while worker 0's is priced from its accumulator gas alone.
+    ///
+    /// This is the only test that discriminates the fold's TARGET selection
+    /// (`worker_id == own_worker` over `ctx.worker_id()` in `record_next_epoch_base_fees`):
+    /// with a worker-0 closing block, a `worker_id()` that always answers 0 and a fold applied
+    /// to every worker are both indistinguishable from the correct close. The fixture guards
+    /// pin both discriminations at runtime — the fold must move worker 1's oracle, and a leak
+    /// of the closing block's gas into worker 0 must move worker 0's.
+    #[tokio::test]
+    async fn test_close_folds_own_gas_into_producing_worker_only() -> eyre::Result<()> {
+        use crate::snapshot::worker_id_from_header;
+        use tn_types::{Hash as _, WorkerId};
+
+        const TARGET_GAS_0: u64 = 2_000_000;
+        const START_FEE_0: u64 = 2_000_000;
+        const EPOCH_GAS_0: u64 = 1_100_000;
+        const TARGET_GAS_1: u64 = 1_000_000;
+        const START_FEE_1: u64 = 1_000_000;
+        const EPOCH_GAS_1: u64 = 1_500_000;
+        const CLOSING_WORKER: WorkerId = 1;
+
+        let mut sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(79));
+        let genesis = test_genesis_with_consensus_registry_and_workers(
+            5,
+            vec![(0u8, TARGET_GAS_0), (0u8, TARGET_GAS_1)],
+        )
+        .extend_accounts([(
+            sender.address(),
+            GenesisAccount::default().with_balance(U256::from(parse_ether("1")?)),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Own Gas Producer Attribution Test");
+
+        // both workers carry moved fees and non-zero mid-epoch gas, so either slot would show a
+        // misattributed fold at full magnitude
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(START_FEE_0);
+        acc.inc_block(0, EPOCH_GAS_0, 30_000_000);
+        acc.base_fee(1).set_base_fee(START_FEE_1);
+        acc.inc_block(1, EPOCH_GAS_1, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // two real transfers ride the closing block
+        let recipient = Address::from_slice(&[0xef; 20]);
+        let txs = vec![
+            sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(recipient),
+                U256::from(1),
+                Bytes::new(),
+            ),
+            sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(recipient),
+                U256::from(1),
+                Bytes::new(),
+            ),
+        ];
+
+        // close epoch 0 from CLOSING_WORKER: `new_for_test` hardcodes worker 0, so build the
+        // payload through the production constructor with the same test inputs
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let parent = chain.sealed_genesis_header();
+        let payload = TNPayload::new(
+            parent.clone(),
+            Address::random(),
+            0, // batch_index
+            B256::random(),
+            &consensus_output,
+            consensus_output.digest().into(),
+            parent.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE),
+            parent.gas_limit,
+            B256::random(),
+            CLOSING_WORKER,
+        );
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, txs)?;
+        let closing_header = block.recovered_block.clone_sealed_header();
+
+        // the sealed header attributes the closing block to worker 1 through the production
+        // mask (the same low-16-bits read the executor's own-gas fold keys on)
+        assert_eq!(
+            worker_id_from_header(&closing_header),
+            CLOSING_WORKER,
+            "closing block must be attributed to worker 1"
+        );
+        let own_gas = closing_header.gas_used;
+        assert!(own_gas > 0, "closing block must carry user-tx gas");
+
+        let config_0 = WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS_0 };
+        let config_1 = WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS_1 };
+        // producing worker: accumulator gas plus the closing block's own gas
+        let expected_1 = next_base_fee_for_config(config_1, START_FEE_1, EPOCH_GAS_1 + own_gas);
+        // non-producing worker: accumulator gas alone
+        let expected_0 = next_base_fee_for_config(config_0, START_FEE_0, EPOCH_GAS_0);
+
+        // fixture guards: the fold must matter for worker 1 (an unfolded worker 1 prices
+        // differently), a leak into worker 0 must be visible (worker 0 with the closing gas
+        // prices differently), and every value sits away from MIN and the start fees
+        let unfolded_1 = next_base_fee_for_config(config_1, START_FEE_1, EPOCH_GAS_1);
+        assert_ne!(
+            expected_1, unfolded_1,
+            "fixture must discriminate the fold on the producing worker"
+        );
+        let leaked_0 = next_base_fee_for_config(config_0, START_FEE_0, EPOCH_GAS_0 + own_gas);
+        assert_ne!(
+            expected_0, leaked_0,
+            "fixture must discriminate own-gas leakage into the non-producing worker"
+        );
+        for fee in [expected_0, expected_1, unfolded_1, leaked_0] {
+            assert_ne!(fee, MIN_PROTOCOL_BASE_FEE, "fixture fees must not pin at MIN");
+        }
+        assert_ne!(expected_0, START_FEE_0);
+        assert_ne!(expected_1, START_FEE_1);
+        assert_ne!(expected_0, expected_1, "a swapped write must not alias the two workers");
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 2);
+        assert_eq!(
+            entries[1].data,
+            U184::from(expected_1),
+            "producing worker's record must fold the closing block's own gas"
+        );
+        assert_eq!(
+            entries[0].data,
+            U184::from(expected_0),
+            "non-producing worker's record must be priced from its accumulator gas alone"
+        );
+        // the data writes preserve both workers' strategies
+        assert_eq!(entries[0].config, config_0);
+        assert_eq!(entries[1].config, config_1);
+
+        Ok(())
+    }
+
     /// A worker governance adds MID-epoch (contract `numWorkers` 1 -> 2 while the shared
     /// accumulator still has 1 slot) is priced at the close from the CONTRACT's count with the
     /// fresh-slot anchor `next_base_fee_for_config(config, MIN_PROTOCOL_BASE_FEE, 0)`; the
