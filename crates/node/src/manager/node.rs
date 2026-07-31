@@ -866,6 +866,7 @@ where
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
         // The canonical epoch cross-checks the finalized header catchup pins its reads to.
         catchup_accumulator(reth_env, &gas_accumulator, &mut self.consensus_chain, epoch).await?;
+        self.try_restore_state(&engine).await?;
 
         // read the network config or use the default, then stamp the genesis chain id
         // onto it so every wire protocol and gossip topic is chain-namespaced (issue
@@ -901,7 +902,6 @@ where
             self.node_shutdown.subscribe(),
         );
 
-        self.try_restore_state(&engine).await?;
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine_update_rx, &node_task_manager);
 
