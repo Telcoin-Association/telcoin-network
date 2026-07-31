@@ -26,7 +26,7 @@ use std::{
 };
 
 use eyre::eyre;
-use tn_reth::RethEnv;
+use tn_reth::{snapshot::check_fees_resumable, RethEnv};
 use tn_storage::exec_state_pack::ExecStateStats;
 use tn_types::{BlockNumHash, ExecHeader, SealedHeader};
 use tokio::sync::{mpsc, oneshot};
@@ -62,7 +62,7 @@ struct ExportRequest {
     reth_env: RethEnv,
     block: BlockNumHash,
     out_dir: PathBuf,
-    reply: oneshot::Sender<eyre::Result<ExportOutcome>>,
+    reply: oneshot::Sender<eyre::Result<Option<ExportOutcome>>>,
 }
 
 /// Message to the background worker.
@@ -86,13 +86,13 @@ pub struct ExecStateExporter {
 impl ExecStateExporter {
     /// Spawn the background export worker. Each export supplies its own [`RethEnv`] (the node's
     /// execution engine — and its `RethEnv` — is recreated per epoch), so the worker holds none.
-    pub fn spawn() -> Self {
+    pub fn spawn() -> eyre::Result<Self> {
         let (tx, rx) = mpsc::channel(REQUEST_QUEUE);
         let worker = std::thread::Builder::new()
             .name("evm-state-exporter".to_string())
             .spawn(move || run_worker(rx))
-            .expect("failed to spawn evm-state-exporter thread");
-        Self { tx, worker: Arc::new(Mutex::new(Some(worker))) }
+            .map_err(|e| eyre::eyre!("failed to spawn evm-state-exporter thread: {e}"))?;
+        Ok(Self { tx, worker: Arc::new(Mutex::new(Some(worker))) })
     }
 
     /// Trigger an export of the execution state at `block` (read through `reth_env`) into
@@ -102,14 +102,16 @@ impl ExecStateExporter {
     /// execution tip (the worker waits briefly if it is still catching up to persistence).
     ///
     /// Non-blocking: enqueues the request and returns a receiver that resolves to the export result
-    /// once the background worker finishes. Drop the receiver for fire-and-forget. Returns an error
-    /// if the worker's queue is full (an export is already in flight/queued) or the worker stopped.
+    /// once the background worker finishes — `Ok(Some(outcome))` on success, or `Ok(None)` if the
+    /// snapshot was intentionally skipped as un-resumable (see [`export_once`]). Drop the receiver
+    /// for fire-and-forget. Returns an error if the worker's queue is full (an export is already in
+    /// flight/queued) or the worker stopped.
     pub fn trigger_export(
         &self,
         reth_env: RethEnv,
         block: BlockNumHash,
         out_dir: PathBuf,
-    ) -> eyre::Result<oneshot::Receiver<eyre::Result<ExportOutcome>>> {
+    ) -> eyre::Result<oneshot::Receiver<eyre::Result<Option<ExportOutcome>>>> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .try_send(WorkerMsg::Export(ExportRequest { reth_env, block, out_dir, reply }))
@@ -182,11 +184,18 @@ fn run_worker(mut rx: mpsc::Receiver<WorkerMsg>) {
 
 /// Pin the execution state at `block` (once it is the persisted tip) and write it to a pack in
 /// `out_dir`.
+///
+/// Returns `Ok(Some(outcome))` on a completed export, or `Ok(None)` when the snapshot is
+/// intentionally skipped because a node could not resume from it — an idle epoch (an EIP-1559
+/// worker with no genuine block in the window) leaves the base-fee derivation nothing to anchor, so
+/// a node bootstrapped from the bundle would walk below the snapshot and halt, and `db load-state`
+/// would reject it anyway. The check is the same one the importer runs and is done before the
+/// expensive state walk, so idle epochs cost only the header scan.
 fn export_once(
     reth_env: &RethEnv,
     block: BlockNumHash,
     out_dir: PathBuf,
-) -> eyre::Result<ExportOutcome> {
+) -> eyre::Result<Option<ExportOutcome>> {
     for attempt in 1..=MAX_PIN_ATTEMPTS {
         let view = reth_env.pin_state_view()?;
         // the pinned plain-state reflects the persisted tip, so `block` can only be exported once
@@ -208,6 +217,23 @@ fn export_once(
             .sealed_header_by_number(block.number)?
             .ok_or_else(|| eyre!("no sealed header at block {}", block.number))?;
         let headers = gather_headers(reth_env, &anchor)?;
+
+        // Do not produce a bundle a node could not resume from. `gather_headers` yields headers
+        // newest-first, so reverse into the ascending window the check expects (its last header is
+        // `block`, the snapshot's B). This is the same fee-derivability check the importer applies;
+        // skip the export (write nothing) when it fails.
+        let window: Vec<SealedHeader> =
+            headers.iter().rev().cloned().map(SealedHeader::seal_slow).collect();
+        if let Err(e) = check_fees_resumable(reth_env, &window) {
+            warn!(
+                target: "tn::snapshot",
+                number = block.number,
+                error = %e,
+                "skipping state export: snapshot would not be resumable"
+            );
+            return Ok(None);
+        }
+
         let stats = view
             .export_state_pack(anchor.state_root, &headers, &out_dir)
             .map_err(|e| eyre!("state export failed: {e}"))?;
@@ -220,7 +246,7 @@ fn export_once(
             bytecodes = stats.bytecodes,
             "exported execution state snapshot"
         );
-        return Ok(ExportOutcome { block, stats, path: out_dir });
+        return Ok(Some(ExportOutcome { block, stats, path: out_dir }));
     }
     Err(eyre!(
         "requested block {}:{} did not become the persisted execution tip after \
@@ -253,13 +279,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tn_reth::{RethChainSpec, RethEnv};
+    use tn_reth::{test_utils::test_genesis_with_consensus_registry, RethChainSpec, RethEnv};
     use tn_storage::exec_state_pack::ExecStatePackReader;
-    use tn_types::{test_genesis, TaskManager};
+    use tn_types::TaskManager;
 
     #[tokio::test]
     async fn triggers_export_on_background_thread() -> eyre::Result<()> {
-        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
         let db_dir = TempDir::new()?;
         let task_manager = TaskManager::new("export exec test");
         let reth_env = RethEnv::new_for_temp_chain(chain, db_dir.path(), &task_manager, None)?;
@@ -267,12 +293,18 @@ mod tests {
         let (genesis_root, genesis_block) =
             (genesis.state_root, BlockNumHash::new(0, genesis.hash()));
 
-        let exporter = ExecStateExporter::spawn();
+        let exporter = ExecStateExporter::spawn().expect("exporter to spawn");
 
         // trigger an export of the (genesis) tip on the background thread and await its result
         let out = TempDir::new()?;
         let rx = exporter.trigger_export(reth_env, genesis_block, out.path().to_path_buf())?;
-        let outcome = rx.await.expect("worker replied").expect("export succeeded");
+        // The registry-bearing test genesis reports entered epoch 0 (< 2), so the fee-resumability
+        // precheck passes and the export runs; unwrap the `Some` to reach the outcome.
+        let outcome = rx
+            .await
+            .expect("worker replied")
+            .expect("export succeeded")
+            .expect("export not skipped");
 
         // exported the requested genesis block, with the funded genesis accounts
         assert_eq!(outcome.block, genesis_block);

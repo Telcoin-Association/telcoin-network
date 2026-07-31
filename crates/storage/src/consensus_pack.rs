@@ -270,8 +270,6 @@ impl ConsensusPack {
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
-    /// Note, you should call persist() on the returned pack to make sure it
-    /// opened cleanly.
     pub fn open_static<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();

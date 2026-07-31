@@ -32,9 +32,12 @@ use tn_types::{
     gas_accumulator::{GasAccumulator, WorkerFeeConfig},
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier,
-    SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, B256,
-    DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
+    SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
+    MIN_PROTOCOL_BASE_FEE,
 };
+// Canonical worker-attribution helpers live in `tn-types` (one implementation, no drift); re-export
+// so the crate-internal call sites and tests keep referring to them by bare name.
+pub(crate) use tn_types::gas_accumulator::{is_worker_batch_block, worker_id_from_header};
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -324,11 +327,6 @@ pub fn sync_num_workers_from_chain(
     Ok(())
 }
 
-/// Worker id encoded in a header's `difficulty` (low 16 bits of `batch_index << 16 | worker_id`).
-pub(crate) fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
-    (header.difficulty.into_limbs()[0] & 0xffff) as u16
-}
-
 /// Return the most recent on-chain `base_fee_per_gas` for each worker that produced a block in
 /// `headers`.
 ///
@@ -349,24 +347,6 @@ pub(crate) fn latest_base_fee_per_worker(headers: &[SealedHeader]) -> HashMap<Wo
         }
     }
     fees
-}
-
-/// True when `header` is a genuine worker batch block.
-///
-/// Two on-chain block shapes are NOT worker batch blocks and must be excluded from per-worker
-/// fee/gas attribution:
-/// - the genesis block (`number == 0`), which carries no worker payload, and
-/// - the synthetic empty-close block the engine builds when an epoch closes with no batches. That
-///   block is stamped worker 0 and copies its PARENT's base fee (see `tn_engine`'s
-///   `execute_consensus_output`), so attributing it would poison worker 0 with another worker's
-///   fee. It is identified by `ommers_hash == B256::ZERO`: the header's `ommers_hash` carries the
-///   batch digest, and only the synthetic block passes `B256::ZERO` (real batch digests are never
-///   zero).
-///
-/// A non-empty epoch-closing block built from real batches has a non-zero `ommers_hash` and IS a
-/// genuine worker block.
-pub(crate) fn is_worker_batch_block(header: &SealedHeader) -> bool {
-    header.number != 0 && header.ommers_hash != B256::ZERO
 }
 
 /// Sum `gas_used` per worker over `headers`.
@@ -782,7 +762,17 @@ where
         };
 
         // Spawn the state exporter once, only when the feature is enabled.
-        let exec_state_exporter = builder.enable_state_export.then(ExecStateExporter::spawn);
+        let exec_state_exporter =
+            builder.enable_state_export.then(ExecStateExporter::spawn).transpose()?;
+
+        // With export enabled, clean up any orphaned temp export dirs left by a crashed/interrupted
+        // prior run. Safe here (startup) because no export is in flight; the per-epoch export path
+        // only ever clears its own epoch's temp, so it can never delete an in-flight one.
+        if exec_state_exporter.is_some() {
+            close_epoch::sweep_stale_tmp_exports(
+                &tn_datadir.consensus_db_path().join("state_exports"),
+            );
+        }
 
         Ok(Self {
             builder,
@@ -876,6 +866,7 @@ where
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
         // The canonical epoch cross-checks the finalized header catchup pins its reads to.
         catchup_accumulator(reth_env, &gas_accumulator, &mut self.consensus_chain, epoch).await?;
+        self.try_restore_state(&engine).await?;
 
         // read the network config or use the default, then stamp the genesis chain id
         // onto it so every wire protocol and gossip topic is chain-namespaced (issue
@@ -911,7 +902,6 @@ where
             self.node_shutdown.subscribe(),
         );
 
-        self.try_restore_state(&engine).await?;
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine_update_rx, &node_task_manager);
 
@@ -1311,6 +1301,17 @@ where
             });
         }
 
+        // Startup consistency guard against an incomplete state restore. Resolve the executed tip's
+        // producing consensus header from the tip's OWN nonce (epoch) and
+        // `parent_beacon_block_root` (hash) via `last_executed_consensus_block` — the
+        // slot-hint-immune signal — and hand both to `check_restore_consistency`, which
+        // decides whether the pair is coherent.
+        let tip = self.consensus_bus.recent_blocks().borrow().latest_execution_block();
+        let producing_header =
+            state_sync::last_executed_consensus_block(&self.consensus_bus, &self.consensus_chain)
+                .await;
+        check_restore_consistency(&tip, producing_header.as_ref())?;
+
         Ok(())
     }
 
@@ -1341,11 +1342,52 @@ where
     }
 }
 
+/// Refuse to start on an incomplete state restore: reth is populated to a tip past genesis but the
+/// consensus store has no record of the consensus output that produced that tip.
+///
+/// `tip` is reth's canonical execution tip (as seeded into `recent_blocks`), and `producing_header`
+/// is the tip's producing consensus header as resolved by
+/// [`last_executed_consensus_block`](state_sync::last_executed_consensus_block) — `None` when the
+/// header is absent from the consensus store.
+///
+/// Invariant relied on: "execution follows consensus" — `save_consensus_output` persists a block's
+/// producing consensus HEADER to the consensus store BEFORE that block executes. So any healthy
+/// node that has executed block `B > 0` always resolves `B`'s producing header, whether it is
+/// running, mid multi-epoch catch-up (epoch RECORDS may lag, but the header does not), or
+/// restarting right at/after an epoch boundary (the closing epoch's pack is persisted static before
+/// the next opens, so it stays readable). The only way the header is absent with a populated reth
+/// tip is a state-only / partial / crashed-mid-import restore, which this rejects.
+///
+/// Genesis / fresh nodes (`tip.number == 0`) are exempt: the genesis header has no producing
+/// consensus output, so `producing_header` is legitimately `None` there.
+/// `last_executed_consensus_block` keys on the tip's OWN nonce/`parent_beacon_block_root`, never
+/// the slot-hint-derived `consensus_header_latest`, so a legitimate node with a stale/torn resume
+/// hint is not flagged.
+fn check_restore_consistency(
+    tip: &SealedHeader,
+    producing_header: Option<&ConsensusHeader>,
+) -> eyre::Result<()> {
+    if tip.number > 0 && producing_header.is_none() {
+        let (tip_epoch, _) = deconstruct_nonce(tip.nonce.into());
+        return Err(eyre!(
+            "datadir is an incomplete state restore: execution is at block {} (epoch {tip_epoch}) \
+             but the consensus store has no record of the consensus that produced it. Remove the \
+             chain-data directories (`db`, `static_files`, and `consensus-db`) under the datadir \
+             and re-run `db load-state` with a COMPLETE export bundle — do NOT delete the datadir \
+             itself, which holds your node keys. Or start from an empty datadir to sync from \
+             genesis.",
+            tip.number
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tn_types::{
-        gas_accumulator::compute_next_base_fee_eip1559, ExecHeader, MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::compute_next_base_fee_eip1559, ExecHeader, B256, MIN_PROTOCOL_BASE_FEE,
+        U256,
     };
 
     /// Build a sealed header shaped like an executed worker block for scan tests.
@@ -1551,5 +1593,43 @@ mod tests {
                 0,
             ),
         );
+    }
+
+    /// A tip sealed header at `number` whose nonce encodes `epoch` (upper 32 bits), matching the
+    /// payload builder's `nonce = epoch << 32 | round` layout that `deconstruct_nonce` reads back.
+    fn tip_at(number: u64, epoch: u32) -> SealedHeader {
+        let header =
+            ExecHeader { number, nonce: ((epoch as u64) << 32).into(), ..Default::default() };
+        SealedHeader::new(header, B256::repeat_byte(0xab))
+    }
+
+    #[test]
+    fn restore_guard_fires_on_populated_tip_without_producing_header() {
+        // reth executed past genesis (block 5, epoch 7) but the tip's producing consensus header is
+        // absent from the store — the incomplete-restore signature.
+        let err = check_restore_consistency(&tip_at(5, 7), None)
+            .expect_err("populated tip with no producing header must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("incomplete state restore"), "unexpected error: {msg}");
+        assert!(msg.contains("block 5"), "error should name the tip block: {msg}");
+        assert!(msg.contains("epoch 7"), "error should name the tip epoch: {msg}");
+    }
+
+    #[test]
+    fn restore_guard_does_not_fire_at_genesis() {
+        // fresh/genesis node: tip is block 0, which has no producing consensus output, so a None
+        // header is legitimate and the guard must not fire.
+        check_restore_consistency(&tip_at(0, 0), None).expect("genesis tip must not be refused");
+    }
+
+    #[test]
+    fn restore_guard_does_not_fire_on_consistent_store() {
+        // normal populated node: reth is past genesis and the tip's producing header resolves, so
+        // the guard must not fire (covers a running node, mid-catch-up, and an epoch-boundary
+        // restart — all of which resolve the header per the "execution follows consensus"
+        // invariant).
+        let header = ConsensusHeader::default();
+        check_restore_consistency(&tip_at(5, 7), Some(&header))
+            .expect("populated tip with a resolved producing header must not be refused");
     }
 }
