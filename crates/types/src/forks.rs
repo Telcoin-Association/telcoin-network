@@ -92,6 +92,14 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 ///   pre-fork code, with pin tests against the embedded `ConsensusRegistry.json` and
 ///   `WorkerConfigs.json` artifacts: after the fork runs live, a tn-contracts artifact bump would
 ///   otherwise change the bytes re-execution swaps in and break historical state roots;
+/// - read the LIVE deployed `WorkerConfigs` and confirm `numWorkers()` and, for every `i <
+///   numWorkers`, `_workerConfigSet[i] == true` (a storage probe — the mapping is internal): the
+///   first post-fork closing block's `setWorkerConfigsData` system call reverts
+///   `MissingWorkerConfig` on any unset row, aborting the one-shot fork-boundary close. Do this
+///   alongside the post-fork hash re-pinning above, since an artifact rebuild silently moves those
+///   hashes. Informational reference only, NOT a compiled constant: at the time of writing, the
+///   embedded artifact's post-fork `WorkerConfigs` splice hashes to
+///   `0x58304c00bbfaa7e348220efb95843614756207311245abc4949f91bb3ddb2ff7`;
 /// - the `WorkerConfigs` bytecode swap ships at this same fork epoch (see
 ///   [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`]) — both swaps land in the epoch-closing block of
 ///   `CONSENSUS_REGISTRY_FORK_EPOCH - 1`, so a build applying one but not the other diverges;

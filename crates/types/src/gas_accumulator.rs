@@ -116,11 +116,16 @@ pub fn is_worker_batch_block(header: &SealedHeader) -> bool {
 /// The contract documents `data` as reserved space for the protocol. As of the epoch-close
 /// base-fee snapshot it carries an [`WorkerFeeConfig::Eip1559`] worker's NEXT-epoch base fee,
 /// written by the closing block's `setWorkerConfigsData` system call, so a node entering an epoch
-/// can read the fee from one state slot instead of scanning the previous epoch's headers. A zero
-/// `data` means the word was never written — no epoch has closed since the worker was configured,
-/// or the worker is [`WorkerFeeConfig::Static`] and its fee already lives in the config's `value`.
-/// Zero is unambiguous for the workers that do get written, because a recorded fee is never below
-/// `MIN_PROTOCOL_BASE_FEE`.
+/// can read the fee from one state slot instead of scanning the previous epoch's headers.
+///
+/// `data` is authoritative ONLY for a row whose config reads [`WorkerFeeConfig::Eip1559`] at an
+/// epoch-closing block after the write path activated. A zero word means it was never written —
+/// no epoch has closed since the worker was configured, or the row is [`WorkerFeeConfig::Static`]
+/// and its fee already lives in the config's `value` (Static rows are never written). Non-zero
+/// does NOT imply current: a row governance switches Eip1559 -> Static keeps its last recorded
+/// word forever, and the owner setters can store an arbitrary `uint184`. Readers must gate on the
+/// row's strategy, never on `data` alone. Zero stays unambiguous for the rows that do get
+/// written, because a recorded fee is never below `MIN_PROTOCOL_BASE_FEE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerConfigEntry {
     /// The worker's fee strategy for the next epoch.
@@ -329,6 +334,11 @@ impl GasAccumulator {
     /// Increment the block count, gas used, and gas limit for `worker_id`.
     ///
     /// Blocks with zero `gas_used` are silently skipped to avoid inflating counts on restarts.
+    ///
+    /// The totals recorded here are consensus-critical: at epoch close the block executor reads
+    /// them to price next-epoch base fees and writes the result into EVM state
+    /// (`record_next_epoch_base_fees` in `tn-reth`), so a missed or double-counted block
+    /// diverges the closing block's hash across the fleet, not just a local fee.
     ///
     /// # Panics
     ///

@@ -176,6 +176,11 @@ pub(crate) struct EpochManager<P, DB> {
 /// count and every worker's base fee for the entered epoch, deriving them from the previous
 /// epoch's closing-block state on every entry.
 ///
+/// The restored per-worker gas totals and worker count are consensus-critical, not merely local
+/// fee inputs: the next epoch close feeds them into the closing block's on-chain base-fee record
+/// (`record_next_epoch_base_fees` in `tn-reth`), so an inaccurate restore here diverges that
+/// block's hash from the rest of the fleet.
+///
 /// Every chain-derived input (the block scan range's start and end, the worker-count read block,
 /// and the epoch used to bound leader counting) is pinned to the single finalized
 /// [`SealedHeader`]. Startup heals the finalized marker to the persisted canonical tip

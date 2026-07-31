@@ -433,7 +433,12 @@ where
     ///
     /// Fatal on any failure (read, decode, or a reverting/halting write), like every other step of
     /// the close: the error aborts execution of the consensus output rather than committing a
-    /// block whose state diverges from the rest of the fleet.
+    /// block whose state diverges from the rest of the fleet. That is deliberately the opposite
+    /// of the manager-side close-time update (`apply_close_time_fee_updates` in `tn-node`), which
+    /// fails OPEN on a chain-global `WorkerConfigs` read failure — keeping the current fees is
+    /// safe there because every node deterministically computes the same keep. A silently skipped
+    /// write here would instead leave a stale `data` word for the entry-time read of the recorded
+    /// fee to trust later, so fatal-and-halt beats silently-wrong state.
     fn record_next_epoch_base_fees(&mut self) -> TnRethResult<()> {
         let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
         let data = self.read_state_on_chain(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
