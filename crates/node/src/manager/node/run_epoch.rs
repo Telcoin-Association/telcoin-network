@@ -31,7 +31,7 @@ use tn_primary::ConsensusBus;
 use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
-    gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator, WorkerFeeConfig},
+    gas_accumulator::{next_base_fee_for_config, GasAccumulator},
     BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase,
     EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
 };
@@ -741,11 +741,11 @@ where
 /// Recompute each worker's next-epoch base fee from the gas it accumulated this epoch and the
 /// worker's fee strategy read from the `WorkerConfigs` contract.
 ///
-/// Reads one [`WorkerFeeConfig`] per worker at the canonical tip — which inside
-/// [`Self::close_epoch`] (after `wait_for_consensus_execution`) is exactly the epoch's closing
-/// block — then applies the strategy via [`next_base_fee_for_config`] and writes the result back to
-/// each worker's base-fee container. This is the deterministic seam every committee member runs
-/// identically at the boundary.
+/// Reads one [`WorkerFeeConfig`](tn_types::gas_accumulator::WorkerFeeConfig) per worker at the
+/// canonical tip — which inside [`Self::close_epoch`] (after `wait_for_consensus_execution`) is
+/// exactly the epoch's closing block — then applies the strategy via [`next_base_fee_for_config`]
+/// and writes the result back to each worker's base-fee container. This is the deterministic seam
+/// every committee member runs identically at the boundary.
 ///
 /// The read's config count is the on-chain `numWorkers()` at the closing block, i.e. the worker
 /// count for the NEXT epoch (a mid-epoch `setNumWorkers` only takes effect at the boundary by
@@ -934,29 +934,6 @@ where
     }
 }
 
-/// Apply a worker's [`WorkerFeeConfig`] to compute its next-epoch base fee.
-///
-/// `Eip1559 { target_gas }` nudges the fee toward the gas target via
-/// [`compute_next_base_fee_eip1559`] (floored at `MIN_PROTOCOL_BASE_FEE`); `Static { fee }` pins
-/// the fee to the governance-set value, ignoring gas usage.
-///
-/// This is the ONE fee formula: [`adjust_base_fees`] applies it at a live epoch close and
-/// `fold_next_epoch_base_fees` (in the parent module) applies it when deriving the entered
-/// epoch's fees from the previous epoch's chain state, so both seams produce identical values
-/// from identical inputs.
-pub(crate) fn next_base_fee_for_config(
-    config: WorkerFeeConfig,
-    current_base_fee: u64,
-    gas_used: u64,
-) -> u64 {
-    match config {
-        WorkerFeeConfig::Eip1559 { target_gas } => {
-            compute_next_base_fee_eip1559(current_base_fee, gas_used, target_gas)
-        }
-        WorkerFeeConfig::Static { fee } => fee,
-    }
-}
-
 /// How the next consensus output's number relates to the last one forwarded to the engine.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum OutputContinuity {
@@ -996,51 +973,8 @@ mod tests {
     };
     use tn_types::{
         BlsSignature, Certificate, CommittedSubDag, ConsensusHeader, ReputationScores,
-        SignatureVerificationState, MIN_PROTOCOL_BASE_FEE,
+        SignatureVerificationState,
     };
-
-    #[test]
-    fn eip1559_config_with_max_target_is_inert_at_min() {
-        // Genesis/default strategy: Eip1559 { target_gas: u64::MAX }. Against an unreachable target
-        // the fee can only ratchet down and floors at MIN, so a worker at MIN stays at MIN
-        // regardless of gas used -- the inert guarantee that keeps existing chains unchanged.
-        let cfg = WorkerFeeConfig::Eip1559 { target_gas: u64::MAX };
-        assert_eq!(
-            next_base_fee_for_config(cfg, MIN_PROTOCOL_BASE_FEE, 5_000_000),
-            MIN_PROTOCOL_BASE_FEE
-        );
-        // a non-MIN fee ratchets down (and never below MIN)
-        let down = next_base_fee_for_config(cfg, MIN_PROTOCOL_BASE_FEE * 1000, 0);
-        assert!((MIN_PROTOCOL_BASE_FEE..MIN_PROTOCOL_BASE_FEE * 1000).contains(&down));
-    }
-
-    #[test]
-    fn eip1559_config_moves_fee_with_gas_vs_target() {
-        let target = 1_000_000u64;
-        let current = 1_000_000u64;
-        let cfg = WorkerFeeConfig::Eip1559 { target_gas: target };
-        // gas above target -> fee increases; below -> decreases; at target -> unchanged.
-        assert!(next_base_fee_for_config(cfg, current, 2_000_000) > current);
-        assert!(next_base_fee_for_config(cfg, current, 0) < current);
-        assert_eq!(next_base_fee_for_config(cfg, current, target), current);
-    }
-
-    #[test]
-    fn static_config_pins_to_configured_fee() {
-        // Static ignores gas usage and the current fee, always returning the governance-set value.
-        assert_eq!(
-            next_base_fee_for_config(
-                WorkerFeeConfig::Static { fee: 12_345 },
-                MIN_PROTOCOL_BASE_FEE,
-                999_999
-            ),
-            12_345
-        );
-        assert_eq!(
-            next_base_fee_for_config(WorkerFeeConfig::Static { fee: 500 }, 1_000_000, 0),
-            500
-        );
-    }
 
     #[tokio::test(start_paused = true)]
     async fn retry_provider_faults_halts_after_exhausting_attempts() {

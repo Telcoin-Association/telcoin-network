@@ -29,7 +29,7 @@ use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce,
-    gas_accumulator::{GasAccumulator, WorkerFeeConfig},
+    gas_accumulator::{next_base_fee_for_config, GasAccumulator, WorkerFeeConfig},
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier,
     SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
@@ -372,7 +372,7 @@ pub(crate) fn gas_used_per_worker(headers: &[SealedHeader]) -> HashMap<WorkerId,
 /// during the epoch that just closed.
 ///
 /// One slot per entry in `configs` (the on-chain `WorkerConfigs` order, indexed by worker id).
-/// A worker present in `held_fees` folds through `next_base_fee_for_config` — the SAME formula
+/// A worker present in `held_fees` folds through [`next_base_fee_for_config`] — the SAME formula
 /// `adjust_base_fees` (in the `run_epoch` module) applies at a live epoch close, so entry
 /// derivation and close-time adjustment produce identical values from identical inputs. A worker
 /// absent from `held_fees` (no genuine block in the scanned range, so the chain does not reveal
@@ -389,7 +389,7 @@ pub fn fold_next_epoch_base_fees(
             let worker_id = worker_id as WorkerId;
             held_fees.get(&worker_id).map(|&held_fee| {
                 let gas_used = gas_totals.get(&worker_id).copied().unwrap_or_default();
-                run_epoch::next_base_fee_for_config(*config, held_fee, gas_used)
+                next_base_fee_for_config(*config, held_fee, gas_used)
             })
         })
         .collect()
@@ -521,7 +521,7 @@ pub fn derive_base_fees_for_entered_epoch(
 ///
 /// A step describes the boundary INTO some epoch `k`: the worker's strategy read at epoch
 /// `k - 1`'s closing block, plus what epoch `k - 1`'s genuine blocks reveal about the worker.
-/// Folding a step ([`fold_forward`]) reproduces the `next_base_fee_for_config` application the
+/// Folding a step ([`fold_forward`]) reproduces the [`next_base_fee_for_config`] application the
 /// live committee ran at that boundary's close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EpochFeeStep {
@@ -543,9 +543,9 @@ pub(crate) struct EpochFeeStep {
 /// the SAME formula a live `adjust_base_fees` ran at that boundary. The result is the fee the
 /// worker holds entering the epoch above the last step's boundary.
 pub(crate) fn fold_forward(anchor: u64, steps: &[EpochFeeStep]) -> u64 {
-    steps.iter().fold(anchor, |current, step| {
-        run_epoch::next_base_fee_for_config(step.config, current, step.gas_used)
-    })
+    steps
+        .iter()
+        .fold(anchor, |current, step| next_base_fee_for_config(step.config, current, step.gas_used))
 }
 
 /// Derive the base fee worker `worker_id` holds during `epoch` purely from on-chain state —
@@ -1516,7 +1516,7 @@ mod tests {
             );
             assert_eq!(
                 fees,
-                vec![Some(run_epoch::next_base_fee_for_config(config, held_fee, gas_used))],
+                vec![Some(next_base_fee_for_config(config, held_fee, gas_used))],
                 "fold diverged from next_base_fee_for_config for {config:?}",
             );
         }
@@ -1545,10 +1545,7 @@ mod tests {
         // the decay is real: three idle boundaries move a non-MIN fee down (and never below MIN)
         assert!((MIN_PROTOCOL_BASE_FEE..anchor).contains(&oracle));
         // and each boundary equals the one-formula seam
-        assert_eq!(
-            fold_forward(anchor, &steps[..1]),
-            run_epoch::next_base_fee_for_config(cfg, anchor, 0),
-        );
+        assert_eq!(fold_forward(anchor, &steps[..1]), next_base_fee_for_config(cfg, anchor, 0));
     }
 
     #[test]
@@ -1580,7 +1577,7 @@ mod tests {
         let creation_static = idle_step(WorkerFeeConfig::Static { fee: 800 });
         assert_eq!(
             fold_forward(MIN_PROTOCOL_BASE_FEE, &[creation_static]),
-            run_epoch::next_base_fee_for_config(
+            next_base_fee_for_config(
                 WorkerFeeConfig::Static { fee: 800 },
                 MIN_PROTOCOL_BASE_FEE,
                 0,
@@ -1594,11 +1591,7 @@ mod tests {
         // later boundaries fold from the creation-priced fee
         assert_eq!(
             fold_forward(MIN_PROTOCOL_BASE_FEE, &[creation_static, creation_eip]),
-            run_epoch::next_base_fee_for_config(
-                WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 },
-                800,
-                0,
-            ),
+            next_base_fee_for_config(WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 }, 800, 0),
         );
     }
 
