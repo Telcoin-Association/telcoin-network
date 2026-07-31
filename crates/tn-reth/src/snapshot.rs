@@ -90,7 +90,7 @@ use tn_storage::exec_state_pack::{
     ExecStateStats, StateEntry,
 };
 use tn_types::{
-    gas_accumulator::{RewardsCounter, WorkerFeeConfig},
+    gas_accumulator::{GasAccumulator, WorkerFeeConfig},
     Address, BlockBody, BlockNumHash, Bytes, Epoch, ExecHeader, GenesisAccount, SealedBlock,
     SealedHeader, TaskManager, WorkerId, B256, U256,
 };
@@ -348,7 +348,7 @@ impl SnapshotRestorer {
         task_manager: &TaskManager,
     ) -> eyre::Result<Self> {
         let reth_env =
-            RethEnv::new(reth_config, task_manager, db, None, RewardsCounter::default())?;
+            RethEnv::new(reth_config, task_manager, db, None, GasAccumulator::default())?;
 
         // a fresh or genesis-only datadir sits at block 0; any higher tip means the datadir
         // already holds chain data that restore must not clobber.
@@ -1008,7 +1008,7 @@ mod tests {
     use tempfile::TempDir;
     use tn_storage::exec_state_pack::{ExecStateAccount, ExecStatePackReader, ExecStatePackWriter};
     use tn_types::{
-        gas_accumulator::RewardsCounter, keccak256, test_genesis, Address, BlockNumHash, Bytes,
+        gas_accumulator::GasAccumulator, keccak256, test_genesis, Address, BlockNumHash, Bytes,
         ExecHeader, GenesisAccount, SealedHeader, TaskManager, B256, U256,
     };
 
@@ -1333,7 +1333,7 @@ mod tests {
         restorer.finish(final_state)?;
 
         // read the restored state back through a fresh env over the destination datadir
-        let reader = RethEnv::new(&reth_config, &dst_tm, db, None, RewardsCounter::default())?;
+        let reader = RethEnv::new(&reth_config, &dst_tm, db, None, GasAccumulator::default())?;
         assert_eq!(reader.last_block_number()?, b);
         assert_eq!(
             reader.sealed_header_by_number(b)?.expect("tip header").hash(),
@@ -1417,7 +1417,7 @@ mod tests {
         assert_eq!(root, root_without_s);
         restorer.finish(final_state)?;
 
-        let reader = RethEnv::new(&reth_config, &dst_tm, db, None, RewardsCounter::default())?;
+        let reader = RethEnv::new(&reth_config, &dst_tm, db, None, GasAccumulator::default())?;
         let state = reader.latest()?;
         assert!(
             state.storage(contract, slot_s)?.unwrap_or_default().is_zero(),
@@ -1863,7 +1863,7 @@ mod tests {
         // open a fresh env over the restored datadir for both the table-level assertions and the
         // state readback
         let reader =
-            RethEnv::new(&dst_config, &dst_tm, dst_db.clone(), None, RewardsCounter::default())?;
+            RethEnv::new(&dst_config, &dst_tm, dst_db.clone(), None, GasAccumulator::default())?;
 
         // change sets at block B MUST be empty: the skip is what lets storage stream per chunk.
         // genesis (block 0) legitimately keeps its own change sets (init_genesis wrote them and the

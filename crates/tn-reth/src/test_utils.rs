@@ -63,7 +63,7 @@ use std::{
 use tn_config::NodeInfo;
 use tn_types::{
     address, calculate_transaction_root,
-    gas_accumulator::{RewardsCounter, WorkerFeeConfig},
+    gas_accumulator::{GasAccumulator, WorkerFeeConfig},
     generate_proof_of_possession_bls_for_test, keccak256, now, test_chain_spec_arc, test_genesis,
     AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsKeypair,
     BlsPublicKey, BlsSignature, Bytes, Certificate, CommittedSubDag, Committee, CommitteeBuilder,
@@ -90,7 +90,7 @@ impl RethEnv {
     pub fn new_for_test<P: AsRef<Path>>(
         db_path: P,
         task_manager: &TaskManager,
-        rewards: Option<RewardsCounter>,
+        rewards: Option<GasAccumulator>,
     ) -> eyre::Result<Self> {
         Self::new_for_temp_chain(test_chain_spec_arc(), db_path, task_manager, rewards)
     }

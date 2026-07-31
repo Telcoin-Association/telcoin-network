@@ -1258,8 +1258,9 @@ where
 
     /// Build the execution engine and its underlying reth environment.
     ///
-    /// The reth env is wired to the shared `reth_db`, the configured base-fee address, and the
-    /// accumulator's rewards counter so execution and reward accounting stay consistent.
+    /// The reth env is wired to the shared `reth_db`, the configured base-fee address, and a clone
+    /// of the live gas accumulator so execution, gas/fee accounting, and reward accounting all
+    /// observe the same shared state.
     fn create_engine(
         &self,
         engine_task_manager: &TaskManager,
@@ -1272,7 +1273,7 @@ where
             engine_task_manager,
             self.reth_db.clone(),
             basefee_address,
-            gas_accumulator.rewards_counter(),
+            gas_accumulator.clone(),
         )?;
         let engine = ExecutionNode::new(&self.builder, reth_env)?;
 

@@ -70,7 +70,7 @@ use tn_config::{
     WORKER_CONFIGS_JSON,
 };
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, Genesis, GenesisAccount, TaskManager, B256, U256,
+    gas_accumulator::GasAccumulator, Address, Genesis, GenesisAccount, TaskManager, B256, U256,
 };
 use tracing::debug;
 
@@ -88,7 +88,7 @@ impl RethEnv {
         chain: Arc<RethChainSpec>,
         db_path: P,
         task_manager: &TaskManager,
-        rewards: Option<RewardsCounter>,
+        rewards: Option<GasAccumulator>,
     ) -> eyre::Result<Self> {
         /// MDBX map-size ceiling for throwaway temp-chain envs. reth defaults to 8 TB per
         /// environment; `cargo test` runs a test binary as threads in ONE process, so N

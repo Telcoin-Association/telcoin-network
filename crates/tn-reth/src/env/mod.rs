@@ -27,7 +27,7 @@ use reth_provider::{
 };
 use reth_revm::{database::StateProviderDatabase, State};
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_types::{gas_accumulator::RewardsCounter, Address, TaskManager, TaskSpawner, B256};
+use tn_types::{gas_accumulator::GasAccumulator, Address, TaskManager, TaskSpawner, B256};
 use tracing::{debug, info};
 
 use crate::{
@@ -109,10 +109,10 @@ impl RethEnv {
         task_manager: &TaskManager,
         database: RethDb,
         basefee_address: Option<Address>,
-        rewards_counter: RewardsCounter,
+        gas_accumulator: GasAccumulator,
     ) -> eyre::Result<Self> {
         let node_config = reth_config.0.clone();
-        let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), rewards_counter);
+        let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), gas_accumulator);
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
         let blockchain_provider = BlockchainProvider::new(provider_factory)?;
         let task_spawner = task_manager.get_spawner();
@@ -200,7 +200,7 @@ impl RethEnv {
     }
 
     /// Return the EVM config used to build and execute TN blocks: the chain spec plus
-    /// the rewards counter, wiring the TN handler (base-fee redirection, gas-limit
+    /// the shared gas accumulator, wiring the TN handler (base-fee redirection, gas-limit
     /// penalty) and the TN precompiles.
     pub(crate) fn evm_config(&self) -> &TnEvmConfig {
         &self.inner.evm_config

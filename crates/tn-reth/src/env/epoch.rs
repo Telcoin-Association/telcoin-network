@@ -990,8 +990,9 @@ mod tests {
     use tempfile::TempDir;
     use tn_config::NodeInfo;
     use tn_types::{
-        gas_accumulator::RewardsCounter, generate_proof_of_possession_bls_for_test, BlsKeypair,
-        GenesisAccount, NodeP2pInfo, TaskManager, U256,
+        gas_accumulator::{GasAccumulator, RewardsCounter},
+        generate_proof_of_possession_bls_for_test, BlsKeypair, GenesisAccount, NodeP2pInfo,
+        TaskManager, U256,
     };
 
     /// In-protocol `ConsensusRegistry` fork over the PRE-fork testnet registry.
@@ -2322,7 +2323,7 @@ mod tests {
             chain.clone(),
             tmp_dir.path(),
             &task_manager,
-            Some(counter.clone()),
+            Some(GasAccumulator::new_with_rewards(1, counter.clone())),
         )?;
 
         // seed the counter exactly as run_epoch does at epoch entry: the genesis committee,

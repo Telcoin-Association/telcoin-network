@@ -27,17 +27,17 @@
 //!    place, then runs the one-time `migrateValidatorSets()`.
 //! 2. `apply_closing_epoch_contract_call` - the three boundary system calls in order:
 //!    `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, then `concludeEpoch(address[])`.
-//!    The reward infos carry the leader counts from `ctx.rewards_counter`; committee membership is
-//!    drawn by the `randomness`-seeded Fisher-Yates shuffle (sorted by address before encoding),
-//!    run AFTER `applySlashes` commits so the eligible-pool read and the committee reflect any
-//!    slash-to-zero ejections. The ordering is a consensus-safety obligation the protocol owns:
-//!    incentives weight on pre-slash collateral, slashes land before the committee is assembled,
-//!    and `concludeEpoch` settles queued stake version changes from post-slash balances. While the
-//!    deployed registry still carries the pre-fork adiri code, the close instead replays the legacy
-//!    `applyIncentives` + `concludeEpoch(address[])` pair (same code-hash gate as the
-//!    committee-pool read), keeping pre-fork history re-executable; the post-fork sequence differs
-//!    only by the interposed `applySlashes` call, and both share byte-identical `applyIncentives`
-//!    and `concludeEpoch(address[])` selectors.
+//!    The reward infos carry the leader counts from `ctx.gas_accumulator`'s rewards counter;
+//!    committee membership is drawn by the `randomness`-seeded Fisher-Yates shuffle (sorted by
+//!    address before encoding), run AFTER `applySlashes` commits so the eligible-pool read and the
+//!    committee reflect any slash-to-zero ejections. The ordering is a consensus-safety obligation
+//!    the protocol owns: incentives weight on pre-slash collateral, slashes land before the
+//!    committee is assembled, and `concludeEpoch` settles queued stake version changes from
+//!    post-slash balances. While the deployed registry still carries the pre-fork adiri code, the
+//!    close instead replays the legacy `applyIncentives` + `concludeEpoch(address[])` pair (same
+//!    code-hash gate as the committee-pool read), keeping pre-fork history re-executable; the
+//!    post-fork sequence differs only by the interposed `applySlashes` call, and both share
+//!    byte-identical `applyIncentives` and `concludeEpoch(address[])` selectors.
 //!
 //! The order is load-bearing. The fork must lead: the code swap flips the code-hash gate in
 //! `read_committee_eligible_pool` so the shuffle's committee-pool reads use the post-fork ABI
@@ -68,7 +68,7 @@
 //! certificate's aggregate BLS signature, computed in `CommittedSubDag::new` and carried through
 //! the payload. It seeds the deterministic committee shuffle AND is stored as the block's
 //! `extra_data`, which is how the replay path (`context_for_block`) rebuilds the ctx from the
-//! sealed header — identical up to `rewards_counter`, which is the live shared counter rather
+//! sealed header — identical up to `gas_accumulator`, which is the live shared accumulator rather
 //! than header-derived (see the `evm/config.rs` module docs for the replay caveat and the
 //! `block.body.withdrawals` reconstruction follow-up). The RNG draw order inside the shuffle
 //! is consensus-critical: any refactor that reorders the draws selects a different committee.
@@ -114,7 +114,7 @@ use reth_revm::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, Bytes, Encodable2718, ExecHeader, Receipt,
+    gas_accumulator::GasAccumulator, Address, Bytes, Encodable2718, ExecHeader, Receipt,
     TransactionSigned, Withdrawals, B256, EMPTY_WITHDRAWALS, U256,
 };
 use tracing::{debug, error, trace};
@@ -146,8 +146,14 @@ pub struct TNBlockExecutionCtx {
     /// Difficulty- this contains the worker id and batch index:
     /// `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
     pub difficulty: U256,
-    /// Counter used to allocate rewards for block leaders.
-    pub rewards_counter: RewardsCounter,
+    /// Live shared accumulator for the current epoch: per-worker gas totals, current base fees,
+    /// worker count, and the leader counts used to allocate block rewards.
+    ///
+    /// Cloned from the EVM config by both context builders, so it is the same object every other
+    /// component holds rather than a header-derived snapshot (see the `evm/config.rs` module docs
+    /// for the replay caveat that follows from that). Execution reads only the rewards counter
+    /// today — the gas and fee data is carried so the epoch-closing block executor can reach it.
+    pub gas_accumulator: GasAccumulator,
     /// Test-only slash injection for the epoch boundary, copied from the payload
     /// (`context_for_next_block`). Feeds the executor's `epoch_boundary_slashes` seam so a test
     /// can drive a non-empty slash list through the production close path. Production builds have
@@ -982,7 +988,7 @@ where
 
             self.apply_closing_epoch_contract_call(
                 randomness,
-                self.ctx.rewards_counter.get_address_counts(),
+                self.ctx.gas_accumulator.rewards_counter().get_address_counts(),
             )
             .map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
@@ -1140,7 +1146,7 @@ where
         let extra_data = ctx.close_epoch.map(|hash| hash.to_vec().into()).unwrap_or_default();
         let (withdrawals, withdrawals_root) = if ctx.close_epoch.is_some() {
             // closing epoch so include rewards info
-            let withdrawals = ctx.rewards_counter.generate_withdrawals();
+            let withdrawals = ctx.gas_accumulator.rewards_counter().generate_withdrawals();
             let withdrawals_root = calculate_withdrawals_root(withdrawals.as_ref());
             (Some(withdrawals), Some(withdrawals_root))
         } else {
