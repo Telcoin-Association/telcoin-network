@@ -988,12 +988,24 @@ fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manager::{derive_base_fees_for_entered_epoch, sync_num_workers_from_chain};
+    use rand::{rngs::StdRng, SeedableRng as _};
     use std::{cell::Cell, sync::Arc};
     use tempfile::TempDir;
     use tn_config::WORKER_CONFIGS_ADDRESS;
     use tn_reth::{
-        system_calls::CONSENSUS_REGISTRY_ADDRESS, test_utils::test_genesis_with_consensus_registry,
+        payload::TNPayload,
+        system_calls::CONSENSUS_REGISTRY_ADDRESS,
+        test_utils::{
+            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
+            read_worker_config_entries_at, test_genesis_with_consensus_registry,
+            test_genesis_with_consensus_registry_and_workers, TransactionFactory,
+        },
         RethChainSpec,
+    };
+    use tn_types::{
+        gas_accumulator::WorkerFeeConfig, Address, GenesisAccount, WorkerId, B256,
+        MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     #[tokio::test(start_paused = true)]
@@ -1145,6 +1157,299 @@ mod tests {
 
         // the guard trips before the config read, so fees stay untouched
         assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
+
+        Ok(())
+    }
+
+    /// Build one worker block on `parent` carrying `base_fee` and `txs`, execute it (running
+    /// the epoch-closing system calls when `output` is flagged), commit it as the canonical +
+    /// finalized tip, and mirror the engine's post-execution accounting by folding the executed
+    /// header's gas into `acc`.
+    ///
+    /// The `inc_block` AFTER execution is the production ordering (`tn_engine`'s
+    /// payload builder): for an epoch-closing block it means the closing system calls read the
+    /// accumulator WITHOUT this block's own gas — the executor folds that gas in itself.
+    fn execute_worker_block(
+        reth_env: &RethEnv,
+        acc: &GasAccumulator,
+        parent: SealedHeader,
+        output: &ConsensusOutput,
+        base_fee: u64,
+        worker_id: WorkerId,
+        txs: Vec<Vec<u8>>,
+    ) -> eyre::Result<SealedHeader> {
+        let gas_limit = parent.gas_limit;
+        let payload = TNPayload::new(
+            parent,
+            Address::random(),
+            0,
+            B256::random(),
+            output,
+            B256::ZERO,
+            base_fee,
+            gas_limit,
+            B256::random(),
+            worker_id,
+        );
+        let block = execute_payload_and_update_canonical_chain(reth_env, payload, txs)?;
+        let header = block.recovered_block.clone_sealed_header();
+        acc.inc_block(worker_id, header.gas_used, header.gas_limit);
+        Ok(header)
+    }
+
+    /// CROSS-LAYER CAPSTONE: the three production computations of a worker's next-epoch base
+    /// fee agree bit-identically at every epoch close:
+    ///
+    ///  (a) the on-chain `WorkerConfigs.data` word the closing block's 4th system call records
+    ///      (`record_next_epoch_base_fees` in `tn-reth`), read back at the closing block's
+    ///      state through the production decode seam;
+    ///  (b) the epoch-entry derivation every node runs ([`derive_base_fees_for_entered_epoch`]);
+    ///  (c) the live producer's close-time accumulator update ([`adjust_base_fees`]);
+    ///
+    /// each pinned against an independent [`next_base_fee_for_config`] oracle computed from raw
+    /// header gas and the epoch's entry fee. This equality is a consensus invariant: the batch
+    /// validator snapshots one entry fee per epoch and compares for EXACT equality, so a
+    /// one-wei divergence between any two of these seams rejects every peer batch for a whole
+    /// epoch — and replacing (b) with a read of (a) is only safe while all three agree.
+    ///
+    /// Drives TWO real epoch closes over one chain (worker 0 `Eip1559 { target_gas: 1M }`,
+    /// worker 1 `Static` — a mixed strategy set), with genuine per-worker user-tx gas and real
+    /// transfers in BOTH closing blocks so the closing block's own-gas fold-in is exercised at
+    /// each boundary. Fixture guards pin that the eip1559 fee moves away from MIN, from the
+    /// epoch's entry fee, AND from the value computed without the closing block's own gas — a
+    /// wrong fee source, a dropped total, or an off-by-one-block gas fold all fail loudly.
+    ///
+    /// Epoch 0 runs at a preloaded `START_FEE` (accumulator slot and epoch-0 block headers
+    /// carry the same value — the input-consistency production guarantees by pricing batches
+    /// from the accumulator), standing in for any epoch N with a real fee so the ±12.5% moves
+    /// are exercised at full scale rather than degenerating to MIN±1. The second boundary is
+    /// fully organic: epoch 1 runs at the fee the FIRST close wrote on-chain, so boundary 2
+    /// starts from a written fee, not genesis defaults.
+    #[tokio::test]
+    async fn close_record_adjust_and_entry_derivation_agree_across_boundaries() -> eyre::Result<()>
+    {
+        const TARGET_GAS: u64 = 1_000_000;
+        const START_FEE: u64 = 1_000_000;
+        const STATIC_FEE: u64 = 12_345;
+        const TX_GAS_PRICE: u128 = 2_000_000;
+        let cfg0 = WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS };
+
+        // fund an EOA so every epoch (and both closing blocks) carries real user-tx gas
+        let mut sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(913));
+        let genesis = test_genesis_with_consensus_registry_and_workers(
+            4,
+            vec![(0u8, TARGET_GAS), (1u8, STATIC_FEE)],
+        )
+        .extend_accounts([(
+            sender.address(),
+            GenesisAccount::default().with_balance(U256::from(1_000_000_000_000_000_000_u64)),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("cross_layer_fee_agreement")?;
+        let task_manager = TaskManager::new("cross layer fee agreement");
+        let recipient = Address::repeat_byte(0xab);
+        let mut transfer = |chain: &Arc<RethChainSpec>| {
+            sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                TX_GAS_PRICE,
+                Some(recipient),
+                U256::from(1),
+                Default::default(),
+            )
+        };
+
+        // the LIVE accumulator, shared with the block executor (wired into the EVM config so
+        // the closing block's record reads exactly this state)
+        let acc = GasAccumulator::new(1);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // epoch-0 entry: size the accumulator from genesis WorkerConfigs state (the production
+        // epoch-0 entry seam), then preload worker 0's stand-in entry fee; worker 1 keeps MIN
+        sync_num_workers_from_chain(&reth_env, &acc, 0)?;
+        assert_eq!(acc.num_workers(), 2, "accumulator sized from the on-chain worker count");
+        acc.base_fee(0).set_base_fee(START_FEE);
+
+        // ceremony genesis deploys WorkerConfigs with every data word unwritten
+        let (_, entries) =
+            read_worker_config_entries_at(&reth_env, chain.sealed_genesis_header().hash())?;
+        assert!(entries[0].data.is_zero(), "no close has recorded a fee yet");
+        assert!(entries[1].data.is_zero(), "no close has recorded a fee yet");
+
+        // ----- epoch 0: worker 0 produces (fee START_FEE), worker 1 produces (fee MIN) -----
+        let out1 = consensus_output_for_tests(1, 0, 1, false);
+        let h1 = execute_worker_block(
+            &reth_env,
+            &acc,
+            chain.sealed_genesis_header(),
+            &out1,
+            START_FEE,
+            0,
+            vec![transfer(&chain), transfer(&chain)],
+        )?;
+        assert!(h1.gas_used > 0, "worker 0's epoch-0 block must carry real gas");
+
+        let out2 = consensus_output_for_tests(2, 0, 2, false);
+        let h2 = execute_worker_block(
+            &reth_env,
+            &acc,
+            h1.clone(),
+            &out2,
+            MIN_PROTOCOL_BASE_FEE,
+            1,
+            vec![transfer(&chain)],
+        )?;
+        assert!(h2.gas_used > 0, "worker 1's epoch-0 block must carry real gas");
+
+        // the closing block: worker 0, epoch-close flagged, with real transfers riding it
+        let out3 = consensus_output_for_tests(3, 0, 3, true);
+        let h3 = execute_worker_block(
+            &reth_env,
+            &acc,
+            h2.clone(),
+            &out3,
+            START_FEE,
+            0,
+            vec![transfer(&chain), transfer(&chain)],
+        )?;
+        assert!(h3.gas_used > 0, "the closing block must carry its own user-tx gas");
+        assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 closed");
+
+        // independent oracle for boundary 1: the ONE formula over the entry fee and the
+        // epoch's total worker-0 gas INCLUDING the closing block's own
+        let epoch0_gas_w0 = h1.gas_used + h3.gas_used;
+        let oracle_1 = next_base_fee_for_config(cfg0, START_FEE, epoch0_gas_w0);
+        // fixture guards: the value discriminates a MIN write, a no-op write, and a total
+        // that dropped the closing block's own gas
+        assert_ne!(oracle_1, MIN_PROTOCOL_BASE_FEE, "fixture: fee must move off MIN");
+        assert_ne!(oracle_1, START_FEE, "fixture: fee must move off the entry fee");
+        assert_ne!(
+            oracle_1,
+            next_base_fee_for_config(cfg0, START_FEE, h1.gas_used),
+            "fixture: the closing block's own gas must change the priced fee",
+        );
+
+        // live totals at the close (before clear): also the scan-equivalence reference
+        let (_, live_gas_w0, _) = acc.get_values(0);
+        let (_, live_gas_w1, _) = acc.get_values(1);
+        assert_eq!(live_gas_w0, epoch0_gas_w0, "inc_block total = header gas total");
+        assert_eq!(live_gas_w1, h2.gas_used);
+
+        // (c) the live producer's close-time update over the shared accumulator
+        adjust_base_fees(&reth_env, &acc).await?;
+        let close_time_w0 = acc.base_fee(0).base_fee();
+        let close_time_w1 = acc.base_fee(1).base_fee();
+
+        // (a) the on-chain record at the closing block's state
+        let (num_workers, entries) = read_worker_config_entries_at(&reth_env, h3.hash())?;
+        assert_eq!(num_workers, 2);
+        assert_eq!(entries[0].config, cfg0, "strategy survives the data write");
+        assert_eq!(entries[1].config, WorkerFeeConfig::Static { fee: STATIC_FEE });
+        assert!(entries[1].data.is_zero(), "a static worker's data word is never written");
+        let recorded_w0 = entries[0].data.to::<u64>();
+
+        // (b) the epoch-entry derivation every node runs, pinned to the same closing block
+        let derived_1 = derive_base_fees_for_entered_epoch(&reth_env, 1, &h3)?;
+        assert_eq!(derived_1.num_workers, 2);
+        // header scan ≡ the live accumulator's inc_block totals for the closed epoch
+        assert_eq!(derived_1.gas_totals.get(&0).copied().unwrap_or_default(), live_gas_w0);
+        assert_eq!(derived_1.gas_totals.get(&1).copied().unwrap_or_default(), live_gas_w1);
+
+        // THE EQUALITY at boundary 1: (a) == (b) == (c) == oracle, per worker
+        assert_eq!(recorded_w0, oracle_1, "(a) on-chain record != oracle");
+        assert_eq!(derived_1.fees[0], Some(oracle_1), "(b) entry derivation != oracle");
+        assert_eq!(close_time_w0, oracle_1, "(c) close-time accumulator != oracle");
+        assert_eq!(derived_1.fees[1], Some(STATIC_FEE), "(b) static worker != configured fee");
+        assert_eq!(close_time_w1, STATIC_FEE, "(c) static worker != configured fee");
+
+        // enter epoch 1 exactly as production: clear the epoch's gas, then derive+apply —
+        // which must rewrite the very fees the close-time update left in place
+        acc.clear();
+        derived_1.apply(&acc);
+        assert_eq!(acc.base_fee(0).base_fee(), oracle_1, "entry apply rewrites the close value");
+        assert_eq!(acc.base_fee(1).base_fee(), STATIC_FEE);
+
+        // ----- epoch 1: runs at the fee the first close WROTE (not genesis defaults) -----
+        let fee_epoch1 = acc.base_fee(0).base_fee();
+        let out4 = consensus_output_for_tests(1, 1, 4, false);
+        let h4 = execute_worker_block(
+            &reth_env,
+            &acc,
+            h3.clone(),
+            &out4,
+            fee_epoch1,
+            0,
+            vec![transfer(&chain), transfer(&chain)],
+        )?;
+        assert!(h4.gas_used > 0);
+
+        let out5 = consensus_output_for_tests(2, 1, 5, false);
+        let h5 = execute_worker_block(
+            &reth_env,
+            &acc,
+            h4.clone(),
+            &out5,
+            STATIC_FEE,
+            1,
+            vec![transfer(&chain)],
+        )?;
+        assert!(h5.gas_used > 0);
+
+        // epoch 1's closing block, again carrying real user-tx gas of its own
+        let out6 = consensus_output_for_tests(3, 1, 6, true);
+        let h6 = execute_worker_block(
+            &reth_env,
+            &acc,
+            h5.clone(),
+            &out6,
+            fee_epoch1,
+            0,
+            vec![transfer(&chain), transfer(&chain)],
+        )?;
+        assert!(h6.gas_used > 0, "the second closing block must carry its own user-tx gas");
+        assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 2, "epoch 1 closed");
+
+        // independent oracle for boundary 2, folded from the WRITTEN boundary-1 fee
+        let epoch1_gas_w0 = h4.gas_used + h6.gas_used;
+        let oracle_2 = next_base_fee_for_config(cfg0, oracle_1, epoch1_gas_w0);
+        assert_ne!(oracle_2, oracle_1, "fixture: the second boundary must move the fee again");
+        assert_ne!(oracle_2, MIN_PROTOCOL_BASE_FEE);
+        assert_ne!(
+            oracle_2,
+            next_base_fee_for_config(cfg0, oracle_1, h4.gas_used),
+            "fixture: the second closing block's own gas must change the priced fee",
+        );
+
+        let (_, live_gas_w0_e1, _) = acc.get_values(0);
+        let (_, live_gas_w1_e1, _) = acc.get_values(1);
+        assert_eq!(live_gas_w0_e1, epoch1_gas_w0);
+        assert_eq!(live_gas_w1_e1, h5.gas_used);
+
+        // (c) at boundary 2
+        adjust_base_fees(&reth_env, &acc).await?;
+
+        // (a) at boundary 2
+        let (num_workers, entries) = read_worker_config_entries_at(&reth_env, h6.hash())?;
+        assert_eq!(num_workers, 2);
+        assert!(entries[1].data.is_zero(), "static worker still never written");
+
+        // (b) at boundary 2
+        let derived_2 = derive_base_fees_for_entered_epoch(&reth_env, 2, &h6)?;
+        assert_eq!(derived_2.num_workers, 2);
+        assert_eq!(derived_2.gas_totals.get(&0).copied().unwrap_or_default(), epoch1_gas_w0);
+        assert_eq!(derived_2.gas_totals.get(&1).copied().unwrap_or_default(), h5.gas_used);
+
+        // THE EQUALITY at boundary 2 — starting from a written fee, not genesis defaults
+        assert_eq!(entries[0].data.to::<u64>(), oracle_2, "(a) on-chain record != oracle");
+        assert_eq!(derived_2.fees[0], Some(oracle_2), "(b) entry derivation != oracle");
+        assert_eq!(acc.base_fee(0).base_fee(), oracle_2, "(c) close-time accumulator != oracle");
+        assert_eq!(derived_2.fees[1], Some(STATIC_FEE));
+        assert_eq!(acc.base_fee(1).base_fee(), STATIC_FEE);
 
         Ok(())
     }
