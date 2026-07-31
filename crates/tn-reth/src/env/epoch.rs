@@ -964,18 +964,26 @@ mod tests {
         TaskManager, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
-    /// In-protocol `ConsensusRegistry` fork over the PRE-fork testnet registry.
+    /// In-protocol `ConsensusRegistry` + `WorkerConfigs` fork over the PRE-fork testnet genesis.
     ///
     /// `test_genesis()` embeds the committed testnet `genesis.yaml`, whose `ConsensusRegistry`
     /// account carries the pre-fork runtime code and validator storage with NO per-status sets —
-    /// the exact on-chain shape the fork upgrades in place. The epoch-closing block that
-    /// concludes `FORK_EPOCH - 1` swaps in the new runtime and runs `migrateValidatorSets()`
-    /// FIRST, then the rewards + conclude calls run on the new code over the byte-identical
-    /// preserved storage.
+    /// the exact on-chain shape the fork upgrades in place — and whose `WorkerConfigs` account
+    /// carries the old uint128-data build without the `setWorkerConfigsData` selector. The
+    /// epoch-closing block that concludes `FORK_EPOCH - 1` swaps in the new registry runtime and
+    /// runs `migrateValidatorSets()` FIRST, then swaps the `WorkerConfigs` runtime (code only),
+    /// then the rewards + conclude + base-fee-record calls run on the new code over the
+    /// byte-identical preserved storage.
     ///
     /// Asserts: the pre-fork code does not answer the new-ABI eligible-count call; post-fork the
     /// new code is live and the migration populated a non-empty eligible set; a preserved BLS
-    /// pubkey survives the swap as 96-byte compressed; and the fork block's `state_root` is
+    /// pubkey survives the swap as 96-byte compressed; the `WorkerConfigs` code hash equals the
+    /// current artifact's (and not the pre-fork pin) with storage preserved (`numWorkers` still
+    /// 1, worker 0 still EIP-1559 with the genesis `u64::MAX` gas target); the SAME closing
+    /// block's fourth system call wrote worker 0's next-epoch base fee through the swapped-in
+    /// code (exactly `MIN_PROTOCOL_BASE_FEE` for the untouched genesis config); `MAX_STRATEGY()`
+    /// flips from the old build's hard-coded `1` to `0` (the appended, unset slot — the
+    /// documented post-swap governance-runbook state); and the fork block's `state_root` is
     /// identical across two independent executions (determinism — every node re-derives the
     /// same root).
     ///
@@ -1026,6 +1034,14 @@ mod tests {
             );
         }
 
+        // pre-fork WorkerConfigs fixture guard: the live old build hard-codes MAX_STRATEGY() = 1
+        // (a readable failure here means the committed genesis fixture was regenerated)
+        assert_eq!(
+            max_strategy_at_block(&env1, genesis_header.hash())?,
+            1,
+            "pre-fork WorkerConfigs must answer MAX_STRATEGY() with its hard-coded 1"
+        );
+
         // --- produce the fork boundary block on the production path ---
         let block = execute_payload_and_update_canonical_chain(&env1, payload.clone(), vec![])?;
         let header = block.recovered_block.clone_sealed_header();
@@ -1075,6 +1091,67 @@ mod tests {
             assert_eq!(bls.len(), 96, "preserved BLS pubkey must remain 96-byte compressed");
         }
 
+        // --- the WorkerConfigs swap landed in the same closing block ---
+        {
+            use reth_provider::StateProvider as _;
+
+            // (a) code hash == the embedded current artifact's, and off the pre-fork pin
+            let code = env1
+                .latest()?
+                .account_code(&WORKER_CONFIGS_ADDRESS)?
+                .expect("worker configs account must have code");
+            let artifact = RethEnv::fetch_value_from_json_str(
+                tn_config::WORKER_CONFIGS_JSON,
+                Some("deployedBytecode.object"),
+            )?;
+            let artifact_code = alloy::hex::decode(
+                artifact.as_str().expect("worker configs deployedBytecode.object is a string"),
+            )?;
+            assert_eq!(
+                code.0.hash_slow(),
+                alloy::primitives::keccak256(&artifact_code),
+                "post-fork WorkerConfigs code hash must match the embedded current artifact"
+            );
+            assert_ne!(
+                code.0.hash_slow(),
+                tn_types::forks::WORKER_CONFIGS_PRE_FORK_CODE_HASH,
+                "the swap must move the WorkerConfigs code hash off the pre-fork pin"
+            );
+        }
+
+        // (b) storage survived the code-only swap: numWorkers and worker 0's config semantics
+        // read back unchanged through the swapped-in code; (c) the SAME closing block's fourth
+        // system call recorded worker 0's next-epoch base fee in its data word
+        let (num_workers, entries) = worker_config_entries_at_block(&env1, header.hash())?;
+        assert_eq!(num_workers, 1, "preserved numWorkers must still read 1 post-swap");
+        assert_eq!(
+            entries[0].config,
+            WorkerFeeConfig::Eip1559 { target_gas: u64::MAX },
+            "preserved worker 0 config semantics must be unchanged post-swap"
+        );
+        // fee oracle: a default accumulator (MIN fee, zero gas) plus a closing block with no
+        // user transactions hold the untouched genesis config (u64::MAX gas target) at the floor
+        assert_eq!(header.gas_used, 0, "fork-boundary closing block carries no user-tx gas");
+        let expected_fee = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: u64::MAX },
+            MIN_PROTOCOL_BASE_FEE,
+            header.gas_used,
+        );
+        assert_eq!(expected_fee, MIN_PROTOCOL_BASE_FEE, "oracle: u64::MAX target floors at MIN");
+        assert_eq!(
+            entries[0].data,
+            U184::from(expected_fee),
+            "the closing block must write worker 0's next-epoch base fee (== MIN_PROTOCOL_BASE_FEE)"
+        );
+
+        // (d) the appended maxStrategy slot reads 0 post-swap — the documented state governance
+        // clears with one setMaxStrategy(1) transaction after the fork
+        assert_eq!(
+            max_strategy_at_block(&env1, header.hash())?,
+            0,
+            "post-swap MAX_STRATEGY() must read the appended, unset slot as 0"
+        );
+
         // --- determinism: an independent execution of the identical block yields the same root ---
         let tmp2 = TempDir::new().unwrap();
         let tm2 = TaskManager::new("fork test env2");
@@ -1101,7 +1178,10 @@ mod tests {
     ///
     /// Asserts: the closing block executes; the registry code hash is untouched (no swap —
     /// epoch 3 is far from the fork boundary); the post-fork-only eligible-count call still
-    /// fails; and the block's `state_root` is identical across two independent executions.
+    /// fails; the `WorkerConfigs` code hash also stays at its pre-fork pin AND nothing was
+    /// written (the legacy close has no fourth system call, so the old build's uint128 data
+    /// words still decode as all-zero through the production seam); and the block's
+    /// `state_root` is identical across two independent executions.
     #[cfg(feature = "adiri")]
     #[tokio::test]
     async fn test_pre_fork_epoch_close_uses_legacy_registry_read() -> eyre::Result<()> {
@@ -1176,6 +1256,17 @@ mod tests {
                 "a normal pre-fork epoch close must not swap the registry code"
             );
 
+            // the WorkerConfigs code is equally untouched: only the fork boundary swaps it
+            let wc_code = env1
+                .latest()?
+                .account_code(&WORKER_CONFIGS_ADDRESS)?
+                .expect("worker configs account must have code");
+            assert_eq!(
+                wc_code.0.hash_slow(),
+                tn_types::forks::WORKER_CONFIGS_PRE_FORK_CODE_HASH,
+                "a normal pre-fork epoch close must not swap the worker configs code"
+            );
+
             let state = StateProviderDatabase::new(env1.latest()?);
             let mut cached = CachedReads::default();
             let mut db = State::builder()
@@ -1195,6 +1286,15 @@ mod tests {
                 "post-fork-only getEligibleValidatorCount must still fail on the pre-fork code"
             );
         }
+
+        // --- and the legacy close wrote nothing: it has no fourth system call, so the old
+        // build's uint128 data words still decode as all-zero through the production seam ---
+        let (num_workers, entries) = worker_config_entries_at_block(&env1, header.hash())?;
+        assert_eq!(num_workers, 1, "pre-fork genesis deploys a single worker");
+        assert!(
+            entries.iter().all(|entry| entry.data == U184::ZERO),
+            "a pre-fork close must leave every worker data word unwritten"
+        );
 
         // --- determinism: an independent execution of the identical block yields the same root ---
         let tmp2 = TempDir::new().unwrap();
@@ -3075,6 +3175,26 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Execute `MAX_STRATEGY()` against the state of `block_hash` and decode the `uint8`.
+    ///
+    /// Both the live pre-fork `WorkerConfigs` build (which hard-codes the ceiling as the
+    /// constant `1`) and the current artifact (which reads the appended `maxStrategy` storage
+    /// slot) expose this selector, so one probe pins the documented value flip across the
+    /// fork's code-only swap: `1` before, `0` after (until governance's `setMaxStrategy(1)`).
+    #[cfg(feature = "adiri")]
+    fn max_strategy_at_block(reth_env: &RethEnv, block_hash: B256) -> eyre::Result<u8> {
+        let mut tn_evm = reth_env.tn_evm(block_hash)?;
+        let calldata = WorkerConfigs::MAX_STRATEGYCall {}.abi_encode().into();
+        let res = tn_evm.transact_system_call(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+        let data = match res.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => eyre::bail!("MAX_STRATEGY failed at pinned block: {other:?}"),
+        };
+        Ok(<WorkerConfigs::MAX_STRATEGYCall as alloy::sol_types::SolCall>::abi_decode_returns(
+            &data,
+        )?)
     }
 
     /// Execute `getAllWorkerConfigs()` against the state of `block_hash` and decode the raw
