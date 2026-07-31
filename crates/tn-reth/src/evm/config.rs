@@ -27,6 +27,13 @@
 //! distributed. Reconstructing the historical counts from `block.body.withdrawals` (which records
 //! them) is a known follow-up. Widening this from the rewards counter to the whole accumulator
 //! extends the same accepted limitation to the gas and fee data.
+//!
+//! Callers that construct a `RethEnv` with a defaulted accumulator (e.g. the snapshot machinery,
+//! `new_for_temp_chain`) must never drive block EXECUTION through it. The accumulator now backs
+//! an EVM state write — `record_next_epoch_base_fees`' `setWorkerConfigsData` — so re-executing
+//! an epoch-closing block there would price every EIP-1559 worker from one empty slot (zero gas,
+//! `MIN_PROTOCOL_BASE_FEE`) and produce a divergent state root, not merely degraded reward
+//! accounting.
 
 use super::{TNBlockAssembler, TNBlockExecutionCtx, TNBlockExecutorFactory, TNEvmFactory};
 use crate::{error::TnRethError, payload::TNPayload, TNPrimitives};

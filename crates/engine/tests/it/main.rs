@@ -529,7 +529,7 @@ async fn test_empty_close_epoch_unknown_leader_fail_stops() -> eyre::Result<()> 
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // install a real committee so the miss comes from the leader, not an unset committee
     let committee =
@@ -645,7 +645,7 @@ async fn test_empty_close_epoch_without_committee_fail_stops() -> eyre::Result<(
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // build the committee to obtain a legitimate member id, but never call `set_committee`:
     // the rewards counter's committee stays `None` (the delta from the happy-path test above)
