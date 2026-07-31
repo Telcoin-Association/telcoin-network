@@ -9,7 +9,10 @@
 //!   closing block: `applyIncentives`, then `applySlashes`, then `concludeEpoch`.
 //! - `LegacyConsensusRegistry` — the pre-fork registry's epoch-close surface, frozen so pre-fork
 //!   epoch closes replay byte-identically (see the code-hash gate in `evm/block.rs`).
-//! - `WorkerConfigs` — per-worker base-fee strategy used for base fee adjustment.
+//! - `WorkerConfigs` — per-worker base-fee strategy used for base fee adjustment, plus the
+//!   `setWorkerConfigsData` mutator the epoch-closing block invokes to record each EIP-1559
+//!   worker's next-epoch base fee. Its `getAllWorkerConfigs` return is decoded in exactly one
+//!   place, [`decode_worker_fee_configs`], shared by the pinned read path and the closing block.
 //!
 //! Two pinned addresses live here: `SYSTEM_ADDRESS` (0xfff...fffe), the reserved caller the EVM
 //! uses for system transactions (the custom handler exempts it from fee/beneficiary
@@ -19,7 +22,10 @@
 //! assume validators can currently be slashed in-protocol.
 
 use alloy::{primitives::address, sol};
-use tn_types::{Address, Epoch};
+use tn_types::{
+    gas_accumulator::{WorkerConfigEntry, WorkerFeeConfig},
+    Address, Epoch,
+};
 
 /// The system address.
 pub(super) const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
@@ -340,6 +346,74 @@ pub struct EpochState {
     /// This time plus the `EpochInfo::epochDuration` creates the timestamp for the next epoch
     /// boundary.
     pub epoch_start: u64,
+}
+
+/// Decode a `getAllWorkerConfigs()` return payload into the on-chain worker count and one
+/// [`WorkerConfigEntry`] per worker.
+///
+/// The single decode seam for the `WorkerConfigs` table: the pinned read path
+/// (`RethEnv::worker_fee_configs_inner`) and the epoch-closing block's base-fee recording both
+/// route through here, so the strategy mapping and the arity check cannot drift between the node
+/// that reads a worker's fee strategy and the block that prices its next-epoch fee.
+///
+/// Errors are returned as strings for the caller to classify: every failure here is a
+/// deterministic product of the return payload (identical on every node reading the same block),
+/// so callers map them into their chain-global error variant.
+///
+/// Fail-open on unknown strategy ids: a strategy this node does not recognize (only possible when
+/// a future contract version introduces one before this node is upgraded) is NOT an error — it
+/// falls back to [`WorkerFeeConfig::Eip1559`] with a warning, preserving liveness instead of
+/// halting all validators on the unrecognized id. The fallback is deterministic, so every node on
+/// this build lands on the same config.
+pub(crate) fn decode_worker_fee_configs(
+    bytes: &[u8],
+) -> Result<(u16, Vec<WorkerConfigEntry>), String> {
+    let ret =
+        <WorkerConfigs::getAllWorkerConfigsCall as alloy::sol_types::SolCall>::abi_decode_returns(
+            bytes,
+        )
+        .map_err(|e| {
+            format!("worker configs return decode failed (contract absent at this block?): {e}")
+        })?;
+
+    let num_workers = ret.count as usize;
+    if ret.strategies.len() != num_workers
+        || ret.values.len() != num_workers
+        || ret.datas.len() != num_workers
+    {
+        return Err(format!(
+            "worker config arity mismatch: count={num_workers}, strategies={}, values={}, datas={}",
+            ret.strategies.len(),
+            ret.values.len(),
+            ret.datas.len(),
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(num_workers);
+    for (worker_id, ((&strategy, &value), &data)) in
+        ret.strategies.iter().zip(ret.values.iter()).zip(ret.datas.iter()).enumerate()
+    {
+        let config = match strategy {
+            0 => WorkerFeeConfig::Eip1559 { target_gas: value },
+            1 => WorkerFeeConfig::Static { fee: value },
+            s => {
+                // The contract rejects unknown strategies, so this branch only fires when a
+                // future contract version introduces a strategy this node hasn't been
+                // updated to understand. Fall back to EIP-1559 to preserve liveness instead
+                // of halting all validators.
+                tracing::warn!(
+                    target: "tn::reth",
+                    worker_id,
+                    strategy = s,
+                    "unknown fee strategy; falling back to strategy 0 (Eip1559)"
+                );
+                WorkerFeeConfig::Eip1559 { target_gas: value }
+            }
+        };
+        entries.push(WorkerConfigEntry { config, data });
+    }
+
+    Ok((ret.count, entries))
 }
 
 #[cfg(test)]

@@ -52,11 +52,26 @@
 
 use crate::{AuthorityIdentifier, Committee, SealedHeader, WorkerId, B256};
 
+use alloy::{
+    eips::eip1559::{calc_next_block_base_fee, BaseFeeParams, MIN_PROTOCOL_BASE_FEE},
+    primitives::{aliases::U184, Address},
+    rpc::types::{Withdrawal, Withdrawals},
+};
+use parking_lot::{Mutex, RwLock};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+use tracing::warn;
+
 /// Fee strategy for a worker, read from the WorkerConfigs contract each epoch.
 /// Adding a new strategy = new contract constant + new enum variant + match arm in
 /// [`next_base_fee_for_config`] below.
 ///
-/// NOTE: these are mapped in `tn-reth/src/env/epoch.rs:worker_fee_configs_inner`
+/// NOTE: these are mapped in `tn-reth/src/system_calls.rs:decode_worker_fee_configs`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerFeeConfig {
     /// Adjust fee +/-12.5% per epoch based on gas utilization vs target.
@@ -95,20 +110,24 @@ pub fn is_worker_batch_block(header: &SealedHeader) -> bool {
     header.number != 0 && header.ommers_hash != B256::ZERO
 }
 
-use alloy::{
-    eips::eip1559::{calc_next_block_base_fee, BaseFeeParams, MIN_PROTOCOL_BASE_FEE},
-    primitives::Address,
-    rpc::types::{Withdrawal, Withdrawals},
-};
-use parking_lot::{Mutex, RwLock};
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
-use tracing::warn;
+/// One row of the on-chain `WorkerConfigs` table: a worker's fee strategy plus the raw `uint184`
+/// `data` word stored alongside it.
+///
+/// The contract documents `data` as reserved space for the protocol. As of the epoch-close
+/// base-fee snapshot it carries an [`WorkerFeeConfig::Eip1559`] worker's NEXT-epoch base fee,
+/// written by the closing block's `setWorkerConfigsData` system call, so a node entering an epoch
+/// can read the fee from one state slot instead of scanning the previous epoch's headers. A zero
+/// `data` means the word was never written — no epoch has closed since the worker was configured,
+/// or the worker is [`WorkerFeeConfig::Static`] and its fee already lives in the config's `value`.
+/// Zero is unambiguous for the workers that do get written, because a recorded fee is never below
+/// `MIN_PROTOCOL_BASE_FEE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerConfigEntry {
+    /// The worker's fee strategy for the next epoch.
+    pub config: WorkerFeeConfig,
+    /// The raw `uint184` word stored with the config.
+    pub data: U184,
+}
 
 /// Tracks how many blocks each leader committed during an epoch for reward distribution.
 ///

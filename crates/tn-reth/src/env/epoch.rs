@@ -97,7 +97,10 @@ use crate::{
         EvmReadError, EvmReadResult, StateReadError, StateReadResult, TnRethError, TnRethResult,
     },
     evm::TNEvm,
-    system_calls::{ConsensusRegistry, EpochState, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS},
+    system_calls::{
+        decode_worker_fee_configs, ConsensusRegistry, EpochState, WorkerConfigs,
+        CONSENSUS_REGISTRY_ADDRESS,
+    },
     RethEnv, SYSTEM_ADDRESS,
 };
 
@@ -571,6 +574,11 @@ impl RethEnv {
     /// when a future contract version introduces one before this node is upgraded) is NOT an
     /// error — it falls back to [`WorkerFeeConfig::Eip1559`] with a warning, preserving liveness
     /// instead of halting all validators on the unrecognized id.
+    ///
+    /// The decode, arity check, and strategy mapping live in
+    /// [`decode_worker_fee_configs`](crate::system_calls::decode_worker_fee_configs), shared with
+    /// the epoch-closing block's base-fee recording so the two cannot drift. Callers of this
+    /// method want fee strategies only, so each row's `data` word is dropped here.
     pub(crate) fn worker_fee_configs_inner(
         &self,
         header: &SealedHeader,
@@ -593,54 +601,12 @@ impl RethEnv {
                 )))
             }
         };
-        let ret =
-            <WorkerConfigs::getAllWorkerConfigsCall as alloy::sol_types::SolCall>::abi_decode_returns(
-                &data,
-            )
-            .map_err(|e| {
-                StateReadError::ChainGlobal(format!(
-                    "worker configs return decode failed (contract absent at this block?): {e}"
-                ))
-            })?;
+        // decode/arity failures are deterministic products of the pinned block, so they land in
+        // ChainGlobal alongside the revert and absent-contract cases above
+        let (num_workers, entries) =
+            decode_worker_fee_configs(&data).map_err(StateReadError::ChainGlobal)?;
 
-        let num_workers = ret.count as usize;
-        if ret.strategies.len() != num_workers
-            || ret.values.len() != num_workers
-            || ret.datas.len() != num_workers
-        {
-            return Err(StateReadError::ChainGlobal(format!(
-                "worker config arity mismatch: count={num_workers}, strategies={}, values={}, datas={}",
-                ret.strategies.len(),
-                ret.values.len(),
-                ret.datas.len(),
-            )));
-        }
-
-        let mut configs = Vec::with_capacity(num_workers);
-        for (worker_id, (&strategy, &value)) in
-            ret.strategies.iter().zip(ret.values.iter()).enumerate()
-        {
-            let config = match strategy {
-                0 => WorkerFeeConfig::Eip1559 { target_gas: value },
-                1 => WorkerFeeConfig::Static { fee: value },
-                s => {
-                    // The contract rejects unknown strategies, so this branch only fires when a
-                    // future contract version introduces a strategy this node hasn't been
-                    // updated to understand. Fall back to EIP-1559 to preserve liveness instead
-                    // of halting all validators.
-                    tracing::warn!(
-                        target: "tn::reth",
-                        worker_id,
-                        strategy = s,
-                        "unknown fee strategy; falling back to strategy 0 (Eip1559)"
-                    );
-                    WorkerFeeConfig::Eip1559 { target_gas: value }
-                }
-            };
-            configs.push(config);
-        }
-
-        Ok((num_workers, configs))
+        Ok((num_workers as usize, entries.into_iter().map(|entry| entry.config).collect()))
     }
 
     /// Build an EVM at the canonical tip, execute a read-only [ConsensusRegistry] call, and
@@ -977,11 +943,12 @@ mod tests {
         test_utils::{
             consensus_output_for_tests, create_committee_from_state,
             execute_payload_and_update_canonical_chain, governance_burn_tx,
-            governance_owner_factory, test_genesis_with_consensus_registry, TransactionFactory,
+            governance_owner_factory, test_genesis_with_consensus_registry,
+            test_genesis_with_consensus_registry_and_workers, TransactionFactory,
         },
         RethChainSpec,
     };
-    use alloy::primitives::utils::parse_ether;
+    use alloy::primitives::{aliases::U184, utils::parse_ether};
     use rand::{rngs::StdRng, SeedableRng as _};
     use reth_revm::{
         cached::CachedReads, database::StateProviderDatabase, DatabaseCommit as _, State,
@@ -990,9 +957,11 @@ mod tests {
     use tempfile::TempDir;
     use tn_config::NodeInfo;
     use tn_types::{
-        gas_accumulator::{GasAccumulator, RewardsCounter},
+        gas_accumulator::{
+            next_base_fee_for_config, GasAccumulator, RewardsCounter, WorkerConfigEntry,
+        },
         generate_proof_of_possession_bls_for_test, BlsKeypair, GenesisAccount, NodeP2pInfo,
-        TaskManager, U256,
+        TaskManager, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// In-protocol `ConsensusRegistry` fork over the PRE-fork testnet registry.
@@ -3104,6 +3073,432 @@ mod tests {
             "batched committee read with an absent registry must classify as ChainGlobal, got: \
              {err}"
         );
+
+        Ok(())
+    }
+
+    /// Execute `getAllWorkerConfigs()` against the state of `block_hash` and decode the raw
+    /// return bytes through the production seam ([`decode_worker_fee_configs`]) — the exact
+    /// decode the closing block's `record_next_epoch_base_fees` uses, so these tests observe
+    /// the write through the same path that produced it.
+    fn worker_config_entries_at_block(
+        reth_env: &RethEnv,
+        block_hash: B256,
+    ) -> eyre::Result<(u16, Vec<WorkerConfigEntry>)> {
+        let mut tn_evm = reth_env.tn_evm(block_hash)?;
+        let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
+        let res = tn_evm.transact_system_call(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+        let data = match res.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => eyre::bail!("getAllWorkerConfigs failed at pinned block: {other:?}"),
+        };
+        decode_worker_fee_configs(&data).map_err(|e| eyre::eyre!(e))
+    }
+
+    /// The closing block's 4th system call records an EIP-1559 worker's NEXT-epoch base fee in
+    /// its `WorkerConfigs.data` word, bit-identical to
+    /// `next_base_fee_for_config(config, accumulator fee at close, accumulator gas + the closing
+    /// block's own user-tx gas)` — the same value `adjust_base_fees` and the epoch-entry
+    /// derivation compute from the same inputs.
+    ///
+    /// The fixture is chosen so the expected value differs from `MIN_PROTOCOL_BASE_FEE`, from
+    /// the starting fee, AND from the value computed without the closing block's own gas — so a
+    /// wrong fee source, a dropped gas total, or an off-by-one-block gas fold all fail loudly.
+    #[tokio::test]
+    async fn test_close_records_eip1559_next_epoch_base_fee_in_worker_data() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+        const START_FEE: u64 = 1_000_000;
+        const EPOCH_GAS: u64 = 1_500_000;
+
+        // fund an EOA so the closing block carries real user-tx gas
+        let mut sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(77));
+        let genesis = test_genesis_with_consensus_registry_and_workers(5, vec![(0u8, TARGET_GAS)])
+            .extend_accounts([(
+                sender.address(),
+                GenesisAccount::default().with_balance(U256::from(parse_ether("1")?)),
+            )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Base Fee Record Test");
+
+        // the shared accumulator the block executor reads: a moved fee and mid-epoch gas
+        let acc = GasAccumulator::new(1);
+        acc.base_fee(0).set_base_fee(START_FEE);
+        acc.inc_block(0, EPOCH_GAS, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // ceremony genesis deploys the current WorkerConfigs with data == 0 (never written)
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, chain.sealed_genesis_header().hash())?;
+        assert_eq!(num_workers, 1);
+        assert_eq!(entries[0].data, U184::ZERO, "genesis data word starts unwritten");
+
+        // close epoch 0 with a real user transaction in the closing block
+        let tx = sender.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(Address::from_slice(&[0xab; 20])),
+            U256::from(1),
+            Bytes::new(),
+        );
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![tx])?;
+        let closing_header = block.recovered_block.clone_sealed_header();
+
+        // independent oracle: the ONE fee formula over the accumulator fee and the total epoch
+        // gas INCLUDING the closing block's own user-tx gas
+        let own_gas = closing_header.gas_used;
+        assert!(own_gas > 0, "closing block must carry user-tx gas");
+        let expected = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS },
+            START_FEE,
+            EPOCH_GAS + own_gas,
+        );
+        // fixture guards: the expected value discriminates against a MIN write, a no-op write,
+        // and a total that dropped the closing block's own gas
+        assert_ne!(expected, MIN_PROTOCOL_BASE_FEE);
+        assert_ne!(expected, START_FEE);
+        assert_ne!(
+            expected,
+            next_base_fee_for_config(
+                WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS },
+                START_FEE,
+                EPOCH_GAS,
+            ),
+        );
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 1);
+        assert_eq!(
+            entries[0].data,
+            U184::from(expected),
+            "recorded next-epoch base fee must equal the independent oracle"
+        );
+        // the data write preserves the worker's strategy and value
+        assert_eq!(entries[0].config, WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS });
+
+        Ok(())
+    }
+
+    /// Mixed strategies at the close: the EIP-1559 worker's `data` word gets its oracle fee
+    /// while the Static worker is skipped entirely — its `data` stays 0 (the fee already lives
+    /// in the config's `value`) no matter what fee or gas its accumulator slot carries.
+    #[tokio::test]
+    async fn test_close_records_eip1559_worker_and_skips_static_worker() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+        const START_FEE: u64 = 1_000_000;
+        const EPOCH_GAS: u64 = 500_000;
+        const STATIC_FEE: u64 = 777;
+
+        let genesis = test_genesis_with_consensus_registry_and_workers(
+            5,
+            vec![(0u8, TARGET_GAS), (1u8, STATIC_FEE)],
+        );
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Mixed Strategy Record Test");
+
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(START_FEE);
+        acc.inc_block(0, EPOCH_GAS, 30_000_000);
+        // distinctive state on the static worker's slot: none of it may reach the chain
+        acc.base_fee(1).set_base_fee(5_555);
+        acc.inc_block(1, 123_456, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let closing_header = block.recovered_block.clone_sealed_header();
+
+        let expected = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS },
+            START_FEE,
+            EPOCH_GAS,
+        );
+        assert_ne!(expected, MIN_PROTOCOL_BASE_FEE);
+        assert_ne!(expected, START_FEE);
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 2);
+        assert_eq!(entries[0].data, U184::from(expected), "eip1559 worker records its oracle");
+        assert_eq!(entries[1].data, U184::ZERO, "static worker is never written");
+        assert_eq!(entries[1].config, WorkerFeeConfig::Static { fee: STATIC_FEE });
+
+        Ok(())
+    }
+
+    /// An all-Static worker set produces an empty write set: the close succeeds while issuing
+    /// no `setWorkerConfigsData` call at all — every worker's `data` word is still 0 at the
+    /// closing block.
+    #[tokio::test]
+    async fn test_close_with_all_static_workers_records_nothing() -> eyre::Result<()> {
+        let genesis =
+            test_genesis_with_consensus_registry_and_workers(5, vec![(1u8, 500), (1u8, 900)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("All Static Record Test");
+
+        // populated slots prove the skip is strategy-driven, not empty-accumulator-driven
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(4_242);
+        acc.inc_block(0, 1_000_000, 30_000_000);
+        acc.base_fee(1).set_base_fee(9_099);
+        acc.inc_block(1, 2_000_000, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // the close must succeed without any base-fee write
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let closing_header = block.recovered_block.clone_sealed_header();
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 2);
+        assert_eq!(entries[0].data, U184::ZERO, "static worker 0 stays unwritten");
+        assert_eq!(entries[1].data, U184::ZERO, "static worker 1 stays unwritten");
+        assert_eq!(entries[0].config, WorkerFeeConfig::Static { fee: 500 });
+        assert_eq!(entries[1].config, WorkerFeeConfig::Static { fee: 900 });
+
+        Ok(())
+    }
+
+    /// The closing block's OWN user-tx gas is folded into its worker's epoch total before
+    /// pricing: the recorded fee equals the oracle computed WITH the closing block's gas and
+    /// differs from the oracle computed WITHOUT it (the accumulator alone — `inc_block` for
+    /// this block only runs after the payload executes).
+    #[tokio::test]
+    async fn test_close_folds_closing_block_gas_into_recorded_fee() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+        const START_FEE: u64 = 1_000_000;
+        const EPOCH_GAS: u64 = 1_200_000;
+
+        let mut sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(78));
+        let genesis = test_genesis_with_consensus_registry_and_workers(5, vec![(0u8, TARGET_GAS)])
+            .extend_accounts([(
+                sender.address(),
+                GenesisAccount::default().with_balance(U256::from(parse_ether("1")?)),
+            )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Own Gas Fold Test");
+
+        let acc = GasAccumulator::new(1);
+        acc.base_fee(0).set_base_fee(START_FEE);
+        acc.inc_block(0, EPOCH_GAS, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // two real transfers ride the closing block
+        let recipient = Address::from_slice(&[0xcd; 20]);
+        let txs = vec![
+            sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(recipient),
+                U256::from(1),
+                Bytes::new(),
+            ),
+            sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(recipient),
+                U256::from(1),
+                Bytes::new(),
+            ),
+        ];
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, txs)?;
+        let closing_header = block.recovered_block.clone_sealed_header();
+
+        let own_gas = closing_header.gas_used;
+        assert!(own_gas > 0, "closing block must carry user-tx gas");
+        let config = WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS };
+        let including = next_base_fee_for_config(config, START_FEE, EPOCH_GAS + own_gas);
+        let excluding = next_base_fee_for_config(config, START_FEE, EPOCH_GAS);
+        // fixture guard: the target makes the two totals price differently
+        assert_ne!(including, excluding, "fixture must discriminate the own-gas fold");
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 1);
+        assert_eq!(
+            entries[0].data,
+            U184::from(including),
+            "recorded fee must include the closing block's own gas"
+        );
+        assert_ne!(
+            entries[0].data,
+            U184::from(excluding),
+            "recorded fee must not be priced from the accumulator alone"
+        );
+
+        Ok(())
+    }
+
+    /// A worker governance adds MID-epoch (contract `numWorkers` 1 -> 2 while the shared
+    /// accumulator still has 1 slot) is priced at the close from the CONTRACT's count with the
+    /// fresh-slot anchor `next_base_fee_for_config(config, MIN_PROTOCOL_BASE_FEE, 0)`; the
+    /// pre-existing worker still gets its normal oracle, and the close only READS the shared
+    /// accumulator — it must not resize it (entry logic owns that).
+    #[tokio::test]
+    async fn test_close_prices_mid_epoch_added_worker_without_resizing_accumulator(
+    ) -> eyre::Result<()> {
+        const TARGET_GAS_0: u64 = 2_000_000;
+        const START_FEE_0: u64 = 2_000_000;
+        const EPOCH_GAS_0: u64 = 2_500_000;
+        const TARGET_GAS_1: u64 = 1_000_000;
+
+        let genesis =
+            test_genesis_with_consensus_registry_and_workers(5, vec![(0u8, TARGET_GAS_0)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Mid Epoch Worker Add Test");
+
+        let acc = GasAccumulator::new(1);
+        acc.base_fee(0).set_base_fee(START_FEE_0);
+        acc.inc_block(0, EPOCH_GAS_0, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // block 1 (mid-epoch-0): the owner configures worker 1 then grows the count
+        // (setWorkerConfig must precede setNumWorkers per the contract)
+        let mut governance = governance_owner_factory();
+        let set_config_tx = governance.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setWorkerConfigCall {
+                workerId: 1,
+                strategy: 0,
+                value: TARGET_GAS_1,
+                data: U184::ZERO,
+            }
+            .abi_encode()
+            .into(),
+        );
+        let set_num_workers_tx = governance.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setNumWorkersCall { numWorkers_: 2 }.abi_encode().into(),
+        );
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(
+            &reth_env,
+            payload,
+            vec![set_config_tx, set_num_workers_tx],
+        )?;
+        let canonical_header = block1.recovered_block.clone_sealed_header();
+
+        // sanity: the governance txs landed (a silent revert would fake a 1-worker close)
+        assert_eq!(reth_env.get_worker_fee_configs()?.len(), 2);
+        assert_eq!(acc.num_workers(), 1, "accumulator untouched by governance txs");
+
+        // block 2: close epoch 0 over the 2-worker contract / 1-worker accumulator split
+        let consensus_output = consensus_output_for_tests(2, 1, 2, true);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let closing_header = block2.recovered_block.clone_sealed_header();
+
+        // the close must not resize the live accumulator shared with the batch validator
+        assert_eq!(acc.num_workers(), 1, "close must only READ the accumulator, never resize it");
+
+        let expected_0 = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS_0 },
+            START_FEE_0,
+            EPOCH_GAS_0,
+        );
+        assert_ne!(expected_0, MIN_PROTOCOL_BASE_FEE);
+        assert_ne!(expected_0, START_FEE_0);
+        // fresh-slot anchor: a worker with no accumulator slot prices from (MIN, 0 gas) —
+        // exactly what adjust_base_fees' resize-then-compute and the entry walk produce
+        let expected_1 = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS_1 },
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+        );
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 2, "contract count grew at the boundary");
+        assert_eq!(entries[0].data, U184::from(expected_0), "worker 0 records its normal oracle");
+        assert_eq!(
+            entries[1].data,
+            U184::from(expected_1),
+            "governance-added worker records the fresh-slot anchor"
+        );
+        assert_ne!(entries[1].data, U184::ZERO, "the added worker WAS written");
+        assert_eq!(entries[1].config, WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS_1 });
+
+        Ok(())
+    }
+
+    /// A closing block over a chain whose `WorkerConfigs` account is absent must ABORT with an
+    /// error naming the base-fee recording — the close is fatal on an unreadable contract, it
+    /// must not silently skip the 4th system call and commit a diverging block.
+    #[tokio::test]
+    async fn test_close_fatal_when_worker_configs_unreadable() -> eyre::Result<()> {
+        // registry genesis WITHOUT the WorkerConfigs account: the three registry calls succeed,
+        // then the base-fee record's read decodes empty return data and fails deterministically
+        let mut genesis = test_genesis_with_consensus_registry(5);
+        genesis.alloc.remove(&WORKER_CONFIGS_ADDRESS);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Fatal Without Contract Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let err = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])
+            .expect_err("closing block without WorkerConfigs must abort");
+
+        // the error chain names the recording step (alternate format walks the full chain)
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("recording next-epoch base fees"),
+            "close failure must name the base-fee recording step, got: {msg}"
+        );
+
+        // the abort happened before anything committed: the canonical tip is still genesis
+        assert_eq!(reth_env.canonical_tip().number, 0, "no closing block may commit");
 
         Ok(())
     }

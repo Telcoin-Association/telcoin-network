@@ -33,7 +33,7 @@ use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache}
 use tn_types::{
     gas_accumulator::{next_base_fee_for_config, GasAccumulator},
     BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase,
-    EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
+    EpochRecord, Notifier, SealedHeader, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -763,6 +763,11 @@ where
 /// Inert on existing chains: the genesis fee strategy is `Eip1559 { target_gas: u64::MAX }`, which
 /// floors every worker at `MIN_PROTOCOL_BASE_FEE`. Fees only move once governance sets a real
 /// per-worker target.
+///
+/// The identity check lives here and the per-worker fold in
+/// [`apply_close_time_fee_updates`]; the closing block itself records the same values on-chain
+/// (`record_next_epoch_base_fees` in `tn-reth`), computed from the same accumulator and the same
+/// pinned block, so all three seams agree bit-for-bit.
 async fn adjust_base_fees(
     reth_env: &RethEnv,
     gas_accumulator: &GasAccumulator,
@@ -835,6 +840,25 @@ async fn adjust_base_fees(
         ));
     }
 
+    apply_close_time_fee_updates(reth_env, gas_accumulator, &tip).await
+}
+
+/// The post-identity-check half of [`adjust_base_fees`]: read the worker fee configs at the
+/// closing block `tip` and fold each worker's next-epoch base fee into `gas_accumulator`.
+///
+/// Split out so the read-failure policy can be exercised at any pinned header without driving a
+/// real epoch-closing block. The closing block itself now records the same fees on-chain (see
+/// `record_next_epoch_base_fees` in `tn-reth`), which is fatal when the `WorkerConfigs` contract
+/// is unreadable — so a test that strips the contract from genesis can no longer produce a
+/// closing block to call the outer function against.
+///
+/// See [`adjust_base_fees`] for the identity check this assumes has already passed, and the
+/// read-failure classification both halves share.
+async fn apply_close_time_fee_updates(
+    reth_env: &RethEnv,
+    gas_accumulator: &GasAccumulator,
+    tip: &SealedHeader,
+) -> eyre::Result<()> {
     // FAIL-OPEN (CHAIN-GLOBAL FAILURES ONLY): a chain-global config-read failure must not abort
     // the epoch close. Keep the current per-worker base fees and worker count untouched -- both
     // are already consensus-consistent (seeded from the same chain at epoch entry, then held
@@ -968,12 +992,8 @@ mod tests {
     use tempfile::TempDir;
     use tn_config::WORKER_CONFIGS_ADDRESS;
     use tn_reth::{
-        payload::TNPayload, system_calls::CONSENSUS_REGISTRY_ADDRESS,
-        test_utils::test_genesis_with_consensus_registry, NewCanonicalChain, RethChainSpec,
-    };
-    use tn_types::{
-        BlsSignature, Certificate, CommittedSubDag, ConsensusHeader, ReputationScores,
-        SignatureVerificationState,
+        system_calls::CONSENSUS_REGISTRY_ADDRESS, test_utils::test_genesis_with_consensus_registry,
+        RethChainSpec,
     };
 
     #[tokio::test(start_paused = true)]
@@ -1026,56 +1046,19 @@ mod tests {
         assert_eq!(calls.get(), 1, "chain-global failures are never retried");
     }
 
-    /// Drive ONE epoch-closing block on `reth_env` (parent = genesis) outside the full engine:
-    /// build the block from a boundary [`ConsensusOutput`] (its payload runs `concludeEpoch`),
-    /// commit it as the canonical head, and finalize it. Afterwards the canonical tip IS an
-    /// epoch-0 closing block, so the close-time identity (`tip + 1 == entered blockHeight`)
-    /// holds for `adjust_base_fees`. Mirrors tn-reth's `execute_payload_and_update_canonical_chain`
-    /// test helper via the public [`RethEnv`] surface.
-    fn execute_epoch_closing_block(
-        reth_env: &RethEnv,
-        chain: &Arc<RethChainSpec>,
-    ) -> eyre::Result<()> {
-        let mut leader = Certificate::default();
-        leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
-            BlsSignature::default(),
-        ));
-        leader.update_header_created_at_for_test(tn_types::now());
-        leader.update_header_round_for_test(2);
-        let sub_dag = CommittedSubDag::new(
-            vec![Certificate::default(), leader.clone()],
-            leader,
-            1,
-            ReputationScores::default(),
-            None,
-        );
-        let output = ConsensusOutput::new_closed_with_subdag(
-            sub_dag,
-            ConsensusHeader::default().digest(),
-            1,
-        );
-
-        let parent = chain.sealed_genesis_header();
-        let payload = TNPayload::new_for_test(parent.clone(), &output);
-        let block =
-            reth_env.build_block_from_batch_payload(payload, &Vec::new(), parent.hash(), &[])?;
-        let header = block.recovered_block.clone_sealed_header();
-        let canonical_state = reth_env.canonical_in_memory_state();
-        canonical_state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
-        canonical_state.set_canonical_head(header.clone());
-        reth_env.finish_executing_output(vec![block], None)?;
-        reth_env.finalize_block(header)?;
-        Ok(())
-    }
-
-    /// Keep-current arm (first coverage of the close-time fail-open): a
-    /// CHAIN-GLOBAL config-read failure (WorkerConfigs contract absent, the alloc-stripped-genesis
-    /// trick) at a REAL closing block returns `Ok` and keeps the per-worker base fees, the worker
-    /// count, and the accumulated gas untouched. The identity read PASSES here (registry
-    /// present, `concludeEpoch` ran in the tip), isolating the failure to the config read's
-    /// fail-open arm.
+    /// Keep-current arm of the close-time fail-open: a CHAIN-GLOBAL config-read failure
+    /// (WorkerConfigs contract absent, the alloc-stripped-genesis trick) returns `Ok` and keeps
+    /// the per-worker base fees, the worker count, and the accumulated gas untouched.
+    ///
+    /// Calls the inner [`apply_close_time_fee_updates`] at a genesis tip rather than the outer
+    /// [`adjust_base_fees`] behind a real closing block: the closing block now records the same
+    /// fees on-chain and is FATAL when `WorkerConfigs` is unreadable, so this fixture (which
+    /// exists precisely to make that contract unreadable) can no longer produce one. Pinning the
+    /// inner function keeps the coverage that matters — the fail-open arm still preserves fees
+    /// and count — and it is also the shape a node whose tip predates this feature hits, where
+    /// the closing block carries no recorded fees at all.
     #[tokio::test]
-    async fn adjust_base_fees_keeps_fees_and_count_on_read_failure() -> eyre::Result<()> {
+    async fn close_time_fee_updates_keep_fees_and_count_on_read_failure() -> eyre::Result<()> {
         // registry genesis WITHOUT the WorkerConfigs account: the config read is guaranteed to
         // fail chain-globally (call to codeless address succeeds with empty data -> decode fails)
         let mut genesis = test_genesis_with_consensus_registry(4);
@@ -1085,13 +1068,7 @@ mod tests {
         let task_manager = TaskManager::new("adjust fees fail open");
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
-
-        // close epoch 0 so the canonical tip is a closing block and the identity gate passes
-        execute_epoch_closing_block(&reth_env, &chain)?;
         let tip = reth_env.canonical_tip();
-        let (entered_epoch, epoch_info) = reth_env.get_current_epoch_info_at_header(&tip)?;
-        assert_eq!(entered_epoch, 1, "registry state crossed to the entered epoch");
-        assert_eq!(tip.number + 1, epoch_info.blockHeight, "close-time identity holds at the tip");
 
         // non-default fees, gas, and count on the accumulator
         let acc = GasAccumulator::new(2);
@@ -1101,7 +1078,7 @@ mod tests {
         acc.inc_block(1, 2_000_000, 30_000_000);
 
         // chain-global failure -> keep-current fail-open: Ok, everything untouched
-        adjust_base_fees(&reth_env, &acc).await?;
+        apply_close_time_fee_updates(&reth_env, &acc, &tip).await?;
 
         assert_eq!(acc.num_workers(), 2, "worker count unchanged");
         assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");

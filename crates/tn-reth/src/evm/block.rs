@@ -25,19 +25,26 @@
 //!    (`deconstruct_nonce(ctx.nonce).0`) satisfies `concluding_epoch + 1 ==
 //!    CONSENSUS_REGISTRY_FORK_EPOCH` (checked addition): swaps the registry's runtime bytecode in
 //!    place, then runs the one-time `migrateValidatorSets()`.
-//! 2. `apply_closing_epoch_contract_call` - the three boundary system calls in order:
-//!    `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, then `concludeEpoch(address[])`.
-//!    The reward infos carry the leader counts from `ctx.gas_accumulator`'s rewards counter;
-//!    committee membership is drawn by the `randomness`-seeded Fisher-Yates shuffle (sorted by
-//!    address before encoding), run AFTER `applySlashes` commits so the eligible-pool read and the
-//!    committee reflect any slash-to-zero ejections. The ordering is a consensus-safety obligation
-//!    the protocol owns: incentives weight on pre-slash collateral, slashes land before the
-//!    committee is assembled, and `concludeEpoch` settles queued stake version changes from
-//!    post-slash balances. While the deployed registry still carries the pre-fork adiri code, the
-//!    close instead replays the legacy `applyIncentives` + `concludeEpoch(address[])` pair (same
-//!    code-hash gate as the committee-pool read), keeping pre-fork history re-executable; the
-//!    post-fork sequence differs only by the interposed `applySlashes` call, and both share
+//! 2. `apply_closing_epoch_contract_call` - the four boundary system calls in order:
+//!    `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`, then
+//!    `setWorkerConfigsData(uint16[],uint184[])`. The reward infos carry the leader counts from
+//!    `ctx.gas_accumulator`'s rewards counter; committee membership is drawn by the
+//!    `randomness`-seeded Fisher-Yates shuffle (sorted by address before encoding), run AFTER
+//!    `applySlashes` commits so the eligible-pool read and the committee reflect any slash-to-zero
+//!    ejections. The ordering is a consensus-safety obligation the protocol owns: incentives weight
+//!    on pre-slash collateral, slashes land before the committee is assembled, and `concludeEpoch`
+//!    settles queued stake version changes from post-slash balances. While the deployed registry
+//!    still carries the pre-fork adiri code, the close instead replays the legacy pair
+//!    `applyIncentives` then `concludeEpoch(address[])` (same code-hash gate as the committee-pool
+//!    read), keeping pre-fork history re-executable; the post-fork sequence differs by the
+//!    interposed `applySlashes` call and the trailing worker-config write, and both share
 //!    byte-identical `applyIncentives` and `concludeEpoch(address[])` selectors.
+//!
+//! The fourth call (`record_next_epoch_base_fees`) writes each EIP-1559 worker's next-epoch base
+//! fee into its `WorkerConfigs` `data` word: an epoch-boundary snapshot that lets a node entering
+//! the epoch read the fee from one state slot instead of scanning the whole prior epoch's headers
+//! to recompute it. It runs last because it is the only step that reads no registry state and
+//! writes to no registry state, so nothing in the epoch transition depends on its position.
 //!
 //! The order is load-bearing. The fork must lead: the code swap flips the code-hash gate in
 //! `read_committee_eligible_pool` so the shuffle's committee-pool reads use the post-fork ABI
@@ -76,8 +83,9 @@
 use crate::{
     error::{TnRethError, TnRethResult},
     system_calls::{
+        decode_worker_fee_configs,
         ConsensusRegistry::{self, RewardInfo, ValidatorStatus},
-        CONSENSUS_REGISTRY_ADDRESS,
+        WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS,
     },
     SYSTEM_ADDRESS,
 };
@@ -88,6 +96,7 @@ use alloy::{
         eip4788::BEACON_ROOTS_ADDRESS,
         eip7685::{Requests, EMPTY_REQUESTS_HASH},
     },
+    primitives::aliases::U184,
     sol_types::SolCall as _,
 };
 use alloy_evm::{Database, Evm};
@@ -113,9 +122,11 @@ use reth_revm::{
     DatabaseCommit as _, State,
 };
 use std::{collections::BTreeMap, sync::Arc};
+use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_types::{
-    gas_accumulator::GasAccumulator, Address, Bytes, Encodable2718, ExecHeader, Receipt,
-    TransactionSigned, Withdrawals, B256, EMPTY_WITHDRAWALS, U256,
+    gas_accumulator::{next_base_fee_for_config, GasAccumulator, WorkerFeeConfig},
+    Address, Bytes, Encodable2718, ExecHeader, Receipt, TransactionSigned, Withdrawals, WorkerId,
+    B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::{debug, error, trace};
 
@@ -192,6 +203,15 @@ impl TNBlockExecutionCtx {
     /// to `BEACON_ROOTS` contract (eip4788).
     fn first_batch(&self) -> bool {
         self.difficulty < U256::from(65536)
+    }
+
+    /// The worker id packed into the low 16 bits of `difficulty`.
+    ///
+    /// Same mask the header-side [`crate::snapshot::worker_id_from_header`] applies, so a block's
+    /// worker attribution is identical whether it is read from the execution context or from the
+    /// sealed header afterwards (the gas accumulator's per-worker totals depend on that).
+    fn worker_id(&self) -> WorkerId {
+        (self.difficulty.into_limbs()[0] & 0xffff) as WorkerId
     }
 }
 
@@ -302,15 +322,18 @@ where
         Ok(())
     }
 
-    /// Close the epoch through the three boundary system calls, in order:
-    /// `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`.
+    /// Close the epoch through the four boundary system calls, in order:
+    /// `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`,
+    /// `setWorkerConfigsData(uint16[],uint184[])`.
     ///
     /// The order is a consensus-safety invariant. `applySlashes` commits before the committee is
     /// assembled, so the `nextCommitteeSize` read and the shuffle below both see any slash-to-zero
     /// ejections: the committee `concludeEpoch` validates cannot be stale, and an ejected
     /// validator is never seated in a future committee. Slashing is not live, so the slashes array
     /// is always empty (production builds) and `applySlashes` is a no-op today; the call is
-    /// issued regardless so the sequence is correct by construction when slashing ships.
+    /// issued regardless so the sequence is correct by construction when slashing ships. The
+    /// base-fee record trails the registry calls (see [`Self::record_next_epoch_base_fees`]): it
+    /// touches a different contract, so nothing in the epoch transition reads what it writes.
     fn apply_closing_epoch_contract_call(
         &mut self,
         randomness: B256,
@@ -362,7 +385,120 @@ where
         // 3. assemble the committee from the post-slash eligible pool, then conclude
         let calldata = self.generate_conclude_epoch_calldata(randomness)?;
         trace!(target: "engine", ?calldata, "close epoch calldata");
-        self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "closing epoch",
+        )?;
+
+        // 4. publish the next epoch's per-worker base fees for the epoch that just began
+        self.record_next_epoch_base_fees()
+    }
+
+    /// Record every EIP-1559 worker's NEXT-epoch base fee in the `WorkerConfigs` contract's
+    /// per-worker `data` word.
+    ///
+    /// Fourth and last of the closing block's system calls, so the write lands in the same block
+    /// that seats the new committee: a node entering the epoch reads each worker's fee from one
+    /// state slot instead of scanning the whole prior epoch's headers to recompute it.
+    ///
+    /// The value written for a worker MUST equal what the live producer's post-close
+    /// `adjust_base_fees` (in `tn_node::manager`) and every node's epoch-entry header-scan
+    /// derivation (`derive_base_fees_for_entered_epoch`) compute for it — the batch validator
+    /// snapshots a plain `u64` per epoch and compares base fees for exact equality, so a
+    /// one-wei divergence makes peers reject each other's batches for a whole epoch. Three
+    /// details carry that equivalence:
+    ///
+    /// - The worker set comes from the CONTRACT's `numWorkers`, not the accumulator's. Governance
+    ///   may have grown the worker set mid-epoch (a `setNumWorkers` only takes effect at this
+    ///   boundary), and both other seams read the count at this same closing block. A worker with
+    ///   no accumulator slot yet prices from `(MIN_PROTOCOL_BASE_FEE, 0 gas)`, which is exactly
+    ///   what `adjust_base_fees`' resize-then-compute and the entry walk's slot-creation anchor
+    ///   produce for a fresh slot.
+    /// - This block's own gas is folded into its worker's total. The accumulator does not include
+    ///   it yet (`inc_block` runs after the payload executes), while the post-close adjustment and
+    ///   the header scan both count this block.
+    /// - The accumulator is only READ. It is shared live with the batch validator and the node
+    ///   manager, so resizing or clearing it here would corrupt state those readers depend on.
+    ///
+    /// `Static` workers are skipped: their fee is already on-chain in the config's `value` word,
+    /// so recording it would be redundant. A closing block with no EIP-1559 worker therefore
+    /// issues no system call at all — an emptiness every node computes identically from the same
+    /// contract state, so skipping cannot diverge the fleet.
+    ///
+    /// Fatal on any failure (read, decode, or a reverting/halting write), like every other step of
+    /// the close: the error aborts execution of the consensus output rather than committing a
+    /// block whose state diverges from the rest of the fleet.
+    fn record_next_epoch_base_fees(&mut self) -> TnRethResult<()> {
+        let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
+        let data = self.read_state_on_chain(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+        let (num_workers, entries) = decode_worker_fee_configs(&data).map_err(|e| {
+            error!(target: "engine", "failed to decode worker configs at epoch close: {e}");
+            TnRethError::EVMCustom(format!(
+                "failed to decode worker configs while recording next-epoch base fees: {e}"
+            ))
+        })?;
+
+        let own_worker = self.ctx.worker_id();
+        let own_gas = self.gas_used;
+        let accumulator_workers = self.ctx.gas_accumulator.num_workers();
+
+        let mut worker_ids: Vec<WorkerId> = Vec::new();
+        let mut datas: Vec<U184> = Vec::new();
+        for (worker_id, entry) in entries.iter().enumerate() {
+            let worker_id = worker_id as WorkerId;
+            match entry.config {
+                WorkerFeeConfig::Eip1559 { .. } => {}
+                // a static worker's fee is the config's `value` on-chain already
+                WorkerFeeConfig::Static { .. } => continue,
+            }
+
+            let (current_fee, gas_used) = if (worker_id as usize) < accumulator_workers {
+                let (_blocks, gas_used, _gas_limit) =
+                    self.ctx.gas_accumulator.get_values(worker_id);
+                (self.ctx.gas_accumulator.base_fee(worker_id).base_fee(), gas_used)
+            } else {
+                // governance added this worker mid-epoch: it has no slot to read, and a fresh
+                // slot is created with the min fee and zero gas
+                (MIN_PROTOCOL_BASE_FEE, 0)
+            };
+            // this block's gas reaches the accumulator only after execution finishes
+            let gas_used =
+                if worker_id == own_worker { gas_used.saturating_add(own_gas) } else { gas_used };
+
+            worker_ids.push(worker_id);
+            datas.push(U184::from(next_base_fee_for_config(entry.config, current_fee, gas_used)));
+        }
+
+        if worker_ids.is_empty() {
+            debug!(
+                target: "engine",
+                num_workers,
+                own_worker,
+                own_gas,
+                "no eip1559 workers configured; skipping next-epoch base fee record"
+            );
+            return Ok(());
+        }
+
+        debug!(
+            target: "engine",
+            num_workers,
+            own_worker,
+            own_gas,
+            ?worker_ids,
+            ?datas,
+            "recording next-epoch base fees"
+        );
+
+        let calldata = WorkerConfigs::setWorkerConfigsDataCall { workerIds: worker_ids, datas }
+            .abi_encode()
+            .into();
+        self.transact_and_commit_system_call(
+            WORKER_CONFIGS_ADDRESS,
+            calldata,
+            "recording next-epoch base fees",
+        )
     }
 
     /// The slashes to submit at this epoch boundary.
