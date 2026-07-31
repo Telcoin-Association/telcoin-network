@@ -83,7 +83,8 @@ async fn test_make_batch_el_to_cl() -> eyre::Result<()> {
         0,
         MIN_PROTOCOL_BASE_FEE,
         0,
-    );
+    )
+    .expect("batch builder");
 
     let gas_price = reth_env.get_gas_price().unwrap();
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
@@ -243,7 +244,8 @@ async fn test_batch_builder_produces_valid_batches() {
         0,
         MIN_PROTOCOL_BASE_FEE,
         0,
-    );
+    )
+    .expect("batch builder");
 
     let gas_price = reth_env.get_gas_price().unwrap();
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
@@ -415,7 +417,8 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
         0,
         MIN_PROTOCOL_BASE_FEE,
         0,
-    );
+    )
+    .expect("batch builder");
 
     let gas_price = reth_env.get_gas_price().unwrap();
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
@@ -498,8 +501,7 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
             ReputationScores::default(),
             None,
             tn_types::EpochSeedChainValue::genesis_placeholder(),
-        )
-        .into(),
+        ),
         ConsensusHeaderDigest::default(),
         0,
         false,

@@ -383,7 +383,7 @@ The `admin` and `txpool` modules are not available at this time.
 
 | Flag                         | Default | Description                                                                                |
 | ---------------------------- | ------- | ------------------------------------------------------------------------------------------ |
-| `--txpool.max-account-slots` | `256`   | Max pending transactions per sender (Reth default is 16; Telcoin Network overrides to 256) |
+| `--txpool.max-account-slots` | `256`   | Max pending transactions per sender. Telcoin Network raises Reth's default of 16 to 256; any explicit value is honored, including 16 |
 
 ## Networking
 

@@ -94,10 +94,10 @@ where
     ///    [`EpochRecord`] if missing so later lookups can treat epoch 0 like any other.
     /// 2. Create the per-epoch [`TaskManager`] and open the epoch pack files via `open_epoch_pack`.
     /// 3. If the mode calls for replay, re-forward any missed consensus output. If that replay
-    ///    crosses the epoch boundary, close the epoch immediately, clear the consensus DB, and
-    ///    return early as [`RunEpochMode::NewEpoch`] — consensus is never configured this
-    ///    iteration. Otherwise, block until the engine has executed the last replayed output before
-    ///    going live.
+    ///    crosses the epoch boundary, close the epoch immediately, write its [`EpochRecord`], clear
+    ///    the consensus DB, and return early as [`RunEpochMode::NewEpoch`] — consensus is never
+    ///    configured this iteration. Otherwise, block until the engine has executed the last
+    ///    replayed output before going live.
     /// 4. Subscribe to consensus output, configure consensus, and create the primary/worker
     ///    components. The one-time per-process network setup is gated on `network_first_init`,
     ///    which is driven by `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the
@@ -107,11 +107,13 @@ where
     ///    builder, and the engine batch builder; reattach any orphaned batches.
     /// 6. `tokio::select!` over three exits: node shutdown, the epoch boundary
     ///    (`wait_for_epoch_boundary`), and the epoch task manager ending early (a CVV resync or a
-    ///    task error). Only the boundary arm closes the epoch and writes its [`EpochRecord`].
+    ///    task error). Of these, only the boundary arm closes the epoch and writes its
+    ///    [`EpochRecord`]; the replay-and-close (step 3) and leftover-drain (step 7) recovery paths
+    ///    write the record on their own closes.
     /// 7. Notify consensus shutdown, abort and drain the epoch task manager, then resolve the
     ///    outcome. On a non-boundary exit, drain leftover output to the engine: if that drain hits
-    ///    the boundary, close the epoch here too. Clear epoch-scoped DB tables when a boundary was
-    ///    crossed.
+    ///    the boundary, close the epoch and write its [`EpochRecord`] here too. Clear epoch-scoped
+    ///    DB tables when a boundary was crossed.
     ///
     /// The returned [`RunEpochMode`] tells the caller (`run_epochs` in the `node` module) which
     /// transition occurred: [`RunEpochMode::NewEpoch`] when the boundary was crossed (advance the
@@ -229,6 +231,10 @@ where
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
                 self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
+                // write the record before clearing tables: a crash after an epoch-0 replay-close
+                // that left no durable record 0 would trip the epoch-0 guard above on every
+                // restart (peers cannot backfill epoch 0), bricking the node
+                self.write_epoch_record(committee.epoch(), engine).await?;
                 self.clear_consensus_db_for_next_epoch()?;
                 return Ok(RunEpochMode::NewEpoch);
             }
@@ -373,7 +379,10 @@ where
                 .await?;
 
                 // Write the epoch record to DB and save in manager for next epoch.
-                self.write_epoch_record(&primary, engine).await?;
+                self.write_epoch_record(current_epoch, engine).await?;
+
+                // Export the epoch's final execution state (no-op unless --enable-state-export).
+                self.export_epoch_state(&primary, &reth_env).await?;
 
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
                 epoch_boundary_reached = true;
@@ -428,6 +437,9 @@ where
             // If things go down at exactly the wrong time we might have reached the epoch end
             // so account for that.
             self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
+            // this arm closed the epoch, so it writes the record too — otherwise the epoch has
+            // no durable record and the next live close fails as out-of-order
+            self.write_epoch_record(current_epoch, engine).await?;
             res = RunEpochMode::NewEpoch;
             clear_tables_for_next_epoch = true;
         } else {
@@ -769,14 +781,14 @@ async fn adjust_base_fees(
     };
 
     let block_height = epoch_info.blockHeight;
-    debug_assert_eq!(
-        tip.number + 1,
-        block_height,
-        "close-time base-fee identity: canonical tip {} + 1 != entered-epoch {entered_epoch} \
-         blockHeight {block_height}",
-        tip.number,
-    );
     if tip.number + 1 != block_height {
+        error!(
+            target: "epoch-manager",
+            tip_number = tip.number,
+            entered_epoch,
+            block_height,
+            "close-time base-fee identity: canonical tip + 1 != entered-epoch blockHeight"
+        );
         return Err(eyre::eyre!(
             "close-time base-fee identity violated: canonical tip {} + 1 != entered-epoch \
              {entered_epoch} blockHeight {block_height} at tip {:?} - refusing to price base fees \
@@ -1141,6 +1153,35 @@ mod tests {
         assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
         assert_eq!(acc.base_fee(1).base_fee(), 9_099, "worker 1 fee unchanged");
         assert_eq!(acc.get_values(0), (1, 1_000_000, 30_000_000), "worker 0 gas unchanged");
+
+        Ok(())
+    }
+
+    /// Identity-violation arm: with the registry present but NO closing block executed, the
+    /// canonical tip is genesis and the identity read succeeds with epoch 0's record
+    /// (`blockHeight` 0), so `tip + 1 != blockHeight` and the guard halts the close with the
+    /// descriptive error instead of pricing base fees off a non-closing block.
+    #[tokio::test]
+    async fn adjust_base_fees_errors_when_tip_is_not_a_closing_block() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("adjust_fees_identity_violation")?;
+        let task_manager = TaskManager::new("adjust fees identity violation");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(4_242);
+
+        let err = adjust_base_fees(&reth_env, &acc)
+            .await
+            .expect_err("non-closing tip must violate the close-time identity");
+        assert!(
+            err.to_string().contains("close-time base-fee identity violated"),
+            "unexpected error: {err}"
+        );
+
+        // the guard trips before the config read, so fees stay untouched
+        assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
 
         Ok(())
     }

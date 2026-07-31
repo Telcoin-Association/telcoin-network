@@ -18,7 +18,7 @@ use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
 use std::collections::BTreeSet;
 use tn_config::TelcoinDirs;
-use tn_reth::recover_raw_transaction;
+use tn_reth::{recover_raw_transaction, RethEnv};
 use tn_storage::tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, LastProposed,
     NodeBatchesCache, OurNodeBatchesCache, Payload, ProposedCertificates, Votes,
@@ -30,7 +30,7 @@ use tn_types::{
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -112,7 +112,10 @@ where
     ///
     /// Returns the [`ConsensusHeaderDigest`] of the first output committed at or
     /// past the epoch boundary, signalling that an epoch-boundary output was
-    /// reached; `None` if no such output was found.
+    /// reached; `None` if no such output was found. That boundary output's header
+    /// is also stashed in `last_consensus_header` so the caller's close-and-write
+    /// sequence (`close_epoch`, then `write_epoch_record`) can commit the epoch's
+    /// record.
     pub(super) async fn send_leftover_consensus_output_to_engine(
         &mut self,
         consensus_output: &mut impl TnReceiver<ConsensusOutput>,
@@ -121,6 +124,8 @@ where
         // Phase 1: Drain broadcast channel (existing behavior)
         while let Ok(output) = consensus_output.try_recv() {
             let result = if output.committed_at() >= self.epoch_boundary {
+                // stash the boundary header for the caller's close-and-write sequence
+                self.last_consensus_header = Some(output.clone().into());
                 Some(output.consensus_header_hash())
             } else {
                 None
@@ -143,6 +148,8 @@ where
                 match self.consensus_chain.get_consensus_output_current(number).await {
                     Ok(output) => {
                         let result = if output.committed_at() >= self.epoch_boundary {
+                            // stash the boundary header for the caller's close-and-write sequence
+                            self.last_consensus_header = Some(output.clone().into());
                             Some(output.consensus_header_hash())
                         } else {
                             None
@@ -165,7 +172,10 @@ where
 
     /// Persist the finalized [`EpochRecord`] for the just-completed epoch and
     /// publish it on `epoch_record_watch` for downstream signing or signature
-    /// collection.
+    /// collection. The record is flushed durably to disk before returning: the
+    /// certificate-quorum path persists asynchronously, so without the explicit
+    /// flush a crash between this write and that persist would lose the record —
+    /// fatal for epoch 0, which has no peer-fetch anchor to heal from.
     ///
     /// Epoch 0 is a special case: it starts with an unsigned "dummy" record so
     /// the initial committee is available before any certificate exists. Once a
@@ -179,11 +189,9 @@ where
     /// inconsistent and is treated as an error rather than silently recorded.
     pub(super) async fn write_epoch_record(
         &mut self,
-        primary: &PrimaryNode<DB>,
+        epoch: Epoch,
         engine: &ExecutionNode,
     ) -> eyre::Result<()> {
-        let committee = primary.current_committee().await;
-        let epoch = committee.epoch();
         if epoch == 0 {
             // Epoch 0 will have a "dummy" epoch record to make the initial committee avaliable to
             // code using these records. In this case there will not be a cert so we
@@ -218,11 +226,12 @@ where
         // commits as `final_state`. `parent_state` is the bus's `recent_blocks` watch value,
         // not the reth canonical tip: the engine publishes each executed output's last block
         // and its consensus hash in ONE watch write, so the bus can lag the true tip
-        // mid-execution but never lead it. At the only call site (the live boundary arm of
-        // `run_epoch`, after `close_epoch`'s `wait_for_consensus_execution`) the wait resolved
-        // on the exact write that carries the closing block, so this read IS that block; the
-        // pin makes the record's committee reads and its `final_state` derive from the same
-        // header by construction instead of by timing.
+        // mid-execution but never lead it. At every call site (the live boundary arm and the
+        // two replay-and-close recovery arms of `run_epoch`, each running after `close_epoch`'s
+        // `wait_for_consensus_execution`) the wait resolved on the exact write that carries the
+        // closing block, so this read IS that block; the pin makes the record's committee reads
+        // and its `final_state` derive from the same header by construction instead of by
+        // timing.
         let parent_state = self.consensus_bus.latest_execution_block_num_hash();
         let committee_keys = engine.validators_for_epoch_at_block(epoch, parent_state.hash).await?;
         let next_committee_keys =
@@ -232,10 +241,9 @@ where
         } else {
             self.consensus_chain.epochs().record_by_epoch(epoch - 1).await
         };
-        let last_consensus_header = self
-            .last_consensus_header
-            .take()
-            .expect("epoch was finished with last consensus header");
+        let last_consensus_header = self.last_consensus_header.take().ok_or_else(|| {
+            eyre!("epoch {epoch} reached write_epoch_record without its boundary consensus header")
+        })?;
         let target_hash = last_consensus_header.digest();
 
         let epoch_rec = build_epoch_record(
@@ -248,7 +256,90 @@ where
         )?;
 
         self.consensus_chain.epochs().save_record(epoch_rec.clone()).await?;
+        // the cert-quorum path persists asynchronously; a crash before that flush would lose
+        // the record just saved — fatal for epoch 0, which has no peer-fetch anchor — so
+        // flush it durably here before publishing
+        self.consensus_chain.epochs().persist().await?;
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
+        Ok(())
+    }
+
+    /// Export the just-closed epoch's final execution state to a snapshot pack.
+    ///
+    /// A no-op unless `--enable-state-export` spawned the exporter. The export runs on the
+    /// exporter's background thread (a full plain-state walk can be slow) and its outcome is
+    /// logged; the epoch transition does not wait on it. The pack is written under
+    /// `consensus-db/state_exports/epoch-{N}/`. The block exported is the epoch's final executed
+    /// block — the same value [`write_epoch_record`](Self::write_epoch_record) records as the
+    /// epoch's `final_state`.
+    pub(super) async fn export_epoch_state(
+        &self,
+        primary: &PrimaryNode<DB>,
+        reth_env: &RethEnv,
+    ) -> eyre::Result<()> {
+        let Some(exporter) = &self.exec_state_exporter else {
+            return Ok(());
+        };
+        let epoch = primary.current_committee().await.epoch();
+        let block = self.consensus_bus.latest_execution_block_num_hash();
+        let export_root = self.tn_datadir.consensus_db_path().join("state_exports");
+        let final_dir = export_root.join(format!("epoch-{epoch}"));
+        // Idempotent: a completed export for this epoch already sits at the final location (e.g.
+        // the boundary is re-processed after a restart); nothing to do.
+        if final_dir.exists() {
+            debug!(target: "tn::snapshot", epoch, "epoch state already exported; skipping");
+            return Ok(());
+        }
+        // Export into a temp sibling and atomically rename it into place on success, so external
+        // tooling only ever observes a complete `epoch-{N}` directory. Clear any leftover temp from
+        // a prior failed attempt first.
+        let tmp_dir = export_root.join(format!("epoch-{epoch}.tmp"));
+        if tmp_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
+                warn!(target: "tn::snapshot", epoch, error = %e, "failed to clear stale temp export dir");
+            }
+        }
+
+        match exporter.trigger_export(reth_env.clone(), block, tmp_dir.clone()) {
+            Ok(rx) => {
+                // fire-and-forget: log the result without blocking the epoch transition.
+                // The reth env task spawner should be the node/app scoped spawner NOT the epoch
+                // scoped spawner (about to die).
+                reth_env.get_task_spawner().spawn_task(format!("exporting execution state for epoch {epoch}"), async move {
+                    match rx.await {
+                        // move the completed pack into place; external tooling watches for the
+                        // final dir appearing atomically.
+                        Ok(Ok(outcome)) => match std::fs::rename(&tmp_dir, &final_dir) {
+                            Ok(()) => info!(
+                                target: "tn::snapshot",
+                                epoch,
+                                block = outcome.block.number,
+                                accounts = outcome.stats.account_count,
+                                path = ?final_dir,
+                                "exported epoch execution state"
+                            ),
+                            Err(e) => {
+                                error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch state into place");
+                                let _ = std::fs::remove_dir_all(&tmp_dir);
+                            }
+                        },
+                        // export failed or the worker went away: drop the partial temp dir.
+                        Ok(Err(e)) => {
+                            warn!(target: "tn::snapshot", epoch, error = %e, "epoch state export failed");
+                            let _ = std::fs::remove_dir_all(&tmp_dir);
+                        }
+                        Err(_) => {
+                            warn!(target: "tn::snapshot", epoch, "epoch state export worker dropped the reply");
+                            let _ = std::fs::remove_dir_all(&tmp_dir);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            Err(e) => {
+                warn!(target: "tn::snapshot", epoch, error = %e, "could not enqueue epoch state export")
+            }
+        }
         Ok(())
     }
 

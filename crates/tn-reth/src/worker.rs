@@ -1,11 +1,16 @@
-//! Node implementation for reth compatibility
+//! RPC-facing network shim and per-worker execution components.
 //!
-//! Inspired by reth_node_ethereum crate.
+//! Inspired by reth_node_ethereum crate. TN does not run reth's devp2p networking, but reth's
+//! RPC builder needs `NetworkInfo`/`Peers` implementations to serve the `net`, `web3`, and
+//! `eth` namespaces. [`WorkerNetwork`] is that shim: it answers with the chain id, a
+//! genesis-derived status, and a peer count that a background task refreshes every 15 seconds
+//! by polling the worker's libp2p network handle. Everything reth-specific (peer management,
+//! ENR/node records, the admin namespace) is a deliberate no-op. The chain spec is held behind
+//! an `Arc`, so cloning the shim is cheap.
 //!
-//! A network implementation for worker RPC.
-//!
-//! This is useful for wiring components together that don't require network but still need to be
-//! generic over it.
+//! [`WorkerComponents`] bundles what the node keeps per worker: the RPC server handle, the
+//! worker's transaction pool, and the [`WorkerNetwork`] (retained so its peer-count task can be
+//! respawned when the epoch rolls over).
 
 use crate::{ChainSpec, WorkerTxPool};
 use parking_lot::RwLock;
@@ -66,7 +71,7 @@ impl WorkerComponents {
 #[non_exhaustive]
 pub struct WorkerNetwork {
     /// Chainspec
-    chain_spec: RethChainSpec,
+    chain_spec: Arc<RethChainSpec>,
     /// Track our peer count for queries.
     peer_count: Arc<RwLock<usize>>,
     /// App version.

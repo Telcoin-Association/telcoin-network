@@ -1,4 +1,12 @@
 //! Utility functions used by EVM.
+//!
+//! Home of [`calculate_gas_penalty`], the quadratic penalty `TNEvmHandler::reimburse_caller`
+//! applies to transactions that set a gas limit far above actual usage (issue #424). The
+//! penalty is zero when the gas limit is at or below 210,000 or when at least 10% of the limit
+//! was used; below 10% usage it grows quadratically with the shortfall, approaching
+//! confiscation of all unused gas for extreme over-estimates. Integer-only `u128` arithmetic
+//! (10^9 fixed-point precision) keeps results identical on every node — a consensus
+//! requirement, since the penalty changes account balances.
 
 use tracing::debug;
 
