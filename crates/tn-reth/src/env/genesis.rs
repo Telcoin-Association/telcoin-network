@@ -234,7 +234,7 @@ impl RethEnv {
             );
 
             let (strategies, values): (Vec<u8>, Vec<u64>) = worker_configs.iter().copied().unzip();
-            let datas = vec![0u128; strategies.len()];
+            let datas = vec![alloy::primitives::aliases::U184::ZERO; strategies.len()];
             let constructor_args =
                 WorkerConfigs::constructorCall { strategies, values, datas, owner_: owner_address }
                     .abi_encode();

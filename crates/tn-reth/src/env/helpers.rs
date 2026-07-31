@@ -298,8 +298,8 @@ impl RethEnv {
     /// output bytes.
     ///
     /// `eth_call`-like semantics: caller is the zero address, value 0, gas price 0, nonce and
-    /// base fee checks disabled, 30M gas; no state is committed. Callers decode the returned
-    /// bytes themselves (e.g. with `SolCall::abi_decode_returns`).
+    /// base fee checks disabled, gas capped at the system-call budget; no state is committed.
+    /// Callers decode the returned bytes themselves (e.g. with `SolCall::abi_decode_returns`).
     ///
     /// # Errors
     ///
