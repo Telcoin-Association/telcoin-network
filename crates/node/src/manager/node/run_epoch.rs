@@ -874,13 +874,14 @@ async fn apply_close_time_fee_updates(
     })
     .await
     {
-        Ok((_num_workers, configs)) => {
-            gas_accumulator.set_num_workers(configs.len());
-            for (worker_id, config) in configs.into_iter().enumerate() {
+        Ok((_num_workers, entries)) => {
+            gas_accumulator.set_num_workers(entries.len());
+            for (worker_id, row) in entries.into_iter().enumerate() {
                 let worker_id = worker_id as u16;
                 let (_blocks, gas_used, _gas_limit) = gas_accumulator.get_values(worker_id);
                 let base_fee = gas_accumulator.base_fee(worker_id);
-                let next_base_fee = next_base_fee_for_config(config, base_fee.base_fee(), gas_used);
+                let next_base_fee =
+                    next_base_fee_for_config(row.config, base_fee.base_fee(), gas_used);
                 base_fee.set_base_fee(next_base_fee);
             }
         }

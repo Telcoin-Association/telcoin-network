@@ -1697,9 +1697,9 @@ async fn epoch_block_height_is_closing_block_plus_one() -> eyre::Result<()> {
 
     // the close-time tripwire's second read (worker configs at the SAME tip) also resolves: the one
     // configured worker is present at the closing block
-    let (num_workers, configs) = reth_env.get_worker_fee_configs_at_block(closing.hash())?;
+    let (num_workers, entries) = reth_env.get_worker_fee_configs_at_block(closing.hash())?;
     assert_eq!(num_workers, 1, "one configured worker at the closing block");
-    assert_eq!(configs.len(), 1, "config arity matches the worker count");
+    assert_eq!(entries.len(), 1, "config arity matches the worker count");
 
     Ok(())
 }

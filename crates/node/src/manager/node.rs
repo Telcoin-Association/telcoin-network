@@ -316,7 +316,7 @@ pub fn sync_num_workers_from_chain(
         .wrap_err_with(|| format!("failed to read header {read_block} while syncing worker count"))?
         .ok_or_else(|| eyre!("no header at block {read_block} while syncing worker count"))?;
 
-    let (num_workers, _configs) =
+    let (num_workers, _entries) =
         reth_env.get_worker_fee_configs_at_block(header.hash()).wrap_err_with(|| {
             format!("failed to read WorkerConfigs at block {read_block} while syncing worker count")
         })?;
@@ -492,7 +492,8 @@ pub fn derive_base_fees_for_entered_epoch(
     let gas_totals = gas_used_per_worker(&genuine);
 
     // worker strategies and count at the closing block = the entered epoch's configuration
-    let (num_workers, configs) = reth_env.get_worker_fee_configs_at_block(closing_header.hash())?;
+    let (num_workers, entries) = reth_env.get_worker_fee_configs_at_block(closing_header.hash())?;
+    let configs: Vec<WorkerFeeConfig> = entries.into_iter().map(|row| row.config).collect();
     let mut fees = fold_next_epoch_base_fees(&configs, &held_fees, &gas_totals);
 
     // Workers with no genuine block in the prior epoch still have a chain-derivable fee: walk
@@ -650,8 +651,8 @@ pub(crate) fn derive_idle_worker_fee_at(
         })?;
 
         // the strategy in force for epoch k, read at the closing block ONLY
-        let (_num_workers, configs) = reth_env.get_worker_fee_configs_at_block(closing.hash())?;
-        let Some(config) = configs.get(worker_id as usize).copied() else {
+        let (_num_workers, entries) = reth_env.get_worker_fee_configs_at_block(closing.hash())?;
+        let Some(config) = entries.get(worker_id as usize).map(|row| row.config) else {
             // rule 3: slot absent at this boundary — anchor at the fresh-slot MIN default
             break MIN_PROTOCOL_BASE_FEE;
         };

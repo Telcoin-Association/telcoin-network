@@ -909,7 +909,7 @@ pub fn check_fee_precondition(
         .ok_or_else(|| eyre!("snapshot restore: cannot check fees over an empty window"))?;
 
     // worker strategies at the closing block define the entered epoch's configuration
-    let (num_workers, configs) = reth_env
+    let (num_workers, entries) = reth_env
         .get_worker_fee_configs_at_block(closing.hash())
         .wrap_err("snapshot restore: reading worker fee configs at the snapshot's final block")?;
 
@@ -922,9 +922,10 @@ pub fn check_fee_precondition(
     }
 
     let prior = entered.saturating_sub(1);
-    for (worker_id, config) in configs.iter().enumerate() {
+    for (worker_id, entry) in entries.iter().enumerate() {
         let worker_id = worker_id as WorkerId;
-        if matches!(config, WorkerFeeConfig::Eip1559 { .. }) && !produced.contains(&worker_id) {
+        if matches!(entry.config, WorkerFeeConfig::Eip1559 { .. }) && !produced.contains(&worker_id)
+        {
             return Err(eyre!(
                 "snapshot restore: worker {worker_id} has an EIP-1559 fee config but produced \
                  no genuine block in the shipped epoch-{prior} window; the restored node would \
