@@ -1001,7 +1001,7 @@ fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manager::{derive_base_fees_for_entered_epoch, sync_num_workers_from_chain};
+    use crate::manager::{read_base_fees_for_entered_epoch, sync_num_workers_from_chain};
     use rand::{rngs::StdRng, SeedableRng as _};
     use std::{cell::Cell, sync::Arc};
     use tempfile::TempDir;
@@ -1216,14 +1216,17 @@ mod tests {
     ///  (a) the on-chain `WorkerConfigs.data` word the closing block's 4th system call records
     ///      (`record_next_epoch_base_fees` in `tn-reth`), read back at the closing block's
     ///      state through the production decode seam;
-    ///  (b) the epoch-entry derivation every node runs ([`derive_base_fees_for_entered_epoch`]);
+    ///  (b) the PRODUCTION ENTRY READ every node runs ([`read_base_fees_for_entered_epoch`]),
+    ///      pinned to the same closing block;
     ///  (c) the live producer's close-time accumulator update ([`adjust_base_fees`]);
     ///
     /// each pinned against an independent [`next_base_fee_for_config`] oracle computed from raw
     /// header gas and the epoch's entry fee. This equality is a consensus invariant: the batch
     /// validator snapshots one entry fee per epoch and compares for EXACT equality, so a
     /// one-wei divergence between any two of these seams rejects every peer batch for a whole
-    /// epoch — and replacing (b) with a read of (a) is only safe while all three agree.
+    /// epoch. (b) is a read of (a) through the production interpretation seam
+    /// (`entry_fee_for_worker`), so the load-bearing equalities are write == oracle and
+    /// read == write == close-time adjust — the entry can only install what the close recorded.
     ///
     /// Drives TWO real epoch closes over one chain (worker 0 `Eip1559 { target_gas: 1M }`,
     /// worker 1 `Static` — a mixed strategy set), with genuine per-worker user-tx gas and real
@@ -1239,8 +1242,7 @@ mod tests {
     /// fully organic: epoch 1 runs at the fee the FIRST close wrote on-chain, so boundary 2
     /// starts from a written fee, not genesis defaults.
     #[tokio::test]
-    async fn close_record_adjust_and_entry_derivation_agree_across_boundaries() -> eyre::Result<()>
-    {
+    async fn close_record_adjust_and_entry_read_agree_across_boundaries() -> eyre::Result<()> {
         const TARGET_GAS: u64 = 1_000_000;
         const START_FEE: u64 = 1_000_000;
         const STATIC_FEE: u64 = 12_345;
@@ -1366,24 +1368,23 @@ mod tests {
         assert!(entries[1].data.is_zero(), "a static worker's data word is never written");
         let recorded_w0 = entries[0].data.to::<u64>();
 
-        // (b) the epoch-entry derivation every node runs, pinned to the same closing block
-        let derived_1 = derive_base_fees_for_entered_epoch(&reth_env, 1, &h3)?;
-        assert_eq!(derived_1.num_workers, 2);
-        // header scan ≡ the live accumulator's inc_block totals for the closed epoch
-        assert_eq!(derived_1.gas_totals.get(&0).copied().unwrap_or_default(), live_gas_w0);
-        assert_eq!(derived_1.gas_totals.get(&1).copied().unwrap_or_default(), live_gas_w1);
+        // (b) the production entry read every node runs, pinned to the same closing block.
+        // (No scan-vs-accumulator gas pin remains: the derivation's whole-epoch header scan is
+        // gone, and inc_block ≡ header gas is already pinned directly above.)
+        let read_1 = read_base_fees_for_entered_epoch(&reth_env, 1, &h3)?;
+        assert_eq!(read_1.num_workers, 2);
 
         // THE EQUALITY at boundary 1: (a) == (b) == (c) == oracle, per worker
         assert_eq!(recorded_w0, oracle_1, "(a) on-chain record != oracle");
-        assert_eq!(derived_1.fees[0], Some(oracle_1), "(b) entry derivation != oracle");
+        assert_eq!(read_1.fees[0], oracle_1, "(b) entry read != oracle");
         assert_eq!(close_time_w0, oracle_1, "(c) close-time accumulator != oracle");
-        assert_eq!(derived_1.fees[1], Some(STATIC_FEE), "(b) static worker != configured fee");
+        assert_eq!(read_1.fees[1], STATIC_FEE, "(b) static worker != configured fee");
         assert_eq!(close_time_w1, STATIC_FEE, "(c) static worker != configured fee");
 
-        // enter epoch 1 exactly as production: clear the epoch's gas, then derive+apply —
+        // enter epoch 1 exactly as production: clear the epoch's gas, then read+apply —
         // which must rewrite the very fees the close-time update left in place
         acc.clear();
-        derived_1.apply(&acc);
+        read_1.apply(&acc);
         assert_eq!(acc.base_fee(0).base_fee(), oracle_1, "entry apply rewrites the close value");
         assert_eq!(acc.base_fee(1).base_fee(), STATIC_FEE);
 
@@ -1452,16 +1453,14 @@ mod tests {
         assert!(entries[1].data.is_zero(), "static worker still never written");
 
         // (b) at boundary 2
-        let derived_2 = derive_base_fees_for_entered_epoch(&reth_env, 2, &h6)?;
-        assert_eq!(derived_2.num_workers, 2);
-        assert_eq!(derived_2.gas_totals.get(&0).copied().unwrap_or_default(), epoch1_gas_w0);
-        assert_eq!(derived_2.gas_totals.get(&1).copied().unwrap_or_default(), h5.gas_used);
+        let read_2 = read_base_fees_for_entered_epoch(&reth_env, 2, &h6)?;
+        assert_eq!(read_2.num_workers, 2);
 
         // THE EQUALITY at boundary 2 — starting from a written fee, not genesis defaults
         assert_eq!(entries[0].data.to::<u64>(), oracle_2, "(a) on-chain record != oracle");
-        assert_eq!(derived_2.fees[0], Some(oracle_2), "(b) entry derivation != oracle");
+        assert_eq!(read_2.fees[0], oracle_2, "(b) entry read != oracle");
         assert_eq!(acc.base_fee(0).base_fee(), oracle_2, "(c) close-time accumulator != oracle");
-        assert_eq!(derived_2.fees[1], Some(STATIC_FEE));
+        assert_eq!(read_2.fees[1], STATIC_FEE);
         assert_eq!(acc.base_fee(1).base_fee(), STATIC_FEE);
 
         Ok(())
