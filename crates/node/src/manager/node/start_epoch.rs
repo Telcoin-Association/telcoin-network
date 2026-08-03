@@ -24,6 +24,7 @@
 //! yet executed is replayed to the engine, with a guard that refuses to cross an
 //! epoch boundary.
 
+use super::run_epoch::retry_provider_faults;
 use crate::{
     engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode, worker::WorkerNode,
     EngineToPrimaryRpc,
@@ -130,19 +131,39 @@ where
     /// `EpochInfo`/epoch-start scalars are unchanged by the pin, since `concludeEpoch` writes them
     /// exactly once at the boundary.
     /// On-chain BLS key bytes are decoded here and a decode failure aborts committee construction.
+    ///
+    /// READ-FAILURE POLICY: the read is a consensus input, so its failure is classified by
+    /// committee determinism ([`StateReadError`](tn_reth::error::StateReadError)) and BOTH classes
+    /// halt. There is deliberately no fail-open arm, despite what
+    /// [`ChainGlobal`](tn_reth::error::StateReadError::ChainGlobal)'s variant doc says about
+    /// keep-current staying committee-consistent: the node is ENTERING the epoch, so it holds no
+    /// prior committee to keep, and entering on an unverifiable one is a consensus-safety failure
+    /// while halting is a single-node liveness failure. A
+    /// [`Provider`](tn_reth::error::StateReadError::Provider) fault is node-local (peers reading
+    /// the same block may succeed), so it is retried briefly first.
     pub(super) async fn get_committee_with_epoch_start_info(
         &self,
         engine: &ExecutionNode,
     ) -> eyre::Result<(Committee, EpochInfo, u64, SealedHeader)> {
-        // Sample the bootstrap tip ONCE: the pin this read resolves is a function of the tip
-        // (`concludeEpoch` rewrites both the epoch number and its `blockHeight` at every
-        // boundary), so holding the sample here is what makes the pin a property of this call
-        // rather than of when each chain read happens to run.
+        // Sample the bootstrap tip ONCE, OUTSIDE the retry below. This is what makes the retry
+        // safe: the pin the read resolves is a function of the tip (`concludeEpoch` rewrites
+        // both the epoch number and its `blockHeight` at EVERY boundary, not once ever), so
+        // re-sampling per attempt could resolve a different header on a later attempt. With the
+        // sample held here, every attempt provably resolves the same pin.
         let tip = engine.get_reth_env().await.canonical_tip();
         let (
             EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start },
             epoch_start_header,
-        ) = engine.epoch_state_at_epoch_start_from_tip(&tip).await?;
+        ) = retry_provider_faults("epoch-entry state read", || {
+            engine.epoch_state_at_epoch_start_from_tip(&tip)
+        })
+        .await
+        .map_err(|e| {
+            eyre!(
+                "failed epoch-entry state read - halting rather than entering an epoch with an \
+                 unverifiable committee: {e}"
+            )
+        })?;
         let validators = validators
             .iter()
             .zip(bls_pubkeys.iter())
@@ -247,6 +268,11 @@ where
         // prefetch is a best-effort network warm-up: the next committee's keys are reused from
         // the config (already read at the pin — no second chain read to fail), and a failed
         // epoch + 2 read is logged and skipped rather than aborting epoch start.
+        //
+        // Deliberately NOT wrapped in `retry_provider_faults`, unlike the hard entry reads: a
+        // provider fault here costs a network warm-up, not correctness, and paying up to
+        // CLOSE_READ_ATTEMPTS x CLOSE_READ_RETRY_BACKOFF on the epoch-entry critical path to
+        // salvage one is a bad trade. Both failure classes skip.
         prefetches.extend(consensus_config.next_committee_keys().iter());
         match engine.validators_for_epoch_at_header(committee.epoch() + 2, epoch_start_header).await
         {

@@ -14,6 +14,7 @@
 //! next epoch starts from a clean slate. Historic data survives in the
 //! `ConsensusChain` store; only the per-epoch working tables are cleared.
 
+use super::run_epoch::retry_provider_faults;
 use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
 use std::{collections::BTreeSet, path::Path, time::Duration};
@@ -286,16 +287,38 @@ where
         // closing block, so this read IS that block; the pin makes the record's committee reads
         // and its `final_state` derive from the same header by construction instead of by
         // timing.
-        // `parent_state` is sampled ONCE and both committees resolve through ONE batched by-hash
-        // read: the watch is live, so re-sampling it per read could straddle a block commit and
-        // desynchronize the two committees from each other and from the `final_state` this record
-        // commits below.
+        //
+        // `parent_state` is sampled ONCE, before the retry below, and both committees resolve
+        // through ONE batched by-hash read. Sampling once is required, not merely tidy: the watch
+        // is live, so re-sampling it per attempt would both shift the pin between attempts and
+        // desynchronize the committee reads from the `parent_state` passed to
+        // `build_epoch_record` as `final_state`, destroying the same-header-by-construction
+        // property the paragraph above claims.
+        //
+        // READ-FAILURE POLICY: this is a consensus input, so its failure is classified by
+        // committee determinism (`StateReadError`) and BOTH classes halt. There is deliberately
+        // no fail-open arm, despite what `StateReadError::ChainGlobal`'s variant doc says about
+        // keep-current staying committee-consistent: a wrong committee in a SIGNED `EpochRecord`
+        // propagates to every syncing node, while halting is a single-node liveness failure.
+        // A Provider fault is node-local (peers reading the same block may succeed), so retry
+        // briefly before halting; ChainGlobal returns from the first attempt, halting exactly
+        // where it did before the retry existed. The net delta is two extra tries on Provider.
         let parent_state = self.consensus_bus.latest_execution_block_num_hash();
-        let [committee_keys, next_committee_keys]: [Vec<BlsPublicKey>; 2] = engine
-            .validators_for_epochs_at_block(&[epoch, epoch + 1], parent_state.hash)
-            .await?
-            .try_into()
-            .map_err(|_| {
+        let epochs = [epoch, epoch + 1];
+        let committees = retry_provider_faults("epoch-record committee reads", || {
+            engine.validators_for_epochs_at_block(&epochs, parent_state.hash)
+        })
+        .await
+        .map_err(|e| {
+            eyre!(
+                "failed committee read at epoch-closing block {} ({:?}) for the epoch {epoch} \
+                 record - halting rather than recording a committee this node cannot verify: {e}",
+                parent_state.number,
+                parent_state.hash
+            )
+        })?;
+        let [committee_keys, next_committee_keys]: [Vec<BlsPublicKey>; 2] =
+            committees.try_into().map_err(|_| {
                 eyre!("committee batch read arity mismatch for the epoch {epoch} record")
             })?;
         let prev_record = if epoch == 0 {
