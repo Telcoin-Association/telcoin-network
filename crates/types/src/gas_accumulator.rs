@@ -11,7 +11,7 @@
 //! contract is the absolute source of truth, and the count for an epoch is the contract's state
 //! at the previous epoch's closing block: `catchup_accumulator` (in `node::manager`) sizes the
 //! accumulator from that state at startup, the epoch entry seeding re-seeds it on every entry
-//! (`DerivedBaseFees::apply`, or `sync_num_workers_from_chain` for epoch 0), and
+//! (`EpochBaseFees::apply`, or `sync_num_workers_from_chain` for epoch 0), and
 //! `adjust_base_fees` resizes at epoch close to the count read from the closing block (the next
 //! epoch's count). All resizes go through [`GasAccumulator::set_num_workers`].
 //!
@@ -39,16 +39,17 @@
 //!
 //! Base fee is consensus-affecting, so a node must never produce with a fee it cannot verify
 //! against the chain. The entered epoch's worker count and per-worker fees are therefore owned
-//! by the epoch entry seeding (`run_epoch` in `node::manager`), which derives them on EVERY
-//! entry — live boundary crossing, restart, mid-epoch re-entry, or sync — as a pure function of
-//! the previous epoch's on-chain state (`derive_base_fees_for_entered_epoch`): the previous
-//! epoch's closing block is resolved from the entered epoch's registry-recorded first block,
-//! worker strategies and count are read at it, and workers with no block to read a fee from walk
-//! back through earlier closing blocks (`derive_idle_worker_fee`). Epoch 0 has no prior epoch,
-//! so every [`BaseFeeContainer`] keeps the MIN default. A node that cannot read or verify that
-//! state halts rather than produce with an unverifiable fee. The live producer's close-time
-//! computation (`adjust_base_fees`) folds the same formula over the same inputs, so the value it
-//! carries between close and the next entry is identical to what entry derivation recomputes.
+//! by the epoch entry seeding (`run_epoch` in `node::manager`), which reads them on EVERY entry
+//! — live boundary crossing, restart, mid-epoch re-entry, or sync — from one pinned block: the
+//! previous epoch's closing block, resolved from the entered epoch's registry-recorded first
+//! block. That block's own system call recorded each worker's next-epoch fee in `WorkerConfigs`
+//! storage, so the entry reads count, strategies, and fees from a single state read
+//! (`read_base_fees_for_entered_epoch`, one row per worker through [`entry_fee_for_worker`]).
+//! Epoch 0 has no prior epoch, so every [`BaseFeeContainer`] keeps the MIN default. A node that
+//! cannot read that state halts rather than produce with an unverifiable fee. The live
+//! producer's close-time computation (`adjust_base_fees`) folds the same formula over the same
+//! inputs the closing block's record used, so the value it carries between close and the next
+//! entry is identical to what the entry reads back.
 
 use crate::{AuthorityIdentifier, Committee, SealedHeader, WorkerId, B256};
 
@@ -506,6 +507,42 @@ pub fn next_base_fee_for_config(
     }
 }
 
+/// Read worker `worker_id`'s base fee for the epoch being entered out of the
+/// [`WorkerConfigEntry`] pinned at the previous epoch's closing block.
+///
+/// `Static { fee }` returns the configured fee and ignores `data` entirely — including a garbage
+/// word. A static row's fee already lives in its config, the write path never records one, and a
+/// row governance switched from `Eip1559` keeps its last recorded word forever, so `data` is stale
+/// by design for this variant (see the data-semantics doc on [`WorkerConfigEntry`]).
+///
+/// `Eip1559` reads the recorded word. A zero word maps to `MIN_PROTOCOL_BASE_FEE`, which is
+/// exactly what the whole-epoch header derivation this read replaced computes for every epoch that
+/// closed before the write path activated, so the cutover is value-identical on all pre-activation
+/// history; the same floor lifts a hypothetical governance-written `1..=6` to the protocol minimum.
+///
+/// # Errors
+///
+/// An `Eip1559` word wider than `u64`. Every honest close records a `u64` fee, so a wider word can
+/// only come from a foreign governance write — halting beats truncating an arbitrary word into a
+/// consensus-critical fee. This is a tripwire rather than a live hazard: once the write path is
+/// active the closing block's own system call rewrites every `Eip1559` row's word, so a read
+/// pinned to a closing block only sees words that block itself wrote.
+pub fn entry_fee_for_worker(worker_id: WorkerId, entry: &WorkerConfigEntry) -> Result<u64, String> {
+    match entry.config {
+        WorkerFeeConfig::Static { fee } => Ok(fee),
+        WorkerFeeConfig::Eip1559 { .. } => {
+            let recorded = u64::try_from(entry.data).map_err(|_| {
+                format!(
+                    "worker {worker_id}'s recorded WorkerConfigs data word {} exceeds u64::MAX and \
+                     cannot be a base fee",
+                    entry.data
+                )
+            })?;
+            Ok(recorded.max(MIN_PROTOCOL_BASE_FEE))
+        }
+    }
+}
+
 impl Default for GasAccumulator {
     fn default() -> Self {
         Self::new(1)
@@ -673,6 +710,72 @@ mod tests {
             next_base_fee_for_config(WorkerFeeConfig::Static { fee: 500 }, 1_000_000, 0),
             500
         );
+    }
+
+    #[test]
+    fn entry_fee_static_ignores_the_data_word() {
+        // a static row's fee lives in its config; the write path never records one, so any word
+        // the row carries is stale by design - never a fee input
+        let cfg = WorkerFeeConfig::Static { fee: 12_345 };
+        assert_eq!(
+            entry_fee_for_worker(0, &WorkerConfigEntry { config: cfg, data: U184::ZERO }),
+            Ok(12_345)
+        );
+        assert_eq!(
+            entry_fee_for_worker(1, &WorkerConfigEntry { config: cfg, data: U184::from(999u64) }),
+            Ok(12_345)
+        );
+        // garbage far beyond u64: still ignored, still no error
+        assert_eq!(
+            entry_fee_for_worker(2, &WorkerConfigEntry { config: cfg, data: U184::MAX }),
+            Ok(12_345)
+        );
+    }
+
+    #[test]
+    fn entry_fee_eip1559_reads_the_recorded_word() {
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 };
+        let entry = WorkerConfigEntry { config: cfg, data: U184::from(1_125_000u64) };
+        assert_eq!(entry_fee_for_worker(0, &entry), Ok(1_125_000));
+    }
+
+    #[test]
+    fn entry_fee_eip1559_zero_word_maps_to_min() {
+        // the cutover case: a never-written row reads MIN, which is what the header-scan
+        // derivation computed for every pre-activation epoch
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: u64::MAX };
+        let entry = WorkerConfigEntry { config: cfg, data: U184::ZERO };
+        assert_eq!(entry_fee_for_worker(0, &entry), Ok(MIN_PROTOCOL_BASE_FEE));
+    }
+
+    #[test]
+    fn entry_fee_eip1559_floors_sub_min_words() {
+        // 1..=6 is unreachable from the write path (a recorded fee is never below MIN) but a
+        // governance write could store one; the floor keeps the protocol minimum
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 };
+        for word in 1..MIN_PROTOCOL_BASE_FEE {
+            let entry = WorkerConfigEntry { config: cfg, data: U184::from(word) };
+            assert_eq!(entry_fee_for_worker(0, &entry), Ok(MIN_PROTOCOL_BASE_FEE), "word {word}");
+        }
+    }
+
+    #[test]
+    fn entry_fee_eip1559_accepts_u64_max_word() {
+        // the widest word an honest close can record
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 };
+        let entry = WorkerConfigEntry { config: cfg, data: U184::from(u64::MAX) };
+        assert_eq!(entry_fee_for_worker(0, &entry), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn entry_fee_eip1559_rejects_word_wider_than_u64() {
+        // one above the widest recordable fee: only a foreign write reaches here, so halt
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 };
+        let data = U184::from(u64::MAX) + U184::from(1u64);
+        let err = entry_fee_for_worker(3, &WorkerConfigEntry { config: cfg, data })
+            .expect_err("a word wider than u64 cannot be a base fee");
+        assert!(err.contains("worker 3"), "error must name the worker: {err}");
+        assert!(err.contains(&data.to_string()), "error must name the data word: {err}");
     }
 
     #[test]

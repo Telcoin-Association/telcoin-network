@@ -110,6 +110,13 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 /// - both swaps fail closed on their pre-fork pin ([`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`],
 ///   [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`]): an unexpected on-chain deployment aborts the block
 ///   (fatal error) rather than migrating over an incompatible layout;
+/// - adiri rollout constraint: governance must NOT move an `Eip1559` worker's `target_gas` off
+///   `u64::MAX` until this fork epoch has passed on a fleet running the entry-read build. Pre-fork
+///   closes take the legacy two-call sequence and record no fee, so the entry read prices such a
+///   worker at `MIN_PROTOCOL_BASE_FEE` from its unwritten `data` word while an older build's header
+///   scan would follow a real target away from MIN — and the exact-equality basefee check makes the
+///   two views reject each other's batches for the whole epoch. At `u64::MAX` both paths pin to
+///   MIN. `Static` fee changes are exempt: both read the config's own value;
 /// - post-fork governance runbook: the `WorkerConfigs` swap replaces code only, so the appended
 ///   `maxStrategy` slot (slot 4) stays `0` and every owner call assigning `Static` (strategy id 1)
 ///   reverts `InvalidStrategy`. The owner must send one `setMaxStrategy(1)` transaction after the

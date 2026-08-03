@@ -32,7 +32,9 @@ use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce,
-    gas_accumulator::{next_base_fee_for_config, GasAccumulator, WorkerFeeConfig},
+    gas_accumulator::{
+        entry_fee_for_worker, next_base_fee_for_config, GasAccumulator, WorkerFeeConfig,
+    },
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier,
     SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
@@ -374,6 +376,101 @@ pub(crate) fn gas_used_per_worker(headers: &[SealedHeader]) -> HashMap<WorkerId,
         *totals.entry(worker_id).or_default() += header.gas_used;
     }
     totals
+}
+
+/// Per-worker base fees for an entered epoch, read from the previous epoch's closing block by
+/// [`read_base_fees_for_entered_epoch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochBaseFees {
+    /// The on-chain worker count read from `WorkerConfigs` at the previous epoch's closing block
+    /// (i.e. the count for the entered epoch).
+    pub num_workers: usize,
+    /// One fee per configured worker, indexed by worker id. Every slot is filled: the closing
+    /// block records a fee for each `Eip1559` worker and a `Static` worker's fee is its config's
+    /// value, so no worker's fee has to be recovered from anywhere else.
+    pub fees: Vec<u64>,
+}
+
+impl EpochBaseFees {
+    /// Install the fees into `gas_accumulator`.
+    ///
+    /// Resizes the accumulator to `num_workers` FIRST (so every configured slot exists), then
+    /// writes every worker's base fee. Gas counters are deliberately untouched — the entered
+    /// epoch starts at zero gas.
+    ///
+    /// Safe to run while the engine is still executing leftover consensus output (a ModeChange
+    /// re-entry does exactly that): both values are pinned to the previous epoch's closing block,
+    /// so a re-entry re-reads the identical count — the resize no-ops — and rewrites the identical
+    /// fees. That value-stability, not quiescence, is what upholds
+    /// [`GasAccumulator::set_num_workers`]' bound against shrinking below an in-flight worker id.
+    pub fn apply(&self, gas_accumulator: &GasAccumulator) {
+        gas_accumulator.set_num_workers(self.num_workers);
+        for (worker_id, fee) in self.fees.iter().enumerate() {
+            gas_accumulator.base_fee(worker_id as WorkerId).set_base_fee(*fee);
+        }
+    }
+}
+
+/// Read the per-worker base fees for `entered` out of the `WorkerConfigs` state pinned at
+/// `closing_header`, the previous epoch's closing block.
+///
+/// ONE state read, O(1) in the epoch's length, replacing the whole-epoch header scan that used to
+/// recompute the same values. The closing block's fourth system call (`record_next_epoch_base_fees`
+/// in `tn-reth`) writes each `Eip1559` worker's next-epoch fee into its `WorkerConfigs` row as it
+/// seats the new committee, so the values this read returns were written exactly once, at the
+/// boundary, by the very block being read. That is a strictly stronger pin than re-deriving them:
+/// a value written into the closing block's state cannot be recomputed differently by a node with
+/// a different view of the epoch's headers. Per-row interpretation (including the never-written
+/// word that maps to `MIN_PROTOCOL_BASE_FEE`) lives in
+/// [`entry_fee_for_worker`](tn_types::gas_accumulator::entry_fee_for_worker).
+///
+/// FAIL-HARD: every read failure bubbles — node-local provider faults and chain-global failures
+/// alike. Base fees are exact-match consensus values, so entering an epoch with a fee this node
+/// cannot verify is a safety failure while halting is only a single-node liveness failure. This is
+/// deliberately stricter than the close-time update's chain-global fail-open, which is safe there
+/// only because keeping the current fees is a value every committee member computes identically.
+///
+/// `entered` must be at least 1: epoch 0 has no previous epoch to close, and its entry is seeded by
+/// [`sync_num_workers_from_chain`] instead.
+pub fn read_base_fees_for_entered_epoch(
+    reth_env: &RethEnv,
+    entered: Epoch,
+    closing_header: &SealedHeader,
+) -> eyre::Result<EpochBaseFees> {
+    let (num_workers, entries) =
+        reth_env.get_worker_fee_configs_at_block(closing_header.hash()).wrap_err_with(|| {
+            format!(
+                "failed to read WorkerConfigs at epoch {entered}'s pinned closing block {} ({:?})",
+                closing_header.number,
+                closing_header.hash()
+            )
+        })?;
+
+    let fees = entries
+        .iter()
+        .enumerate()
+        .map(|(worker_id, entry)| {
+            entry_fee_for_worker(worker_id as WorkerId, entry).map_err(|e| {
+                eyre!(
+                    "worker {worker_id}: cannot read epoch {entered}'s entry base fee at the \
+                     pinned closing block {} ({:?}): {e}",
+                    closing_header.number,
+                    closing_header.hash()
+                )
+            })
+        })
+        .collect::<eyre::Result<Vec<u64>>>()?;
+
+    info!(
+        target: "epoch-manager",
+        entered,
+        closing_block = closing_header.number,
+        num_workers,
+        ?fees,
+        "read entered-epoch base fees from the closing block's on-chain record"
+    );
+
+    Ok(EpochBaseFees { num_workers, fees })
 }
 
 /// Fold each configured worker's next-epoch base fee from the fee it held and the gas it used
