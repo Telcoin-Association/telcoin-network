@@ -379,7 +379,7 @@ impl ExecutionNodeInner {
     /// Read the current epoch's [EpochState] pinned to the previous epoch's closing block
     /// (genesis for epoch 0), returning the pin header alongside it.
     pub(super) fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
-        self.reth_env.epoch_state_at_epoch_start()
+        Ok(self.reth_env.epoch_state_at_epoch_start()?)
     }
 
     /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
