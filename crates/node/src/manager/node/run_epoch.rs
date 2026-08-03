@@ -272,7 +272,9 @@ where
                     .validators_for_epochs_at_header(&[entered + 1], &epoch_start_header)
                     .await?
                     .try_into()
-                    .map_err(|_| eyre::eyre!("neighbor-committee batch arity mismatch"))?;
+                    .map_err(|_| {
+                        eyre::eyre!("neighbor-committee batch arity mismatch for epoch 0")
+                    })?;
                 (HashSet::new(), next)
             } else {
                 let [previous, next] = engine
@@ -282,7 +284,9 @@ where
                     )
                     .await?
                     .try_into()
-                    .map_err(|_| eyre::eyre!("neighbor-committee batch arity mismatch"))?;
+                    .map_err(|_| {
+                        eyre::eyre!("neighbor-committee batch arity mismatch for epoch {entered}")
+                    })?;
                 (previous.into_iter().collect(), next)
             };
 
