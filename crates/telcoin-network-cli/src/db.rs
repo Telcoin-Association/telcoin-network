@@ -363,7 +363,10 @@ fn reject_non_resumable_bundle(
 ///
 /// The record itself is cryptographically verified against its certificate later, in
 /// `verify_and_save_epoch_records`; pinning the exec pack to it here makes the super-quorum
-/// certificate over the record transitively cover the exec pack's identity.
+/// certificate over the record transitively cover the exec pack's identity. That coverage reaches
+/// the pack's ancestor headers too, not just its tip: `SnapshotRestorer::import_chain_scaffold`
+/// walks the parent-hash links across the whole window, and a header hash commits to every field
+/// of its header, so the certified tip hash pins each ancestor in turn.
 fn check_state_pack_matches_record(pack: &Path, record: &EpochRecord) -> eyre::Result<()> {
     let reader = ExecStatePackReader::open(pack)
         .map_err(|e| eyre!("failed to open state pack {}: {e}", pack.display()))?;
