@@ -15,20 +15,20 @@
 //! them (`validator-1`). That single exporter produces the bundle the observer imports; the other
 //! three only keep the quorum alive.
 //!
-//! ## Why the network must not be idle
+//! ## What the restored node needs from the snapshot block
 //!
-//! When a node enters an epoch it derives each worker's base fee, and for an EIP-1559 worker that
-//! produced no genuine block in the previous epoch it walks BACKWARD through earlier epochs reading
-//! `WorkerConfigs` state to find a fee anchor (`derive_idle_worker_fee_at`). A full node has all of
-//! history (archive mode), but a snapshot-imported node only has state at the snapshot block `B`
-//! and forward — so an idle exported epoch would make the restored node walk below `B` into state
-//! the snapshot omitted and halt. That is exactly the precondition
-//! `SnapshotRestorer::derive_fee_precondition` guards. To keep the exported epoch (and every epoch
-//! the observer later enters) anchorable at `B`, this test runs a steady transaction stream, so
-//! every epoch contains a genuine worker block. This mirrors a real network, which is never idle. A
-//! companion test in this file (`test_state_export_skips_idle_epoch_bundle`) runs an idle network
-//! to prove the exporter *skips* producing a bundle for an epoch it could not resume from, rather
-//! than writing one that would be rejected at import.
+//! When a node enters an epoch it reads the entered epoch's worker count and per-worker base fees
+//! from ONE pinned block: the previous epoch's closing block, whose own system call recorded each
+//! EIP-1559 worker's next-epoch fee into its `WorkerConfigs` row. A snapshot-imported node pins that
+//! read to the snapshot block `B`, so all it needs is that `B` actually closed an epoch — no walk
+//! into pre-snapshot history, and no dependence on whether any worker produced a block. That is
+//! what `SnapshotRestorer::entry_readiness_precondition` validates at import.
+//!
+//! This test still runs a steady transaction stream, but only so the exported state is non-trivial
+//! (accounts, storage, and code to round-trip) and the observer has real blocks to follow forward.
+//! A companion test in this file (`test_state_export_import_idle_epoch`) runs a fully idle network
+//! to prove the idle case now round-trips end to end — the hazard that used to force the exporter
+//! to skip an idle epoch's bundle is gone.
 //!
 //! ## Why the assertions prove *import*, not just *sync*
 //!
@@ -425,12 +425,10 @@ async fn test_state_export_import_bootstrap_inner() -> eyre::Result<()> {
     Ok(())
 }
 
-/// The exporter must NOT produce a bundle it knows is un-resumable. On an IDLE network (epochs with
-/// no genuine worker block), each epoch `>= 1`'s snapshot fails the fee-derivability precheck, so
-/// the exporter skips it and writes no bundle. Epoch 0 is still exported (entering epoch 1 never
-/// walks below the snapshot, so it is fee-resumable). The importer's reject guard is the
-/// counterpart, unit-tested in `tn-reth`; an idle bundle can no longer reach it via a real
-/// exporter.
+/// An IDLE network (epochs with no genuine worker block) still produces exportable bundles: the
+/// restored node reads its first epoch-entry fees from ONE pinned read at the snapshot's final
+/// block, which the closing block itself recorded, so worker activity in the exported epoch is
+/// irrelevant. The exporter's only requirement is that the block it pins is an epoch-closing block.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
 fn test_state_export_skips_idle_epoch_bundle() -> eyre::Result<()> {

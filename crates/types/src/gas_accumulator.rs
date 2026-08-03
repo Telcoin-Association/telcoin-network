@@ -51,7 +51,7 @@
 //! inputs the closing block's record used, so the value it carries between close and the next
 //! entry is identical to what the entry reads back.
 
-use crate::{AuthorityIdentifier, Committee, SealedHeader, WorkerId, B256};
+use crate::{AuthorityIdentifier, Committee, SealedHeader, WorkerId};
 
 use alloy::{
     eips::eip1559::{calc_next_block_base_fee, BaseFeeParams, MIN_PROTOCOL_BASE_FEE},
@@ -90,25 +90,6 @@ pub enum WorkerFeeConfig {
 /// (`tn_reth`), so both attribute headers with the exact same rule — no drift.
 pub fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
     (header.difficulty.into_limbs()[0] & 0xffff) as u16
-}
-
-/// True when `header` is a genuine worker batch block.
-///
-/// Two on-chain block shapes are NOT worker batch blocks and must be excluded from per-worker
-/// fee/gas attribution:
-/// - the genesis block (`number == 0`), which carries no worker payload, and
-/// - the synthetic empty-close block the engine builds when an epoch closes with no batches. That
-///   block is stamped worker 0 and copies its PARENT's base fee (see `tn_engine`'s
-///   `execute_consensus_output`), so attributing it would poison worker 0 with another worker's
-///   fee. It is identified by `ommers_hash == B256::ZERO`: the header's `ommers_hash` carries the
-///   batch digest, and only the synthetic block passes `B256::ZERO` (real batch digests are never
-///   zero).
-///
-/// A non-empty epoch-closing block built from real batches has a non-zero `ommers_hash` and IS a
-/// genuine worker block. Shared canonical implementation used by both `tn_node` (fee/gas
-/// derivation) and `tn_reth` (snapshot fee-derivability precheck).
-pub fn is_worker_batch_block(header: &SealedHeader) -> bool {
-    header.number != 0 && header.ommers_hash != B256::ZERO
 }
 
 /// One row of the on-chain `WorkerConfigs` table: a worker's fee strategy plus the raw `uint184`
@@ -554,29 +535,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worker_attribution_helpers_match_header_encoding() {
+    fn worker_attribution_matches_header_encoding() {
         use crate::{ExecHeader, U256};
-        // `difficulty` encodes `batch_index << 16 | worker_id`; `ommers_hash` is the batch digest.
-        let header = |number: u64, batch_index: u64, wid: u16, ommers: B256| -> SealedHeader {
+        // `difficulty` encodes `batch_index << 16 | worker_id`.
+        let header = |number: u64, batch_index: u64, wid: u16| -> SealedHeader {
             SealedHeader::seal_slow(ExecHeader {
                 number,
                 difficulty: U256::from((batch_index << 16) | wid as u64),
-                ommers_hash: ommers,
                 ..Default::default()
             })
         };
-        let nonzero = B256::from([0xab; 32]);
-
-        // genesis (block 0) is never a genuine batch block
-        assert!(!is_worker_batch_block(&header(0, 0, 0, nonzero)));
-        // the synthetic empty-close block carries a zero ommers_hash (batch-digest slot)
-        assert!(!is_worker_batch_block(&header(5, 0, 0, B256::ZERO)));
-        // a real batch block: non-genesis number, non-zero batch digest
-        assert!(is_worker_batch_block(&header(5, 0, 3, nonzero)));
 
         // worker id is the LOW 16 bits; the batch index (upper bits) is ignored
-        assert_eq!(worker_id_from_header(&header(5, 42, 3, nonzero)), 3);
-        assert_eq!(worker_id_from_header(&header(5, 0, 0xffff, nonzero)), 0xffff);
+        assert_eq!(worker_id_from_header(&header(5, 42, 3)), 3);
+        assert_eq!(worker_id_from_header(&header(5, 0, 0xffff)), 0xffff);
     }
 
     #[test]

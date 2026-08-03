@@ -52,6 +52,13 @@
 //! linkage walk carries such a caller's guarantee from the tip down through the whole window.
 //! Genesis is never taken from the snapshot; it always comes from the local chain spec, which
 //! remains the trust root.
+//!
+//! The linkage walk's own consumer set has narrowed: nothing in the restore reads the CONTENT of a
+//! window header below `B` any more. The entry-readiness precondition is a single pinned state read
+//! at `B` (no prior-epoch header scan), so the `BLOCKHASH` opcode — which resolves ancestor hashes
+//! for blocks inside the window — is now the sole consumer of the sub-`B` headers. They are still
+//! scaffolded with real hashes and still walked for linkage: `BLOCKHASH` returning a hash that does
+//! not belong to the chain the tip commits to would diverge execution from the fleet.
 
 use crate::{
     error::{TnRethError, TnRethResult},
@@ -82,7 +89,7 @@ use reth_trie::{IntermediateStateRootState, StateRoot, StateRootProgress};
 use reth_trie_db::DatabaseStateRoot;
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     path::Path,
 };
 use tn_storage::exec_state_pack::{
@@ -90,9 +97,9 @@ use tn_storage::exec_state_pack::{
     ExecStateStats, StateEntry,
 };
 use tn_types::{
-    gas_accumulator::{GasAccumulator, WorkerFeeConfig},
-    Address, BlockBody, BlockNumHash, Bytes, Epoch, ExecHeader, GenesisAccount, SealedBlock,
-    SealedHeader, TaskManager, WorkerId, B256, U256,
+    gas_accumulator::{entry_fee_for_worker, GasAccumulator},
+    Address, BlockBody, BlockNumHash, Bytes, ExecHeader, GenesisAccount, SealedBlock, SealedHeader,
+    TaskManager, WorkerId, B256, U256,
 };
 use tracing::{debug, info};
 
@@ -297,9 +304,20 @@ impl RethEnv {
 /// reth ships `reth_cli_commands::init_state::setup_without_evm`, which does almost exactly what
 /// [`import_chain_scaffold`](Self::import_chain_scaffold) does, but it is unusable here for two
 /// reasons: it fills every dummy header below the tip with a `B256::ZERO` hash, which would break
-/// the `BLOCKHASH` opcode and the base-fee walk for blocks inside the shipped window; and pulling
-/// it in drags the whole `reth-cli-commands` dependency tree. So the scaffold is reimplemented with
-/// real hashes for the window headers and zero-hash dummies only strictly below it.
+/// the `BLOCKHASH` opcode for blocks inside the shipped window; and pulling it in drags the whole
+/// `reth-cli-commands` dependency tree. So the scaffold is reimplemented with real hashes for the
+/// window headers and zero-hash dummies only strictly below it.
+///
+/// # Epoch-boundary requirement (validated, not assumed)
+///
+/// Snapshots are taken at epoch boundaries: `B` must be the block that closed an epoch. The
+/// restored node's first epoch entry seeds its worker count and per-worker base fees from ONE
+/// pinned state read at the previous epoch's closing block — which, for a restored node, is `B`
+/// itself — and its accumulator catchup scans forward from the entered epoch's first block
+/// (`B + 1`). [`entry_readiness_precondition`](Self::entry_readiness_precondition) VALIDATES this
+/// shape against the imported state instead of trusting the operator: a mid-epoch `B` would pin
+/// the fee read to a block the close-time write path never touched and leave catchup a scan range
+/// whose earlier blocks the snapshot omitted.
 ///
 /// # Restore algorithm
 ///
@@ -315,9 +333,9 @@ impl RethEnv {
 /// 3. [`import_state`](Self::import_state) streams the pack's accounts into reth's state tables one
 ///    account header and one bounded storage chunk at a time, recomputes the state root from
 ///    scratch, and hard-fails on any mismatch with `header(B).state_root`.
-/// 4. [`derive_fee_precondition`](Self::derive_fee_precondition) verifies the shipped window is
-///    self-sufficient for the node's first epoch-entry base-fee derivation, so the restored node
-///    will not walk below the window into history the snapshot omitted and halt.
+/// 4. [`entry_readiness_precondition`](Self::entry_readiness_precondition) verifies `B` is an
+///    epoch-closing block and that the imported state at `B` can seed the node's first epoch entry
+///    (worker count and per-worker base fees from one pinned read).
 /// 5. [`finish`](Self::finish) persists the finalized/safe markers at `B` and sanity-checks the
 ///    reconstructed tip.
 #[derive(Debug)]
@@ -326,8 +344,8 @@ pub struct SnapshotRestorer {
     ///
     /// Built once in [`SnapshotRestorer::open`]; its in-memory canonical state stays empty for the
     /// life of the restore (nothing is committed through the canonical path), so every read falls
-    /// through to the committed database tip — which is exactly what the post-import fee read at
-    /// block `B` needs.
+    /// through to the committed database tip — which is exactly what the post-import
+    /// entry-readiness reads at block `B` need.
     reth_env: RethEnv,
 }
 
@@ -378,13 +396,13 @@ impl SnapshotRestorer {
     ///   deliberately kept.
     /// - Appends headers `1..=B-1` to the Headers static file: the real header (with its real hash)
     ///   for every block inside `window`, and a zero-hash dummy for every block below it. Real
-    ///   hashes inside the window keep `BLOCKHASH` and the base-fee walk resolvable.
+    ///   hashes inside the window keep `BLOCKHASH` resolvable.
     /// - Advances the transactions/receipts/senders static-file segments to `B-1`, inserts block
     ///   `B` itself with an empty body (advancing headers and transactions to `B`), and advances
     ///   receipts to `B` — mirroring reth's own dummy-chain shaping so the segments stay internally
     ///   consistent.
-    /// - Writes `HeaderNumbers` (hash → number) for every window header so `BLOCKHASH` and the fee
-    ///   walk resolve by hash, and sets every stage checkpoint to `B`.
+    /// - Writes `HeaderNumbers` (hash → number) for every window header so `BLOCKHASH` resolves by
+    ///   hash, and sets every stage checkpoint to `B`.
     ///
     /// Static files are committed BEFORE the database provider: the refuse-non-empty check in
     /// [`open`](Self::open) keys on the Headers static-file height, so committing static files
@@ -538,8 +556,8 @@ impl SnapshotRestorer {
             sf.latest_writer(StaticFileSegment::Receipts)?.increment_block(b)?;
         }
 
-        // HeaderNumbers for every window header so BLOCKHASH and the fee walk resolve by hash
-        // (insert_block already covered block B; the rest are written here)
+        // HeaderNumbers for every window header so BLOCKHASH resolves by hash (insert_block
+        // already covered block B; the rest are written here)
         {
             let tx = provider_rw.tx_ref();
             for header in window {
@@ -726,24 +744,33 @@ impl SnapshotRestorer {
         Ok(root)
     }
 
-    /// Restore-side driver for [`check_fee_precondition`]: verifies the shipped window can seed the
-    /// restored node's first epoch-entry base fees, reading contract state through this restorer's
-    /// env. Must run AFTER [`import_state`](Self::import_state), since it reads contract state at
-    /// `B`.
-    pub fn derive_fee_precondition(
-        &self,
-        entered: Epoch,
-        window: &[SealedHeader],
-    ) -> eyre::Result<()> {
-        check_fee_precondition(&self.reth_env, entered, window)
-    }
+    /// Restore-side driver for [`check_entry_readiness`]: resolves the snapshot's final block `B`
+    /// from `final_state` and verifies the imported state at it can seed the restored node's first
+    /// epoch entry.
+    ///
+    /// Must run AFTER [`import_state`](Self::import_state), since the check reads contract state at
+    /// `B`, and before [`finish`](Self::finish). Failure handling is deliberately stricter than the
+    /// live node's: both [`StateReadError`](crate::error::StateReadError) classes fail the restore,
+    /// including `ChainGlobal` failures a running fleet may fail open on — a restoring node has no
+    /// fleet to stay in lockstep with, so strictness is free.
+    pub fn entry_readiness_precondition(&self, final_state: BlockNumHash) -> eyre::Result<()> {
+        let b = final_state.number;
+        let header_b = self.reth_env.sealed_header_by_hash(final_state.hash)?.ok_or_else(|| {
+            eyre!(
+                "snapshot restore: no header for final block {b} ({}) to check entry readiness \
+                 against (run the precondition after the scaffold and state import)",
+                final_state.hash
+            )
+        })?;
+        if header_b.number != b {
+            return Err(eyre!(
+                "snapshot restore: final block hash {} resolves to block {}, expected {b}",
+                final_state.hash,
+                header_b.number
+            ));
+        }
 
-    /// Restore-side driver for [`check_fees_resumable`]: reads the entered epoch from the restored
-    /// state at `B` and verifies fee derivability. Must run AFTER
-    /// [`import_state`](Self::import_state) (it reads contract state at `B`) and before
-    /// [`finish`](Self::finish).
-    pub fn check_resumable_fees(&self, window: &[SealedHeader]) -> eyre::Result<()> {
-        check_fees_resumable(&self.reth_env, window)
+        check_entry_readiness(&self.reth_env, &header_b)
     }
 
     /// Persist the finalized/safe markers at `B` and sanity-check the reconstructed tip.
@@ -883,117 +910,104 @@ impl SnapshotRestorer {
     }
 }
 
-/// Verify a snapshot's shipped `window` can seed the restored node's first epoch-entry base fees,
-/// reading contract state at `B` (= `window.last()`) through `reth_env`.
+/// Verify the state at `header_b` — the snapshot's final block `B` — can seed a restored node's
+/// first epoch entry: ONE pinned state read, no prior-epoch headers.
 ///
-/// At epoch entry the node derives each worker's base fee from the previous epoch's genuine blocks;
-/// a worker with an `Eip1559` config that produced no genuine block in that epoch has no
-/// chain-observable fee anchor and the node walks BACKWARD through earlier epochs to find one. A
-/// node holding only the shipped `window` (a snapshot-restored node bootstrapped from an idle
-/// epoch) would run off the bottom of the window into pre-snapshot history and halt. This reads the
-/// worker fee configs at `B` (the closing block of the epoch below `entered`, which defines
-/// `entered`'s configuration) and requires every `Eip1559` worker to have produced at least one
-/// genuine batch block within `window`; `Static` workers need no anchor. Errors name the offending
-/// worker.
+/// At epoch entry the node reads the entered epoch's worker count and per-worker base fees from ONE
+/// pinned block: the previous epoch's closing block, whose own system call recorded each `Eip1559`
+/// worker's next-epoch fee in its `WorkerConfigs.data` word (`read_base_fees_for_entered_epoch` in
+/// `tn_node::manager`, one row per worker through [`entry_fee_for_worker`]). A restored node pins
+/// that first entry read to `B`, so this precondition re-issues the same reads against the
+/// post-import state and fails on anything the entry would trip over. Three checks:
 ///
-/// Shared by the restore side ([`SnapshotRestorer::derive_fee_precondition`]) and the export side
-/// (which runs it against a candidate bundle's window before writing it) — one implementation, no
-/// drift.
-pub fn check_fee_precondition(
-    reth_env: &RethEnv,
-    entered: Epoch,
-    window: &[SealedHeader],
-) -> eyre::Result<()> {
-    let closing = window
-        .last()
-        .ok_or_else(|| eyre!("snapshot restore: cannot check fees over an empty window"))?;
+/// 1. **`B` closed an epoch.** The `ConsensusRegistry` at `B` must report the entered epoch
+///    beginning at `B.number + 1` — `concludeEpoch` runs INSIDE a closing block, so only an
+///    epoch-closing block satisfies this. This check upgrades "snapshots are taken at epoch
+///    boundaries" from a scaffold assumption to a VALIDATED requirement: with a mid-epoch final
+///    block, the restored node's entry would pin its fee read to a block the close-time write path
+///    never touched (a wrong-block-pinned fee), and its accumulator catchup would scan the entered
+///    epoch's range from a start below `B` whose blocks the snapshot omitted — either way the
+///    rebuilt per-worker state diverges from the fleet and forks the state root once the node
+///    produces.
+/// 2. **Fee readiness.** The `WorkerConfigs` read at `B` must succeed, and every `Eip1559` row's
+///    `data` word must pass [`entry_fee_for_worker`]. A word wider than `u64` (only reachable
+///    through a foreign governance write) fails HERE — naming the worker and word — instead of
+///    halting the node at its first epoch entry later. `Static` rows keep their fee in the config's
+///    value and ignore `data` entirely, so a garbage word on a `Static` row is accepted by design.
+/// 3. **At least one worker.** A zero-worker count cannot seed any entry.
+///
+/// Shared by the restore side ([`SnapshotRestorer::entry_readiness_precondition`]) and the export
+/// side (which runs it against a candidate bundle's anchor block before writing the pack) — one
+/// implementation, no drift.
+pub fn check_entry_readiness(reth_env: &RethEnv, header_b: &SealedHeader) -> eyre::Result<()> {
+    let b = header_b.number;
 
-    // worker strategies at the closing block define the entered epoch's configuration
-    let (num_workers, entries) = reth_env
-        .get_worker_fee_configs_at_block(closing.hash())
-        .wrap_err("snapshot restore: reading worker fee configs at the snapshot's final block")?;
-
-    // workers with a genuine batch block inside the shipped window
-    let mut produced: BTreeSet<WorkerId> = BTreeSet::new();
-    for header in window {
-        if is_worker_batch_block(header) {
-            produced.insert(worker_id_from_header(header));
-        }
+    // (1) B must be an epoch-closing block: concludeEpoch runs inside the closing block, so the
+    // registry pinned at B already reports the entered epoch, and that epoch's first block must be
+    // the very next one.
+    let (entered, epoch_info) = reth_env.get_current_epoch_info_at_header(header_b).wrap_err(
+        "snapshot restore: reading the registry epoch record at the snapshot's final block",
+    )?;
+    if epoch_info.blockHeight != b + 1 {
+        return Err(eyre!(
+            "snapshot restore: final block {b} is not an epoch-closing block — the registry \
+             at this block reports epoch {entered} with first block {}, expected {} — \
+             snapshots must end at an epoch boundary (the block that closed the previous \
+             epoch), or the restored node's epoch entry and catchup would run against a \
+             mid-epoch state",
+            epoch_info.blockHeight,
+            b + 1
+        ));
     }
 
-    let prior = entered.saturating_sub(1);
+    // (2)+(3) the entry fee read must succeed for every worker
+    let (num_workers, entries) = reth_env
+        .get_worker_fee_configs_at_block(header_b.hash())
+        .wrap_err("snapshot restore: reading WorkerConfigs at the snapshot's final block")?;
+    if num_workers == 0 {
+        return Err(eyre!(
+            "snapshot restore: WorkerConfigs at final block {b} reports zero workers; the \
+             restored node cannot enter epoch {entered} without at least one worker"
+        ));
+    }
     for (worker_id, entry) in entries.iter().enumerate() {
-        let worker_id = worker_id as WorkerId;
-        if matches!(entry.config, WorkerFeeConfig::Eip1559 { .. }) && !produced.contains(&worker_id)
-        {
-            return Err(eyre!(
-                "snapshot restore: worker {worker_id} has an EIP-1559 fee config but produced \
-                 no genuine block in the shipped epoch-{prior} window; the restored node would \
-                 walk into pre-snapshot history deriving its base fee when entering epoch \
-                 {entered} and halt"
-            ));
-        }
+        entry_fee_for_worker(worker_id as WorkerId, entry).map_err(|e| {
+            eyre!(
+                "snapshot restore: epoch {entered}'s entry base fee is unreadable at the \
+                 final block {b}: {e}"
+            )
+        })?;
     }
 
     debug!(
         target: "tn::reth",
         entered,
+        final_block = b,
         num_workers,
-        produced = produced.len(),
-        "snapshot restore: fee precondition satisfied"
+        "snapshot restore: entry-readiness precondition satisfied"
     );
     Ok(())
 }
 
-/// Verify a snapshot `window` is fee-resumable without being told the entered epoch: read it from
-/// the state at `B` (the window's last header, whose registry state — stamped by `concludeEpoch` at
-/// that closing block — names the epoch a node would enter) and defer to
-/// [`check_fee_precondition`].
-///
-/// A no-op when the node would enter epoch 0 or 1: entering epoch 1 stops at the epoch-0 base case
-/// of the base-fee walk (`derive_idle_worker_fee_at`) and never reads state below `B`, so there is
-/// nothing to guard (and an epoch-0 snapshot is not consensus-resumable regardless). The
-/// ConsensusRegistry that names the entered epoch is a protocol invariant present at every block,
-/// so a failed read is a hard error and the snapshot is not declared fee-resumable. An actual
-/// idle-epoch violation is likewise a hard error naming the offending worker.
-///
-/// On the restore side, run AFTER [`SnapshotRestorer::import_state`] (it reads contract state at
-/// `B`). On the export side, run against a candidate bundle's window before writing the pack.
-pub fn check_fees_resumable(reth_env: &RethEnv, window: &[SealedHeader]) -> eyre::Result<()> {
-    let closing = window.last().ok_or_else(|| {
-        eyre!("snapshot restore: cannot check fee resumability over an empty window")
-    })?;
-    // The ConsensusRegistry that names the entered epoch is a protocol invariant present at every
-    // block, so a failed read is a genuine fault (a node-local provider error, or absent/corrupt
-    // registry state) — never a benign "registry-less chain". Fail closed rather than declaring the
-    // snapshot fee-resumable unchecked.
-    let (entered, _info) = reth_env.get_current_epoch_info_at_header(closing).map_err(|e| {
-        eyre!(
-            "snapshot restore: could not read the entered epoch from the ConsensusRegistry at the \
-             snapshot block {} — the registry is a protocol invariant and must be present, so a \
-             failed read is a fault; refusing to declare the snapshot fee-resumable: {e}",
-            closing.number,
-        )
-    })?;
-    // Entering epoch 0 or 1 never walks below B (the walk stops at the epoch-0 base case), so there
-    // is nothing to verify.
-    if entered < 2 {
-        return Ok(());
-    }
-    check_fee_precondition(reth_env, entered, window)
-}
-
-// Canonical worker-attribution helpers live in `tn-types` (one implementation shared with
-// `tn_node`'s per-worker fee/gas derivation — no drift). Re-exported so the fee-derivability
-// precheck here and its tests keep referring to them via the `tn_reth::snapshot::` path.
-pub use tn_types::gas_accumulator::{is_worker_batch_block, worker_id_from_header};
+// The canonical worker-attribution helper lives in `tn-types` (one implementation shared with
+// `tn_node`'s epoch-entry read — no drift). Re-exported so in-crate consumers and tests keep
+// referring to it via the `tn_reth::snapshot::` path.
+pub use tn_types::gas_accumulator::worker_id_from_header;
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_worker_batch_block, worker_id_from_header, PinnedStateView, SnapshotRestorer, StateEntry,
+    use super::{worker_id_from_header, PinnedStateView, SnapshotRestorer, StateEntry};
+    use crate::{
+        payload::TNPayload,
+        system_calls::WorkerConfigs,
+        test_utils::{
+            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
+            governance_owner_factory, read_worker_config_entries_at,
+            test_genesis_with_consensus_registry_and_workers,
+        },
+        MaybePlatformPath, RethChainSpec, RethConfig, RethDb, RethEnv,
     };
-    use crate::{MaybePlatformPath, RethChainSpec, RethConfig, RethDb, RethEnv};
+    use alloy::{eips::eip7685::EMPTY_REQUESTS_HASH, primitives::aliases::U184};
     use reth::{args::DatadirArgs, builder::NodeConfig};
     use reth_db::{
         cursor::{DbCursorRW, DbDupCursorRO},
@@ -1007,10 +1021,13 @@ mod tests {
     };
     use std::{collections::BTreeMap, path::Path, sync::Arc};
     use tempfile::TempDir;
+    use tn_config::WORKER_CONFIGS_ADDRESS;
     use tn_storage::exec_state_pack::{ExecStateAccount, ExecStatePackReader, ExecStatePackWriter};
     use tn_types::{
-        gas_accumulator::GasAccumulator, keccak256, test_genesis, Address, BlockNumHash, Bytes,
-        ExecHeader, GenesisAccount, SealedHeader, TaskManager, B256, U256,
+        gas_accumulator::{next_base_fee_for_config, GasAccumulator, WorkerFeeConfig},
+        keccak256, test_genesis, Address, BlockNumHash, Bytes, ExecHeader, GenesisAccount,
+        SealedHeader, SolCall as _, TaskManager, B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE,
+        U256,
     };
 
     /// Compile-time proof that a pinned view can be moved into a background upload task.
@@ -1212,47 +1229,24 @@ mod tests {
     }
 
     /// A sealed header for a synthetic window block: `state_root` is set to the snapshot's exported
-    /// root so the import's from-scratch recompute matches, and a non-zero `ommers_hash` marks it a
-    /// genuine batch block attributed to `worker_id`.
-    fn synthetic_header(
-        number: u64,
-        parent: B256,
-        state_root: B256,
-        worker_id: u16,
-        genuine: bool,
-    ) -> SealedHeader {
+    /// root so the import's from-scratch recompute matches. The optional post-London fields carry
+    /// the values every real TN block sets (see the header assembly in `evm/block.rs`) — the full
+    /// contiguous suffix keeps the header RLP round-trippable through the pack, and the blob-gas
+    /// fields let an EVM pinned to this header (the entry-readiness precondition reads contract
+    /// state at the final block) pass header validation.
+    fn synthetic_header(number: u64, parent: B256, state_root: B256) -> SealedHeader {
         let header = ExecHeader {
             number,
             parent_hash: parent,
             state_root,
-            difficulty: U256::from(worker_id as u64),
-            ommers_hash: if genuine { B256::repeat_byte(0xbb) } else { B256::ZERO },
+            base_fee_per_gas: Some(MIN_PROTOCOL_BASE_FEE),
+            withdrawals_root: Some(EMPTY_WITHDRAWALS),
+            parent_beacon_block_root: Some(B256::ZERO),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            requests_hash: Some(EMPTY_REQUESTS_HASH),
             ..Default::default()
         };
-        SealedHeader::seal_slow(header)
-    }
-
-    /// A window header built on top of the real genesis header, so it carries the Cancun/Prague
-    /// fields (`excess_blob_gas`, base fee, gas limit, timestamp, ...) that `evm_env` requires for
-    /// the post-import contract reads — `synthetic_header`'s `Default`-filled header omits them,
-    /// which is fine for tests that only read state but not for ones that issue EVM calls.
-    /// `state_root` pins the exported (genesis) root; `worker_id`/`genuine` drive worker
-    /// attribution.
-    fn window_header_on_genesis(
-        genesis: &SealedHeader,
-        number: u64,
-        parent: B256,
-        state_root: B256,
-        worker_id: u16,
-        genuine: bool,
-    ) -> SealedHeader {
-        let mut header = genesis.header().clone();
-        header.number = number;
-        header.parent_hash = parent;
-        header.state_root = state_root;
-        header.timestamp = genesis.timestamp + number;
-        header.difficulty = U256::from(worker_id as u64);
-        header.ommers_hash = if genuine { B256::repeat_byte(0xbb) } else { B256::ZERO };
         SealedHeader::seal_slow(header)
     }
 
@@ -1306,9 +1300,9 @@ mod tests {
         // a contiguous window of real headers ending at block B, all pinning the exported root
         // (empty blocks 1..=3 keep the state equal to genesis, so header(B).state_root == root)
         let b = 3u64;
-        let h1 = synthetic_header(1, genesis_header.hash(), state_root, 0, true);
-        let h2 = synthetic_header(2, h1.hash(), state_root, 0, true);
-        let h3 = synthetic_header(3, h2.hash(), state_root, 0, true);
+        let h1 = synthetic_header(1, genesis_header.hash(), state_root);
+        let h2 = synthetic_header(2, h1.hash(), state_root);
+        let h3 = synthetic_header(3, h2.hash(), state_root);
         let window = vec![h1.clone(), h2.clone(), h3.clone()];
         let final_state = BlockNumHash::new(b, h3.hash());
 
@@ -1395,7 +1389,7 @@ mod tests {
         )]);
         let dest_chain: Arc<RethChainSpec> = Arc::new(dest_genesis.into());
         let parent = dest_chain.sealed_genesis_header().hash();
-        let header_b = synthetic_header(b, parent, root_without_s, 0, true);
+        let header_b = synthetic_header(b, parent, root_without_s);
         let window = vec![header_b.clone()];
         let final_state = BlockNumHash::new(b, header_b.hash());
 
@@ -1484,7 +1478,7 @@ mod tests {
         let state_root = genesis_header.state_root;
 
         let b = 1u64;
-        let header_b = synthetic_header(b, genesis_header.hash(), state_root, 0, true);
+        let header_b = synthetic_header(b, genesis_header.hash(), state_root);
         let window = vec![header_b.clone()];
         let final_state = BlockNumHash::new(b, header_b.hash());
 
@@ -1515,19 +1509,15 @@ mod tests {
     }
 
     #[test]
-    fn worker_attribution_helpers_match_header_encoding() {
-        // genesis (block 0) is never a genuine batch block
-        let genesis = synthetic_header(0, B256::ZERO, B256::ZERO, 0, true);
-        assert!(!is_worker_batch_block(&genesis));
-
-        // the synthetic empty-close block carries a zero ommers_hash (batch-digest slot)
-        let empty_close = synthetic_header(5, B256::ZERO, B256::ZERO, 2, false);
-        assert!(!is_worker_batch_block(&empty_close));
-
-        // a real batch block has a non-zero ommers_hash and a worker id in difficulty's low bits
-        let genuine = synthetic_header(5, B256::ZERO, B256::ZERO, 3, true);
-        assert!(is_worker_batch_block(&genuine));
-        assert_eq!(worker_id_from_header(&genuine), 3);
+    fn worker_id_mask_matches_header_encoding() {
+        // the payload builder writes `batch_index << 16 | worker_id` into difficulty; only the
+        // low 16 bits attribute the worker
+        let header = SealedHeader::seal_slow(ExecHeader {
+            number: 5,
+            difficulty: U256::from((7u64 << 16) | 3),
+            ..Default::default()
+        });
+        assert_eq!(worker_id_from_header(&header), 3);
     }
 
     #[tokio::test]
@@ -1539,8 +1529,7 @@ mod tests {
 
         // scaffold one block so the datadir holds chain data above genesis
         let genesis_header = chain.sealed_genesis_header();
-        let header_b =
-            synthetic_header(1, genesis_header.hash(), genesis_header.state_root, 0, true);
+        let header_b = synthetic_header(1, genesis_header.hash(), genesis_header.state_root);
         let window = vec![header_b.clone()];
         let final_state = BlockNumHash::new(1, header_b.hash());
         {
@@ -1571,10 +1560,10 @@ mod tests {
         // (non-empty, non-genesis, number contiguity, tip vs `final_state`) passes either way, so
         // the two runs differ in the parent-hash link and nothing else.
         let run = |linked: bool| -> eyre::Result<()> {
-            let h1 = synthetic_header(1, genesis_header.hash(), state_root, 0, true);
+            let h1 = synthetic_header(1, genesis_header.hash(), state_root);
             let h2_parent = if linked { h1.hash() } else { B256::repeat_byte(0xee) };
-            let h2 = synthetic_header(2, h2_parent, state_root, 0, true);
-            let h3 = synthetic_header(3, h2.hash(), state_root, 0, true);
+            let h2 = synthetic_header(2, h2_parent, state_root);
+            let h3 = synthetic_header(3, h2.hash(), state_root);
             let window = vec![h1, h2, h3.clone()];
             let final_state = BlockNumHash::new(3, h3.hash());
 
@@ -1594,97 +1583,6 @@ mod tests {
             err.to_string().contains("not hash-linked at block 2"),
             "expected a parent-hash linkage rejection, got: {err:?}"
         );
-
-        Ok(())
-    }
-
-    /// The fee-derivability precheck rejects a snapshot whose EIP-1559 worker produced no genuine
-    /// block in the shipped window (the node would walk below the snapshot and halt), and accepts
-    /// one that did. Uses a consensus-registry genesis (worker 0 is EIP-1559 by default) and passes
-    /// `entered = 2` explicitly so the check runs regardless of the genesis registry epoch.
-    #[tokio::test]
-    async fn fee_precondition_gates_idle_snapshot_epochs() -> eyre::Result<()> {
-        let genesis = crate::test_utils::test_genesis_with_consensus_registry(4);
-        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
-
-        // source: export the registry genesis state at its real root
-        let src_dir = TempDir::new()?;
-        let src_tm = TaskManager::new("Fee Precondition Source");
-        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
-        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
-        let state_root = genesis_header.state_root;
-        let parent0 = genesis_header.hash();
-
-        // Restore a 1-block window (block 1, parent = genesis, pinning the genesis root) into a
-        // fresh datadir and run the precheck. `genuine` controls whether worker 0's window block is
-        // a genuine batch block.
-        let run = |genuine: bool| -> eyre::Result<()> {
-            let h1 = window_header_on_genesis(&genesis_header, 1, parent0, state_root, 0, genuine);
-            let window = vec![h1.clone()];
-            let final_state = BlockNumHash::new(1, h1.hash());
-            let pack_dir = TempDir::new()?;
-            export_pack(&source, state_root, &[h1.header().clone()], pack_dir.path());
-            let dst_dir = TempDir::new()?;
-            let dst_tm = TaskManager::new("Fee Precondition Dest");
-            let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
-            let restorer = SnapshotRestorer::open(&reth_config, db, &dst_tm)?;
-            restorer.import_chain_scaffold(&window, final_state)?;
-            let mut reader = ExecStatePackReader::open(pack_dir.path())?;
-            restorer.import_state(&mut reader)?;
-            // The precheck reads worker configs at B (= the restored genesis state) and scans the
-            // window for genuine blocks; returns its verdict (datadir/guards drop after it runs).
-            restorer.derive_fee_precondition(2, &window)
-        };
-
-        let err = run(false).expect_err("an idle EIP-1559 window must be rejected");
-        assert!(
-            err.to_string().contains("produced no genuine block"),
-            "expected an idle-worker rejection, got: {err:?}"
-        );
-        run(true).expect("a window with a genuine worker block must satisfy the precondition");
-
-        Ok(())
-    }
-
-    /// `check_resumable_fees` is a no-op for a snapshot rooted at the genesis block: the node would
-    /// enter epoch <= 1, whose base-fee derivation never walks below B, so even an idle window is
-    /// tolerated (the entered-epoch read returns < 2).
-    #[tokio::test]
-    async fn check_resumable_fees_tolerates_epoch_zero_snapshot() -> eyre::Result<()> {
-        let genesis = crate::test_utils::test_genesis_with_consensus_registry(4);
-        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
-
-        let src_dir = TempDir::new()?;
-        let src_tm = TaskManager::new("Resumable Fees Skip Source");
-        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
-        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
-        let state_root = genesis_header.state_root;
-
-        // an idle 1-block window that WOULD be rejected if the entered epoch were >= 2
-        let h1 = window_header_on_genesis(
-            &genesis_header,
-            1,
-            genesis_header.hash(),
-            state_root,
-            0,
-            false,
-        );
-        let window = vec![h1.clone()];
-        let final_state = BlockNumHash::new(1, h1.hash());
-        let pack_dir = TempDir::new()?;
-        export_pack(&source, state_root, &[h1.header().clone()], pack_dir.path());
-
-        let dst_dir = TempDir::new()?;
-        let dst_tm = TaskManager::new("Resumable Fees Skip Dest");
-        let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
-        let restorer = SnapshotRestorer::open(&reth_config, db, &dst_tm)?;
-        restorer.import_chain_scaffold(&window, final_state)?;
-        let mut reader = ExecStatePackReader::open(pack_dir.path())?;
-        restorer.import_state(&mut reader)?;
-
-        restorer
-            .check_resumable_fees(&window)
-            .expect("an epoch-<=1 snapshot must skip the fee-derivability precheck");
 
         Ok(())
     }
@@ -1817,7 +1715,7 @@ mod tests {
         // sanity: the pack really does emit `big` across more than one storage chunk (otherwise the
         // whale test would not exercise the per-chunk path at all)
         let b = 1u64;
-        let h1 = synthetic_header(b, genesis_header.hash(), state_root, 0, true);
+        let h1 = synthetic_header(b, genesis_header.hash(), state_root);
         let window = vec![h1.clone()];
         let final_state = BlockNumHash::new(b, h1.hash());
         let pack_dir = TempDir::new()?;
@@ -1973,7 +1871,7 @@ mod tests {
         let state_root = genesis_header.state_root;
 
         let b = 1u64;
-        let h1 = synthetic_header(b, genesis_header.hash(), state_root, 0, true);
+        let h1 = synthetic_header(b, genesis_header.hash(), state_root);
         let window = vec![h1.clone()];
         let final_state = BlockNumHash::new(b, h1.hash());
 
@@ -2014,6 +1912,289 @@ mod tests {
             err.to_string().contains("strictly ascending address order"),
             "expected an ascending-order rejection, got: {err:?}"
         );
+
+        Ok(())
+    }
+
+    /// Drive the restore pipeline through the state import (open → scaffold → import) over a
+    /// fresh datadir, returning the restorer ready for the entry-readiness precondition.
+    fn restore_through_import(
+        chain: Arc<RethChainSpec>,
+        dst_dir: &Path,
+        task_manager: &TaskManager,
+        window: &[SealedHeader],
+        final_state: BlockNumHash,
+        pack_dir: &Path,
+    ) -> eyre::Result<SnapshotRestorer> {
+        let (reth_config, db) = temp_config_and_db(chain, dst_dir)?;
+        let restorer = SnapshotRestorer::open(&reth_config, db, task_manager)?;
+        restorer.import_chain_scaffold(window, final_state)?;
+        let mut reader = ExecStatePackReader::open(pack_dir)?;
+        restorer.import_state(&mut reader)?;
+        Ok(restorer)
+    }
+
+    /// A genuine epoch-boundary snapshot passes the entry-readiness precondition end to end: the
+    /// final block `B` closed epoch 0 (so the registry at `B` reports epoch 1 beginning at
+    /// `B + 1`), and `B`'s own system call recorded the EIP-1559 worker's next-epoch base fee in
+    /// its `WorkerConfigs.data` word — one state read at `B` seeds the restored node's first
+    /// entry, no prior-epoch headers required.
+    #[tokio::test]
+    async fn entry_readiness_accepts_epoch_boundary_snapshot() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+        const START_FEE: u64 = 1_000_000;
+        const EPOCH_GAS: u64 = 1_500_000;
+
+        let genesis = test_genesis_with_consensus_registry_and_workers(5, vec![(0u8, TARGET_GAS)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        // source: a moved fee and mid-epoch gas so the close records a non-trivial word
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Entry Readiness Accept Source");
+        let acc = GasAccumulator::new(1);
+        acc.base_fee(0).set_base_fee(START_FEE);
+        acc.inc_block(0, EPOCH_GAS, 30_000_000);
+        let source =
+            RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, Some(acc))?;
+
+        // block 1 closes epoch 0: concludeEpoch seats epoch 1 and records worker 0's fee
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&source, payload, vec![])?;
+        let closing = block.recovered_block.clone_sealed_header();
+
+        // fixture guard: the close wrote a genuine fee word (oracle value, away from MIN)
+        let expected = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS },
+            START_FEE,
+            EPOCH_GAS,
+        );
+        assert_ne!(expected, MIN_PROTOCOL_BASE_FEE, "fixture fee must not pin at MIN");
+        let (num_workers, entries) = read_worker_config_entries_at(&source, closing.hash())?;
+        assert_eq!(num_workers, 1);
+        assert_eq!(
+            entries[0].data,
+            U184::from(expected),
+            "the closing block must record worker 0's next-epoch fee"
+        );
+
+        // export the boundary state; the closing block is the snapshot's final block B
+        let final_state = BlockNumHash::new(closing.number, closing.hash());
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, closing.state_root, &[closing.header().clone()], pack_dir.path());
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Entry Readiness Accept Dest");
+        let restorer = restore_through_import(
+            chain,
+            dst_dir.path(),
+            &dst_tm,
+            std::slice::from_ref(&closing),
+            final_state,
+            pack_dir.path(),
+        )?;
+        restorer.entry_readiness_precondition(final_state)?;
+        restorer.finish(final_state)?;
+
+        Ok(())
+    }
+
+    /// A snapshot whose final block did NOT close an epoch is refused, and the error names the
+    /// boundary requirement: block 1 here is a mid-epoch-0 block, so the registry at `B` still
+    /// reports epoch 0 with first block 0 — not an entered epoch beginning at `B + 1`.
+    #[tokio::test]
+    async fn entry_readiness_rejects_non_boundary_final_block() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry_and_workers(5, vec![(0u8, 1_000_000)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Entry Readiness Non Boundary Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+
+        // block 1 stays mid-epoch: no concludeEpoch, no boundary
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&source, payload, vec![])?;
+        let mid_epoch = block.recovered_block.clone_sealed_header();
+
+        let final_state = BlockNumHash::new(mid_epoch.number, mid_epoch.hash());
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, mid_epoch.state_root, &[mid_epoch.header().clone()], pack_dir.path());
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Entry Readiness Non Boundary Dest");
+        let restorer = restore_through_import(
+            chain,
+            dst_dir.path(),
+            &dst_tm,
+            &[mid_epoch],
+            final_state,
+            pack_dir.path(),
+        )?;
+
+        let err = restorer
+            .entry_readiness_precondition(final_state)
+            .expect_err("a mid-epoch final block must fail the restore");
+        assert!(
+            err.to_string().contains("not an epoch-closing block"),
+            "error must name the boundary requirement: {err}"
+        );
+
+        Ok(())
+    }
+
+    /// An EIP-1559 row whose `data` word was governance-poisoned above `u64::MAX` fails the
+    /// RESTORE (not the node's first epoch entry later), naming the worker and the oversized
+    /// word.
+    ///
+    /// A genuine close always rewrites every EIP-1559 row's word last (the boundary system calls
+    /// run in `finish`, after user transactions), so the poison lands in a follow-up block and
+    /// ships under a forged-but-self-consistent boundary header: number 1 — keeping the
+    /// registry's `blockHeight == B + 1` boundary claim intact — over the poisoned block's real
+    /// state root. Header provenance is outside restore's trust boundary (see the module docs),
+    /// so the WORD check is what catches this shape.
+    #[tokio::test]
+    async fn entry_readiness_rejects_poisoned_eip1559_data_word() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+        let poison = U184::from((u64::MAX as u128) + 1);
+
+        let genesis = test_genesis_with_consensus_registry_and_workers(5, vec![(0u8, TARGET_GAS)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Entry Readiness Poison Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+
+        // block 1 closes epoch 0 (the close itself records a sane word for worker 0)
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(&source, payload, vec![])?;
+        let closing = block1.recovered_block.clone_sealed_header();
+
+        // block 2 (mid-epoch-1): the owner rewrites worker 0's row with an oversized data word;
+        // no close runs here, so nothing rewrites it back
+        let mut governance = governance_owner_factory();
+        let poison_tx = governance.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setWorkerConfigCall {
+                workerId: 0,
+                strategy: 0,
+                value: TARGET_GAS,
+                data: poison,
+            }
+            .abi_encode()
+            .into(),
+        );
+        let consensus_output = consensus_output_for_tests(2, 1, 2, false);
+        let payload = TNPayload::new_for_test(closing.clone(), &consensus_output);
+        let block2 = execute_payload_and_update_canonical_chain(&source, payload, vec![poison_tx])?;
+        let poisoned = block2.recovered_block.clone_sealed_header();
+
+        // fixture guard: the oversized word stuck on an EIP-1559 row
+        let (_, entries) = read_worker_config_entries_at(&source, poisoned.hash())?;
+        assert_eq!(entries[0].data, poison, "the owner tx must land the oversized word");
+        assert!(
+            matches!(entries[0].config, WorkerFeeConfig::Eip1559 { .. }),
+            "the poisoned row must still decode as EIP-1559"
+        );
+
+        // forge a self-consistent boundary header over the poisoned state: number 1 (so the
+        // registry's blockHeight 2 still reads as B + 1) with block 2's real state root
+        let forged = synthetic_header(1, chain.sealed_genesis_header().hash(), poisoned.state_root);
+        let final_state = BlockNumHash::new(forged.number, forged.hash());
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, poisoned.state_root, &[forged.header().clone()], pack_dir.path());
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Entry Readiness Poison Dest");
+        let restorer = restore_through_import(
+            chain,
+            dst_dir.path(),
+            &dst_tm,
+            &[forged],
+            final_state,
+            pack_dir.path(),
+        )?;
+
+        let err = restorer
+            .entry_readiness_precondition(final_state)
+            .expect_err("a poisoned EIP-1559 data word must fail the restore");
+        let msg = err.to_string();
+        assert!(msg.contains("worker 0"), "error must name the worker: {msg}");
+        assert!(msg.contains("exceeds u64::MAX"), "error must name the oversized word: {msg}");
+
+        Ok(())
+    }
+
+    /// A `Static` row's garbage `data` word is ACCEPTED: the fee lives in the config's value and
+    /// the entry read never consults `data` for `Static` rows, so the precondition is
+    /// deliberately non-strict here. The garbage rides the closing block itself — user
+    /// transactions execute before the boundary system calls in `finish`, and the close never
+    /// writes `Static` rows, so the word survives to `B` on a GENUINE boundary.
+    #[tokio::test]
+    async fn entry_readiness_accepts_static_worker_with_garbage_data() -> eyre::Result<()> {
+        const STATIC_FEE: u64 = 777;
+        let garbage = U184::MAX;
+
+        let genesis = test_genesis_with_consensus_registry_and_workers(5, vec![(1u8, STATIC_FEE)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Entry Readiness Static Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+
+        // the owner writes the garbage word in the closing block; the all-Static close records
+        // nothing, so the word is still there when concludeEpoch seals the boundary
+        let mut governance = governance_owner_factory();
+        let garbage_tx = governance.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setWorkerConfigCall {
+                workerId: 0,
+                strategy: 1,
+                value: STATIC_FEE,
+                data: garbage,
+            }
+            .abi_encode()
+            .into(),
+        );
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&source, payload, vec![garbage_tx])?;
+        let closing = block.recovered_block.clone_sealed_header();
+
+        // fixture guards: B is a genuine boundary AND the static row carries the garbage word
+        let (num_workers, entries) = read_worker_config_entries_at(&source, closing.hash())?;
+        assert_eq!(num_workers, 1);
+        assert_eq!(entries[0].config, WorkerFeeConfig::Static { fee: STATIC_FEE });
+        assert_eq!(
+            entries[0].data, garbage,
+            "the garbage word must survive the close on a Static row"
+        );
+
+        let final_state = BlockNumHash::new(closing.number, closing.hash());
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, closing.state_root, &[closing.header().clone()], pack_dir.path());
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Entry Readiness Static Dest");
+        let restorer = restore_through_import(
+            chain,
+            dst_dir.path(),
+            &dst_tm,
+            &[closing],
+            final_state,
+            pack_dir.path(),
+        )?;
+
+        // accepted: data is ignored for Static rows
+        restorer.entry_readiness_precondition(final_state)?;
+        restorer.finish(final_state)?;
 
         Ok(())
     }

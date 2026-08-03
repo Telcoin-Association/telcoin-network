@@ -16,7 +16,9 @@ from the code at the cited paths; when the code and this file disagree, the code
   into `RethEnv`.
 - Each batch in the output becomes one EVM block. An output with no batches and no epoch close is
   skipped entirely; an epoch-closing output with no batches still produces a synthetic closing
-  block (its `ommers_hash` is zero — see `is_worker_batch_block` in `src/snapshot.rs`).
+  block, identifiable by `ommers_hash == B256::ZERO` — the engine passes a zero batch digest for
+  it (`execute_consensus_output` in `crates/engine/src/payload_builder.rs`; see the header field
+  mapping below).
 - Blocks are canonicalized directly: `finish_executing_output` (`src/env/execution.rs`) persists
   the blocks **and** the finalized/safe markers in a single database transaction, then broadcasts
   the canonical-state notification. There is no beacon/engine API, no fork choice, and no reorgs
