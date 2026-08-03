@@ -782,10 +782,15 @@ impl RethEnv {
     /// Read the CURRENT epoch number and [`EpochInfo`](ConsensusRegistry::EpochInfo) from the
     /// [`ConsensusRegistry`] at `header`, with failures classified per [`StateReadError`].
     ///
-    /// This is the close-time identity read for the epoch manager's `adjust_base_fees`: at an
-    /// epoch's closing block the registry state has already crossed to the entered epoch
-    /// (`concludeEpoch` ran inside that block), so the returned info is the entered epoch's record
-    /// and its `blockHeight` must equal `header.number + 1`. It reads exactly what
+    /// This is the ONE boundary predicate for "did this block close an epoch": the epoch
+    /// manager's close-time identity check (`adjust_base_fees`), the entry read's pin guard
+    /// (`read_base_fees_for_entered_epoch`, both in `tn-node`), and the snapshot restore's
+    /// [`entry_readiness_precondition`](crate::snapshot::SnapshotRestorer::entry_readiness_precondition)
+    /// all validate the same boundary through it — deliberately shared so the three seams cannot
+    /// drift on what counts as a closing block. At an epoch's closing block the registry state
+    /// has already crossed to the entered epoch (`concludeEpoch` ran inside that block), so the
+    /// returned info is the entered epoch's record and its `blockHeight` must equal
+    /// `header.number + 1`. It reads exactly what
     /// [`Self::epoch_state_at_header`] reads for the same check but skips the committee/BLS/
     /// epoch-start lookups (a gating check needs only the epoch identity) and — unlike that
     /// method, whose failures collapse into `eyre` strings — keeps node-local provider faults

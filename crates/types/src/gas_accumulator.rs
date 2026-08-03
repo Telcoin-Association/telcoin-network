@@ -471,10 +471,11 @@ pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, targe
 /// the fee to the governance-set value, ignoring gas usage.
 ///
 /// This is the ONE fee formula, and it lives here so every seam that prices a worker's next-epoch
-/// fee dispatches through the same strategy match: `adjust_base_fees` (in `node::manager`) applies
-/// it at a live epoch close and `fold_next_epoch_base_fees` (also in `node::manager`) applies it
-/// when deriving the entered epoch's fees from the previous epoch's chain state, so both seams
-/// produce identical values from identical inputs.
+/// fee dispatches through the same strategy match: `record_next_epoch_base_fees` (in
+/// `tn-reth::evm::block`) applies it inside the closing block to write the fee into the worker's
+/// on-chain `WorkerConfigs.data` word — the record the epoch entry reads back — and
+/// `adjust_base_fees` (in `node::manager`) applies it to the live accumulator at close time, so
+/// both seams produce identical values from identical inputs.
 pub fn next_base_fee_for_config(
     config: WorkerFeeConfig,
     current_base_fee: u64,

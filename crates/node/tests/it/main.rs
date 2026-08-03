@@ -799,7 +799,11 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
         .await?;
     assert_eq!(recovered.num_workers(), 2, "catchup sizes the accumulator to the on-chain count");
 
-    // worker 0: totals restored to match the live accumulator
+    // worker 0: totals restored to match the live accumulator. LOAD-BEARING: with the
+    // independent header scan deleted, this recovered==live equality is the ONLY remaining
+    // cross-check that the accumulator the closing block prices from matches the chain's
+    // headers — do not delete it believing the capstone covers this (the capstone's gas
+    // identity is tautological within its own harness).
     let (blocks, gas_used, gas_limit) = recovered.get_values(0);
     assert_eq!((blocks, gas_used, gas_limit), gas_accumulator.get_values(0));
     assert!(gas_used > 0, "worker 0 accumulated gas this epoch");

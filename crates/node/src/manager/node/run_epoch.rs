@@ -180,13 +180,13 @@ where
         // That value-stability is also the safety argument under concurrent execution -
         // `send_leftover_consensus_output_to_engine` forwards leftover output without waiting,
         // so the engine may still be executing (calling `inc_block`) while this entry runs:
-        // `apply`'s resize no-ops and its fee writes rewrite the same values. The guard is
-        // value-stability, NOT quiescence and NOT any refusal inside `set_num_workers` (it
-        // truncates unconditionally): the pinned re-read yields the identical count so the resize
+        // `apply`'s resize no-ops and its fee writes rewrite the same values. Keeping the count
+        // above every in-flight worker id is a CALLER obligation - `GasAccumulator::set_num_workers`
+        // truncates unconditionally, and its own doc states that bound canonically, so keep the two
+        // in sync. Value-stability is how this entry meets it, NOT quiescence and NOT any refusal
+        // inside `set_num_workers`: the pinned re-read yields the identical count so the resize
         // no-ops, and a shrink below an in-flight worker id would trip `inc_block`'s production
-        // panic rather than pass silently. `GasAccumulator::set_num_workers`'s own doc states
-        // that bound canonically - keep the two in sync. See the
-        // `mode_change_reentry_is_idempotent` IT.
+        // panic rather than pass silently. See the `mode_change_reentry_is_idempotent` IT.
         //
         // Seed the accumulator's worker count and per-worker base fees for the entered epoch
         // from the pinned header (the previous epoch's closing block). This is the single seam
@@ -1170,6 +1170,54 @@ mod tests {
 
         // the guard trips before the config read, so fees stay untouched
         assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
+
+        Ok(())
+    }
+
+    /// Entry-read guard: `entered == 0` is rejected before any chain read — epoch 0 has no
+    /// previous closing block, and its entry is seeded by `sync_num_workers_from_chain` instead.
+    #[tokio::test]
+    async fn entry_read_rejects_epoch_zero() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("entry_read_epoch_zero")?;
+        let task_manager = TaskManager::new("entry read epoch zero");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let err = read_base_fees_for_entered_epoch(&reth_env, 0, &chain.sealed_genesis_header())
+            .expect_err("epoch 0 has no previous closing block to read");
+        assert!(
+            err.to_string().contains("sync_num_workers_from_chain"),
+            "error must point at the epoch-0 seeding path: {err}"
+        );
+
+        Ok(())
+    }
+
+    /// Entry-read guard: a header that is not the entered epoch's closing-block pin is rejected
+    /// by the boundary predicate (the same `get_current_epoch_info_at_header` read the snapshot
+    /// restore's entry-readiness precondition runs), naming the pin and what the registry
+    /// actually reports.
+    ///
+    /// Genesis is such a header: the registry at it reports epoch 0 beginning at block 0, so a
+    /// caller claiming it closes into epoch 1 trips both halves of the check.
+    #[tokio::test]
+    async fn entry_read_rejects_non_boundary_header() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("entry_read_non_boundary")?;
+        let task_manager = TaskManager::new("entry read non boundary");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let genesis_header = chain.sealed_genesis_header();
+        let err = read_base_fees_for_entered_epoch(&reth_env, 1, &genesis_header)
+            .expect_err("a non-boundary header must fail the pin check");
+        let msg = err.to_string();
+        assert!(msg.contains("closing-block pin"), "error must name the pin: {msg}");
+        assert!(msg.contains("reports epoch 0"), "error must name the registry's view: {msg}");
+        assert!(msg.contains("expected epoch 1"), "error must name the expected epoch: {msg}");
 
         Ok(())
     }

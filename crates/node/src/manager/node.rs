@@ -351,11 +351,15 @@ impl EpochBaseFees {
     /// writes every worker's base fee. Gas counters are deliberately untouched — the entered
     /// epoch starts at zero gas.
     ///
-    /// Safe to run while the engine is still executing leftover consensus output (a ModeChange
-    /// re-entry does exactly that): both values are pinned to the previous epoch's closing block,
-    /// so a re-entry re-reads the identical count — the resize no-ops — and rewrites the identical
-    /// fees. That value-stability, not quiescence, is what upholds
-    /// [`GasAccumulator::set_num_workers`]' bound against shrinking below an in-flight worker id.
+    /// Safe to run while the engine is still executing leftover consensus output on a ModeChange
+    /// re-entry: both values are pinned to the previous epoch's closing block, so the re-entry
+    /// re-reads the identical count — the resize no-ops — and rewrites the identical fees. That
+    /// value-stability argument covers ModeChange re-entry ONLY. On the NewEpoch path a governance
+    /// shrink takes effect at the boundary and [`GasAccumulator::set_num_workers`] truncates
+    /// unconditionally (staying above in-flight worker ids is the CALLER obligation its doc
+    /// records); there the bound comes from the boundary-drain ordering — the closed epoch's
+    /// output is executed through the boundary before the entry runs — with the accepted residual
+    /// that a leftover batch from a removed worker would panic in `GasAccumulator::inc_block`.
     pub fn apply(&self, gas_accumulator: &GasAccumulator) {
         gas_accumulator.set_num_workers(self.num_workers);
         for (worker_id, fee) in self.fees.iter().enumerate() {
@@ -383,13 +387,59 @@ impl EpochBaseFees {
 /// deliberately stricter than the close-time update's chain-global fail-open, which is safe there
 /// only because keeping the current fees is a value every committee member computes identically.
 ///
-/// `entered` must be at least 1: epoch 0 has no previous epoch to close, and its entry is seeded by
-/// [`sync_num_workers_from_chain`] instead.
+/// Three guards protect the read (this fn is pub-exported, so callers beyond `run_epoch` exist):
+/// - `entered` must be at least 1: epoch 0 has no previous epoch to close, and its entry is seeded
+///   by [`sync_num_workers_from_chain`] instead.
+/// - `closing_header` must actually be `entered`'s boundary pin: the registry at it must report
+///   epoch `entered` beginning at `closing_header.number + 1` (`concludeEpoch` runs INSIDE the
+///   closing block, so only that block satisfies this). The check runs the same canonical boundary
+///   predicate the snapshot restore's entry-readiness precondition uses
+///   ([`RethEnv::get_current_epoch_info_at_header`]) — deliberately ONE predicate for what counts
+///   as a closing block. Production upholds it by construction: `run_epoch` passes the pin resolved
+///   by `RethEnv::epoch_state_at_epoch_start`, which self-validates.
+///
+///   The `blockHeight` side of that comparison is trustworthy because a begun epoch always carries a
+///   real height: epoch 0 alone is stamped by the registry's constructor at genesis and reports
+///   `blockHeight = 0` for the life of the chain, and `RethEnv::get_epoch_info_at_block` rejects a
+///   `blockHeight = 0` record for any epoch but 0 as not-yet-begun. Since this guard only ever runs
+///   for `entered >= 1`, a zero height cannot reach the comparison as a false match.
+/// - The read must return at least one worker (unreachable while the contract clamps its count;
+///   mirrors the snapshot side's guard).
 pub fn read_base_fees_for_entered_epoch(
     reth_env: &RethEnv,
     entered: Epoch,
     closing_header: &SealedHeader,
 ) -> eyre::Result<EpochBaseFees> {
+    if entered == 0 {
+        return Err(eyre!(
+            "epoch 0 has no previous closing block to read base fees from; its entry is seeded \
+             via sync_num_workers_from_chain"
+        ));
+    }
+
+    // Pin check: the header must be the boundary the fees were written at, validated through the
+    // same predicate the snapshot restore's entry-readiness precondition runs.
+    let (epoch_at_pin, epoch_info) =
+        reth_env.get_current_epoch_info_at_header(closing_header).wrap_err_with(|| {
+            format!(
+                "failed to read the registry epoch record at epoch {entered}'s pinned closing \
+                 block {} ({:?})",
+                closing_header.number,
+                closing_header.hash()
+            )
+        })?;
+    if epoch_at_pin != entered || epoch_info.blockHeight != closing_header.number + 1 {
+        return Err(eyre!(
+            "header {} ({:?}) is not epoch {entered}'s closing-block pin: the registry at it \
+             reports epoch {epoch_at_pin} beginning at block {}, expected epoch {entered} \
+             beginning at block {}",
+            closing_header.number,
+            closing_header.hash(),
+            epoch_info.blockHeight,
+            closing_header.number + 1,
+        ));
+    }
+
     let (num_workers, entries) =
         reth_env.get_worker_fee_configs_at_block(closing_header.hash()).wrap_err_with(|| {
             format!(
@@ -398,6 +448,13 @@ pub fn read_base_fees_for_entered_epoch(
                 closing_header.hash()
             )
         })?;
+    if num_workers == 0 {
+        return Err(eyre!(
+            "WorkerConfigs at epoch {entered}'s pinned closing block {} reports zero workers; \
+             an epoch cannot be entered without at least one worker",
+            closing_header.number
+        ));
+    }
 
     let fees = entries
         .iter()
