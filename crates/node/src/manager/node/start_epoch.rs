@@ -134,10 +134,15 @@ where
         &self,
         engine: &ExecutionNode,
     ) -> eyre::Result<(Committee, EpochInfo, u64, SealedHeader)> {
+        // Sample the bootstrap tip ONCE: the pin this read resolves is a function of the tip
+        // (`concludeEpoch` rewrites both the epoch number and its `blockHeight` at every
+        // boundary), so holding the sample here is what makes the pin a property of this call
+        // rather than of when each chain read happens to run.
+        let tip = engine.get_reth_env().await.canonical_tip();
         let (
             EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start },
             epoch_start_header,
-        ) = engine.epoch_state_at_epoch_start().await?;
+        ) = engine.epoch_state_at_epoch_start_from_tip(&tip).await?;
         let validators = validators
             .iter()
             .zip(bls_pubkeys.iter())

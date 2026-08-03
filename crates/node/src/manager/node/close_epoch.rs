@@ -286,10 +286,18 @@ where
         // closing block, so this read IS that block; the pin makes the record's committee reads
         // and its `final_state` derive from the same header by construction instead of by
         // timing.
+        // `parent_state` is sampled ONCE and both committees resolve through ONE batched by-hash
+        // read: the watch is live, so re-sampling it per read could straddle a block commit and
+        // desynchronize the two committees from each other and from the `final_state` this record
+        // commits below.
         let parent_state = self.consensus_bus.latest_execution_block_num_hash();
-        let committee_keys = engine.validators_for_epoch_at_block(epoch, parent_state.hash).await?;
-        let next_committee_keys =
-            engine.validators_for_epoch_at_block(epoch + 1, parent_state.hash).await?;
+        let [committee_keys, next_committee_keys]: [Vec<BlsPublicKey>; 2] = engine
+            .validators_for_epochs_at_block(&[epoch, epoch + 1], parent_state.hash)
+            .await?
+            .try_into()
+            .map_err(|_| {
+                eyre!("committee batch read arity mismatch for the epoch {epoch} record")
+            })?;
         let prev_record = if epoch == 0 {
             None
         } else {
