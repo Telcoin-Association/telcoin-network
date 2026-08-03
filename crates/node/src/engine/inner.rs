@@ -18,8 +18,8 @@ use tn_reth::{
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     gas_accumulator::GasAccumulator, Address, BatchSender, BatchValidation, BlockHeader,
-    BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer,
-    SealedHeader, TaskSpawner, WorkerId, B256,
+    BlsPublicKey, Bytes, ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader,
+    Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -383,24 +383,72 @@ impl ExecutionNodeInner {
     }
 
     /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
-    /// On-chain BLS key bytes are decoded here; a decode failure is a hard error, mirroring the
-    /// epoch-entry committee read.
+    /// On-chain BLS key bytes are decoded through [`decode_committee_keys`], so a decode failure
+    /// is a hard error, mirroring the epoch-entry committee read.
     pub(super) fn validators_for_epoch_at_block(
         &self,
         epoch: u32,
         block_hash: B256,
     ) -> eyre::Result<Vec<BlsPublicKey>> {
+        decode_committee_keys(
+            epoch,
+            block_hash,
+            self.reth_env.bls_pubkeys_for_epoch_at_block(epoch, block_hash)?,
+        )
+    }
+
+    /// Read committee validator keys for epoch, pinned to `header`'s state.
+    ///
+    /// Decodes through [`decode_committee_keys`], so it hard-errors on undecodable on-chain
+    /// bytes exactly like [`Self::validators_for_epoch_at_block`].
+    pub(super) fn validators_for_epoch_at_header(
+        &self,
+        epoch: u32,
+        header: &SealedHeader,
+    ) -> eyre::Result<Vec<BlsPublicKey>> {
+        decode_committee_keys(
+            epoch,
+            header.hash(),
+            self.reth_env.bls_pubkeys_for_epoch_at_header(epoch, header)?,
+        )
+    }
+
+    /// Read several epochs' committee validator keys, pinned to `header`'s state — ONE pinned
+    /// EVM for the whole batch, results ordered to match `epochs`.
+    ///
+    /// Each set decodes through [`decode_committee_keys`] under its own epoch, so an
+    /// undecodable key fails the whole batch and names the epoch it came from.
+    pub(super) fn validators_for_epochs_at_header(
+        &self,
+        epochs: &[Epoch],
+        header: &SealedHeader,
+    ) -> eyre::Result<Vec<Vec<BlsPublicKey>>> {
         self.reth_env
-            .bls_pubkeys_for_epoch_at_block(epoch, block_hash)?
-            .iter()
-            .map(|bls| {
-                BlsPublicKey::from_literal_bytes(bls.as_ref()).map_err(|err| {
-                    eyre::eyre!(
-                        "failed to create bls key from on-chain bytes for epoch {epoch} at block \
-                         {block_hash:?}: {err:?}"
-                    )
-                })
-            })
+            .bls_pubkeys_for_epochs_at_header(epochs, header)?
+            .into_iter()
+            .zip(epochs)
+            .map(|(raw, &epoch)| decode_committee_keys(epoch, header.hash(), raw))
             .collect()
     }
+}
+
+/// Decode on-chain BLS key bytes into committee keys for `epoch`, read at pin block `pin`.
+///
+/// A decode failure is a hard error: a silently short committee is a consensus-safety failure,
+/// while halting is a single-node liveness failure.
+fn decode_committee_keys(
+    epoch: Epoch,
+    pin: B256,
+    raw: Vec<Bytes>,
+) -> eyre::Result<Vec<BlsPublicKey>> {
+    raw.iter()
+        .map(|bls| {
+            BlsPublicKey::from_literal_bytes(bls.as_ref()).map_err(|err| {
+                eyre::eyre!(
+                    "failed to create bls key from on-chain bytes for epoch {epoch} at block \
+                     {pin:?}: {err:?}"
+                )
+            })
+        })
+        .collect()
 }
