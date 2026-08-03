@@ -40,13 +40,16 @@
 //!
 //! Restore proves internal consistency, not provenance. It verifies that the pack's accounts
 //! rebuild from scratch to both the pack's declared state root and `header(B).state_root`, that
-//! the header window is contiguous by block number and its tip matches the claimed `final_state`
-//! number and hash, and (in [`SnapshotRestorer::finish`]) that the reconstructed tip matches
-//! `final_state`. It does NOT verify that the window headers or `final_state` belong to the
-//! canonical chain: no consensus provenance or signature check happens in this module, and
-//! parent-hash linkage between consecutive window headers is not re-checked here (the window is
-//! validated upstream). The operator-supplied header window and final block hash are therefore
-//! the trusted inputs — a restore against forged-but-self-consistent headers would succeed.
+//! the header window is contiguous by block number, hash-linked from each header to its
+//! predecessor, and tipped by a header matching the claimed `final_state` number and hash, and
+//! (in [`SnapshotRestorer::finish`]) that the reconstructed tip matches `final_state`. It does
+//! NOT verify that `final_state` itself belongs to the canonical chain: no consensus provenance
+//! or signature check happens in this module, so `final_state` is the trusted input here: a
+//! restore against a forged window that is internally consistent and tipped by the claimed final
+//! block would succeed. Callers are expected to supply a `final_state` they have verified: `tn db
+//! load-state` pins it to an epoch record checked against that epoch's super-quorum certificate.
+//! Because a header hash commits to every field of its header, including `parent_hash`, the
+//! linkage walk carries such a caller's guarantee from the tip down through the whole window.
 //! Genesis is never taken from the snapshot; it always comes from the local chain spec, which
 //! remains the trust root.
 
@@ -362,9 +365,10 @@ impl SnapshotRestorer {
 
     /// Write a header-only chain scaffold up to the snapshot's final block `B`.
     ///
-    /// `window` is a contiguous, ascending run of the real headers that end at `final_state`
-    /// (block `B`); it must not include genesis. This method, run once before
-    /// [`import_state`](Self::import_state):
+    /// `window` is a contiguous, ascending, parent-hash-linked run of the real headers that end at
+    /// `final_state` (block `B`); it must not include genesis. Those properties are re-checked
+    /// here rather than assumed, so every caller of this `pub` API gets them. This method, run
+    /// once before [`import_state`](Self::import_state):
     ///
     /// - Clears the genesis alloc from `PlainAccountState`, `PlainStorageState`, `HashedAccounts`,
     ///   `HashedStorages`, `AccountsTrie`, and `StoragesTrie`. `init_genesis` (run in
@@ -395,8 +399,9 @@ impl SnapshotRestorer {
             .ok_or_else(|| eyre!("snapshot restore: cannot scaffold an empty header window"))?;
         let b = final_state.number;
 
-        // cheap invariant checks (the window is validated upstream, but a mis-shaped window here
-        // would silently corrupt the scaffold)
+        // cheap invariant checks. nothing upstream re-checks the window's shape or its linkage
+        // (`scaffold_window` only normalizes, and the pack-vs-record check sees the tip alone), so
+        // these run here or nowhere, and a mis-shaped window would silently corrupt the scaffold
         if b == 0 {
             return Err(eyre!("snapshot restore: cannot scaffold at genesis (block 0)"));
         }
@@ -422,6 +427,24 @@ impl SnapshotRestorer {
                 ));
             }
         }
+        // parent-hash linkage. `final_state.hash` is pinned upstream to the certificate-verified
+        // `EpochRecord.final_state`, and a header hash commits to every field of that header,
+        // including its `parent_hash`. Walking the links therefore carries the certificate's
+        // coverage from the tip down through every ancestor this scaffold writes, instead of
+        // trusting the bundle's producer for them. Number contiguity alone accepts a header that
+        // sits at the right height with arbitrary ancestry.
+        window.iter().zip(window.iter().skip(1)).try_for_each(|(parent, child)| {
+            (child.parent_hash == parent.hash()).then_some(()).ok_or_else(|| {
+                eyre!(
+                    "snapshot restore: window is not hash-linked at block {}: parent_hash {} does \
+                     not match block {}'s hash {}",
+                    child.number,
+                    child.parent_hash,
+                    parent.number,
+                    parent.hash()
+                )
+            })
+        })?;
 
         info!(
             target: "tn::reth",
@@ -1528,6 +1551,48 @@ mod tests {
         let err = SnapshotRestorer::open(&reth_config, db, &tm)
             .expect_err("open must refuse a datadir that already holds chain data");
         assert!(err.to_string().contains("non-empty"), "unexpected error: {err}");
+
+        Ok(())
+    }
+
+    /// Block-number contiguity alone accepts a window whose headers carry the right heights but
+    /// descend from different ancestors, so the scaffold also walks the parent-hash links. The
+    /// break sits in the middle of the window and the header above it re-links to the mutated
+    /// header, so only a per-pair walk catches it; checking the ends of the window would not.
+    #[tokio::test]
+    async fn import_rejects_a_window_that_is_not_hash_linked() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let genesis_header = chain.sealed_genesis_header();
+        let state_root = genesis_header.state_root;
+
+        // scaffold a 3-block window into a fresh datadir; `linked` decides whether block 2
+        // descends from block 1 or from a stranger. every other check the scaffold makes
+        // (non-empty, non-genesis, number contiguity, tip vs `final_state`) passes either way, so
+        // the two runs differ in the parent-hash link and nothing else.
+        let run = |linked: bool| -> eyre::Result<()> {
+            let h1 = synthetic_header(1, genesis_header.hash(), state_root, 0, true);
+            let h2_parent = if linked { h1.hash() } else { B256::repeat_byte(0xee) };
+            let h2 = synthetic_header(2, h2_parent, state_root, 0, true);
+            let h3 = synthetic_header(3, h2.hash(), state_root, 0, true);
+            let window = vec![h1, h2, h3.clone()];
+            let final_state = BlockNumHash::new(3, h3.hash());
+
+            let dir = TempDir::new()?;
+            let tm = TaskManager::new("Window Linkage");
+            let (reth_config, db) = temp_config_and_db(chain.clone(), dir.path())?;
+            let restorer = SnapshotRestorer::open(&reth_config, db, &tm)?;
+            restorer.import_chain_scaffold(&window, final_state)
+        };
+
+        // positive control: the same fixture, honestly linked, is accepted, so the rejection
+        // below is attributable to the broken link rather than to the synthetic headers
+        run(true)?;
+
+        let err = run(false).expect_err("a window that is not hash-linked must be rejected");
+        assert!(
+            err.to_string().contains("not hash-linked at block 2"),
+            "expected a parent-hash linkage rejection, got: {err:?}"
+        );
 
         Ok(())
     }
