@@ -165,8 +165,12 @@ async fn forward(
     // sizes are client-controlled (`eth_getLogs`, `debug_*`, large batches can
     // reach the worker's ~160 MB response cap), so N concurrent buffered
     // responses would exhaust gateway memory. The proxy client's total request
-    // timeout keeps bounding the stream, so a stalled upstream or slow-reading
-    // client cannot hold the connection past the deadline.
+    // timeout bounds a stalled *upstream* (hyper keeps polling the body while
+    // its write buffer has room, so the timeout is observed) but not a
+    // slow-reading *client*: under downstream backpressure hyper stops polling
+    // the body and the poll-driven timeout never fires. That side is bounded
+    // at the connection layer instead: `TCP_USER_TIMEOUT` plus the
+    // connection-lifetime cap (see [`crate::server::accept_loop`]).
     let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
     *response.status_mut() = status;
     if let Some(content_type) = upstream_content_type {
