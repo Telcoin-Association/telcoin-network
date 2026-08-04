@@ -827,7 +827,14 @@ where
         // continuity check report a spurious gap on the first live output (and the leftover
         // drain re-forward already-executed output).
         self.last_forwarded_consensus_number =
-            state_sync::last_consensus_parent(&self.consensus_bus, &self.consensus_chain).await.1;
+            state_sync::last_consensus_parent(&self.consensus_bus, &self.consensus_chain)
+                .await
+                .wrap_err(
+                    "failed to READ the consensus store while priming the last forwarded \
+                     consensus number: this is a storage error, not a missing record - do NOT \
+                     delete the chain-data directories",
+                )?
+                .1;
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
@@ -1292,7 +1299,15 @@ where
             let consensus_number = self
                 .consensus_chain
                 .consensus_header_by_digest(epoch, consensus_hash)
-                .await?
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to READ the consensus store while priming recent blocks \
+                         (block {}, epoch {epoch}): this is a storage error, not a missing \
+                         record - do NOT delete the chain-data directories",
+                        recent_block.number
+                    )
+                })?
                 .map(|h| h.number)
                 .unwrap_or_default();
             let consensus_num_hash = ConsensusNumHash::new(consensus_number, consensus_hash);
@@ -1307,9 +1322,24 @@ where
         // slot-hint-immune signal — and hand both to `check_restore_consistency`, which
         // decides whether the pair is coherent.
         let tip = self.consensus_bus.recent_blocks().borrow().latest_execution_block();
+        // A read FAILURE fails startup here with a do-not-delete message; only a confirmed
+        // absence (`Ok(None)`) reaches `check_restore_consistency`, whose delete-and-reimport
+        // instruction is correct for a partial restore but destructive for a merely unreadable
+        // store.
         let producing_header =
             state_sync::last_executed_consensus_block(&self.consensus_bus, &self.consensus_chain)
-                .await;
+                .await
+                .wrap_err_with(|| {
+                    let (tip_epoch, _) = deconstruct_nonce(tip.nonce.into());
+                    format!(
+                        "failed to READ the consensus store while resolving the producing \
+                         consensus header for the executed tip (block {}, epoch {tip_epoch}): \
+                         this is a storage error, not a missing record - do NOT delete the \
+                         chain-data directories; inspect the consensus-db epoch pack files (or \
+                         restore them from a backup or peers) and retry",
+                        tip.number
+                    )
+                })?;
         check_restore_consistency(&tip, producing_header.as_ref())?;
 
         Ok(())
@@ -1347,16 +1377,26 @@ where
 ///
 /// `tip` is reth's canonical execution tip (as seeded into `recent_blocks`), and `producing_header`
 /// is the tip's producing consensus header as resolved by
-/// [`last_executed_consensus_block`](state_sync::last_executed_consensus_block) — `None` when the
-/// header is absent from the consensus store.
+/// [`last_executed_consensus_block`](state_sync::last_executed_consensus_block); `None` when the
+/// header is confirmed ABSENT from the consensus store. Storage READ failures the lookup can
+/// detect (a sealed static epoch pack that fails to OPEN, with missing-vs-unreadable classified
+/// by `PackError::is_missing_static_files`) never reach this guard: the lookup surfaces them as
+/// errors and `try_restore_state` fails startup with a distinct do-not-delete message first.
+/// Record-level damage inside a pack that still opens, and the current-epoch pack's own reads
+/// (the mid-epoch restart path), still resolve as `None` (documented at
+/// `consensus_header_by_digest` in `tn-storage`), which is why the message below asks the
+/// operator to verify pack readability before deleting anything.
 ///
 /// Invariant relied on: "execution follows consensus" — `save_consensus_output` persists a block's
 /// producing consensus HEADER to the consensus store BEFORE that block executes. So any healthy
 /// node that has executed block `B > 0` always resolves `B`'s producing header, whether it is
 /// running, mid multi-epoch catch-up (epoch RECORDS may lag, but the header does not), or
 /// restarting right at/after an epoch boundary (the closing epoch's pack is persisted static before
-/// the next opens, so it stays readable). The only way the header is absent with a populated reth
-/// tip is a state-only / partial / crashed-mid-import restore, which this rejects.
+/// the next opens). Persistence does not guarantee readability: a static pack that fails to OPEN
+/// is reported as a read ERROR by the lookup, not as absence, while in-record damage that
+/// survives the length-only open check is not yet detectable and still reads as absence. With
+/// the detectable read failures excluded, a header absent under a populated reth tip is
+/// overwhelmingly a state-only / partial / crashed-mid-import restore, which this rejects.
 ///
 /// Genesis / fresh nodes (`tip.number == 0`) are exempt: the genesis header has no producing
 /// consensus output, so `producing_header` is legitimately `None` there.
@@ -1371,11 +1411,13 @@ fn check_restore_consistency(
         let (tip_epoch, _) = deconstruct_nonce(tip.nonce.into());
         return Err(eyre!(
             "datadir is an incomplete state restore: execution is at block {} (epoch {tip_epoch}) \
-             but the consensus store has no record of the consensus that produced it. Remove the \
-             chain-data directories (`db`, `static_files`, and `consensus-db`) under the datadir \
-             and re-run `db load-state` with a COMPLETE export bundle — do NOT delete the datadir \
-             itself, which holds your node keys. Or start from an empty datadir to sync from \
-             genesis.",
+             but the consensus store has no record of the consensus that produced it. Before \
+             deleting anything, verify the consensus-db epoch pack files are present and \
+             readable: damage inside a record can still resolve as a missing record. If the \
+             restore is genuinely incomplete, remove the chain-data directories (`db`, \
+             `static_files`, and `consensus-db`) under the datadir and re-run `db load-state` \
+             with a COMPLETE export bundle; do NOT delete the datadir itself, which holds your \
+             node keys. Or start from an empty datadir to sync from genesis.",
             tip.number
         ));
     }

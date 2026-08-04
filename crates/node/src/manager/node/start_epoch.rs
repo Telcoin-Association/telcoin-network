@@ -24,7 +24,7 @@ use crate::{
     engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode, worker::WorkerNode,
     EngineToPrimaryRpc,
 };
-use eyre::{eyre, OptionExt};
+use eyre::{eyre, OptionExt, WrapErr as _};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
@@ -835,7 +835,11 @@ where
             consensus_config,
             self.consensus_chain.clone(),
         )
-        .await;
+        .await
+        .wrap_err(
+            "failed to READ the consensus store while priming consensus state: this is a \
+             storage error, not a missing record - do NOT delete the chain-data directories",
+        )?;
         let mode = if !in_committee || self.builder.tn_config.observer {
             NodeMode::Observer
         } else {

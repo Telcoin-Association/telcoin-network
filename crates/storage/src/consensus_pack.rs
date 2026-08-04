@@ -34,7 +34,7 @@ use tracing::{debug, error};
 use crate::archive::{
     data_file::create_dir_synced,
     digest_index::index::HdxIndex,
-    error::{fetch::FetchError, open::OpenError},
+    error::{fetch::FetchError, load_header::LoadHeaderError, open::OpenError},
     fxhasher::FxHasher,
     index::Index as _,
     pack::{write_value, DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
@@ -1895,6 +1895,33 @@ pub enum PackError {
         expected: ConsensusHeaderDigest,
         got: ConsensusHeaderDigest,
     },
+}
+
+impl PackError {
+    /// True when a static-pack open failed because the epoch's files are absent on disk: the
+    /// data-file or an index-file open bottomed out in io `NotFound`. [`Inner::open_static`]
+    /// opens the data file before anything else, so a missing `epoch-{N}` directory (or a
+    /// never-created epoch) always surfaces as the data file's `NotFound`; an index file can
+    /// bottom out there on its own while the data file still opens, because `stream_import`
+    /// removes an incomplete epoch directory entry by entry before re-importing it, and the
+    /// pre-classifier lookup fell back to staging during that window.
+    ///
+    /// Callers use this to distinguish an epoch whose files are not (or are no longer) on disk
+    /// (a normal miss, answered with `None`) from files that are present but unreadable
+    /// (corrupt pack, damaged header or index, non-`NotFound` I/O failure): a storage READ
+    /// error that must propagate instead of being collapsed into a miss.
+    pub fn is_missing_static_files(&self) -> bool {
+        matches!(
+            self,
+            PackError::Open(open_error)
+                if matches!(
+                    open_error.as_ref(),
+                    OpenError::DataFileOpen(LoadHeaderError::IO(io_error))
+                    | OpenError::IndexFileOpen(LoadHeaderError::IO(io_error))
+                        if io_error.kind() == io::ErrorKind::NotFound
+                )
+        )
+    }
 }
 
 impl Error for PackError {}

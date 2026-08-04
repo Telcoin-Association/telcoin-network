@@ -29,15 +29,18 @@ pub use consensus::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_re
 
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.
+///
+/// Returns an error when the last executed consensus block cannot be READ from the consensus
+/// store (as opposed to being absent, which primes from a default header as before).
 pub async fn prime_consensus<DB: Database>(
     consensus_bus: &ConsensusBusApp,
     config: &ConsensusConfig<DB>,
     consensus_chain: ConsensusChain,
-) {
+) -> eyre::Result<()> {
     // Get the DB and load our last executed consensus block (note there may be unexecuted
     // blocks, catch up will execute them).
     let last_executed_block =
-        last_executed_consensus_block(consensus_bus, &consensus_chain).await.unwrap_or_default();
+        last_executed_consensus_block(consensus_bus, &consensus_chain).await?.unwrap_or_default();
 
     let current_epoch = config.epoch();
 
@@ -54,6 +57,7 @@ pub async fn prime_consensus<DB: Database>(
 
     consensus_bus.committed_round_updates().send_replace(last_consensus_round);
     consensus_bus.primary_round_updates().send_replace(last_consensus_round);
+    Ok(())
 }
 
 /// Spawn the state sync tasks.
@@ -123,31 +127,38 @@ pub async fn save_consensus(
 /// Returns the ConsensusHeader that created the last executed block if can be found.
 /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
 /// issue.
+///
+/// `Ok(None)` means the header is confirmed ABSENT from the consensus store; a storage read
+/// failure surfaced by the lookup (for example a sealed static epoch pack that fails to OPEN)
+/// is `Err`, never `Ok(None)`. Record-level reads inside a pack that opened cleanly still
+/// collapse to `None`; that remaining channel is documented at
+/// `ConsensusChain::consensus_header_by_digest` in `tn-storage`.
 pub async fn last_executed_consensus_block(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
-) -> Option<ConsensusHeader> {
-    let last = consensus_bus.last_executed_consensus_block(consensus_chain).await;
+) -> eyre::Result<Option<ConsensusHeader>> {
+    let last = consensus_bus.last_executed_consensus_block(consensus_chain).await?;
     debug!(target: "state-sync", ?last, "last executed consensus block");
-    last
+    Ok(last)
 }
 
 /// Return the (hash, number) to use as parent for the next ConsensusHeader.
 /// Accounts for outputs committed to DB but not yet executed (which
 /// replay_missed_consensus handles before the subscriber starts).
+///
+/// Returns an error when the last executed consensus block or the latest recorded consensus
+/// header cannot be READ from the consensus store (as opposed to being absent, which falls
+/// back to a default header as before).
 pub async fn last_consensus_parent(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
-) -> (ConsensusHeaderDigest, u64) {
+) -> eyre::Result<(ConsensusHeaderDigest, u64)> {
     let last_executed =
-        last_executed_consensus_block(consensus_bus, consensus_chain).await.unwrap_or_default();
-    let last_db = consensus_chain
-        .consensus_header_latest()
-        .await
-        .unwrap_or_default()
-        .unwrap_or_else(|| last_executed.clone());
+        last_executed_consensus_block(consensus_bus, consensus_chain).await?.unwrap_or_default();
+    let last_db =
+        consensus_chain.consensus_header_latest().await?.unwrap_or_else(|| last_executed.clone());
     let parent = if last_db.number > last_executed.number { last_db } else { last_executed };
-    (parent.digest(), parent.number)
+    Ok((parent.digest(), parent.number))
 }
 
 /// Collect and return any consensus headers that were not executed before last shutdown.
@@ -159,7 +170,7 @@ pub async fn get_missing_consensus(
     let mut result = Vec::new();
     // Get the DB and load our last executed consensus block.
     let last_executed_block =
-        last_executed_consensus_block(consensus_bus, consensus_chain).await.unwrap_or_default();
+        last_executed_consensus_block(consensus_bus, consensus_chain).await?.unwrap_or_default();
 
     // Edge case, in case we don't hear from peers but have un-executed blocks...
     // Not sure we should handle this, but it hurts nothing.

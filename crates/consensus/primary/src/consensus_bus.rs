@@ -710,22 +710,27 @@ impl ConsensusBusApp {
     /// Returns the ConsensusHeader that created the last executed block if it can be found.
     /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
     /// issue.
+    ///
+    /// `Ok(None)` means the header is confirmed ABSENT from the consensus store. A storage read
+    /// failure (for example a present-but-unreadable static epoch pack) is returned as `Err`
+    /// instead of being conflated with absence, so callers can tell "no record" apart from
+    /// "could not read the record".
     pub async fn last_executed_consensus_block(
         &self,
         consensus_chain: &ConsensusChain,
-    ) -> Option<ConsensusHeader> {
+    ) -> eyre::Result<Option<ConsensusHeader>> {
         let block = self.recent_blocks().borrow().latest_execution_block();
         let header = block.header();
         let (epoch, _) = deconstruct_nonce(header.nonce.into());
         let parent_beacon_block_root = header.parent_beacon_block_root;
-        if let Some(consensus_hash) = parent_beacon_block_root {
-            consensus_chain
-                .consensus_header_by_digest(epoch, consensus_hash.into())
-                .await
-                .unwrap_or_default()
-        } else {
-            None
-        }
+        // Genesis has no parent beacon block root, so the lookup itself is optional; a `Some`
+        // lookup that FAILS to read propagates as `Err` rather than degrading into `None`.
+        let looked_up =
+            futures::future::OptionFuture::from(parent_beacon_block_root.map(|consensus_hash| {
+                consensus_chain.consensus_header_by_digest(epoch, consensus_hash.into())
+            }))
+            .await;
+        Ok(looked_up.transpose()?.flatten())
     }
 
     /// Returns the ConsensusHeader that was processed.
