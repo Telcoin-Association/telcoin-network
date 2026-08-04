@@ -1,7 +1,7 @@
 //! The state of consensus
 
 use crate::{
-    consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError},
+    consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError, ConsensusInvariant},
     ConsensusBus, NodeMode,
 };
 use std::{
@@ -305,13 +305,17 @@ impl<DB: Database> Consensus<DB> {
 
         debug!(target: "epoch-manager", ?latest_sub_dag, "recovered latest subdag:");
         if let Some(sub_dag) = &latest_sub_dag {
-            assert_eq!(
-                sub_dag.leader_round(),
-                last_committed_round,
-                "Last subdag leader round {} is not equal to the last committed round {}!",
-                sub_dag.leader_round(),
-                last_committed_round,
-            );
+            // Self-consistency tripwire for recovery. Both operands derive from the same
+            // append-only `ConsensusPack` (a torn tail is reconciled in lockstep at pack open),
+            // so an honest single-node crash cannot tear them apart; this can only fire on an
+            // internal sub-dag construction regression. Surface a typed, recoverable error
+            // instead of aborting recovery with an `assert_eq!` backtrace.
+            (sub_dag.leader_round() == last_committed_round).then_some(()).ok_or_else(|| {
+                ConsensusInvariant::RecoveredLeaderRoundMismatch {
+                    leader_round: sub_dag.leader_round(),
+                    last_committed_round,
+                }
+            })?;
         }
 
         // restore local dag
@@ -467,12 +471,29 @@ impl<DB: Database> Consensus<DB> {
                     .await
                     .map_err(|_| ConsensusError::ShuttingDown)?;
 
-                assert_eq!(self.state.last_round.committed_round, leader_commit_round);
-
-                self.consensus_bus
-                    .app()
-                    .committed_round_updates()
-                    .send_replace(self.state.last_round.committed_round);
+                // Commit-accounting invariant: the last committed round must equal the max
+                // header round we just sequenced. If it ever disagrees, mirror the bogus-sub-dag
+                // handling above (go inactive + shut down cleanly) instead of panicking on the
+                // single consensus task; the notified shutdown ends the run loop on the next
+                // select, so the trailing `Ok(())` is reached without further processing.
+                if self.state.last_round.committed_round == leader_commit_round {
+                    self.consensus_bus
+                        .app()
+                        .committed_round_updates()
+                        .send_replace(self.state.last_round.committed_round);
+                } else {
+                    tracing::error!(
+                        target: "telcoin::consensus_state",
+                        committed_round = self.state.last_round.committed_round,
+                        leader_commit_round,
+                        "commit-accounting invariant violated: last committed round does not match leader commit round; going inactive and shutting down",
+                    );
+                    self.consensus_bus
+                        .app()
+                        .node_mode()
+                        .send_modify(|v| *v = NodeMode::CvvInactive);
+                    self.consensus_config.shutdown().notify();
+                }
             }
         }
         Ok(())
