@@ -479,6 +479,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn screened_transaction_is_rejected_with_the_request_id() {
+        // The screening reject answers from the id its own parse produced; end
+        // to end, the client must still get its id echoed back. The upstream is
+        // marked ready and points at a dead port, so a submission that reached
+        // forwarding would surface as a 502 rather than this 400.
+        let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+        state.readiness.set_ready(0, true);
+        let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway_addr}/"))
+            .body(
+                r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":"tx-77"}"#,
+            )
+            .send()
+            .await
+            .expect("send");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json().await.expect("json");
+        assert_eq!(body["error"]["code"], -32007);
+        assert_eq!(body["id"], "tx-77");
+    }
+
+    #[tokio::test]
     async fn oversized_body_gets_jsonrpc_error() {
         let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
         // A tiny configured body limit so a small request trips the size guard

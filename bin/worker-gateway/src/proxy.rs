@@ -29,7 +29,7 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
-    error::{error_response, GatewayError},
+    error::{error_response, error_response_with_id, GatewayError, RequestId},
     server::AppState,
     telemetry,
 };
@@ -90,10 +90,11 @@ pub(crate) async fn proxy(
 
     // Shallow pre-flight for raw-transaction submissions: reject a payload the
     // worker would also reject (undecodable, or an EIP-4844 blob) before paying
-    // for an upstream round-trip.
-    if let Some(err) = screen_raw_transaction(body.as_ref()) {
+    // for an upstream round-trip. The screen has already parsed the body, so it
+    // hands back the request id rather than leaving it to be re-parsed here.
+    if let Some((err, id)) = screen_raw_transaction(body.as_ref()) {
         warn!(target: "gateway::proxy", ?err, "rejecting eth_sendRawTransaction before forwarding");
-        return error_response(&err, body.as_ref());
+        return error_response_with_id(&err, id);
     }
 
     let Some(rpc_url) = state.readiness.first_ready_rpc_url() else {
@@ -197,17 +198,21 @@ fn classify_error(err: reqwest::Error) -> GatewayError {
 
 /// Shallow pre-flight for `eth_sendRawTransaction`.
 ///
-/// Returns `Some(error)` only when `body` is a single `eth_sendRawTransaction`
-/// call whose raw transaction cannot be decoded, or decodes to an EIP-4844 blob
-/// transaction (which the network does not accept). Every other request —
-/// including batches, other methods, and any structurally-off submission —
-/// returns `None` and is forwarded unchanged.
+/// Returns `Some((error, id))` only when `body` is a single
+/// `eth_sendRawTransaction` call whose raw transaction cannot be decoded, or
+/// decodes to an EIP-4844 blob transaction (which the network does not accept).
+/// Every other request — including batches, other methods, and any
+/// structurally-off submission — returns `None` and is forwarded unchanged.
+///
+/// The `id` rides along with the rejection because deciding it required parsing
+/// the body: returning it spares the response path a second parse of the same
+/// bytes.
 ///
 /// The decode uses the same pooled wire format the worker's RPC accepts and
 /// never recovers the signer, so it cannot reject a transaction the worker
 /// would have accepted (no false rejections); it only front-runs a rejection
 /// the worker would issue anyway.
-fn screen_raw_transaction(body: &[u8]) -> Option<GatewayError> {
+fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
     // Fast path: skip JSON parsing entirely unless the method name is present.
     if !mentions_send_raw_transaction(body) {
         return None;
@@ -221,16 +226,19 @@ fn screen_raw_transaction(body: &[u8]) -> Option<GatewayError> {
     // A submission whose params are structurally off (missing / not a string)
     // is forwarded so the worker returns its own canonical parameter error.
     let raw_hex = request.get("params").and_then(|params| params.get(0)).and_then(Value::as_str)?;
+    // Read off the parse that got us here; a rejection below must not re-parse
+    // the body just to echo this back.
+    let id = RequestId::from_request(&request);
 
     // From here the payload is unambiguously a raw transaction, so a decode
     // failure is a real rejection rather than a reason to forward.
     let Some(raw) = decode_hex(raw_hex) else {
-        return Some(GatewayError::InvalidTransaction);
+        return Some((GatewayError::InvalidTransaction, id));
     };
     let mut buf = raw.as_slice();
     match PooledTransaction::decode_2718(&mut buf) {
-        Err(_) => Some(GatewayError::InvalidTransaction),
-        Ok(tx) if tx.is_eip4844() => Some(GatewayError::UnsupportedTransactionType),
+        Err(_) => Some((GatewayError::InvalidTransaction, id)),
+        Ok(tx) if tx.is_eip4844() => Some((GatewayError::UnsupportedTransactionType, id)),
         Ok(_) => None,
     }
 }
@@ -261,15 +269,20 @@ mod tests {
             .into_bytes()
     }
 
+    /// The screen's verdict alone, for the cases that do not assert on the id.
+    fn screen_err(body: &[u8]) -> Option<GatewayError> {
+        screen_raw_transaction(body).map(|(err, _)| err)
+    }
+
     #[test]
     fn valid_legacy_transaction_is_forwarded() {
-        assert!(screen_raw_transaction(&send_raw(&format!("[\"{EIP155_LEGACY_TX}\"]"))).is_none());
+        assert!(screen_err(&send_raw(&format!("[\"{EIP155_LEGACY_TX}\"]"))).is_none());
     }
 
     #[test]
     fn undecodable_transaction_is_rejected() {
         // Valid hex, but not a decodable transaction envelope.
-        let err = screen_raw_transaction(&send_raw(r#"["0xdeadbeef"]"#));
+        let err = screen_err(&send_raw(r#"["0xdeadbeef"]"#));
         assert!(matches!(err, Some(GatewayError::InvalidTransaction)));
     }
 
@@ -279,14 +292,46 @@ mod tests {
         // a pooled transaction, so it is rejected rather than forwarded. Real
         // blob submissions decode and hit the `is_eip4844` reject; either way a
         // blob-typed payload never reaches an upstream.
-        let err = screen_raw_transaction(&send_raw(r#"["0x03c0"]"#));
+        let err = screen_err(&send_raw(r#"["0x03c0"]"#));
         assert!(err.is_some());
     }
 
     #[test]
     fn non_hex_param_is_rejected() {
-        let err = screen_raw_transaction(&send_raw(r#"["not-hex"]"#));
+        let err = screen_err(&send_raw(r#"["not-hex"]"#));
         assert!(matches!(err, Some(GatewayError::InvalidTransaction)));
+    }
+
+    #[test]
+    fn rejection_carries_the_id_a_re_parse_would_have_recovered() {
+        // The point of threading the id out of the screen: the client must see
+        // exactly the id that re-parsing the body would have produced, across
+        // every id shape a submission can carry.
+        let bodies = [
+            send_raw(r#"["0xdeadbeef"]"#),
+            br#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["not-hex"],"id":"tx-7"}"#.to_vec(),
+            br#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdeadbeef"]}"#
+                .to_vec(),
+            br#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":null}"#.to_vec(),
+        ];
+        bodies.iter().for_each(|body| {
+            let (_, id) = screen_raw_transaction(body).expect("rejected");
+            assert_eq!(id, RequestId::recover(body), "{}", String::from_utf8_lossy(body));
+        });
+    }
+
+    #[test]
+    fn rejection_id_survives_a_payload_serialized_before_it() {
+        // `id` after a large `params` is the ordering that rules out recovering
+        // it from a bounded prefix of the body; the reused parse is unaffected.
+        let payload = format!("0xdead{}", "beef".repeat(16 * 1024));
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{payload}"],"id":31}}"#
+        )
+        .into_bytes();
+        let (err, id) = screen_raw_transaction(&body).expect("rejected");
+        assert!(matches!(err, GatewayError::InvalidTransaction));
+        assert_eq!(id, RequestId::recover(&body));
     }
 
     #[test]
