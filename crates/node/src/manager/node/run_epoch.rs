@@ -16,8 +16,15 @@
 //! `parse_listener_address_for_swarm`, `wait_for_network_peers` — plus the [`RunEpochMode`] /
 //! [`ReplayResult`] types that thread control flow through the loop.
 
-use crate::{engine::ExecutionNode, manager::EpochManager, worker::worker_task_manager_name};
-use std::{collections::HashSet, time::Duration};
+use crate::{
+    engine::ExecutionNode, manager::EpochManager, metrics::EpochMetrics,
+    worker::worker_task_manager_name,
+};
+use std::{
+    collections::HashSet,
+    future::{ready, Future},
+    time::Duration,
+};
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::ConsensusBus;
@@ -263,30 +270,44 @@ where
         // is frozen once this epoch starts (a mid-epoch burn mutates the current and future
         // epochs' arrays, never a past epoch's), and the registry at the pin already serves the
         // next epoch's committee, so a post-burn re-entry derives the same sets (see the
-        // ENTRY-READ INVARIANT above). Both stay hard errors: either read failing already
-        // halted the entry before this hoist.
+        // ENTRY-READ INVARIANT above).
+        //
+        // READ-FAILURE POLICY: this is a consensus input, so the failure is classified by
+        // committee determinism (`StateReadError`) and BOTH classes halt - there is no fail-open
+        // arm here, despite what `StateReadError::ChainGlobal`'s variant doc says about
+        // keep-current staying committee-consistent. There is nothing to keep: the node is
+        // ENTERING the epoch, so it holds no prior neighbor sets, and entering with an
+        // unverifiable neighbor committee mis-scopes peer banning and next-committee
+        // pre-resolution for the whole epoch. Halting is a single-node liveness failure.
+        //
+        // A Provider fault is node-local (peers reading the same block may succeed), so retry
+        // briefly before halting; ChainGlobal returns from the first attempt. The pin is
+        // `epoch_start_header`, a fixed `SealedHeader` captured before this retry, so every
+        // attempt provably reads the same block. The `try_into` arity checks are `eyre`, not
+        // `StateReadError`, so they stay OUTSIDE the retried closure.
+        let epochs: Vec<_> =
+            if entered == 0 { vec![entered + 1] } else { vec![entered - 1, entered + 1] };
+        let sets = retry_provider_faults("neighbor committees at the epoch-start pin", || {
+            engine.validators_for_epochs_at_header(&epochs, &epoch_start_header)
+        })
+        .await
+        .map_err(|e| {
+            eyre::eyre!(
+                "failed neighbor-committee read at the epoch-start pin - halting rather than \
+                 entering epoch {entered} with an unverifiable neighbor committee: {e}"
+            )
+        })?;
         let (previous_committee_keys, next_committee_keys): (HashSet<BlsPublicKey>, Vec<_>) =
             if entered == 0 {
                 // epoch 0 has no previous committee
-                let [next] = engine
-                    .validators_for_epochs_at_header(&[entered + 1], &epoch_start_header)
-                    .await?
-                    .try_into()
-                    .map_err(|_| {
-                        eyre::eyre!("neighbor-committee batch arity mismatch for epoch 0")
-                    })?;
+                let [next] = sets.try_into().map_err(|_| {
+                    eyre::eyre!("neighbor-committee batch arity mismatch for epoch 0")
+                })?;
                 (HashSet::new(), next)
             } else {
-                let [previous, next] = engine
-                    .validators_for_epochs_at_header(
-                        &[entered - 1, entered + 1],
-                        &epoch_start_header,
-                    )
-                    .await?
-                    .try_into()
-                    .map_err(|_| {
-                        eyre::eyre!("neighbor-committee batch arity mismatch for epoch {entered}")
-                    })?;
+                let [previous, next] = sets.try_into().map_err(|_| {
+                    eyre::eyre!("neighbor-committee batch arity mismatch for epoch {entered}")
+                })?;
                 (previous.into_iter().collect(), next)
             };
 
@@ -771,7 +792,7 @@ async fn adjust_base_fees(
     // Only a proven identity VIOLATION or an exhausted provider fault halts.
     let (entered_epoch, epoch_info) = match retry_provider_faults(
         "close-time epoch info (identity check)",
-        || reth_env.get_current_epoch_info_at_header(&tip),
+        || ready(reth_env.get_current_epoch_info_at_header(&tip)),
     )
     .await
     {
@@ -825,7 +846,7 @@ async fn adjust_base_fees(
     // and move to the new fees), so it must never fail open: retry, then halt. Pinned to the SAME
     // `tip` the identity check validated (one-header discipline).
     match retry_provider_faults("close-time worker fee configs", || {
-        reth_env.get_worker_fee_configs_at_block(tip.hash())
+        ready(reth_env.get_worker_fee_configs_at_block(tip.hash()))
     })
     .await
     {
@@ -859,27 +880,42 @@ async fn adjust_base_fees(
     Ok(())
 }
 
-/// Total attempts (first try + retries) for each close-time chain read in [`adjust_base_fees`]
-/// before a node-local provider fault halts the close.
+/// Total attempts (first try + retries) for each classified pinned chain read at an epoch seam —
+/// the close-time reads in [`adjust_base_fees`], the epoch-record committee reads, and the
+/// epoch-entry reads — before a node-local provider fault escalates to the caller (a halt at every
+/// current site).
 const CLOSE_READ_ATTEMPTS: u32 = 3;
 
-/// Pause between close-time read retries in [`retry_provider_faults`].
+/// Pause between read retries in [`retry_provider_faults`].
 const CLOSE_READ_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Run `read` up to [`CLOSE_READ_ATTEMPTS`] times, sleeping [`CLOSE_READ_RETRY_BACKOFF`] between
 /// tries, retrying ONLY on [`StateReadError::Provider`].
 ///
-/// Provider faults are node-local (a transient I/O error may clear on a re-read), so a bounded
-/// retry preserves liveness before the caller escalates to a halt. Chain-global failures are
-/// deterministic products of the pinned block — re-reading cannot change them — so they return
-/// immediately for the caller's fail-open arm. Success passes straight through.
-async fn retry_provider_faults<T>(
+/// Provider faults are node-local (a transient I/O error may clear on a re-read: every pinned
+/// read constructs a fresh state provider per attempt), so a bounded retry preserves liveness
+/// before the caller escalates to a halt. Chain-global failures are deterministic products of the
+/// pinned block — re-reading cannot change them — so they return immediately for the caller's
+/// fail-open-or-halt arm. Success passes straight through.
+///
+/// `read` returns a future so the async epoch-record and epoch-entry committee reads share this
+/// policy with the synchronous close-time reads (which adapt with [`std::future::ready`]). Each
+/// attempt calls `read` afresh, so every retry re-runs the whole read — which is why every caller
+/// must fix its pin OUTSIDE the closure, or successive attempts could resolve different blocks.
+///
+/// Every retry is counted through [`EpochMetrics::record_provider_fault_retry`], labelled by
+/// `what`. Once a provider fault at an epoch seam is survivable it becomes invisible until it is
+/// not, and a `warn!` alone will not surface a node quietly retrying at every boundary.
+pub(super) async fn retry_provider_faults<T, Fut>(
     what: &'static str,
-    mut read: impl FnMut() -> Result<T, StateReadError>,
-) -> Result<T, StateReadError> {
+    mut read: impl FnMut() -> Fut,
+) -> Result<T, StateReadError>
+where
+    Fut: Future<Output = Result<T, StateReadError>>,
+{
     let mut attempt = 1u32;
     loop {
-        match read() {
+        match read().await {
             Err(StateReadError::Provider(detail)) if attempt < CLOSE_READ_ATTEMPTS => {
                 warn!(
                     target: "epoch-manager",
@@ -887,8 +923,9 @@ async fn retry_provider_faults<T>(
                     max_attempts = CLOSE_READ_ATTEMPTS,
                     what,
                     detail,
-                    "node-local provider fault on close-time read - retrying"
+                    "node-local provider fault on pinned chain read - retrying"
                 );
+                EpochMetrics::record_provider_fault_retry(what);
                 attempt += 1;
                 tokio::time::sleep(CLOSE_READ_RETRY_BACKOFF).await;
             }
@@ -1013,7 +1050,7 @@ mod tests {
         let calls = Cell::new(0u32);
         let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            Err(StateReadError::Provider("mdbx i/o fault".into()))
+            ready(Err(StateReadError::Provider("mdbx i/o fault".into())))
         })
         .await;
 
@@ -1028,11 +1065,11 @@ mod tests {
         let calls = Cell::new(0u32);
         let res = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            if calls.get() == 1 {
+            ready(if calls.get() == 1 {
                 Err(StateReadError::Provider("transient i/o fault".into()))
             } else {
                 Ok(7u64)
-            }
+            })
         })
         .await;
 
@@ -1047,7 +1084,7 @@ mod tests {
         let calls = Cell::new(0u32);
         let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            Err(StateReadError::ChainGlobal("contract absent".into()))
+            ready(Err(StateReadError::ChainGlobal("contract absent".into())))
         })
         .await;
 
