@@ -397,6 +397,13 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Result<bool, SubscriptionError>>,
     },
+    /// Unsubscribe from a topic.
+    Unsubscribe {
+        /// The topic to unsubscribe from.
+        topic: String,
+        /// The reply to caller: true if this node was subscribed.
+        reply: oneshot::Sender<bool>,
+    },
     /// Publish a message to topic subscribers.
     Publish {
         /// The topic to publish the message on.
@@ -652,6 +659,20 @@ where
         self.sender.send(NetworkCommand::Subscribe { topic, publishers: None, reply }).await?;
         let res = already_subscribed.await?;
         res.map_err(Into::into)
+    }
+
+    /// Unsubscribe from a topic.
+    ///
+    /// Gossipsub subscriptions live on the process-lifetime swarm, so a topic subscribed for one
+    /// epoch stays subscribed until it is explicitly dropped. This also clears the topic's
+    /// authorized-publisher entry, restoring the "not subscribed here" state that
+    /// `verify_gossip` expects for an absent entry.
+    ///
+    /// Return `true` if this node was subscribed to the topic.
+    pub async fn unsubscribe(&self, topic: String) -> NetworkResult<bool> {
+        let (reply, was_subscribed) = oneshot::channel();
+        self.sender.send(NetworkCommand::Unsubscribe { topic, reply }).await?;
+        Ok(was_subscribed.await?)
     }
 
     /// Publish a message on a certain topic.

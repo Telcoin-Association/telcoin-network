@@ -137,8 +137,11 @@ where
 
     /// Process gossip from the committee.
     ///
-    /// Workers gossip the Batch Digests once accepted so that non-committee peers can request the
-    /// Batch.
+    /// Workers gossip a batch digest once it is accepted so that peers which consume individual
+    /// current-epoch batches — committee validators, including one catching up to rejoin — can
+    /// prefetch the body into `NodeBatchesCache` before the vote path needs it. Observers do not
+    /// subscribe to this topic (issue #960): they receive batch bodies inside the verified
+    /// consensus output and epoch packs they already download (`crates/state-sync`).
     pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> WorkerNetworkResult<()> {
         // deconstruct message
         let GossipMessage { data, source: _, sequence_number: _, topic } = msg;
@@ -155,9 +158,10 @@ where
                     WorkerNetworkError::InvalidTopic
                 );
                 let my_epoch = self.consensus_config.epoch();
-                // We are probably behind.  Do not bother to fetch and store this Batch now, it will
-                // most likely be removed before we can use it and will be fetched
-                // later when needed.
+                // We are probably behind. Do not bother to fetch and store this Batch now: the
+                // cache is cleared at the epoch boundary, and a node that is behind receives the
+                // bodies for the epochs it is missing inside the epoch packs / consensus output
+                // it syncs (`crates/state-sync`), not through a later per-batch fetch.
                 ensure!(my_epoch == epoch, WorkerNetworkError::BatchEpochMismatch(epoch, my_epoch));
                 // Since we are precaching Batches for the current epoch we only need to check if it
                 // is in the local cache. There should not have been an opertunity
@@ -174,8 +178,9 @@ where
                     // and a concurrency permit for the whole fetch, releasing both on
                     // scope exit. When admission declines (a prefetch for this digest
                     // is already in flight, or the cap is reached) the prefetch is
-                    // skipped: it is a best-effort optimization and a genuinely needed
-                    // batch is fetched on demand later.
+                    // skipped: it is a best-effort optimization, and a genuinely needed
+                    // batch is still fetched by the vote path itself
+                    // (`PrimaryReceiverHandler::synchronize` -> `request_batches`).
                     let Some(_prefetch) = try_admit_prefetch(
                         &self.prefetch_semaphore,
                         &self.in_flight_prefetch,
@@ -183,14 +188,14 @@ where
                     ) else {
                         return Ok(());
                     };
-                    // If batch is missing from db, then request from peer.
-                    // If we are a CVV then we should already have it.
-                    // This allows non-CVVs to pre fetch batches they will soon need.
+                    // If batch is missing from db, then request from peer. Only committee
+                    // validators subscribe to this topic (issue #960), so this warms the cache
+                    // the vote path reads: an active CVV usually already has the body from the
+                    // normal worker path, while a CVV catching up to rejoin gets the most out of
+                    // the prefetch — the cache survives the mode-change re-entry that promotes it.
                     let mut missing = BTreeSet::from([batch_hash]);
                     match self.network_handle.request_batches(&mut missing).await {
                         Ok(batches) => {
-                            // Note: retrieving this batch for no reason is wasteful, it should
-                            // only effect nodes catching up old epochs though...
                             if let Some((digest, batch)) = batches.first() {
                                 self.validate_and_cache_prefetched_batch(digest, batch)?;
                             }

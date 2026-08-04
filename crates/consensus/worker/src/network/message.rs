@@ -8,7 +8,9 @@ use tn_types::{BlockHash, Epoch, SealedBatch};
 /// Worker messages on the gossip network.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerGossip {
-    /// A new batch digest is available so non-committee peers can fetch it.
+    /// An accepted batch digest, announced so subscribed committee validators can prefetch the
+    /// body before the vote path needs it. Carries the epoch so a stale-epoch announcement is
+    /// rejected rather than prefetched.
     Batch(Epoch, BlockHash),
 }
 

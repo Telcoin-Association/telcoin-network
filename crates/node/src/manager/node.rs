@@ -883,7 +883,9 @@ where
         // once here in the process-lifetime path. That makes the network layer drop non-committee
         // messages before re-propagation and refreshes the authorized set on every committee
         // rotation, rather than accepting any publisher once at node start. See issues #898 and
-        // #912.
+        // #912. `worker_batch_topic` follows the same per-epoch pattern in
+        // `spawn_worker_network_for_epoch`, and is additionally gated on node mode: only
+        // committee validators subscribe, observers unsubscribe (issue #960).
         state_sync::spawn_epoch_record_collector(
             self.consensus_chain.clone(),
             primary_network_handle.clone(),

@@ -693,9 +693,13 @@ where
     /// committee peers — the peer manager drops dials to peers already connected — then waits
     /// for peers before spawning the network on the epoch-scoped spawner.
     ///
-    /// The batch topic is subscribed, restricted to committee publishers so non-CVVs can
-    /// prefetch batches (harmless for CVVs). Non-CVVs push the transactions they accept to
-    /// the committee over RPC rather than gossiping them (issue #804).
+    /// The batch topic is subscribed only by committee validators, restricted to committee
+    /// publishers, so they can prefetch batch bodies into `NodeBatchesCache` ahead of the vote
+    /// path. Observers skip it and unsubscribe: they receive batch bodies inside the verified
+    /// consensus output and epoch packs they already download (`crates/state-sync`), so the
+    /// digest gossip would only fetch the same bytes a second time (issue #960). Non-CVVs push
+    /// the transactions they accept to the committee over RPC rather than gossiping them
+    /// (issue #804).
     #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_network_for_epoch(
         &mut self,
@@ -765,15 +769,28 @@ where
 
         Self::wait_for_network_peers(network_handle.inner_handle(), "worker network").await?;
 
-        // Get gossip from committee members about batches every epoch.
-        // Useful for non-CVVs to prefetch and harmless for CVVs.
-        network_handle
-            .inner_handle()
-            .subscribe_with_publishers(
-                tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id()),
-                committee_keys.into_iter().collect(),
-            )
-            .await?;
+        // Decide the batch-digest gossip subscription for this epoch (issue #960). Committee
+        // validators subscribe to warm the vote path's batch cache; observers unsubscribe,
+        // because state-sync already delivers batch bodies with the consensus output they
+        // follow, so the prefetch would refetch bytes they are downloading anyway.
+        //
+        // The decision is two-sided rather than a bare skip because the worker swarm is
+        // process-lifetime: a validator that subscribed in one epoch stays subscribed into every
+        // later epoch unless the subscription is explicitly dropped. Skipping alone would also
+        // skip the only refresh of this topic's authorized-publisher allowlist, freezing it on
+        // the committee that was current when the node last subscribed.
+        let batch_topic = tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id());
+        let mode = self.consensus_bus.current_node_mode();
+        if should_subscribe_batch_topic(mode) {
+            debug!(target: "epoch-manager", ?mode, "subscribing to worker batch topic");
+            network_handle
+                .inner_handle()
+                .subscribe_with_publishers(batch_topic, committee_keys.into_iter().collect())
+                .await?;
+        } else {
+            debug!(target: "epoch-manager", ?mode, "skipping worker batch topic - follows consensus output");
+            network_handle.inner_handle().unsubscribe(batch_topic).await?;
+        }
 
         // spawn worker network
         WorkerNetwork::new(
@@ -945,5 +962,48 @@ impl ReplayResult {
     /// Take `Self::last_replayed_hash` if it exists.
     pub(super) fn take_last_replayed_hash(&mut self) -> Option<ConsensusHeaderDigest> {
         self.last_replayed_hash.take()
+    }
+}
+
+/// Whether a node in this [`NodeMode`] should subscribe to the worker batch-digest gossip topic.
+///
+/// Only nodes that consume individual current-epoch batches benefit: a committee validator
+/// prefetches the body into `NodeBatchesCache` so the vote path finds it locally instead of
+/// fetching it on demand. That includes `CvvInactive` — a validator catching up to rejoin warms
+/// the cache it will vote against, and a mode-change re-entry does not clear that cache, so the
+/// warm-up survives its promotion. An `Observer` never votes and receives batch bodies inside the
+/// verified consensus output and epoch packs it already downloads (`crates/state-sync`), so for it
+/// the prefetch is pure duplicate bandwidth.
+///
+/// Equivalent to [`ConsensusBus::is_cvv`], written as an exhaustive match so a new [`NodeMode`]
+/// variant fails to compile until this decision is made for it.
+fn should_subscribe_batch_topic(mode: NodeMode) -> bool {
+    match mode {
+        NodeMode::CvvActive | NodeMode::CvvInactive => true,
+        NodeMode::Observer => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_subscribe_batch_topic, NodeMode};
+
+    /// An active committee validator prefetches batches for the vote path.
+    #[test]
+    fn active_cvv_subscribes_to_batch_topic() {
+        assert!(should_subscribe_batch_topic(NodeMode::CvvActive));
+    }
+
+    /// A validator catching up to rejoin warms the cache it is about to vote against; the cache
+    /// survives the mode-change re-entry that promotes it.
+    #[test]
+    fn inactive_cvv_subscribes_to_batch_topic() {
+        assert!(should_subscribe_batch_topic(NodeMode::CvvInactive));
+    }
+
+    /// An observer follows consensus output and would only refetch bytes it already downloads.
+    #[test]
+    fn observer_does_not_subscribe_to_batch_topic() {
+        assert!(!should_subscribe_batch_topic(NodeMode::Observer));
     }
 }
