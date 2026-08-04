@@ -1008,17 +1008,21 @@ impl From<io::Error> for EpochDbError {
 ///
 /// Removes any pre-existing file at `path` first, so a re-run overwrites rather than appends —
 /// `Pack::open` opens read-write in append mode, so writing over a leftover file would otherwise
-/// prepend prior-attempt records. Then opens the pack (which creates the file and writes its
-/// header), appends every value in order, and commits so the file is complete on disk. Keeps the
-/// sentinel tags and codec inside this crate so the export bundle stays readable by
-/// `read_records_from_pack` / `read_certs_from_pack`.
+/// prepend prior-attempt records. A removal failure other than `NotFound` is surfaced as
+/// [`EpochDbError::IO`] rather than ignored, since the stale file would otherwise survive and be
+/// appended onto. Then opens the pack (which creates the file and writes its header), appends
+/// every value in order, and commits so the file is complete on disk. Keeps the sentinel tags and
+/// codec inside this crate so the export bundle stays readable by `read_records_from_pack` /
+/// `read_certs_from_pack`.
 fn write_bounded_pack<V>(path: &Path, uid_idx: u64, values: &[V]) -> Result<(), EpochDbError>
 where
     V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
 {
     // Enforce the "fresh" contract: a leftover file (e.g. from a prior failed export attempt) would
-    // be appended to, not replaced. NotFound is the normal case and is ignored.
-    let _ = std::fs::remove_file(path);
+    // be appended to, not replaced. NotFound is the normal case; any other removal failure means
+    // the stale file may survive, so surface it instead of appending a doubled pack.
+    std::fs::remove_file(path)
+        .or_else(|e| (e.kind() == io::ErrorKind::NotFound).then_some(()).ok_or(e))?;
     let mut pack =
         Pack::<V>::open(path, uid_idx, false, PackCompression::ZStd, EPOCH_PACK_VERSION)?;
     for value in values {
@@ -1205,6 +1209,54 @@ mod test {
             got.len()
         );
         assert_eq!(got.iter().map(|r| r.epoch).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    /// Issue #1080: a non-`NotFound` `remove_file` failure must surface as an error instead of
+    /// being swallowed. A stale file surviving a failed removal would be appended onto, silently
+    /// doubling the pack.
+    #[test]
+    #[cfg(unix)]
+    fn write_bounded_pack_surfaces_remove_file_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::with_prefix("write_bounded_remove_err").expect("temp dir");
+        let path = dir.path().join("epoch_records");
+        let first: Vec<EpochRecord> =
+            (0..3).map(|epoch| EpochRecord { epoch, ..Default::default() }).collect();
+        super::write_bounded_pack(&path, super::Inner::PACK_EPOCH, &first).expect("first write");
+        let stale_bytes = std::fs::read(&path).expect("read stale pack");
+
+        // A probe file distinguishes root (directory permissions are bypassed, removal succeeds)
+        // from a genuine `PermissionDenied` environment.
+        let probe = dir.path().join("root-probe");
+        std::fs::write(&probe, b"probe").expect("write probe");
+
+        // Read-only directory: `remove_file` on its entries now fails with `PermissionDenied`.
+        let writable = std::fs::metadata(dir.path()).expect("dir metadata").permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("make dir read-only");
+        if std::fs::remove_file(&probe).is_ok() {
+            // Running as root (directory permissions are bypassed): the error branch is
+            // unreachable, so the regression is untestable here. Say so loudly rather than
+            // report a silently vacuous pass, then restore cleanup permissions.
+            eprintln!(
+                "write_bounded_pack_surfaces_remove_file_failure: SKIPPED (root bypasses \
+                 directory permissions, so nothing was tested)"
+            );
+            std::fs::set_permissions(dir.path(), writable).expect("restore permissions");
+        } else {
+            let second: Vec<EpochRecord> =
+                (0..2).map(|epoch| EpochRecord { epoch, ..Default::default() }).collect();
+            let result = super::write_bounded_pack(&path, super::Inner::PACK_EPOCH, &second);
+
+            // Restore before asserting so `TempDir` cleanup works even if an assertion fails.
+            std::fs::set_permissions(dir.path(), writable).expect("restore permissions");
+
+            let err = result.expect_err("removal failure must surface, not append");
+            assert!(matches!(err, super::EpochDbError::IO(_)), "unexpected error: {err:?}");
+            // The stale pack is byte-identical: nothing was appended.
+            assert_eq!(std::fs::read(&path).expect("re-read pack"), stale_bytes);
+        }
     }
 
     #[tokio::test]
