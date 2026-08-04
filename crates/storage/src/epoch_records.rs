@@ -199,6 +199,42 @@ fn epoch_committee_valid(
     epoch_rec.committee_compatible(committee)
 }
 
+/// Apply the epoch-record acceptance rules to `record` + `cert` for the epoch slot `epoch`, against
+/// an anchor supplied by the caller rather than read from a database.
+///
+/// This is the one place the four acceptance checks live.
+/// [`EpochRecordDb::validate_downloaded_record`] derives `parent_hash` / `committee` from local
+/// database state and delegates here; a caller that holds the trusted anchor in memory — the `db
+/// load-state` pre-import chain walk, which must reject a bad bundle before it opens any database —
+/// calls it directly. Sharing the predicate is what keeps a record from being acceptable on one
+/// path and not the other.
+///
+/// `parent_hash` and `committee` must describe the epoch the caller trusts *before* `record`:
+/// [`EpochDigest::default()`] plus the genesis committee for epoch 0, otherwise record `epoch -
+/// 1`'s digest and its `next_committee`. Anchoring against the requested `epoch` (rather than the
+/// record's self-declared `record.epoch`) is what makes a record for the wrong slot fail
+/// `epoch_matches`.
+///
+/// Never returns [`EpochRecordValidation::NoAnchor`] — the caller supplying the anchor is what
+/// resolves that case; the variant exists for the database path, which can fail to find one.
+pub fn validate_record_against_anchor(
+    epoch: Epoch,
+    record: &EpochRecord,
+    cert: &EpochCertificate,
+    parent_hash: EpochDigest,
+    committee: &std::collections::BTreeSet<BlsPublicKey>,
+) -> EpochRecordValidation {
+    let epoch_matches = record.epoch == epoch;
+    let parents_match = parent_hash == record.parent_hash;
+    let committee_valid = epoch_committee_valid(record, committee);
+    let cert_valid = record.verify_with_cert(cert);
+    if epoch_matches && parents_match && committee_valid && cert_valid {
+        EpochRecordValidation::Valid
+    } else {
+        EpochRecordValidation::Invalid { epoch_matches, parents_match, committee_valid, cert_valid }
+    }
+}
+
 impl EpochRecordDb {
     /// Open (or create) the epoch records database at `path` for append.
     ///
@@ -605,7 +641,10 @@ impl EpochRecordDb {
     ///
     /// This is the single validation routine shared by the state-sync ingest path and the
     /// failed-quorum recovery path, so a downloaded record cannot be accepted under weaker rules
-    /// on one path than the other.
+    /// on one path than the other. It looks the anchor up locally and then applies
+    /// [`validate_record_against_anchor`], which holds the acceptance rules themselves; callers
+    /// that already hold the trusted anchor in memory (and have no database to consult) call
+    /// that directly rather than reimplementing the checks.
     pub async fn validate_downloaded_record(
         &self,
         epoch: Epoch,
@@ -622,20 +661,7 @@ impl EpochRecordDb {
         };
         anchor
             .map(|(parent_hash, committee)| {
-                let epoch_matches = record.epoch == epoch;
-                let parents_match = parent_hash == record.parent_hash;
-                let committee_valid = epoch_committee_valid(record, &committee);
-                let cert_valid = record.verify_with_cert(cert);
-                if epoch_matches && parents_match && committee_valid && cert_valid {
-                    EpochRecordValidation::Valid
-                } else {
-                    EpochRecordValidation::Invalid {
-                        epoch_matches,
-                        parents_match,
-                        committee_valid,
-                        cert_valid,
-                    }
-                }
+                validate_record_against_anchor(epoch, record, cert, parent_hash, &committee)
             })
             .unwrap_or(EpochRecordValidation::NoAnchor)
     }
