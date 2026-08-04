@@ -190,20 +190,20 @@ telcoin-network genesis \
     --consensus-registry-owner 0xGOVERNANCE_MULTISIG \
     --basefee-address 0xBASEFEE_RECIPIENT \
     --initial-stake-per-validator 1000000 \
-    --epoch-duration-in-secs 86400
+    --epoch-duration-in-secs 28800
 ```
 
 ### genesis flags
 
 | Flag                                                 | Default        | Description                                                                               |
 | ---------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------- |
-| `--chain-id`                                         | `2017` (0x7e1) | Numeric chain ID. Accepts decimal or `0x`-prefixed hex                                    |
+| `--chain-id`                                         | `911329` (0xde7e1) | Numeric chain ID. Accepts decimal or `0x`-prefixed hex                                |
 | `--consensus-registry-owner`                         | `0x...07a0`    | Owner address for the ConsensusRegistry contract. Use a governance multisig in production |
 | `--basefee-address`                                  | `0x...07a0`    | Address that receives all transaction base fees                                           |
 | `--initial-stake-per-validator`, `--stake`           | `1000000`      | TEL staked per validator at genesis (input in whole TEL, stored as wei)                   |
 | `--min-withdraw-amount`, `--min_withdraw`            | `1000`         | Minimum TEL withdrawal amount                                                             |
 | `--epoch-block-rewards`, `--block_rewards_per_epoch` | `25806`        | Total block rewards per epoch in TEL                                                      |
-| `--epoch-duration-in-secs`, `--epoch_length`         | `86400`        | Epoch duration in seconds (default: 24 hours)                                             |
+| `--epoch-duration-in-secs`, `--epoch_length`         | `28800`        | Epoch duration in seconds (default: 8 hours)                                              |
 | `--max-header-delay-ms`                              | none           | Max delay between header proposals (milliseconds)                                         |
 | `--min-header-delay-ms`                              | none           | Min delay between header proposals (milliseconds)                                         |
 | `--max-batch-delay-ms`                               | none           | Max delay before a worker seals a batch of pending transactions (milliseconds)            |
