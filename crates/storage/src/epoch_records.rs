@@ -22,7 +22,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
 };
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::archive::{
     data_file::create_dir_synced,
@@ -59,6 +59,9 @@ enum EpochDbMessage {
     ContainsRecordDigest(EpochDigest, oneshot::Sender<bool>),
     /// Return the latest (highest epoch) [`EpochRecord`] stored, if any.
     LatestRecord(oneshot::Sender<Option<EpochRecord>>),
+    /// Return the first epoch in `0..tip` whose record or certificate is not yet stored,
+    /// resuming from (and advancing) the actor's contiguous-certified-prefix watermark.
+    FirstMissingHistoricalCert(Epoch, oneshot::Sender<Option<Epoch>>),
     /// Flush all pending writes to disk.
     Persist(oneshot::Sender<Result<(), EpochDbError>>),
     Shutdown,
@@ -129,6 +132,9 @@ fn run_db_loop(
             }
             EpochDbMessage::LatestRecord(tx) => {
                 let _ = tx.send(inner.latest_record());
+            }
+            EpochDbMessage::FirstMissingHistoricalCert(tip_epoch, tx) => {
+                let _ = tx.send(inner.first_missing_historical_cert(tip_epoch));
             }
             EpochDbMessage::Persist(tx) => {
                 let _ = tx.send(inner.persist());
@@ -504,22 +510,25 @@ impl EpochRecordDb {
     }
 
     /// Scan the historical epochs `0..tip_epoch` and return the first whose certificate (or record)
-    /// is not yet stored, or `None` if every one has a cert. Cheap: record + cert actor lookups, no
-    /// state I/O — the same per-epoch queries
-    /// [`export_bounded_bundle`](Self::export_bounded_bundle) already does, run before the
-    /// export's plain-state walk so it can skip early when a required historical cert is
-    /// permanently missing (e.g. a network-wide failed-quorum epoch no peer can supply) instead
-    /// of walking the whole state and then failing.
+    /// is not yet stored, or `None` if every one has a cert. Cheap: a single actor round-trip that
+    /// resumes from the actor's contiguous-certified-prefix watermark, so per-boundary work is
+    /// bounded by the epochs newly certified since the previous scan rather than by the chain's
+    /// age. Run before the export's plain-state walk so it can skip early when a required
+    /// historical cert is permanently missing (e.g. a network-wide failed-quorum epoch no peer can
+    /// supply) instead of walking the whole state and then failing.
     ///
     /// `tip_epoch` itself is EXCLUDED: the exported tip's own cert is only aggregated at the next
     /// epoch's start, so it is normally still pending at export time and is waited for separately.
     pub async fn first_missing_historical_cert(&self, tip_epoch: Epoch) -> Option<Epoch> {
-        for epoch in 0..tip_epoch {
-            if !matches!(self.get_epoch_by_number(epoch).await, Some((_, Some(_)))) {
-                return Some(epoch);
-            }
+        let (tx, rx) = oneshot::channel();
+        // On a dead or dying actor, report epoch 0 as unconfirmed (whenever any historical epoch
+        // exists) so the caller skips the export rather than proceeding blind; the per-epoch
+        // lookups this scan replaced degraded the same way.
+        if self.tx.send(EpochDbMessage::FirstMissingHistoricalCert(tip_epoch, tx)).await.is_ok() {
+            rx.await.unwrap_or_else(|_| (tip_epoch > 0).then_some(0))
+        } else {
+            (tip_epoch > 0).then_some(0)
         }
-        None
     }
 
     /// Retrieve the epoch record and certificate (if available) by record digest.
@@ -578,6 +587,95 @@ impl EpochRecordDb {
         .await
         .map_err(|_| EpochDbError::JoinError)??;
         Ok(())
+    }
+
+    /// Write the bounded export bundle covering `0..=through_epoch`, reusing the previous
+    /// boundary's published bundle when one is supplied.
+    ///
+    /// The incremental path copies the previous bundle's records/certs packs to the destination
+    /// paths, validates the copies against epoch `through_epoch`'s record (each pack must hold
+    /// exactly `through_epoch` entries and end at epoch `through_epoch - 1`, anchored by digest),
+    /// and appends only the new epoch's record and certificate. That removes the full rebuild's
+    /// per-epoch actor round-trips, deserialization, and ZStd recompression; per-boundary work
+    /// is still linear in the chain length (the copy itself, plus a validation walk of the
+    /// copied packs' record-size chain that CRC-checks every copied entry), but as cheap
+    /// sequential local file I/O off the DB actor's single thread. The produced bundle is the
+    /// same self-contained `0..=through_epoch` bundle that round-trips through
+    /// [`read_records_from_pack`](Self::read_records_from_pack) /
+    /// [`read_certs_from_pack`](Self::read_certs_from_pack).
+    ///
+    /// Any failure on the incremental path falls back unconditionally to
+    /// [`export_bounded_bundle`](Self::export_bounded_bundle), which remains the correctness
+    /// baseline: the previous bundle can be legitimately absent (first exported epoch, a skipped
+    /// or failed prior export, operator pruning) or fail validation. The previous bundle is only
+    /// ever read, never appended to in place, so published bundles stay immutable and the
+    /// caller's atomic tmp-then-rename publish contract is unchanged.
+    pub async fn export_incremental_bundle(
+        &self,
+        through_epoch: Epoch,
+        prev_bundle: Option<(PathBuf, PathBuf)>,
+        records_path: &Path,
+        certs_path: &Path,
+    ) -> Result<(), EpochDbError> {
+        // Surface any pending background write error before reading (without clearing it).
+        self.peek_error()?;
+
+        let incremental = self
+            .try_append_previous_bundle(through_epoch, prev_bundle, records_path, certs_path)
+            .await;
+        if let Err(reason) = &incremental {
+            debug!(
+                target: "epoch-db", %reason, through_epoch,
+                "incremental bundle append unavailable; rebuilding the full bundle"
+            );
+        }
+        if incremental.is_ok() {
+            incremental
+        } else {
+            self.export_bounded_bundle(through_epoch, records_path, certs_path).await
+        }
+    }
+
+    /// Attempt the incremental copy + append against the previous bundle's packs.
+    ///
+    /// Every error (absent previous bundle, failed validation, IO) aborts before the destination
+    /// holds a committed pack, so the caller can rebuild over the same paths. Fetches only epoch
+    /// `through_epoch`'s record and certificate from the actor; the historical entries come from
+    /// the copied files.
+    async fn try_append_previous_bundle(
+        &self,
+        through_epoch: Epoch,
+        prev_bundle: Option<(PathBuf, PathBuf)>,
+        records_path: &Path,
+        certs_path: &Path,
+    ) -> Result<(), EpochDbError> {
+        let (prev_records, prev_certs) = prev_bundle
+            .filter(|_| through_epoch > 0)
+            .ok_or_else(|| EpochDbError::BundleValidation("no previous bundle to extend".into()))?;
+
+        // The only per-boundary actor traffic on the incremental path: the new epoch's own
+        // record and certificate.
+        let (record, cert) = self
+            .get_epoch_by_number(through_epoch)
+            .await
+            .ok_or(EpochDbError::MissingRecord(through_epoch))?;
+        let cert = cert.ok_or(EpochDbError::MissingCertificate(through_epoch))?;
+
+        let records_dest = records_path.to_path_buf();
+        let certs_dest = certs_path.to_path_buf();
+        // Blocking file work (copy, validate, append, commit) off the async threads.
+        tokio::task::spawn_blocking(move || {
+            append_bundle_increment(
+                &prev_records,
+                &prev_certs,
+                &records_dest,
+                &certs_dest,
+                &record,
+                &cert,
+            )
+        })
+        .await
+        .map_err(|_| EpochDbError::JoinError)?
     }
 
     /// Find the epoch for a consensus header number.
@@ -660,6 +758,13 @@ struct Inner {
     start_epoch: Epoch,
     /// Store a dummy record for epoch 0 to allow chain to start.
     dummy_epoch0: Option<EpochRecord>,
+    /// Every epoch in `0..certified_watermark` has both a record and a stored certificate (a
+    /// contiguous certified prefix, counted from absolute epoch 0 regardless of `start_epoch`).
+    /// Never persisted: recomputed per process at open, because the heal step can truncate
+    /// trailing records or certs after a crash. Advances only while the epoch at the watermark
+    /// is certified, so a hole (a cert that arrives late via failed-quorum recovery or
+    /// state-sync backfill) parks it until a later scan observes the backfill.
+    certified_watermark: Epoch,
 }
 
 impl Inner {
@@ -785,7 +890,7 @@ impl Inner {
             start_epoch
         };
 
-        Ok(Self {
+        let mut inner = Self {
             records,
             certs,
             epoch_idx,
@@ -793,7 +898,10 @@ impl Inner {
             cert_digests,
             start_epoch,
             dummy_epoch0: None,
-        })
+            certified_watermark: 0,
+        };
+        inner.seed_certified_watermark();
+        Ok(inner)
     }
 
     /// Save an [`EpochRecord`] without a certificate.
@@ -926,6 +1034,45 @@ impl Inner {
         }
     }
 
+    /// True if `epoch` has both a stored record and a stored certificate for that record.
+    ///
+    /// The epoch-0 dummy record deliberately fails this check: it exists only to let the chain
+    /// start and never has a certificate.
+    fn epoch_certified(&mut self, epoch: Epoch) -> bool {
+        self.record_by_epoch(epoch)
+            .is_some_and(|record| self.cert_digests.load(record.digest().into()).is_ok())
+    }
+
+    /// Return the first epoch in `0..tip_epoch` without a stored record + certificate pair, or
+    /// `None` when every one is certified, resuming from (and advancing) the
+    /// contiguous-certified-prefix watermark.
+    ///
+    /// The watermark only advances while the epoch at the watermark is certified, never to a
+    /// max-certified-epoch: certs for older epochs legitimately arrive after newer epochs are
+    /// certified (failed-quorum recovery and state-sync backfill), so the scan waits at the hole
+    /// and self-heals on the scan after the backfill lands. Epochs below the watermark are
+    /// immutable within a process: record insertion is idempotent and gap-rejecting, certs are
+    /// append-only, and no delete message exists.
+    fn first_missing_historical_cert(&mut self, tip_epoch: Epoch) -> Option<Epoch> {
+        let resume_from = self.certified_watermark;
+        let first_missing = (resume_from..tip_epoch)
+            .find(|epoch| !self.epoch_certified(*epoch))
+            .unwrap_or(tip_epoch);
+        self.certified_watermark = self.certified_watermark.max(first_missing);
+        (first_missing < tip_epoch).then_some(first_missing)
+    }
+
+    /// Seed the certified-prefix watermark from on-disk state at open (after the heal step), so
+    /// the process's first boundary scan resumes instead of rescanning from epoch 0. Bounded by
+    /// the stored epochs: epochs at or beyond `start_epoch + len` have no record yet, and the
+    /// scan stops at the first uncertified epoch anyway.
+    fn seed_certified_watermark(&mut self) {
+        let stored_end = self
+            .start_epoch
+            .saturating_add(Epoch::try_from(self.epoch_idx.len()).unwrap_or(Epoch::MAX));
+        let _ = self.first_missing_historical_cert(stored_end);
+    }
+
     fn persist(&mut self) -> Result<(), EpochDbError> {
         if !self.records.read_only() {
             self.records.commit().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
@@ -953,6 +1100,8 @@ pub enum EpochDbError {
     ReceiveFailed,
     PersistError(String),
     CorruptDb,
+    /// An export bundle failed validation on the incremental append path.
+    BundleValidation(String),
     JoinError,
 }
 
@@ -980,6 +1129,9 @@ impl Display for EpochDbError {
             EpochDbError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             EpochDbError::PersistError(e) => write!(f, "Failed to persist: {e}"),
             EpochDbError::CorruptDb => write!(f, "Epoch records database is corrupt"),
+            EpochDbError::BundleValidation(e) => {
+                write!(f, "Export bundle validation failed: {e}")
+            }
             EpochDbError::JoinError => write!(f, "Failed to join a background thread for DB"),
         }
     }
@@ -1028,12 +1180,119 @@ where
     Ok(())
 }
 
+/// Entry count and byte position of the final entry in `pack`, derived by walking the
+/// record-size chain from the data header to the end of the file (bundle packs carry no sidecar
+/// indexes, so the chain is the only structure available). Errors if the pack holds no entries
+/// or the chain does not land exactly on the file length, so a truncated or torn pack can never
+/// validate. Metadata-only: no entry is decompressed or deserialized.
+fn pack_entry_chain<V>(pack: &mut Pack<V>) -> Result<(u64, u64), EpochDbError>
+where
+    V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let file_len = pack.file_len();
+    let start = u64::try_from(DATA_HEADER_BYTES).unwrap_or(u64::MAX);
+    let positions = std::iter::successors((start < file_len).then_some(start), |&pos| {
+        pack.record_size(pos)
+            .ok()
+            .map(|size| pos.saturating_add(u64::from(size)))
+            .filter(|&next| next < file_len)
+    });
+    let (count, last) = positions.fold((0_u64, None), |(count, _), pos| (count + 1, Some(pos)));
+    let last = last
+        .ok_or_else(|| EpochDbError::BundleValidation("previous pack holds no entries".into()))?;
+    let last_size = pack
+        .record_size(last)
+        .map_err(|e| EpochDbError::BundleValidation(format!("unreadable final entry: {e}")))?;
+    (last.saturating_add(u64::from(last_size)) == file_len).then_some((count, last)).ok_or_else(
+        || EpochDbError::BundleValidation("entry chain does not reach the file length".into()),
+    )
+}
+
+/// Copy the previous bundle's pack at `prev` over `dest`, verify the copy holds exactly
+/// `expected_entries` entries ending with an entry accepted by `last_entry_ok`, then append
+/// `value` and commit.
+///
+/// Any error aborts before the append, leaving the caller to fall back to a full rebuild;
+/// `dest` lives inside the export's temp dir, so a partial copy is discarded with it. `prev` is
+/// opened only through `std::fs::copy`, never for writing.
+fn append_to_copied_pack<V, F>(
+    prev: &Path,
+    dest: &Path,
+    uid_idx: u64,
+    expected_entries: u64,
+    last_entry_ok: F,
+    value: &V,
+) -> Result<(), EpochDbError>
+where
+    V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    F: FnOnce(&V) -> bool,
+{
+    // Enforce the "fresh" contract like `write_bounded_pack`: `std::fs::copy` truncates an
+    // existing destination, but remove first so a failed copy cannot leave stale prior-attempt
+    // bytes behind for a later step to append onto.
+    let _ = std::fs::remove_file(dest);
+    std::fs::copy(prev, dest)?;
+    let mut pack =
+        Pack::<V>::open(dest, uid_idx, false, PackCompression::ZStd, EPOCH_PACK_VERSION)?;
+    let (entries, last_pos) = pack_entry_chain(&mut pack)?;
+    let last: V = pack
+        .fetch(last_pos)
+        .map_err(|e| EpochDbError::BundleValidation(format!("unreadable final entry: {e}")))?;
+    (entries == expected_entries && last_entry_ok(&last)).then_some(()).ok_or_else(|| {
+        EpochDbError::BundleValidation(format!(
+            "expected {expected_entries} entries ending at the previous epoch, found {entries}"
+        ))
+    })?;
+    pack.append(value).map_err(|e| EpochDbError::Append(e.to_string()))?;
+    pack.commit().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
+    Ok(())
+}
+
+/// Build the `0..=record.epoch` bundle at `records_dest` / `certs_dest` by copying the previous
+/// boundary's published packs and appending only the new epoch's `record` and `cert`.
+///
+/// Validation anchors both copied packs to the new record before anything is appended: each pack
+/// must hold exactly `record.epoch` entries (epochs `0..=record.epoch - 1`), the last copied
+/// record must be the previous epoch's with the digest `record.parent_hash` names, and the last
+/// copied certificate must certify that same digest. A previous bundle that is absent,
+/// truncated, reordered, or from a different chain therefore fails closed and the caller
+/// rebuilds the bundle in full.
+fn append_bundle_increment(
+    prev_records: &Path,
+    prev_certs: &Path,
+    records_dest: &Path,
+    certs_dest: &Path,
+    record: &EpochRecord,
+    cert: &EpochCertificate,
+) -> Result<(), EpochDbError> {
+    let expected_entries = u64::from(record.epoch);
+    let prev_epoch = record.epoch.saturating_sub(1);
+    let parent = record.parent_hash;
+    append_to_copied_pack(
+        prev_records,
+        records_dest,
+        Inner::PACK_EPOCH,
+        expected_entries,
+        |last: &EpochRecord| last.epoch == prev_epoch && last.digest() == parent,
+        record,
+    )?;
+    append_to_copied_pack(
+        prev_certs,
+        certs_dest,
+        Inner::CERT_PACK_EPOCH,
+        expected_entries,
+        |last: &EpochCertificate| last.epoch_hash == parent,
+        cert,
+    )
+}
+
 #[cfg(test)]
 mod test {
     use std::{
         collections::BTreeSet,
         fs::OpenOptions,
         io::{Seek as _, SeekFrom},
+        path::Path,
         sync::Arc,
     };
 
@@ -1944,5 +2203,290 @@ mod test {
             .await
             .expect_err("export must fail when epoch 0's cert is missing");
         assert!(matches!(err, EpochDbError::MissingCertificate(0)), "unexpected error: {err}");
+    }
+
+    /// Build the four chained, fully-signed (record, cert) pairs for epochs 0..=3.
+    fn make_chain4(signers: &[TestSigner]) -> [(EpochRecord, EpochCertificate); 4] {
+        let (r0, c0) = make_test_pair(0, signers, EpochDigest::default());
+        let (r1, c1) = make_test_pair(1, signers, r0.digest());
+        let (r2, c2) = make_test_pair(2, signers, r1.digest());
+        let (r3, c3) = make_test_pair(3, signers, r2.digest());
+        [(r0, c0), (r1, c1), (r2, c2), (r3, c3)]
+    }
+
+    /// A clone of `record` tagged with a sentinel consensus number the live database never
+    /// stores, so bundle bytes that came from a crafted "previous bundle" are distinguishable
+    /// from bytes rebuilt out of the live database.
+    fn sentinel_copy(record: &EpochRecord, number: u64) -> EpochRecord {
+        EpochRecord {
+            final_consensus: ConsensusNumHash::new(number, ConsensusHeaderDigest::default()),
+            ..record.clone()
+        }
+    }
+
+    #[test]
+    fn certified_watermark_resumes_and_waits_at_hole() {
+        // Issue #1078 fix 1: the scan resumes from the contiguous-certified-prefix watermark
+        // instead of rescanning from epoch 0, and the watermark never advances past a hole, so a
+        // late-arriving cert (failed-quorum recovery / state-sync backfill) is still requested.
+        let dir = TempDir::with_prefix("watermark_hole").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let mut inner = super::Inner::open_append(dir.path(), 0).expect("open inner");
+
+        let [(r0, c0), (r1, c1), (r2, c2), _] = make_chain4(&signers);
+        let r1_digest = r1.digest();
+        inner.save(r0, c0).expect("save 0");
+        inner.save_record(r1).expect("save 1 record only"); // cert arrives later
+        inner.save(r2, c2).expect("save 2");
+
+        // First scan: epoch 1 is the hole; the watermark parks there, NOT at the max certified
+        // epoch (2), so the backfill for epoch 1 keeps being requested.
+        assert_eq!(inner.first_missing_historical_cert(3), Some(1));
+        assert_eq!(inner.certified_watermark, 1, "watermark must wait at the hole");
+
+        // Backfill epoch 1's cert (the failed-quorum recovery / state-sync path) and rescan:
+        // the watermark self-heals past the hole.
+        inner.save_certificate(r1_digest, c1).expect("backfill cert 1");
+        assert_eq!(inner.first_missing_historical_cert(3), None);
+        assert_eq!(inner.certified_watermark, 3, "watermark must pass the backfilled hole");
+
+        // A smaller tip neither regresses the watermark nor reports a phantom hole.
+        assert_eq!(inner.first_missing_historical_cert(1), None);
+        assert_eq!(inner.certified_watermark, 3);
+    }
+
+    #[test]
+    fn certified_watermark_seeded_at_open() {
+        // Issue #1078 fix 1: the watermark is recomputed per process (never persisted, because
+        // the open-time heal can truncate trailing records or certs). Reopening seeds it from
+        // the on-disk records and certs, so the first boundary scan after a restart resumes
+        // instead of walking from epoch 0.
+        let dir = TempDir::with_prefix("watermark_seed").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        {
+            let mut inner = super::Inner::open_append(dir.path(), 0).expect("open inner");
+            let [(r0, c0), (r1, c1), (r2, _), _] = make_chain4(&signers);
+            inner.save(r0, c0).expect("save 0");
+            inner.save(r1, c1).expect("save 1");
+            inner.save_record(r2).expect("save 2 record only");
+            inner.persist().expect("persist");
+        }
+        let reopened = super::Inner::open_append(dir.path(), 0).expect("reopen inner");
+        assert_eq!(
+            reopened.certified_watermark, 2,
+            "seed must stop at the first uncertified epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_incremental_bundle_appends_to_previous_bundle() {
+        // Issue #1078 fix 2: the incremental path must actually REUSE the previous bundle's
+        // bytes (copy + append), not silently rebuild from the live database. The crafted
+        // previous bundle's historical records carry sentinel consensus numbers the live
+        // database does not have, so sentinels surviving into the new bundle prove the
+        // copy-and-append path ran.
+        let temp_dir = TempDir::with_prefix("incr_append_db").expect("temp dir");
+        let bundle_dir = TempDir::with_prefix("incr_append_out").expect("bundle dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let [(r0, c0), (r1, c1), (r2, c2), (r3, c3)] = make_chain4(&signers);
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        db.save(r0.clone(), c0.clone()).await.expect("save 0");
+        db.save(r1.clone(), c1.clone()).await.expect("save 1");
+        db.save(r2.clone(), c2.clone()).await.expect("save 2");
+        db.save(r3.clone(), c3.clone()).await.expect("save 3");
+
+        // Craft the "previous" 0..=2 bundle: sentinel copies for epochs 0..=1, but the REAL
+        // record 2 (the validation anchor: its digest is record 3's parent_hash).
+        let sentinel0 = sentinel_copy(&r0, 9_990);
+        let sentinel1 = sentinel_copy(&r1, 9_991);
+        let prev_records = bundle_dir.path().join("prev_records");
+        let prev_certs = bundle_dir.path().join("prev_certs");
+        super::write_bounded_pack(
+            &prev_records,
+            super::Inner::PACK_EPOCH,
+            &[sentinel0.clone(), sentinel1.clone(), r2.clone()],
+        )
+        .expect("write prev records");
+        super::write_bounded_pack(
+            &prev_certs,
+            super::Inner::CERT_PACK_EPOCH,
+            &[c0.clone(), c1.clone(), c2.clone()],
+        )
+        .expect("write prev certs");
+
+        let out_records = bundle_dir.path().join("epoch_records");
+        let out_certs = bundle_dir.path().join("epoch_certs");
+        db.export_incremental_bundle(3, Some((prev_records, prev_certs)), &out_records, &out_certs)
+            .await
+            .expect("incremental export");
+
+        let got_records =
+            EpochRecordDb::read_records_from_pack(&out_records).expect("read records");
+        let [g0, g1, g2, g3]: [EpochRecord; 4] =
+            got_records.try_into().expect("exactly four records");
+        // Sentinels survived: the bundle was extended from the previous bundle's bytes.
+        assert_eq!(g0.digest(), sentinel0.digest(), "epoch 0 must come from the copied bundle");
+        assert_eq!(g1.digest(), sentinel1.digest(), "epoch 1 must come from the copied bundle");
+        assert_eq!(g2.digest(), r2.digest());
+        assert_eq!(g3.digest(), r3.digest(), "epoch 3 must be the appended new record");
+
+        let got_certs = EpochRecordDb::read_certs_from_pack(&out_certs).expect("read certs");
+        let [gc0, gc1, gc2, gc3]: [EpochCertificate; 4] =
+            got_certs.try_into().expect("exactly four certs");
+        assert_eq!(gc0.epoch_hash, c0.epoch_hash);
+        assert_eq!(gc1.epoch_hash, c1.epoch_hash);
+        assert_eq!(gc2.epoch_hash, r2.digest());
+        assert_eq!(gc3.epoch_hash, r3.digest(), "epoch 3's cert must be the appended one");
+    }
+
+    #[tokio::test]
+    async fn export_incremental_bundle_falls_back_without_previous_bundle() {
+        // No previous bundle (first exported epoch, a skipped prior export, operator pruning):
+        // the export must transparently rebuild the full 0..=N bundle from the live database,
+        // whether the caller passes None or paths that do not exist.
+        let temp_dir = TempDir::with_prefix("incr_fallback_db").expect("temp dir");
+        let bundle_dir = TempDir::with_prefix("incr_fallback_out").expect("bundle dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let [(r0, c0), (r1, c1), (r2, c2), _] = make_chain4(&signers);
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        db.save(r0.clone(), c0).await.expect("save 0");
+        db.save(r1.clone(), c1).await.expect("save 1");
+        db.save(r2.clone(), c2).await.expect("save 2");
+
+        let assert_full = |records_path: std::path::PathBuf, want: Vec<EpochDigest>| {
+            let got = EpochRecordDb::read_records_from_pack(&records_path)
+                .expect("read records")
+                .iter()
+                .map(|record| record.digest())
+                .collect::<Vec<_>>();
+            assert_eq!(got, want, "bundle must hold the full live-database record chain");
+        };
+
+        let none_records = bundle_dir.path().join("none_records");
+        db.export_incremental_bundle(2, None, &none_records, &bundle_dir.path().join("none_certs"))
+            .await
+            .expect("export without previous bundle");
+        assert_full(none_records, vec![r0.digest(), r1.digest(), r2.digest()]);
+
+        let missing_records = bundle_dir.path().join("missing_records");
+        db.export_incremental_bundle(
+            2,
+            Some((
+                bundle_dir.path().join("no_such_records"),
+                bundle_dir.path().join("no_such_certs"),
+            )),
+            &missing_records,
+            &bundle_dir.path().join("missing_certs"),
+        )
+        .await
+        .expect("export with absent previous bundle");
+        assert_full(missing_records, vec![r0.digest(), r1.digest(), r2.digest()]);
+    }
+
+    #[tokio::test]
+    async fn export_incremental_bundle_rejects_stale_or_padded_previous() {
+        // A previous bundle that fails validation must be rejected in favor of the full rebuild,
+        // and the rejected copy's sentinel bytes must never leak into the produced bundle. Three
+        // rows, one per validation clause: stale (ends at N-2), padded (right final record,
+        // wrong entry count), and a certs pack whose final cert does not certify epoch N-1.
+        let temp_dir = TempDir::with_prefix("incr_reject_db").expect("temp dir");
+        let bundle_dir = TempDir::with_prefix("incr_reject_out").expect("bundle dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let [(r0, c0), (r1, c1), (r2, c2), (r3, c3)] = make_chain4(&signers);
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        db.save(r0.clone(), c0.clone()).await.expect("save 0");
+        db.save(r1.clone(), c1.clone()).await.expect("save 1");
+        db.save(r2.clone(), c2.clone()).await.expect("save 2");
+        db.save(r3.clone(), c3.clone()).await.expect("save 3");
+
+        let sentinel0 = sentinel_copy(&r0, 9_990);
+        let sentinel1 = sentinel_copy(&r1, 9_991);
+        let real_chain = vec![r0.digest(), r1.digest(), r2.digest(), r3.digest()];
+        let run_row = |name: &str,
+                       prev_recs: Vec<EpochRecord>,
+                       prev_certs_v: Vec<EpochCertificate>| {
+            let prev_records = bundle_dir.path().join(format!("{name}_prev_records"));
+            let prev_certs = bundle_dir.path().join(format!("{name}_prev_certs"));
+            super::write_bounded_pack(&prev_records, super::Inner::PACK_EPOCH, &prev_recs)
+                .expect("write prev records");
+            super::write_bounded_pack(&prev_certs, super::Inner::CERT_PACK_EPOCH, &prev_certs_v)
+                .expect("write prev certs");
+            (prev_records, prev_certs)
+        };
+
+        // Row 1, stale: previous bundle ends at epoch 1 (N-2); the final-record check rejects it.
+        let (stale_records, stale_certs) =
+            run_row("stale", vec![sentinel0.clone(), r1.clone()], vec![c0.clone(), c1.clone()]);
+        // Row 2, padded: four entries ending with the REAL record 2, so the final-record check
+        // passes and only the entry-count check can reject it.
+        let (padded_records, padded_certs) = run_row(
+            "padded",
+            vec![sentinel0.clone(), sentinel0.clone(), sentinel1.clone(), r2.clone()],
+            vec![c0.clone(), c0.clone(), c1.clone(), c2.clone()],
+        );
+        // Row 3, bad certs: records pack valid, but the final cert certifies epoch 1, not 2.
+        let (badcert_records, badcert_certs) = run_row(
+            "badcert",
+            vec![sentinel0.clone(), sentinel1.clone(), r2.clone()],
+            vec![c0.clone(), c1.clone(), c1.clone()],
+        );
+        // Row 4, wrong final record with the RIGHT entry count and a VALID certs pack, so only
+        // the final-record epoch/digest check can reject it.
+        let (wronglast_records, wronglast_certs) = run_row(
+            "wronglast",
+            vec![sentinel0.clone(), sentinel1.clone(), r1.clone()],
+            vec![c0.clone(), c1.clone(), c2.clone()],
+        );
+
+        /// Export with the given crafted previous bundle and assert the produced bundle is the
+        /// real live-database chain (the fallback ran and no sentinel bytes leaked).
+        async fn assert_falls_back(
+            db: &EpochRecordDb,
+            prev: (std::path::PathBuf, std::path::PathBuf),
+            out_dir: &Path,
+            real_chain: &[EpochDigest],
+            name: &str,
+        ) {
+            let out_records = out_dir.join(format!("{name}_records"));
+            let out_certs = out_dir.join(format!("{name}_certs"));
+            db.export_incremental_bundle(3, Some(prev), &out_records, &out_certs)
+                .await
+                .expect("export must fall back, not error");
+            let got = EpochRecordDb::read_records_from_pack(&out_records)
+                .expect("read records")
+                .iter()
+                .map(|record| record.digest())
+                .collect::<Vec<_>>();
+            assert_eq!(got, real_chain, "{name}: fallback must rebuild the real chain");
+            let got_certs = EpochRecordDb::read_certs_from_pack(&out_certs)
+                .expect("read certs")
+                .iter()
+                .map(|cert| cert.epoch_hash)
+                .collect::<Vec<_>>();
+            assert_eq!(got_certs, real_chain, "{name}: fallback must rebuild the real cert chain");
+        }
+
+        let out_dir = bundle_dir.path();
+        assert_falls_back(&db, (stale_records, stale_certs), out_dir, &real_chain, "stale").await;
+        assert_falls_back(&db, (padded_records, padded_certs), out_dir, &real_chain, "padded")
+            .await;
+        assert_falls_back(&db, (badcert_records, badcert_certs), out_dir, &real_chain, "badcert")
+            .await;
+        assert_falls_back(
+            &db,
+            (wronglast_records, wronglast_certs),
+            out_dir,
+            &real_chain,
+            "wronglast",
+        )
+        .await;
     }
 }
