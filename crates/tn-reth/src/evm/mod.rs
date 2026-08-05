@@ -77,7 +77,7 @@ pub use utils::calculate_gas_penalty;
 /// binary built with the old 30M diverges from a 100M binary on any system call needing more
 /// than 30M — exactly the calls the headroom exists for. Every validator must run a binary
 /// with the same value before any close can depend on it. (Relatedly, the epoch boundary is
-/// now three calls — `applyIncentives`, `applySlashes`, `concludeEpoch` — vs two on `main`;
+/// three calls — `applyIncentives`, `applySlashes`, `concludeEpoch` — vs two on `main`;
 /// `applySlashes` is present in the deployed testnet and mainnet genesis bytecode and an
 /// empty-array call is a state-neutral no-op, so existing history replays unchanged.)
 ///
