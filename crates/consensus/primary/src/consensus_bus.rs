@@ -16,7 +16,7 @@ use std::{
 };
 use tn_config::Parameters;
 use tn_network_libp2p::types::NetworkEvent;
-use tn_storage::consensus::ConsensusChain;
+use tn_storage::consensus::{ConsensusChain, ConsensusChainError};
 use tn_types::{
     deconstruct_nonce, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader,
     ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord, EpochVote, Header, Round,
@@ -29,6 +29,7 @@ use tokio::{
     },
     time::error::Elapsed,
 };
+use tracing::error;
 
 /// Capacity for the `sync_output` broadcast.
 ///
@@ -710,10 +711,18 @@ impl ConsensusBusApp {
     /// Returns the ConsensusHeader that created the last executed block if it can be found.
     /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
     /// issue.
+    ///
+    /// `Ok(None)` strictly means the header is legitimately absent: the latest executed block
+    /// has no `parent_beacon_block_root` (genesis) or the digest is unknown to local storage. A
+    /// lookup that FAILS is logged and returned as `Err` - it used to be swallowed into `None`,
+    /// which let startup silently resume from a default header at number 0. Under the
+    /// epoch-gated seed-signature serde, pre-fork packs stay decodable so the error path should
+    /// never fire; it exists so any future format change halts startup loudly instead of
+    /// silently corrupting the chain.
     pub async fn last_executed_consensus_block(
         &self,
         consensus_chain: &ConsensusChain,
-    ) -> Option<ConsensusHeader> {
+    ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         let block = self.recent_blocks().borrow().latest_execution_block();
         let header = block.header();
         let (epoch, _) = deconstruct_nonce(header.nonce.into());
@@ -722,25 +731,38 @@ impl ConsensusBusApp {
             consensus_chain
                 .consensus_header_by_digest(epoch, consensus_hash.into())
                 .await
-                .unwrap_or_default()
+                .inspect_err(|e| {
+                    error!(target: "primary", "failed to load the last executed consensus header from storage: {e}");
+                })
         } else {
-            None
+            // The latest executed block has no parent consensus header (genesis): legitimately
+            // absent, not a failure.
+            Ok(None)
         }
     }
 
     /// Returns the ConsensusHeader that was processed.
     /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
     /// issue.
+    ///
+    /// `Ok(None)` strictly means the header is legitimately absent from local storage; a lookup
+    /// that FAILS is logged and returned as `Err` (it used to be swallowed into `None`) so
+    /// callers halt or degrade loudly instead of silently resuming from a default header at
+    /// number 0. Under the epoch-gated seed-signature serde, pre-fork packs stay decodable so
+    /// the error path should never fire; it exists so any future format change halts startup
+    /// loudly instead of silently corrupting the chain.
     pub async fn last_consensus_block(
         &self,
         consensus_chain: &ConsensusChain,
-    ) -> Option<ConsensusHeader> {
+    ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         let latest_consensus = self.recent_blocks().borrow().latest_consensus_block_num_hash();
         let epoch = consensus_chain.epochs().number_to_epoch(latest_consensus.number);
         consensus_chain
             .consensus_header_by_digest(epoch, latest_consensus.hash)
             .await
-            .unwrap_or_default()
+            .inspect_err(|e| {
+                error!(target: "primary", "failed to load the last processed consensus header from storage: {e}");
+            })
     }
 
     /// Send a request to download the epoch pack file for the provided EpochRecord.

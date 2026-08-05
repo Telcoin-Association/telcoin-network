@@ -76,7 +76,7 @@ fn assert_seed_chain_advances(sub_dags: &[CommittedSubDag], epoch: Epoch) {
         independent_fold(
             independent_root(epoch),
             first.leader().round(),
-            first.leader().seed_signature()
+            first.leader().seed_signature().expect("leader seed signature for fork-active epoch")
         ),
         "the epoch's first commit must fold the epoch root"
     );
@@ -88,7 +88,10 @@ fn assert_seed_chain_advances(sub_dags: &[CommittedSubDag], epoch: Epoch) {
             independent_fold(
                 previous.randomness(),
                 current.leader().round(),
-                current.leader().seed_signature()
+                current
+                    .leader()
+                    .seed_signature()
+                    .expect("leader seed signature for fork-active epoch")
             ),
             "commit at leader round {} must fold the previous commit's chain value",
             current.leader().round()
@@ -98,7 +101,10 @@ fn assert_seed_chain_advances(sub_dags: &[CommittedSubDag], epoch: Epoch) {
             independent_fold(
                 independent_root(epoch),
                 current.leader().round(),
-                current.leader().seed_signature()
+                current
+                    .leader()
+                    .seed_signature()
+                    .expect("leader seed signature for fork-active epoch")
             ),
             "commit at leader round {} must not re-root the chain",
             current.leader().round()
@@ -743,8 +749,8 @@ async fn test_seed_chain_survives_restart() {
             ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
                 .await
                 .unwrap();
-        // Consensus output number 1: `save_consensus_output` ignores anything at or below the
-        // chain's current number, and a fresh chain starts at 0.
+        // Consensus output number 1: `save_consensus_output` requires each saved number to
+        // strictly advance the chain's current number, and a fresh chain starts at 0.
         consensus_chain.write_subdag_for_test(1, first_commit.clone()).await;
         consensus_chain.persist_current().await.unwrap();
     }

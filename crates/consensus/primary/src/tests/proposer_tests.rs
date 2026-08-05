@@ -87,7 +87,10 @@ async fn test_proposed_header_seed_signature_binds_its_own_epoch_and_round() {
     let message =
         EpochSeedMessage::new(header.epoch(), header.round(), config.prior_epoch_record());
     assert!(
-        message.verify(header.seed_signature(), &primary.primary_public_key()),
+        message.verify(
+            header.seed_signature().expect("seed signature present for fork-active epoch"),
+            &primary.primary_public_key()
+        ),
         "the proposed header's seed signature must verify against that header's own (epoch, round)"
     );
 
@@ -116,15 +119,19 @@ async fn test_proposed_header_seed_signature_binds_its_own_epoch_and_round() {
     .expect("header channel stays open");
 
     assert!(
-        EpochSeedMessage::new(next.epoch(), next.round(), config.prior_epoch_record())
-            .verify(next.seed_signature(), &primary.primary_public_key()),
+        EpochSeedMessage::new(next.epoch(), next.round(), config.prior_epoch_record()).verify(
+            next.seed_signature().expect("seed signature present for fork-active epoch"),
+            &primary.primary_public_key()
+        ),
         "the seed message must be re-signed for every round the proposer advances to"
     );
 
     // ...and bound to THAT round specifically, not merely to some round this authority once held.
     assert!(
-        !EpochSeedMessage::new(next.epoch(), header.round(), config.prior_epoch_record())
-            .verify(next.seed_signature(), &primary.primary_public_key()),
+        !EpochSeedMessage::new(next.epoch(), header.round(), config.prior_epoch_record()).verify(
+            next.seed_signature().expect("seed signature present for fork-active epoch"),
+            &primary.primary_public_key()
+        ),
         "a later round's header must not carry the earlier round's seed signature"
     );
 }

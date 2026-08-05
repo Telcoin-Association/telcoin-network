@@ -8,9 +8,11 @@
 use std::{
     error::Error,
     fmt::Display,
+    future::Future,
     hash::BuildHasherDefault,
     io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     thread::JoinHandle,
     time::Duration,
@@ -24,14 +26,17 @@ use tokio::sync::{
 };
 use tracing::error;
 
-use crate::archive::{
-    data_file::create_dir_synced,
-    digest_index::index::HdxIndex,
-    error::{fetch::FetchError, open::OpenError},
-    fxhasher::FxHasher,
-    index::Index as _,
-    pack::{Pack, PackCompression, DATA_HEADER_BYTES},
-    position_index::index::PositionIndex,
+use crate::{
+    archive::{
+        data_file::create_dir_synced,
+        digest_index::index::HdxIndex,
+        error::{fetch::FetchError, open::OpenError},
+        fxhasher::FxHasher,
+        index::Index as _,
+        pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+        position_index::index::PositionIndex,
+    },
+    consensus_pack::fetch_error_is_absent,
 };
 
 /// Current version of the epoch pack file.
@@ -49,10 +54,16 @@ enum EpochDbMessage {
     SaveCertificate(EpochDigest, EpochCertificate),
     /// Retrieve an [`EpochRecord`] by epoch number.
     RecordByEpoch(Epoch, oneshot::Sender<Option<EpochRecord>>),
+    /// Retrieve an [`EpochRecord`] by epoch number without collapsing storage failures into
+    /// absence: `Ok(None)` only when the record is genuinely not stored.
+    TryRecordByEpoch(Epoch, oneshot::Sender<Result<Option<EpochRecord>, FetchError>>),
     /// Retrieve an [`EpochRecord`] by its digest.
     RecordByDigest(EpochDigest, oneshot::Sender<Option<EpochRecord>>),
     /// Retrieve an [`EpochCertificate`] by its epoch_hash digest.
     CertByDigest(EpochDigest, oneshot::Sender<Option<EpochCertificate>>),
+    /// Retrieve an [`EpochCertificate`] by its epoch_hash digest without collapsing storage
+    /// failures into absence: `Ok(None)` only when no certificate is stored for the digest.
+    TryCertByDigest(EpochDigest, oneshot::Sender<Result<Option<EpochCertificate>, FetchError>>),
     /// True if the database contains a record for the given epoch number.
     ContainsEpoch(Epoch, oneshot::Sender<bool>),
     /// True if the database contains a record with the given digest.
@@ -115,11 +126,17 @@ fn run_db_loop(
             EpochDbMessage::RecordByEpoch(epoch, tx) => {
                 let _ = tx.send(inner.record_by_epoch(epoch));
             }
+            EpochDbMessage::TryRecordByEpoch(epoch, tx) => {
+                let _ = tx.send(inner.try_record_by_epoch(epoch));
+            }
             EpochDbMessage::RecordByDigest(digest, tx) => {
                 let _ = tx.send(inner.record_by_digest(digest));
             }
             EpochDbMessage::CertByDigest(digest, tx) => {
                 let _ = tx.send(inner.cert_by_digest(digest));
+            }
+            EpochDbMessage::TryCertByDigest(digest, tx) => {
+                let _ = tx.send(inner.try_cert_by_digest(digest));
             }
             EpochDbMessage::ContainsEpoch(epoch, tx) => {
                 let _ = tx.send(inner.contains_epoch(epoch));
@@ -197,6 +214,83 @@ fn epoch_committee_valid(
     committee: &std::collections::BTreeSet<BlsPublicKey>,
 ) -> bool {
     epoch_rec.committee_compatible(committee)
+}
+
+/// Why a *certified* epoch record could not be resolved.
+///
+/// Returned by [`EpochRecordDb::certified_record_by_epoch`] and its timeout variant, for callers
+/// (e.g. the epoch-close seed-anchor capture) that must never consume a record digest the
+/// record's committee did not actually seal. The variants are distinguished because they heal
+/// differently: a missing record or certificate can still arrive asynchronously (epoch record
+/// collector, vote aggregation), while a stored-but-invalid certificate is permanent — the
+/// certificate store is append-once per digest — and must surface loudly instead of being
+/// retried. A storage-level read failure is likewise permanent from the poller's point of
+/// view: re-reading corrupt bytes cannot repair them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertifiedRecordError {
+    /// No [`EpochRecord`] is stored for the requested epoch.
+    MissingRecord(Epoch),
+    /// A record is stored for the epoch, but no [`EpochCertificate`] is stored under its digest
+    /// (yet). Carries the record's digest for diagnostics.
+    MissingCertificate(Epoch, EpochDigest),
+    /// A certificate is stored under the record's digest but fails
+    /// [`EpochRecord::verify_with_cert`]: it does not carry a verified super-quorum of the
+    /// record's committee over that digest. Carries the record's digest for diagnostics.
+    InvalidCertificate(Epoch, EpochDigest),
+    /// Resolving the record or its certificate failed at the storage layer for a reason other
+    /// than genuine absence (I/O error, CRC mismatch, decode failure, or an unreachable
+    /// database thread — everything [`fetch_error_is_absent`] rejects). The underlying error is
+    /// logged at `error!` at the classification site; only the epoch is carried so the enum
+    /// stays `Copy`. Never retryable: polling corrupt bytes can only mask the corruption behind
+    /// a misleading "missing" timeout.
+    Storage(Epoch),
+}
+
+impl CertifiedRecordError {
+    /// True when re-reading later could legitimately succeed.
+    ///
+    /// A missing record or certificate can still be supplied by the epoch record collector or
+    /// the epoch-vote aggregation task; an invalid stored certificate can never be replaced
+    /// (certificate writes are append-once per digest), and a storage-level failure cannot be
+    /// repaired by re-reading, so retrying either would only mask the failure.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            CertifiedRecordError::MissingRecord(_)
+            | CertifiedRecordError::MissingCertificate(_, _) => true,
+            CertifiedRecordError::InvalidCertificate(_, _) | CertifiedRecordError::Storage(_) => {
+                false
+            }
+        }
+    }
+}
+
+impl Error for CertifiedRecordError {}
+
+impl Display for CertifiedRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CertifiedRecordError::MissingRecord(epoch) => {
+                write!(f, "no epoch record stored for epoch {epoch}")
+            }
+            CertifiedRecordError::MissingCertificate(epoch, digest) => {
+                write!(f, "epoch record {digest} for epoch {epoch} has no stored certificate")
+            }
+            CertifiedRecordError::InvalidCertificate(epoch, digest) => {
+                write!(
+                    f,
+                    "stored certificate for epoch record {digest} (epoch {epoch}) failed \
+                     super-quorum verification"
+                )
+            }
+            CertifiedRecordError::Storage(epoch) => {
+                write!(
+                    f,
+                    "storage-level failure (not a miss) resolving the certified epoch record \
+                     for epoch {epoch}; see the error log for the underlying error"
+                )
+            }
+        }
+    }
 }
 
 impl EpochRecordDb {
@@ -331,6 +425,139 @@ impl EpochRecordDb {
                 return None;
             }
         }
+    }
+
+    /// Retrieve the [`EpochRecord`] for `epoch` only when a stored [`EpochCertificate`]
+    /// cryptographically verifies against it.
+    ///
+    /// The verification reuses [`EpochRecord::verify_with_cert`] — the same super-quorum BLS
+    /// aggregate check the vote-quorum and peer-recovery paths run before storing a certificate
+    /// — so a record is only released when its own committee actually sealed its digest. This
+    /// closes the gap left by [`Self::record_by_epoch`], which is a raw first-write-wins fetch:
+    /// a record that no committee member ever certified (e.g. a divergent record built locally
+    /// at an epoch close that failed quorum) is returned by the raw fetch but refused here, so
+    /// consensus-critical consumers (the epoch-close seed anchor) can never silently adopt it.
+    ///
+    /// Threat model: both the record and the certificate come from the local, validated ingest
+    /// paths (a record's embedded committee is anchored at download time by
+    /// [`Self::validate_downloaded_record`], or derived from executed on-chain state at epoch
+    /// close), so this check defends against *local divergence* — holding a digest the previous
+    /// committee never certified — not against an attacker with arbitrary DB write access.
+    ///
+    /// Unlike the raw [`Self::record_by_epoch`] / [`Self::cert_by_digest`] fetches, the reads
+    /// here do NOT collapse storage failures into absence: only a genuine miss (per the shared
+    /// absence classification, [`fetch_error_is_absent`]) reports
+    /// [`CertifiedRecordError::MissingRecord`] / [`CertifiedRecordError::MissingCertificate`];
+    /// corruption or an unreachable db thread reports the non-retryable
+    /// [`CertifiedRecordError::Storage`] so the timeout variant fails loudly at once instead of
+    /// polling corrupt bytes until the deadline and mislabeling them "missing".
+    pub async fn certified_record_by_epoch(
+        &self,
+        epoch: Epoch,
+    ) -> Result<EpochRecord, CertifiedRecordError> {
+        let record = self
+            .certified_read_record(epoch)
+            .await?
+            .ok_or(CertifiedRecordError::MissingRecord(epoch))?;
+        let digest = record.digest();
+        let cert = self
+            .certified_read_cert(epoch, digest)
+            .await?
+            .ok_or(CertifiedRecordError::MissingCertificate(epoch, digest))?;
+        record
+            .verify_with_cert(&cert)
+            .then_some(record)
+            .ok_or(CertifiedRecordError::InvalidCertificate(epoch, digest))
+    }
+
+    /// Non-collapsing record read for the certified path: `Ok(None)` only on genuine absence.
+    ///
+    /// This is the classification site for [`CertifiedRecordError::Storage`]: the underlying
+    /// error (a [`FetchError`] from the background thread, or a dead command channel) is logged
+    /// at `error!` here before being reduced to the `Copy` variant, so no detail is lost.
+    async fn certified_read_record(
+        &self,
+        epoch: Epoch,
+    ) -> Result<Option<EpochRecord>, CertifiedRecordError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(EpochDbMessage::TryRecordByEpoch(epoch, tx)).await.map_err(|_| {
+            error!(target: "epoch-db", epoch, "epoch record read failed: db thread unreachable (send)");
+            CertifiedRecordError::Storage(epoch)
+        })?;
+        rx.await
+            .map_err(|_| {
+                error!(target: "epoch-db", epoch, "epoch record read failed: db thread unreachable (recv)");
+                CertifiedRecordError::Storage(epoch)
+            })?
+            .map_err(|e| {
+                error!(target: "epoch-db", epoch, "epoch record read failed (not a miss): {e}");
+                CertifiedRecordError::Storage(epoch)
+            })
+    }
+
+    /// Non-collapsing certificate read for the certified path; same classification (and
+    /// logging) as [`Self::certified_read_record`], keyed by the record's `digest`.
+    async fn certified_read_cert(
+        &self,
+        epoch: Epoch,
+        digest: EpochDigest,
+    ) -> Result<Option<EpochCertificate>, CertifiedRecordError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(EpochDbMessage::TryCertByDigest(digest, tx)).await.map_err(|_| {
+            error!(target: "epoch-db", epoch, ?digest, "epoch certificate read failed: db thread unreachable (send)");
+            CertifiedRecordError::Storage(epoch)
+        })?;
+        rx.await
+            .map_err(|_| {
+                error!(target: "epoch-db", epoch, ?digest, "epoch certificate read failed: db thread unreachable (recv)");
+                CertifiedRecordError::Storage(epoch)
+            })?
+            .map_err(|e| {
+                error!(target: "epoch-db", epoch, ?digest, "epoch certificate read failed (not a miss): {e}");
+                CertifiedRecordError::Storage(epoch)
+            })
+    }
+
+    /// Like [`Self::certified_record_by_epoch`], but waits up to `timeout` for the record and
+    /// its certificate to arrive, polling every 200ms (matching
+    /// [`Self::record_by_epoch_with_timeout`]).
+    ///
+    /// Only the retryable outcomes are waited on (see [`CertifiedRecordError::is_retryable`]):
+    /// a record or certificate that has not arrived yet can still be supplied asynchronously,
+    /// while a stored-but-invalid certificate fails immediately because certificate writes are
+    /// append-once per digest, so re-reading can never observe a repaired one. A storage-level
+    /// failure ([`CertifiedRecordError::Storage`]) likewise fails immediately: re-reading
+    /// corrupt bytes for the full timeout would only relabel corruption as "missing".
+    pub async fn certified_record_by_epoch_with_timeout(
+        &self,
+        epoch: Epoch,
+        timeout: Duration,
+    ) -> Result<EpochRecord, CertifiedRecordError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.certified_record_poll(epoch, deadline).await
+    }
+
+    /// Recursive polling body of [`Self::certified_record_by_epoch_with_timeout`].
+    ///
+    /// Boxed because async recursion needs an indirected future type. Always performs at least
+    /// one check, then recurses only while the failure is retryable and `deadline` has not
+    /// passed; the final (non-retryable or timed-out) error is returned to the caller intact.
+    fn certified_record_poll(
+        &self,
+        epoch: Epoch,
+        deadline: tokio::time::Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<EpochRecord, CertifiedRecordError>> + Send + '_>> {
+        Box::pin(async move {
+            let outcome = self.certified_record_by_epoch(epoch).await;
+            let retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
+                && tokio::time::Instant::now() < deadline;
+            if retry {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                self.certified_record_poll(epoch, deadline).await
+            } else {
+                outcome
+            }
+        })
     }
 
     /// Retrieve an [`EpochRecord`] by its digest.
@@ -495,6 +722,14 @@ impl EpochRecordDb {
 
 pub const RECORDS_NAME: &str = Inner::RECORDS_NAME;
 pub const CERTS_NAME: &str = Inner::CERTS_NAME;
+
+/// Lift a raw index/pack read into the non-collapsing shape: `Ok(Some(v))` on success,
+/// `Ok(None)` when the error means the key is genuinely not present (per
+/// [`fetch_error_is_absent`], the single absence classification shared with the consensus
+/// pack), and `Err` for every real storage failure.
+fn absent_to_none<T>(res: Result<T, FetchError>) -> Result<Option<T>, FetchError> {
+    res.map(Some).or_else(|e| fetch_error_is_absent(&e).then_some(None).ok_or(e))
+}
 
 #[derive(Debug)]
 struct Inner {
@@ -728,15 +963,28 @@ impl Inner {
         Ok(())
     }
 
+    /// Raw first-write-wins fetch of the record for `epoch`; collapses EVERY storage failure
+    /// into `None`. Callers that must distinguish corruption from absence use
+    /// [`Self::try_record_by_epoch`] instead.
     fn record_by_epoch(&mut self, epoch: Epoch) -> Option<EpochRecord> {
+        self.try_record_by_epoch(epoch).ok().flatten()
+    }
+
+    /// Non-collapsing read of the record for `epoch`.
+    ///
+    /// `Ok(None)` only on genuine absence — an index or pack lookup failing with an error
+    /// [`fetch_error_is_absent`] accepts. Every other storage failure (I/O, CRC mismatch,
+    /// decode) surfaces as `Err` so the certified read path can classify it as
+    /// [`CertifiedRecordError::Storage`] instead of a retryable "missing".
+    fn try_record_by_epoch(&mut self, epoch: Epoch) -> Result<Option<EpochRecord>, FetchError> {
         if epoch < self.start_epoch {
-            return None;
+            return Ok(None);
         }
         if epoch == 0 && self.epoch_idx.is_empty() {
-            self.dummy_epoch0.clone()
+            Ok(self.dummy_epoch0.clone())
         } else {
-            let pos = self.epoch_idx.load((epoch - self.start_epoch) as u64).ok()?;
-            self.records.fetch(pos).ok()
+            absent_to_none(self.epoch_idx.load((epoch - self.start_epoch) as u64))?
+                .map_or(Ok(None), |pos| absent_to_none(self.records.fetch(pos)))
         }
     }
 
@@ -745,9 +993,21 @@ impl Inner {
         self.records.fetch(pos).ok()
     }
 
+    /// Raw fetch of the certificate stored under `digest`; collapses EVERY storage failure
+    /// into `None`. Callers that must distinguish corruption from absence use
+    /// [`Self::try_cert_by_digest`] instead.
     fn cert_by_digest(&mut self, digest: EpochDigest) -> Option<EpochCertificate> {
-        let pos = self.cert_digests.load(digest.into()).ok()?;
-        self.certs.fetch(pos).ok()
+        self.try_cert_by_digest(digest).ok().flatten()
+    }
+
+    /// Non-collapsing read of the certificate stored under `digest`; same absence semantics as
+    /// [`Self::try_record_by_epoch`].
+    fn try_cert_by_digest(
+        &mut self,
+        digest: EpochDigest,
+    ) -> Result<Option<EpochCertificate>, FetchError> {
+        absent_to_none(self.cert_digests.load(digest.into()))?
+            .map_or(Ok(None), |pos| absent_to_none(self.certs.fetch(pos)))
     }
 
     fn contains_epoch(&self, epoch: Epoch) -> bool {
@@ -863,8 +1123,12 @@ mod test {
         Signer as _,
     };
 
-    use crate::epoch_records::{
-        epoch_committee_valid, EpochRecordDb, EpochRecordValidation, RECORDS_NAME,
+    use crate::{
+        archive::pack::DATA_HEADER_BYTES,
+        epoch_records::{
+            epoch_committee_valid, CertifiedRecordError, EpochRecordDb, EpochRecordValidation,
+            RECORDS_NAME,
+        },
     };
 
     // Minimal BlsSigner wrapper around a BlsKeypair.
@@ -1435,5 +1699,207 @@ mod test {
         assert_eq!(survived.digest(), real0.digest(), "record survives with equal digest");
         let anchor = db.get_committee_keys(0).await.expect("committee anchor restored");
         assert_eq!(anchor, committee.iter().copied().collect::<BTreeSet<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_certified_record_by_epoch_accepts_certified_record() {
+        // Positive control: a record saved with its quorum certificate is released, and the
+        // released record is byte-identical (equal digest) to the raw fetch.
+        let temp_dir = TempDir::with_prefix("certified_accept").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save(rec0.clone(), cert0).await.expect("save epoch 0");
+
+        let certified =
+            db.certified_record_by_epoch(0).await.expect("certified record 0 must be released");
+        assert_eq!(certified.digest(), rec0.digest());
+
+        // The timeout variant takes the same fast path with no waiting.
+        let start = tokio::time::Instant::now();
+        let certified = db
+            .certified_record_by_epoch_with_timeout(0, std::time::Duration::from_secs(30))
+            .await
+            .expect("certified record 0 must be released without waiting");
+        assert_eq!(certified.digest(), rec0.digest());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "an already-certified record must not wait on the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_certified_record_by_epoch_refuses_uncertified_record() {
+        // The core seed-anchor defect: a record saved without any certificate is served by the
+        // raw record_by_epoch fetch but must be refused by the certified fetch.
+        let temp_dir = TempDir::with_prefix("certified_missing_cert").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, _cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save_record(rec0.clone()).await.expect("save record without cert");
+
+        // Raw fetch serves the uncertified record — this is the gap being closed.
+        assert!(db.record_by_epoch(0).await.is_some());
+        let err = db
+            .certified_record_by_epoch(0)
+            .await
+            .expect_err("an uncertified record must be refused");
+        assert_eq!(err, CertifiedRecordError::MissingCertificate(0, rec0.digest()));
+        assert!(err.is_retryable(), "a missing cert can still arrive and is retryable");
+    }
+
+    #[tokio::test]
+    async fn test_certified_record_by_epoch_missing_record() {
+        // No record stored at all: MissingRecord, retryable (the collector can still fetch it).
+        let temp_dir = TempDir::with_prefix("certified_missing_rec").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let err =
+            db.certified_record_by_epoch(3).await.expect_err("a missing record must be refused");
+        assert_eq!(err, CertifiedRecordError::MissingRecord(3));
+        assert!(err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn test_certified_record_by_epoch_refuses_invalid_certificate() {
+        // A certificate stored under the record's digest that does not verify against the
+        // record (here: a valid cert for a DIFFERENT record, filed under this record's digest)
+        // must be refused, and the failure is terminal — cert writes are append-once per
+        // digest, so the timeout variant must fail fast instead of polling out the clock.
+        let temp_dir = TempDir::with_prefix("certified_invalid_cert").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let others: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, _cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save_record(rec0.clone()).await.expect("save record without cert");
+        let (_other_rec, other_cert) = make_test_pair(0, &others, EpochDigest::default());
+        db.save_certificate(rec0.digest(), other_cert).await.expect("file foreign cert");
+
+        let err = db
+            .certified_record_by_epoch(0)
+            .await
+            .expect_err("a non-verifying certificate must be refused");
+        assert_eq!(err, CertifiedRecordError::InvalidCertificate(0, rec0.digest()));
+        assert!(!err.is_retryable(), "an invalid stored cert can never be replaced");
+
+        let start = tokio::time::Instant::now();
+        let err = db
+            .certified_record_by_epoch_with_timeout(0, std::time::Duration::from_secs(30))
+            .await
+            .expect_err("the timeout variant must also refuse the invalid certificate");
+        assert_eq!(err, CertifiedRecordError::InvalidCertificate(0, rec0.digest()));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "an invalid certificate is terminal and must fail fast, not poll out the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_certified_record_with_timeout_heals_when_cert_arrives() {
+        // The wait path: the record is stored but its certificate arrives asynchronously
+        // (mirroring vote aggregation finishing after the next epoch opens). The poll must
+        // pick the certificate up and release the record within the timeout.
+        let temp_dir = TempDir::with_prefix("certified_heal").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save_record(rec0.clone()).await.expect("save record without cert");
+
+        let db_writer = db.clone();
+        let digest = rec0.digest();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            db_writer.save_certificate(digest, cert0).await.expect("late cert save");
+        });
+
+        let certified = db
+            .certified_record_by_epoch_with_timeout(0, std::time::Duration::from_secs(10))
+            .await
+            .expect("the record must be released once its certificate arrives");
+        assert_eq!(certified.digest(), rec0.digest());
+        writer.await.expect("cert writer task");
+
+        // The short-timeout counterpart: with no writer, the retryable wait expires and the
+        // final retryable error is surfaced rather than swallowed.
+        let temp_dir2 = TempDir::with_prefix("certified_timeout").expect("temp dir");
+        let db2 = EpochRecordDb::open(temp_dir2.path()).expect("open db2");
+        let (rec, _cert) = make_test_pair(0, &signers, EpochDigest::default());
+        db2.save_record(rec.clone()).await.expect("save record without cert");
+        let err = db2
+            .certified_record_by_epoch_with_timeout(0, std::time::Duration::from_millis(500))
+            .await
+            .expect_err("with no certificate ever arriving, the wait must expire");
+        assert_eq!(err, CertifiedRecordError::MissingCertificate(0, rec.digest()));
+    }
+
+    /// On-disk corruption under the certified read path must classify as the non-retryable
+    /// [`CertifiedRecordError::Storage`] — never as a retryable "missing" outcome that the
+    /// timeout variant would poll for the full budget before mislabeling the corruption.
+    /// Modeled on `test_latest_consensus_recovers_from_corrupt_slot` in `consensus.rs`: write
+    /// real data, flip one payload byte on disk to break the record's CRC, then read.
+    #[tokio::test]
+    async fn test_certified_record_by_epoch_reports_storage_corruption() {
+        use std::io::{Read as _, Write as _};
+
+        let temp_dir = TempDir::with_prefix("certified_storage_error").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        let (rec1, cert1) = make_test_pair(1, &signers, rec0.digest());
+        db.save(rec0.clone(), cert0).await.expect("save epoch 0");
+        db.save(rec1.clone(), cert1).await.expect("save epoch 1");
+        db.persist().await.expect("persist");
+
+        // Flip the first payload byte of the first stored record (epoch 0). The pack layout
+        // is the fixed data header, then per record a 4-byte size prefix followed by the
+        // payload the crc32 covers, so this breaks exactly that record's CRC while leaving
+        // its neighbor intact. The db handle stays open: nothing was read through it yet, so
+        // the next fetch hits the corrupted bytes on disk.
+        let corrupt_at = (DATA_HEADER_BYTES + 4) as u64;
+        let records_path = temp_dir.path().join(RECORDS_NAME);
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&records_path)
+            .expect("open records file");
+        f.seek(SeekFrom::Start(corrupt_at)).expect("seek to payload");
+        let mut byte = [0_u8; 1];
+        f.read_exact(&mut byte).expect("read payload byte");
+        f.seek(SeekFrom::Start(corrupt_at)).expect("seek back");
+        f.write_all(&[!byte[0]]).expect("flip payload byte");
+        f.sync_all().expect("sync corruption");
+        drop(f);
+
+        // The corrupt record must surface as Storage, and Storage must not be polled.
+        let err =
+            db.certified_record_by_epoch(0).await.expect_err("corrupt record must be refused");
+        assert_eq!(err, CertifiedRecordError::Storage(0));
+        assert!(!err.is_retryable(), "storage corruption cannot heal by re-reading");
+
+        // The timeout variant must return the same error immediately, not after its budget.
+        let start = tokio::time::Instant::now();
+        let err = db
+            .certified_record_by_epoch_with_timeout(0, std::time::Duration::from_secs(30))
+            .await
+            .expect_err("the timeout variant must also refuse the corrupt record");
+        assert_eq!(err, CertifiedRecordError::Storage(0));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "a storage error is terminal and must fail fast, not poll out the timeout"
+        );
+
+        // Positive control: the undamaged neighbor still resolves through the very same path,
+        // so the Storage classification above is not a vacuous artifact of a broken db.
+        let good = db.certified_record_by_epoch(1).await.expect("undamaged record must resolve");
+        assert_eq!(good.digest(), rec1.digest());
     }
 }

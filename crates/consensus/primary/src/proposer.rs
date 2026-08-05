@@ -27,9 +27,9 @@ use std::{
 use tn_config::{ConsensusConfig, KeyConfig};
 use tn_storage::{tables::LastProposed, ProposerStore};
 use tn_types::{
-    now, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, EpochDigest,
-    EpochSeedMessage, Hash as _, Header, Noticer, Round, TaskManager, TaskSpawner, TnReceiver,
-    TnSender, WorkerId,
+    forks::seed_signature_active, now, AuthorityIdentifier, BlockHash, Certificate, Committee,
+    Database, Epoch, EpochDigest, EpochSeedMessage, Hash as _, Header, Noticer, Round, TaskManager,
+    TaskSpawner, TnReceiver, TnSender, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -284,9 +284,19 @@ impl<DB: Database> Proposer<DB> {
         // before the header is built, because the message binds the round: a signature for round
         // `r` must not exist before this authority proposes at `r`, or every future seed
         // contribution would be publicly derivable in advance.
-        let seed_signature =
+        //
+        // Signing is fork-gated (#1086): for pre-fork epochs (`seed_signature_active` false) the
+        // BLS signing is skipped and the header carries the inert `BlsSignature::default()`.
+        // The default is inert because `HeaderRef` never serializes the field for those epochs,
+        // the header digest does not cover it, and `Header::seed_signature` surfaces it as
+        // `None` - so it can never reach the wire or a verifier, and pre-fork headers stay
+        // wire-identical to origin/main.
+        let seed_signature = if seed_signature_active(current_epoch) {
             EpochSeedMessage::new(current_epoch, current_round, prior_epoch_record)
-                .sign(&key_config);
+                .sign(&key_config)
+        } else {
+            Default::default()
+        };
 
         let header = Header::new(
             author,

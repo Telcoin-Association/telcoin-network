@@ -1,6 +1,5 @@
 //! Code to support various chain forks.
 
-#[cfg(feature = "adiri")]
 use crate::Epoch;
 use alloy::primitives::{b256, B256};
 
@@ -80,6 +79,69 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 /// - the swap fails closed on [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]: an unexpected on-chain
 ///   deployment aborts the block (fatal error) rather than migrating over an incompatible layout.
 pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
+
+#[cfg(feature = "adiri")]
+/// First epoch whose `Header`s carry the `seed_signature` field on the wire (#1032).
+///
+/// Headers of earlier epochs serialize the seven legacy fields byte-identically to the
+/// pre-fork binary and keep the legacy leader-aggregate committee-shuffle seed, so a binary
+/// with this gate is wire-indistinguishable from the historical chain for every pre-fork
+/// epoch: deploys roll gradually across a mixed fleet with no protocol bump, no migration,
+/// and no coordination window. From this epoch onward the eighth field is written (and
+/// required) on the wire, voters verify it, and the epoch seed chain
+/// ([`EpochSeedChainValue`](crate::EpochSeedChainValue)) replaces the leader-aggregate seed.
+///
+/// The gate ([`seed_signature_active`]) always reads the epoch carried inside the value
+/// being encoded or decoded — never node-local committee state — so mixed-epoch containers
+/// (certificate vectors, sub-DAGs, pack records) decode correctly at any nesting depth, and
+/// historical digests are preserved end to end.
+///
+/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch (at least
+/// current + 8, about 48h at 6h epochs) in a dedicated epoch-setting PR only after every
+/// validator and observer runs a gate-capable build. The full fork schedule is logged at
+/// startup so operators can diff it across the fleet; a compile-time constant that differs
+/// between binaries has no other in-protocol detection.
+///
+/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide
+/// first (safe indefinitely while dormant), then land the epoch-setting PR fleet-wide before
+/// the fork epoch begins. A straggler still on an old build past the boundary fails to
+/// decode post-fork headers loudly and drops out rather than silently diverging: the field
+/// is covered by the header digest, and decode failures charge `Penalty::Fatal` to the
+/// author while committee authors stay exempt from bans.
+///
+/// Non-adiri builds (mainnet) have no dormant period: the field is active from genesis and
+/// this constant does not exist there.
+pub const SEED_SIGNATURE_FORK_EPOCH: Epoch = u32::MAX;
+
+/// Whether `Header`s of `epoch` carry the `seed_signature` field on the wire and the epoch
+/// seed chain drives the epoch-close committee shuffle (#1032).
+///
+/// Gates both directions of serialization plus every consumer of the seed (proposer signing,
+/// vote verification, sub-DAG randomness). Callers MUST pass the epoch carried inside the
+/// value being encoded or decoded (e.g. `HeaderInner::epoch`, `leader.epoch()`), never
+/// `Committee::epoch()` or other node-local state, so that historical values keep their
+/// historical layout at any nesting depth.
+///
+/// Adiri builds activate at [`SEED_SIGNATURE_FORK_EPOCH`]; all other builds are active from
+/// genesis (mainnet never carries the legacy layout).
+#[inline]
+pub const fn seed_signature_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "adiri")]
+    #[expect(
+        clippy::absurd_extreme_comparisons,
+        reason = "SEED_SIGNATURE_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) is the \
+                  gate the future epoch-setting PR relies on, and this expectation flags itself \
+                  for removal once that PR lowers the constant"
+    )]
+    {
+        epoch >= SEED_SIGNATURE_FORK_EPOCH
+    }
+    #[cfg(not(feature = "adiri"))]
+    {
+        let _ = epoch;
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests {

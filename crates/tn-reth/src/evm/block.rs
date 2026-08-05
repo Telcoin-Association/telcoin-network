@@ -137,9 +137,11 @@ pub struct TNBlockExecutionCtx {
     /// final batch of the epoch's last `ConsensusOutput`.
     ///
     /// When included, the executor runs the epoch-closing system calls (see the module docs) and
-    /// seeds the deterministic committee shuffle with this value. It is folded per commit in
-    /// `CommittedSubDag::new` from the previous commit's chain value and the leader header's
-    /// mandatory `seed_signature`, and is also stored in the block's `extra_data`: both the marker
+    /// seeds the deterministic committee shuffle with this value. It is derived per commit in
+    /// `CommittedSubDag::new`: for fork-active epochs (#1086, `seed_signature_active`) it folds
+    /// the previous commit's chain value with the leader header's digest-pinned `seed_signature`;
+    /// pre-fork epochs retain the legacy keccak of the leader certificate's aggregate signature.
+    /// It is also stored in the block's `extra_data`: both the marker
     /// clients use to recognize an epoch-closing block and the value the replay path
     /// (`context_for_block`) reads back to rebuild an identical ctx from the sealed header.
     pub close_epoch: Option<B256>,

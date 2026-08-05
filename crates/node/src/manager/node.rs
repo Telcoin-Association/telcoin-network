@@ -836,8 +836,10 @@ where
         // stale after a hard crash, and a low prime would make `wait_for_epoch_boundary`'s
         // continuity check report a spurious gap on the first live output (and the leftover
         // drain re-forward already-executed output).
+        // A failed lookup aborts startup here rather than priming from a silently-defaulted
+        // height 0.
         self.last_forwarded_consensus_number =
-            state_sync::last_consensus_parent(&self.consensus_bus, &self.consensus_chain).await.1;
+            state_sync::last_consensus_parent(&self.consensus_bus, &self.consensus_chain).await?.1;
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 

@@ -38,8 +38,10 @@ async fn test_subdag_persists_restart() {
                 .await
                 .unwrap();
 
-        // Create and persist subdags with sequential indices
-        for idx in 0..5u64 {
+        // Create and persist subdags with sequential indices. Numbering starts at 1: a fresh
+        // chain's latest consensus number is 0 and `save_consensus_output` hard-rejects any
+        // number that does not strictly advance it (number 0 used to be silently dropped).
+        for idx in 1..5u64 {
             let leader = certificates.last().cloned().unwrap();
             let reputation = ReputationScores::new(&committee);
             let subdag = CommittedSubDag::new(
@@ -105,8 +107,9 @@ async fn test_subdag_persists_multiple_writes() {
     let (_, headers) = fixture_epoch0.headers_round(0, &genesis);
     let certs_epoch0: Vec<_> = headers.iter().map(|h| fixture_epoch0.certificate(h)).collect();
 
-    // Write subdags for epoch 0 with indices 0, 1, 2
-    for idx in 0..3u64 {
+    // Write subdags for epoch 0 with indices 1, 2 (numbering starts at 1: number 0 does not
+    // advance a fresh chain's latest consensus number of 0 and is hard-rejected).
+    for idx in 1..3u64 {
         let leader = certs_epoch0.last().cloned().unwrap();
         let reputation = ReputationScores::new(&committee_epoch0);
         let subdag = CommittedSubDag::new(
@@ -268,18 +271,21 @@ async fn test_last_committed_persists() {
     let (_, headers) = fixture.headers_round(0, &genesis);
     let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
 
-    // Create subdags with different leaders to track last committed per authority
+    // Create subdags with different leaders to track last committed per authority. Numbering
+    // starts at 1: number 0 does not advance a fresh chain's latest consensus number of 0 and
+    // is hard-rejected by `save_consensus_output`.
     for (idx, cert) in certificates.iter().enumerate() {
+        let number = idx as u64 + 1;
         let reputation = ReputationScores::new(&committee);
         let subdag = CommittedSubDag::new(
             vec![cert.clone()],
             cert.clone(),
-            idx as u64,
+            number,
             reputation,
             None,
             tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
-        consensus_chain.write_subdag_for_test(idx as u64, subdag).await;
+        consensus_chain.write_subdag_for_test(number, subdag).await;
     }
     consensus_chain.persist_current().await.unwrap();
 

@@ -27,6 +27,24 @@ const FOLD_DOMAIN: &[u8] = b"TN_EPOCH_SEED_FOLD_V1";
 /// The root domain separator, duplicated here on purpose (see [`independent_root`]).
 const ROOT_DOMAIN: &[u8] = b"TN_EPOCH_SEED_ROOT_V1";
 
+/// The first epoch whose headers carry a seed signature under the running cfg.
+///
+/// Adiri builds keep the field dormant until `tn_types::forks::SEED_SIGNATURE_FORK_EPOCH`;
+/// every other build is active from genesis (epoch zero). Building every fixture at this
+/// epoch keeps both cfg lanes on the V1 seed-chain path, so [`tn_types::Header::seed_signature`]
+/// is `Some` throughout this file (mirrors the `v1_epoch` precedent in the `header` module's
+/// tests).
+fn seed_active_epoch() -> Epoch {
+    #[cfg(feature = "adiri")]
+    {
+        tn_types::forks::SEED_SIGNATURE_FORK_EPOCH
+    }
+    #[cfg(not(feature = "adiri"))]
+    {
+        0
+    }
+}
+
 /// Recompute one seed chain fold step INDEPENDENTLY of the production helper.
 ///
 /// This deliberately does not call [`EpochSeedChainValue::fold`]. `CommittedSubDag::new` calls
@@ -80,6 +98,7 @@ async fn test_randomness_identical_across_certificate_vote_subsets() {
     // carve two distinct 5-vote quorums from.
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .committee_size(NonZeroUsize::new(7).unwrap())
+        .epoch(seed_active_epoch())
         .build();
     let committee = fixture.committee();
 
@@ -135,7 +154,11 @@ async fn test_randomness_identical_across_certificate_vote_subsets() {
     // here from literal domain bytes rather than by calling the production fold helper.
     assert_eq!(
         sub_dag_a.randomness(),
-        independent_fold(FIXTURE_ANCHOR, header.round(), header.seed_signature()),
+        independent_fold(
+            FIXTURE_ANCHOR,
+            header.round(),
+            header.seed_signature().expect("seed signature present for fork-active epoch")
+        ),
         "randomness must be the seed chain fold of the leader's round and seed signature"
     );
 }
@@ -147,6 +170,7 @@ async fn test_randomness_identical_across_certificate_vote_subsets() {
 async fn test_randomness_immune_to_header_content_grinding() {
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .committee_size(NonZeroUsize::new(7).unwrap())
+        .epoch(seed_active_epoch())
         .build();
     let committee = fixture.committee();
     let authority = fixture.last_authority();
@@ -161,10 +185,11 @@ async fn test_randomness_immune_to_header_content_grinding() {
     assert_ne!(header_a.digest(), header_b.digest(), "headers must differ");
 
     // Same deterministic seed signature - the message signs only (epoch, round, prior record), and
-    // both headers are at the builder's round 1.
+    // both headers are at the builder's round 1. Unwrapping both sides pins that the fixtures sit
+    // at a fork-active epoch: a vacuous `None == None` pass can never satisfy this assert.
     assert_eq!(
-        header_a.seed_signature(),
-        header_b.seed_signature(),
+        header_a.seed_signature().expect("seed signature present for fork-active epoch"),
+        header_b.seed_signature().expect("seed signature present for fork-active epoch"),
         "seed signature must not depend on header content"
     );
 
@@ -199,13 +224,16 @@ async fn test_randomness_immune_to_header_content_grinding() {
 /// anchor folded with the leader's round and that default signature's bytes.
 ///
 /// This pins that the removed silent `unwrap_or_else(|| BlsSignature::default())` fallback stays
-/// gone: the derivation is already total because every header carries a `seed_signature` field,
-/// and it hashes *that* field - never the certificate's aggregate signature. Reintroducing the old
-/// aggregate-based derivation would hash the cert's (non-default) aggregate here and break this.
+/// gone: the derivation is total by construction (`Header::seed_signature` is `Some` for every
+/// fork-active epoch, and the pre-fork arm never reads the field - #1086), and for fork-active
+/// epochs it hashes *that* field - never the certificate's aggregate signature. Reintroducing the
+/// old aggregate-based derivation would hash the cert's (non-default) aggregate here and break
+/// this.
 #[tokio::test]
 async fn test_randomness_from_default_seed_signature_is_total() {
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .committee_size(NonZeroUsize::new(4).unwrap())
+        .epoch(seed_active_epoch())
         .build();
     let committee = fixture.committee();
     let authority = fixture.last_authority();
@@ -275,7 +303,8 @@ fn test_epoch_root_depends_only_on_the_epoch() {
 /// anchored fold instead, which the second `assert_ne!` pins) and dropping the leader round.
 #[tokio::test]
 async fn test_fold_binds_previous_commit() {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let fixture =
+        CommitteeFixture::builder(MemDatabase::default).epoch(seed_active_epoch()).build();
     let committee = fixture.committee();
     let epoch = committee.epoch();
 
@@ -305,8 +334,8 @@ async fn test_fold_binds_previous_commit() {
     let leader_2 = fixture.last_authority().header_with_round(&committee, 2);
     let cert_2 = fixture.certificate(&leader_2);
     assert_ne!(
-        leader_1.seed_signature(),
-        leader_2.seed_signature(),
+        leader_1.seed_signature().expect("seed signature present for fork-active epoch"),
+        leader_2.seed_signature().expect("seed signature present for fork-active epoch"),
         "the two leaders must contribute different seed signatures"
     );
     let sub_dag_2 = CommittedSubDag::new(
@@ -321,28 +350,45 @@ async fn test_fold_binds_previous_commit() {
     // C1 folds the epoch root.
     assert_eq!(
         sub_dag_1.randomness(),
-        independent_fold(independent_root(epoch), leader_1.round(), leader_1.seed_signature()),
+        independent_fold(
+            independent_root(epoch),
+            leader_1.round(),
+            leader_1.seed_signature().expect("seed signature present for fork-active epoch")
+        ),
         "the epoch's first commit must fold the epoch root"
     );
 
     // C2 folds C1's value: this is the chain.
     assert_eq!(
         sub_dag_2.randomness(),
-        independent_fold(sub_dag_1.randomness(), leader_2.round(), leader_2.seed_signature()),
+        independent_fold(
+            sub_dag_1.randomness(),
+            leader_2.round(),
+            leader_2.seed_signature().expect("seed signature present for fork-active epoch")
+        ),
         "a commit must fold the previous commit's chain value"
     );
 
     // ...and specifically NOT the old per-epoch constant.
     assert_ne!(
         sub_dag_2.randomness(),
-        keccak256(leader_2.seed_signature().to_bytes()),
+        keccak256(
+            leader_2
+                .seed_signature()
+                .expect("seed signature present for fork-active epoch")
+                .to_bytes()
+        ),
         "randomness must not be the keccak of the leader's seed signature alone"
     );
 
     // ...and not a re-rooted fold that ignores the previous commit.
     assert_ne!(
         sub_dag_2.randomness(),
-        independent_fold(independent_root(epoch), leader_2.round(), leader_2.seed_signature()),
+        independent_fold(
+            independent_root(epoch),
+            leader_2.round(),
+            leader_2.seed_signature().expect("seed signature present for fork-active epoch")
+        ),
         "randomness must not re-root the chain at every commit"
     );
 

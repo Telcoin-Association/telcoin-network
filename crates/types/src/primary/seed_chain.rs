@@ -71,7 +71,8 @@ impl EpochSeedChainValue {
     /// commits still matches the network exactly.
     ///
     /// Feeding a node-local prior-record digest into the root here would invert that property. That
-    /// digest is read from an uncertified, first-write-wins local `EpochRecord`, and the root flows
+    /// digest is read from a first-write-wins local `EpochRecord` (certificate-verified at capture
+    /// for seed-signature-active epochs, but still node-local state), and the root flows
     /// into [`CommittedSubDag::randomness`](crate::CommittedSubDag::randomness), then the sub-dag
     /// digest, then the consensus header digest, and finally the executed block's
     /// `parent_beacon_block_root`. A node whose record is divergent or partially written would then
