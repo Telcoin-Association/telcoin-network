@@ -1310,6 +1310,130 @@ mod tests {
         Ok(())
     }
 
+    /// An epoch-closing block publishes what each of its system calls spent.
+    ///
+    /// The boundary calls are submitted at `gas_price: 0`, so their gas never enters the block's
+    /// `gas_used` and no other metric can see it (#1031) — while #1012 raised the per-call budget
+    /// to 100M without any measurement of what the calls actually consume. This drives a real
+    /// close through the production path and asserts the gauges observe it: each of the four
+    /// post-fork calls reports nonzero gas inside the budget it was granted, the total is their
+    /// sum, and the one-shot `registry_migration` series is absent away from the fork boundary.
+    ///
+    /// The local recorder is why `record_epoch_close_gas` resolves its handles on every close
+    /// instead of caching them: a cached handle binds to whichever recorder was installed first in
+    /// the process, which would make this assertion depend on test ordering (`crate::metrics`).
+    #[tokio::test]
+    async fn test_epoch_close_records_system_call_gas() -> eyre::Result<()> {
+        use crate::evm::SYSTEM_CALL_GAS_LIMIT;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        /// Read one gauge out of the snapshot, selecting by `call` label when one is given.
+        ///
+        /// Generic over the description slot so the recorder's own string type never has to be
+        /// named here.
+        fn gauge<D>(
+            snapshot: &[(metrics_util::CompositeKey, Option<metrics::Unit>, D, DebugValue)],
+            name: &str,
+            call: Option<&str>,
+        ) -> Option<f64> {
+            snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    key.key().name() == name
+                        && call.is_none_or(|call| {
+                            key.key().labels().any(|l| l.key() == "call" && l.value() == call)
+                        })
+                })
+                .and_then(|(.., value)| match value {
+                    DebugValue::Gauge(g) => Some(g.0),
+                    DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+                })
+        }
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(5).into());
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("epoch close gas metrics");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+
+        let output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // block execution is inline on this thread, so the thread-local recorder observes it
+        metrics::with_local_recorder(&recorder, || {
+            execute_payload_and_update_canonical_chain(&env, payload, vec![])
+        })?;
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        const PER_CALL: &str = "tn_reth.epoch_close_system_call_gas_used";
+        let budget = SYSTEM_CALL_GAS_LIMIT as f64;
+
+        // the four calls a post-fork close makes, each real work inside the budget it was granted
+        let spent: Vec<f64> =
+            ["apply_incentives", "apply_slashes", "conclude_epoch", "record_base_fees"]
+                .into_iter()
+                .map(|call| {
+                    let gas = gauge(&snapshot, PER_CALL, Some(call))
+                        .unwrap_or_else(|| panic!("{call} gas must be recorded: {snapshot:?}"));
+                    assert!(gas > 0.0, "{call} must report the gas it spent, got {gas}");
+                    assert!(gas < budget, "{call} spent {gas}, at or over its {budget} budget");
+                    gas
+                })
+                .collect();
+
+        assert_eq!(
+            gauge(&snapshot, "tn_reth.epoch_close_gas_used", None),
+            Some(spent.iter().sum::<f64>()),
+            "the total gauge must sum exactly the calls that ran"
+        );
+        assert_eq!(
+            gauge(&snapshot, "tn_reth.epoch_close_system_call_gas_limit", None),
+            Some(budget),
+            "the budget gauge must publish the compiled-in limit"
+        );
+
+        // epoch 0 is not the registry fork boundary, so no migration ran
+        assert!(
+            gauge(&snapshot, PER_CALL, Some("registry_migration")).is_none(),
+            "no registry migration away from the fork boundary: {snapshot:?}"
+        );
+
+        Ok(())
+    }
+
+    /// A block that closes no epoch publishes no epoch-close gas at all.
+    ///
+    /// Absent rather than zero. Ordinary blocks vastly outnumber closing ones, so publishing a
+    /// zero for each would overwrite the last real close's figures within seconds and leave the
+    /// gauges reading as though concluding an epoch were free.
+    #[tokio::test]
+    async fn test_block_without_epoch_close_records_no_gas() -> eyre::Result<()> {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(5).into());
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("epoch close gas metrics (no close)");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+
+        let output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            execute_payload_and_update_canonical_chain(&env, payload, vec![])
+        })?;
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(
+            !snapshot.iter().any(|(key, ..)| key.key().name().starts_with("tn_reth.epoch_close")),
+            "a block that closes no epoch must record no epoch-close gas: {snapshot:?}"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_close_epochs() -> eyre::Result<()> {
         let validator_1 = Address::from_slice(&[0x11; 20]);

@@ -76,8 +76,13 @@ failure**:
 1. *(adiri builds only)* If the epoch being concluded satisfies
    `concluding_epoch + 1 == CONSENSUS_REGISTRY_FORK_EPOCH`, apply the registry fork
    (`apply_consensus_registry_fork`) — code swap plus one-time `migrateValidatorSets()` — so the
-   remaining steps in this same block already run on the upgraded code.
-2. The three boundary system calls (`apply_closing_epoch_contract_call`), in a client-enforced
+   remaining steps in this same block already run on the upgraded code, then the `WorkerConfigs`
+   fork (`apply_worker_configs_fork`), a code-only swap with no initializer call. The two ride the
+   same boundary, in that order, because the registry swap flips this very block's close onto the
+   post-fork sequence, whose fourth call needs the `setWorkerConfigsData` selector the pre-fork
+   `WorkerConfigs` deployment lacks — a build applying one swap but not the other aborts this
+   block.
+2. The four boundary system calls (`apply_closing_epoch_contract_call`), in a client-enforced
    order that is itself a consensus-safety obligation: `applyIncentives(RewardInfo[])` first
    (the reward infos carry each validator's consensus-leader count, weighted on pre-slash
    collateral), then `applySlashes(Slash[])` (the slashes carrier — the protocol passes an
@@ -89,11 +94,17 @@ failure**:
    obligation lives in the client** — the registry only enforces the outcome (it validates the
    committee against post-slash state and reverts `InvalidCommitteeSize` on a stale one). An
    undersized pool fails client-side with `TnRethError::UndersizedCommittee` instead of
-   submitting calldata that reverts on-chain. While the deployed registry still carries the
-   pre-fork adiri code, the close instead replays the legacy `applyIncentives` +
-   `concludeEpoch(address[])` pair through the same code-hash gate as the committee-pool read
-   (no interposed `applySlashes`; the shared selectors are byte-identical), keeping pre-fork
-   history re-executable.
+   submitting calldata that reverts on-chain. Finally `setWorkerConfigsData(uint16[],uint184[])`
+   (`record_next_epoch_base_fees`) writes each EIP-1559 worker's next-epoch base fee into its
+   `WorkerConfigs` `data` word, so a node entering the epoch reads the fee from one state slot
+   instead of rescanning the prior epoch's headers. It trails the registry calls because it
+   touches a different contract — nothing in the epoch transition reads what it writes — and it
+   is skipped entirely when no worker is EIP-1559 (an emptiness every node derives identically
+   from the same contract state, so skipping cannot diverge the fleet). While the deployed
+   registry still carries the pre-fork adiri code, the close instead replays the legacy
+   `applyIncentives` + `concludeEpoch(address[])` pair through the same code-hash gate as the
+   committee-pool read (no interposed `applySlashes` and no base-fee record; the shared selectors
+   are byte-identical), keeping pre-fork history re-executable.
 
 There is deliberately no in-`finish()` transition merge: reth's block-builder/executor wrappers
 merge once after `finish()` returns, and a second merge would push a phantom empty reverts entry
@@ -106,6 +117,83 @@ base-fee and nonce checks disabled (`transact_system_call` in `src/evm/mod.rs`);
 **Slashing is not live.** `applySlashes(Slash[])` is the slashes carrier and the registry
 implements it, but the client always passes an empty array (production builds);
 `concludeEpoch` takes only the new committee `address[]`.
+
+### Boundary gas
+
+The 100M budget is granted **per call**, not per block, and is independent of the block gas limit:
+a system call is submitted at `gas_price: 0`, so it neither pays for gas nor counts against the
+block. That also means its gas never enters the block's `gas_used`, and no block-level or
+engine-level gas metric can see it.
+
+Every step of the close is fatal on failure, and the revert is a pure function of committed state,
+so a `concludeEpoch` that outgrows its budget halts every node at the same boundary rather than
+degrading. Raising the limit changes block execution and is a lockstep fleet upgrade (see the
+`SYSTEM_CALL_GAS_LIMIT` doc in `src/evm/mod.rs`), so the headroom needs lead time. These gauges
+(`src/metrics.rs`) are where it comes from:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `tn_reth_epoch_close_system_call_gas_used{call="…"}` | gauge | Gas spent by one boundary system call. `call` is `apply_incentives`, `apply_slashes`, `conclude_epoch`, `record_base_fees`, or `registry_migration` (the one-shot registry fork migration, absent on every other close). A call that did not run publishes no series rather than a zero. |
+| `tn_reth_epoch_close_gas_used` | gauge | Gas spent by those calls together. Each has its own budget, so this is the boundary's total cost rather than the bounded figure. |
+| `tn_reth_epoch_close_system_call_gas_limit` | gauge | The compiled-in per-call budget, published so queries express headroom as a ratio instead of hardcoding 100000000. |
+
+These record gas **spent**, before EIP-3529 refunds, because the spend is what the budget bounds.
+That is deliberately not revm's `ExecutionResult::gas_used`, which is the spend net of the refund.
+The refund is computed after execution and capped at a fifth of the spend, so it never buys the
+call more room — publishing `gas_used` would slide the alert threshold with the refund: a call
+earning the full refund reports four fifths of what it spent, so an 80%-of-budget alert would not
+fire until the spend reached the whole 100M, which is the halt it exists to predict.
+
+Every node records these as it executes the closing block, so the series is fleet-wide rather than
+proposer-only, and it covers closing blocks re-executed during a sync — a replayed value is still a
+true observation of what that epoch cost.
+
+Dashboard — worst epoch close seen in the last 30 days, per call:
+
+```promql
+max_over_time(tn_reth_epoch_close_system_call_gas_used[30d])
+```
+
+The same figure as a fraction of the budget, which is the number to watch:
+
+```promql
+max_over_time(tn_reth_epoch_close_system_call_gas_used[30d])
+  / ignoring(call) group_left max_over_time(tn_reth_epoch_close_system_call_gas_limit[30d])
+```
+
+Alert — a node's epoch close crossed four fifths of its budget in the last 30 days, the same
+threshold that makes each close log a warning. `registry_migration` is excluded: it is the call the
+100M headroom exists for, and it is written once at the fork block and then latches forever, so it
+could never clear:
+
+```promql
+max_over_time(
+  tn_reth_epoch_close_system_call_gas_used{call!="registry_migration"}[30d]
+)
+  / ignoring(call) group_left max_over_time(tn_reth_epoch_close_system_call_gas_limit[30d])
+  > 0.8
+```
+
+Reading these correctly needs two properties of a once-per-epoch gauge:
+
+- **They latch, they do not lapse.** The exporter registers no idle timeout, so a gauge is
+  re-rendered with its last value on every scrape until the next close overwrites it. Short range
+  selectors are therefore legal, but a value can be an entire epoch old, and a node that has stopped
+  closing epochs keeps publishing its last figure as though it were current. Pair these with
+  `tn_epoch_current` when freshness matters.
+- **They are absent before the first close.** A restarted node publishes no
+  `tn_reth_epoch_close_*` series at all until it next executes a closing block, which for a node at
+  the start of an epoch is the whole epoch. Alerts must tolerate the absence rather than read it as
+  zero.
+
+What these do **not** cover: only the committed system calls above are instrumented. The closing
+block issues other calls under their own copy of the same budget, each equally fatal. The
+blockhashes (EIP-2935) and beacon-root (EIP-4788) pre-block calls are fixed-cost, so they need no
+watching. The reads are the gap — `shuffle_new_committee`'s committee-pool read scales with the
+eligible validator set and `record_next_epoch_base_fees`' `getAllWorkerConfigs` with the worker
+count, both inherit the same 100M ceiling (contract reads share the system-call plumbing; see the
+`SYSTEM_CALL_GAS_LIMIT` doc), and neither is instrumented. A boundary can still fail on a call
+these gauges never showed.
 
 ## ConsensusRegistry fork gate (adiri)
 
@@ -290,7 +378,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/evm/tel_precompile/` | Native TEL issuance at `0x…07e1` (see its README). |
 | `src/evm/bls_precompile/` | BLS12-381 signature verification at `0x…b151`. |
 | `src/forward.rs` | `WorkerRpcForwarder`: observer → committee transaction forwarding. |
-| `src/metrics.rs` | Block-building drop counters (`unrecoverable` alertable, `invalid` expected). |
+| `src/metrics.rs` | Block-building drop counters (`unrecoverable` alertable, `invalid` expected) and the epoch-close system-call gas gauges. |
 | `src/payload.rs` | `TNPayload` and `BuildArguments`: consensus data shaped for execution. |
 | `src/rpc_server_args.rs` | RPC CLI argument subset and transport-limit defaults. |
 | `src/snapshot.rs` | State-pack export (`PinnedStateView`) and verified restore (`SnapshotRestorer`). |

@@ -87,6 +87,7 @@
 
 use crate::{
     error::{TnRethError, TnRethResult},
+    metrics::{gas_spent, EpochCloseGas},
     system_calls::{
         decode_worker_fee_configs,
         ConsensusRegistry::{self, RewardInfo, ValidatorStatus},
@@ -236,6 +237,13 @@ pub(crate) struct TNBlockExecutor<Evm, Spec, R: ReceiptBuilder> {
     receipts: Vec<R::Receipt>,
     /// Total gas used by transactions in this block.
     gas_used: u64,
+    /// Gas spent by the epoch-boundary system calls this block issued, accumulated as they run
+    /// and published once by [`Self::finish`] (`crate::metrics::record_epoch_close_gas`).
+    ///
+    /// Every caller of [`Self::transact_and_commit_system_call`] is an epoch-boundary call, so
+    /// this stays empty on the overwhelming majority of blocks — and an empty `Vec` does not
+    /// allocate, so a non-closing block pays nothing for the instrumentation.
+    epoch_close_gas: EpochCloseGas,
 }
 
 // alloy-evm
@@ -252,7 +260,15 @@ where
 {
     /// Creates a new [`TNBlockExecutor`]
     pub(crate) fn new(evm: Evm, ctx: TNBlockExecutionCtx, spec: Spec, receipt_builder: R) -> Self {
-        Self { evm, ctx, receipts: Vec::new(), gas_used: 0, spec, receipt_builder }
+        Self {
+            evm,
+            ctx,
+            receipts: Vec::new(),
+            gas_used: 0,
+            spec,
+            receipt_builder,
+            epoch_close_gas: EpochCloseGas::default(),
+        }
     }
 
     /// Execute a system call from [`SYSTEM_ADDRESS`] to `contract` and commit its state changes.
@@ -269,11 +285,18 @@ where
     /// spurious account into the bundle and diverge the state root. Every commit of a
     /// system-call result must uphold this invariant; the EIP-4788/EIP-2935 pre-block calls do
     /// so with a `retain` of their target contract, which also drops the touched beneficiary.
+    ///
+    /// On success the gas the call SPENT (see [`gas_spent`]) is accumulated under `label` for
+    /// [`Self::finish`] to publish. `label` is the `call` label value the gauge carries, so it is
+    /// a stable machine-readable name rather than the human `description`: the two are separate
+    /// because renaming a log line must not silently rename a metric series. Only the success arm
+    /// records — a revert or halt aborts the block, leaving no epoch close to report gas for.
     fn transact_and_commit_system_call(
         &mut self,
         contract: Address,
         calldata: Bytes,
         description: &str,
+        label: &'static str,
     ) -> TnRethResult<()> {
         let mut res = match self.evm.transact_system_call(SYSTEM_ADDRESS, contract, calldata) {
             Ok(res) => res,
@@ -287,7 +310,9 @@ where
         // return error if the call executed but did not succeed, keeping Revert (decoded
         // reason + selector) distinguishable from Halt
         match &res.result {
-            ExecutionResult::Success { .. } => {}
+            ExecutionResult::Success { gas_used, gas_refunded, .. } => {
+                self.epoch_close_gas.push(label, gas_spent(*gas_used, *gas_refunded));
+            }
             ExecutionResult::Revert { output, gas_used } => {
                 let reason = alloy::sol_types::decode_revert_reason(output)
                     .unwrap_or_else(|| "<undecodable revert reason>".to_string());
@@ -376,6 +401,7 @@ where
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "applying incentives",
+            "apply_incentives",
         )?;
 
         // 2. slashes, landing before the committee is read
@@ -385,6 +411,7 @@ where
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "applying slashes",
+            "apply_slashes",
         )?;
 
         // 3. assemble the committee from the post-slash eligible pool, then conclude
@@ -394,6 +421,7 @@ where
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "closing epoch",
+            "conclude_epoch",
         )?;
 
         // 4. publish the next epoch's per-worker base fees for the epoch that just began
@@ -508,6 +536,7 @@ where
             WORKER_CONFIGS_ADDRESS,
             calldata,
             "recording next-epoch base fees",
+            "record_base_fees",
         )
     }
 
@@ -574,6 +603,7 @@ where
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "applying consensus block rewards",
+            "apply_incentives",
         )?;
 
         let mut new_committee = self.shuffle_new_committee(randomness)?;
@@ -582,7 +612,12 @@ where
         let calldata = LegacyConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
             .abi_encode()
             .into();
-        self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "closing epoch",
+            "conclude_epoch",
+        )
     }
 
     /// The upgraded `ConsensusRegistry` runtime bytecode and its code hash, sourced from the same
@@ -746,6 +781,7 @@ where
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "consensus registry migration",
+            "registry_migration",
         )?;
 
         // Read back the rebuilt eligible count for an operational confirmation log. Best-effort and
@@ -1291,6 +1327,13 @@ where
             // deliberately NO merge_transitions here: both reth wrappers merge after finish()
             // returns, and revm pushes a reverts entry per merge — merging in here too gives
             // every epoch-closing block a phantom empty bundle.reverts entry (len 2 vs 1)
+
+            // Publish what the boundary's system calls spent. Observation only — nothing below
+            // reads it and no state is touched. It lands here, after the calls have succeeded,
+            // because any failure above already aborted the block: there is no partial epoch
+            // close to report gas for. A system call runs at `gas_price: 0`, so this gas never
+            // enters `self.gas_used` and these gauges are the only place it is visible.
+            crate::metrics::record_epoch_close_gas(&self.epoch_close_gas);
         }
 
         Ok((
