@@ -474,13 +474,19 @@ impl RethEnv {
     /// the block identified by `block_hash`.
     ///
     /// Builds an EVM pinned to `block_hash`'s state and issues a single `getEpochInfo(uint32)`
-    /// call. The registry keeps a ring buffer of the four most recent epochs and reverts
-    /// (`InvalidEpoch`) for anything outside it, so a successful return is guaranteed to be the
-    /// requested epoch's record. Used by the epoch manager to recover the previous epoch's block
-    /// range from its closing block when deriving next-epoch base fees.
+    /// call. The registry serves the window `[current - 3, current + 2]` and reverts
+    /// (`InvalidEpoch`) outside it — but a FUTURE epoch inside the window does not revert: it
+    /// returns a synthesized projection whose `blockHeight` is 0 (the interface's "not yet
+    /// begun" sentinel) with config fields as they would be stamped if the epoch began now.
+    /// This method exists to recover a *begun* epoch's record (the epoch manager derives the
+    /// previous epoch's block range from its closing block when seeding next-epoch base fees),
+    /// so it rejects non-identity records rather than handing callers a sentinel `blockHeight`
+    /// they would use as a block-scan floor: the returned `epochId` must equal the request
+    /// (re-checked here so a binding drift cannot mislabel a record), and `blockHeight == 0` is
+    /// only legitimate for epoch 0, whose first block is genesis.
     ///
-    /// Fails with a descriptive error if `block_hash` does not resolve to a sealed header or the
-    /// registry call does not succeed.
+    /// Fails with a descriptive error if `block_hash` does not resolve to a sealed header, the
+    /// registry call does not succeed, or the returned record is synthesized/mismatched.
     pub fn get_epoch_info_at_block(
         &self,
         epoch: Epoch,
@@ -493,8 +499,23 @@ impl RethEnv {
         let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
         let calldata = ConsensusRegistry::getEpochInfoCall { epoch }.abi_encode().into();
-        self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)
-            .map_err(Into::into)
+        let info =
+            self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)?;
+
+        if info.epochId != epoch {
+            eyre::bail!(
+                "getEpochInfo({epoch}) at block {block_hash:?} returned a record for epoch {}",
+                info.epochId
+            );
+        }
+        if info.blockHeight == 0 && epoch != 0 {
+            eyre::bail!(
+                "getEpochInfo({epoch}) at block {block_hash:?} returned a not-yet-begun record \
+                 (blockHeight 0): epoch {epoch} had not started as of this block"
+            );
+        }
+
+        Ok(info)
     }
 
     /// Read worker fee configs from the [`WorkerConfigs`] contract at the block identified by
@@ -954,9 +975,9 @@ mod tests {
         payload::TNPayload,
         system_calls::ConsensusRegistry::ValidatorStatus,
         test_utils::{
-            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
-            governance_burn_tx, governance_owner_factory, test_genesis_with_consensus_registry,
-            TransactionFactory,
+            consensus_output_for_tests, create_committee_from_state,
+            execute_payload_and_update_canonical_chain, governance_burn_tx,
+            governance_owner_factory, test_genesis_with_consensus_registry, TransactionFactory,
         },
         RethChainSpec,
     };
@@ -969,8 +990,8 @@ mod tests {
     use tempfile::TempDir;
     use tn_config::NodeInfo;
     use tn_types::{
-        generate_proof_of_possession_bls_for_test, BlsKeypair, GenesisAccount, NodeP2pInfo,
-        TaskManager, U256,
+        gas_accumulator::RewardsCounter, generate_proof_of_possession_bls_for_test, BlsKeypair,
+        GenesisAccount, NodeP2pInfo, TaskManager, U256,
     };
 
     /// In-protocol `ConsensusRegistry` fork over the PRE-fork testnet registry.
@@ -1409,6 +1430,32 @@ mod tests {
         let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block2.recovered_block.clone_sealed_header();
 
+        // system-call state hygiene through the close: SYSTEM_ADDRESS is a caller convention
+        // and must never enter the bundle (the executor strips it before every commit), and the
+        // closing block carries exactly one reverts entry — the wrapper's single post-finish
+        // merge (an in-finish merge would push a phantom second entry)
+        assert!(
+            !block2.execution_output.state.state.contains_key(&SYSTEM_ADDRESS),
+            "SYSTEM_ADDRESS must not enter the epoch-closing bundle"
+        );
+        assert_eq!(
+            block2.execution_output.state.reverts.len(),
+            1,
+            "one merged reverts entry per closing block"
+        );
+
+        // a default (empty) RewardsCounter close allocates nothing: the boundary's
+        // applyIncentives ran with an empty rewardInfos array, so every genesis committee
+        // member still reads zero rewards
+        for v in &validators {
+            let rewards = reth_env.read_consensus_registry::<U256>(
+                ConsensusRegistry::getRewardsCall { validatorAddress: v.execution_address }
+                    .abi_encode()
+                    .into(),
+            )?;
+            assert!(rewards.is_zero(), "empty-counter close must allocate no rewards");
+        }
+
         // now close the second epoch so the new validator is active
         expected_epoch += 1;
         let consensus_output = consensus_output_for_tests(2, expected_epoch, 3, true);
@@ -1443,6 +1490,11 @@ mod tests {
         let calldata = ConsensusRegistry::getEpochInfoCall { epoch: epoch + 1 }.abi_encode().into();
         let new_epoch_info = reth_env
             .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)?;
+
+        // replay-critical order normalization: the installed committee is address-sorted
+        // (generate_conclude_epoch_calldata sorts after the shuffle) — asserted as a property,
+        // independent of the exact-membership golden below
+        assert!(new_epoch_info.committee.is_sorted(), "installed committee must be address-sorted");
 
         // ensure validators in increasing order by address
         let expected_new_committee = vec![
@@ -1754,7 +1806,9 @@ mod tests {
 
         // applyIncentives with rewards for the burned + a surviving validator: the isRetired
         // branch skips the burned validator while the survivor accrues rewards. Then
-        // concludeEpoch over the shrunken committee, matching the protocol's boundary sequence.
+        // concludeEpoch over the shrunken committee. (A hand-rolled pair, not the protocol's
+        // boundary sequence - the executor issues three calls with applySlashes interposed; see
+        // test_epoch_boundary_slash_ejects_through_production_close.)
         let alive = committee[0].validatorAddress;
         let mut tn_evm = reth_env.tn_evm(canonical_header.hash())?;
         let mut new_committee: Vec<Address> =
@@ -1813,11 +1867,13 @@ mod tests {
     /// The epoch-boundary slashing sequence: a slash-to-zero ejection lands mid-sequence and the
     /// close still succeeds because the committee is assembled from post-slash state.
     ///
-    /// Drives the exact three-call order the block executor issues - `applyIncentives`, then
-    /// `applySlashes`, then `concludeEpoch` - with a slash that empties a validator's stake.
-    /// Pins the sequencing contract an automated slash producer must uphold: the committee size
-    /// and eligible pool are read AFTER `applySlashes` commits, so the ejection is reflected
-    /// before `concludeEpoch` validates the committee. Also pins the preserved reward economics:
+    /// Hand-rolls the three-call boundary order - `applyIncentives`, then `applySlashes`, then
+    /// `concludeEpoch` - on a raw `tn_evm`, with a slash that empties a validator's stake. Pins
+    /// the CONTRACT-side outcome an automated slash producer relies on: the committee size and
+    /// eligible pool reflect the ejection once `applySlashes` commits, so a post-slash committee
+    /// passes `concludeEpoch` validation. (The ordering as the block executor actually issues it
+    /// is pinned end-to-end by `test_epoch_boundary_slash_ejects_through_production_close`.)
+    /// Also pins the preserved reward economics:
     /// incentives run before slashes, so the closing epoch's rewards are weighted on pre-slash
     /// collateral and even the about-to-be-ejected validator collects its final epoch.
     #[tokio::test]
@@ -1938,6 +1994,107 @@ mod tests {
         Ok(())
     }
 
+    /// The production close path ejects a slash-to-zero validator: a slash injected through the
+    /// `TNPayload` seam rides `finish()`'s boundary sequence and the close succeeds because the
+    /// committee is assembled from post-slash state.
+    ///
+    /// This is the end-to-end pin for the executor's call ordering (`applyIncentives` →
+    /// `applySlashes` → committee reads → `concludeEpoch`), driving the real
+    /// `apply_closing_epoch_contract_call` rather than hand-rolling the sequence like the
+    /// siblings above. Each assertion kills a distinct mis-ordering:
+    /// - the block succeeding at all: the slash landed before the committee reads (a stale
+    ///   five-member committee would revert `InvalidCommitteeSize` on-chain and error the block);
+    /// - `exitEpoch == 1`: the slash landed BEFORE `concludeEpoch` rotated the epoch
+    ///   (`_consensusBurn` records the current epoch at slash time; a slash issued after the
+    ///   rotation would record 2, and close-success alone cannot discriminate that reorder);
+    /// - the shrunken current + shuffled committees: the ejection propagated into committee
+    ///   assembly.
+    ///
+    /// The inverted-order negative variant is deliberately absent: the fixed production path
+    /// cannot issue the calls out of order, and the contract half (stale committee ⇒
+    /// `InvalidCommitteeSize` revert) is already pinned by
+    /// `test_stale_pre_slash_committee_reverts_close`.
+    #[tokio::test]
+    async fn test_epoch_boundary_slash_ejects_through_production_close() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Seam Slash Ejection Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // close epoch 0 through the production payload path so the seam-injected close below
+        // runs at a realistic mid-chain boundary rather than directly on genesis state
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block1.recovered_block.clone_sealed_header();
+
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 1);
+        assert_eq!(committee.len(), 5);
+        let victim = committee[0].validatorAddress;
+
+        // slash sizing: the env runs a default (empty) RewardsCounter, so the boundary's
+        // `applyIncentives` credits nothing and the pre-boundary outstanding balance equals the
+        // balance `applySlashes` compares — a full-outstanding slash is a slash-to-zero
+        let (outstanding, _initial, _rewards) = reth_env
+            .read_consensus_registry::<(U256, U256, U256)>(
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: victim }
+                    .abi_encode()
+                    .into(),
+            )?;
+
+        // close epoch 1 through the PRODUCTION path with the slash injected through the seam:
+        // finish() must sequence it between applyIncentives and the committee reads
+        let consensus_output = consensus_output_for_tests(2, 1, 2, true);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output)
+            .with_epoch_boundary_slashes(vec![ConsensusRegistry::Slash {
+                validatorAddress: victim,
+                amount: outstanding,
+            }]);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+
+        // the slash landed: retired, ejected from the eligible pool, size clamped
+        let retired = reth_env.read_consensus_registry::<bool>(
+            ConsensusRegistry::isRetiredCall { validatorAddress: victim }.abi_encode().into(),
+        )?;
+        assert!(retired, "slash-to-zero through the production close retires the validator");
+        let eligible = reth_env.read_consensus_registry::<U256>(
+            ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(eligible, U256::from(4));
+        let next_size = reth_env.read_consensus_registry::<u16>(
+            ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(next_size, 4);
+
+        // ordering discriminator: `_consensusBurn` → `_exit(validator, currentEpoch)` records
+        // the epoch at slash time. The close rotated 1 → 2, so a slash issued after
+        // `concludeEpoch` would record 2; only the slash-before-conclude order records 1.
+        let victim_info = reth_env.read_consensus_registry::<ConsensusRegistry::ValidatorInfo>(
+            ConsensusRegistry::getValidatorCall { validatorAddress: victim }.abi_encode().into(),
+        )?;
+        assert_eq!(victim_info.exitEpoch, 1, "slash must land before the epoch rotates");
+
+        // the epoch rotated over a post-slash committee that excludes the victim
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 2);
+        assert_eq!(committee.len(), 4);
+        assert!(committee.iter().all(|v| v.validatorAddress != victim));
+
+        // the committee this concludeEpoch installed (stored at newEpoch + 2 = 4) was shuffled
+        // from the post-slash pool: four members, victim absent
+        let shuffled =
+            reth_env.validators_for_epoch_at_block(4, reth_env.canonical_tip().hash())?;
+        assert_eq!(shuffled.len(), 4);
+        assert!(shuffled.iter().all(|v| v.validatorAddress != victim));
+
+        Ok(())
+    }
+
     /// A committee sized from PRE-slash state makes `concludeEpoch` revert with
     /// `InvalidCommitteeSize` when a slash-to-zero ejection lands in between.
     ///
@@ -1945,7 +2102,9 @@ mod tests {
     /// `nextCommitteeSize`, so a slash producer that reads the size before `applySlashes`
     /// commits produces a fatal on-chain revert (a deterministic fleet halt), not a silent
     /// mis-seat. The block executor's read-after-slash sequencing exists to prevent exactly
-    /// this; the test pins the failure mode so it trips loudly if that ordering regresses.
+    /// this; this test pins the CONTRACT half (the revert and its selector), while the
+    /// executor's own ordering is pinned through the production close path by
+    /// `test_epoch_boundary_slash_ejects_through_production_close`.
     #[tokio::test]
     async fn test_stale_pre_slash_committee_reverts_close() -> eyre::Result<()> {
         use reth_revm::context::result::ExecutionResult;
@@ -2002,7 +2161,7 @@ mod tests {
                     "InvalidCommitteeSize(uint256,uint256)".as_bytes(),
                 )[..4];
                 assert_eq!(
-                    &output[..4],
+                    output.get(..4).expect("revert output carries at least a 4-byte selector"),
                     selector,
                     "stale committee must revert with InvalidCommitteeSize"
                 );
@@ -2026,6 +2185,7 @@ mod tests {
 
         let committee =
             reth_env.validators_for_epoch_at_block(0, reth_env.canonical_tip().hash())?;
+        assert_eq!(committee.len(), 5);
         let victim = committee[0].validatorAddress;
         let mut tn_evm = reth_env.tn_evm(chain.sealed_genesis_header().hash())?;
 
@@ -2083,6 +2243,133 @@ mod tests {
         assert!(res.result.is_success(), "concludeEpoch succeeds: {:?}", res.result);
         res.state.remove(&SYSTEM_ADDRESS);
         tn_evm.db_mut().commit(res.state);
+
+        Ok(())
+    }
+
+    /// Boundary-block determinism at default features: two independent executions of the
+    /// byte-identical epoch-closing payload derive the same `state_root` and install the same
+    /// next-epoch state.
+    ///
+    /// Every node must re-derive the identical boundary block or the fleet forks — the core
+    /// safety property of the epoch close. Until now it was pinned only inside two
+    /// `adiri`-gated tests that CI never compiles, so a default-build regression (e.g. a
+    /// nondeterministic iteration order feeding `applyIncentives`, or an RNG-draw reorder in
+    /// the committee shuffle) had no tripwire.
+    #[tokio::test]
+    async fn test_epoch_close_deterministic_across_envs() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        // one payload, cloned across both executions: `new_for_test` randomizes
+        // beneficiary/mix_hash/digest per call, and mix_hash seeds the committee shuffle
+        let output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+
+        let tmp1 = TempDir::new().unwrap();
+        let tm1 = TaskManager::new("determinism env1");
+        let env1 = RethEnv::new_for_temp_chain(chain.clone(), tmp1.path(), &tm1, None)?;
+        let block1 = execute_payload_and_update_canonical_chain(&env1, payload.clone(), vec![])?;
+        let header1 = block1.recovered_block.clone_sealed_header();
+
+        let tmp2 = TempDir::new().unwrap();
+        let tm2 = TaskManager::new("determinism env2");
+        let env2 = RethEnv::new_for_temp_chain(chain.clone(), tmp2.path(), &tm2, None)?;
+        let block2 = execute_payload_and_update_canonical_chain(&env2, payload, vec![])?;
+        let header2 = block2.recovered_block.clone_sealed_header();
+
+        assert_eq!(
+            header1.state_root, header2.state_root,
+            "epoch-closing state_root must be identical across independent executions"
+        );
+
+        // the installed next-epoch state matches read-for-read: same epoch record, same
+        // shuffled committee (stored at newEpoch + 2), same keys
+        let state1 = env1.epoch_state_from_canonical_tip()?;
+        let state2 = env2.epoch_state_from_canonical_tip()?;
+        assert_eq!(state1.epoch, 1);
+        assert_eq!(state1.epoch, state2.epoch);
+        assert_eq!(state1.epoch_info, state2.epoch_info);
+        assert_eq!(
+            env1.validators_for_epoch_at_block(3, env1.canonical_tip().hash())?,
+            env2.validators_for_epoch_at_block(3, env2.canonical_tip().hash())?
+        );
+        assert_eq!(
+            env1.bls_pubkeys_for_epoch_at_block(3, env1.canonical_tip().hash())?,
+            env2.bls_pubkeys_for_epoch_at_block(3, env2.canonical_tip().hash())?
+        );
+
+        Ok(())
+    }
+
+    /// Reward accounting through the production close: seeded leader counts flow
+    /// `RewardsCounter` → `applyIncentives(RewardInfo[])` → on-chain balances, with the epoch
+    /// issuance split exactly between equal-count leaders.
+    ///
+    /// Pins the `BTreeMap<Address, u32>` → `RewardInfo[]` mapping in
+    /// `apply_closing_epoch_contract_call` with a NON-empty rewards array at unit level —
+    /// previously exercised only by the engine e2e suite. The fixture's `epochIssuance`
+    /// (25,806 TEL) is even, so two equal-weight leaders each collect exactly half
+    /// (`div_ceil(2)` matches the engine assertions and is exact here).
+    #[tokio::test]
+    async fn test_rewards_counter_flows_through_production_close() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Rewards Close Test");
+        let counter = RewardsCounter::default();
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(counter.clone()),
+        )?;
+
+        // seed the counter exactly as run_epoch does at epoch entry: the genesis committee,
+        // then equal leader tallies for two members
+        let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch_state.validators.len(), 5);
+        let member_addresses: Vec<Address> =
+            epoch_state.validators.iter().map(|v| v.validatorAddress).collect();
+        let issuance = epoch_state.epoch_info.epochIssuance;
+        let committee = create_committee_from_state(epoch_state).await?;
+        counter.set_committee(committee.clone());
+        let authorities: Vec<_> = committee.authorities().into_iter().collect();
+        let (leader_a, leader_b) = (&authorities[0], &authorities[1]);
+        for _ in 0..3 {
+            counter.inc_leader_count(&leader_a.id());
+            counter.inc_leader_count(&leader_b.id());
+        }
+        assert_eq!(counter.get_address_counts().len(), 2);
+
+        // close epoch 0 through the production path; finish() drains the counter into
+        // applyIncentives(RewardInfo[]) with a two-entry array
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+
+        // equal weights split the (even) issuance exactly; non-leaders collect nothing
+        let expected_each = issuance.div_ceil(U256::from(2));
+        assert_eq!(expected_each * U256::from(2), issuance, "fixture issuance splits exactly");
+        for leader in [leader_a, leader_b] {
+            let rewards = reth_env.read_consensus_registry::<U256>(
+                ConsensusRegistry::getRewardsCall { validatorAddress: leader.execution_address() }
+                    .abi_encode()
+                    .into(),
+            )?;
+            assert_eq!(rewards, expected_each, "equal-count leader collects an exact half");
+        }
+        let non_leader = member_addresses
+            .iter()
+            .find(|address| {
+                **address != leader_a.execution_address()
+                    && **address != leader_b.execution_address()
+            })
+            .expect("five members, two leaders");
+        let rewards = reth_env.read_consensus_registry::<U256>(
+            ConsensusRegistry::getRewardsCall { validatorAddress: *non_leader }.abi_encode().into(),
+        )?;
+        assert!(rewards.is_zero(), "non-leader collects nothing");
 
         Ok(())
     }

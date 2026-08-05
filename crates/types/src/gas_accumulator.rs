@@ -755,4 +755,60 @@ mod tests {
         assert_eq!(counts.len(), 4);
         assert_eq!(counts.get(&victim_address), Some(&VICTIM_LEADER_BLOCKS));
     }
+
+    /// Epoch-boundary invariant: `clear` resets every leader count so no rewards carry into the
+    /// next epoch's withdrawals, while the committee survives for the next epoch's tallies.
+    #[test]
+    fn clear_resets_leader_counts_but_preserves_committee() {
+        use crate::{BlsKeypair, CommitteeBuilder};
+        use rand::rng;
+
+        let mut rng = rng();
+        let keypairs: Vec<BlsKeypair> = (0..4).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let addresses: Vec<Address> = (0..4).map(|i| Address::repeat_byte(i as u8 + 1)).collect();
+
+        let mut builder = CommitteeBuilder::new(1);
+        for (keypair, address) in keypairs.iter().zip(addresses.iter()) {
+            builder.add_authority(*keypair.public(), *address);
+        }
+        let committee = builder.build();
+
+        let counter = RewardsCounter::default();
+        counter.set_committee(committee.clone());
+
+        let ids: Vec<AuthorityIdentifier> = keypairs
+            .iter()
+            .map(|keypair| {
+                committee
+                    .authority_by_key(keypair.public())
+                    .expect("keypair is a committee member")
+                    .id()
+            })
+            .collect();
+
+        // tally leader counts for two distinct addresses
+        for _ in 0..3 {
+            counter.inc_leader_count(&ids[0]);
+        }
+        counter.inc_leader_count(&ids[1]);
+
+        // sanity: the tallies are visible before the boundary
+        let counts = counter.get_address_counts();
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts.get(&addresses[0]), Some(&3));
+        assert_eq!(counts.get(&addresses[1]), Some(&1));
+        assert_eq!(counter.generate_withdrawals().len(), 2);
+
+        counter.clear();
+
+        // counts reset: nothing carries into the next epoch's incentives or withdrawals
+        assert!(counter.get_address_counts().is_empty());
+        assert!(counter.generate_withdrawals().is_empty());
+
+        // the committee survives clear: a fresh tally still resolves through it
+        counter.inc_leader_count(&ids[1]);
+        let counts = counter.get_address_counts();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get(&addresses[1]), Some(&1));
+    }
 }

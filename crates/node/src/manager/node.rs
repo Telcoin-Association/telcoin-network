@@ -440,7 +440,10 @@ impl DerivedBaseFees {
 ///
 /// Steps:
 /// 1. `getEpochInfo(entered_epoch - 1)` at `closing_header` yields the previous epoch's first block
-///    (clamped to 1: constructor-seeded epochs report `blockHeight = 0`).
+///    (clamped to 1: epoch 0 is stamped by the registry's constructor at genesis and reports
+///    `blockHeight = 0` for the life of the chain). Every other epoch that has actually begun
+///    carries a real height — `RethEnv::get_epoch_info_at_block` rejects a `blockHeight = 0` for
+///    any epoch but 0 as a not-yet-begun record — so the `.max(1)` covers epoch 0 alone.
 /// 2. Scan the sealed headers `first..=closing`, keeping only genuine worker batch blocks
 ///    ([`is_worker_batch_block`] — excludes genesis and the synthetic empty-close block).
 /// 3. Extract each worker's last held fee ([`latest_base_fee_per_worker`]) and gas total
@@ -466,8 +469,10 @@ pub fn derive_base_fees_for_entered_epoch(
         .checked_sub(1)
         .ok_or_else(|| eyre!("cannot derive base fees for entered epoch 0: no prior epoch"))?;
 
-    // the previous epoch's block range, read from the registry AT the closing block (the ring
-    // buffer holds the four most recent epochs, so the prior epoch is always resolvable here)
+    // the previous epoch's block range, read from the registry AT the closing block.
+    // `getEpochInfo` resolves the window `[current - 3, current + 2]` (four recent slots plus two
+    // future ones); at this block the prior epoch is at most one behind `currentEpoch`, so it sits
+    // at the newest end of the past half — resolvable, and already stamped with its block height.
     let epoch_info = reth_env.get_epoch_info_at_block(prior_epoch, closing_header.hash())?;
     let range = epoch_info.blockHeight.max(1)..=closing_header.number;
     let range_len = range.end().saturating_sub(*range.start()).saturating_add(1);

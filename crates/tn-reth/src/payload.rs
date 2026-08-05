@@ -71,6 +71,15 @@ pub struct TNPayload {
     pub close_epoch: Option<B256>,
     /// Worker that created this payload.
     pub worker_id: WorkerId,
+    /// Test-only slash injection for the epoch boundary.
+    ///
+    /// Flows through `TNBlockExecutionCtx` into the executor's `epoch_boundary_slashes` seam so a
+    /// test can drive a non-empty slash list through the production close path. Production builds
+    /// have no such field: slashing is not live and the executor's production body always returns
+    /// an empty list. `serde(skip)` keeps the serialized payload byte-identical to production.
+    #[cfg(test)]
+    #[serde(skip)]
+    pub epoch_boundary_slashes: Vec<crate::system_calls::ConsensusRegistry::Slash>,
 }
 
 impl TNPayload {
@@ -107,6 +116,8 @@ impl TNPayload {
             mix_hash,
             close_epoch,
             worker_id,
+            #[cfg(test)]
+            epoch_boundary_slashes: Vec::new(),
         }
     }
 
@@ -151,6 +162,20 @@ impl TNPayload {
             0,
         )
     }
+
+    /// Inject slashes to submit at the epoch boundary this payload closes.
+    ///
+    /// Only meaningful on an epoch-closing payload: the executor reads the list in its
+    /// `epoch_boundary_slashes` seam and sequences it through `applySlashes` between
+    /// `applyIncentives` and `concludeEpoch`.
+    #[cfg(test)]
+    pub(crate) fn with_epoch_boundary_slashes(
+        mut self,
+        slashes: Vec<crate::system_calls::ConsensusRegistry::Slash>,
+    ) -> Self {
+        self.epoch_boundary_slashes = slashes;
+        self
+    }
 }
 
 impl BuildPendingEnv<ExecHeader> for TNPayload {
@@ -168,6 +193,8 @@ impl BuildPendingEnv<ExecHeader> for TNPayload {
             mix_hash: B256::ZERO,
             close_epoch: None,
             worker_id: 0,
+            #[cfg(test)]
+            epoch_boundary_slashes: Vec::new(),
         }
     }
 }

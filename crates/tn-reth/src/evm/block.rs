@@ -38,8 +38,6 @@
 //!    committee-pool read), keeping pre-fork history re-executable; the post-fork sequence differs
 //!    only by the interposed `applySlashes` call, and both share byte-identical `applyIncentives`
 //!    and `concludeEpoch(address[])` selectors.
-//! 3. `merge_transitions(BundleRetention::Reverts)` - folds the transaction and system-call
-//!    transitions into the bundle state, retaining revert data.
 //!
 //! The order is load-bearing. The fork must lead: the code swap flips the code-hash gate in
 //! `read_committee_eligible_pool` so the shuffle's committee-pool reads use the post-fork ABI
@@ -52,7 +50,8 @@
 //! block whose state diverges from the rest of the fleet.
 //!
 //! Note for auditors: protocol-side slashing is not live - the `slashes` array passed to
-//! `applySlashes` is always empty.
+//! `applySlashes` is always empty (production builds; tests may inject slashes through the
+//! `cfg(test)` seam on `TNPayload`).
 //!
 //! # System-call state hygiene
 //!
@@ -68,9 +67,11 @@
 //! The epoch-close `randomness` (`ctx.close_epoch`) is the keccak256 of the leader
 //! certificate's aggregate BLS signature, computed in `CommittedSubDag::new` and carried through
 //! the payload. It seeds the deterministic committee shuffle AND is stored as the block's
-//! `extra_data`, which is how the replay path (`context_for_block`) rebuilds an identical ctx
-//! from the sealed header. The RNG draw order inside the shuffle is consensus-critical: any
-//! refactor that reorders the draws selects a different committee.
+//! `extra_data`, which is how the replay path (`context_for_block`) rebuilds the ctx from the
+//! sealed header — identical up to `rewards_counter`, which is the live shared counter rather
+//! than header-derived (see the `evm/config.rs` module docs for the replay caveat and the
+//! `block.body.withdrawals` reconstruction follow-up). The RNG draw order inside the shuffle
+//! is consensus-critical: any refactor that reorders the draws selects a different committee.
 
 use crate::{
     error::{TnRethError, TnRethResult},
@@ -109,7 +110,6 @@ use reth_revm::{
         result::{ExecutionResult, ResultAndState},
         Block as _,
     },
-    db::states::bundle_state::BundleRetention,
     DatabaseCommit as _, State,
 };
 use std::{collections::BTreeMap, sync::Arc};
@@ -148,6 +148,12 @@ pub struct TNBlockExecutionCtx {
     pub difficulty: U256,
     /// Counter used to allocate rewards for block leaders.
     pub rewards_counter: RewardsCounter,
+    /// Test-only slash injection for the epoch boundary, copied from the payload
+    /// (`context_for_next_block`). Feeds the executor's `epoch_boundary_slashes` seam so a test
+    /// can drive a non-empty slash list through the production close path. Production builds have
+    /// no such field.
+    #[cfg(test)]
+    pub epoch_boundary_slashes: Vec<ConsensusRegistry::Slash>,
 }
 
 impl TNBlockExecutionCtx {
@@ -220,10 +226,12 @@ where
 
     /// Execute a system call from [`SYSTEM_ADDRESS`] to `contract` and commit its state changes.
     ///
-    /// Shared implementation for the epoch system calls (`concludeEpoch`, its legacy pre-fork
-    /// pair, `migrateValidatorSets`). Any failure — the call itself erroring or the execution
-    /// result being unsuccessful — is fatal to the block; `description` names the call in the
-    /// log and error strings.
+    /// Shared implementation for the epoch system calls (`applyIncentives`, `applySlashes`,
+    /// `concludeEpoch`, the legacy pre-fork close pair, `migrateValidatorSets`). Any failure —
+    /// the call itself erroring or the execution result being unsuccessful — is fatal to the
+    /// block; `description` names the call in the log and error strings, and a revert's decoded
+    /// reason (with its selector and raw output in the log) rides along so the deterministic
+    /// fleet halt this causes is diagnosable from the error alone.
     ///
     /// [`SYSTEM_ADDRESS`] is removed from the result state before commit: it is only touched as
     /// the system caller, not a real state change — leaving it in the changeset would put a
@@ -245,11 +253,38 @@ where
             }
         };
 
-        // return error if the call executed but did not succeed
-        if !res.result.is_success() {
-            // execution failed
-            error!(target: "engine", "failed {description} call: {:?}", res.result);
-            return Err(TnRethError::EVMCustom(format!("failed {description}")));
+        // return error if the call executed but did not succeed, keeping Revert (decoded
+        // reason + selector) distinguishable from Halt
+        match &res.result {
+            ExecutionResult::Success { .. } => {}
+            ExecutionResult::Revert { output, gas_used } => {
+                let reason = alloy::sol_types::decode_revert_reason(output)
+                    .unwrap_or_else(|| "<undecodable revert reason>".to_string());
+                let selector = output
+                    .get(..4)
+                    .map(alloy::hex::encode_prefixed)
+                    .unwrap_or_else(|| format!("<{} bytes>", output.len()));
+                error!(
+                    target: "engine",
+                    %selector,
+                    raw_output = %output,
+                    gas_used,
+                    "failed {description} call: reverted: {reason}"
+                );
+                return Err(TnRethError::EVMCustom(format!(
+                    "failed {description}: reverted: {reason}"
+                )));
+            }
+            ExecutionResult::Halt { reason, gas_used } => {
+                error!(
+                    target: "engine",
+                    gas_used,
+                    "failed {description} call: halted: {reason:?}"
+                );
+                return Err(TnRethError::EVMCustom(format!(
+                    "failed {description}: halted: {reason:?} (gas used {gas_used})"
+                )));
+            }
         }
         trace!(target: "engine", ?res, "{description}");
 
@@ -268,8 +303,8 @@ where
     /// assembled, so the `nextCommitteeSize` read and the shuffle below both see any slash-to-zero
     /// ejections: the committee `concludeEpoch` validates cannot be stale, and an ejected
     /// validator is never seated in a future committee. Slashing is not live, so the slashes array
-    /// is always empty and `applySlashes` is a no-op today; the call is issued regardless so the
-    /// sequence is correct by construction when slashing ships.
+    /// is always empty (production builds) and `applySlashes` is a no-op today; the call is
+    /// issued regardless so the sequence is correct by construction when slashing ships.
     fn apply_closing_epoch_contract_call(
         &mut self,
         randomness: B256,
@@ -326,18 +361,34 @@ where
 
     /// The slashes to submit at this epoch boundary.
     ///
-    /// Slashing is not live: this always returns an empty list and `applySlashes` runs as a
-    /// no-op. An automated slash producer plugs in here and nowhere else. The caller sequences
-    /// the returned slashes through `applySlashes` BEFORE the committee size and eligible pool
-    /// are read, so a slash-to-zero ejection is always reflected in the committee that
-    /// `concludeEpoch` validates. Submitting slashes through any other path, or after the
-    /// committee reads, reintroduces the stale-committee revert pinned by
-    /// `test_stale_pre_slash_committee_reverts_close` - a deterministic fleet halt.
+    /// Slashing is not live: this always returns an empty list (production builds) and
+    /// `applySlashes` runs as a no-op. An automated slash producer plugs in here and nowhere
+    /// else. The caller sequences the returned slashes through `applySlashes` BEFORE the
+    /// committee size and eligible pool are read, so a slash-to-zero ejection is always
+    /// reflected in the committee that `concludeEpoch` validates. That end-to-end ordering is
+    /// pinned by `test_epoch_boundary_slash_ejects_through_production_close`, which injects a
+    /// slash-to-zero through the test seam and drives it through this production close path.
+    ///
+    /// Sizing contract for a future slash producer: amounts must be computed against
+    /// POST-incentive balances. `applyIncentives` credits `balances[validator]` before
+    /// `applySlashes` runs, and the registry ejects only when `balance <= slash.amount`
+    /// (otherwise it decrements and keeps the validator seated) — so an amount sized from the
+    /// pre-boundary balance under-slashes: the validator keeps the incentive delta and is never
+    /// ejected.
     ///
     /// Determinism: every node must derive an identical list (content and order) from the same
     /// certified consensus output, or the boundary block diverges across the fleet.
+    #[cfg(not(test))]
     fn epoch_boundary_slashes(&self) -> Vec<ConsensusRegistry::Slash> {
         Vec::new()
+    }
+
+    /// Test-only body for the epoch-boundary slash seam: yields the slashes injected through
+    /// `TNPayload::with_epoch_boundary_slashes` (carried on the execution ctx). See the
+    /// production body above for the ordering, sizing, and determinism contract.
+    #[cfg(test)]
+    fn epoch_boundary_slashes(&self) -> Vec<ConsensusRegistry::Slash> {
+        self.ctx.epoch_boundary_slashes.clone()
     }
 
     /// Close the epoch via the PRE-fork registry ABI: `applyIncentives(RewardInfo[])` followed
@@ -526,7 +577,16 @@ where
                 debug!(target: "engine", "non-fatal eligible-count readback after migration failed: {e}");
             })
             .ok()
-            .and_then(|data| <U256 as alloy::sol_types::SolValue>::abi_decode(&data).ok());
+            .and_then(|data| {
+                <U256 as alloy::sol_types::SolValue>::abi_decode(&data)
+                    .inspect_err(|e| {
+                        debug!(
+                            target: "engine",
+                            "non-fatal eligible-count readback after migration returned undecodable data: {e}"
+                        );
+                    })
+                    .ok()
+            });
 
         tracing::info!(target: "engine", ?eligible, %code_hash, "consensus registry fork applied");
         Ok(())
@@ -928,8 +988,9 @@ where
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
 
-            // merge transitions into bundle state
-            self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
+            // deliberately NO merge_transitions here: both reth wrappers merge after finish()
+            // returns, and revm pushes a reverts entry per merge — merging in here too gives
+            // every epoch-closing block a phantom empty bundle.reverts entry (len 2 vs 1)
         }
 
         Ok((
@@ -1141,6 +1202,15 @@ fn assemble_new_committee(
     eligible_pool: Vec<ConsensusRegistry::ValidatorInfo>,
     rng: &mut StdRng,
 ) -> TnRethResult<Vec<Address>> {
+    // a zero target would sail through the final length check below (`0 == 0`) and forward
+    // `concludeEpoch([])` — an opaque on-chain revert; refuse it here with a distinct message
+    if new_committee_size == 0 {
+        return Err(TnRethError::EVMCustom(
+            "next committee size is zero: refusing to conclude the epoch with an empty committee"
+                .to_string(),
+        ));
+    }
+
     // 1) separate active and pending validators
     // 2) check if active length is sufficient
     // 3) if missing, randomly select from the pending validators
