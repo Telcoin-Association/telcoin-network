@@ -29,6 +29,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         upstream_request_timeout,
         header_read_timeout,
         max_connections,
+        tcp_user_timeout,
+        max_connection_duration,
         max_request_bytes,
         rate_limit_per_ip,
         rate_limit_global,
@@ -53,6 +55,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
         max_request_bytes,
+        ?tcp_user_timeout,
+        ?max_connection_duration,
         "edge protections configured"
     );
 
@@ -125,9 +129,12 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         // One deadline must fit the body read plus the upstream response
         // headers: the upstream hop is bounded by its own request timeout, and
         // the body read gets a header-scale budget on top, so a trickled body
-        // cannot hold a request slot indefinitely.
+        // cannot hold a request slot indefinitely. (`into_settings` guarantees
+        // any connection-lifetime cap is at least this deadline.)
         request_deadline: upstream_request_timeout.saturating_add(header_read_timeout),
         max_connections,
+        tcp_user_timeout,
+        max_connection_duration,
         max_request_bytes,
     };
 

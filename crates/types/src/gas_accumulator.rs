@@ -50,19 +50,49 @@
 //! computation (`adjust_base_fees`) folds the same formula over the same inputs, so the value it
 //! carries between close and the next entry is identical to what entry derivation recomputes.
 
-use crate::{AuthorityIdentifier, Committee, WorkerId};
+use crate::{AuthorityIdentifier, Committee, SealedHeader, WorkerId, B256};
 
 /// Fee strategy for a worker, read from the WorkerConfigs contract each epoch.
 /// Adding a new strategy = new contract constant + new enum variant + match arm in
 /// adjust_base_fees.
 ///
-/// NOTE: these are mapped in `tn-reth/src/lib.rs:worker_fee_configs_inner`
+/// NOTE: these are mapped in `tn-reth/src/env/epoch.rs:worker_fee_configs_inner`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerFeeConfig {
     /// Adjust fee +/-12.5% per epoch based on gas utilization vs target.
     Eip1559 { target_gas: u64 },
     /// Fixed fee set by governance, no utilization-based adjustment.
     Static { fee: u64 },
+}
+
+/// The worker id that produced `header`, read from the low 16 bits of its `difficulty` field.
+///
+/// The engine encodes `difficulty` as `batch_index << 16 | worker_id` (matching how
+/// [`GasAccumulator::inc_block`] callers attribute blocks), so the worker id is the low 16 bits and
+/// the batch index occupies the upper bits. This is the single canonical implementation shared by
+/// the per-worker fee/gas derivation (`tn_node`) and the snapshot fee-derivability precheck
+/// (`tn_reth`), so both attribute headers with the exact same rule — no drift.
+pub fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
+    (header.difficulty.into_limbs()[0] & 0xffff) as u16
+}
+
+/// True when `header` is a genuine worker batch block.
+///
+/// Two on-chain block shapes are NOT worker batch blocks and must be excluded from per-worker
+/// fee/gas attribution:
+/// - the genesis block (`number == 0`), which carries no worker payload, and
+/// - the synthetic empty-close block the engine builds when an epoch closes with no batches. That
+///   block is stamped worker 0 and copies its PARENT's base fee (see `tn_engine`'s
+///   `execute_consensus_output`), so attributing it would poison worker 0 with another worker's
+///   fee. It is identified by `ommers_hash == B256::ZERO`: the header's `ommers_hash` carries the
+///   batch digest, and only the synthetic block passes `B256::ZERO` (real batch digests are never
+///   zero).
+///
+/// A non-empty epoch-closing block built from real batches has a non-zero `ommers_hash` and IS a
+/// genuine worker block. Shared canonical implementation used by both `tn_node` (fee/gas
+/// derivation) and `tn_reth` (snapshot fee-derivability precheck).
+pub fn is_worker_batch_block(header: &SealedHeader) -> bool {
+    header.number != 0 && header.ommers_hash != B256::ZERO
 }
 
 use alloy::{
@@ -432,6 +462,32 @@ impl Default for GasAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_attribution_helpers_match_header_encoding() {
+        use crate::{ExecHeader, U256};
+        // `difficulty` encodes `batch_index << 16 | worker_id`; `ommers_hash` is the batch digest.
+        let header = |number: u64, batch_index: u64, wid: u16, ommers: B256| -> SealedHeader {
+            SealedHeader::seal_slow(ExecHeader {
+                number,
+                difficulty: U256::from((batch_index << 16) | wid as u64),
+                ommers_hash: ommers,
+                ..Default::default()
+            })
+        };
+        let nonzero = B256::from([0xab; 32]);
+
+        // genesis (block 0) is never a genuine batch block
+        assert!(!is_worker_batch_block(&header(0, 0, 0, nonzero)));
+        // the synthetic empty-close block carries a zero ommers_hash (batch-digest slot)
+        assert!(!is_worker_batch_block(&header(5, 0, 0, B256::ZERO)));
+        // a real batch block: non-genesis number, non-zero batch digest
+        assert!(is_worker_batch_block(&header(5, 0, 3, nonzero)));
+
+        // worker id is the LOW 16 bits; the batch index (upper bits) is ignored
+        assert_eq!(worker_id_from_header(&header(5, 42, 3, nonzero)), 3);
+        assert_eq!(worker_id_from_header(&header(5, 0, 0xffff, nonzero)), 0xffff);
+    }
 
     #[test]
     fn gas_at_target_no_change() {

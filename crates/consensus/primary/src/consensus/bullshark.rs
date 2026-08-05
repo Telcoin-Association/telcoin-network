@@ -1,7 +1,8 @@
 //! Bullshark
 
 use crate::consensus::{
-    utils, ConsensusError, ConsensusState, Dag, LeaderSchedule, LeaderSwapTable, Outcome,
+    utils, ConsensusError, ConsensusInvariant, ConsensusState, Dag, LeaderSchedule,
+    LeaderSwapTable, Outcome,
 };
 use std::collections::VecDeque;
 use tn_types::{
@@ -62,7 +63,7 @@ impl Bullshark {
         state: &mut ConsensusState,
         committed_sequence: &[Certificate],
         sub_dag_index: u64,
-    ) -> ReputationScores {
+    ) -> Result<ReputationScores, ConsensusError> {
         // we reset the scores for every schedule change window, or initialise when it's the first
         // sub dag we are going to create.
         // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
@@ -97,10 +98,18 @@ impl Bullshark {
             ((sub_dag_index / 2) + 1).is_multiple_of(self.num_sub_dags_per_schedule as u64);
 
         // Always ensure that all the authorities are present in the reputation scores - even
-        // when score is zero.
-        assert_eq!(reputation_score.total_authorities() as usize, self.committee.size());
-
-        reputation_score
+        // when score is zero. This is a construction invariant: every committed certificate's
+        // origin is committee-checked upstream, so it holds under the `< f` fault assumption.
+        // If a future regression ever breaks it, surface a typed error and shut down cleanly
+        // rather than panicking on the single consensus task.
+        let authorities = reputation_score.total_authorities() as usize;
+        (authorities == self.committee.size()).then_some(reputation_score).ok_or_else(|| {
+            ConsensusInvariant::ReputationAuthorityCount {
+                actual: authorities,
+                expected: self.committee.size(),
+            }
+            .into()
+        })
     }
 
     #[instrument(level = "debug", skip_all, fields(round = certificate.round(), origin = ?certificate.origin()))]
@@ -194,7 +203,7 @@ impl Bullshark {
         let voting_power: VotingPower = state
             .dag
             .get(&(leader_round + 1))
-            .expect("We should have the whole history by now")
+            .ok_or(ConsensusInvariant::MissingLeaderChildRound(leader_round + 1))?
             .values()
             .filter(|(_, x)| x.header().parents().contains(&leader_digest))
             .map(|(_, x)| self.committee.voting_power_by_id(x.origin()))
@@ -212,7 +221,7 @@ impl Bullshark {
         // the last committed leader, and commit all preceding leaders in the right order.
         // Committing a leader block means committing all its dependencies.
         let mut committed_sub_dags = Vec::new();
-        let mut leaders_to_commit = self.order_leaders(leader, state);
+        let mut leaders_to_commit = self.order_leaders(leader, state)?;
 
         while let Some(leader) = leaders_to_commit.pop_front() {
             let sub_dag_index = leader.nonce();
@@ -235,7 +244,8 @@ impl Bullshark {
             debug!(min_round, "Subdag has {} certificates", num_certificates);
 
             // We resolve the reputation score that should be stored alongside with this sub dag.
-            let reputation_score = self.resolve_reputation_score(state, &sequence, sub_dag_index);
+            let reputation_score =
+                self.resolve_reputation_score(state, &sequence, sub_dag_index)?;
 
             let sub_dag: CommittedSubDag = CommittedSubDag::new(
                 sequence,
@@ -281,12 +291,23 @@ impl Bullshark {
     /// Order the past leaders that we didn't already commit. It orders the leaders from the one
     /// of the older (smaller) round to the newest round.
     #[instrument(level = "debug", skip_all, fields(leader_round = leader.round()))]
-    fn order_leaders(&self, leader: &Certificate, state: &ConsensusState) -> VecDeque<Certificate> {
+    fn order_leaders(
+        &self,
+        leader: &Certificate,
+        state: &ConsensusState,
+    ) -> Result<VecDeque<Certificate>, ConsensusError> {
         let mut to_commit = VecDeque::new();
         to_commit.push_front(leader.clone());
 
         let mut leader = leader;
-        assert_eq!(leader.round() % 2, 0);
+        // Leaders are elected only on even rounds. This is a construction invariant of the
+        // schedule; surface a typed error rather than asserting so a regression degrades to a
+        // clean shutdown instead of a bare `assert_eq!` backtrace on the consensus task.
+        leader
+            .round()
+            .is_multiple_of(2)
+            .then_some(())
+            .ok_or(ConsensusInvariant::LeaderRoundNotEven(leader.round()))?;
         for r in (state.last_round.committed_round + 2..=leader.round() - 2).rev().step_by(2) {
             // Get the certificate proposed by the previous leader.
             let (prev_leader, _authority) =
@@ -306,7 +327,7 @@ impl Bullshark {
             }
         }
 
-        to_commit
+        Ok(to_commit)
     }
 
     /// Checks if there is a path between two leaders.

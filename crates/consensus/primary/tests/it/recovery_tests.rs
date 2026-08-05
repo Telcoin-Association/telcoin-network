@@ -157,7 +157,7 @@ async fn test_certificate_store_persists_restart() {
     {
         let store = open_db(temp_dir.path());
         store.write_all(&certificates).unwrap();
-        store.persist::<Certificates>().await;
+        store.persist::<Certificates>().await.expect("persist");
         drop(store); // Explicit drop to release DB lock
     }
 
@@ -207,8 +207,8 @@ async fn test_dag_reconstruction_from_store() {
         parents = certs.iter().map(|c| c.digest()).collect();
         all_certs.extend(certs);
     }
-    store.persist::<Certificates>().await;
-    store.persist::<CertificateDigestByRound>().await;
+    store.persist::<Certificates>().await.expect("persist");
+    store.persist::<CertificateDigestByRound>().await.expect("persist");
 
     // Verify we can retrieve certificates by round (simulates DAG reconstruction)
     let gc_round = 0;

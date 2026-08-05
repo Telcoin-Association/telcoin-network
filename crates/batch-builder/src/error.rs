@@ -5,7 +5,7 @@ use std::any::Any;
 use tn_reth::{PoolTransactionError, ProviderError, RethError};
 use tokio::sync::{mpsc, oneshot};
 
-/// Result alias for [`TNEngineError`].
+/// Result alias for [`BatchBuilderError`].
 pub(crate) type BatchBuilderResult<T> = Result<T, BatchBuilderError>;
 
 /// Core error variants when executing the output from consensus and extending the canonical block.
@@ -17,6 +17,9 @@ pub enum BatchBuilderError {
     /// Error retrieving data from Provider.
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    /// Error from the tn-reth environment.
+    #[error(transparent)]
+    TnReth(#[from] tn_reth::error::TnRethError),
     /// The next batch digest is missing.
     #[error("Missing next batch digest for recovered sealed block with senders.")]
     NextBatchDigestMissing,

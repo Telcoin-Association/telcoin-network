@@ -16,8 +16,15 @@
 //! `parse_listener_address_for_swarm`, `wait_for_network_peers` — plus the [`RunEpochMode`] /
 //! [`ReplayResult`] types that thread control flow through the loop.
 
-use crate::{engine::ExecutionNode, manager::EpochManager, worker::worker_task_manager_name};
-use std::{collections::HashSet, time::Duration};
+use crate::{
+    engine::ExecutionNode, manager::EpochManager, metrics::EpochMetrics,
+    worker::worker_task_manager_name,
+};
+use std::{
+    collections::HashSet,
+    future::{ready, Future},
+    time::Duration,
+};
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::ConsensusBus;
@@ -94,24 +101,27 @@ where
     ///    [`EpochRecord`] if missing so later lookups can treat epoch 0 like any other.
     /// 2. Create the per-epoch [`TaskManager`] and open the epoch pack files via `open_epoch_pack`.
     /// 3. If the mode calls for replay, re-forward any missed consensus output. If that replay
-    ///    crosses the epoch boundary, close the epoch immediately, clear the consensus DB, and
-    ///    return early as [`RunEpochMode::NewEpoch`] — consensus is never configured this
-    ///    iteration. Otherwise, block until the engine has executed the last replayed output before
-    ///    going live.
+    ///    crosses the epoch boundary, close the epoch immediately, write its [`EpochRecord`], clear
+    ///    the consensus DB, and return early as [`RunEpochMode::NewEpoch`] — consensus is never
+    ///    configured this iteration. Otherwise, block until the engine has executed the last
+    ///    replayed output before going live.
     /// 4. Subscribe to consensus output, configure consensus, and create the primary/worker
-    ///    components. The one-time per-process network setup is gated on `network_first_init`,
-    ///    which is driven by `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the
-    ///    replay-and-close return above can defer setup to a following iteration without skipping
-    ///    it.
+    ///    components. The previous and next committees' keys are resolved first in ONE batched read
+    ///    pinned to the epoch-start header and threaded into both steps as parameters. The one-time
+    ///    per-process network setup is gated on `network_first_init`, which is driven by
+    ///    `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the replay-and-close
+    ///    return above can defer setup to a following iteration without skipping it.
     /// 5. Start the primary (if this node is an active CVV), the subscriber, the worker batch
     ///    builder, and the engine batch builder; reattach any orphaned batches.
     /// 6. `tokio::select!` over three exits: node shutdown, the epoch boundary
     ///    (`wait_for_epoch_boundary`), and the epoch task manager ending early (a CVV resync or a
-    ///    task error). Only the boundary arm closes the epoch and writes its [`EpochRecord`].
+    ///    task error). Of these, only the boundary arm closes the epoch and writes its
+    ///    [`EpochRecord`]; the replay-and-close (step 3) and leftover-drain (step 7) recovery paths
+    ///    write the record on their own closes.
     /// 7. Notify consensus shutdown, abort and drain the epoch task manager, then resolve the
     ///    outcome. On a non-boundary exit, drain leftover output to the engine: if that drain hits
-    ///    the boundary, close the epoch here too. Clear epoch-scoped DB tables when a boundary was
-    ///    crossed.
+    ///    the boundary, close the epoch and write its [`EpochRecord`] here too. Clear epoch-scoped
+    ///    DB tables when a boundary was crossed.
     ///
     /// The returned [`RunEpochMode`] tells the caller (`run_epochs` in the `node` module) which
     /// transition occurred: [`RunEpochMode::NewEpoch`] when the boundary was crossed (advance the
@@ -156,14 +166,20 @@ where
         // CURRENT epoch's stored committee arrays immediately) re-reads the IDENTICAL
         // epoch-start membership - RewardsCounter rows, quorum thresholds, leader schedule -
         // instead of the post-burn tip set, so entry timing can no longer change the node's
-        // view of the epoch.
+        // view of the epoch. The neighbor-committee hoist below (previous and next, batched in
+        // one pinned EVM at the same header) is an entry read too and inherits the same
+        // stability.
         //
         // That value-stability is also the safety argument under concurrent execution -
         // `send_leftover_consensus_output_to_engine` forwards leftover output without waiting,
         // so the engine may still be executing (calling `inc_block`) while this entry runs:
-        // `apply`'s resize no-ops, its fee writes rewrite the same values, and
-        // `GasAccumulator::set_num_workers` refuses to shrink below an in-flight worker id -
-        // NOT quiescence. See the `mode_change_reentry_is_idempotent` IT.
+        // `apply`'s resize no-ops and its fee writes rewrite the same values. The guard is
+        // value-stability, NOT quiescence and NOT any refusal inside `set_num_workers` (it
+        // truncates unconditionally): the pinned re-read yields the identical count so the resize
+        // no-ops, and a shrink below an in-flight worker id would trip `inc_block`'s production
+        // panic rather than pass silently. `GasAccumulator::set_num_workers`'s own doc states
+        // that bound canonically - keep the two in sync. See the
+        // `mode_change_reentry_is_idempotent` IT.
         //
         // Seed the accumulator's worker count and per-worker base fees for the entered epoch
         // from the pinned header (the previous epoch's closing block). This is the single seam
@@ -228,6 +244,10 @@ where
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
                 self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
+                // write the record before clearing tables: a crash after an epoch-0 replay-close
+                // that left no durable record 0 would trip the epoch-0 guard above on every
+                // restart (peers cannot backfill epoch 0), bricking the node
+                self.write_epoch_record(committee.epoch(), engine).await?;
                 self.clear_consensus_db_for_next_epoch()?;
                 return Ok(RunEpochMode::NewEpoch);
             }
@@ -244,9 +264,55 @@ where
 
         // subscribe to output early to prevent missed messages
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
-        let consensus_config = self
-            .configure_consensus(engine, network_config, committee, &epoch_start_header)
-            .await?;
+
+        // Neighbor committees from on-chain state - canonical source of truth - resolve through
+        // ONE pinned EVM at the held epoch-start header. The previous epoch's committee array
+        // is frozen once this epoch starts (a mid-epoch burn mutates the current and future
+        // epochs' arrays, never a past epoch's), and the registry at the pin already serves the
+        // next epoch's committee, so a post-burn re-entry derives the same sets (see the
+        // ENTRY-READ INVARIANT above).
+        //
+        // READ-FAILURE POLICY: this is a consensus input, so the failure is classified by
+        // committee determinism (`StateReadError`) and BOTH classes halt - there is no fail-open
+        // arm here, despite what `StateReadError::ChainGlobal`'s variant doc says about
+        // keep-current staying committee-consistent. There is nothing to keep: the node is
+        // ENTERING the epoch, so it holds no prior neighbor sets, and entering with an
+        // unverifiable neighbor committee mis-scopes peer banning and next-committee
+        // pre-resolution for the whole epoch. Halting is a single-node liveness failure.
+        //
+        // A Provider fault is node-local (peers reading the same block may succeed), so retry
+        // briefly before halting; ChainGlobal returns from the first attempt. The pin is
+        // `epoch_start_header`, a fixed `SealedHeader` captured before this retry, so every
+        // attempt provably reads the same block. The `try_into` arity checks are `eyre`, not
+        // `StateReadError`, so they stay OUTSIDE the retried closure.
+        let epochs: Vec<_> =
+            if entered == 0 { vec![entered + 1] } else { vec![entered - 1, entered + 1] };
+        let sets = retry_provider_faults("neighbor committees at the epoch-start pin", || {
+            engine.validators_for_epochs_at_header(&epochs, &epoch_start_header)
+        })
+        .await
+        .map_err(|e| {
+            eyre::eyre!(
+                "failed neighbor-committee read at the epoch-start pin - halting rather than \
+                 entering epoch {entered} with an unverifiable neighbor committee: {e}"
+            )
+        })?;
+        let (previous_committee_keys, next_committee_keys): (HashSet<BlsPublicKey>, Vec<_>) =
+            if entered == 0 {
+                // epoch 0 has no previous committee
+                let [next] = sets.try_into().map_err(|_| {
+                    eyre::eyre!("neighbor-committee batch arity mismatch for epoch 0")
+                })?;
+                (HashSet::new(), next)
+            } else {
+                let [previous, next] = sets.try_into().map_err(|_| {
+                    eyre::eyre!("neighbor-committee batch arity mismatch for epoch {entered}")
+                })?;
+                (previous.into_iter().collect(), next)
+            };
+
+        let consensus_config =
+            self.configure_consensus(network_config, committee, next_committee_keys).await?;
 
         // The networks need their one-time, per-process setup (start listening, register bootstrap
         // peers) on the first iteration that actually reaches `create_consensus`. This is usually
@@ -268,6 +334,7 @@ where
                 consensus_bus.clone(),
                 consensus_config.clone(),
                 &epoch_start_header,
+                previous_committee_keys,
             )
             .await?;
         // Networks are now set up; subsequent epochs rotate committees instead of re-seeding.
@@ -366,7 +433,10 @@ where
                 .await?;
 
                 // Write the epoch record to DB and save in manager for next epoch.
-                self.write_epoch_record(&primary, engine).await?;
+                self.write_epoch_record(current_epoch, engine).await?;
+
+                // Export the epoch's final execution state (no-op unless --enable-state-export).
+                self.export_epoch_state(&primary, &reth_env).await?;
 
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
                 epoch_boundary_reached = true;
@@ -421,6 +491,9 @@ where
             // If things go down at exactly the wrong time we might have reached the epoch end
             // so account for that.
             self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
+            // this arm closed the epoch, so it writes the record too — otherwise the epoch has
+            // no durable record and the next live close fails as out-of-order
+            self.write_epoch_record(current_epoch, engine).await?;
             res = RunEpochMode::NewEpoch;
             clear_tables_for_next_epoch = true;
         } else {
@@ -719,7 +792,7 @@ async fn adjust_base_fees(
     // Only a proven identity VIOLATION or an exhausted provider fault halts.
     let (entered_epoch, epoch_info) = match retry_provider_faults(
         "close-time epoch info (identity check)",
-        || reth_env.get_current_epoch_info_at_header(&tip),
+        || ready(reth_env.get_current_epoch_info_at_header(&tip)),
     )
     .await
     {
@@ -745,14 +818,14 @@ async fn adjust_base_fees(
     };
 
     let block_height = epoch_info.blockHeight;
-    debug_assert_eq!(
-        tip.number + 1,
-        block_height,
-        "close-time base-fee identity: canonical tip {} + 1 != entered-epoch {entered_epoch} \
-         blockHeight {block_height}",
-        tip.number,
-    );
     if tip.number + 1 != block_height {
+        error!(
+            target: "epoch-manager",
+            tip_number = tip.number,
+            entered_epoch,
+            block_height,
+            "close-time base-fee identity: canonical tip + 1 != entered-epoch blockHeight"
+        );
         return Err(eyre::eyre!(
             "close-time base-fee identity violated: canonical tip {} + 1 != entered-epoch \
              {entered_epoch} blockHeight {block_height} at tip {:?} - refusing to price base fees \
@@ -773,7 +846,7 @@ async fn adjust_base_fees(
     // and move to the new fees), so it must never fail open: retry, then halt. Pinned to the SAME
     // `tip` the identity check validated (one-header discipline).
     match retry_provider_faults("close-time worker fee configs", || {
-        reth_env.get_worker_fee_configs_at_block(tip.hash())
+        ready(reth_env.get_worker_fee_configs_at_block(tip.hash()))
     })
     .await
     {
@@ -807,27 +880,42 @@ async fn adjust_base_fees(
     Ok(())
 }
 
-/// Total attempts (first try + retries) for each close-time chain read in [`adjust_base_fees`]
-/// before a node-local provider fault halts the close.
+/// Total attempts (first try + retries) for each classified pinned chain read at an epoch seam —
+/// the close-time reads in [`adjust_base_fees`], the epoch-record committee reads, and the
+/// epoch-entry reads — before a node-local provider fault escalates to the caller (a halt at every
+/// current site).
 const CLOSE_READ_ATTEMPTS: u32 = 3;
 
-/// Pause between close-time read retries in [`retry_provider_faults`].
+/// Pause between read retries in [`retry_provider_faults`].
 const CLOSE_READ_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Run `read` up to [`CLOSE_READ_ATTEMPTS`] times, sleeping [`CLOSE_READ_RETRY_BACKOFF`] between
 /// tries, retrying ONLY on [`StateReadError::Provider`].
 ///
-/// Provider faults are node-local (a transient I/O error may clear on a re-read), so a bounded
-/// retry preserves liveness before the caller escalates to a halt. Chain-global failures are
-/// deterministic products of the pinned block — re-reading cannot change them — so they return
-/// immediately for the caller's fail-open arm. Success passes straight through.
-async fn retry_provider_faults<T>(
+/// Provider faults are node-local (a transient I/O error may clear on a re-read: every pinned
+/// read constructs a fresh state provider per attempt), so a bounded retry preserves liveness
+/// before the caller escalates to a halt. Chain-global failures are deterministic products of the
+/// pinned block — re-reading cannot change them — so they return immediately for the caller's
+/// fail-open-or-halt arm. Success passes straight through.
+///
+/// `read` returns a future so the async epoch-record and epoch-entry committee reads share this
+/// policy with the synchronous close-time reads (which adapt with [`std::future::ready`]). Each
+/// attempt calls `read` afresh, so every retry re-runs the whole read — which is why every caller
+/// must fix its pin OUTSIDE the closure, or successive attempts could resolve different blocks.
+///
+/// Every retry is counted through [`EpochMetrics::record_provider_fault_retry`], labelled by
+/// `what`. Once a provider fault at an epoch seam is survivable it becomes invisible until it is
+/// not, and a `warn!` alone will not surface a node quietly retrying at every boundary.
+pub(super) async fn retry_provider_faults<T, Fut>(
     what: &'static str,
-    mut read: impl FnMut() -> Result<T, StateReadError>,
-) -> Result<T, StateReadError> {
+    mut read: impl FnMut() -> Fut,
+) -> Result<T, StateReadError>
+where
+    Fut: Future<Output = Result<T, StateReadError>>,
+{
     let mut attempt = 1u32;
     loop {
-        match read() {
+        match read().await {
             Err(StateReadError::Provider(detail)) if attempt < CLOSE_READ_ATTEMPTS => {
                 warn!(
                     target: "epoch-manager",
@@ -835,8 +923,9 @@ async fn retry_provider_faults<T>(
                     max_attempts = CLOSE_READ_ATTEMPTS,
                     what,
                     detail,
-                    "node-local provider fault on close-time read - retrying"
+                    "node-local provider fault on pinned chain read - retrying"
                 );
+                EpochMetrics::record_provider_fault_retry(what);
                 attempt += 1;
                 tokio::time::sleep(CLOSE_READ_RETRY_BACKOFF).await;
             }
@@ -961,7 +1050,7 @@ mod tests {
         let calls = Cell::new(0u32);
         let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            Err(StateReadError::Provider("mdbx i/o fault".into()))
+            ready(Err(StateReadError::Provider("mdbx i/o fault".into())))
         })
         .await;
 
@@ -976,11 +1065,11 @@ mod tests {
         let calls = Cell::new(0u32);
         let res = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            if calls.get() == 1 {
+            ready(if calls.get() == 1 {
                 Err(StateReadError::Provider("transient i/o fault".into()))
             } else {
                 Ok(7u64)
-            }
+            })
         })
         .await;
 
@@ -995,7 +1084,7 @@ mod tests {
         let calls = Cell::new(0u32);
         let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            Err(StateReadError::ChainGlobal("contract absent".into()))
+            ready(Err(StateReadError::ChainGlobal("contract absent".into())))
         })
         .await;
 
@@ -1116,6 +1205,35 @@ mod tests {
         assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
         assert_eq!(acc.base_fee(1).base_fee(), 9_099, "worker 1 fee unchanged");
         assert_eq!(acc.get_values(0), (1, 1_000_000, 30_000_000), "worker 0 gas unchanged");
+
+        Ok(())
+    }
+
+    /// Identity-violation arm: with the registry present but NO closing block executed, the
+    /// canonical tip is genesis and the identity read succeeds with epoch 0's record
+    /// (`blockHeight` 0), so `tip + 1 != blockHeight` and the guard halts the close with the
+    /// descriptive error instead of pricing base fees off a non-closing block.
+    #[tokio::test]
+    async fn adjust_base_fees_errors_when_tip_is_not_a_closing_block() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("adjust_fees_identity_violation")?;
+        let task_manager = TaskManager::new("adjust fees identity violation");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(4_242);
+
+        let err = adjust_base_fees(&reth_env, &acc)
+            .await
+            .expect_err("non-closing tip must violate the close-time identity");
+        assert!(
+            err.to_string().contains("close-time base-fee identity violated"),
+            "unexpected error: {err}"
+        );
+
+        // the guard trips before the config read, so fees stay untouched
+        assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
 
         Ok(())
     }

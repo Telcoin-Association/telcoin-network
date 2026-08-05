@@ -21,6 +21,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 alloy = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 
 [lints]
 workspace = true

@@ -101,8 +101,14 @@ fn test_metrics_endpoint_serves_tn_and_reth_metrics() -> eyre::Result<()> {
             "reth_process_cpu_seconds_total",
             // per-crate instrumentation registered on a running validator
             "tn_primary_round",
+            "tn_primary_certificates_formed_total",
             "tn_epoch_current",
             "tn_node_mode{",
+            // the falling-behind alarm trio: free-form gauge! calls, so nothing but
+            // this scrape pins their names against a silent typo or deletion
+            "tn_node_last_executed_consensus_height",
+            "tn_node_latest_gossip_consensus_height",
+            "tn_node_consensus_sync_distance",
             "tn_engine_queued_outputs",
             "tn_worker_batches_sealed_total",
             "tn_batch_builder_base_fee",

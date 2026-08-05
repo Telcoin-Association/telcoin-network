@@ -58,6 +58,11 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "OBSERVER", global = true, default_value_t = false)]
     pub observer: bool,
 
+    /// Export each epoch's final execution state to a snapshot pack under
+    /// `consensus-db/state_exports/epoch-{N}/`.
+    #[arg(long, global = true, default_value_t = false)]
+    pub enable_state_export: bool,
+
     /// Sets all ports to unused, allowing the OS to choose random unused ports when sockets are
     /// bound.
     ///
@@ -174,6 +179,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             chain: _,    // Used above
             observer: _, // Used above
             metrics,
+            enable_state_export,
             instance,
             with_unused_ports,
             reth,
@@ -194,8 +200,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // create dbs to survive between sync state transitions
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
-        let builder =
-            TnBuilder { node_config, tn_config, metrics, healthcheck, reth_db, exex_fns: vec![] };
+        let builder = TnBuilder {
+            node_config,
+            tn_config,
+            metrics,
+            healthcheck,
+            enable_state_export,
+            reth_db,
+            exex_fns: vec![],
+        };
 
         Ok(launcher(builder, ext, tn_datadir, key_config, SHORT_VERSION))
     }

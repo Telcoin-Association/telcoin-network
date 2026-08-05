@@ -73,7 +73,7 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 ///   [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`] pins the pre-fork code, with a pin test against the
 ///   embedded `ConsensusRegistry.json` artifact: after the fork runs live, a tn-contracts artifact
 ///   bump would otherwise change the bytes re-execution swaps in and break historical state roots;
-/// - confirm the live validator/ConsensusNFT count leaves headroom under the 30M system-call gas
+/// - confirm the live validator/ConsensusNFT count leaves headroom under the 100M system-call gas
 ///   cap that bounds the one-shot `migrateValidatorSets()` walk;
 /// - operator dry-run: resync a fork-build node against a live adiri archive across the fork
 ///   boundary and confirm matching state roots (also measures the live migration gas);

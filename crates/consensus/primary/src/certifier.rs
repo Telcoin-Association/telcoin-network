@@ -471,7 +471,21 @@ impl<DB: Database> Certifier<DB> {
                         // certifier re-proposes the same header, re-collecting votes over an unordered
                         // channel, which can aggregate a different 2f+1 subset into a distinct aggregate
                         // signature and thereby perturb the leader-signature randomness. See #934, #963.
-                        self.config.node_storage().persist::<ProposedCertificates>().await;
+                        // If the barrier reports a failed commit (disk full, `EIO`, checksum), the
+                        // record is not on disk, so the internal processing and gossip publish below
+                        // would externalize a certificate whose guard record can be lost on restart -
+                        // exactly the re-proposal and leader-signature perturbation this barrier
+                        // exists to prevent. Refuse and fail the task (mirroring the insert failure
+                        // handled above) rather than externalize a non-durable certificate
+                        // (issue #975).
+                        self.config
+                            .node_storage()
+                            .persist::<ProposedCertificates>()
+                            .await
+                            .map_err(|e| {
+                                error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize: {e}");
+                                TaskError::from_message(e.to_string())
+                            })?;
 
                         // pass to state_sync for internal processing
                         if let Err(e) = self.state_sync.process_own_certificate(&mut certificate).await {

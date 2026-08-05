@@ -1,4 +1,13 @@
 //! The factory to create EVM environments.
+//!
+//! [`TNEvmFactory`] is the construction point for every EVM built through `TnEvmConfig`'s
+//! factories: block execution (production and replay), the env layer's read-only and
+//! system-call EVMs, and inspector-driven (tracing) EVMs. Both constructors —
+//! `create_evm` and `create_evm_with_inspector` — install the TEL and BLS G1 precompiles on
+//! top of the spec's stock precompile set, so the precompile surface is identical no matter
+//! how an EVM was obtained. That uniformity is a determinism requirement: if a simulation or
+//! read-only EVM saw a different precompile set than consensus execution, the same
+//! transaction could produce different results on different paths and fork the chain.
 
 use super::{
     bls_precompile::add_bls_precompile, tel_precompile::add_telcoin_precompile,

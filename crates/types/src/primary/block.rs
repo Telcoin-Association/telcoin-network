@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 /// Header for the consensus chain.
 ///
 /// The consensus chain records consensus output used to extend the execution chain.
-/// All hashes are Keccak 256.
+///
+/// Consensus-layer digests are BLAKE3 ([`crypto::DefaultHashFunction`]), not Keccak-256.
+/// Keccak-256 is used at the execution layer and for the committee-shuffle seed.
 #[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
 pub struct ConsensusHeader {
     /// The hash of the previous ConsesusHeader in the chain.

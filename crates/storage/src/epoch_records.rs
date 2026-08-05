@@ -223,10 +223,68 @@ impl EpochRecordDb {
         })
     }
 
+    /// Read every [`EpochRecord`] from a bare records pack file (e.g. an `epoch_records` file
+    /// copied out of an export bundle) without needing its sidecar indexes. Records come back
+    /// in stored (epoch-ascending) order.
+    ///
+    /// Used by `db load-state` to rebuild a fully-indexed records database from a data-only bundle:
+    /// the returned records are re-saved through [`EpochRecordDb::save_record`] (which rebuilds the
+    /// indexes) and also supply the previous-epoch / final-consensus-number context needed to
+    /// stream-import the matching consensus pack.
+    pub fn read_records_from_pack<P: Into<PathBuf>>(
+        path: P,
+    ) -> Result<Vec<EpochRecord>, EpochDbError> {
+        let pack = Pack::<EpochRecord>::open(
+            path.into(),
+            Inner::PACK_EPOCH,
+            true,
+            PackCompression::ZStd,
+            EPOCH_PACK_VERSION,
+        )
+        .map_err(|_| EpochDbError::CorruptDb)?;
+        let mut records = Vec::new();
+        for record in pack.raw_iter().map_err(|_| EpochDbError::CorruptDb)? {
+            records.push(record.map_err(|_| EpochDbError::CorruptDb)?);
+        }
+        Ok(records)
+    }
+
+    /// Read every [`EpochCertificate`] from a bare certs pack file (e.g. an `epoch_certs` file
+    /// copied out of an export bundle) without needing its sidecar index. Certificates come back in
+    /// stored order; match one to its record with `cert.epoch_hash == record.digest()`.
+    ///
+    /// Used by `db load-state` to verify each restored epoch record against its certificate.
+    pub fn read_certs_from_pack<P: Into<PathBuf>>(
+        path: P,
+    ) -> Result<Vec<EpochCertificate>, EpochDbError> {
+        let pack = Pack::<EpochCertificate>::open(
+            path.into(),
+            Inner::CERT_PACK_EPOCH,
+            true,
+            PackCompression::ZStd,
+            EPOCH_PACK_VERSION,
+        )
+        .map_err(|_| EpochDbError::CorruptDb)?;
+        let mut certs = Vec::new();
+        for cert in pack.raw_iter().map_err(|_| EpochDbError::CorruptDb)? {
+            certs.push(cert.map_err(|_| EpochDbError::CorruptDb)?);
+        }
+        Ok(certs)
+    }
+
     /// Return any delayed error recorded by the background thread.
     /// Also clears the error.
     pub fn get_error(&self) -> Result<(), EpochDbError> {
         match self.error.send_replace(None) {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Return any delayed error recorded by the background thread.
+    /// Does not clear the error.
+    pub fn peek_error(&self) -> Result<(), EpochDbError> {
+        match &*self.error.borrow() {
             Some(e) => Err(e.clone()),
             None => Ok(()),
         }
@@ -353,6 +411,29 @@ impl EpochRecordDb {
         }
     }
 
+    /// Retrieve an [`EpochCertificate`] by its `epoch_hash` digest.
+    /// This version will wait up to timeout time for the cert to show up if not available.
+    ///
+    /// A just-closed epoch's certificate is only aggregated at the next epoch's start, so a caller
+    /// that needs epoch N's cert immediately after N closes (e.g. the state exporter) must give the
+    /// collector a bounded window to produce it.
+    pub async fn cert_by_digest_with_timeout(
+        &self,
+        digest: EpochDigest,
+        timeout: Duration,
+    ) -> Option<EpochCertificate> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(cert) = self.cert_by_digest(digest).await {
+                return Some(cert);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+        }
+    }
+
     /// True if the database contains a record for the given epoch number.
     pub async fn contains_epoch(&self, epoch: Epoch) -> bool {
         let (tx, rx) = oneshot::channel();
@@ -422,6 +503,25 @@ impl EpochRecordDb {
         Some((record, cert))
     }
 
+    /// Scan the historical epochs `0..tip_epoch` and return the first whose certificate (or record)
+    /// is not yet stored, or `None` if every one has a cert. Cheap: record + cert actor lookups, no
+    /// state I/O — the same per-epoch queries
+    /// [`export_bounded_bundle`](Self::export_bounded_bundle) already does, run before the
+    /// export's plain-state walk so it can skip early when a required historical cert is
+    /// permanently missing (e.g. a network-wide failed-quorum epoch no peer can supply) instead
+    /// of walking the whole state and then failing.
+    ///
+    /// `tip_epoch` itself is EXCLUDED: the exported tip's own cert is only aggregated at the next
+    /// epoch's start, so it is normally still pending at export time and is waited for separately.
+    pub async fn first_missing_historical_cert(&self, tip_epoch: Epoch) -> Option<Epoch> {
+        for epoch in 0..tip_epoch {
+            if !matches!(self.get_epoch_by_number(epoch).await, Some((_, Some(_)))) {
+                return Some(epoch);
+            }
+        }
+        None
+    }
+
     /// Retrieve the epoch record and certificate (if available) by record digest.
     pub async fn get_epoch_by_hash(
         &self,
@@ -430,6 +530,54 @@ impl EpochRecordDb {
         let record = self.record_by_digest(hash).await?;
         let cert = self.cert_by_digest(record.digest()).await;
         Some((record, cert))
+    }
+
+    /// Write a bounded export bundle covering epochs `0..=through_epoch` into fresh records/certs
+    /// pack files at `records_path` and `certs_path`.
+    ///
+    /// Unlike copying the live shared `epochs.pack` / `epoch_certs.pack`, this selects an explicit,
+    /// bounded record set through the actor, so a later epoch appending to the live packs cannot
+    /// race into the exported bundle. The written files are bare pack `data` streams (no sidecar
+    /// indexes) that round-trip through [`read_records_from_pack`](Self::read_records_from_pack) /
+    /// [`read_certs_from_pack`](Self::read_certs_from_pack).
+    ///
+    /// A certificate is required for every epoch, including epoch 0: the importer fully verifies
+    /// each record against its cert — epoch 0 against the seeded genesis committee — so a missing
+    /// cert would make the bundle unverifiable. A missing cert is therefore a hard error.
+    pub async fn export_bounded_bundle(
+        &self,
+        through_epoch: Epoch,
+        records_path: &Path,
+        certs_path: &Path,
+    ) -> Result<(), EpochDbError> {
+        // Surface any pending background write error before reading.
+        self.peek_error()?;
+
+        // Collect the bounded record+cert set from the actor first, so the on-disk write below sees
+        // a fixed snapshot even if a later epoch is appended concurrently to the live packs.
+        let mut records = Vec::with_capacity(through_epoch as usize + 1);
+        let mut certs = Vec::with_capacity(through_epoch as usize + 1);
+        for epoch in 0..=through_epoch {
+            let (record, cert) =
+                self.get_epoch_by_number(epoch).await.ok_or(EpochDbError::MissingRecord(epoch))?;
+            match cert {
+                Some(cert) => certs.push(cert),
+                None => return Err(EpochDbError::MissingCertificate(epoch)),
+            }
+            records.push(record);
+        }
+
+        let records_path = records_path.to_path_buf();
+        let certs_path = certs_path.to_path_buf();
+        // These are blocking calls that may take some time, so don't jamb up an async thread.
+        tokio::task::spawn_blocking(move || -> Result<(), EpochDbError> {
+            write_bounded_pack(&records_path, Inner::PACK_EPOCH, &records)?;
+            write_bounded_pack(&certs_path, Inner::CERT_PACK_EPOCH, &certs)?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| EpochDbError::JoinError)??;
+        Ok(())
     }
 
     /// Find the epoch for a consensus header number.
@@ -799,10 +947,13 @@ pub enum EpochDbError {
     Open(Arc<OpenError>),
     EpochAlreadySaved,
     EpochOutOfOrder(Epoch, Epoch),
+    MissingCertificate(Epoch),
+    MissingRecord(Epoch),
     SendFailed,
     ReceiveFailed,
     PersistError(String),
     CorruptDb,
+    JoinError,
 }
 
 impl Error for EpochDbError {}
@@ -819,10 +970,17 @@ impl Display for EpochDbError {
             EpochDbError::EpochOutOfOrder(expected, got) => {
                 write!(f, "Epochs must be saved in order; expected {expected}, got {got}")
             }
+            EpochDbError::MissingCertificate(epoch) => {
+                write!(f, "Missing certificate for epoch {epoch}")
+            }
+            EpochDbError::MissingRecord(epoch) => {
+                write!(f, "Missing record for epoch {epoch}")
+            }
             EpochDbError::SendFailed => write!(f, "Internal channel send failed"),
             EpochDbError::ReceiveFailed => write!(f, "Internal channel receive failed"),
             EpochDbError::PersistError(e) => write!(f, "Failed to persist: {e}"),
             EpochDbError::CorruptDb => write!(f, "Epoch records database is corrupt"),
+            EpochDbError::JoinError => write!(f, "Failed to join a background thread for DB"),
         }
     }
 }
@@ -845,6 +1003,31 @@ impl From<io::Error> for EpochDbError {
     }
 }
 
+/// Write `values` into a fresh pack `data` stream at `path`, tagged with `uid_idx` and encoded
+/// byte-compatibly with the read paths (`ZStd`, `EPOCH_PACK_VERSION`).
+///
+/// Removes any pre-existing file at `path` first, so a re-run overwrites rather than appends —
+/// `Pack::open` opens read-write in append mode, so writing over a leftover file would otherwise
+/// prepend prior-attempt records. Then opens the pack (which creates the file and writes its
+/// header), appends every value in order, and commits so the file is complete on disk. Keeps the
+/// sentinel tags and codec inside this crate so the export bundle stays readable by
+/// `read_records_from_pack` / `read_certs_from_pack`.
+fn write_bounded_pack<V>(path: &Path, uid_idx: u64, values: &[V]) -> Result<(), EpochDbError>
+where
+    V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+{
+    // Enforce the "fresh" contract: a leftover file (e.g. from a prior failed export attempt) would
+    // be appended to, not replaced. NotFound is the normal case and is ignored.
+    let _ = std::fs::remove_file(path);
+    let mut pack =
+        Pack::<V>::open(path, uid_idx, false, PackCompression::ZStd, EPOCH_PACK_VERSION)?;
+    for value in values {
+        pack.append(value).map_err(|e| EpochDbError::Append(e.to_string()))?;
+    }
+    pack.commit().map_err(|e| EpochDbError::PersistError(e.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use std::{
@@ -864,7 +1047,8 @@ mod test {
     };
 
     use crate::epoch_records::{
-        epoch_committee_valid, EpochRecordDb, EpochRecordValidation, RECORDS_NAME,
+        epoch_committee_valid, EpochDbError, EpochRecordDb, EpochRecordValidation, CERTS_NAME,
+        RECORDS_NAME,
     };
 
     // Minimal BlsSigner wrapper around a BlsKeypair.
@@ -929,6 +1113,150 @@ mod test {
         }
         let cert = EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
         (record, cert)
+    }
+
+    #[tokio::test]
+    async fn read_records_and_certs_from_pack_round_trips() {
+        let temp_dir = TempDir::with_prefix("read_records_from_pack").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        // Write a handful of records with their certificates, flush, and close so the on-disk
+        // `epochs.pack` / `epoch_certs.pack` are complete.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let mut records = Vec::new();
+        let mut certs = Vec::new();
+        let mut parent = EpochDigest::default();
+        for epoch in 0..6u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            db.save(record.clone(), cert.clone()).await.expect("save record + cert");
+            records.push(record);
+            certs.push(cert);
+        }
+        db.persist().await.expect("persist");
+        drop(db);
+
+        // Reading the bare packs (no sidecar indexes) must return every record and cert in order.
+        let got_records = EpochRecordDb::read_records_from_pack(temp_dir.path().join(RECORDS_NAME))
+            .expect("read records from pack");
+        assert_eq!(got_records.len(), records.len());
+        for (got, want) in got_records.iter().zip(records.iter()) {
+            assert_eq!(got.epoch, want.epoch);
+            assert_eq!(got.digest(), want.digest());
+        }
+
+        let got_certs = EpochRecordDb::read_certs_from_pack(temp_dir.path().join(CERTS_NAME))
+            .expect("read certs from pack");
+        assert_eq!(got_certs.len(), certs.len());
+        for (got, want) in got_certs.iter().zip(certs.iter()) {
+            assert_eq!(got.epoch_hash, want.epoch_hash);
+        }
+    }
+
+    #[tokio::test]
+    async fn export_bundle_peeks_write_error_without_clearing_it() {
+        // Regression test for finding #6: the read-only export must surface a pending background
+        // write error WITHOUT clearing it, so the write path (the acknowledger) still learns of the
+        // failure instead of it being silently consumed by an in-flight export.
+        let temp_dir = TempDir::with_prefix("export_peek_error").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        // Simulate a background write failure the actor recorded into the shared error slot.
+        db.error.send_replace(Some(EpochDbError::CorruptDb));
+
+        // The export surfaces the pending error (it returns at `peek_error()?` before any disk
+        // work).
+        let err = db
+            .export_bounded_bundle(0, &temp_dir.path().join("recs"), &temp_dir.path().join("certs"))
+            .await
+            .expect_err("export must surface the pending write error");
+        assert!(matches!(err, EpochDbError::CorruptDb), "unexpected error: {err:?}");
+
+        // ...but must NOT clear it: the write path still learns of the failure (the #6 fix).
+        let latched = db.get_error().expect_err("write path must still see the error");
+        assert!(matches!(latched, EpochDbError::CorruptDb), "unexpected error: {latched:?}");
+
+        // `get_error` is the acknowledger, so the slot is cleared only after it is read there.
+        db.get_error().expect("slot cleared after acknowledgement");
+    }
+
+    #[test]
+    fn write_bounded_pack_overwrites_stale_file() {
+        // Regression test for finding #14: `write_bounded_pack` must produce a FRESH pack. A
+        // leftover file (e.g. from a prior failed export attempt) must be overwritten, not
+        // appended to — otherwise the bundle would carry prior-attempt records prepended to
+        // this attempt's.
+        let dir = TempDir::with_prefix("write_bounded_fresh").expect("temp dir");
+        let path = dir.path().join("epoch_records");
+        let first: Vec<EpochRecord> =
+            (0..3).map(|epoch| EpochRecord { epoch, ..Default::default() }).collect();
+        let second: Vec<EpochRecord> =
+            (0..2).map(|epoch| EpochRecord { epoch, ..Default::default() }).collect();
+
+        super::write_bounded_pack(&path, super::Inner::PACK_EPOCH, &first).expect("first write");
+        super::write_bounded_pack(&path, super::Inner::PACK_EPOCH, &second).expect("second write");
+
+        // Fresh, not append: reading back yields exactly the second write (2 records), not 3+2=5.
+        let got = EpochRecordDb::read_records_from_pack(&path).expect("read records");
+        assert_eq!(
+            got.len(),
+            2,
+            "second write must overwrite, not append (got {} records)",
+            got.len()
+        );
+        assert_eq!(got.iter().map(|r| r.epoch).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn first_missing_historical_cert_excludes_pending_tip() {
+        // Finding #8: the export pre-check verifies historical certs `0..tip` are present,
+        // EXCLUDING the tip epoch (whose cert is legitimately still pending at export
+        // time).
+        let dir = TempDir::with_prefix("first_missing_tip").expect("temp dir");
+        let db = EpochRecordDb::open(dir.path()).expect("open db");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        // epochs 0..=2 each with a cert; epoch 3's record saved but its cert still pending.
+        let mut parent = EpochDigest::default();
+        for epoch in 0..=2u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            db.save(record, cert).await.expect("save with cert");
+        }
+        let (record3, _cert3) = make_test_pair(3, &signers, parent);
+        db.save_record(record3).await.expect("save record only");
+
+        // tip = 3 scans 0..3 — all have certs — so nothing is missing (tip 3 excluded).
+        assert_eq!(db.first_missing_historical_cert(3).await, None);
+        // tip = 4 scans 0..4 — epoch 3 has no cert — so it is the first missing.
+        assert_eq!(db.first_missing_historical_cert(4).await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn first_missing_historical_cert_detects_middle_gap() {
+        // A historical cert missing in the middle (epoch 1) must be caught before the tip.
+        let dir = TempDir::with_prefix("first_missing_gap").expect("temp dir");
+        let db = EpochRecordDb::open(dir.path()).expect("open db");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let (r0, c0) = make_test_pair(0, &signers, EpochDigest::default());
+        let (r1, _c1) = make_test_pair(1, &signers, r0.digest());
+        let (r2, c2) = make_test_pair(2, &signers, r1.digest());
+        db.save(r0, c0).await.expect("save 0 with cert");
+        db.save_record(r1).await.expect("save 1 record only"); // cert never arrived
+        db.save(r2, c2).await.expect("save 2 with cert");
+
+        // tip = 3 scans 0..3 — epoch 1 has a record but no cert.
+        assert_eq!(db.first_missing_historical_cert(3).await, Some(1));
+    }
+
+    #[test]
+    fn missing_record_error_display() {
+        // The record-absent case in `export_bounded_bundle` uses `MissingRecord`, not the
+        // misleading `EpochOutOfOrder` ("Epochs must be saved in order...").
+        assert_eq!(EpochDbError::MissingRecord(5).to_string(), "Missing record for epoch 5");
     }
 
     #[tokio::test]
@@ -1309,6 +1637,54 @@ mod test {
     }
 
     #[tokio::test]
+    async fn validate_chain_against_seeded_genesis_dummy() {
+        // Mirrors `db load-state`'s verification: seed a dummy epoch-0 carrying the genesis
+        // committee, verify the real epoch-0 record against it *before* saving (so the dummy — not
+        // the record itself — is the trust anchor), then verify epoch 1 against the saved epoch-0's
+        // `next_committee`.
+        let temp_dir = TempDir::with_prefix("validate_seeded_dummy").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let committee: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let genesis_keys: Vec<BlsPublicKey> = committee.iter().map(|s| s.public_key()).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        db.save_dummy_epoch0(EpochRecord {
+            epoch: 0,
+            committee: genesis_keys.clone(),
+            next_committee: genesis_keys,
+            ..Default::default()
+        })
+        .await
+        .expect("seed dummy");
+
+        // Epoch 0 verifies against the seeded dummy (record index still empty), then is saved.
+        let (rec0, cert0) = make_test_pair(0, &committee, EpochDigest::default());
+        assert_eq!(
+            db.validate_downloaded_record(0, &rec0, &cert0).await,
+            EpochRecordValidation::Valid,
+            "epoch 0 should verify against the seeded genesis committee"
+        );
+        db.save(rec0.clone(), cert0.clone()).await.expect("save epoch 0");
+
+        // Epoch 1 chains from the saved epoch-0 record and verifies against its `next_committee`.
+        let (rec1, cert1) = make_test_pair(1, &committee, rec0.digest());
+        assert_eq!(
+            db.validate_downloaded_record(1, &rec1, &cert1).await,
+            EpochRecordValidation::Valid,
+            "epoch 1 should verify against the saved epoch-0 next_committee"
+        );
+
+        // A record whose committee is unrelated to the trusted chain is rejected.
+        let attacker: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let (bad1, bad_cert1) = make_test_pair(1, &attacker, rec0.digest());
+        assert_ne!(
+            db.validate_downloaded_record(1, &bad1, &bad_cert1).await,
+            EpochRecordValidation::Valid,
+            "a record signed by an unanchored committee must be rejected"
+        );
+    }
+
+    #[tokio::test]
     async fn test_validate_downloaded_record_rejects_wrong_epoch() {
         // A peer answering a request for epoch N must not satisfy it with a self-consistent record
         // for a different epoch. Even a genuine, correctly-anchored historical record is rejected
@@ -1388,5 +1764,185 @@ mod test {
 
         // Beyond the one-epoch fallback horizon there is nothing to serve.
         assert!(db.get_committee_keys(3).await.is_none());
+    }
+
+    /// The dummy epoch-0 record is memory-only: `persist` never writes it, so a reopen loses
+    /// it entirely — no record 0, no committee anchor for validating downloaded records. This
+    /// is why every epoch-close path must overwrite the dummy with a real, persisted record
+    /// before a restart can be survived: a real record saved and persisted comes back from
+    /// reopen with its digest and committee anchor intact.
+    #[tokio::test]
+    async fn test_dummy_epoch0_lost_on_reopen_but_persisted_record_survives() {
+        let temp_dir = TempDir::with_prefix("test_dummy_epoch0_lost_on_reopen").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
+
+        // Save the dummy record 0 and persist: the dummy lives only in memory, so even an
+        // explicit persist leaves nothing durable behind.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let dummy = EpochRecord {
+            epoch: 0,
+            committee: committee.clone(),
+            next_committee: committee.clone(),
+            ..Default::default()
+        };
+        db.save_dummy_epoch0(dummy).await.expect("save dummy epoch 0");
+        db.persist().await.expect("persist dummy");
+        // The dummy serves reads while this handle is open.
+        assert!(db.contains_epoch(0).await);
+        drop(db);
+
+        // Reopen: the dummy is gone — no record and no committee anchor.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("reopen after dummy");
+        assert!(!db.contains_epoch(0).await, "dummy epoch 0 must not survive reopen");
+        assert!(db.record_by_epoch(0).await.is_none(), "no durable record 0 after reopen");
+        assert!(db.get_committee_keys(0).await.is_none(), "no committee anchor after reopen");
+
+        // A real record 0, saved and persisted, survives the same reopen cycle.
+        let (real0, _cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save_record(real0.clone()).await.expect("save real record 0");
+        db.persist().await.expect("persist real record 0");
+        drop(db);
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("reopen after real record");
+        assert!(db.contains_epoch(0).await, "persisted record 0 must survive reopen");
+        let survived = db.record_by_epoch(0).await.expect("record 0 after reopen");
+        assert_eq!(survived.digest(), real0.digest(), "record survives with equal digest");
+        let anchor = db.get_committee_keys(0).await.expect("committee anchor restored");
+        assert_eq!(anchor, committee.iter().copied().collect::<BTreeSet<_>>());
+    }
+
+    #[tokio::test]
+    async fn cert_by_digest_with_timeout_returns_saved_cert() {
+        // A cert that is already stored is returned without hitting the deadline.
+        let temp_dir = TempDir::with_prefix("cert_timeout_present").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (record, cert) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save(record.clone(), cert.clone()).await.expect("save record + cert");
+
+        let got = db
+            .cert_by_digest_with_timeout(record.digest(), std::time::Duration::from_secs(5))
+            .await
+            .expect("cert present within timeout");
+        assert_eq!(got.epoch_hash, cert.epoch_hash);
+    }
+
+    #[tokio::test]
+    async fn cert_by_digest_with_timeout_times_out_when_absent() {
+        // With no cert stored for the digest, the poll loop returns None after the deadline rather
+        // than hanging. A short timeout keeps the test fast.
+        let temp_dir = TempDir::with_prefix("cert_timeout_absent").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        // Save the record only (no cert), so cert_by_digest never resolves.
+        let (record, _cert) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save_record(record.clone()).await.expect("save record");
+
+        let start = std::time::Instant::now();
+        let got = db
+            .cert_by_digest_with_timeout(record.digest(), std::time::Duration::from_millis(300))
+            .await;
+        assert!(got.is_none(), "expected a timeout with no cert stored");
+        // Poll interval is 200ms, so the loop must have waited at least one interval.
+        assert!(start.elapsed() >= std::time::Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn export_bounded_bundle_writes_exactly_through_epoch() {
+        // The bundle must hold records + certs for exactly 0..=N and round-trip through the bare
+        // pack readers, even though the live db holds more epochs than N.
+        let temp_dir = TempDir::with_prefix("export_bundle").expect("temp dir");
+        let bundle_dir = TempDir::with_prefix("export_bundle_out").expect("bundle dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let mut records = Vec::new();
+        let mut parent = EpochDigest::default();
+        for epoch in 0..6u32 {
+            let (record, cert) = make_test_pair(epoch, &signers, parent);
+            parent = record.digest();
+            db.save(record.clone(), cert).await.expect("save record + cert");
+            records.push(record);
+        }
+
+        // Export only through epoch 3 while the db holds through epoch 5.
+        let records_path = bundle_dir.path().join("epoch_records");
+        let certs_path = bundle_dir.path().join("epoch_certs");
+        db.export_bounded_bundle(3, &records_path, &certs_path).await.expect("export bundle");
+
+        let got_records =
+            EpochRecordDb::read_records_from_pack(&records_path).expect("read records");
+        assert_eq!(got_records.len(), 4, "bundle must hold exactly records 0..=3");
+        for (got, want) in got_records.iter().zip(records.iter().take(4)) {
+            assert_eq!(got.epoch, want.epoch);
+            assert_eq!(got.digest(), want.digest());
+        }
+
+        let got_certs = EpochRecordDb::read_certs_from_pack(&certs_path).expect("read certs");
+        assert_eq!(got_certs.len(), 4, "bundle must hold a cert for every record 0..=3");
+        for (got, want) in got_certs.iter().zip(records.iter().take(4)) {
+            assert_eq!(got.epoch_hash, want.digest());
+        }
+    }
+
+    #[tokio::test]
+    async fn export_bounded_bundle_errors_on_missing_required_cert() {
+        // A record for epoch >= 1 with no cert makes the bundle unverifiable, so the export must
+        // error rather than write a partial bundle.
+        let temp_dir = TempDir::with_prefix("export_bundle_missing_cert").expect("temp dir");
+        let bundle_dir = TempDir::with_prefix("export_bundle_missing_out").expect("bundle dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save(rec0.clone(), cert0).await.expect("save epoch 0");
+        // Epoch 1 saved without its cert (mirrors the tip epoch before aggregation).
+        let (rec1, _cert1) = make_test_pair(1, &signers, rec0.digest());
+        db.save_record(rec1).await.expect("save epoch 1 record");
+
+        let err = db
+            .export_bounded_bundle(
+                1,
+                &bundle_dir.path().join("epoch_records"),
+                &bundle_dir.path().join("epoch_certs"),
+            )
+            .await
+            .expect_err("export must fail when a required cert is missing");
+        assert!(matches!(err, EpochDbError::MissingCertificate(1)), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn export_bounded_bundle_errors_on_missing_genesis_cert() {
+        // Epoch 0 must carry a cert like every other epoch, so an exporter missing epoch 0's cert
+        // must error rather than write a bundle the importer would reject.
+        let temp_dir = TempDir::with_prefix("export_bundle_genesis").expect("temp dir");
+        let bundle_dir = TempDir::with_prefix("export_bundle_genesis_out").expect("bundle dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        // Epoch 0 record only, no cert.
+        let (rec0, _cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save_record(rec0.clone()).await.expect("save epoch 0 record");
+        let (rec1, cert1) = make_test_pair(1, &signers, rec0.digest());
+        db.save(rec1, cert1).await.expect("save epoch 1");
+
+        let err = db
+            .export_bounded_bundle(
+                1,
+                &bundle_dir.path().join("epoch_records"),
+                &bundle_dir.path().join("epoch_certs"),
+            )
+            .await
+            .expect_err("export must fail when epoch 0's cert is missing");
+        assert!(matches!(err, EpochDbError::MissingCertificate(0)), "unexpected error: {err}");
     }
 }

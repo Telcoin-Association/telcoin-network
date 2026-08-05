@@ -58,10 +58,12 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 
 /// Maximum number of concurrent gossip-triggered batch prefetches.
 ///
-/// When a committee worker gossips an accepted batch digest, a peer that is missing
-/// the batch prefetches it, and that fetch fans out to every connected peer (see
+/// When a committee worker gossips an accepted batch digest, a subscribed committee validator
+/// that is missing the batch prefetches it, and that fetch fans out to every connected peer (see
 /// [`handle::WorkerNetworkHandle::request_batches`]). Prefetching is a best-effort
-/// optimization: a genuinely needed batch is still fetched on demand later. Capping
+/// optimization: a genuinely needed batch is still fetched by the vote path itself
+/// (`PrimaryReceiverHandler::synchronize` -> `request_batches`), and observers never take this
+/// path at all — they receive batch bodies with the consensus output they follow. Capping
 /// the number in flight (and deduplicating by digest) stops a Byzantine author from
 /// amplifying bandwidth/connection load across the worker mesh by gossiping many
 /// distinct (possibly forged) digests. Load beyond the cap is shed, not queued.

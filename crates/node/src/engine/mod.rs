@@ -16,8 +16,8 @@ use std::{future::Future, net::SocketAddr, sync::Arc};
 use tn_config::Config;
 use tn_exex::ExExInstallFn;
 use tn_reth::{
-    system_calls::EpochState, CanonStateNotificationStream, RethConfig, RethDb, RethEnv,
-    WorkerTxPool,
+    error::StateReadResult, system_calls::EpochState, CanonStateNotificationStream, RethConfig,
+    RethDb, RethEnv, WorkerTxPool,
 };
 use tn_rpc::EngineToPrimary;
 use tn_types::{
@@ -52,6 +52,8 @@ pub struct TnBuilder {
     /// healthcheck service responds unconditionally. This reads from `HEALTHCHECK_TCP_PORT` env
     /// var.
     pub healthcheck: Option<u16>,
+    /// Export each epoch's final execution state to a snapshot pack when set.
+    pub enable_state_export: bool,
     /// A reference to the long lived reth DB for the node.
     pub reth_db: RethDb,
     /// Registered ExEx install functions.
@@ -293,6 +295,13 @@ impl ExecutionNode {
     }
 
     /// Read [EpochState] from the canonical tip.
+    ///
+    /// The committee arrays this returns mutate mid-epoch: a governance `burn` swap-and-pops the
+    /// ejected validator out of the CURRENT epoch's stored committees immediately, so tip reads
+    /// before and after the burn disagree. Epoch-scoped consensus reads must use
+    /// [`Self::epoch_state_at_epoch_start_from_tip`] / [`Self::validators_for_epochs_at_block`]
+    /// instead; the tip read remains correct for point-in-time queries (its `epoch` scalar is
+    /// boundary-written-once).
     pub async fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         let guard = self.internal.read().await;
         guard.epoch_state_from_canonical_tip()
@@ -300,23 +309,61 @@ impl ExecutionNode {
 
     /// Read the current epoch's [EpochState] pinned to the previous epoch's closing block
     /// (genesis for epoch 0), returning the pin header alongside it.
-    pub async fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
+    ///
+    /// The bootstrap `tip` is the caller's, not a fresh sample: the pin derives from the epoch
+    /// number and `blockHeight` read AT `tip`, both of which `concludeEpoch` rewrites at every
+    /// boundary, so only a caller-held sample makes a retried read provably resolve one pin.
+    pub async fn epoch_state_at_epoch_start_from_tip(
+        &self,
+        tip: &SealedHeader,
+    ) -> StateReadResult<(EpochState, SealedHeader)> {
         let guard = self.internal.read().await;
-        guard.epoch_state_at_epoch_start()
+        guard.epoch_state_at_epoch_start_from_tip(tip)
     }
 
-    /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
+    /// Read committee validator keys for epoch, pinned to `header`'s state.
     ///
-    /// This is deliberately the ONLY committee read the engine exposes: an unpinned
-    /// (canonical-tip) variant would make the result depend on when the caller runs
-    /// relative to a mid-epoch governance burn. Callers must choose their pin header
-    /// explicitly (epoch-start for entry reads, the epoch-closing block for the record).
-    pub async fn validators_for_epoch_at_block(
+    /// Every committee-keys read the engine exposes is PINNED: an unpinned (canonical-tip)
+    /// variant would make the result depend on when the caller runs relative to a mid-epoch
+    /// governance burn. Callers must choose their pin explicitly. The `_at_header` variants serve
+    /// the entry path, which already holds the epoch-start header;
+    /// [`Self::validators_for_epochs_at_block`] serves callers holding only a `BlockNumHash` (the
+    /// epoch-record close). [`Self::epoch_state_from_canonical_tip`] still exposes tip-read
+    /// committee fields, for point-in-time queries only.
+    pub async fn validators_for_epoch_at_header(
         &self,
         epoch: u32,
-        block_hash: B256,
-    ) -> eyre::Result<Vec<BlsPublicKey>> {
+        header: &SealedHeader,
+    ) -> StateReadResult<Vec<BlsPublicKey>> {
         let guard = self.internal.read().await;
-        guard.validators_for_epoch_at_block(epoch, block_hash)
+        guard.validators_for_epoch_at_header(epoch, header)
+    }
+
+    /// Read several epochs' committee validator keys, pinned to `header`'s state.
+    ///
+    /// The whole batch executes against ONE pinned EVM and the returned key sets are ordered to
+    /// match `epochs`; each set decodes like [`Self::validators_for_epoch_at_header`].
+    pub async fn validators_for_epochs_at_header(
+        &self,
+        epochs: &[Epoch],
+        header: &SealedHeader,
+    ) -> StateReadResult<Vec<Vec<BlsPublicKey>>> {
+        let guard = self.internal.read().await;
+        guard.validators_for_epochs_at_header(epochs, header)
+    }
+
+    /// Read several epochs' committee validator keys, pinned to the block identified by
+    /// `block_hash`.
+    ///
+    /// The by-hash sibling of [`Self::validators_for_epochs_at_header`]: ONE header lookup and
+    /// ONE pinned EVM for the whole batch, so every returned set provably derives from the same
+    /// block rather than from two independently-resolved reads.
+    pub async fn validators_for_epochs_at_block(
+        &self,
+        epochs: &[Epoch],
+        block_hash: B256,
+    ) -> StateReadResult<Vec<Vec<BlsPublicKey>>> {
+        let guard = self.internal.read().await;
+        guard.validators_for_epochs_at_block(epochs, block_hash)
     }
 }
