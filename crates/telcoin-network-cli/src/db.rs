@@ -5,7 +5,10 @@
 //! `MissingBatches` check and classifying each missing batch as Absent (a real data gap) vs
 //! Misordered (present, but in the wrong consensus-header group).
 
-use crate::{node::NamedChain, version::SHORT_VERSION};
+use crate::{
+    node::{validate_faucet_build, NamedChain},
+    version::SHORT_VERSION,
+};
 use clap::{Args, Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::{bail, eyre};
@@ -188,6 +191,10 @@ impl DbLoadStateArgs {
             Some(NamedChain::MainNet) => Config::load_mainnet(&datadir, false, SHORT_VERSION)?,
             None => Config::load(&datadir, false, SHORT_VERSION)?,
         };
+
+        // A faucet-compiled binary must not prepare mainnet chain data either: same guard as
+        // the node command, refused before any datadir mutation.
+        validate_faucet_build(tn_reth::FAUCET_ENABLED, tn_config.genesis())?;
 
         // Reject a non-resumable bundle BEFORE `restore_pack` mutates the datadir, so a refusal
         // leaves the target untouched.
