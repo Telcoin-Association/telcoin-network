@@ -408,11 +408,12 @@ impl EpochBaseFees {
 ///   as a closing block. Production upholds it by construction: `run_epoch` passes the pin resolved
 ///   by `RethEnv::epoch_state_at_epoch_start`, which self-validates.
 ///
-///   The `blockHeight` side of that comparison is trustworthy because a begun epoch always carries a
-///   real height: epoch 0 alone is stamped by the registry's constructor at genesis and reports
-///   `blockHeight = 0` for the life of the chain, and `RethEnv::get_epoch_info_at_block` rejects a
-///   `blockHeight = 0` record for any epoch but 0 as not-yet-begun. Since this guard only ever runs
-///   for `entered >= 1`, a zero height cannot reach the comparison as a false match.
+///   The `blockHeight` side of that comparison is trustworthy because a begun epoch always
+///   carries a real height: epoch 0 alone is stamped by the registry's constructor at genesis and
+///   reports `blockHeight = 0` for the life of the chain, and `RethEnv::get_epoch_info_at_block`
+///   rejects a `blockHeight = 0` record for any epoch but 0 as not-yet-begun. Since this guard
+///   only ever runs for `entered >= 1`, a zero height cannot reach the comparison as a false
+///   match.
 /// - The read must return at least one worker (unreachable while the contract clamps its count;
 ///   mirrors the snapshot side's guard).
 pub async fn read_base_fees_for_entered_epoch(

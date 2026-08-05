@@ -181,12 +181,13 @@ where
         // `send_leftover_consensus_output_to_engine` forwards leftover output without waiting,
         // so the engine may still be executing (calling `inc_block`) while this entry runs:
         // `apply`'s resize no-ops and its fee writes rewrite the same values. Keeping the count
-        // above every in-flight worker id is a CALLER obligation - `GasAccumulator::set_num_workers`
-        // truncates unconditionally, and its own doc states that bound canonically, so keep the two
-        // in sync. Value-stability is how this entry meets it, NOT quiescence and NOT any refusal
-        // inside `set_num_workers`: the pinned re-read yields the identical count so the resize
-        // no-ops, and a shrink below an in-flight worker id would trip `inc_block`'s production
-        // panic rather than pass silently. See the `mode_change_reentry_is_idempotent` IT.
+        // above every in-flight worker id is a CALLER obligation -
+        // `GasAccumulator::set_num_workers` truncates unconditionally, and its own doc
+        // states that bound canonically, so keep the two in sync. Value-stability is how
+        // this entry meets it, NOT quiescence and NOT any refusal inside `set_num_workers`:
+        // the pinned re-read yields the identical count so the resize no-ops, and a shrink
+        // below an in-flight worker id would trip `inc_block`'s production panic rather
+        // than pass silently. See the `mode_change_reentry_is_idempotent` IT.
         //
         // Seed the accumulator's worker count and per-worker base fees for the entered epoch
         // from the pinned header (the previous epoch's closing block). This is the single seam

@@ -644,8 +644,7 @@ async fn test_sync_num_workers_errors_when_contract_absent() -> eyre::Result<()>
     let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
 
     let gas_accumulator = GasAccumulator::new(3);
-    let result =
-        sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block).await;
+    let result = sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block).await;
     assert!(result.is_err(), "a missing WorkerConfigs contract must be a hard error");
     assert_eq!(gas_accumulator.num_workers(), 3, "a failed sync must not resize the accumulator");
 
@@ -2143,8 +2142,12 @@ async fn run_epoch_entry_sequence(
     // from boundary-written-once scalars, so any mid-epoch tip yields the identical header
     let (entered_state, epoch_start_header) = reth_env.epoch_state_at_epoch_start()?;
     if entered_state.epoch == 0 {
-        sync_num_workers_from_chain(reth_env, gas_accumulator, entered_state.epoch_info.blockHeight)
-            .await?;
+        sync_num_workers_from_chain(
+            reth_env,
+            gas_accumulator,
+            entered_state.epoch_info.blockHeight,
+        )
+        .await?;
     } else {
         read_base_fees_for_entered_epoch(reth_env, entered_state.epoch, &epoch_start_header)
             .await?

@@ -224,9 +224,9 @@ fn export_once(
         // Skip the export (write nothing) when it fails.
         //
         // Logged at `error!`: neither failure mode is routine. A non-boundary anchor means the tip
-        // this export pinned is not the closing block the caller assumed, and an unreadable fee word
-        // means governance wrote a value the entry read cannot consume — both need an operator's
-        // attention rather than a quiet skip.
+        // this export pinned is not the closing block the caller assumed, and an unreadable fee
+        // word means governance wrote a value the entry read cannot consume — both need an
+        // operator's attention rather than a quiet skip.
         if let Err(e) = check_entry_readiness(reth_env, &anchor) {
             error!(
                 target: "tn::snapshot",
@@ -286,8 +286,7 @@ mod tests {
         payload::TNPayload,
         test_utils::{
             consensus_output_for_tests, execute_payload_and_update_canonical_chain,
-            test_genesis_with_consensus_registry,
-            test_genesis_with_consensus_registry_and_workers,
+            test_genesis_with_consensus_registry, test_genesis_with_consensus_registry_and_workers,
         },
         RethChainSpec, RethEnv,
     };
