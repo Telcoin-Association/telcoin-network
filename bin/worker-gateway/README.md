@@ -108,6 +108,8 @@ Every flag has an environment-variable fallback.
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `26214400` | Max request body size, in bytes. |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
+| `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its bucket. |
+| `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its bucket. |
 | `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
@@ -156,14 +158,44 @@ revisit instead of exhausting file descriptors.
 
 Two token-bucket limiters shed load before a request is buffered or forwarded:
 
-- A **per-client-IP** limiter (`--rate-limit-per-ip`, requests/second, with
-  `--rate-limit-per-ip-burst`) stops any single source monopolizing the workers.
+- A **per-client** limiter (`--rate-limit-per-ip`, requests/second, with
+  `--rate-limit-per-ip-burst`) caps what one source can take of that budget.
 - A **global** limiter (`--rate-limit-global` / `--rate-limit-global-burst`)
   caps aggregate throughput to roughly what the upstream workers can absorb.
 
 Either limiter is disabled by setting its rate to `0`; a `0` burst derives twice
 the sustained rate. An over-limit request receives a JSON-RPC `429` (see below),
 never a bare reset.
+
+#### Prefix keying
+
+The per-client bucket is keyed on the client's **network prefix**, not its bare
+address: the peer address has its host bits cleared before the bucket is looked
+up. Keyed on the bare address, a client that rotates its source address gets a
+fresh, full bucket per address and never accumulates spent budget, so only the
+global limit applies to it; a single IPv6 `/64` makes that trivial.
+
+- `--rate-limit-per-ip-v6-prefix` (default `64`) is the IPv6 prefix. A `/64` is
+  the smallest subnet routed to one customer, so every address a client can pick
+  inside its own allocation shares one bucket.
+- `--rate-limit-per-ip-v4-prefix` (default `32`) is the IPv4 prefix. A `/32` is
+  a single address, so the IPv4 path behaves exactly as it did before prefix
+  keying and unrelated customers behind one carrier-grade NAT are never grouped
+  onto a shared bucket. Narrow it only if your clients genuinely map to larger
+  IPv4 allocations.
+
+A prefix wider than its address family allows (`/33` for IPv4, `/129` for IPv6)
+is rejected at startup rather than clamped. On a dual-stack listener an IPv4
+peer is reported in the mapped `::ffff:a.b.c.d` form; those are unmapped and
+keyed by the **IPv4** prefix, so they are metered per address rather than all
+landing in one `/64`.
+
+> **Residual limitation.** Prefix keying bounds rotation *within* one allocation,
+> not across allocations. An attacker holding many distinct allocations (several
+> `/64`s, a spread of unrelated IPv4 addresses, or a botnet) still earns one
+> bucket per allocation, and only the global limiter caps their total. Prefix
+> keying raises the cost of the attack from free to the price of address space;
+> it does not eliminate it. Size `--rate-limit-global` accordingly.
 
 The client identity is the immediate TCP peer. Run the gateway **edge-facing**:
 behind an untrusted L7 proxy the peer is that proxy, so per-IP limiting would

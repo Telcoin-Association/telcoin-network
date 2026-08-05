@@ -2,10 +2,21 @@
 //!
 //! Two token-bucket limiters shed load before a request reaches the proxy or
 //! has its body buffered: a gateway-wide bucket caps aggregate throughput to
-//! roughly what the upstream workers can absorb, and a per-client-IP bucket
-//! stops any single source monopolizing that budget. An over-limit request
-//! receives the gateway's JSON-RPC "rate limit exceeded" envelope (HTTP `429`),
-//! never a bare connection reset.
+//! roughly what the upstream workers can absorb, and a per-client bucket keyed
+//! on the client's *network prefix* caps what one source can take of that
+//! budget. An over-limit request receives the gateway's JSON-RPC "rate limit
+//! exceeded" envelope (HTTP `429`), never a bare connection reset.
+//!
+//! The per-client key is the peer address masked to a configurable prefix
+//! ([`PrefixPolicy`]), not the bare address. Keyed on the bare address, a client
+//! that rotates its source address gets a fresh, full bucket per address and so
+//! never accumulates spent budget, which a single IPv6 `/64` makes trivial;
+//! masking collapses one allocation onto one bucket. The defaults are `/64` for
+//! IPv6 and `/32` for IPv4, so IPv4 behaviour is unchanged and unrelated
+//! customers behind one carrier NAT are never grouped. This bounds rotation
+//! *within* an allocation, not across them: a client holding many distinct
+//! allocations still earns a bucket per allocation, and only the gateway-wide
+//! bucket caps their total.
 //!
 //! The client identity is the immediate TCP peer address (`ConnectInfo`,
 //! injected per connection by the accept loop). The gateway is meant to run
@@ -16,7 +27,8 @@
 
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU32,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
@@ -141,31 +153,195 @@ struct GlobalLimiter {
     bucket: Mutex<Bucket>,
 }
 
-/// Per-client-IP buckets, bounded in cardinality; idle buckets are reclaimed by
-/// [`RateLimiters::gc`].
+/// Width of an IPv4 address, in bits.
+const V4_BITS: u8 = 32;
+
+/// Width of an IPv6 address, in bits.
+const V6_BITS: u8 = 128;
+
+/// Default IPv6 prefix the client address is masked to before it keys a bucket.
+/// A `/64` is the smallest subnet routed to a single customer in practice, so it
+/// is the smallest unit a rotating client cannot escape by picking another
+/// address.
+pub(crate) const DEFAULT_V6_PREFIX: u8 = 64;
+
+/// Default IPv4 prefix the client address is masked to before it keys a bucket.
+/// A `/32` is a single address, so it preserves the gateway's historical
+/// per-address behaviour exactly and cannot group unrelated customers that share
+/// one carrier-grade NAT onto a single bucket. IPv4 addresses are scarce enough
+/// that rotation inside one allocation is not the cheap attack it is on IPv6.
+pub(crate) const DEFAULT_V4_PREFIX: u8 = 32;
+
+/// Why a prefix length was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixLenError {
+    /// The requested length is wider than its address family allows.
+    TooLong {
+        /// The length that was requested, in bits.
+        requested: u8,
+        /// The widest length the family permits, in bits.
+        max: u8,
+    },
+}
+
+impl fmt::Display for PrefixLenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLong { requested, max } => {
+                write!(f, "prefix length /{requested} exceeds the maximum /{max} for this family")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PrefixLenError {}
+
+/// A network prefix length in bits, validated against its address family so it
+/// can never exceed the address width. Only [`PrefixLen::v4`] and
+/// [`PrefixLen::v6`] construct one, so masking can never shift past the width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PrefixLen(u8);
+
+impl PrefixLen {
+    /// An IPv4 prefix length, rejecting anything wider than `/32`.
+    pub(crate) fn v4(bits: u8) -> Result<Self, PrefixLenError> {
+        Self::checked(bits, V4_BITS)
+    }
+
+    /// An IPv6 prefix length, rejecting anything wider than `/128`.
+    pub(crate) fn v6(bits: u8) -> Result<Self, PrefixLenError> {
+        Self::checked(bits, V6_BITS)
+    }
+
+    /// The shared range check: `bits` must fit within the family's `max` width.
+    fn checked(bits: u8, max: u8) -> Result<Self, PrefixLenError> {
+        (bits <= max).then_some(Self(bits)).ok_or(PrefixLenError::TooLong { requested: bits, max })
+    }
+
+    /// The prefix width, in bits.
+    fn bits(&self) -> u8 {
+        self.0
+    }
+}
+
+/// The network prefix each address family is masked to before it keys a per-IP
+/// bucket, so a client rotating addresses inside one allocation shares a single
+/// bucket instead of minting a fresh one per address.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefixPolicy {
+    /// Prefix applied to IPv4 client addresses.
+    v4: PrefixLen,
+    /// Prefix applied to IPv6 client addresses.
+    v6: PrefixLen,
+}
+
+impl PrefixPolicy {
+    /// Build a policy from a validated length per address family.
+    pub(crate) fn new(v4: PrefixLen, v6: PrefixLen) -> Self {
+        Self { v4, v6 }
+    }
+
+    /// The IPv4 prefix width, in bits.
+    #[cfg(test)]
+    pub(crate) fn v4_bits(&self) -> u8 {
+        self.v4.bits()
+    }
+
+    /// The IPv6 prefix width, in bits.
+    #[cfg(test)]
+    pub(crate) fn v6_bits(&self) -> u8 {
+        self.v6.bits()
+    }
+
+    /// The bucket key for `ip`: the address with its host bits cleared, per this
+    /// policy's prefix for the address's family.
+    ///
+    /// A dual-stack listener reports an IPv4 peer as the mapped `::ffff:a.b.c.d`
+    /// form. Every such address shares the same fixed top 96 bits, so masking
+    /// them as IPv6 would collapse *all* IPv4 clients onto one bucket; they are
+    /// unmapped first and keyed by the IPv4 prefix, exactly as an IPv4-only
+    /// listener would key them.
+    fn key(&self, ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V4(addr) => IpAddr::V4(mask_v4(addr, self.v4)),
+            IpAddr::V6(addr) => addr.to_ipv4_mapped().map_or_else(
+                || IpAddr::V6(mask_v6(addr, self.v6)),
+                |unmapped| IpAddr::V4(mask_v4(unmapped, self.v4)),
+            ),
+        }
+    }
+}
+
+impl Default for PrefixPolicy {
+    /// The shipped defaults: [`DEFAULT_V4_PREFIX`] and [`DEFAULT_V6_PREFIX`].
+    fn default() -> Self {
+        // Both constants are within their family's width, so neither checked
+        // constructor can fail; fall back to the widest (identity) prefix rather
+        // than panic if that ever stops holding.
+        Self {
+            v4: PrefixLen::v4(DEFAULT_V4_PREFIX).unwrap_or(PrefixLen(V4_BITS)),
+            v6: PrefixLen::v6(DEFAULT_V6_PREFIX).unwrap_or(PrefixLen(V6_BITS)),
+        }
+    }
+}
+
+/// Clear the host bits of an IPv4 address below `prefix`.
+///
+/// The host-bit count is `32 - prefix`, which is a full-width shift at
+/// `prefix == 0` and so an arithmetic overflow (a panic in debug builds);
+/// `checked_shl` returns `None` there and the `unwrap_or(0)` yields the all-zero
+/// mask that a `/0` means. At `/32` the shift is zero and the mask is all-ones,
+/// i.e. the identity.
+fn mask_v4(addr: Ipv4Addr, prefix: PrefixLen) -> Ipv4Addr {
+    let host_bits = u32::from(V4_BITS.saturating_sub(prefix.bits()));
+    let mask = u32::MAX.checked_shl(host_bits).unwrap_or(0);
+    Ipv4Addr::from(u32::from(addr) & mask)
+}
+
+/// Clear the host bits of an IPv6 address below `prefix`. Same full-width shift
+/// guard as [`mask_v4`]: `/0` masks to `::`, `/128` is the identity.
+fn mask_v6(addr: Ipv6Addr, prefix: PrefixLen) -> Ipv6Addr {
+    let host_bits = u32::from(V6_BITS.saturating_sub(prefix.bits()));
+    let mask = u128::MAX.checked_shl(host_bits).unwrap_or(0);
+    Ipv6Addr::from(u128::from(addr) & mask)
+}
+
+/// Per-client-prefix buckets, bounded in cardinality; idle buckets are reclaimed
+/// by [`RateLimiters::gc`]. The map is keyed on the *masked* client address (see
+/// [`PrefixPolicy`]), so address rotation inside one allocation shares a bucket.
 #[derive(Debug)]
 struct PerIpLimiter {
+    /// The rate and burst every per-client bucket is built with.
     limit: RateLimit,
+    /// Ceiling on tracked buckets; beyond it new clients are admitted untracked.
     max_entries: usize,
+    /// Live buckets, keyed on the prefix-masked client address.
     buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    /// How a client address is masked down to its bucket key.
+    prefix: PrefixPolicy,
 }
 
 impl PerIpLimiter {
-    /// Admit or reject a request from `ip`, creating its bucket on first sight.
+    /// Admit or reject a request from `ip`, creating the bucket for its network
+    /// prefix on first sight.
     fn admit(&self, now: Instant, ip: IpAddr) -> bool {
         let rate = self.limit.tokens_per_sec();
         let capacity = self.limit.capacity();
+        // Every address in one allocation collapses onto this key, so a rotating
+        // client keeps spending the same budget.
+        let key = self.prefix.key(ip);
         let mut buckets = lock(&self.buckets);
         // Bind the existing-bucket outcome first so its borrow of `buckets` ends
         // before the new-IP path takes `&mut buckets`.
-        let existing = buckets.get_mut(&ip).map(|bucket| bucket.try_admit(now, rate, capacity));
+        let existing = buckets.get_mut(&key).map(|bucket| bucket.try_admit(now, rate, capacity));
         existing.unwrap_or_else(|| {
-            admit_new_ip(&mut buckets, self.max_entries, now, ip, rate, capacity)
+            admit_new_ip(&mut buckets, self.max_entries, now, key, rate, capacity)
         })
     }
 }
 
-/// Admit a first-seen `ip`, tracking it unless the table is at capacity.
+/// Admit a first-seen `ip` (already masked to its network prefix by the
+/// caller), tracking it unless the table is at capacity.
 ///
 /// A new IP with the table already full is admitted *untracked* rather than
 /// evicting a live bucket or rejecting a fresh client: the global limit still
@@ -205,17 +381,22 @@ impl RateLimiters<SystemClock> {
         per_ip: Option<RateLimit>,
         global: Option<RateLimit>,
         max_per_ip_entries: usize,
+        prefix: PrefixPolicy,
     ) -> Option<Arc<Self>> {
-        Self::with_clock(SystemClock, per_ip, global, max_per_ip_entries).map(Arc::new)
+        Self::with_clock(SystemClock, per_ip, global, max_per_ip_entries, prefix).map(Arc::new)
     }
 }
 
 impl<C: Clock> RateLimiters<C> {
+    /// Build the limiters over an injected clock. `prefix` decides how a client
+    /// address is masked before it keys a per-IP bucket; it is inert when the
+    /// per-IP limiter is disabled.
     fn with_clock(
         clock: C,
         per_ip: Option<RateLimit>,
         global: Option<RateLimit>,
         max_per_ip_entries: usize,
+        prefix: PrefixPolicy,
     ) -> Option<Self> {
         if per_ip.is_none() && global.is_none() {
             return None;
@@ -229,6 +410,7 @@ impl<C: Clock> RateLimiters<C> {
             limit,
             max_entries: max_per_ip_entries.max(1),
             buckets: Mutex::new(HashMap::new()),
+            prefix,
         });
         Some(Self { clock, global, per_ip })
     }
@@ -354,19 +536,45 @@ mod tests {
         IpAddr::from([10, 0, 0, last])
     }
 
+    /// An address in `2001:db8::/32`: `subnet` picks the `/64`, `host` the
+    /// address within it.
+    fn ip6(subnet: u16, host: u16) -> IpAddr {
+        IpAddr::from([0x2001, 0x0db8, 0, subnet, 0, 0, 0, host])
+    }
+
+    fn prefixes(v4: u8, v6: u8) -> PrefixPolicy {
+        PrefixPolicy::new(
+            PrefixLen::v4(v4).expect("v4 prefix in range"),
+            PrefixLen::v6(v6).expect("v6 prefix in range"),
+        )
+    }
+
     impl<C: Clock> RateLimiters<C> {
         fn per_ip_len(&self) -> usize {
             self.per_ip.as_ref().map(|per_ip| lock(&per_ip.buckets).len()).unwrap_or(0)
         }
     }
 
+    /// Limiters under the shipped prefix policy (`/32` v4, `/64` v6).
     fn limiters<C: Clock>(
         clock: C,
         per_ip: Option<RateLimit>,
         global: Option<RateLimit>,
         max_entries: usize,
     ) -> RateLimiters<C> {
-        RateLimiters::with_clock(clock, per_ip, global, max_entries).expect("some limiter enabled")
+        limiters_with_prefix(clock, per_ip, global, max_entries, PrefixPolicy::default())
+    }
+
+    /// Limiters under an explicit prefix policy.
+    fn limiters_with_prefix<C: Clock>(
+        clock: C,
+        per_ip: Option<RateLimit>,
+        global: Option<RateLimit>,
+        max_entries: usize,
+        prefix: PrefixPolicy,
+    ) -> RateLimiters<C> {
+        RateLimiters::with_clock(clock, per_ip, global, max_entries, prefix)
+            .expect("some limiter enabled")
     }
 
     #[test]
@@ -447,6 +655,125 @@ mod tests {
 
     #[test]
     fn both_disabled_yields_no_limiters() {
-        assert!(RateLimiters::with_clock(SystemClock, None, None, 16).is_none());
+        assert!(RateLimiters::with_clock(SystemClock, None, None, 16, PrefixPolicy::default())
+            .is_none());
+    }
+
+    #[test]
+    fn rotation_inside_one_v6_prefix_shares_a_bucket() {
+        let limiters = limiters(ManualClock::new(), Some(limit(1, 2)), None, 16);
+        // Three requests, each from a different address inside one /64. Keyed on
+        // the bare address they would be three fresh, full buckets and all three
+        // would be admitted; keyed on the /64 they share one burst of 2.
+        assert!(limiters.check(Some(ip6(1, 1))).is_ok());
+        assert!(limiters.check(Some(ip6(1, 2))).is_ok());
+        assert!(
+            matches!(limiters.check(Some(ip6(1, 3))), Err(GatewayError::RateLimited)),
+            "address rotation inside one /64 must not mint a fresh bucket"
+        );
+        assert_eq!(limiters.per_ip_len(), 1, "one /64 is one bucket");
+    }
+
+    #[test]
+    fn rotation_across_v6_prefixes_uses_separate_buckets() {
+        let limiters = limiters(ManualClock::new(), Some(limit(1, 2)), None, 16);
+        // Exhaust the first /64.
+        assert!(limiters.check(Some(ip6(1, 1))).is_ok());
+        assert!(limiters.check(Some(ip6(1, 2))).is_ok());
+        assert!(limiters.check(Some(ip6(1, 3))).is_err());
+        // A different /64 is a different customer, so it gets its own bucket.
+        // This is the residual limit: prefix keying bounds rotation within an
+        // allocation, not across allocations.
+        assert!(limiters.check(Some(ip6(2, 1))).is_ok());
+        assert_eq!(limiters.per_ip_len(), 2);
+    }
+
+    #[test]
+    fn ipv4_default_prefix_preserves_per_address_buckets() {
+        let limiters = limiters(ManualClock::new(), Some(limit(1, 1)), None, 16);
+        // The default IPv4 prefix is /32, so neighbouring addresses stay
+        // independent exactly as before prefix keying.
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        assert!(limiters.check(Some(ip(1))).is_err());
+        assert!(limiters.check(Some(ip(2))).is_ok());
+        assert_eq!(limiters.per_ip_len(), 2);
+    }
+
+    #[test]
+    fn ipv4_mapped_peers_key_as_ipv4() {
+        let limiters = limiters(ManualClock::new(), Some(limit(1, 1)), None, 16);
+        let mapped = |last: u8| IpAddr::V6(Ipv4Addr::new(10, 0, 0, last).to_ipv6_mapped());
+        // A dual-stack listener sees IPv4 peers as `::ffff:a.b.c.d`, which all
+        // share their top 96 bits: masked as IPv6 under the /64 default they
+        // would become one bucket for every IPv4 client on earth.
+        assert!(limiters.check(Some(mapped(1))).is_ok());
+        assert!(limiters.check(Some(mapped(2))).is_ok(), "mapped peers must not share a bucket");
+        // The mapped form keys to the same bucket as the bare IPv4 address,
+        // whose single token the first request already spent.
+        assert!(limiters.check(Some(ip(1))).is_err());
+        assert_eq!(limiters.per_ip_len(), 2);
+    }
+
+    #[test]
+    fn prefix_zero_collapses_every_address_to_one_bucket() {
+        let limiters =
+            limiters_with_prefix(ManualClock::new(), Some(limit(1, 1)), None, 16, prefixes(0, 0));
+        // A /0 is the degenerate policy: every address in a family shares one
+        // bucket, and the full-width shift it implies must not panic.
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        assert!(limiters.check(Some(ip(2))).is_err(), "a /0 keys all of IPv4 to one bucket");
+        assert!(limiters.check(Some(ip6(1, 1))).is_ok());
+        assert!(limiters.check(Some(ip6(2, 9))).is_err(), "a /0 keys all of IPv6 to one bucket");
+        assert_eq!(limiters.per_ip_len(), 2, "one bucket per address family");
+    }
+
+    #[test]
+    fn prefix_zero_masks_to_the_unspecified_address() {
+        let v4 = PrefixLen::v4(0).expect("/0 is in range");
+        let v6 = PrefixLen::v6(0).expect("/0 is in range");
+        assert_eq!(mask_v4(Ipv4Addr::new(203, 0, 113, 7), v4), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            mask_v6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 9), v6),
+            Ipv6Addr::UNSPECIFIED
+        );
+    }
+
+    #[test]
+    fn max_prefix_masking_is_identity() {
+        let v4 = PrefixLen::v4(32).expect("/32 is in range");
+        let v6 = PrefixLen::v6(128).expect("/128 is in range");
+        let addr4 = Ipv4Addr::new(203, 0, 113, 7);
+        let addr6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 9);
+        assert_eq!(mask_v4(addr4, v4), addr4);
+        assert_eq!(mask_v6(addr6, v6), addr6);
+    }
+
+    #[test]
+    fn masking_clears_only_the_host_bits() {
+        let v4 = PrefixLen::v4(24).expect("/24 is in range");
+        let v6 = PrefixLen::v6(64).expect("/64 is in range");
+        assert_eq!(mask_v4(Ipv4Addr::new(203, 0, 113, 7), v4), Ipv4Addr::new(203, 0, 113, 0));
+        assert_eq!(
+            mask_v6(Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0xdead, 0xbeef, 0, 9), v6),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn out_of_range_prefix_is_rejected() {
+        assert_eq!(
+            PrefixLen::v4(33),
+            Err(PrefixLenError::TooLong { requested: 33, max: 32 }),
+            "a /33 is not an IPv4 prefix"
+        );
+        assert_eq!(
+            PrefixLen::v6(129),
+            Err(PrefixLenError::TooLong { requested: 129, max: 128 }),
+            "a /129 is not an IPv6 prefix"
+        );
+        assert!(PrefixLen::v4(32).is_ok());
+        assert!(PrefixLen::v6(128).is_ok());
+        assert!(PrefixLen::v4(0).is_ok());
+        assert!(PrefixLen::v6(0).is_ok());
     }
 }
