@@ -67,7 +67,10 @@ enum EpochDbMessage {
 /// Handle to the epoch records database.
 ///
 /// Operations are dispatched to a background thread that owns the file handles.
-/// Errors from background writes are surfaced on the next call via [`get_error`].
+/// Errors from background writes are surfaced on the next call via [`get_error`], which clears
+/// the slot as it reads, so exactly one subsequent caller observes a given failure. Use
+/// [`peek_error`] to check without consuming. [`persist`] is the durability barrier: it reports
+/// any earlier write failure even if that write was still queued when the flush was requested.
 #[derive(Debug, Clone)]
 pub struct EpochRecordDb {
     /// Channel to send commands to the background thread.
@@ -131,7 +134,13 @@ fn run_db_loop(
                 let _ = tx.send(inner.latest_record());
             }
             EpochDbMessage::Persist(tx) => {
-                let _ = tx.send(inner.persist());
+                // Fold a write that failed while this persist was queued into the reply.
+                // `persist()` samples the error slot before enqueueing, and writes are
+                // fire-and-forget, so a save that fails after that sample but before this arm
+                // would otherwise be acknowledged as a successful flush.
+                let pending = tx_error.send_replace(None);
+                let flushed = inner.persist();
+                let _ = tx.send(pending.map_or(flushed, Err));
             }
             EpochDbMessage::Shutdown => {
                 let _ = inner.persist();
@@ -465,6 +474,12 @@ impl EpochRecordDb {
     }
 
     /// Flush all pending writes to disk.
+    ///
+    /// Returns `Err` if any background write queued before this call failed, including one that
+    /// was still queued when this call sampled the error slot: the actor drains a single FIFO
+    /// channel, so every earlier write is processed before the flush and its failure is folded
+    /// into the reply. Callers that treat a successful `persist()` as proof of durability, such
+    /// as the epoch-close path, depend on that guarantee.
     pub async fn persist(&self) -> Result<(), EpochDbError> {
         self.get_error()?;
         let (tx, rx) = oneshot::channel();
@@ -1178,6 +1193,36 @@ mod test {
 
         // `get_error` is the acknowledger, so the slot is cleared only after it is read there.
         db.get_error().expect("slot cleared after acknowledgement");
+    }
+
+    #[tokio::test]
+    async fn persist_reports_a_write_that_failed_while_the_flush_was_queued() {
+        // Regression test for #1065: `persist()` samples the error slot before it enqueues, and
+        // writes are fire-and-forget, so a save that fails while the `Persist` message is still
+        // queued behind it must be folded into the persist reply. Otherwise the epoch-close path
+        // treats `Ok(())` as proof of durability for a record that never reached disk.
+        let temp_dir = TempDir::with_prefix("persist_queued_write_error").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+
+        // Queue a save the actor will reject — epoch 5 is out of order on an empty db — and a
+        // persist behind it. Both go straight to the channel: the handle-side guards would reject
+        // this record before it ever reached the actor, and the point of the test is the actor's
+        // ordering. A single consumer draining a FIFO channel guarantees the save fails before
+        // the persist is dequeued, so this is deterministic rather than a race.
+        let record = EpochRecord { epoch: 5, ..Default::default() };
+        db.tx.send(super::EpochDbMessage::SaveRecord(record)).await.expect("queue failing save");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        db.tx.send(super::EpochDbMessage::Persist(tx)).await.expect("queue persist");
+
+        let err = rx
+            .await
+            .expect("actor replied to the persist")
+            .expect_err("persist must report the write that failed while it was queued");
+        assert!(matches!(err, EpochDbError::EpochOutOfOrder(0, 5)), "unexpected error: {err:?}");
+
+        // The flush consumed the failure, so it is not left behind to be misattributed to an
+        // unrelated later caller.
+        db.get_error().expect("persist acknowledged the error");
     }
 
     #[test]
