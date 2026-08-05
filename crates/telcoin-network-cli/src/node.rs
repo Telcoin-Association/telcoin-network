@@ -9,7 +9,8 @@ use rayon::ThreadPoolBuilder;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
 use tn_config::{Config, KeyConfig, TelcoinDirs as _};
 use tn_node::engine::TnBuilder;
-use tn_reth::{parse_socket_address, RethCommand, RethConfig};
+use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
+use tn_types::{Genesis, B256, MAINNET_GENESIS};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
@@ -171,6 +172,9 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
                 "Must NOT compile with adiri feature flag when connecting to non-adiri (testnet) networks!"
             ));
         }
+        // Runtime value, not a #[cfg], so the check holds no matter which crate in the
+        // build graph enabled the faucet feature.
+        validate_faucet_build(FAUCET_ENABLED, tn_config.genesis())?;
         debug!(target: "cli", validator = ?tn_config.node_info.name, "tn datadir for node command: {tn_datadir:?}");
         info!(target: "cli", validator = ?tn_config.node_info.name, "config loaded");
 
@@ -211,5 +215,115 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         };
 
         Ok(launcher(builder, ext, tn_datadir, key_config, SHORT_VERSION))
+    }
+}
+
+/// Refuse to run a faucet-compiled binary against canonical Telcoin mainnet.
+///
+/// The `faucet` cargo feature swaps the TEL precompile's `mint` dispatch table (the
+/// instant, role-gated `mint(address,uint256)` replaces the timelocked, governance-only
+/// `mint(uint256)`), so a faucet build joining mainnet computes different state roots
+/// than the rest of the network for the same block: a consensus split, not a local
+/// misconfiguration. No attacker is required; cargo feature unification can enable the
+/// feature transitively without the operator ever typing it.
+///
+/// The check keys on the genesis block hash, the identity peers actually agree on,
+/// rather than either alternative:
+///
+/// - Chain id: the guard the issue literally proposed (refuse `chain_id != 2017` in faucet builds)
+///   would reject both supported faucet flows, the docker devnet scripts at chain id 487
+///   (`etc/genesis.sh`) and the e2e faucet test at the default 911329; keying on mainnet's own 487
+///   instead would still reject the devnet flow, which shares that id.
+/// - Struct equality on [`Genesis`]: the fork-config fields (`config`) sit outside the genesis
+///   header preimage, so a genesis differing from canonical mainnet only in such a field still
+///   computes mainnet's genesis block hash (and could join mainnet consensus) while comparing
+///   unequal.
+///
+/// Only the canonical embedded mainnet genesis is refused; adiri/testnet (2017) is
+/// faucet-intended and separately covered by the `adiri` feature guard at the call
+/// site in [`NodeCommand::execute`].
+pub(crate) fn validate_faucet_build(faucet_enabled: bool, genesis: &Genesis) -> eyre::Result<()> {
+    let joins_mainnet = faucet_enabled
+        .then(|| serde_yaml::from_str::<Genesis>(MAINNET_GENESIS))
+        .transpose()?
+        .is_some_and(|mainnet| genesis_block_hash(genesis.clone()) == genesis_block_hash(mainnet));
+    (!joins_mainnet).then_some(()).ok_or_else(|| {
+        eyre::eyre!("Must NOT compile with faucet feature flag when connecting to Telcoin mainnet!")
+    })
+}
+
+/// The genesis block hash of `genesis`: the hash of the sealed genesis header, covering
+/// the header fields plus the state root computed from `alloc`, built by the same
+/// chain-spec construction the node itself boots with.
+fn genesis_block_hash(genesis: Genesis) -> B256 {
+    RethChainSpec::from(genesis).sealed_genesis_header().hash()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tn_types::adiri_genesis;
+
+    /// A faucet build configured with the canonical mainnet genesis must refuse to start.
+    #[test]
+    fn faucet_build_rejects_canonical_mainnet_genesis() -> eyre::Result<()> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        assert!(validate_faucet_build(true, &mainnet).is_err());
+        Ok(())
+    }
+
+    /// A default (non-faucet) build starts against the canonical mainnet genesis.
+    #[test]
+    fn default_build_accepts_mainnet_genesis() -> eyre::Result<()> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        assert!(validate_faucet_build(false, &mainnet).is_ok());
+        Ok(())
+    }
+
+    /// A faucet build on the adiri/testnet genesis is allowed; that chain is
+    /// faucet-intended and separately covered by the `adiri` feature guard.
+    #[test]
+    fn faucet_build_accepts_testnet_genesis() -> eyre::Result<()> {
+        assert!(validate_faucet_build(true, &adiri_genesis()).is_ok());
+        Ok(())
+    }
+
+    /// A faucet build on a devnet genesis that reuses mainnet's chain id 487 (the
+    /// documented docker-devnet flow) must NOT be rejected: the guard keys on genesis
+    /// identity, not chain id.
+    #[test]
+    fn faucet_build_accepts_devnet_genesis_with_mainnet_chain_id() -> eyre::Result<()> {
+        let base: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        let devnet = Genesis { timestamp: base.timestamp.wrapping_add(1), ..base };
+        assert_eq!(devnet.config.chain_id, 487);
+        assert!(validate_faucet_build(true, &devnet).is_ok());
+        Ok(())
+    }
+
+    /// A faucet build must be refused on a genesis whose fork config diverges from
+    /// canonical mainnet while header and alloc stay identical: such a genesis computes
+    /// mainnet's exact genesis block hash (the positive control below), so it could
+    /// still join mainnet consensus. Struct equality would wrongly admit it; hash
+    /// identity refuses it.
+    #[test]
+    fn faucet_build_rejects_config_only_divergence_from_mainnet() -> eyre::Result<()> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        let mut divergent = mainnet.clone();
+        divergent.config.dao_fork_support = !divergent.config.dao_fork_support;
+        assert_ne!(divergent, mainnet);
+        assert_eq!(genesis_block_hash(divergent.clone()), genesis_block_hash(mainnet));
+        assert!(validate_faucet_build(true, &divergent).is_err());
+        Ok(())
+    }
+
+    /// The compiled feature set gates the canonical mainnet genesis exactly: refused
+    /// when the binary carries the faucet feature and accepted otherwise. This
+    /// exercises the same `FAUCET_ENABLED` value the [`NodeCommand::execute`] call site
+    /// wires in, under whichever feature set the test build resolved.
+    #[test]
+    fn compiled_feature_set_gates_canonical_mainnet_genesis() -> eyre::Result<()> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        assert_eq!(validate_faucet_build(FAUCET_ENABLED, &mainnet).is_err(), FAUCET_ENABLED);
+        Ok(())
     }
 }
