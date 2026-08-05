@@ -112,9 +112,9 @@ impl RethEnv {
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<Self> {
         // Fail fast on a pruning configuration before any database work happens. Every RethEnv in
-        // the process funnels through here, and every pinned registry read this env goes on to
-        // serve resolves historical state through `pinned_state_and_env`, which reth can only
-        // answer from the pinned block while the history covering it is intact.
+        // the process funnels through here, and every pinned read this env goes on to serve
+        // resolves historical state through `read_only_state_db`, which reth can only answer from
+        // the pinned block while the history covering it is intact.
         reth_config.ensure_archive_mode()?;
 
         let node_config = reth_config.0.clone();

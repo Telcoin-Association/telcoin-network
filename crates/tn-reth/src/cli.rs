@@ -381,9 +381,11 @@ impl RethConfig {
 
     /// Assert the archive-mode invariant that every pinned historical read depends on.
     ///
-    /// Pinned reads (committee membership, epoch records, epoch state, worker fee configs) all
-    /// resolve their state through `RethEnv::pinned_state_and_env`, and reth only serves that
-    /// state from the requested block while the history indices covering it are intact.
+    /// Pinned reads (committee membership, epoch records, epoch state, worker fee configs, and
+    /// the general pinned contract read) all resolve their state through
+    /// `RethEnv::read_only_state_db` — the epoch reads via its `pinned_state_and_env` wrapper,
+    /// `read_contract_inner` directly — and reth only serves that state from the requested block
+    /// while the history indices covering it are intact.
     ///
     /// Reth catches part of the pruned case loudly: for a pinned block strictly BELOW the
     /// recorded watermark, `HistoricalStateProviderRef` returns
