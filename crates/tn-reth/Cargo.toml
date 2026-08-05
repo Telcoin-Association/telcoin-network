@@ -72,6 +72,7 @@ secp256k1 = { workspace = true, optional = true }
 
 [dev-dependencies]
 metrics-util = { workspace = true }
+serde_yaml = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 secp256k1 = { workspace = true }
 proptest = { workspace = true }
