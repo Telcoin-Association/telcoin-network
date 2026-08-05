@@ -64,10 +64,12 @@ pub struct TNPayload {
     /// Randomness digest carried only by the payload that closes the epoch.
     ///
     /// `Some` for the last batch of an epoch-closing `ConsensusOutput`; `None` otherwise. The
-    /// value is the epoch seed chain value as of the closing commit (see
-    /// `ConsensusOutput::committee_shuffle_seed`). During execution it seeds the deterministic
-    /// shuffle that selects the next committee, and it is recorded in the executed block
-    /// header's `extra_data` so replay recovers the same seed.
+    /// value is whatever `ConsensusOutput::committee_shuffle_seed` yields for the closing epoch,
+    /// which is epoch-gated: the epoch seed chain value as of the closing commit once
+    /// `seed_signature_active` holds, and the legacy keccak256 of the leader certificate's
+    /// aggregate BLS signature for every epoch before the fork. During execution it seeds the
+    /// deterministic shuffle that selects the next committee, and it is recorded in the executed
+    /// block header's `extra_data` so replay recovers the same seed.
     pub close_epoch: Option<B256>,
     /// Worker that created this payload.
     pub worker_id: WorkerId,

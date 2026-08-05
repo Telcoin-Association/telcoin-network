@@ -931,10 +931,19 @@ pub fn consensus_output_for_tests(
         subdag_index,
         reputation_scores,
         previous_sub_dag,
-        // This fixture stands in for the FIRST commit of `epoch`, so it anchors on that epoch's
-        // root exactly as production does. The genesis placeholder would freeze the shuffle seed
-        // to one constant for every epoch, which is what the epoch-close tests in
-        // `crate::env::epoch` would then be pinning.
+        // Anchor on `epoch`'s root rather than the genesis placeholder, which would freeze the
+        // shuffle seed to one constant for every epoch and leave the epoch-close tests in
+        // `crate::env::epoch` pinning that constant instead of a seed-dependent committee.
+        //
+        // CAVEAT: this re-derives the root on EVERY call, ignoring `subdag_index`, so it models
+        // production only for the FIRST commit of `epoch`. `CommittedSubDag::new` documents
+        // `seed_chain` as the previous commit's value (the epoch root only at the first commit),
+        // and this fixture does not thread that chain forward. Two calls with the same `epoch`
+        // therefore produce the same seed even though they stand in for different commits. That is
+        // currently harmless because the seed is only read when `close_epoch` is true
+        // (`TNPayload::new`) and every such call site here uses a freshly incremented epoch. A new
+        // test that closes the same epoch twice would silently pin a degenerate seed: thread the
+        // prior output's `committee_shuffle_seed()` in instead of calling this helper again.
         tn_types::EpochSeedChainValue::epoch_root(epoch),
     );
     ConsensusOutput::new(

@@ -1277,13 +1277,19 @@ mod tests {
         // all run the genesis five). Six validators are eligible for five seats, so WHICH one the
         // shuffle drops is a pinned function of this fixture's seed: change
         // `consensus_output_for_tests`, `EpochSeedChainValue`, or the registry shuffle and this
-        // membership moves. This is a full-equality pin; only the committee size and the
-        // increasing-address ordering it also encodes are seed-independent.
+        // membership moves.
+        //
+        // The dropped validator is `validator_2_eoa`, so the seat goes to `validator_2_address`
+        // (`0x901ce5be..`), not to `validator_5` (`0x5555..`). Both keep the vec in increasing
+        // address order, so ordering CANNOT tell them apart: verify this pin against the addresses
+        // themselves, never against the ordering. This membership is byte-identical to the pin on
+        // `origin/main`, i.e. seeding the shuffle from the epoch seed chain rather than the leader
+        // aggregate signature does not move which validator this fixture drops.
         let expected_new_committee = vec![
             validator_1,
             validator_3,
             validator_4,
-            validator_5,
+            validator_2_address,
             new_validator.execution_address,
         ];
 
@@ -1332,10 +1338,19 @@ mod tests {
             execute_payload_and_update_canonical_chain(&reth_env, payload, vec![begin_exit_tx])?;
         let canonical_header = block4.recovered_block.clone_sealed_header();
 
-        // Read the exit state at the tip WITHOUT closing an epoch first. `beginExit` moves the
-        // validator to `PendingExit` in its own block, but how many closes it then takes to reach
-        // `Exited` depends on whether the shuffle seated it in an upcoming committee, which is a
-        // function of the fixture's seed rather than of the exit lifecycle under test here.
+        // close epoch
+        expected_epoch += 1;
+        let consensus_output = consensus_output_for_tests(2, expected_epoch, 5, true);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block5 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block5.recovered_block.clone_sealed_header();
+
+        // create evm to read latest state
+        //
+        // NOTE: the assertions below deliberately run AFTER an epoch close, so they check that
+        // `PendingExit` and the active/pending-exit counts SURVIVE an epoch boundary rather than
+        // merely that `beginExit` set them in its own block. That is the interaction most exposed
+        // to a change in the epoch-close randomness source, so keep the close ahead of the reads.
         let state = StateProviderDatabase::new(reth_env.latest()?);
         let mut cached_reads = CachedReads::default();
         let mut db = State::builder()
@@ -1387,13 +1402,6 @@ mod tests {
             pending_exit.first().expect("one pending validator").validatorAddress,
             validator_2_address
         );
-
-        // close epoch
-        expected_epoch += 1;
-        let consensus_output = consensus_output_for_tests(2, expected_epoch, 5, true);
-        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
-        let block5 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
-        let canonical_header = block5.recovered_block.clone_sealed_header();
 
         // close epoch again to exit validator
         expected_epoch += 1;

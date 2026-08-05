@@ -65,12 +65,19 @@
 //!
 //! # Randomness
 //!
-//! The epoch-close `randomness` (`ctx.close_epoch`) is the epoch seed chain value as of the
-//! closing commit, folded per commit in `CommittedSubDag::new` and carried through
-//! the payload. It seeds the deterministic committee shuffle AND is stored as the block's
-//! `extra_data`, which is how the replay path (`context_for_block`) rebuilds an identical ctx
-//! from the sealed header. The RNG draw order inside the shuffle is consensus-critical: any
-//! refactor that reorders the draws selects a different committee.
+//! The epoch-close `randomness` (`ctx.close_epoch`) is whichever seed
+//! `ConsensusOutput::committee_shuffle_seed` yields for the closing epoch, and that is epoch-gated
+//! on `tn_types::forks::seed_signature_active`. For epochs where the gate is inactive (every
+//! `adiri` epoch before `SEED_SIGNATURE_FORK_EPOCH`) it stays the LEGACY seed, keccak256 of the
+//! leader certificate's aggregate BLS signature, wire-identical to pre-fork releases; for active
+//! epochs it is the epoch seed chain value as of the closing commit, folded per commit in
+//! `CommittedSubDag::new`. Do not read this module as describing the seed chain unconditionally:
+//! the whole point of the gate is that pre-fork epochs re-execute exactly as they always did.
+//!
+//! Either way the value is carried through the payload, seeds the deterministic committee shuffle,
+//! AND is stored as the block's `extra_data`, which is how the replay path (`context_for_block`)
+//! rebuilds an identical ctx from the sealed header. The RNG draw order inside the shuffle is
+//! consensus-critical: any refactor that reorders the draws selects a different committee.
 
 use crate::{
     error::{TnRethError, TnRethResult},
@@ -133,7 +140,7 @@ pub struct TNBlockExecutionCtx {
     /// This is the batch that was validated by consensus and executed
     /// to produce the EVM block.
     pub ommers_hash: B256,
-    /// The epoch seed chain value as of the closing commit. `Some` only for the
+    /// The epoch-close committee-shuffle seed. `Some` only for the
     /// final batch of the epoch's last `ConsensusOutput`.
     ///
     /// When included, the executor runs the epoch-closing system calls (see the module docs) and
@@ -561,8 +568,9 @@ where
     /// [`assemble_new_committee`] free function; this method only performs the on-chain reads and
     /// seeds the RNG so that the assembly logic stays unit-testable without a live EVM state.
     ///
-    /// `randomness` is `ctx.close_epoch`, the epoch seed chain value as of the closing commit,
-    /// used verbatim as the `StdRng` seed, so every node derives the same RNG
+    /// `randomness` is `ctx.close_epoch`, the epoch-gated committee-shuffle seed (epoch seed chain
+    /// value for fork-active epochs, legacy leader-aggregate keccak before the fork), used
+    /// verbatim as the `StdRng` seed, so every node derives the same RNG
     /// stream. The downstream draw order is consensus-critical: the draws decide which
     /// validators survive the truncation to committee size.
     fn shuffle_new_committee(&mut self, randomness: B256) -> TnRethResult<Vec<Address>> {
@@ -572,7 +580,7 @@ where
 
         debug!(target: "engine",  "validators pre-shuffle {:?}", all_active_validators);
 
-        // create seed from the epoch seed chain value as of the closing commit
+        // create seed from the epoch-close randomness carried in `ctx.close_epoch`
         let mut seed = [0; 32];
         seed.copy_from_slice(randomness.as_slice());
         trace!(target: "engine", ?seed, "seed after");
