@@ -1274,22 +1274,48 @@ mod tests {
             .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)?;
 
         // Epoch 3 is the first shuffled committee (committees are fixed two epochs ahead, so 0-2
-        // all run the genesis five). Six validators are eligible for five seats, so WHICH one the
-        // shuffle drops is a pinned function of this fixture's seed: change
-        // `consensus_output_for_tests`, `EpochSeedChainValue`, or the registry shuffle and this
-        // membership moves.
+        // all run the genesis five). Six validators are eligible for five seats, so the shuffle
+        // drops exactly one, and WHICH one is a function of the epoch-close seed.
         //
-        // The dropped validator is `validator_2_eoa`, so the seat goes to `validator_2_address`
-        // (`0x901ce5be..`), not to `validator_5` (`0x5555..`). Both keep the vec in increasing
-        // address order, so ordering CANNOT tell them apart: verify this pin against the addresses
-        // themselves, never against the ordering. This membership is byte-identical to the pin on
-        // `origin/main`, i.e. seeding the shuffle from the epoch seed chain rather than the leader
-        // aggregate signature does not move which validator this fixture drops.
+        // That seed is fork-gated, and the two sides of the gate drop DIFFERENT validators here,
+        // so no single hardcoded committee is correct for both builds. `make attest` runs this
+        // test twice: once with default features, where `seed_signature_active` is true from
+        // genesis and the seed is the epoch seed chain value, and once with `--features adiri`,
+        // where the gate is dormant while `SEED_SIGNATURE_FORK_EPOCH` is the `u32::MAX`
+        // placeholder and the seed stays the legacy keccak256 of the leader certificate's
+        // aggregate BLS signature. Pinning either literal on its own turns the other pass red, so
+        // derive the pin from the gate rather than picking a side.
+        //
+        // Epoch 3's membership was decided by the close of epoch 1 (`block2`), so the gate is
+        // evaluated at THAT epoch, not at the epoch being read.
+        //
+        // Verify these addresses against the addresses themselves, never against the vec's
+        // ordering: `0x5555..` and `0x901ce5be..` both leave it in increasing address order, so
+        // ordering CANNOT tell them apart. Changing `consensus_output_for_tests`,
+        // `EpochSeedChainValue`, or the registry shuffle moves this membership; re-pin it from an
+        // actual run of BOTH feature configurations.
+        let committee_seed_epoch = expected_epoch - 1;
+        let shuffle_seat = if tn_types::forks::seed_signature_active(committee_seed_epoch) {
+            // epoch seed chain seed: the shuffle drops `validator_2_eoa`, seating `validator_5`
+            validator_5
+        } else {
+            // legacy leader-aggregate seed: the shuffle drops `validator_5`, seating
+            // `validator_2_eoa`'s address. This is the pin `origin/main` carries, main having no
+            // seed chain to draw from.
+            validator_2_address
+        };
+
+        // The shuffle's choice propagates past this assert: a validator that keeps its seat in the
+        // committee just fixed cannot finish exiting at the next boundary, while an unseated one
+        // does. So validator 2's exit trajectory further down is decided by the same gate, and is
+        // expressed in terms of this one binding rather than re-deriving the condition there.
+        let validator_2_keeps_seat = shuffle_seat == validator_2_address;
+
         let expected_new_committee = vec![
             validator_1,
             validator_3,
             validator_4,
-            validator_2_address,
+            shuffle_seat,
             new_validator.execution_address,
         ];
 
@@ -1373,7 +1399,18 @@ mod tests {
                 calldata,
             )?;
         debug!(target: "engine", ?validator_2_info, "getting validator 2 info");
-        assert_eq!(validator_2_info.currentStatus, ValidatorStatus::PendingExit);
+        // `beginExit` ran in block4 and the epoch close in block5 followed it. Whether that close
+        // COMPLETED the exit depends on whether validator 2 still holds a seat in the committee
+        // the shuffle fixed above: a seated validator stays `PendingExit` until it leaves the
+        // committee, an unseated one reaches `Exited` at the boundary. Both are correct registry
+        // behavior, and which one this fixture sees is decided by the epoch-close seed, so the
+        // expectation keys on the same gate as the committee pin.
+        let (expected_status, expected_pending_exits) = if validator_2_keeps_seat {
+            (ValidatorStatus::PendingExit, 1)
+        } else {
+            (ValidatorStatus::Exited, 0)
+        };
+        assert_eq!(validator_2_info.currentStatus, expected_status);
 
         // With the per-status sets, `getValidatorsInfo(Active)` returns strictly-active validators;
         // the committee-eligible pool is the union of Active/PendingActivation/PendingExit, so the
@@ -1397,10 +1434,13 @@ mod tests {
                 .abi_encode()
                 .into(),
             )?;
-        assert_eq!(pending_exit.len(), 1);
+        assert_eq!(pending_exit.len(), expected_pending_exits);
+        // When the close already completed the exit there is no pending-exit entry to identify, so
+        // compare optionally rather than indexing: `None` is the correct answer in that build, and
+        // an `expect` here would turn a legitimate trajectory into a panic.
         assert_eq!(
-            pending_exit.first().expect("one pending validator").validatorAddress,
-            validator_2_address
+            pending_exit.first().map(|v| v.validatorAddress),
+            validator_2_keeps_seat.then_some(validator_2_address)
         );
 
         // close epoch again to exit validator
