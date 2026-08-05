@@ -77,8 +77,18 @@ pub(super) fn sweep_stale_tmp_exports(export_root: &Path) {
 /// Best-effort removal of an export temp dir, logging at warn on failure so a leftover temp is
 /// observable (the next boundary's [`sweep_stale_tmp_exports`] will retry it). Replaces the silent
 /// `let _ = remove_dir_all(..)` cleanups on the export completion task's failure/skip paths.
-fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
-    match std::fs::remove_dir_all(tmp_dir) {
+///
+/// Runs the removal on tokio's blocking pool: a partially-written export can be arbitrarily large
+/// (most of a finished state walk plus the copied consensus pack), so an inline `remove_dir_all`
+/// would pin a runtime worker thread. A cancelled/panicked blocking task surfaces through the same
+/// warn path as an IO failure.
+async fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
+    let dir = tmp_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir))
+        .await
+        .map_err(std::io::Error::other)
+        .flatten()
+    {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
@@ -368,6 +378,11 @@ where
     /// also waits a bounded time for epoch N's own certificate (only aggregated at the next epoch's
     /// start) and fails the export without it, so an importer never has to store the tip record
     /// unverified.
+    ///
+    /// Filesystem work that scales with epoch size (the consensus-pack copy and every temp-dir
+    /// removal) runs on tokio's blocking pool ([`tokio::task::spawn_blocking`]), never on a
+    /// runtime worker thread. The one pre-spawn removal below goes through the same offload,
+    /// since `run_epoch` awaits this method on the epoch-close critical path.
     pub(super) async fn export_epoch_state(
         &self,
         primary: &PrimaryNode<DB>,
@@ -440,7 +455,15 @@ where
         // If it cannot be removed, writing into it would append onto stale bytes and publish a
         // doubled bundle, so skip this export — NOT fatal, the next epoch boundary retries.
         let tmp_dir = export_root.join(format!("epoch-{epoch}.tmp"));
-        match std::fs::remove_dir_all(&tmp_dir) {
+        // The stale temp can itself be a large partial export from a crashed run, so its removal
+        // is offloaded to the blocking pool too: `run_epoch` awaits this method, so an inline
+        // removal here would block the epoch-close critical path.
+        let stale_tmp = tmp_dir.clone();
+        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&stale_tmp))
+            .await
+            .map_err(std::io::Error::other)
+            .flatten()
+        {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -463,10 +486,20 @@ where
                         Ok(Ok(Some(outcome))) => {
                             // Safe: the closed epoch's pack is sealed at export time (see the
                             // persist note above) — no writer appends to a concluded epoch's pack,
-                            // so this reads a complete, immutable file.
-                            if let Err(e) = std::fs::copy(&src_consensus, tmp_dir.join("consensus_data")) {
+                            // so this reads a complete, immutable file. The pack scales with the
+                            // epoch's consensus throughput, so copy it on the blocking pool
+                            // instead of pinning a runtime worker for the duration; a
+                            // cancelled/panicked blocking task surfaces as the same copy error.
+                            let copy_dst = tmp_dir.join("consensus_data");
+                            let copied = tokio::task::spawn_blocking(move || {
+                                std::fs::copy(&src_consensus, &copy_dst)
+                            })
+                            .await
+                            .map_err(std::io::Error::other)
+                            .flatten();
+                            if let Err(e) = copied {
                                 error!(target: "tn::snapshot", epoch, error = %e, "failed to copy consensus pack into export");
-                                remove_tmp_export(&tmp_dir, epoch);
+                                remove_tmp_export(&tmp_dir, epoch).await;
                                 return Ok(());
                             }
 
@@ -481,7 +514,7 @@ where
                             // to store the tip record unverified, so fail the export instead.
                             let Some(record_n) = consensus_chain.epochs().record_by_epoch(epoch).await else {
                                 warn!(target: "tn::snapshot", epoch, "epoch record missing at export time; skipping export");
-                                remove_tmp_export(&tmp_dir, epoch);
+                                remove_tmp_export(&tmp_dir, epoch).await;
                                 return Ok(());
                             };
                             if consensus_chain
@@ -491,7 +524,7 @@ where
                                 .is_none()
                             {
                                 warn!(target: "tn::snapshot", epoch, wait_secs = CERT_WAIT.as_secs(), "epoch certificate not aggregated within wait; skipping export of epoch {epoch}");
-                                remove_tmp_export(&tmp_dir, epoch);
+                                remove_tmp_export(&tmp_dir, epoch).await;
                                 return Ok(());
                             }
 
@@ -507,7 +540,7 @@ where
                                 .await
                             {
                                 error!(target: "tn::snapshot", epoch, error = %e, "failed to write epoch records/certs bundle into export");
-                                remove_tmp_export(&tmp_dir, epoch);
+                                remove_tmp_export(&tmp_dir, epoch).await;
                                 return Ok(());
                             }
 
@@ -522,23 +555,23 @@ where
                                 ),
                                 Err(e) => {
                                     error!(target: "tn::snapshot", epoch, error = %e, "failed to move exported epoch bundle into place");
-                                    remove_tmp_export(&tmp_dir, epoch);
+                                    remove_tmp_export(&tmp_dir, epoch).await;
                                 }
                             }
                         }
                         // intentional skip: the epoch is not resumable, so no bundle was written.
                         Ok(Ok(None)) => {
                             info!(target: "tn::snapshot", epoch, "skipped state export for epoch: snapshot would not be resumable; no bundle written");
-                            remove_tmp_export(&tmp_dir, epoch);
+                            remove_tmp_export(&tmp_dir, epoch).await;
                         }
                         // export failed or the worker went away: drop the partial temp dir.
                         Ok(Err(e)) => {
                             warn!(target: "tn::snapshot", epoch, error = %e, "epoch state export failed");
-                            remove_tmp_export(&tmp_dir, epoch);
+                            remove_tmp_export(&tmp_dir, epoch).await;
                         }
                         Err(_) => {
                             warn!(target: "tn::snapshot", epoch, "epoch state export worker dropped the reply");
-                            remove_tmp_export(&tmp_dir, epoch);
+                            remove_tmp_export(&tmp_dir, epoch).await;
                         }
                     }
                     Ok(())
@@ -838,5 +871,22 @@ mod tests {
 
         // A missing exports root is a no-op (must not panic).
         sweep_stale_tmp_exports(&export_root.join("does-not-exist"));
+    }
+
+    /// The completion-task cleanup must remove this epoch's temp dir (contents and all) via the
+    /// blocking pool, and treat an already-missing dir as the silent NotFound fast path.
+    #[tokio::test]
+    async fn remove_tmp_export_removes_dir_and_tolerates_missing() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let tmp_dir = root.path().join("epoch-3.tmp");
+        std::fs::create_dir_all(tmp_dir.join("nested")).expect("mkdir");
+        std::fs::write(tmp_dir.join("nested").join("state_data"), b"x").expect("write file");
+
+        remove_tmp_export(&tmp_dir, 3).await;
+        assert!(!tmp_dir.exists(), "temp export dir must be removed recursively");
+
+        // Second call hits the NotFound arm: must be a silent no-op, not an error.
+        remove_tmp_export(&tmp_dir, 3).await;
+        assert!(!tmp_dir.exists(), "missing temp dir must remain a no-op");
     }
 }
