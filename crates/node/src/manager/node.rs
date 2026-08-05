@@ -21,7 +21,10 @@ use crate::{
 };
 use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
@@ -1280,6 +1283,11 @@ where
             basefee_address,
             gas_accumulator.clone(),
         )?;
+        // Give the consensus bus a canonical-DB fallback for `wait_for_execution` (issue #1036):
+        // an execution tip evicted from the in-memory `recent_blocks` ring but still persisted as
+        // canonical in the DB must not be misread as a fork. The bus is constructed before the
+        // engine exists, so the reader is wired here; a per-epoch rebuild simply refreshes it.
+        self.consensus_bus.set_canonical_reader(Arc::new(reth_env.clone()));
         let engine = ExecutionNode::new(&self.builder, reth_env)?;
 
         Ok(engine)
