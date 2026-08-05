@@ -242,7 +242,9 @@ fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
     let mut buf = raw.as_slice();
     match PooledTransaction::decode_2718(&mut buf) {
         Err(_) => Some((GatewayError::InvalidTransaction, id)),
-        Ok(tx) if tx.is_eip4844() => Some((GatewayError::UnsupportedTransactionType, id)),
+        Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
+            Some((GatewayError::UnsupportedTransactionType, id))
+        }
         Ok(_) => None,
     }
 }

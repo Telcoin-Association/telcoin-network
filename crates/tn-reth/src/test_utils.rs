@@ -3,7 +3,7 @@
 //! Grouped by role:
 //!
 //! - [`TransactionFactory`]: deterministic keypair plus nonce tracking to create, sign, and submit
-//!   EIP-1559, legacy, and EIP-4844 transactions.
+//!   EIP-1559, legacy, EIP-4844, and EIP-7702 transactions.
 //! - `RethEnv` test constructors and read helpers: `new_for_test`, `state_by_block_hash`, `tn_evm`,
 //!   `execution_outcome_for_tests`, and `ConsensusRegistry` reads (`get_validator_rewards`,
 //!   `get_bls_pubkey`, `get_validator_info`, `validators_for_epoch_at_block`,
@@ -30,8 +30,10 @@ use crate::{
     ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool,
 };
 use alloy::{
-    consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant, TxLegacy},
-    eips::eip7594::BlobTransactionSidecarVariant,
+    consensus::{
+        SignableTransaction as _, TxEip2930, TxEip4844, TxEip4844Variant, TxEip7702, TxLegacy,
+    },
+    eips::{eip7594::BlobTransactionSidecarVariant, eip7702::Authorization},
     hex,
     primitives::{utils::parse_ether, ChainId},
     signers::{
@@ -413,6 +415,84 @@ impl TransactionFactory {
         self.inc_nonce();
 
         TransactionSigned::new_unhashed(variant.into(), signature)
+    }
+
+    /// Create a signed EIP-2930 access-list transaction.
+    pub fn create_eip2930(
+        &mut self,
+        chain_id: ChainId,
+        gas_limit: Option<u64>,
+        gas_price: u128,
+        to: Address,
+    ) -> TransactionSigned {
+        let gas_limit = gas_limit.unwrap_or(1_000_000);
+
+        // access-list transaction
+        let tx = TxEip2930 {
+            chain_id,
+            nonce: self.nonce,
+            gas_price,
+            gas_limit,
+            to: TxKind::Call(to),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::new(),
+        };
+        let tx_signature_hash = tx.signature_hash();
+
+        // construct transaction and sign
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for next tx
+        self.inc_nonce();
+
+        TransactionSigned::new_unhashed(tx.into(), signature)
+    }
+
+    /// Create a signed EIP-7702 set-code transaction carrying one authorization
+    /// signed by this factory's key, so the envelope is well-formed and its type
+    /// byte is the only reason a fork-blind validator could reject it.
+    pub fn create_eip7702(
+        &mut self,
+        chain_id: ChainId,
+        gas_limit: Option<u64>,
+        gas_price: u128,
+    ) -> TransactionSigned {
+        let gas_limit = gas_limit.unwrap_or(1_000_000);
+
+        // authorization signed by this factory's key; for a self-sponsored delegation
+        // the account nonce at authorization check time is the tx nonce + 1 (the
+        // sender's nonce increments before the authorization list is processed)
+        let authorization = Authorization {
+            chain_id: U256::from(chain_id),
+            address: Address::ZERO,
+            nonce: self.nonce + 1,
+        };
+        let auth_signature = self.sign_hash(authorization.signature_hash());
+        let signed_authorization = authorization.into_signed(auth_signature);
+
+        // set-code transaction
+        let tx = TxEip7702 {
+            chain_id,
+            nonce: self.nonce,
+            gas_limit,
+            max_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: 0,
+            to: address!("a8cb082a5a689e0d594d7da1e2d72a3d63adc1bd"),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list: vec![signed_authorization],
+            input: Bytes::new(),
+        };
+        let tx_signature_hash = tx.signature_hash();
+
+        // construct transaction and sign
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for next tx
+        self.inc_nonce();
+
+        TransactionSigned::new_unhashed(tx.into(), signature)
     }
 
     /// Create and sign an EIP4844 transaction.

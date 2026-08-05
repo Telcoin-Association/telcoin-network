@@ -54,7 +54,7 @@ pub use alloy::{
     },
     eips::{
         eip1559::{ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE},
-        eip2718::{Decodable2718, Encodable2718},
+        eip2718::{Decodable2718, Encodable2718, Typed2718},
         eip4844::{env_settings::EnvKzgSettings, BlobAndProofV1, BlobTransactionSidecar},
         BlockHashOrNumber, BlockNumHash,
     },
@@ -70,6 +70,16 @@ pub use alloy::{
     sol_types::{SolCall, SolType, SolValue},
 };
 pub use libp2p::{multiaddr::Protocol, Multiaddr};
+
+/// Whether a transaction's EIP-2718 type is on the batch executable allowlist
+/// (legacy, EIP-2930, EIP-1559).
+///
+/// One predicate shared by the batch validator, the batch builder, and the
+/// worker gateway so producers and validators can never disagree on the set.
+/// Deliberately fork-blind: uniform across chain configurations.
+pub fn batch_allowlisted_tx_type<T: Typed2718>(tx: &T) -> bool {
+    tx.is_legacy() || tx.is_eip2930() || tx.is_eip1559()
+}
 pub use reth_primitives::{
     Account, Block, BlockBody, EthPrimitives, NodePrimitives, PooledTransaction, Receipt,
     Recovered, RecoveredBlock, SealedBlock, SealedHeader, Transaction, TransactionSigned,
