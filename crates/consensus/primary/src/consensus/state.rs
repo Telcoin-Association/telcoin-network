@@ -378,6 +378,15 @@ impl<DB: Database> Consensus<DB> {
 
         debug!(target: "epoch-manager", ?latest_sub_dag, "recovered latest subdag:");
 
+        // Recovery's self-consistency tripwire lives inside `resolve_seed_chain_anchor`, which
+        // subsumes the standalone `sub_dag.leader_round() == last_committed_round` check main
+        // carries here: it rejects that same disagreement as
+        // `EpochSeedChainError::LeaderRoundMismatch`, and additionally rejects the two cursor
+        // combinations the standalone check cannot see (a committed round with no readable
+        // sub-dag, and a sub-dag with no cursor pointing at it). Both operands derive from the
+        // same append-only `ConsensusPack`, so none of these is reachable on an honest
+        // single-node crash; all three are typed, recoverable errors rather than an
+        // `assert_eq!` backtrace, which is what `ConsensusInvariant` asks for at this site.
         let seed_chain = resolve_seed_chain_anchor(
             latest_sub_dag.as_ref(),
             last_committed_round,
@@ -538,12 +547,29 @@ impl<DB: Database> Consensus<DB> {
                     .await
                     .map_err(|_| ConsensusError::ShuttingDown)?;
 
-                assert_eq!(self.state.last_round.committed_round, leader_commit_round);
-
-                self.consensus_bus
-                    .app()
-                    .committed_round_updates()
-                    .send_replace(self.state.last_round.committed_round);
+                // Commit-accounting invariant: the last committed round must equal the max
+                // header round we just sequenced. If it ever disagrees, mirror the bogus-sub-dag
+                // handling above (go inactive + shut down cleanly) instead of panicking on the
+                // single consensus task; the notified shutdown ends the run loop on the next
+                // select, so the trailing `Ok(())` is reached without further processing.
+                if self.state.last_round.committed_round == leader_commit_round {
+                    self.consensus_bus
+                        .app()
+                        .committed_round_updates()
+                        .send_replace(self.state.last_round.committed_round);
+                } else {
+                    tracing::error!(
+                        target: "telcoin::consensus_state",
+                        committed_round = self.state.last_round.committed_round,
+                        leader_commit_round,
+                        "commit-accounting invariant violated: last committed round does not match leader commit round; going inactive and shutting down",
+                    );
+                    self.consensus_bus
+                        .app()
+                        .node_mode()
+                        .send_modify(|v| *v = NodeMode::CvvInactive);
+                    self.consensus_config.shutdown().notify();
+                }
             }
         }
         Ok(())

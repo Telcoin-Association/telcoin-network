@@ -12,8 +12,15 @@
 //! `context_for_next_block` copies `TNPayload::close_epoch` into the execution context, and the
 //! assembler later records it as the header's `extra_data`. Re-executing a stored block,
 //! `context_for_block` recovers the same value by decoding `extra_data` (empty = normal block,
-//! 32 bytes = the closing-epoch digest, any other length = malformed-header error), so replay
-//! reproduces the identical epoch-boundary execution.
+//! 32 bytes = the closing-epoch digest, any other length = malformed-header error).
+//!
+//! Replay caveat: `rewards_counter` is NOT header-derived — both context builders clone the
+//! config's live shared counter. Re-executing an epoch-closing block outside its original
+//! epoch context (e.g. `debug_executionWitness`) therefore runs `applyIncentives` with
+//! whatever the counter holds at that moment, not the amounts the historical block
+//! distributed. Reconstructing the historical counts from `block.body.withdrawals` (which
+//! records them) is a known follow-up; the canonical sync path is unaffected because the
+//! epoch manager seeds the counter before replaying an epoch's outputs.
 
 use super::{TNBlockAssembler, TNBlockExecutionCtx, TNBlockExecutorFactory, TNEvmFactory};
 use crate::{error::TnRethError, payload::TNPayload, TNPrimitives};
@@ -145,7 +152,9 @@ impl ConfigureEvm for TnEvmConfig {
             number: U256::from(parent.number + 1),
             beneficiary: payload.beneficiary,
             timestamp: U256::from(payload.timestamp),
-            difficulty: U256::from(payload.batch_index), // stored in final execution
+            // unread post-merge; the header's difficulty comes from ctx.difficulty in the
+            // assembler (batch_index << 16 | worker_id), not from this block-env field
+            difficulty: U256::from(payload.batch_index),
             prevrandao: Some(payload.prev_randao()),
             gas_limit: payload.gas_limit,
             basefee: payload.base_fee_per_gas,
@@ -188,6 +197,10 @@ impl ConfigureEvm for TnEvmConfig {
             close_epoch,
             difficulty: block.difficulty,
             rewards_counter: self.rewards_counter.clone(),
+            // the header carries no slash list: a replayed block cannot reproduce a
+            // test-injected slash (and does not need to — production lists are always empty)
+            #[cfg(test)]
+            epoch_boundary_slashes: Vec::new(),
         })
     }
 
@@ -204,6 +217,8 @@ impl ConfigureEvm for TnEvmConfig {
             close_epoch: payload.close_epoch,
             difficulty: U256::from(payload.batch_index << 16 | payload.worker_id as usize),
             rewards_counter: self.rewards_counter.clone(),
+            #[cfg(test)]
+            epoch_boundary_slashes: payload.epoch_boundary_slashes,
         })
     }
 }

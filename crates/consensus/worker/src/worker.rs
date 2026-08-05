@@ -313,8 +313,9 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                             "batch sealed"
                         );
                         self.metrics.record_batch_sealed(batch.size(), batch.transactions.len());
-                        // Publish the digest for any nodes listening to this gossip (non-committee
-                        // members). Note, ignore error- this should not
+                        // Publish the digest for the nodes subscribed to this gossip, i.e. the
+                        // committee validators that consume individual current-epoch batches.
+                        // Note, ignore error- this should not
                         // happen and should not cause an issue (except the
                         // underlying p2p network may be in trouble but that will manifest quickly).
                         let _ = self.network_handle.publish_batch(digest).await;

@@ -300,8 +300,9 @@ sol!(
 
 // The epoch-close surface of the PRE-fork `ConsensusRegistry` deployment. While the deployed
 // registry still carries the pre-fork code hash, epoch closes must replay this exact two-call
-// ABI (the unified three-argument `concludeEpoch` does not exist on-chain there); the code-hash
-// gate in `evm/block.rs` routes between the two. Frozen: these signatures must stay
+// sequence byte-for-byte — re-executed pre-fork blocks must derive identical state roots
+// without leaning on contract-semantics arguments about which extra calls would no-op; the
+// code-hash gate in `evm/block.rs` routes between the two. Frozen: these signatures must stay
 // byte-identical to the calls the historical chain executed.
 sol!(
     /// Pre-fork `ConsensusRegistry` epoch-close interface.

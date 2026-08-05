@@ -13,6 +13,7 @@ mod genesis_tests;
 mod metrics;
 mod restarts;
 mod staking;
+mod state_export_import;
 mod sync;
 
 fn main() {}

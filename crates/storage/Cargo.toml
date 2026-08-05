@@ -18,8 +18,10 @@ eyre = { workspace = true }
 ouroboros = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
-# For the persist async implemetation.
-tokio = { workspace = true, features = [ "sync", "fs" ] }
+# For the persist async implemetation. `rt` is needed for `spawn_blocking` (offloading the blocking
+# pack writes in `export_bounded_bundle`); declared explicitly rather than relying on workspace
+# feature unification so a lib-only `cargo build -p tn-storage` also resolves it.
+tokio = { workspace = true, features = [ "sync", "fs", "rt" ] }
 crc32fast = "1.5.0"
 cfg-if = { workspace = true }
 serde = { workspace = true }

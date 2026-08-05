@@ -65,6 +65,8 @@ tn-types = { workspace = true, features = ["test-utils"] }
 tn-reth = { workspace = true, features = ["test-utils"] }
 tn-config = { workspace = true, features = ["test-utils"]}
 tempfile = { workspace = true }
+rand = { workspace = true }
+roaring = { workspace = true }
 
 [build-dependencies]
 vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }

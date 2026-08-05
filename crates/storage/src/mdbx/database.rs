@@ -113,6 +113,14 @@ fn default_page_size() -> usize {
     os_page_size.clamp(min_page_size, libmdbx_max_page_size)
 }
 
+/// The MDBX sync mode compiled into `test` and `test-utils` builds. `SafeNoSync` removes the
+/// hot-path `fsync` while still surviving a process kill+restart (see [`MdbxDatabase::open`]);
+/// it must never be `UtterlyNoSync`, which risks whole-DB corruption on an OS/power crash. This
+/// is the single source of truth `open` applies, so a test can pin it exactly. Production builds
+/// enable neither cfg and this const does not exist for them (the env stays `Durable`).
+#[cfg(any(test, feature = "test-utils"))]
+const BUILD_SYNC_MODE: reth_libmdbx::SyncMode = reth_libmdbx::SyncMode::SafeNoSync;
+
 impl MdbxDatabase {
     /// Creates a new database at the specified path if it doesn't exist. Does NOT create tables.
     /// Check [`init_db`].
@@ -122,19 +130,51 @@ impl MdbxDatabase {
         max_size: usize,
         growth_step: usize,
     ) -> eyre::Result<Self> {
-        let env = Environment::builder()
-            .set_max_dbs(max_tables)
-            .write_map()
-            .set_geometry(Geometry {
-                // Maximum database size
-                size: Some(0..max_size),
-                // We grow the database in increments of 1 gigabyte
-                growth_step: Some(growth_step as isize),
-                // The database never shrinks
-                shrink_threshold: Some(0),
-                page_size: Some(PageSize::Set(default_page_size())),
-            })
-            .open(path.as_ref())?;
+        let mut builder = Environment::builder();
+        builder.set_max_dbs(max_tables).write_map().set_geometry(Geometry {
+            // Maximum database size
+            size: Some(0..max_size),
+            // We grow the database in increments of 1 gigabyte
+            growth_step: Some(growth_step as isize),
+            // The database never shrinks
+            shrink_threshold: Some(0),
+            page_size: Some(PageSize::Set(default_page_size())),
+        });
+
+        // Test and `test-utils` builds trade fsync durability for write speed: they open the
+        // env in `SafeNoSync` instead of the default `Durable`, which removes the meta+data
+        // `fsync` that MDBX performs at every `txn.commit()` on the consensus hot path.
+        //
+        // This is coverage-preserving. With `write_map()` + `SafeNoSync`, a committed
+        // transaction survives a *process* crash/kill+restart -- the only recovery the tests
+        // ever exercise (they restart a node by relaunching the process against the same
+        // on-disk datadir) -- because the data lives in the file-backed mmap / OS page cache
+        // and a relaunched process re-maps it. Durability is lost only on an *OS/power* crash,
+        // which no test induces.
+        //
+        // It must be `SafeNoSync`, never `UtterlyNoSync`. `SafeNoSync` keeps the last steady
+        // commit's pages untouched, so it is corruption-proof on *any* crash (it can always roll
+        // back to that steady commit) and merely loses the last transactions on an OS/power
+        // crash. `UtterlyNoSync` discards that steady commit for marginally faster writes and can
+        // corrupt the whole database on an OS/power crash -- a needless risk given our access
+        // pattern. Note the e2e suite would NOT reliably catch a drift to `UtterlyNoSync`: an
+        // OS-alive process restart recovers under either mode, so the `BUILD_SYNC_MODE` const and
+        // its `assert_eq!` are what actually enforce the choice, not the restart tests.
+        //
+        // The `feature = "test-utils"` arm is what reaches the e2e nodes: they are spawned as
+        // separate processes built with `--features tn-storage/test-utils`, where `cfg(test)`
+        // is not live, so no CLI plumbing is required to select the mode. Production builds
+        // enable neither cfg, so this block is compiled out and the default `Durable` stands.
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            use reth_libmdbx::{EnvironmentFlags, Mode};
+            builder.set_flags(EnvironmentFlags {
+                mode: Mode::ReadWrite { sync_mode: BUILD_SYNC_MODE },
+                ..Default::default()
+            });
+        }
+
+        let env = builder.open(path.as_ref())?;
 
         Ok(MdbxDatabase { inner: env })
     }
@@ -427,5 +467,35 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let db = open_db(temp_dir.path());
         db_simp_bench(db, "MDBX");
+    }
+
+    /// #917: under the `test`/`test-utils` cfg the env must open in `SafeNoSync` (no hot-path
+    /// `fsync`) -- specifically not `Durable` (would keep the fsync) and, critically, not
+    /// `UtterlyNoSync` (risks whole-DB corruption on an OS/power crash). The e2e restart suite
+    /// cannot tell the two no-sync modes apart, so this const-assert is the real guard.
+    #[test]
+    fn test_open_uses_safe_no_sync_under_test_cfg() {
+        use super::BUILD_SYNC_MODE;
+        use reth_libmdbx::{Mode, SyncMode};
+
+        // Pin the exact compiled mode. `SyncMode` is `PartialEq`, so this catches a drift to
+        // `Durable` (fsync back on) or to `UtterlyNoSync` (recovery broken) -- the latter is the
+        // one the readback below cannot see, so this assert is what guards the hard constraint.
+        assert_eq!(BUILD_SYNC_MODE, SyncMode::SafeNoSync);
+
+        // And prove the flag actually reached MDBX: the opened env reports a non-`Durable` mode,
+        // so the hot-path fsync is genuinely gone. NOTE: MDBX defines
+        // `MDBX_UTTERLY_NOSYNC = MDBX_SAFE_NOSYNC | <extra bit>`, and reth-libmdbx's `mode()`
+        // tests the UtterlyNoSync mask before the SafeNoSync one, so it reports `UtterlyNoSync`
+        // for a genuine `SafeNoSync` env. We therefore assert only "not Durable / not read-only"
+        // from the readback; the exact-mode guarantee is pinned by the const assert above. Do not
+        // "fix" this into `assert_eq!(mode, ..SafeNoSync)` -- it cannot pass by construction.
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_db(temp_dir.path());
+        let mode = db.inner.info().expect("read env info").mode();
+        assert!(
+            matches!(mode, Mode::ReadWrite { sync_mode } if sync_mode != SyncMode::Durable),
+            "test-build MDBX env must not be Durable (hot-path fsync must be off), got {mode:?}"
+        );
     }
 }

@@ -118,6 +118,24 @@ pub fn execute_consensus_output(
         let base_fee_per_gas = canonical_header.base_fee_per_gas.unwrap_or_default();
         let gas_limit = canonical_header.gas_limit;
         let leader = output.leader().author();
+        // INVARIANT: this lookup cannot miss for valid output, and the halt on `None` is a
+        // deliberate fail-safe for impossible state; do NOT replace it with a default
+        // beneficiary. A silent default is chain-consistent (every node computes the same
+        // wrong address from the same state), so nothing downstream would ever detect the
+        // regression. Four legs make the miss unreachable:
+        //   1. `set_committee` runs at every `run_epoch` start before any output is forwarded (both
+        //      the replay and live paths in `crates/node/src/manager/node/run_epoch.rs`).
+        //   2. `close_epoch` blocks on `wait_for_consensus_execution` before returning, so the next
+        //      epoch's `set_committee` cannot overwrite the committee while the closing output is
+        //      still executing.
+        //   3. `RewardsCounter::clear` clears only leader counts, never the committee.
+        //   4. A committed sub-dag leader is a committee member by construction:
+        //      `LeaderSchedule::leader` indexes `committee.authorities()`, and the swap table only
+        //      substitutes members of the same committee.
+        // The fail-stop is pinned by `test_empty_close_epoch_unknown_leader_fail_stops` and
+        // `test_empty_close_epoch_without_committee_fail_stops` (`tests/it/main.rs`), which
+        // mirror the subscriber's own fail-stop for the non-empty path
+        // (`SubscriberError::UnexpectedAuthority`).
         let beneficiary = gas_accumulator
             .get_authority_address(leader)
             .ok_or(TnEngineError::UnknownAuthority(leader.clone()))

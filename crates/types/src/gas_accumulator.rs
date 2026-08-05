@@ -50,7 +50,7 @@
 //! computation (`adjust_base_fees`) folds the same formula over the same inputs, so the value it
 //! carries between close and the next entry is identical to what entry derivation recomputes.
 
-use crate::{AuthorityIdentifier, Committee, WorkerId};
+use crate::{AuthorityIdentifier, Committee, SealedHeader, WorkerId, B256};
 
 /// Fee strategy for a worker, read from the WorkerConfigs contract each epoch.
 /// Adding a new strategy = new contract constant + new enum variant + match arm in
@@ -63,6 +63,36 @@ pub enum WorkerFeeConfig {
     Eip1559 { target_gas: u64 },
     /// Fixed fee set by governance, no utilization-based adjustment.
     Static { fee: u64 },
+}
+
+/// The worker id that produced `header`, read from the low 16 bits of its `difficulty` field.
+///
+/// The engine encodes `difficulty` as `batch_index << 16 | worker_id` (matching how
+/// [`GasAccumulator::inc_block`] callers attribute blocks), so the worker id is the low 16 bits and
+/// the batch index occupies the upper bits. This is the single canonical implementation shared by
+/// the per-worker fee/gas derivation (`tn_node`) and the snapshot fee-derivability precheck
+/// (`tn_reth`), so both attribute headers with the exact same rule — no drift.
+pub fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
+    (header.difficulty.into_limbs()[0] & 0xffff) as u16
+}
+
+/// True when `header` is a genuine worker batch block.
+///
+/// Two on-chain block shapes are NOT worker batch blocks and must be excluded from per-worker
+/// fee/gas attribution:
+/// - the genesis block (`number == 0`), which carries no worker payload, and
+/// - the synthetic empty-close block the engine builds when an epoch closes with no batches. That
+///   block is stamped worker 0 and copies its PARENT's base fee (see `tn_engine`'s
+///   `execute_consensus_output`), so attributing it would poison worker 0 with another worker's
+///   fee. It is identified by `ommers_hash == B256::ZERO`: the header's `ommers_hash` carries the
+///   batch digest, and only the synthetic block passes `B256::ZERO` (real batch digests are never
+///   zero).
+///
+/// A non-empty epoch-closing block built from real batches has a non-zero `ommers_hash` and IS a
+/// genuine worker block. Shared canonical implementation used by both `tn_node` (fee/gas
+/// derivation) and `tn_reth` (snapshot fee-derivability precheck).
+pub fn is_worker_batch_block(header: &SealedHeader) -> bool {
+    header.number != 0 && header.ommers_hash != B256::ZERO
 }
 
 use alloy::{
@@ -434,6 +464,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_attribution_helpers_match_header_encoding() {
+        use crate::{ExecHeader, U256};
+        // `difficulty` encodes `batch_index << 16 | worker_id`; `ommers_hash` is the batch digest.
+        let header = |number: u64, batch_index: u64, wid: u16, ommers: B256| -> SealedHeader {
+            SealedHeader::seal_slow(ExecHeader {
+                number,
+                difficulty: U256::from((batch_index << 16) | wid as u64),
+                ommers_hash: ommers,
+                ..Default::default()
+            })
+        };
+        let nonzero = B256::from([0xab; 32]);
+
+        // genesis (block 0) is never a genuine batch block
+        assert!(!is_worker_batch_block(&header(0, 0, 0, nonzero)));
+        // the synthetic empty-close block carries a zero ommers_hash (batch-digest slot)
+        assert!(!is_worker_batch_block(&header(5, 0, 0, B256::ZERO)));
+        // a real batch block: non-genesis number, non-zero batch digest
+        assert!(is_worker_batch_block(&header(5, 0, 3, nonzero)));
+
+        // worker id is the LOW 16 bits; the batch index (upper bits) is ignored
+        assert_eq!(worker_id_from_header(&header(5, 42, 3, nonzero)), 3);
+        assert_eq!(worker_id_from_header(&header(5, 0, 0xffff, nonzero)), 0xffff);
+    }
+
+    #[test]
     fn gas_at_target_no_change() {
         // When gas_used == target_gas, delta is 0, fee unchanged
         assert_eq!(compute_next_base_fee_eip1559(1000, 500, 500), 1000);
@@ -698,5 +754,61 @@ mod tests {
         let counts = counter.get_address_counts();
         assert_eq!(counts.len(), 4);
         assert_eq!(counts.get(&victim_address), Some(&VICTIM_LEADER_BLOCKS));
+    }
+
+    /// Epoch-boundary invariant: `clear` resets every leader count so no rewards carry into the
+    /// next epoch's withdrawals, while the committee survives for the next epoch's tallies.
+    #[test]
+    fn clear_resets_leader_counts_but_preserves_committee() {
+        use crate::{BlsKeypair, CommitteeBuilder};
+        use rand::rng;
+
+        let mut rng = rng();
+        let keypairs: Vec<BlsKeypair> = (0..4).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let addresses: Vec<Address> = (0..4).map(|i| Address::repeat_byte(i as u8 + 1)).collect();
+
+        let mut builder = CommitteeBuilder::new(1);
+        for (keypair, address) in keypairs.iter().zip(addresses.iter()) {
+            builder.add_authority(*keypair.public(), *address);
+        }
+        let committee = builder.build();
+
+        let counter = RewardsCounter::default();
+        counter.set_committee(committee.clone());
+
+        let ids: Vec<AuthorityIdentifier> = keypairs
+            .iter()
+            .map(|keypair| {
+                committee
+                    .authority_by_key(keypair.public())
+                    .expect("keypair is a committee member")
+                    .id()
+            })
+            .collect();
+
+        // tally leader counts for two distinct addresses
+        for _ in 0..3 {
+            counter.inc_leader_count(&ids[0]);
+        }
+        counter.inc_leader_count(&ids[1]);
+
+        // sanity: the tallies are visible before the boundary
+        let counts = counter.get_address_counts();
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts.get(&addresses[0]), Some(&3));
+        assert_eq!(counts.get(&addresses[1]), Some(&1));
+        assert_eq!(counter.generate_withdrawals().len(), 2);
+
+        counter.clear();
+
+        // counts reset: nothing carries into the next epoch's incentives or withdrawals
+        assert!(counter.get_address_counts().is_empty());
+        assert!(counter.generate_withdrawals().is_empty());
+
+        // the committee survives clear: a fresh tally still resolves through it
+        counter.inc_leader_count(&ids[1]);
+        let counts = counter.get_address_counts();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get(&addresses[1]), Some(&1));
     }
 }

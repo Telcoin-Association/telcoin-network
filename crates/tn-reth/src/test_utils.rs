@@ -237,9 +237,11 @@ impl RethEnv {
     /// Read the committee validators for the provided epoch from the [ConsensusRegistry], pinned
     /// to the state of the block identified by `block_hash`.
     ///
-    /// Unlike [`Self::validators_for_epoch`], which reads the mutable canonical tip, every node
-    /// issuing this read at the same block decodes the identical committee — even after a
-    /// mid-epoch governance `burn` swap-and-pops the stored committee arrays.
+    /// Every node issuing this read at the same block decodes the identical committee — even
+    /// after a mid-epoch governance `burn` swap-and-pops the stored committee arrays; an
+    /// unpinned canonical-tip read would not. No unpinned sibling exists: this is the only
+    /// per-epoch validator-info accessor, and it is `test-utils`-gated because production takes
+    /// the whole committee from `RethEnv::epoch_state_at_epoch_start` instead.
     pub fn validators_for_epoch_at_block(
         &self,
         epoch: u32,

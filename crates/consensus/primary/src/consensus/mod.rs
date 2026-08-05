@@ -12,7 +12,7 @@ pub use crate::consensus::{
 };
 use thiserror::Error;
 use tn_storage::StoreError;
-use tn_types::{Certificate, EpochSeedChainError, HeaderDigest};
+use tn_types::{Certificate, EpochSeedChainError, HeaderDigest, Round};
 
 /// The default channel size used in the consensus and subscriber logic.
 pub const DEFAULT_CHANNEL_SIZE: usize = 1_000;
@@ -43,6 +43,54 @@ pub enum ConsensusError {
     /// execution permanently because the chain value reaches `parent_beacon_block_root`.
     #[error("Epoch seed chain recovery failed: {0}")]
     SeedChain(#[from] EpochSeedChainError),
+
+    /// A Bullshark construction invariant (or a startup-recovery self-consistency
+    /// invariant) did not hold. None of these conditions is reachable under the `< f`
+    /// fault assumption on current `main`; converting the former always-active
+    /// `assert!`/`.expect` panics into this typed error turns a would-be node panic
+    /// (with a low-context backtrace) into a diagnosable, structured shutdown.
+    #[error("Consensus invariant violated: {0}")]
+    Invariant(#[from] ConsensusInvariant),
+}
+
+/// A violated internal construction invariant of the Bullshark commit hot path or of
+/// startup recovery.
+///
+/// Each variant records the operands that disagreed so a future regression is
+/// diagnosable from the error alone, rather than from a bare `assert_eq!` backtrace.
+/// These are defense-in-depth: on current `main` none is reachable under the standard
+/// `< f` Byzantine fault assumption.
+#[derive(Debug, Error)]
+pub enum ConsensusInvariant {
+    /// The reputation-score map did not carry exactly the committee's authorities.
+    #[error("reputation score authority count {actual} does not match committee size {expected}")]
+    ReputationAuthorityCount {
+        /// Number of authorities present in the reputation-score map.
+        actual: usize,
+        /// Number of authorities in the current committee.
+        expected: usize,
+    },
+
+    /// The child round of a committable leader was absent from the in-memory DAG, so
+    /// the leader's support could not be tallied.
+    #[error("missing round {0} in DAG while tallying leader support (expected full history)")]
+    MissingLeaderChildRound(Round),
+
+    /// A leader was elected on an odd round; leaders are only ever elected on even rounds.
+    #[error("leader round {0} is odd (leaders are elected only on even rounds)")]
+    LeaderRoundNotEven(Round),
+
+    /// On startup recovery, the recovered latest sub-dag's leader round did not equal the
+    /// recovered last committed round.
+    #[error(
+        "recovered sub-dag leader round {leader_round} does not equal last committed round {last_committed_round}"
+    )]
+    RecoveredLeaderRoundMismatch {
+        /// Leader round of the recovered latest sub-dag.
+        leader_round: Round,
+        /// Recovered last committed round.
+        last_committed_round: Round,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]

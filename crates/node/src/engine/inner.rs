@@ -11,6 +11,7 @@ use tn_batch_validator::BatchValidator;
 use tn_config::Config;
 use tn_engine::ExecutorEngine;
 use tn_reth::{
+    error::{StateReadError, StateReadResult},
     system_calls::EpochState,
     worker::{WorkerComponents, WorkerNetwork},
     RethEnv, RpcServerHandle, WorkerTxPool,
@@ -18,8 +19,8 @@ use tn_reth::{
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
     gas_accumulator::GasAccumulator, Address, BatchSender, BatchValidation, BlockHeader,
-    BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer,
-    SealedHeader, TaskSpawner, WorkerId, B256,
+    BlsPublicKey, Bytes, ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader,
+    Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -378,29 +379,94 @@ impl ExecutionNodeInner {
 
     /// Read the current epoch's [EpochState] pinned to the previous epoch's closing block
     /// (genesis for epoch 0), returning the pin header alongside it.
-    pub(super) fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
-        self.reth_env.epoch_state_at_epoch_start()
+    ///
+    /// `tip` is the bootstrap sample the pin derives from, supplied by the caller so a retried
+    /// read can prove every attempt resolves the same pin (see
+    /// [`RethEnv::epoch_state_at_epoch_start_from_tip`]).
+    pub(super) fn epoch_state_at_epoch_start_from_tip(
+        &self,
+        tip: &SealedHeader,
+    ) -> StateReadResult<(EpochState, SealedHeader)> {
+        self.reth_env.epoch_state_at_epoch_start_from_tip(tip)
     }
 
-    /// Read committee validator keys for epoch, pinned to the block identified by `block_hash`.
-    /// On-chain BLS key bytes are decoded here; a decode failure is a hard error, mirroring the
-    /// epoch-entry committee read.
-    pub(super) fn validators_for_epoch_at_block(
+    /// Read committee validator keys for epoch, pinned to `header`'s state.
+    ///
+    /// On-chain BLS key bytes are decoded through [`decode_committee_keys`], so a decode failure
+    /// is a hard error, mirroring the epoch-entry committee read.
+    pub(super) fn validators_for_epoch_at_header(
         &self,
         epoch: u32,
-        block_hash: B256,
-    ) -> eyre::Result<Vec<BlsPublicKey>> {
+        header: &SealedHeader,
+    ) -> StateReadResult<Vec<BlsPublicKey>> {
+        decode_committee_keys(
+            epoch,
+            header.hash(),
+            self.reth_env.bls_pubkeys_for_epoch_at_header(epoch, header)?,
+        )
+    }
+
+    /// Read several epochs' committee validator keys, pinned to `header`'s state — ONE pinned
+    /// EVM for the whole batch, results ordered to match `epochs`.
+    ///
+    /// Each set decodes through [`decode_committee_keys`] under its own epoch, so an
+    /// undecodable key fails the whole batch and names the epoch it came from.
+    pub(super) fn validators_for_epochs_at_header(
+        &self,
+        epochs: &[Epoch],
+        header: &SealedHeader,
+    ) -> StateReadResult<Vec<Vec<BlsPublicKey>>> {
         self.reth_env
-            .bls_pubkeys_for_epoch_at_block(epoch, block_hash)?
-            .iter()
-            .map(|bls| {
-                BlsPublicKey::from_literal_bytes(bls.as_ref()).map_err(|err| {
-                    eyre::eyre!(
-                        "failed to create bls key from on-chain bytes for epoch {epoch} at block \
-                         {block_hash:?}: {err:?}"
-                    )
-                })
-            })
+            .bls_pubkeys_for_epochs_at_header(epochs, header)?
+            .into_iter()
+            .zip(epochs)
+            .map(|(raw, &epoch)| decode_committee_keys(epoch, header.hash(), raw))
             .collect()
     }
+
+    /// Read several epochs' committee validator keys, pinned to the block identified by
+    /// `block_hash` — the by-hash sibling of [`Self::validators_for_epochs_at_header`].
+    ///
+    /// ONE header lookup and ONE pinned EVM serve the whole batch, so every returned set provably
+    /// derives from the same block. Serves callers holding only a `BlockNumHash` (the
+    /// epoch-record close).
+    pub(super) fn validators_for_epochs_at_block(
+        &self,
+        epochs: &[Epoch],
+        block_hash: B256,
+    ) -> StateReadResult<Vec<Vec<BlsPublicKey>>> {
+        self.reth_env
+            .bls_pubkeys_for_epochs_at_block(epochs, block_hash)?
+            .into_iter()
+            .zip(epochs)
+            .map(|(raw, &epoch)| decode_committee_keys(epoch, block_hash, raw))
+            .collect()
+    }
+}
+
+/// Decode on-chain BLS key bytes into committee keys for `epoch`, read at pin block `pin`.
+///
+/// A decode failure is a hard error: a silently short committee is a consensus-safety failure,
+/// while halting is a single-node liveness failure.
+///
+/// The failure is [`StateReadError::ChainGlobal`], never `Provider`: the decode is a pure function
+/// of the bytes at the pin plus this node's own code, so every node reading the same block fails
+/// identically and no retry can clear it. That classification is what lets the decode stay fused
+/// inside a caller's retried closure — `retry_provider_faults` short-circuits `ChainGlobal`, so a
+/// bad key set halts on the first attempt rather than after three.
+fn decode_committee_keys(
+    epoch: Epoch,
+    pin: B256,
+    raw: Vec<Bytes>,
+) -> StateReadResult<Vec<BlsPublicKey>> {
+    raw.iter()
+        .map(|bls| {
+            BlsPublicKey::from_literal_bytes(bls.as_ref()).map_err(|err| {
+                StateReadError::ChainGlobal(format!(
+                    "failed to create bls key from on-chain bytes for epoch {epoch} at block \
+                     {pin:?}: {err:?}"
+                ))
+            })
+        })
+        .collect()
 }
