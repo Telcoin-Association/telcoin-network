@@ -8,7 +8,7 @@ use tn_config::Config;
 use tn_node::engine::{ExecutionNode, TnBuilder};
 use tn_reth::{init_txpool_defaults, RethChainSpec, RethCommand, RethConfig, RethEnv};
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, TaskManager, TimestampSec, Withdrawals, B256,
+    gas_accumulator::GasAccumulator, Address, TaskManager, TimestampSec, Withdrawals, B256,
 };
 
 /// Convenience type for testing Execution Node.
@@ -23,7 +23,7 @@ pub fn default_test_execution_node(
     opt_chain: Option<Arc<RethChainSpec>>,
     opt_address: Option<Address>,
     tmp_dir: &Path,
-    rewards: Option<RewardsCounter>,
+    rewards: Option<GasAccumulator>,
 ) -> eyre::Result<TestExecutionNode> {
     let (builder, _) = execution_builder::<NoArgs>(
         opt_chain.clone(),

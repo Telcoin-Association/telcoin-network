@@ -7,7 +7,8 @@
 //! - `RethEnv` test constructors and read helpers: `new_for_test`, `state_by_block_hash`, `tn_evm`,
 //!   `execution_outcome_for_tests`, and `ConsensusRegistry` reads (`get_validator_rewards`,
 //!   `get_bls_pubkey`, `get_validator_info`, `validators_for_epoch_at_block`,
-//!   `get_worker_fee_configs`).
+//!   `get_worker_fee_configs`), plus the pinned `WorkerConfigs` table read
+//!   [`read_worker_config_entries_at`].
 //! - Batch fixtures: `transaction`, `batch`, `batches`, `fixture_batch_with_transactions`,
 //!   `batch_with_transactions`.
 //! - Genesis builders: `seeded_genesis_from_random_batch(es)`, and the
@@ -26,8 +27,11 @@ use crate::{
     evm::TNEvm,
     payload::TNPayload,
     recover_raw_transaction,
-    system_calls::{ConsensusRegistry, EpochState, CONSENSUS_REGISTRY_ADDRESS},
-    ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool,
+    system_calls::{
+        decode_worker_fee_configs, ConsensusRegistry, EpochState, WorkerConfigs,
+        CONSENSUS_REGISTRY_ADDRESS,
+    },
+    ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool, SYSTEM_ADDRESS,
 };
 use alloy::{
     consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant, TxLegacy},
@@ -41,14 +45,16 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
-use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
+use reth_evm::{execute::Executor as _, ConfigureEvm, Evm as _, EvmFactory as _};
 use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
     DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory,
 };
-use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
+use reth_revm::{
+    context::result::ExecutionResult, database::StateProviderDatabase, db::BundleState, State,
+};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
@@ -60,10 +66,10 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tn_config::NodeInfo;
+use tn_config::{NodeInfo, WORKER_CONFIGS_ADDRESS};
 use tn_types::{
     address, calculate_transaction_root,
-    gas_accumulator::{RewardsCounter, WorkerFeeConfig},
+    gas_accumulator::{GasAccumulator, WorkerConfigEntry, WorkerFeeConfig},
     generate_proof_of_possession_bls_for_test, keccak256, now, test_chain_spec_arc, test_genesis,
     AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsKeypair,
     BlsPublicKey, BlsSignature, Bytes, Certificate, CommittedSubDag, Committee, CommitteeBuilder,
@@ -90,7 +96,7 @@ impl RethEnv {
     pub fn new_for_test<P: AsRef<Path>>(
         db_path: P,
         task_manager: &TaskManager,
-        rewards: Option<RewardsCounter>,
+        rewards: Option<GasAccumulator>,
     ) -> eyre::Result<Self> {
         Self::new_for_temp_chain(test_chain_spec_arc(), db_path, task_manager, rewards)
     }
@@ -814,6 +820,28 @@ pub fn plant_finalized_marker(reth_env: &RethEnv, header: SealedHeader) -> eyre:
     reth_env.blockchain_provider().set_finalized(header.clone());
     reth_env.blockchain_provider().set_safe(header);
     Ok(())
+}
+
+/// Execute `getAllWorkerConfigs()` against the state of `block` and decode the raw return bytes
+/// through the production seam (`decode_worker_fee_configs`) — the exact decode the closing
+/// block's `record_next_epoch_base_fees` uses — returning the on-chain worker count and one
+/// [`WorkerConfigEntry`] per worker (fee strategy plus the raw `data` word).
+///
+/// Cross-crate epoch-close tests use this to read the next-epoch base fee a closing block
+/// recorded in an EIP-1559 worker's `data` word, pinned at that block's state and observed
+/// through the same system-call + decode path that produced the write.
+pub fn read_worker_config_entries_at(
+    env: &RethEnv,
+    block: B256,
+) -> eyre::Result<(u16, Vec<WorkerConfigEntry>)> {
+    let mut tn_evm = env.tn_evm(block)?;
+    let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
+    let res = tn_evm.transact_system_call(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+    let data = match res.result {
+        ExecutionResult::Success { output, .. } => output.into_data(),
+        other => eyre::bail!("getAllWorkerConfigs failed at pinned block {block}: {other:?}"),
+    };
+    decode_worker_fee_configs(&data).map_err(|e| eyre::eyre!(e))
 }
 
 /// Build a test genesis whose `ConsensusRegistry` is freshly deployed from the current artifact

@@ -21,23 +21,35 @@
 //! When `ctx.close_epoch` is `Some(randomness)`, `finish` closes the epoch with system calls in
 //! this exact order:
 //!
-//! 1. (`adiri` builds only) `apply_consensus_registry_fork` — fires only when the concluding epoch
-//!    (`deconstruct_nonce(ctx.nonce).0`) satisfies `concluding_epoch + 1 ==
-//!    CONSENSUS_REGISTRY_FORK_EPOCH` (checked addition): swaps the registry's runtime bytecode in
-//!    place, then runs the one-time `migrateValidatorSets()`.
-//! 2. `apply_closing_epoch_contract_call` - the three boundary system calls in order:
-//!    `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, then `concludeEpoch(address[])`.
-//!    The reward infos carry the leader counts from `ctx.rewards_counter`; committee membership is
-//!    drawn by the `randomness`-seeded Fisher-Yates shuffle (sorted by address before encoding),
-//!    run AFTER `applySlashes` commits so the eligible-pool read and the committee reflect any
-//!    slash-to-zero ejections. The ordering is a consensus-safety obligation the protocol owns:
-//!    incentives weight on pre-slash collateral, slashes land before the committee is assembled,
-//!    and `concludeEpoch` settles queued stake version changes from post-slash balances. While the
-//!    deployed registry still carries the pre-fork adiri code, the close instead replays the legacy
-//!    `applyIncentives` + `concludeEpoch(address[])` pair (same code-hash gate as the
-//!    committee-pool read), keeping pre-fork history re-executable; the post-fork sequence differs
-//!    only by the interposed `applySlashes` call, and both share byte-identical `applyIncentives`
-//!    and `concludeEpoch(address[])` selectors.
+//! 1. (`adiri` builds only) `apply_consensus_registry_fork` then `apply_worker_configs_fork` — fire
+//!    only when the concluding epoch (`deconstruct_nonce(ctx.nonce).0`), plus one (checked), equals
+//!    `CONSENSUS_REGISTRY_FORK_EPOCH`. The registry swap replaces the registry's runtime bytecode
+//!    in place, then runs the one-time `migrateValidatorSets()`; the worker-configs swap then
+//!    replaces the `WorkerConfigs` runtime bytecode (code only, no initializer). The two ship at
+//!    the same boundary because the registry swap flips this very block's close onto the post-fork
+//!    sequence, whose fourth call needs the `setWorkerConfigsData` selector the pre-fork
+//!    `WorkerConfigs` deployment lacks — a build applying one swap but not the other aborts this
+//!    block.
+//! 2. `apply_closing_epoch_contract_call` - the four boundary system calls in order:
+//!    `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`, then
+//!    `setWorkerConfigsData(uint16[],uint184[])`. The reward infos carry the leader counts from
+//!    `ctx.gas_accumulator`'s rewards counter; committee membership is drawn by the
+//!    `randomness`-seeded Fisher-Yates shuffle (sorted by address before encoding), run AFTER
+//!    `applySlashes` commits so the eligible-pool read and the committee reflect any slash-to-zero
+//!    ejections. The ordering is a consensus-safety obligation the protocol owns: incentives weight
+//!    on pre-slash collateral, slashes land before the committee is assembled, and `concludeEpoch`
+//!    settles queued stake version changes from post-slash balances. While the deployed registry
+//!    still carries the pre-fork adiri code, the close instead replays the legacy pair
+//!    `applyIncentives` then `concludeEpoch(address[])` (same code-hash gate as the committee-pool
+//!    read), keeping pre-fork history re-executable; the post-fork sequence differs by the
+//!    interposed `applySlashes` call and the trailing worker-config write, and both share
+//!    byte-identical `applyIncentives` and `concludeEpoch(address[])` selectors.
+//!
+//! The fourth call (`record_next_epoch_base_fees`) writes each EIP-1559 worker's next-epoch base
+//! fee into its `WorkerConfigs` `data` word: an epoch-boundary snapshot that lets a node entering
+//! the epoch read the fee from one state slot instead of scanning the whole prior epoch's headers
+//! to recompute it. It runs last because it is the only step that reads no registry state and
+//! writes to no registry state, so nothing in the epoch transition depends on its position.
 //!
 //! The order is load-bearing. The fork must lead: the code swap flips the code-hash gate in
 //! `read_committee_eligible_pool` so the shuffle's committee-pool reads use the post-fork ABI
@@ -68,7 +80,7 @@
 //! certificate's aggregate BLS signature, computed in `CommittedSubDag::new` and carried through
 //! the payload. It seeds the deterministic committee shuffle AND is stored as the block's
 //! `extra_data`, which is how the replay path (`context_for_block`) rebuilds the ctx from the
-//! sealed header — identical up to `rewards_counter`, which is the live shared counter rather
+//! sealed header — identical up to `gas_accumulator`, which is the live shared accumulator rather
 //! than header-derived (see the `evm/config.rs` module docs for the replay caveat and the
 //! `block.body.withdrawals` reconstruction follow-up). The RNG draw order inside the shuffle
 //! is consensus-critical: any refactor that reorders the draws selects a different committee.
@@ -76,8 +88,9 @@
 use crate::{
     error::{TnRethError, TnRethResult},
     system_calls::{
+        decode_worker_fee_configs,
         ConsensusRegistry::{self, RewardInfo, ValidatorStatus},
-        CONSENSUS_REGISTRY_ADDRESS,
+        WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS,
     },
     SYSTEM_ADDRESS,
 };
@@ -88,6 +101,7 @@ use alloy::{
         eip4788::BEACON_ROOTS_ADDRESS,
         eip7685::{Requests, EMPTY_REQUESTS_HASH},
     },
+    primitives::aliases::U184,
     sol_types::SolCall as _,
 };
 use alloy_evm::{Database, Evm};
@@ -113,9 +127,11 @@ use reth_revm::{
     DatabaseCommit as _, State,
 };
 use std::{collections::BTreeMap, sync::Arc};
+use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, Bytes, Encodable2718, ExecHeader, Receipt,
-    TransactionSigned, Withdrawals, B256, EMPTY_WITHDRAWALS, U256,
+    gas_accumulator::{next_base_fee_for_config, GasAccumulator, WorkerFeeConfig},
+    Address, Bytes, Encodable2718, ExecHeader, Receipt, TransactionSigned, Withdrawals, WorkerId,
+    B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::{debug, error, trace};
 
@@ -146,8 +162,14 @@ pub struct TNBlockExecutionCtx {
     /// Difficulty- this contains the worker id and batch index:
     /// `U256::from(payload.batch_index << 16 | payload.worker_id as usize)`
     pub difficulty: U256,
-    /// Counter used to allocate rewards for block leaders.
-    pub rewards_counter: RewardsCounter,
+    /// Live shared accumulator for the current epoch: per-worker gas totals, current base fees,
+    /// worker count, and the leader counts used to allocate block rewards.
+    ///
+    /// Cloned from the EVM config by both context builders, so it is the same object every other
+    /// component holds rather than a header-derived snapshot (see the `evm/config.rs` module docs
+    /// for the replay caveat that follows from that). Execution reads only the rewards counter
+    /// today — the gas and fee data is carried so the epoch-closing block executor can reach it.
+    pub gas_accumulator: GasAccumulator,
     /// Test-only slash injection for the epoch boundary, copied from the payload
     /// (`context_for_next_block`). Feeds the executor's `epoch_boundary_slashes` seam so a test
     /// can drive a non-empty slash list through the production close path. Production builds have
@@ -186,6 +208,15 @@ impl TNBlockExecutionCtx {
     /// to `BEACON_ROOTS` contract (eip4788).
     fn first_batch(&self) -> bool {
         self.difficulty < U256::from(65536)
+    }
+
+    /// The worker id packed into the low 16 bits of `difficulty`.
+    ///
+    /// Same mask the header-side [`crate::snapshot::worker_id_from_header`] applies, so a block's
+    /// worker attribution is identical whether it is read from the execution context or from the
+    /// sealed header afterwards (the gas accumulator's per-worker totals depend on that).
+    fn worker_id(&self) -> WorkerId {
+        (self.difficulty.into_limbs()[0] & 0xffff) as WorkerId
     }
 }
 
@@ -296,15 +327,18 @@ where
         Ok(())
     }
 
-    /// Close the epoch through the three boundary system calls, in order:
-    /// `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`.
+    /// Close the epoch through the four boundary system calls, in order:
+    /// `applyIncentives(RewardInfo[])`, `applySlashes(Slash[])`, `concludeEpoch(address[])`,
+    /// `setWorkerConfigsData(uint16[],uint184[])`.
     ///
     /// The order is a consensus-safety invariant. `applySlashes` commits before the committee is
     /// assembled, so the `nextCommitteeSize` read and the shuffle below both see any slash-to-zero
     /// ejections: the committee `concludeEpoch` validates cannot be stale, and an ejected
     /// validator is never seated in a future committee. Slashing is not live, so the slashes array
     /// is always empty (production builds) and `applySlashes` is a no-op today; the call is
-    /// issued regardless so the sequence is correct by construction when slashing ships.
+    /// issued regardless so the sequence is correct by construction when slashing ships. The
+    /// base-fee record trails the registry calls (see [`Self::record_next_epoch_base_fees`]): it
+    /// touches a different contract, so nothing in the epoch transition reads what it writes.
     fn apply_closing_epoch_contract_call(
         &mut self,
         randomness: B256,
@@ -356,7 +390,125 @@ where
         // 3. assemble the committee from the post-slash eligible pool, then conclude
         let calldata = self.generate_conclude_epoch_calldata(randomness)?;
         trace!(target: "engine", ?calldata, "close epoch calldata");
-        self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "closing epoch",
+        )?;
+
+        // 4. publish the next epoch's per-worker base fees for the epoch that just began
+        self.record_next_epoch_base_fees()
+    }
+
+    /// Record every EIP-1559 worker's NEXT-epoch base fee in the `WorkerConfigs` contract's
+    /// per-worker `data` word.
+    ///
+    /// Fourth and last of the closing block's system calls, so the write lands in the same block
+    /// that seats the new committee: a node entering the epoch reads each worker's fee from one
+    /// state slot instead of scanning the whole prior epoch's headers to recompute it.
+    ///
+    /// The value written for a worker MUST equal what the live producer's post-close
+    /// `adjust_base_fees` (in `tn_node::manager`) and every node's epoch-entry header-scan
+    /// derivation (`derive_base_fees_for_entered_epoch`) compute for it — the batch validator
+    /// snapshots a plain `u64` per epoch and compares base fees for exact equality, so a
+    /// one-wei divergence makes peers reject each other's batches for a whole epoch. Three
+    /// details carry that equivalence:
+    ///
+    /// - The worker set comes from the CONTRACT's `numWorkers`, not the accumulator's. Governance
+    ///   may have grown the worker set mid-epoch (a `setNumWorkers` only takes effect at this
+    ///   boundary), and both other seams read the count at this same closing block. A worker with
+    ///   no accumulator slot yet prices from `(MIN_PROTOCOL_BASE_FEE, 0 gas)`, which is exactly
+    ///   what `adjust_base_fees`' resize-then-compute and the entry walk's slot-creation anchor
+    ///   produce for a fresh slot.
+    /// - This block's own gas is folded into its worker's total. The accumulator does not include
+    ///   it yet (`inc_block` runs after the payload executes), while the post-close adjustment and
+    ///   the header scan both count this block.
+    /// - The accumulator is only READ. It is shared live with the batch validator and the node
+    ///   manager, so resizing or clearing it here would corrupt state those readers depend on.
+    ///
+    /// `Static` workers are skipped: their fee is already on-chain in the config's `value` word,
+    /// so recording it would be redundant. A closing block with no EIP-1559 worker therefore
+    /// issues no system call at all — an emptiness every node computes identically from the same
+    /// contract state, so skipping cannot diverge the fleet.
+    ///
+    /// Fatal on any failure (read, decode, or a reverting/halting write), like every other step of
+    /// the close: the error aborts execution of the consensus output rather than committing a
+    /// block whose state diverges from the rest of the fleet. That is deliberately the opposite
+    /// of the manager-side close-time update (`apply_close_time_fee_updates` in `tn-node`), which
+    /// fails OPEN on a chain-global `WorkerConfigs` read failure — keeping the current fees is
+    /// safe there because every node deterministically computes the same keep. A silently skipped
+    /// write here would instead leave a stale `data` word for the entry-time read of the recorded
+    /// fee to trust later, so fatal-and-halt beats silently-wrong state.
+    fn record_next_epoch_base_fees(&mut self) -> TnRethResult<()> {
+        let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
+        let data = self.read_state_on_chain(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+        let (num_workers, entries) = decode_worker_fee_configs(&data).map_err(|e| {
+            error!(target: "engine", "failed to decode worker configs at epoch close: {e}");
+            TnRethError::EVMCustom(format!(
+                "failed to decode worker configs while recording next-epoch base fees: {e}"
+            ))
+        })?;
+
+        let own_worker = self.ctx.worker_id();
+        let own_gas = self.gas_used;
+        let accumulator_workers = self.ctx.gas_accumulator.num_workers();
+
+        let mut worker_ids: Vec<WorkerId> = Vec::new();
+        let mut datas: Vec<U184> = Vec::new();
+        for (worker_id, entry) in entries.iter().enumerate() {
+            let worker_id = worker_id as WorkerId;
+            match entry.config {
+                WorkerFeeConfig::Eip1559 { .. } => {}
+                // a static worker's fee is the config's `value` on-chain already
+                WorkerFeeConfig::Static { .. } => continue,
+            }
+
+            let (current_fee, gas_used) = if (worker_id as usize) < accumulator_workers {
+                let (_blocks, gas_used, _gas_limit) =
+                    self.ctx.gas_accumulator.get_values(worker_id);
+                (self.ctx.gas_accumulator.base_fee(worker_id).base_fee(), gas_used)
+            } else {
+                // governance added this worker mid-epoch: it has no slot to read, and a fresh
+                // slot is created with the min fee and zero gas
+                (MIN_PROTOCOL_BASE_FEE, 0)
+            };
+            // this block's gas reaches the accumulator only after execution finishes
+            let gas_used =
+                if worker_id == own_worker { gas_used.saturating_add(own_gas) } else { gas_used };
+
+            worker_ids.push(worker_id);
+            datas.push(U184::from(next_base_fee_for_config(entry.config, current_fee, gas_used)));
+        }
+
+        if worker_ids.is_empty() {
+            debug!(
+                target: "engine",
+                num_workers,
+                own_worker,
+                own_gas,
+                "no eip1559 workers configured; skipping next-epoch base fee record"
+            );
+            return Ok(());
+        }
+
+        debug!(
+            target: "engine",
+            num_workers,
+            own_worker,
+            own_gas,
+            ?worker_ids,
+            ?datas,
+            "recording next-epoch base fees"
+        );
+
+        let calldata = WorkerConfigs::setWorkerConfigsDataCall { workerIds: worker_ids, datas }
+            .abi_encode()
+            .into();
+        self.transact_and_commit_system_call(
+            WORKER_CONFIGS_ADDRESS,
+            calldata,
+            "recording next-epoch base fees",
+        )
     }
 
     /// The slashes to submit at this epoch boundary.
@@ -455,6 +607,37 @@ where
             let hex_str = value.as_str().expect("registry deployedBytecode.object is a string");
             let raw =
                 alloy::hex::decode(hex_str).expect("registry deployedBytecode.object is valid hex");
+            let bytecode = Bytecode::new_raw(raw.into());
+            let code_hash = bytecode.hash_slow();
+            (bytecode, code_hash)
+        });
+
+        &CODE
+    }
+
+    /// The upgraded `WorkerConfigs` runtime bytecode and its code hash, sourced from the same
+    /// embedded artifact genesis deploys (`WORKER_CONFIGS_JSON` `deployedBytecode.object`).
+    ///
+    /// Materialized once. The embedded artifact is a compile-time `include_str!` constant (the
+    /// same bytes genesis generation decodes, and exercised by the fork unit test), so a decode
+    /// failure here is a corrupt build — uniform across the fleet — not a live-node runtime
+    /// condition; hence `expect` rather than a fallible return.
+    #[cfg(feature = "adiri")]
+    fn worker_configs_runtime_code() -> &'static (reth_revm::bytecode::Bytecode, B256) {
+        use reth_revm::bytecode::Bytecode;
+        use std::sync::LazyLock;
+        use tn_config::WORKER_CONFIGS_JSON;
+
+        static CODE: LazyLock<(Bytecode, B256)> = LazyLock::new(|| {
+            let value = crate::RethEnv::fetch_value_from_json_str(
+                WORKER_CONFIGS_JSON,
+                Some("deployedBytecode.object"),
+            )
+            .expect("embedded worker configs artifact json is valid");
+            let hex_str =
+                value.as_str().expect("worker configs deployedBytecode.object is a string");
+            let raw = alloy::hex::decode(hex_str)
+                .expect("worker configs deployedBytecode.object is valid hex");
             let bytecode = Bytecode::new_raw(raw.into());
             let code_hash = bytecode.hash_slow();
             (bytecode, code_hash)
@@ -589,6 +772,113 @@ where
             });
 
         tracing::info!(target: "engine", ?eligible, %code_hash, "consensus registry fork applied");
+        Ok(())
+    }
+
+    /// Apply the in-protocol `WorkerConfigs` fork.
+    ///
+    /// Swaps the deployed worker-configs runtime bytecode to the current artifact's — preserving
+    /// the account's balance, nonce, and **all** existing storage (slots 0-3: `_owner`, the
+    /// `_pendingOwner` + `numWorkers` packing, the `_workerConfigs` mapping, and
+    /// `_workerConfigSet`), so the swap rewrites only the account-code leaf.
+    ///
+    /// Ships at the SAME fork boundary as [`Self::apply_consensus_registry_fork`] (the
+    /// epoch-closing block of `CONSENSUS_REGISTRY_FORK_EPOCH - 1`, registry first) because the
+    /// two are coupled through this very block's close: the registry swap flips the code-hash
+    /// gate in `apply_closing_epoch_contract_call` onto the post-fork sequence, whose fourth
+    /// call ([`Self::record_next_epoch_base_fees`]) invokes the `setWorkerConfigsData` selector
+    /// — absent from the live pre-fork `WorkerConfigs` deployment (an old build whose
+    /// `WorkerConfig.data` is a `uint128` and which exposes no protocol write path at all). A
+    /// build applying one swap but not the other therefore diverges from fork-capable peers: its
+    /// own fourth system call reverts and aborts this block.
+    ///
+    /// Unlike the registry fork there is NO migrate-style initializer call: the pre-fork
+    /// deployment already holds `_workerConfigSet[0] = true` and `numWorkers = 1`, so
+    /// `getAllWorkerConfigs` (and the `_workerConfigSet` guard inside `setWorkerConfigsData`)
+    /// work immediately post-swap. The appended `maxStrategy` slot (slot 4) deliberately reads 0
+    /// after the code-only swap: a documented governance runbook item — one owner
+    /// `setMaxStrategy(1)` transaction after the fork (see
+    /// `tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH`). The protocol write path never reads
+    /// `maxStrategy`, so the zeroed ceiling gates future governance actions only.
+    ///
+    /// Fail-closed gate: the swap proceeds only if the worker-configs account's current code
+    /// hash equals the pinned `WORKER_CONFIGS_PRE_FORK_CODE_HASH`; any other deployment aborts
+    /// the block. Aborting cannot split the network: the check is a pure function of committed
+    /// state, so every fork-capable node evaluates it identically and fails (or passes) in
+    /// lockstep.
+    ///
+    /// Fatal on failure — a partial swap diverges state across the fleet.
+    #[cfg(feature = "adiri")]
+    fn apply_worker_configs_fork(&mut self) -> TnRethResult<()> {
+        // revm `Database` trait provides `basic`; imported anonymously to avoid clashing with the
+        // `alloy_evm::Database` already in module scope.
+        use reth_revm::{
+            state::{Account, AccountInfo, AccountStatus, EvmState},
+            Database as _,
+        };
+
+        let (code, code_hash) = Self::worker_configs_runtime_code().clone();
+
+        // Preserve the worker-configs account's balance + nonce; only the code changes. Reading
+        // via `basic` also loads the account into the `State` cache so the code-only commit below
+        // takes the `change` path (info updated, storage left intact) rather than creating a new
+        // account.
+        let current = self
+            .evm
+            .db_mut()
+            .basic(WORKER_CONFIGS_ADDRESS)
+            .map_err(|e| {
+                TnRethError::EVMCustom(format!("worker configs account read failed: {e}"))
+            })?
+            .unwrap_or_default();
+
+        // Fail closed on an unexpected pre-fork deployment. The code-only swap assumes the exact
+        // storage layout of the pinned pre-fork worker-configs code (on the live chain this is
+        // the fixed genesis code hash); swapping over anything else risks silent state
+        // corruption. Abort the block instead — the check is a pure function of committed state,
+        // so every fork-capable node fails uniformly rather than diverging.
+        if current.code_hash != tn_types::forks::WORKER_CONFIGS_PRE_FORK_CODE_HASH {
+            error!(
+                target: "engine",
+                pre_swap_code_hash = %current.code_hash,
+                expected = %tn_types::forks::WORKER_CONFIGS_PRE_FORK_CODE_HASH,
+                "worker configs fork failing closed: unexpected pre-fork worker configs code",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "worker configs fork failing closed: pre-swap code hash {} does not match the \
+                 pinned pre-fork deployment {}",
+                current.code_hash,
+                tn_types::forks::WORKER_CONFIGS_PRE_FORK_CODE_HASH,
+            )));
+        }
+
+        debug!(
+            target: "engine",
+            pre_swap_code_hash = %current.code_hash,
+            new_code_hash = %code_hash,
+            "applying worker configs fork",
+        );
+
+        // Commit a code-only override: an empty storage map and a plain `Touched` status (never
+        // `Created`/`SelfDestructed`) so no storage slot enters the bundle and the existing
+        // storage root is preserved — only the single account-code leaf changes. The new bytecode
+        // is carried inline on the account info, so it is registered in the bundle's contracts
+        // (for post-restart `code_by_hash`) and is immediately callable by the fourth system call
+        // of this same block's close.
+        let account = Account {
+            info: AccountInfo {
+                balance: current.balance,
+                nonce: current.nonce,
+                code_hash,
+                code: Some(code),
+                ..Default::default()
+            },
+            status: AccountStatus::Touched,
+            ..Default::default()
+        };
+        self.evm.db_mut().commit(EvmState::from_iter([(WORKER_CONFIGS_ADDRESS, account)]));
+
+        tracing::info!(target: "engine", %code_hash, "worker configs fork applied");
         Ok(())
     }
 
@@ -978,11 +1268,21 @@ where
                 self.apply_consensus_registry_fork().map_err(|e| {
                     BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
                 })?;
+
+                // The `WorkerConfigs` swap rides the same boundary, AFTER the registry swap:
+                // the registry swap just flipped this block's close onto the post-fork
+                // sequence, whose fourth call (`record_next_epoch_base_fees`) needs the
+                // `setWorkerConfigsData` selector the pre-fork deployment lacks. Code-only —
+                // no migrate-style call — see `apply_worker_configs_fork` for the storage
+                // preservation and `maxStrategy` runbook notes.
+                self.apply_worker_configs_fork().map_err(|e| {
+                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+                })?;
             }
 
             self.apply_closing_epoch_contract_call(
                 randomness,
-                self.ctx.rewards_counter.get_address_counts(),
+                self.ctx.gas_accumulator.rewards_counter().get_address_counts(),
             )
             .map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
@@ -1140,7 +1440,7 @@ where
         let extra_data = ctx.close_epoch.map(|hash| hash.to_vec().into()).unwrap_or_default();
         let (withdrawals, withdrawals_root) = if ctx.close_epoch.is_some() {
             // closing epoch so include rewards info
-            let withdrawals = ctx.rewards_counter.generate_withdrawals();
+            let withdrawals = ctx.gas_accumulator.rewards_counter().generate_withdrawals();
             let withdrawals_root = calculate_withdrawals_root(withdrawals.as_ref());
             (Some(withdrawals), Some(withdrawals_root))
         } else {
@@ -1273,7 +1573,7 @@ mod tests {
     use tempfile::TempDir;
     use tn_config::NodeInfo;
     #[cfg(feature = "adiri")]
-    use tn_config::CONSENSUS_REGISTRY_JSON;
+    use tn_config::{CONSENSUS_REGISTRY_JSON, WORKER_CONFIGS_JSON};
     use tn_types::{
         generate_proof_of_possession_bls_for_test, BlsKeypair, GenesisAccount, NodeP2pInfo,
         TaskManager,
@@ -1425,6 +1725,55 @@ mod tests {
         assert!(
             format!("{err:#}").contains("failing closed"),
             "abort must come from the fail-closed code-hash gate, got: {err:#}"
+        );
+
+        Ok(())
+    }
+
+    /// The `WorkerConfigs` fork must fail closed over an unexpected pre-fork deployment.
+    ///
+    /// Mirrors the registry's fail-closed test above: the genesis fixture's worker-configs
+    /// account is overwritten with the post-fork artifact bytes (any hash other than
+    /// `WORKER_CONFIGS_PRE_FORK_CODE_HASH` — a stand-in for an unknown deployment) while the
+    /// registry account keeps its pinned pre-fork code, so the registry swap that leads the
+    /// fork boundary succeeds and the abort is attributable to the WorkerConfigs gate alone.
+    /// (Without the gate this block would execute: the code-only swap is a no-op over the
+    /// current artifact, making this test the discriminating check.)
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_worker_configs_fork_fails_closed_on_unexpected_code() -> eyre::Result<()> {
+        // overwrite the worker-configs code (keeping balance + storage) with the post-fork
+        // artifact
+        let mut genesis = tn_types::test_genesis();
+        let v2_value = RethEnv::fetch_value_from_json_str(
+            WORKER_CONFIGS_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let v2_code: Bytes =
+            alloy::hex::decode(v2_value.as_str().expect("deployedBytecode.object is a string"))?
+                .into();
+        genesis
+            .alloc
+            .get_mut(&WORKER_CONFIGS_ADDRESS)
+            .expect("testnet genesis must allocate the WorkerConfigs account")
+            .code = Some(v2_code);
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+
+        // drive the fork boundary: the concluding epoch + 1 == CONSENSUS_REGISTRY_FORK_EPOCH
+        let concluding_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH - 1;
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("worker configs fail closed test");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        let err = execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect_err("fork over an unexpected worker-configs deployment must abort the block");
+        assert!(
+            format!("{err:#}").contains("worker configs fork failing closed"),
+            "abort must come from the WorkerConfigs fail-closed code-hash gate, got: {err:#}"
         );
 
         Ok(())
