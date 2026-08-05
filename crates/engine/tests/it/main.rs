@@ -126,7 +126,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // update rewards counter so execution address is visible
     let committee =
@@ -231,7 +231,7 @@ async fn test_queued_outputs_bounded_with_backpressure() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     let committee =
         create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
@@ -341,7 +341,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // update rewards counter so execution address is visible
     let committee =
@@ -509,6 +509,237 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     Ok(())
 }
 
+/// This pins the fail-stop for an empty epoch-closing output whose leader is not a member of
+/// the committee installed on the rewards counter: the engine must terminate with
+/// [`TnEngineError::UnknownAuthority`], build no block, and send no tip update.
+///
+/// The lookup miss is unreachable for valid output (see the invariant comment at the
+/// `get_authority_address` call in `payload_builder.rs`), so this constructs the impossible
+/// state directly and asserts the engine refuses to paper over it with a default beneficiary.
+/// A "graceful default" regression here is chain-consistent (every node computes the same
+/// wrong beneficiary), so no downstream validation would ever catch it; only this test does.
+#[tokio::test]
+async fn test_empty_close_epoch_unknown_leader_fail_stops() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    // install a real committee so the miss comes from the leader, not an unset committee
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus
+    //
+    // create consensus output with no batches and close_epoch: true, authored by a non-member:
+    // keep the `Certificate::default()` author instead of overwriting it with a committee
+    // member's id (the delta from the happy-path test above)
+    let timestamp = now();
+    let mut leader = Certificate::default();
+    let sub_dag_index = 0;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // update timestamp so it's not default 0
+    leader.update_header_created_at_for_test(timestamp);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    // the default author is not a committee member; capture it for the error assertion
+    let outside_leader = leader.header().author().clone();
+
+    let subdag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::new(),
+        vec![],
+    );
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let max_round = None;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        engine_update_tx,
+    );
+
+    // send output
+    let broadcast_result = to_engine.send(consensus_output).await;
+    assert!(broadcast_result.is_ok());
+
+    // drop sending channel so the stream closes after the output is processed
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+
+    // spawn engine task
+    task_manager.spawn_task("Test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // the engine must fail-stop on the lookup miss, carrying the offending identifier
+    assert_matches!(
+        engine_task,
+        Err(TnEngineError::UnknownAuthority(id)) if id == outside_leader
+    );
+
+    // no tip update may be sent on a lookup miss
+    assert!(
+        engine_update_rx.try_recv().is_err(),
+        "engine must not send an update for a failed epoch-closing output"
+    );
+
+    // no block may be built on a lookup miss
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.last_block_number()?, 0, "no block may be built on a lookup miss");
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    Ok(())
+}
+
+/// This pins the fail-stop for an empty epoch-closing output executed before any committee is
+/// installed on the rewards counter: even a leader that would be a valid committee member must
+/// terminate the engine with [`TnEngineError::UnknownAuthority`], build no block, and send no
+/// tip update.
+///
+/// Companion to [`test_empty_close_epoch_unknown_leader_fail_stops`]: together they pin both
+/// ways the beneficiary lookup can miss (non-member author, committee never set), so replacing
+/// the fail-stop with a silent default beneficiary turns at least one of them red.
+#[tokio::test]
+async fn test_empty_close_epoch_without_committee_fail_stops() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    // build the committee to obtain a legitimate member id, but never call `set_committee`:
+    // the rewards counter's committee stays `None` (the delta from the happy-path test above)
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+
+    //=== Consensus
+    //
+    // create consensus output with no batches and close_epoch: true, authored by a valid member
+    let timestamp = now();
+    let mut leader = Certificate::default();
+    let sub_dag_index = 0;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // update timestamp so it's not default 0
+    leader.update_header_created_at_for_test(timestamp);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    leader.update_header_author_for_test(leader_id.clone());
+
+    let subdag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::new(),
+        vec![],
+    );
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let max_round = None;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        engine_update_tx,
+    );
+
+    // send output
+    let broadcast_result = to_engine.send(consensus_output).await;
+    assert!(broadcast_result.is_ok());
+
+    // drop sending channel so the stream closes after the output is processed
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+
+    // spawn engine task
+    task_manager.spawn_task("Test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // the engine must fail-stop on the lookup miss, carrying the offending identifier
+    assert_matches!(
+        engine_task,
+        Err(TnEngineError::UnknownAuthority(id)) if id == leader_id
+    );
+
+    // no tip update may be sent on a lookup miss
+    assert!(
+        engine_update_rx.try_recv().is_err(),
+        "engine must not send an update for a failed epoch-closing output"
+    );
+
+    // no block may be built on a lookup miss
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.last_block_number()?, 0, "no block may be built on a lookup miss");
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    Ok(())
+}
+
 /// This tests that leader count is incremented even when execution is skipped
 /// for empty non-epoch-closing output.
 #[tokio::test]
@@ -522,7 +753,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // update rewards counter so execution address is visible
     let committee =
@@ -702,7 +933,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee from genesis state
@@ -1191,7 +1422,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee from genesis state
@@ -1892,7 +2123,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee from genesis state
@@ -2246,7 +2477,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee
@@ -2434,7 +2665,7 @@ async fn test_partial_output_failure_rolls_back_in_memory_state() -> eyre::Resul
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     let committee =
         create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;

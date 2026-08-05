@@ -50,24 +50,11 @@
 //! computation (`adjust_base_fees`) folds the same formula over the same inputs, so the value it
 //! carries between close and the next entry is identical to what entry derivation recomputes.
 
-use crate::{AuthorityIdentifier, Committee, WorkerId};
-
-/// Fee strategy for a worker, read from the WorkerConfigs contract each epoch.
-/// Adding a new strategy = new contract constant + new enum variant + match arm in
-/// adjust_base_fees.
-///
-/// NOTE: these are mapped in `tn-reth/src/lib.rs:worker_fee_configs_inner`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerFeeConfig {
-    /// Adjust fee +/-12.5% per epoch based on gas utilization vs target.
-    Eip1559 { target_gas: u64 },
-    /// Fixed fee set by governance, no utilization-based adjustment.
-    Static { fee: u64 },
-}
+use crate::{AuthorityIdentifier, Committee, SealedHeader, WorkerId, B256};
 
 use alloy::{
     eips::eip1559::{calc_next_block_base_fee, BaseFeeParams, MIN_PROTOCOL_BASE_FEE},
-    primitives::Address,
+    primitives::{aliases::U184, Address},
     rpc::types::{Withdrawal, Withdrawals},
 };
 use parking_lot::{Mutex, RwLock};
@@ -79,6 +66,73 @@ use std::{
     },
 };
 use tracing::warn;
+
+/// Fee strategy for a worker, read from the WorkerConfigs contract each epoch.
+/// Adding a new strategy = new contract constant + new enum variant + match arm in
+/// [`next_base_fee_for_config`] below.
+///
+/// NOTE: these are mapped in `tn-reth/src/system_calls.rs:decode_worker_fee_configs`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerFeeConfig {
+    /// Adjust fee +/-12.5% per epoch based on gas utilization vs target.
+    Eip1559 { target_gas: u64 },
+    /// Fixed fee set by governance, no utilization-based adjustment.
+    Static { fee: u64 },
+}
+
+/// The worker id that produced `header`, read from the low 16 bits of its `difficulty` field.
+///
+/// The engine encodes `difficulty` as `batch_index << 16 | worker_id` (matching how
+/// [`GasAccumulator::inc_block`] callers attribute blocks), so the worker id is the low 16 bits and
+/// the batch index occupies the upper bits. This is the single canonical implementation shared by
+/// the per-worker fee/gas derivation (`tn_node`) and the snapshot fee-derivability precheck
+/// (`tn_reth`), so both attribute headers with the exact same rule — no drift.
+pub fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
+    (header.difficulty.into_limbs()[0] & 0xffff) as u16
+}
+
+/// True when `header` is a genuine worker batch block.
+///
+/// Two on-chain block shapes are NOT worker batch blocks and must be excluded from per-worker
+/// fee/gas attribution:
+/// - the genesis block (`number == 0`), which carries no worker payload, and
+/// - the synthetic empty-close block the engine builds when an epoch closes with no batches. That
+///   block is stamped worker 0 and copies its PARENT's base fee (see `tn_engine`'s
+///   `execute_consensus_output`), so attributing it would poison worker 0 with another worker's
+///   fee. It is identified by `ommers_hash == B256::ZERO`: the header's `ommers_hash` carries the
+///   batch digest, and only the synthetic block passes `B256::ZERO` (real batch digests are never
+///   zero).
+///
+/// A non-empty epoch-closing block built from real batches has a non-zero `ommers_hash` and IS a
+/// genuine worker block. Shared canonical implementation used by both `tn_node` (fee/gas
+/// derivation) and `tn_reth` (snapshot fee-derivability precheck).
+pub fn is_worker_batch_block(header: &SealedHeader) -> bool {
+    header.number != 0 && header.ommers_hash != B256::ZERO
+}
+
+/// One row of the on-chain `WorkerConfigs` table: a worker's fee strategy plus the raw `uint184`
+/// `data` word stored alongside it.
+///
+/// The contract documents `data` as reserved space for the protocol. As of the epoch-close
+/// base-fee snapshot it carries an [`WorkerFeeConfig::Eip1559`] worker's NEXT-epoch base fee,
+/// written by the closing block's `setWorkerConfigsData` system call, so a node entering an epoch
+/// can read the fee from one state slot instead of scanning the previous epoch's headers.
+///
+/// `data` is authoritative ONLY for a row whose config reads [`WorkerFeeConfig::Eip1559`] at an
+/// epoch-closing block after the write path activated. A zero word means it was never written —
+/// no epoch has closed since the worker was configured, or the row is [`WorkerFeeConfig::Static`]
+/// and its fee already lives in the config's `value` (Static rows are never written). Non-zero
+/// does NOT imply current: a row governance switches Eip1559 -> Static keeps its last recorded
+/// word forever, and the owner setters can store an arbitrary `uint184`. Readers must gate on the
+/// row's strategy, never on `data` alone. Zero stays unambiguous for the rows that do get
+/// written, because a recorded fee is never below `MIN_PROTOCOL_BASE_FEE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerConfigEntry {
+    /// The worker's fee strategy for the next epoch.
+    pub config: WorkerFeeConfig,
+    /// The raw `uint184` word stored with the config.
+    pub data: U184,
+}
 
 /// Tracks how many blocks each leader committed during an epoch for reward distribution.
 ///
@@ -281,6 +335,11 @@ impl GasAccumulator {
     ///
     /// Blocks with zero `gas_used` are silently skipped to avoid inflating counts on restarts.
     ///
+    /// The totals recorded here are consensus-critical: at epoch close the block executor reads
+    /// them to price next-epoch base fees and writes the result into EVM state
+    /// (`record_next_epoch_base_fees` in `tn-reth`), so a missed or double-counted block
+    /// diverges the closing block's hash across the fleet, not just a local fee.
+    ///
     /// # Panics
     ///
     /// Panics if `worker_id` is out of range. Any batch that reaches execution has a valid id;
@@ -423,6 +482,30 @@ pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, targe
     new_base_fee.max(MIN_PROTOCOL_BASE_FEE)
 }
 
+/// Apply a worker's [`WorkerFeeConfig`] to compute its next-epoch base fee.
+///
+/// `Eip1559 { target_gas }` nudges the fee toward the gas target via
+/// [`compute_next_base_fee_eip1559`] (floored at `MIN_PROTOCOL_BASE_FEE`); `Static { fee }` pins
+/// the fee to the governance-set value, ignoring gas usage.
+///
+/// This is the ONE fee formula, and it lives here so every seam that prices a worker's next-epoch
+/// fee dispatches through the same strategy match: `adjust_base_fees` (in `node::manager`) applies
+/// it at a live epoch close and `fold_next_epoch_base_fees` (also in `node::manager`) applies it
+/// when deriving the entered epoch's fees from the previous epoch's chain state, so both seams
+/// produce identical values from identical inputs.
+pub fn next_base_fee_for_config(
+    config: WorkerFeeConfig,
+    current_base_fee: u64,
+    gas_used: u64,
+) -> u64 {
+    match config {
+        WorkerFeeConfig::Eip1559 { target_gas } => {
+            compute_next_base_fee_eip1559(current_base_fee, gas_used, target_gas)
+        }
+        WorkerFeeConfig::Static { fee } => fee,
+    }
+}
+
 impl Default for GasAccumulator {
     fn default() -> Self {
         Self::new(1)
@@ -432,6 +515,32 @@ impl Default for GasAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_attribution_helpers_match_header_encoding() {
+        use crate::{ExecHeader, U256};
+        // `difficulty` encodes `batch_index << 16 | worker_id`; `ommers_hash` is the batch digest.
+        let header = |number: u64, batch_index: u64, wid: u16, ommers: B256| -> SealedHeader {
+            SealedHeader::seal_slow(ExecHeader {
+                number,
+                difficulty: U256::from((batch_index << 16) | wid as u64),
+                ommers_hash: ommers,
+                ..Default::default()
+            })
+        };
+        let nonzero = B256::from([0xab; 32]);
+
+        // genesis (block 0) is never a genuine batch block
+        assert!(!is_worker_batch_block(&header(0, 0, 0, nonzero)));
+        // the synthetic empty-close block carries a zero ommers_hash (batch-digest slot)
+        assert!(!is_worker_batch_block(&header(5, 0, 0, B256::ZERO)));
+        // a real batch block: non-genesis number, non-zero batch digest
+        assert!(is_worker_batch_block(&header(5, 0, 3, nonzero)));
+
+        // worker id is the LOW 16 bits; the batch index (upper bits) is ignored
+        assert_eq!(worker_id_from_header(&header(5, 42, 3, nonzero)), 3);
+        assert_eq!(worker_id_from_header(&header(5, 0, 0xffff, nonzero)), 0xffff);
+    }
 
     #[test]
     fn gas_at_target_no_change() {
@@ -520,6 +629,49 @@ mod tests {
         assert_eq!(
             compute_next_base_fee_eip1559(MIN_PROTOCOL_BASE_FEE, 200, 100),
             MIN_PROTOCOL_BASE_FEE + 1
+        );
+    }
+
+    #[test]
+    fn eip1559_config_with_max_target_is_inert_at_min() {
+        // Genesis/default strategy: Eip1559 { target_gas: u64::MAX }. Against an unreachable target
+        // the fee can only ratchet down and floors at MIN, so a worker at MIN stays at MIN
+        // regardless of gas used -- the inert guarantee that keeps existing chains unchanged.
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: u64::MAX };
+        assert_eq!(
+            next_base_fee_for_config(cfg, MIN_PROTOCOL_BASE_FEE, 5_000_000),
+            MIN_PROTOCOL_BASE_FEE
+        );
+        // a non-MIN fee ratchets down (and never below MIN)
+        let down = next_base_fee_for_config(cfg, MIN_PROTOCOL_BASE_FEE * 1000, 0);
+        assert!((MIN_PROTOCOL_BASE_FEE..MIN_PROTOCOL_BASE_FEE * 1000).contains(&down));
+    }
+
+    #[test]
+    fn eip1559_config_moves_fee_with_gas_vs_target() {
+        let target = 1_000_000u64;
+        let current = 1_000_000u64;
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: target };
+        // gas above target -> fee increases; below -> decreases; at target -> unchanged.
+        assert!(next_base_fee_for_config(cfg, current, 2_000_000) > current);
+        assert!(next_base_fee_for_config(cfg, current, 0) < current);
+        assert_eq!(next_base_fee_for_config(cfg, current, target), current);
+    }
+
+    #[test]
+    fn static_config_pins_to_configured_fee() {
+        // Static ignores gas usage and the current fee, always returning the governance-set value.
+        assert_eq!(
+            next_base_fee_for_config(
+                WorkerFeeConfig::Static { fee: 12_345 },
+                MIN_PROTOCOL_BASE_FEE,
+                999_999
+            ),
+            12_345
+        );
+        assert_eq!(
+            next_base_fee_for_config(WorkerFeeConfig::Static { fee: 500 }, 1_000_000, 0),
+            500
         );
     }
 
@@ -698,5 +850,61 @@ mod tests {
         let counts = counter.get_address_counts();
         assert_eq!(counts.len(), 4);
         assert_eq!(counts.get(&victim_address), Some(&VICTIM_LEADER_BLOCKS));
+    }
+
+    /// Epoch-boundary invariant: `clear` resets every leader count so no rewards carry into the
+    /// next epoch's withdrawals, while the committee survives for the next epoch's tallies.
+    #[test]
+    fn clear_resets_leader_counts_but_preserves_committee() {
+        use crate::{BlsKeypair, CommitteeBuilder};
+        use rand::rng;
+
+        let mut rng = rng();
+        let keypairs: Vec<BlsKeypair> = (0..4).map(|_| BlsKeypair::generate(&mut rng)).collect();
+        let addresses: Vec<Address> = (0..4).map(|i| Address::repeat_byte(i as u8 + 1)).collect();
+
+        let mut builder = CommitteeBuilder::new(1);
+        for (keypair, address) in keypairs.iter().zip(addresses.iter()) {
+            builder.add_authority(*keypair.public(), *address);
+        }
+        let committee = builder.build();
+
+        let counter = RewardsCounter::default();
+        counter.set_committee(committee.clone());
+
+        let ids: Vec<AuthorityIdentifier> = keypairs
+            .iter()
+            .map(|keypair| {
+                committee
+                    .authority_by_key(keypair.public())
+                    .expect("keypair is a committee member")
+                    .id()
+            })
+            .collect();
+
+        // tally leader counts for two distinct addresses
+        for _ in 0..3 {
+            counter.inc_leader_count(&ids[0]);
+        }
+        counter.inc_leader_count(&ids[1]);
+
+        // sanity: the tallies are visible before the boundary
+        let counts = counter.get_address_counts();
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts.get(&addresses[0]), Some(&3));
+        assert_eq!(counts.get(&addresses[1]), Some(&1));
+        assert_eq!(counter.generate_withdrawals().len(), 2);
+
+        counter.clear();
+
+        // counts reset: nothing carries into the next epoch's incentives or withdrawals
+        assert!(counter.get_address_counts().is_empty());
+        assert!(counter.generate_withdrawals().is_empty());
+
+        // the committee survives clear: a fresh tally still resolves through it
+        counter.inc_leader_count(&ids[1]);
+        let counts = counter.get_address_counts();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get(&addresses[1]), Some(&1));
     }
 }

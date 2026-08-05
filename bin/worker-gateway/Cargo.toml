@@ -51,6 +51,11 @@ tn-config = { workspace = true }
 tn-metrics = { workspace = true }
 tn-types = { workspace = true }
 
+# `TCP_USER_TIMEOUT` on accepted connections (see `server::set_tcp_user_timeout`);
+# the socket option is Linux-family only, so the dependency is too.
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+socket2 = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

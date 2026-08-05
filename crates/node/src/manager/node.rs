@@ -15,13 +15,16 @@ use crate::{
     health::HealthcheckServer,
     manager::{
         exex::{run_critical_exex_future, run_isolated_exex_future},
-        spawn_epoch_vote_collector,
+        spawn_epoch_vote_collector, ExecStateExporter,
     },
     metrics::EpochMetrics,
 };
 use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
@@ -29,12 +32,15 @@ use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
     deconstruct_nonce,
-    gas_accumulator::{GasAccumulator, WorkerFeeConfig},
+    gas_accumulator::{next_base_fee_for_config, GasAccumulator, WorkerFeeConfig},
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier,
-    SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, B256,
-    DEFAULT_WORKER_ID, MIN_PROTOCOL_BASE_FEE,
+    SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
+    MIN_PROTOCOL_BASE_FEE,
 };
+// Canonical worker-attribution helpers live in `tn-types` (one implementation, no drift); re-export
+// so the crate-internal call sites and tests keep referring to them by bare name.
+pub(crate) use tn_types::gas_accumulator::{is_worker_batch_block, worker_id_from_header};
 use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -143,6 +149,10 @@ pub(crate) struct EpochManager<P, DB> {
     /// Static version string for the running node, reported by node-info surfaces.
     version_str: &'static str,
 
+    /// Background execution-state exporter. `Some` only when `--enable-state-export` is set;
+    /// exports each epoch's final state at the epoch boundary. Stops on drop.
+    exec_state_exporter: Option<ExecStateExporter>,
+
     /// Prometheus metrics for the epoch lifecycle.
     metrics: EpochMetrics,
 }
@@ -168,6 +178,11 @@ pub(crate) struct EpochManager<P, DB> {
 /// Base fees are NOT restored here: the epoch entry seeding in `run_epoch` owns both the worker
 /// count and every worker's base fee for the entered epoch, deriving them from the previous
 /// epoch's closing-block state on every entry.
+///
+/// The restored per-worker gas totals and worker count are consensus-critical, not merely local
+/// fee inputs: the next epoch close feeds them into the closing block's on-chain base-fee record
+/// (`record_next_epoch_base_fees` in `tn-reth`), so an inaccurate restore here diverges that
+/// block's hash from the rest of the fleet.
 ///
 /// Every chain-derived input (the block scan range's start and end, the worker-count read block,
 /// and the epoch used to bound leader counting) is pinned to the single finalized
@@ -320,11 +335,6 @@ pub fn sync_num_workers_from_chain(
     Ok(())
 }
 
-/// Worker id encoded in a header's `difficulty` (low 16 bits of `batch_index << 16 | worker_id`).
-pub(crate) fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
-    (header.difficulty.into_limbs()[0] & 0xffff) as u16
-}
-
 /// Return the most recent on-chain `base_fee_per_gas` for each worker that produced a block in
 /// `headers`.
 ///
@@ -345,24 +355,6 @@ pub(crate) fn latest_base_fee_per_worker(headers: &[SealedHeader]) -> HashMap<Wo
         }
     }
     fees
-}
-
-/// True when `header` is a genuine worker batch block.
-///
-/// Two on-chain block shapes are NOT worker batch blocks and must be excluded from per-worker
-/// fee/gas attribution:
-/// - the genesis block (`number == 0`), which carries no worker payload, and
-/// - the synthetic empty-close block the engine builds when an epoch closes with no batches. That
-///   block is stamped worker 0 and copies its PARENT's base fee (see `tn_engine`'s
-///   `execute_consensus_output`), so attributing it would poison worker 0 with another worker's
-///   fee. It is identified by `ommers_hash == B256::ZERO`: the header's `ommers_hash` carries the
-///   batch digest, and only the synthetic block passes `B256::ZERO` (real batch digests are never
-///   zero).
-///
-/// A non-empty epoch-closing block built from real batches has a non-zero `ommers_hash` and IS a
-/// genuine worker block.
-pub(crate) fn is_worker_batch_block(header: &SealedHeader) -> bool {
-    header.number != 0 && header.ommers_hash != B256::ZERO
 }
 
 /// Sum `gas_used` per worker over `headers`.
@@ -388,7 +380,7 @@ pub(crate) fn gas_used_per_worker(headers: &[SealedHeader]) -> HashMap<WorkerId,
 /// during the epoch that just closed.
 ///
 /// One slot per entry in `configs` (the on-chain `WorkerConfigs` order, indexed by worker id).
-/// A worker present in `held_fees` folds through `next_base_fee_for_config` — the SAME formula
+/// A worker present in `held_fees` folds through [`next_base_fee_for_config`] — the SAME formula
 /// `adjust_base_fees` (in the `run_epoch` module) applies at a live epoch close, so entry
 /// derivation and close-time adjustment produce identical values from identical inputs. A worker
 /// absent from `held_fees` (no genuine block in the scanned range, so the chain does not reveal
@@ -405,7 +397,7 @@ pub fn fold_next_epoch_base_fees(
             let worker_id = worker_id as WorkerId;
             held_fees.get(&worker_id).map(|&held_fee| {
                 let gas_used = gas_totals.get(&worker_id).copied().unwrap_or_default();
-                run_epoch::next_base_fee_for_config(*config, held_fee, gas_used)
+                next_base_fee_for_config(*config, held_fee, gas_used)
             })
         })
         .collect()
@@ -456,7 +448,10 @@ impl DerivedBaseFees {
 ///
 /// Steps:
 /// 1. `getEpochInfo(entered_epoch - 1)` at `closing_header` yields the previous epoch's first block
-///    (clamped to 1: constructor-seeded epochs report `blockHeight = 0`).
+///    (clamped to 1: epoch 0 is stamped by the registry's constructor at genesis and reports
+///    `blockHeight = 0` for the life of the chain). Every other epoch that has actually begun
+///    carries a real height — `RethEnv::get_epoch_info_at_block` rejects a `blockHeight = 0` for
+///    any epoch but 0 as a not-yet-begun record — so the `.max(1)` covers epoch 0 alone.
 /// 2. Scan the sealed headers `first..=closing`, keeping only genuine worker batch blocks
 ///    ([`is_worker_batch_block`] — excludes genesis and the synthetic empty-close block).
 /// 3. Extract each worker's last held fee ([`latest_base_fee_per_worker`]) and gas total
@@ -482,8 +477,10 @@ pub fn derive_base_fees_for_entered_epoch(
         .checked_sub(1)
         .ok_or_else(|| eyre!("cannot derive base fees for entered epoch 0: no prior epoch"))?;
 
-    // the previous epoch's block range, read from the registry AT the closing block (the ring
-    // buffer holds the four most recent epochs, so the prior epoch is always resolvable here)
+    // the previous epoch's block range, read from the registry AT the closing block.
+    // `getEpochInfo` resolves the window `[current - 3, current + 2]` (four recent slots plus two
+    // future ones); at this block the prior epoch is at most one behind `currentEpoch`, so it sits
+    // at the newest end of the past half — resolvable, and already stamped with its block height.
     let epoch_info = reth_env.get_epoch_info_at_block(prior_epoch, closing_header.hash())?;
     let range = epoch_info.blockHeight.max(1)..=closing_header.number;
     let range_len = range.end().saturating_sub(*range.start()).saturating_add(1);
@@ -532,7 +529,7 @@ pub fn derive_base_fees_for_entered_epoch(
 ///
 /// A step describes the boundary INTO some epoch `k`: the worker's strategy read at epoch
 /// `k - 1`'s closing block, plus what epoch `k - 1`'s genuine blocks reveal about the worker.
-/// Folding a step ([`fold_forward`]) reproduces the `next_base_fee_for_config` application the
+/// Folding a step ([`fold_forward`]) reproduces the [`next_base_fee_for_config`] application the
 /// live committee ran at that boundary's close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EpochFeeStep {
@@ -554,9 +551,9 @@ pub(crate) struct EpochFeeStep {
 /// the SAME formula a live `adjust_base_fees` ran at that boundary. The result is the fee the
 /// worker holds entering the epoch above the last step's boundary.
 pub(crate) fn fold_forward(anchor: u64, steps: &[EpochFeeStep]) -> u64 {
-    steps.iter().fold(anchor, |current, step| {
-        run_epoch::next_base_fee_for_config(step.config, current, step.gas_used)
-    })
+    steps
+        .iter()
+        .fold(anchor, |current, step| next_base_fee_for_config(step.config, current, step.gas_used))
 }
 
 /// Derive the base fee worker `worker_id` holds during `epoch` purely from on-chain state —
@@ -777,6 +774,19 @@ where
             BTreeMap::new()
         };
 
+        // Spawn the state exporter once, only when the feature is enabled.
+        let exec_state_exporter =
+            builder.enable_state_export.then(ExecStateExporter::spawn).transpose()?;
+
+        // With export enabled, clean up any orphaned temp export dirs left by a crashed/interrupted
+        // prior run. Safe here (startup) because no export is in flight; the per-epoch export path
+        // only ever clears its own epoch's temp, so it can never delete an in-flight one.
+        if exec_state_exporter.is_some() {
+            close_epoch::sweep_stale_tmp_exports(
+                &tn_datadir.consensus_db_path().join("state_exports"),
+            );
+        }
+
         Ok(Self {
             builder,
             tn_datadir,
@@ -795,6 +805,7 @@ where
             consensus_chain,
             bootstrap_servers,
             version_str,
+            exec_state_exporter,
             metrics: EpochMetrics::default(),
         })
     }
@@ -868,6 +879,7 @@ where
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
         // The canonical epoch cross-checks the finalized header catchup pins its reads to.
         catchup_accumulator(reth_env, &gas_accumulator, &mut self.consensus_chain, epoch).await?;
+        self.try_restore_state(&engine).await?;
 
         // read the network config or use the default, then stamp the genesis chain id
         // onto it so every wire protocol and gossip topic is chain-namespaced (issue
@@ -884,7 +896,9 @@ where
         // once here in the process-lifetime path. That makes the network layer drop non-committee
         // messages before re-propagation and refreshes the authorized set on every committee
         // rotation, rather than accepting any publisher once at node start. See issues #898 and
-        // #912.
+        // #912. `worker_batch_topic` follows the same per-epoch pattern in
+        // `spawn_worker_network_for_epoch`, and is additionally gated on node mode: only
+        // committee validators subscribe, observers unsubscribe (issue #960).
         state_sync::spawn_epoch_record_collector(
             self.consensus_chain.clone(),
             primary_network_handle.clone(),
@@ -903,7 +917,6 @@ where
             self.node_shutdown.subscribe(),
         );
 
-        self.try_restore_state(&engine).await?;
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine_update_rx, &node_task_manager);
 
@@ -1253,8 +1266,9 @@ where
 
     /// Build the execution engine and its underlying reth environment.
     ///
-    /// The reth env is wired to the shared `reth_db`, the configured base-fee address, and the
-    /// accumulator's rewards counter so execution and reward accounting stay consistent.
+    /// The reth env is wired to the shared `reth_db`, the configured base-fee address, and a clone
+    /// of the live gas accumulator so execution, gas/fee accounting, and reward accounting all
+    /// observe the same shared state.
     fn create_engine(
         &self,
         engine_task_manager: &TaskManager,
@@ -1267,8 +1281,13 @@ where
             engine_task_manager,
             self.reth_db.clone(),
             basefee_address,
-            gas_accumulator.rewards_counter(),
+            gas_accumulator.clone(),
         )?;
+        // Give the consensus bus a canonical-DB fallback for `wait_for_execution` (issue #1036):
+        // an execution tip evicted from the in-memory `recent_blocks` ring but still persisted as
+        // canonical in the DB must not be misread as a fork. The bus is constructed before the
+        // engine exists, so the reader is wired here; a per-epoch rebuild simply refreshes it.
+        self.consensus_bus.set_canonical_reader(Arc::new(reth_env.clone()));
         let engine = ExecutionNode::new(&self.builder, reth_env)?;
 
         Ok(engine)
@@ -1303,6 +1322,17 @@ where
             });
         }
 
+        // Startup consistency guard against an incomplete state restore. Resolve the executed tip's
+        // producing consensus header from the tip's OWN nonce (epoch) and
+        // `parent_beacon_block_root` (hash) via `last_executed_consensus_block` — the
+        // slot-hint-immune signal — and hand both to `check_restore_consistency`, which
+        // decides whether the pair is coherent.
+        let tip = self.consensus_bus.recent_blocks().borrow().latest_execution_block();
+        let producing_header =
+            state_sync::last_executed_consensus_block(&self.consensus_bus, &self.consensus_chain)
+                .await;
+        check_restore_consistency(&tip, producing_header.as_ref())?;
+
         Ok(())
     }
 
@@ -1333,11 +1363,52 @@ where
     }
 }
 
+/// Refuse to start on an incomplete state restore: reth is populated to a tip past genesis but the
+/// consensus store has no record of the consensus output that produced that tip.
+///
+/// `tip` is reth's canonical execution tip (as seeded into `recent_blocks`), and `producing_header`
+/// is the tip's producing consensus header as resolved by
+/// [`last_executed_consensus_block`](state_sync::last_executed_consensus_block) — `None` when the
+/// header is absent from the consensus store.
+///
+/// Invariant relied on: "execution follows consensus" — `save_consensus_output` persists a block's
+/// producing consensus HEADER to the consensus store BEFORE that block executes. So any healthy
+/// node that has executed block `B > 0` always resolves `B`'s producing header, whether it is
+/// running, mid multi-epoch catch-up (epoch RECORDS may lag, but the header does not), or
+/// restarting right at/after an epoch boundary (the closing epoch's pack is persisted static before
+/// the next opens, so it stays readable). The only way the header is absent with a populated reth
+/// tip is a state-only / partial / crashed-mid-import restore, which this rejects.
+///
+/// Genesis / fresh nodes (`tip.number == 0`) are exempt: the genesis header has no producing
+/// consensus output, so `producing_header` is legitimately `None` there.
+/// `last_executed_consensus_block` keys on the tip's OWN nonce/`parent_beacon_block_root`, never
+/// the slot-hint-derived `consensus_header_latest`, so a legitimate node with a stale/torn resume
+/// hint is not flagged.
+fn check_restore_consistency(
+    tip: &SealedHeader,
+    producing_header: Option<&ConsensusHeader>,
+) -> eyre::Result<()> {
+    if tip.number > 0 && producing_header.is_none() {
+        let (tip_epoch, _) = deconstruct_nonce(tip.nonce.into());
+        return Err(eyre!(
+            "datadir is an incomplete state restore: execution is at block {} (epoch {tip_epoch}) \
+             but the consensus store has no record of the consensus that produced it. Remove the \
+             chain-data directories (`db`, `static_files`, and `consensus-db`) under the datadir \
+             and re-run `db load-state` with a COMPLETE export bundle — do NOT delete the datadir \
+             itself, which holds your node keys. Or start from an empty datadir to sync from \
+             genesis.",
+            tip.number
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tn_types::{
-        gas_accumulator::compute_next_base_fee_eip1559, ExecHeader, MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::compute_next_base_fee_eip1559, ExecHeader, B256, MIN_PROTOCOL_BASE_FEE,
+        U256,
     };
 
     /// Build a sealed header shaped like an executed worker block for scan tests.
@@ -1459,7 +1530,7 @@ mod tests {
             );
             assert_eq!(
                 fees,
-                vec![Some(run_epoch::next_base_fee_for_config(config, held_fee, gas_used))],
+                vec![Some(next_base_fee_for_config(config, held_fee, gas_used))],
                 "fold diverged from next_base_fee_for_config for {config:?}",
             );
         }
@@ -1488,10 +1559,7 @@ mod tests {
         // the decay is real: three idle boundaries move a non-MIN fee down (and never below MIN)
         assert!((MIN_PROTOCOL_BASE_FEE..anchor).contains(&oracle));
         // and each boundary equals the one-formula seam
-        assert_eq!(
-            fold_forward(anchor, &steps[..1]),
-            run_epoch::next_base_fee_for_config(cfg, anchor, 0),
-        );
+        assert_eq!(fold_forward(anchor, &steps[..1]), next_base_fee_for_config(cfg, anchor, 0));
     }
 
     #[test]
@@ -1523,7 +1591,7 @@ mod tests {
         let creation_static = idle_step(WorkerFeeConfig::Static { fee: 800 });
         assert_eq!(
             fold_forward(MIN_PROTOCOL_BASE_FEE, &[creation_static]),
-            run_epoch::next_base_fee_for_config(
+            next_base_fee_for_config(
                 WorkerFeeConfig::Static { fee: 800 },
                 MIN_PROTOCOL_BASE_FEE,
                 0,
@@ -1537,11 +1605,45 @@ mod tests {
         // later boundaries fold from the creation-priced fee
         assert_eq!(
             fold_forward(MIN_PROTOCOL_BASE_FEE, &[creation_static, creation_eip]),
-            run_epoch::next_base_fee_for_config(
-                WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 },
-                800,
-                0,
-            ),
+            next_base_fee_for_config(WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 }, 800, 0),
         );
+    }
+
+    /// A tip sealed header at `number` whose nonce encodes `epoch` (upper 32 bits), matching the
+    /// payload builder's `nonce = epoch << 32 | round` layout that `deconstruct_nonce` reads back.
+    fn tip_at(number: u64, epoch: u32) -> SealedHeader {
+        let header =
+            ExecHeader { number, nonce: ((epoch as u64) << 32).into(), ..Default::default() };
+        SealedHeader::new(header, B256::repeat_byte(0xab))
+    }
+
+    #[test]
+    fn restore_guard_fires_on_populated_tip_without_producing_header() {
+        // reth executed past genesis (block 5, epoch 7) but the tip's producing consensus header is
+        // absent from the store — the incomplete-restore signature.
+        let err = check_restore_consistency(&tip_at(5, 7), None)
+            .expect_err("populated tip with no producing header must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("incomplete state restore"), "unexpected error: {msg}");
+        assert!(msg.contains("block 5"), "error should name the tip block: {msg}");
+        assert!(msg.contains("epoch 7"), "error should name the tip epoch: {msg}");
+    }
+
+    #[test]
+    fn restore_guard_does_not_fire_at_genesis() {
+        // fresh/genesis node: tip is block 0, which has no producing consensus output, so a None
+        // header is legitimate and the guard must not fire.
+        check_restore_consistency(&tip_at(0, 0), None).expect("genesis tip must not be refused");
+    }
+
+    #[test]
+    fn restore_guard_does_not_fire_on_consistent_store() {
+        // normal populated node: reth is past genesis and the tip's producing header resolves, so
+        // the guard must not fire (covers a running node, mid-catch-up, and an epoch-boundary
+        // restart — all of which resolve the header per the "execution follows consensus"
+        // invariant).
+        let header = ConsensusHeader::default();
+        check_restore_consistency(&tip_at(5, 7), Some(&header))
+            .expect("populated tip with a resolved producing header must not be refused");
     }
 }

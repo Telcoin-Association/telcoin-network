@@ -60,21 +60,49 @@ sol! {
     ) external view returns (bool);
 }
 
-/// Gas charged for a BLS signature verification.
+/// Base gas charged for a BLS signature verification, independent of message length.
 ///
 /// Priced to reflect the equivalent EIP-2537 work the verification represents: a 2-pairing check
-/// (`37_700 + 2 * 32_600 = 102_900`) plus hash-to-curve and point decompression, rounded up. This
-/// keeps the on-chain cost proportional to the cryptography while remaining well within a normal
-/// transaction's gas budget (`stake` / `delegateStake` run with a 1M default limit). The native
-/// implementation completes in microseconds; the charge exists for metering, not compute time.
+/// (`37_700 + 2 * 32_600 = 102_900`) plus point decompression and the fixed portion of
+/// hash-to-curve, rounded up. This keeps the on-chain cost proportional to the cryptography while
+/// remaining well within a normal transaction's gas budget (`stake` / `delegateStake` run with a 1M
+/// default limit). The native implementation completes in microseconds; the charge exists for
+/// metering, not compute time.
 ///
-/// This is a flat charge calibrated for the registry's fixed-size proof-of-possession message (119
-/// bytes). As a generic primitive, `blsVerify` accepts an arbitrary `message` whose hash-to-curve
-/// cost scales with its length; in practice that length is bounded by the calldata gas the caller
-/// already pays to supply it. Before any non-proof-of-possession caller relies on `blsVerify` with
-/// large messages, add a per-word component to this charge (mirroring EIP-2537 hash-to-curve
-/// pricing) or cap `message.len()`.
+/// The length-dependent portion of hash-to-curve is charged separately by
+/// [`BLS_VERIFY_PER_WORD_GAS_COST`]; the total for a given message is [`bls_verify_gas_cost`].
 const BLS_VERIFY_GAS_COST: u64 = 150_000;
+
+/// Per-32-byte-word surcharge over the hashed `message`.
+///
+/// `blsVerify` is a generic primitive, so it accepts a message of any length up to
+/// [`MAX_BLS_VERIFY_MESSAGE_LEN`]. The message-dependent cost of [`bls_verify_secure`] is the
+/// `expand_message_xmd` SHA-256 expansion, which hashes the message once; this rate mirrors the
+/// `SHA256` precompile's 12-gas-per-word charge for the same variable-length hashing, so a longer
+/// message pays for the extra work it induces instead of riding the flat base charge.
+const BLS_VERIFY_PER_WORD_GAS_COST: u64 = 12;
+
+/// Upper bound on the `message` the precompile will hash.
+///
+/// A generous ceiling - far above any realistic signed message, and orders of magnitude above the
+/// sole on-chain caller's fixed 119-byte proof-of-possession message - that keeps `blsVerify` a
+/// general primitive while foreclosing an unbounded hash-to-curve request charged through the
+/// per-word rate. It also bounds [`bls_verify_gas_cost`]'s arithmetic so the charge cannot overflow
+/// for any accepted message.
+const MAX_BLS_VERIFY_MESSAGE_LEN: usize = 4096;
+
+/// Total gas for verifying a `message_len`-byte message: the flat [`BLS_VERIFY_GAS_COST`] base plus
+/// [`BLS_VERIFY_PER_WORD_GAS_COST`] for each 32-byte word of the message (rounded up).
+///
+/// Returns `None` on arithmetic overflow. That is unreachable for any `message_len` at or under
+/// [`MAX_BLS_VERIFY_MESSAGE_LEN`] (the caller gates on the cap first), but the checked arithmetic
+/// keeps the function total rather than panicking if a future caller ever skips the gate.
+fn bls_verify_gas_cost(message_len: usize) -> Option<u64> {
+    u64::try_from(message_len.div_ceil(32))
+        .ok()
+        .and_then(|words| words.checked_mul(BLS_VERIFY_PER_WORD_GAS_COST))
+        .and_then(|word_gas| BLS_VERIFY_GAS_COST.checked_add(word_gas))
+}
 
 /// Registers the BLS precompile at [`BLS_G1_PRECOMPILE_ADDRESS`] in the given map.
 ///
@@ -111,13 +139,23 @@ fn dispatch(data: &[u8], gas: u64) -> PrecompileResult {
 }
 
 /// `blsVerify(bytes,bytes,bytes) -> bool`.
+///
+/// Decoding precedes the gas gate so the message length - which determines the charge - is known
+/// before pricing (the decode is cheap; the previous early gate was only a coarse floor). The
+/// message is capped at [`MAX_BLS_VERIFY_MESSAGE_LEN`] and then charged [`bls_verify_gas_cost`]
+/// (base plus a per-word surcharge), so a caller supplying a long message pays for the extra
+/// hash-to-curve work it induces instead of riding the flat base. An over-cap message is rejected
+/// as `Other`; an under-funded call is `OutOfGas`.
 fn handle_bls_verify(calldata: &[u8], gas_limit: u64) -> PrecompileResult {
-    if gas_limit < BLS_VERIFY_GAS_COST {
-        return Err(PrecompileError::OutOfGas);
-    }
-
     let decoded = blsVerifyCall::abi_decode_raw(calldata)
         .map_err(|e| PrecompileError::Other(format!("blsVerify: {e}").into()))?;
+
+    let message_len = decoded.message.len();
+    let cost = (message_len <= MAX_BLS_VERIFY_MESSAGE_LEN)
+        .then_some(message_len)
+        .ok_or_else(|| PrecompileError::Other("blsVerify: message exceeds maximum length".into()))
+        .and_then(|len| bls_verify_gas_cost(len).ok_or(PrecompileError::OutOfGas))
+        .and_then(|cost| (gas_limit >= cost).then_some(cost).ok_or(PrecompileError::OutOfGas))?;
 
     // Reuse the exact crypto the consensus layer uses to *produce* signatures, so signer and
     // verifier can never disagree. A malformed point or failed verification yields `false` (not
@@ -126,7 +164,7 @@ fn handle_bls_verify(calldata: &[u8], gas_limit: u64) -> PrecompileResult {
     // revert.
     let verified = bls_verify(&decoded.signature, &decoded.pubkey, &decoded.message);
 
-    Ok(PrecompileOutput::new(BLS_VERIFY_GAS_COST, Bytes::from(verified.abi_encode())))
+    Ok(PrecompileOutput::new(cost, Bytes::from(verified.abi_encode())))
 }
 
 /// Decode the compressed sig/pubkey and verify the signature over `message` via `blst`. Any decode
@@ -298,15 +336,21 @@ mod tests {
 
     // --- selector dispatch / ABI surface ---------------------------------------------------------
 
-    /// A valid signature through the full ABI path returns ABI-encoded `true` and charges the fixed
-    /// cost.
+    /// A valid signature through the full ABI path returns ABI-encoded `true` and charges the
+    /// length-dependent cost: the flat base plus the per-word surcharge over the fixed 119-byte
+    /// proof-of-possession message (4 words). This pins the current caller's cost as a regression
+    /// guard - the 119-byte layout is under the cap and adds only a small, fixed delta.
     #[test]
     fn dispatch_verify_valid_returns_true() {
         let v = vector(7, 0x42);
-        let out = dispatch(&encode_verify(&v.sig, &v.pubkey, &v.message), BLS_VERIFY_GAS_COST)
-            .expect("dispatch ok");
+        assert_eq!(v.message.len(), 119, "PoP message is the fixed intentPrefix||pubkey||address");
+        let expected = bls_verify_gas_cost(v.message.len()).expect("cost fits u64");
+        assert_eq!(expected, BLS_VERIFY_GAS_COST + 4 * BLS_VERIFY_PER_WORD_GAS_COST);
+
+        let out =
+            dispatch(&encode_verify(&v.sig, &v.pubkey, &v.message), expected).expect("dispatch ok");
         assert!(decode_bool(&out.bytes));
-        assert_eq!(out.gas_used, BLS_VERIFY_GAS_COST);
+        assert_eq!(out.gas_used, expected);
     }
 
     /// An invalid signature returns ABI-encoded `false` rather than reverting: the precompile
@@ -315,19 +359,100 @@ mod tests {
     fn dispatch_verify_invalid_returns_false_not_revert() {
         let v = vector(7, 0x42);
         let other = vector(7, 0x43);
-        let out = dispatch(&encode_verify(&v.sig, &v.pubkey, &other.message), BLS_VERIFY_GAS_COST)
+        let expected = bls_verify_gas_cost(other.message.len()).expect("cost fits u64");
+        let out = dispatch(&encode_verify(&v.sig, &v.pubkey, &other.message), expected)
             .expect("dispatch ok (false, not error)");
         assert!(!decode_bool(&out.bytes));
         // gas is still charged for the work performed
-        assert_eq!(out.gas_used, BLS_VERIFY_GAS_COST);
+        assert_eq!(out.gas_used, expected);
     }
 
-    /// Verification with less gas than the fixed cost is metered as out-of-gas.
+    /// Verification with less gas than the length-dependent cost is metered as out-of-gas.
     #[test]
     fn dispatch_verify_out_of_gas() {
         let v = vector(7, 0x42);
-        let res = dispatch(&encode_verify(&v.sig, &v.pubkey, &v.message), BLS_VERIFY_GAS_COST - 1);
+        let cost = bls_verify_gas_cost(v.message.len()).expect("cost fits u64");
+        let res = dispatch(&encode_verify(&v.sig, &v.pubkey, &v.message), cost - 1);
         assert!(matches!(res, Err(PrecompileError::OutOfGas)));
+    }
+
+    /// `bls_verify_gas_cost` is the flat base plus the per-word surcharge, rounding the message up
+    /// to whole 32-byte words (an empty message is the bare base; 1..=32 bytes is one word).
+    #[test]
+    fn bls_verify_gas_cost_charges_per_word() {
+        assert_eq!(bls_verify_gas_cost(0), Some(BLS_VERIFY_GAS_COST));
+        // Concrete-rate anchor: pin the surcharge to its literal value, so zeroing the rate
+        // constant - which the constant-symbolic assertions below would not catch - fails here.
+        assert_eq!(bls_verify_gas_cost(32), Some(BLS_VERIFY_GAS_COST + 12));
+        assert_eq!(
+            bls_verify_gas_cost(1),
+            Some(BLS_VERIFY_GAS_COST + BLS_VERIFY_PER_WORD_GAS_COST)
+        );
+        assert_eq!(
+            bls_verify_gas_cost(32),
+            Some(BLS_VERIFY_GAS_COST + BLS_VERIFY_PER_WORD_GAS_COST)
+        );
+        assert_eq!(
+            bls_verify_gas_cost(33),
+            Some(BLS_VERIFY_GAS_COST + 2 * BLS_VERIFY_PER_WORD_GAS_COST)
+        );
+        // the fixed 119-byte proof-of-possession message rounds up to 4 words
+        assert_eq!(
+            bls_verify_gas_cost(119),
+            Some(BLS_VERIFY_GAS_COST + 4 * BLS_VERIFY_PER_WORD_GAS_COST)
+        );
+    }
+
+    /// The charge scales with `message.len()`: two calls that differ only in message length are
+    /// metered differently, by exactly the per-word surcharge over the extra words. On the previous
+    /// flat charge both calls cost `BLS_VERIFY_GAS_COST`, so this fails there and pins the new
+    /// length-dependent pricing. Well-formed sig/pubkey lengths with an invalid (all-zero) key make
+    /// verification return `false`, but the length-dependent gas is charged regardless - which is
+    /// what is measured here.
+    #[test]
+    fn dispatch_meters_by_message_length() {
+        let sig = [0u8; 48];
+        let pubkey = [0u8; 96];
+        let short = vec![0u8; 32]; // 1 word
+        let long = vec![0u8; 32 + 32 * 10]; // 11 words
+
+        let out_short =
+            dispatch(&encode_verify(&sig, &pubkey, &short), 1_000_000).expect("short ok");
+        let out_long = dispatch(&encode_verify(&sig, &pubkey, &long), 1_000_000).expect("long ok");
+
+        assert!(!decode_bool(&out_short.bytes));
+        assert!(!decode_bool(&out_long.bytes));
+        assert!(out_long.gas_used > out_short.gas_used, "longer message must cost more gas");
+        assert_eq!(
+            out_long.gas_used - out_short.gas_used,
+            10 * BLS_VERIFY_PER_WORD_GAS_COST,
+            "delta is exactly the per-word charge over the 10 extra words"
+        );
+    }
+
+    /// The message length is capped: a message at `MAX_BLS_VERIFY_MESSAGE_LEN` is accepted (and
+    /// charged), while one byte over is rejected as an `Other` error - not charged-and-run - even
+    /// with ample gas, proving the cap (not the gas gate) is the enforcement.
+    #[test]
+    fn dispatch_rejects_oversized_message() {
+        let sig = [0u8; 48];
+        let pubkey = [0u8; 96];
+        let at_cap = vec![0u8; MAX_BLS_VERIFY_MESSAGE_LEN];
+        let over_cap = vec![0u8; MAX_BLS_VERIFY_MESSAGE_LEN + 1];
+
+        // At the cap: accepted. Verification returns `false` (invalid key), charged the full cost.
+        let cost = bls_verify_gas_cost(at_cap.len()).expect("cost fits u64");
+        let out = dispatch(&encode_verify(&sig, &pubkey, &at_cap), cost).expect("at-cap accepted");
+        assert!(!decode_bool(&out.bytes));
+        assert_eq!(out.gas_used, cost);
+
+        // One byte over the cap: rejected as an error even with far more gas than any charge, so
+        // it is the length bound - not out-of-gas - doing the rejecting.
+        let res = dispatch(&encode_verify(&sig, &pubkey, &over_cap), 10_000_000);
+        assert!(
+            matches!(res, Err(PrecompileError::Other(_))),
+            "over-cap message must be rejected, not charged and run"
+        );
     }
 
     /// Unknown selectors and truncated calldata are rejected.

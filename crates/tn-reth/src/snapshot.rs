@@ -35,6 +35,23 @@
 //! recompute on a live database just re-reads the already-cached trie tables and proves nothing
 //! about the plain-state rows we actually stream. The restore side is the real check — it rebuilds
 //! the trie from scratch out of the accounts in the pack and hard-fails on any mismatch.
+//!
+//! # Trust boundary: what restore verifies, and what it trusts
+//!
+//! Restore proves internal consistency, not provenance. It verifies that the pack's accounts
+//! rebuild from scratch to both the pack's declared state root and `header(B).state_root`, that
+//! the header window is contiguous by block number, hash-linked from each header to its
+//! predecessor, and tipped by a header matching the claimed `final_state` number and hash, and
+//! (in [`SnapshotRestorer::finish`]) that the reconstructed tip matches `final_state`. It does
+//! NOT verify that `final_state` itself belongs to the canonical chain: no consensus provenance
+//! or signature check happens in this module, so `final_state` is the trusted input here: a
+//! restore against a forged window that is internally consistent and tipped by the claimed final
+//! block would succeed. Callers are expected to supply a `final_state` they have verified: `tn db
+//! load-state` pins it to an epoch record checked against that epoch's super-quorum certificate.
+//! Because a header hash commits to every field of its header, including `parent_hash`, the
+//! linkage walk carries such a caller's guarantee from the tip down through the whole window.
+//! Genesis is never taken from the snapshot; it always comes from the local chain spec, which
+//! remains the trust root.
 
 use crate::{
     error::{TnRethError, TnRethResult},
@@ -50,14 +67,18 @@ use reth_db::{
     },
     transaction::{DbTx, DbTxMut},
 };
-use reth_db_common::init::{insert_genesis_hashes, insert_history, insert_state};
+use reth_primitives_traits::{Account, StorageEntry};
 use reth_provider::{
-    BlockWriter, ChainStateBlockWriter, DBProvider, DatabaseProviderFactory, ProviderError,
-    StageCheckpointWriter, StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
-    TrieWriter,
+    BlockWriter, ChainStateBlockWriter, DBProvider, DatabaseProviderFactory, HashingWriter,
+    HistoryWriter, ProviderError, StageCheckpointWriter, StateWriter, StaticFileProviderFactory,
+    StaticFileSegment, StaticFileWriter, StorageSettingsCache, TrieWriter,
+};
+use reth_revm::{
+    bytecode::Bytecode,
+    db::states::{PlainStorageChangeset, StateChangeset},
 };
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_trie::StateRoot;
+use reth_trie::{IntermediateStateRootState, StateRoot, StateRootProgress};
 use reth_trie_db::DatabaseStateRoot;
 use std::{
     cmp::Ordering,
@@ -65,17 +86,23 @@ use std::{
     path::Path,
 };
 use tn_storage::exec_state_pack::{
-    ExecStateAccount, ExecStatePackReader, ExecStatePackWriter, ExecStateStats,
+    ExecStateAccount, ExecStateAccountMeta, ExecStatePackReader, ExecStatePackWriter,
+    ExecStateStats, StateEntry,
 };
 use tn_types::{
-    gas_accumulator::{RewardsCounter, WorkerFeeConfig},
+    gas_accumulator::{GasAccumulator, WorkerFeeConfig},
     Address, BlockBody, BlockNumHash, Bytes, Epoch, ExecHeader, GenesisAccount, SealedBlock,
-    SealedHeader, TaskManager, WorkerId, B256,
+    SealedHeader, TaskManager, WorkerId, B256, U256,
 };
-use tracing::debug;
+use tracing::{debug, info};
 
 /// The pinned read-only MDBX transaction type — reth's `Tx<RO>` with long-read safety disabled.
 type PinnedTx = <DatabaseEnv as RethDatabaseT>::TX;
+
+/// Emit a scaffold-progress log every this many blocks. The chain scaffold's cost scales with chain
+/// height (not state size), so on a mature chain the header/body loops churn through millions of
+/// static-file writes; periodic logging makes a long scaffold observable instead of silent.
+const SCAFFOLD_LOG_INTERVAL: u64 = 500_000;
 
 /// A read-consistent view of reth's plain EVM state pinned to the tip at open time.
 ///
@@ -238,8 +265,7 @@ impl RethEnv {
         // view only carries what it needs (the plain-state tables all live in mdbx, not static
         // files, so no provider/static-file handle has to be kept alive alongside it)
         let tx = self
-            .inner
-            .blockchain_provider
+            .blockchain_provider()
             .database_provider_ro()?
             .disable_long_read_transaction_safety()
             .into_tx();
@@ -259,11 +285,12 @@ impl RethEnv {
 /// # Why restore does not use reth's `init_from_state_dump`
 ///
 /// reth's `init_from_state_dump` is private and JSONL-only. Instead,
-/// [`import_state`](Self::import_state) feeds the pack's accounts to reth's *public*
-/// state-insertion building blocks ([`insert_state`], [`insert_genesis_hashes`],
-/// [`insert_history`]) and recomputes the state root from scratch with [`StateRoot`] — the same
-/// tables and the same from-scratch check `init_from_state_dump` performs internally, without the
-/// JSONL parser.
+/// [`import_state`](Self::import_state) streams the pack's accounts through reth's *public*
+/// state-insertion building blocks ([`StateWriter::write_state_changes`] for plain state and
+/// bytecode, [`HashingWriter`] for the hashed tables, [`HistoryWriter`] for the history indices)
+/// one account header and one bounded storage chunk at a time, then recomputes the state root from
+/// scratch with [`StateRoot`] — the same hashed/history tables and the same from-scratch check
+/// `init_from_state_dump` performs internally, without the JSONL parser.
 ///
 /// # Why this reimplements reth's `setup_without_evm`
 ///
@@ -285,9 +312,9 @@ impl RethEnv {
 ///    state tables and writes a header-only chain up to `B` (real hashes in the window, zero-hash
 ///    dummies below it), so the state import has a real `header(B)` to check its recomputed root
 ///    against.
-/// 3. [`import_state`](Self::import_state) writes the pack's accounts into reth's state tables,
-///    recomputes the state root from scratch, and hard-fails on any mismatch with
-///    `header(B).state_root`.
+/// 3. [`import_state`](Self::import_state) streams the pack's accounts into reth's state tables one
+///    account header and one bounded storage chunk at a time, recomputes the state root from
+///    scratch, and hard-fails on any mismatch with `header(B).state_root`.
 /// 4. [`derive_fee_precondition`](Self::derive_fee_precondition) verifies the shipped window is
 ///    self-sufficient for the node's first epoch-entry base-fee derivation, so the restored node
 ///    will not walk below the window into history the snapshot omitted and halt.
@@ -321,7 +348,7 @@ impl SnapshotRestorer {
         task_manager: &TaskManager,
     ) -> eyre::Result<Self> {
         let reth_env =
-            RethEnv::new(reth_config, task_manager, db, None, RewardsCounter::default())?;
+            RethEnv::new(reth_config, task_manager, db, None, GasAccumulator::default())?;
 
         // a fresh or genesis-only datadir sits at block 0; any higher tip means the datadir
         // already holds chain data that restore must not clobber.
@@ -338,9 +365,10 @@ impl SnapshotRestorer {
 
     /// Write a header-only chain scaffold up to the snapshot's final block `B`.
     ///
-    /// `window` is a contiguous, ascending run of the real headers that end at `final_state`
-    /// (block `B`); it must not include genesis. This method, run once before
-    /// [`import_state`](Self::import_state):
+    /// `window` is a contiguous, ascending, parent-hash-linked run of the real headers that end at
+    /// `final_state` (block `B`); it must not include genesis. Those properties are re-checked
+    /// here rather than assumed, so every caller of this `pub` API gets them. This method, run
+    /// once before [`import_state`](Self::import_state):
     ///
     /// - Clears the genesis alloc from `PlainAccountState`, `PlainStorageState`, `HashedAccounts`,
     ///   `HashedStorages`, `AccountsTrie`, and `StoragesTrie`. `init_genesis` (run in
@@ -371,8 +399,9 @@ impl SnapshotRestorer {
             .ok_or_else(|| eyre!("snapshot restore: cannot scaffold an empty header window"))?;
         let b = final_state.number;
 
-        // cheap invariant checks (the window is validated upstream, but a mis-shaped window here
-        // would silently corrupt the scaffold)
+        // cheap invariant checks. nothing upstream re-checks the window's shape or its linkage
+        // (`scaffold_window` only normalizes, and the pack-vs-record check sees the tip alone), so
+        // these run here or nowhere, and a mis-shaped window would silently corrupt the scaffold
         if b == 0 {
             return Err(eyre!("snapshot restore: cannot scaffold at genesis (block 0)"));
         }
@@ -398,8 +427,32 @@ impl SnapshotRestorer {
                 ));
             }
         }
+        // parent-hash linkage. `final_state.hash` is pinned upstream to the certificate-verified
+        // `EpochRecord.final_state`, and a header hash commits to every field of that header,
+        // including its `parent_hash`. Walking the links therefore carries the certificate's
+        // coverage from the tip down through every ancestor this scaffold writes, instead of
+        // trusting the bundle's producer for them. Number contiguity alone accepts a header that
+        // sits at the right height with arbitrary ancestry.
+        window.iter().zip(window.iter().skip(1)).try_for_each(|(parent, child)| {
+            (child.parent_hash == parent.hash()).then_some(()).ok_or_else(|| {
+                eyre!(
+                    "snapshot restore: window is not hash-linked at block {}: parent_hash {} does \
+                     not match block {}'s hash {}",
+                    child.number,
+                    child.parent_hash,
+                    parent.number,
+                    parent.hash()
+                )
+            })
+        })?;
 
-        let provider_rw = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
+        info!(
+            target: "tn::reth",
+            blocks = b,
+            "snapshot restore: writing header-only chain scaffold up to block {b}"
+        );
+
+        let provider_rw = self.reth_env.blockchain_provider().database_provider_rw()?;
 
         // drop the genesis alloc so an on-chain-zeroed genesis slot cannot survive the import
         {
@@ -434,6 +487,14 @@ impl SnapshotRestorer {
                         headers_writer.append_header(&dummy, &B256::ZERO)?;
                     }
                 }
+                if number.is_multiple_of(SCAFFOLD_LOG_INTERVAL) {
+                    info!(
+                        target: "tn::reth",
+                        block = number,
+                        total = b,
+                        "snapshot restore: scaffolding headers"
+                    );
+                }
             }
         }
 
@@ -451,6 +512,15 @@ impl SnapshotRestorer {
             let mut writer = sf.latest_writer(segment)?;
             for number in 1..b {
                 writer.increment_block(number)?;
+                if number.is_multiple_of(SCAFFOLD_LOG_INTERVAL) {
+                    info!(
+                        target: "tn::reth",
+                        ?segment,
+                        block = number,
+                        total = b,
+                        "snapshot restore: advancing body segments"
+                    );
+                }
             }
         }
 
@@ -486,43 +556,151 @@ impl SnapshotRestorer {
         sf.commit()?;
         provider_rw.commit()?;
 
+        info!(target: "tn::reth", blocks = b, "snapshot restore: chain scaffold written");
         Ok(())
     }
 
     /// Import the pack's plain-state accounts into the scaffolded datadir and return the recomputed
     /// state root.
     ///
-    /// Streams every [`ExecStateAccount`] out of `reader`, writes them into reth's state tables
-    /// with the public building blocks [`insert_genesis_hashes`], [`insert_history`], and
-    /// [`insert_state`] (mirroring what reth's private `dump_state` does, but reading from the
-    /// pack, not JSONL), then recomputes the state root FROM SCRATCH with
-    /// [`StateRoot::from_tx`] and hard-fails unless it equals both the pack's declared root and
-    /// `header(B).state_root` (written by
-    /// [`import_chain_scaffold`](Self::import_chain_scaffold)). No JSONL, no ETL.
+    /// Drives the pack's chunked read stream ([`ExecStatePackReader::next_entry`]): each
+    /// [`StateEntry::Account`] writes one account header (`PlainAccountState`, `HashedAccounts`,
+    /// `AccountsHistory`, and its `Bytecodes` row) and each [`StateEntry::Storage`] writes one
+    /// bounded slot chunk (`PlainStorageState`, `HashedStorages`, `StoragesHistory`) for the
+    /// current account. Plain state and bytecode go through
+    /// [`StateWriter::write_state_changes`], the hashed tables through [`HashingWriter`], and
+    /// the history indices through [`HistoryWriter`] — the same hashed/history/plain rows
+    /// reth's private `dump_state` writes, but never the `AccountChangeSets`/
+    /// `StorageChangeSets` those helpers also fabricate (see the change-set section). The state
+    /// root is then recomputed FROM SCRATCH with [`StateRoot::from_tx`], driven incrementally
+    /// via [`StateRoot::root_with_progress`] so the in-flight `TrieUpdates` are flushed to disk
+    /// as they accumulate rather than pinned in RAM. The import hard-fails unless
+    /// the recomputed root equals both the pack's declared root and `header(B).state_root` (written
+    /// by [`import_chain_scaffold`](Self::import_chain_scaffold)). No JSONL, no ETL.
+    ///
+    /// # Memory profile
+    ///
+    /// At most one account header plus one `STORAGE_CHUNK_SLOTS`-bounded storage chunk is resident
+    /// at a time — a whale account's storage is never fully materialized, unlike
+    /// [`ExecStatePackReader::next_account`] (which reassembles it into one `Vec`) or the reth
+    /// `write_state`/`insert_state` path (which builds a whole-account `BundleState`). The
+    /// trie-update flushing bounds the recompute's memory the same way.
+    ///
+    /// # Why the block-`B` change sets are skipped
+    ///
+    /// `insert_state` (and every reth `write_state` variant) records a per-block revert into
+    /// `AccountChangeSets`/`StorageChangeSets`, and there is no public reth API that writes plain
+    /// state per storage chunk WITHOUT also bundling those change sets and materializing the whole
+    /// account. This import deliberately writes neither table for block `B`. That is sound because
+    /// those rows would be fictional anyway (the scaffold fabricates "all state created at `B`"
+    /// over dummy blocks) and nothing a snapshot-bootstrapped node does ever reads them: the
+    /// state root is recomputed from the HASHED tables (not change sets); the node never
+    /// unwinds a persisted canonical block (`TN reorgs are impossible`) and restore finalizes
+    /// `B`, so `B` and below are never rolled back; every registry/fee read pins the canonical
+    /// tip (`= B`), which reth serves from a `LatestStateProvider` (plain state, no change-set
+    /// read); and the node runs archive mode with the pruner fully disabled, so a historical
+    /// read below `B` resolves through `HistoryInfo::NotYetWritten` (the single-`[B]` history
+    /// index + absent prune boundary) rather than a change-set lookup. Blocks executed forward
+    /// from `B` write their change sets normally through `save_blocks`.
+    ///
+    /// # Ascending-address invariant
+    ///
+    /// The exporter ([`PinnedStateView::export_state_pack`]) emits accounts in strictly ascending,
+    /// unique address order (it walks the `PlainAccountState` cursor). The per-account
+    /// [`HashingWriter::insert_storage_for_hashing`] MERGES a chunk's slots into any existing
+    /// `HashedStorages` dup-list for the address, so re-visiting an address across the stream would
+    /// silently fold two accounts' storage together; the per-account/per-chunk history-index writes
+    /// likewise assume each `(address, slot)` sharded key is touched once. This method verifies the
+    /// ordering explicitly and returns a clear error on any violation, turning a corrupt, crafted,
+    /// or out-of-order pack into a loud failure instead of silent state corruption.
     pub fn import_state(&self, reader: &mut ExecStatePackReader) -> eyre::Result<B256> {
         let expected_root = reader.meta().state_root;
         let b = reader.meta().block_number;
 
-        // pull the full account set out of the pack (address + genesis-shaped account)
-        let accounts: Vec<(Address, GenesisAccount)> = reader
-            .accounts()
-            .map(|res| res.map(|a| (a.address, a.account)))
-            .collect::<Result<_, _>>()?;
+        let provider = self.reth_env.blockchain_provider().database_provider_rw()?;
 
-        let provider = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
+        // TN keeps EVM state in the PLAIN tables (the exporter reads PlainAccountState /
+        // PlainStorageState, and the account-header / storage-chunk writers below target the plain
+        // tables). reth's `write_state_changes` silently SKIPS plain writes when the db is in
+        // hashed-state mode, so a hashed-mode db here would leave the plain tables empty and the
+        // node unable to serve state. assert the mode up front rather than importing a
+        // half-populated db.
+        if provider.cached_storage_settings().use_hashed_state() {
+            return Err(eyre!(
+                "snapshot restore: reth db is in hashed-state mode, but the import writes plain \
+                 state; refusing to import a db whose plain tables would be left empty"
+            ));
+        }
 
-        // write plain + hashed + history state, mirroring reth's private `dump_state` sequence but
-        // driven from the pack's accounts rather than a JSONL reader.
-        insert_genesis_hashes(&provider, accounts.iter().map(|(a, g)| (a, g)))?;
-        insert_history(&provider, accounts.iter().map(|(a, g)| (a, g)), b)?;
-        insert_state(&provider, accounts.iter().map(|(a, g)| (a, g)), b)?;
+        // drive the pack's chunked read stream, writing one account header or one bounded storage
+        // chunk at a time. only the current chunk (and one header) is ever resident, so a whale
+        // account's storage is never fully materialized. the ascending-address check enforces the
+        // unique-address assumption the per-account HashedStorages merge and history-index writes
+        // rely on.
+        let mut current: Option<Address> = None;
+        let mut prev_address: Option<Address> = None;
+
+        while let Some(entry) = reader.next_entry() {
+            match entry? {
+                StateEntry::Account(meta) => {
+                    let address = meta.address;
+
+                    // strictly ascending, unique addresses: the exporter guarantees this, so a
+                    // violation means the pack is corrupt or was not produced by the exporter.
+                    if let Some(prev) = prev_address {
+                        if address <= prev {
+                            return Err(eyre!(
+                                "snapshot restore: pack accounts are not in strictly ascending \
+                                 address order at {address}; the pack is corrupt or was not \
+                                 produced by the exporter"
+                            ));
+                        }
+                    }
+                    prev_address = Some(address);
+                    current = Some(address);
+
+                    Self::write_account_header(&provider, &meta, b)?;
+                }
+                StateEntry::Storage(chunk) => {
+                    // a Storage record can only follow an Account record; the pack layout
+                    // guarantees this, but guard so a malformed pack fails loudly here rather than
+                    // silently dropping storage.
+                    let address = current.ok_or_else(|| {
+                        eyre!(
+                            "snapshot restore: pack has a storage chunk before any account; the \
+                             pack is corrupt or was not produced by the exporter"
+                        )
+                    })?;
+                    Self::write_storage_chunk(&provider, address, chunk, b)?;
+                }
+            }
+        }
 
         // recompute the state root from scratch out of the just-written hashed state and persist
-        // the trie nodes. the scaffold cleared the trie tables, so this is a full rebuild.
-        let (root, trie_updates) = StateRoot::from_tx(provider.tx_ref())
-            .root_with_updates()
-            .map_err(|e| eyre!("snapshot restore: state root computation failed: {e}"))?;
-        provider.write_trie_updates(trie_updates)?;
+        // the trie nodes. the scaffold cleared the trie tables, so this is a full rebuild with no
+        // prefix sets. drive it incrementally: `root_with_progress` yields the trie updates in
+        // batches, which are written and released each iteration so they are never all pinned in
+        // RAM, resuming from the returned intermediate state until it completes.
+        let root = {
+            let tx = provider.tx_ref();
+            let mut intermediate: Option<IntermediateStateRootState> = None;
+            loop {
+                let computer = StateRoot::from_tx(tx).with_intermediate_state(intermediate.take());
+                match computer
+                    .root_with_progress()
+                    .map_err(|e| eyre!("snapshot restore: state root computation failed: {e}"))?
+                {
+                    StateRootProgress::Progress(state, _, updates) => {
+                        provider.write_trie_updates(updates)?;
+                        intermediate = Some(*state);
+                    }
+                    StateRootProgress::Complete(root, _, updates) => {
+                        provider.write_trie_updates(updates)?;
+                        break root;
+                    }
+                }
+            }
+        };
 
         // authoritative check: the recomputed root must match the pack's declared root and the
         // scaffolded header(B). a mismatch means the shipped accounts do not hash to the claimed
@@ -548,64 +726,24 @@ impl SnapshotRestorer {
         Ok(root)
     }
 
-    /// Verify the shipped window can seed the restored node's first epoch-entry base fees.
-    ///
-    /// At epoch entry the node derives each worker's base fee from the previous epoch's genuine
-    /// blocks; a worker with an `Eip1559` config that produced no genuine block in that epoch has
-    /// no chain-observable fee anchor and the node walks BACKWARD through earlier epochs to
-    /// find one. A restored node only has the shipped `window`, so such a walk would run off
-    /// the bottom of the window into pre-snapshot history the snapshot omitted, and halt.
-    ///
-    /// This mirrors that attribution: it reads the worker fee configs at block `B` (the closing
-    /// block of the epoch below `entered`, which defines `entered`'s configuration) against the
-    /// post-import state, then requires every `Eip1559` worker to have produced at least one
-    /// genuine batch block within `window`. `Static` workers need no anchor — their fee is
-    /// pinned by config. Errors name the offending worker. Must run AFTER
-    /// [`import_state`](Self::import_state), since it reads contract state at `B`.
+    /// Restore-side driver for [`check_fee_precondition`]: verifies the shipped window can seed the
+    /// restored node's first epoch-entry base fees, reading contract state through this restorer's
+    /// env. Must run AFTER [`import_state`](Self::import_state), since it reads contract state at
+    /// `B`.
     pub fn derive_fee_precondition(
         &self,
         entered: Epoch,
         window: &[SealedHeader],
     ) -> eyre::Result<()> {
-        let closing = window
-            .last()
-            .ok_or_else(|| eyre!("snapshot restore: cannot check fees over an empty window"))?;
+        check_fee_precondition(&self.reth_env, entered, window)
+    }
 
-        // worker strategies at the closing block define the entered epoch's configuration
-        let (num_workers, configs) =
-            self.reth_env.get_worker_fee_configs_at_block(closing.hash()).wrap_err(
-                "snapshot restore: reading worker fee configs at the snapshot's final block",
-            )?;
-
-        // workers with a genuine batch block inside the shipped window
-        let mut produced: BTreeSet<WorkerId> = BTreeSet::new();
-        for header in window {
-            if is_worker_batch_block(header) {
-                produced.insert(worker_id_from_header(header));
-            }
-        }
-
-        let prior = entered.saturating_sub(1);
-        for (worker_id, config) in configs.iter().enumerate() {
-            let worker_id = worker_id as WorkerId;
-            if matches!(config, WorkerFeeConfig::Eip1559 { .. }) && !produced.contains(&worker_id) {
-                return Err(eyre!(
-                    "snapshot restore: worker {worker_id} has an EIP-1559 fee config but produced \
-                     no genuine block in the shipped epoch-{prior} window; the restored node would \
-                     walk into pre-snapshot history deriving its base fee when entering epoch \
-                     {entered} and halt"
-                ));
-            }
-        }
-
-        debug!(
-            target: "tn::reth",
-            entered,
-            num_workers,
-            produced = produced.len(),
-            "snapshot restore: fee precondition satisfied"
-        );
-        Ok(())
+    /// Restore-side driver for [`check_fees_resumable`]: reads the entered epoch from the restored
+    /// state at `B` and verifies fee derivability. Must run AFTER
+    /// [`import_state`](Self::import_state) (it reads contract state at `B`) and before
+    /// [`finish`](Self::finish).
+    pub fn check_resumable_fees(&self, window: &[SealedHeader]) -> eyre::Result<()> {
+        check_fees_resumable(&self.reth_env, window)
     }
 
     /// Persist the finalized/safe markers at `B` and sanity-check the reconstructed tip.
@@ -619,7 +757,7 @@ impl SnapshotRestorer {
         let b = final_state.number;
 
         {
-            let provider = self.reth_env.inner.blockchain_provider.database_provider_rw()?;
+            let provider = self.reth_env.blockchain_provider().database_provider_rw()?;
             provider.save_finalized_block_number(b)?;
             provider.save_safe_block_number(b)?;
             provider.commit()?;
@@ -642,43 +780,236 @@ impl SnapshotRestorer {
 
         Ok(())
     }
+
+    /// Write one account header (nonce/balance/code) into the plain, hashed, history, and bytecode
+    /// tables at block `b`, WITHOUT any change-set row.
+    ///
+    /// This is the account-only half of what reth's `insert_state` + `insert_genesis_hashes` +
+    /// `insert_history` write for a single account: `write_state_changes` upserts
+    /// `PlainAccountState` and (via `contracts`) `Bytecodes` but no `AccountChangeSets`;
+    /// `insert_account_for_hashing` upserts `HashedAccounts`; `insert_account_history_index`
+    /// appends the single `[b]` transition to `AccountsHistory`. The account's storage arrives
+    /// separately as [`Self::write_storage_chunk`] calls, so this never touches storage.
+    fn write_account_header<Provider>(
+        provider: &Provider,
+        meta: &ExecStateAccountMeta,
+        b: u64,
+    ) -> eyre::Result<()>
+    where
+        Provider: StateWriter + HashingWriter + HistoryWriter,
+    {
+        // resolve the bytecode hash once and reuse it across the plain account row, the hashed
+        // account row, and the Bytecodes entry, mirroring reth's genesis-account handling. an empty
+        // code slice is treated as no code (hash left None) so the account keeps KECCAK_EMPTY.
+        let (bytecode_hash, contracts) = match &meta.code {
+            Some(code) if !code.is_empty() => {
+                let bytecode = Bytecode::new_raw_checked(code.clone()).map_err(|e| {
+                    eyre!("snapshot restore: invalid bytecode for account {}: {e}", meta.address)
+                })?;
+                let hash = bytecode.hash_slow();
+                (Some(hash), vec![(hash, bytecode)])
+            }
+            _ => (None, Vec::new()),
+        };
+        let account = Account { nonce: meta.nonce, balance: meta.balance, bytecode_hash };
+
+        // plain account + bytecode only: `write_state_changes` writes NO change sets.
+        provider.write_state_changes(StateChangeset {
+            accounts: vec![(meta.address, Some(account.into()))],
+            storage: Vec::new(),
+            contracts,
+        })?;
+        // hashed account row
+        provider.insert_account_for_hashing([(meta.address, Some(account))])?;
+        // single history transition at block `b`
+        provider.insert_account_history_index([(meta.address, [b])])?;
+
+        Ok(())
+    }
+
+    /// Write one bounded storage chunk for `address` into the plain, hashed, and history tables at
+    /// block `b`, WITHOUT any change-set row.
+    ///
+    /// `chunk` is a slice of the account's `(slot, value)` pairs (at most `STORAGE_CHUNK_SLOTS`),
+    /// already ascending by slot and free of zero values (the exporter filters them). This is the
+    /// storage half of reth's `insert_state`/`insert_genesis_hashes`/`insert_history`:
+    /// `write_state_changes` upserts `PlainStorageState` (no `StorageChangeSets`);
+    /// `insert_storage_for_hashing` MERGES the chunk into the address's `HashedStorages` dup-list;
+    /// `insert_storage_history_index` appends the single `[b]` transition per slot to
+    /// `StoragesHistory`. Merging is why the caller must never re-visit an address (see the
+    /// ascending-address invariant on [`import_state`](Self::import_state)).
+    fn write_storage_chunk<Provider>(
+        provider: &Provider,
+        address: Address,
+        chunk: Vec<(B256, B256)>,
+        b: u64,
+    ) -> eyre::Result<()>
+    where
+        Provider: StateWriter + HashingWriter + HistoryWriter,
+    {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        // plain storage: `write_state_changes` upserts PlainStorageState (values are U256; the
+        // exporter already dropped zero-valued slots) and writes NO change sets. `wipe_storage` is
+        // false — the scaffold cleared the tables, so there is nothing to wipe and every account is
+        // visited once.
+        let plain_storage: Vec<(U256, U256)> = chunk
+            .iter()
+            .map(|(slot, value)| (U256::from_be_bytes(slot.0), U256::from_be_bytes(value.0)))
+            .collect();
+        provider.write_state_changes(StateChangeset {
+            accounts: Vec::new(),
+            storage: vec![PlainStorageChangeset {
+                address,
+                wipe_storage: false,
+                storage: plain_storage,
+            }],
+            contracts: Vec::new(),
+        })?;
+
+        // hashed storage: merges this chunk's slots into the address's existing dup-list.
+        let hashed_entries = chunk
+            .iter()
+            .map(|(slot, value)| StorageEntry { key: *slot, value: U256::from_be_bytes(value.0) });
+        provider.insert_storage_for_hashing([(address, hashed_entries)])?;
+
+        // storage history: one `[b]` transition per slot, keyed by (address, slot).
+        let history = chunk.iter().map(|(slot, _)| ((address, *slot), [b]));
+        provider.insert_storage_history_index(history)?;
+
+        Ok(())
+    }
 }
 
-/// The worker id encoded in a header's `difficulty` (low 16 bits).
+/// Verify a snapshot's shipped `window` can seed the restored node's first epoch-entry base fees,
+/// reading contract state at `B` (= `window.last()`) through `reth_env`.
 ///
-/// Mirrors the canonical `worker_id_from_header` in `tn_node::manager::node`; kept in sync with the
-/// encoding used by the gas accumulator's block attribution. Public so the snapshot uploader's
-/// fee-derivability precheck attributes headers with the exact same rule the restore-side
-/// [`SnapshotRestorer::derive_fee_precondition`] uses — one implementation, no drift.
-pub fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
-    (header.difficulty.into_limbs()[0] & 0xffff) as u16
+/// At epoch entry the node derives each worker's base fee from the previous epoch's genuine blocks;
+/// a worker with an `Eip1559` config that produced no genuine block in that epoch has no
+/// chain-observable fee anchor and the node walks BACKWARD through earlier epochs to find one. A
+/// node holding only the shipped `window` (a snapshot-restored node bootstrapped from an idle
+/// epoch) would run off the bottom of the window into pre-snapshot history and halt. This reads the
+/// worker fee configs at `B` (the closing block of the epoch below `entered`, which defines
+/// `entered`'s configuration) and requires every `Eip1559` worker to have produced at least one
+/// genuine batch block within `window`; `Static` workers need no anchor. Errors name the offending
+/// worker.
+///
+/// Shared by the restore side ([`SnapshotRestorer::derive_fee_precondition`]) and the export side
+/// (which runs it against a candidate bundle's window before writing it) — one implementation, no
+/// drift.
+pub fn check_fee_precondition(
+    reth_env: &RethEnv,
+    entered: Epoch,
+    window: &[SealedHeader],
+) -> eyre::Result<()> {
+    let closing = window
+        .last()
+        .ok_or_else(|| eyre!("snapshot restore: cannot check fees over an empty window"))?;
+
+    // worker strategies at the closing block define the entered epoch's configuration
+    let (num_workers, configs) = reth_env
+        .get_worker_fee_configs_at_block(closing.hash())
+        .wrap_err("snapshot restore: reading worker fee configs at the snapshot's final block")?;
+
+    // workers with a genuine batch block inside the shipped window
+    let mut produced: BTreeSet<WorkerId> = BTreeSet::new();
+    for header in window {
+        if is_worker_batch_block(header) {
+            produced.insert(worker_id_from_header(header));
+        }
+    }
+
+    let prior = entered.saturating_sub(1);
+    for (worker_id, config) in configs.iter().enumerate() {
+        let worker_id = worker_id as WorkerId;
+        if matches!(config, WorkerFeeConfig::Eip1559 { .. }) && !produced.contains(&worker_id) {
+            return Err(eyre!(
+                "snapshot restore: worker {worker_id} has an EIP-1559 fee config but produced \
+                 no genuine block in the shipped epoch-{prior} window; the restored node would \
+                 walk into pre-snapshot history deriving its base fee when entering epoch \
+                 {entered} and halt"
+            ));
+        }
+    }
+
+    debug!(
+        target: "tn::reth",
+        entered,
+        num_workers,
+        produced = produced.len(),
+        "snapshot restore: fee precondition satisfied"
+    );
+    Ok(())
 }
 
-/// True when `header` is a genuine worker batch block.
+/// Verify a snapshot `window` is fee-resumable without being told the entered epoch: read it from
+/// the state at `B` (the window's last header, whose registry state — stamped by `concludeEpoch` at
+/// that closing block — names the epoch a node would enter) and defer to
+/// [`check_fee_precondition`].
 ///
-/// Mirrors the canonical `is_worker_batch_block` in `tn_node::manager::node`: excludes genesis
-/// (`number == 0`) and the synthetic empty-close block, whose `ommers_hash` (the batch-digest slot)
-/// is zero. Only genuine batch blocks carry a non-zero batch digest. Public so the snapshot
-/// uploader's fee-derivability precheck shares the exact attribution rule the restore-side
-/// [`SnapshotRestorer::derive_fee_precondition`] applies.
-pub fn is_worker_batch_block(header: &SealedHeader) -> bool {
-    header.number != 0 && header.ommers_hash != B256::ZERO
+/// A no-op when the node would enter epoch 0 or 1: entering epoch 1 stops at the epoch-0 base case
+/// of the base-fee walk (`derive_idle_worker_fee_at`) and never reads state below `B`, so there is
+/// nothing to guard (and an epoch-0 snapshot is not consensus-resumable regardless). The
+/// ConsensusRegistry that names the entered epoch is a protocol invariant present at every block,
+/// so a failed read is a hard error and the snapshot is not declared fee-resumable. An actual
+/// idle-epoch violation is likewise a hard error naming the offending worker.
+///
+/// On the restore side, run AFTER [`SnapshotRestorer::import_state`] (it reads contract state at
+/// `B`). On the export side, run against a candidate bundle's window before writing the pack.
+pub fn check_fees_resumable(reth_env: &RethEnv, window: &[SealedHeader]) -> eyre::Result<()> {
+    let closing = window.last().ok_or_else(|| {
+        eyre!("snapshot restore: cannot check fee resumability over an empty window")
+    })?;
+    // The ConsensusRegistry that names the entered epoch is a protocol invariant present at every
+    // block, so a failed read is a genuine fault (a node-local provider error, or absent/corrupt
+    // registry state) — never a benign "registry-less chain". Fail closed rather than declaring the
+    // snapshot fee-resumable unchecked.
+    let (entered, _info) = reth_env.get_current_epoch_info_at_header(closing).map_err(|e| {
+        eyre!(
+            "snapshot restore: could not read the entered epoch from the ConsensusRegistry at the \
+             snapshot block {} — the registry is a protocol invariant and must be present, so a \
+             failed read is a fault; refusing to declare the snapshot fee-resumable: {e}",
+            closing.number,
+        )
+    })?;
+    // Entering epoch 0 or 1 never walks below B (the walk stops at the epoch-0 base case), so there
+    // is nothing to verify.
+    if entered < 2 {
+        return Ok(());
+    }
+    check_fee_precondition(reth_env, entered, window)
 }
+
+// Canonical worker-attribution helpers live in `tn-types` (one implementation shared with
+// `tn_node`'s per-worker fee/gas derivation — no drift). Re-exported so the fee-derivability
+// precheck here and its tests keep referring to them via the `tn_reth::snapshot::` path.
+pub use tn_types::gas_accumulator::{is_worker_batch_block, worker_id_from_header};
 
 #[cfg(test)]
 mod tests {
-    use super::{is_worker_batch_block, worker_id_from_header, PinnedStateView, SnapshotRestorer};
+    use super::{
+        is_worker_batch_block, worker_id_from_header, PinnedStateView, SnapshotRestorer, StateEntry,
+    };
     use crate::{MaybePlatformPath, RethChainSpec, RethConfig, RethDb, RethEnv};
     use reth::{args::DatadirArgs, builder::NodeConfig};
-    use reth_db::{cursor::DbCursorRW, tables::PlainStorageState, transaction::DbTxMut};
+    use reth_db::{
+        cursor::{DbCursorRW, DbDupCursorRO},
+        tables::{HashedAccounts, HashedStorages, PlainAccountState, PlainStorageState},
+        transaction::{DbTx, DbTxMut},
+    };
     use reth_primitives_traits::StorageEntry;
-    use reth_provider::{AccountReader, DBProvider, DatabaseProviderFactory, StateProvider};
+    use reth_provider::{
+        AccountReader, ChangeSetReader, DBProvider, DatabaseProviderFactory, StateProvider,
+        StorageChangeSetReader,
+    };
     use std::{collections::BTreeMap, path::Path, sync::Arc};
     use tempfile::TempDir;
-    use tn_storage::exec_state_pack::{ExecStateAccount, ExecStatePackReader};
+    use tn_storage::exec_state_pack::{ExecStateAccount, ExecStatePackReader, ExecStatePackWriter};
     use tn_types::{
-        gas_accumulator::RewardsCounter, test_genesis, Address, BlockNumHash, Bytes, ExecHeader,
-        GenesisAccount, SealedHeader, TaskManager, B256, U256,
+        gas_accumulator::GasAccumulator, keccak256, test_genesis, Address, BlockNumHash, Bytes,
+        ExecHeader, GenesisAccount, SealedHeader, TaskManager, B256, U256,
     };
 
     /// Compile-time proof that a pinned view can be moved into a background upload task.
@@ -700,7 +1031,7 @@ mod tests {
         slot: B256,
         value: U256,
     ) -> eyre::Result<()> {
-        let provider = reth_env.inner.blockchain_provider.database_provider_rw()?;
+        let provider = reth_env.blockchain_provider().database_provider_rw()?;
         {
             let tx = provider.tx_ref();
             let mut cursor = tx.cursor_dup_write::<PlainStorageState>()?;
@@ -900,6 +1231,30 @@ mod tests {
         SealedHeader::seal_slow(header)
     }
 
+    /// A window header built on top of the real genesis header, so it carries the Cancun/Prague
+    /// fields (`excess_blob_gas`, base fee, gas limit, timestamp, ...) that `evm_env` requires for
+    /// the post-import contract reads — `synthetic_header`'s `Default`-filled header omits them,
+    /// which is fine for tests that only read state but not for ones that issue EVM calls.
+    /// `state_root` pins the exported (genesis) root; `worker_id`/`genuine` drive worker
+    /// attribution.
+    fn window_header_on_genesis(
+        genesis: &SealedHeader,
+        number: u64,
+        parent: B256,
+        state_root: B256,
+        worker_id: u16,
+        genuine: bool,
+    ) -> SealedHeader {
+        let mut header = genesis.header().clone();
+        header.number = number;
+        header.parent_hash = parent;
+        header.state_root = state_root;
+        header.timestamp = genesis.timestamp + number;
+        header.difficulty = U256::from(worker_id as u64);
+        header.ommers_hash = if genuine { B256::repeat_byte(0xbb) } else { B256::ZERO };
+        SealedHeader::seal_slow(header)
+    }
+
     /// Export the source's plain state into a pack, embedding `headers` (snapshot header first).
     fn export_pack(source: &RethEnv, state_root: B256, headers: &[ExecHeader], dir: &Path) {
         source
@@ -978,7 +1333,7 @@ mod tests {
         restorer.finish(final_state)?;
 
         // read the restored state back through a fresh env over the destination datadir
-        let reader = RethEnv::new(&reth_config, &dst_tm, db, None, RewardsCounter::default())?;
+        let reader = RethEnv::new(&reth_config, &dst_tm, db, None, GasAccumulator::default())?;
         assert_eq!(reader.last_block_number()?, b);
         assert_eq!(
             reader.sealed_header_by_number(b)?.expect("tip header").hash(),
@@ -1062,7 +1417,7 @@ mod tests {
         assert_eq!(root, root_without_s);
         restorer.finish(final_state)?;
 
-        let reader = RethEnv::new(&reth_config, &dst_tm, db, None, RewardsCounter::default())?;
+        let reader = RethEnv::new(&reth_config, &dst_tm, db, None, GasAccumulator::default())?;
         let state = reader.latest()?;
         assert!(
             state.storage(contract, slot_s)?.unwrap_or_default().is_zero(),
@@ -1073,6 +1428,87 @@ mod tests {
             Some(U256::from(111u64)),
             "the surviving slot must still be present"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_rejects_truncated_pack() -> eyre::Result<()> {
+        // A valid pack whose `state_data` file is then truncated on disk so the trailing records
+        // (the End footer and part of the account run) are lost. meta + headers at the front
+        // survive, so the reader opens, but the restore must reject the damaged stream rather than
+        // import a partial, footerless state.
+        let a = Address::from([0x0a; 20]);
+        let b_addr = Address::from([0x0b; 20]);
+        let contract = Address::from([0x0c; 20]);
+        let code: Bytes = Bytes::from_static(CODE);
+        let genesis = test_genesis().extend_accounts([
+            (
+                a,
+                GenesisAccount {
+                    nonce: Some(1),
+                    balance: U256::from(100u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                b_addr,
+                GenesisAccount {
+                    nonce: Some(2),
+                    balance: U256::from(200u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                contract,
+                GenesisAccount {
+                    nonce: Some(3),
+                    balance: U256::from(300u64),
+                    code: Some(code.clone()),
+                    storage: Some(BTreeMap::from([(B256::from([0x01; 32]), word(111))])),
+                    private_key: None,
+                },
+            ),
+        ]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Truncated Pack Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
+        let state_root = genesis_header.state_root;
+
+        let b = 1u64;
+        let header_b = synthetic_header(b, genesis_header.hash(), state_root, 0, true);
+        let window = vec![header_b.clone()];
+        let final_state = BlockNumHash::new(b, header_b.hash());
+
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, state_root, &[header_b.header().clone()], pack_dir.path());
+
+        // Corrupt the pack: drop the tail of the `state_data` stream (the End footer and part of
+        // the account run). The meta + header records at the front are untouched.
+        let data_path = pack_dir.path().join("state_data");
+        let len = std::fs::metadata(&data_path)?.len();
+        assert!(len > 24, "pack data should be larger than the truncation amount");
+        std::fs::OpenOptions::new().write(true).open(&data_path)?.set_len(len - 24)?;
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Truncated Pack Dest");
+        let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+        let restorer = SnapshotRestorer::open(&reth_config, db, &dst_tm)?;
+        restorer.import_chain_scaffold(&window, final_state)?;
+        let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+        let err = restorer
+            .import_state(&mut reader)
+            .expect_err("a truncated pack must be rejected, not imported as partial state");
+        // MissingFooter / CorruptPack / a CRC or short-read error are all acceptable — the point is
+        // the restore fails loudly instead of committing a partial state.
+        assert!(!err.to_string().is_empty(), "expected a descriptive error");
 
         Ok(())
     }
@@ -1115,6 +1551,468 @@ mod tests {
         let err = SnapshotRestorer::open(&reth_config, db, &tm)
             .expect_err("open must refuse a datadir that already holds chain data");
         assert!(err.to_string().contains("non-empty"), "unexpected error: {err}");
+
+        Ok(())
+    }
+
+    /// Block-number contiguity alone accepts a window whose headers carry the right heights but
+    /// descend from different ancestors, so the scaffold also walks the parent-hash links. The
+    /// break sits in the middle of the window and the header above it re-links to the mutated
+    /// header, so only a per-pair walk catches it; checking the ends of the window would not.
+    #[tokio::test]
+    async fn import_rejects_a_window_that_is_not_hash_linked() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let genesis_header = chain.sealed_genesis_header();
+        let state_root = genesis_header.state_root;
+
+        // scaffold a 3-block window into a fresh datadir; `linked` decides whether block 2
+        // descends from block 1 or from a stranger. every other check the scaffold makes
+        // (non-empty, non-genesis, number contiguity, tip vs `final_state`) passes either way, so
+        // the two runs differ in the parent-hash link and nothing else.
+        let run = |linked: bool| -> eyre::Result<()> {
+            let h1 = synthetic_header(1, genesis_header.hash(), state_root, 0, true);
+            let h2_parent = if linked { h1.hash() } else { B256::repeat_byte(0xee) };
+            let h2 = synthetic_header(2, h2_parent, state_root, 0, true);
+            let h3 = synthetic_header(3, h2.hash(), state_root, 0, true);
+            let window = vec![h1, h2, h3.clone()];
+            let final_state = BlockNumHash::new(3, h3.hash());
+
+            let dir = TempDir::new()?;
+            let tm = TaskManager::new("Window Linkage");
+            let (reth_config, db) = temp_config_and_db(chain.clone(), dir.path())?;
+            let restorer = SnapshotRestorer::open(&reth_config, db, &tm)?;
+            restorer.import_chain_scaffold(&window, final_state)
+        };
+
+        // positive control: the same fixture, honestly linked, is accepted, so the rejection
+        // below is attributable to the broken link rather than to the synthetic headers
+        run(true)?;
+
+        let err = run(false).expect_err("a window that is not hash-linked must be rejected");
+        assert!(
+            err.to_string().contains("not hash-linked at block 2"),
+            "expected a parent-hash linkage rejection, got: {err:?}"
+        );
+
+        Ok(())
+    }
+
+    /// The fee-derivability precheck rejects a snapshot whose EIP-1559 worker produced no genuine
+    /// block in the shipped window (the node would walk below the snapshot and halt), and accepts
+    /// one that did. Uses a consensus-registry genesis (worker 0 is EIP-1559 by default) and passes
+    /// `entered = 2` explicitly so the check runs regardless of the genesis registry epoch.
+    #[tokio::test]
+    async fn fee_precondition_gates_idle_snapshot_epochs() -> eyre::Result<()> {
+        let genesis = crate::test_utils::test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        // source: export the registry genesis state at its real root
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Fee Precondition Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
+        let state_root = genesis_header.state_root;
+        let parent0 = genesis_header.hash();
+
+        // Restore a 1-block window (block 1, parent = genesis, pinning the genesis root) into a
+        // fresh datadir and run the precheck. `genuine` controls whether worker 0's window block is
+        // a genuine batch block.
+        let run = |genuine: bool| -> eyre::Result<()> {
+            let h1 = window_header_on_genesis(&genesis_header, 1, parent0, state_root, 0, genuine);
+            let window = vec![h1.clone()];
+            let final_state = BlockNumHash::new(1, h1.hash());
+            let pack_dir = TempDir::new()?;
+            export_pack(&source, state_root, &[h1.header().clone()], pack_dir.path());
+            let dst_dir = TempDir::new()?;
+            let dst_tm = TaskManager::new("Fee Precondition Dest");
+            let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+            let restorer = SnapshotRestorer::open(&reth_config, db, &dst_tm)?;
+            restorer.import_chain_scaffold(&window, final_state)?;
+            let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+            restorer.import_state(&mut reader)?;
+            // The precheck reads worker configs at B (= the restored genesis state) and scans the
+            // window for genuine blocks; returns its verdict (datadir/guards drop after it runs).
+            restorer.derive_fee_precondition(2, &window)
+        };
+
+        let err = run(false).expect_err("an idle EIP-1559 window must be rejected");
+        assert!(
+            err.to_string().contains("produced no genuine block"),
+            "expected an idle-worker rejection, got: {err:?}"
+        );
+        run(true).expect("a window with a genuine worker block must satisfy the precondition");
+
+        Ok(())
+    }
+
+    /// `check_resumable_fees` is a no-op for a snapshot rooted at the genesis block: the node would
+    /// enter epoch <= 1, whose base-fee derivation never walks below B, so even an idle window is
+    /// tolerated (the entered-epoch read returns < 2).
+    #[tokio::test]
+    async fn check_resumable_fees_tolerates_epoch_zero_snapshot() -> eyre::Result<()> {
+        let genesis = crate::test_utils::test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Resumable Fees Skip Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
+        let state_root = genesis_header.state_root;
+
+        // an idle 1-block window that WOULD be rejected if the entered epoch were >= 2
+        let h1 = window_header_on_genesis(
+            &genesis_header,
+            1,
+            genesis_header.hash(),
+            state_root,
+            0,
+            false,
+        );
+        let window = vec![h1.clone()];
+        let final_state = BlockNumHash::new(1, h1.hash());
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, state_root, &[h1.header().clone()], pack_dir.path());
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Resumable Fees Skip Dest");
+        let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+        let restorer = SnapshotRestorer::open(&reth_config, db, &dst_tm)?;
+        restorer.import_chain_scaffold(&window, final_state)?;
+        let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+        restorer.import_state(&mut reader)?;
+
+        restorer
+            .check_resumable_fees(&window)
+            .expect("an epoch-<=1 snapshot must skip the fee-derivability precheck");
+
+        Ok(())
+    }
+
+    /// Several slots more than the exporter packs into a single storage record, so the whale
+    /// account below is emitted across MANY `STORAGE_CHUNK_SLOTS`-bounded storage chunks and the
+    /// streaming import must write each chunk without ever materializing the whole account. Kept
+    /// local (the pack constant is private) and only a few chunks past the boundary to keep the
+    /// heavy multi-slot env cheap.
+    const MULTI_CHUNK_SLOTS: u64 = 4 * 64 * 1024 + 7;
+
+    /// Import a pack containing a WHALE account whose storage spans many storage chunks and prove
+    /// the streaming, per-chunk import is exactly correct.
+    ///
+    /// The source holds several accounts in ascending address order plus one contract (`big`) with
+    /// `MULTI_CHUNK_SLOTS` slots — several times the pack's per-record `STORAGE_CHUNK_SLOTS` bound,
+    /// so the pack emits `big` as one account header followed by many `Storage` chunks and the
+    /// import writes them one chunk at a time (never holding the whole account). The import must:
+    ///
+    /// - recompute the SAME root the pack declares (the dual hard-fail check passes) — this is the
+    ///   byte-exact equivalence proof: the declared root came from the source node's genuine trie
+    ///   built by a full-account write, so matching it proves the streamed hashed state is
+    ///   identical to a whole-account import;
+    /// - read every account back intact — balances, code, and multiple storage slots INCLUDING a
+    ///   probe slot deep past the first storage chunk;
+    /// - leave `AccountChangeSets`/`StorageChangeSets` EMPTY (the deliberate skip that lets the
+    ///   storage stream per chunk); and
+    /// - populate the hashed and plain tables with the same rows a whole-account import would (spot
+    ///   checked against the source's keccak256 keys).
+    #[tokio::test]
+    async fn import_streams_whale_storage_in_chunks() -> eyre::Result<()> {
+        let code: Bytes = Bytes::from_static(CODE);
+
+        // several accounts in ascending address order, spanning many storage chunks for `big`
+        let eoa_a = Address::from([0x0a; 20]);
+        let eoa_b = Address::from([0x0b; 20]);
+        let contract = Address::from([0x0c; 20]);
+        let big = Address::from([0x0d; 20]);
+        let eoa_e = Address::from([0x0e; 20]);
+        let eoa_f = Address::from([0x0f; 20]);
+        let (slot_a, slot_b) = (B256::from([0x01; 32]), B256::from([0x02; 32]));
+
+        // a probe slot deep inside the whale's storage (past several chunk boundaries), to prove
+        // the per-chunk writes round-trip a slot far beyond the first storage record
+        let probe_slot = word(MULTI_CHUNK_SLOTS - 7);
+        // well above every `word(i + 1)` filler below, so the probe value is unambiguous
+        let probe_value = word(0x7_0000_0000);
+
+        // build the whale's storage: MULTI_CHUNK_SLOTS non-zero slots keyed by index, with the
+        // probe slot carrying a distinctive value
+        let big_storage: BTreeMap<B256, B256> = (0..MULTI_CHUNK_SLOTS)
+            .map(|i| {
+                let slot = word(i);
+                let value = if slot == probe_slot { probe_value } else { word(i + 1) };
+                (slot, value)
+            })
+            .collect();
+
+        let genesis = test_genesis().extend_accounts([
+            (
+                eoa_a,
+                GenesisAccount {
+                    nonce: Some(1),
+                    balance: U256::from(100u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                eoa_b,
+                GenesisAccount {
+                    nonce: Some(2),
+                    balance: U256::from(200u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                contract,
+                GenesisAccount {
+                    nonce: Some(3),
+                    balance: U256::from(300u64),
+                    code: Some(code.clone()),
+                    storage: Some(BTreeMap::from([(slot_a, word(111)), (slot_b, word(222))])),
+                    private_key: None,
+                },
+            ),
+            (
+                big,
+                GenesisAccount {
+                    nonce: Some(4),
+                    balance: U256::from(400u64),
+                    code: Some(code.clone()),
+                    storage: Some(big_storage),
+                    private_key: None,
+                },
+            ),
+            (
+                eoa_e,
+                GenesisAccount {
+                    nonce: Some(5),
+                    balance: U256::from(500u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+            (
+                eoa_f,
+                GenesisAccount {
+                    nonce: Some(6),
+                    balance: U256::from(600u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            ),
+        ]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        // source: export the genesis state at its real root
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Whale Import Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
+        let state_root = genesis_header.state_root;
+
+        // sanity: the pack really does emit `big` across more than one storage chunk (otherwise the
+        // whale test would not exercise the per-chunk path at all)
+        let b = 1u64;
+        let h1 = synthetic_header(b, genesis_header.hash(), state_root, 0, true);
+        let window = vec![h1.clone()];
+        let final_state = BlockNumHash::new(b, h1.hash());
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, state_root, &[h1.header().clone()], pack_dir.path());
+        {
+            let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+            let mut big_chunks = 0usize;
+            let mut in_big = false;
+            while let Some(entry) = reader.next_entry() {
+                match entry? {
+                    StateEntry::Account(meta) => in_big = meta.address == big,
+                    StateEntry::Storage(_) => {
+                        if in_big {
+                            big_chunks += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                big_chunks > 1,
+                "the whale account must span more than one storage chunk (got {big_chunks})"
+            );
+        }
+
+        // restore: single streaming import (the per-entry path never materializes the whole whale)
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Whale Import Dest");
+        let (dst_config, dst_db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+        let root = {
+            let restorer = SnapshotRestorer::open(&dst_config, dst_db.clone(), &dst_tm)?;
+            restorer.import_chain_scaffold(&window, final_state)?;
+            let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+            let root = restorer.import_state(&mut reader)?;
+            restorer.finish(final_state)?;
+            root
+        };
+        // matching the pack's declared root proves the streamed state is byte-exactly what a
+        // full-account import produces
+        assert_eq!(
+            root, state_root,
+            "streaming import must recompute the pack's declared (genuine full-trie) root"
+        );
+
+        // open a fresh env over the restored datadir for both the table-level assertions and the
+        // state readback
+        let reader =
+            RethEnv::new(&dst_config, &dst_tm, dst_db.clone(), None, GasAccumulator::default())?;
+
+        // change sets at block B MUST be empty: the skip is what lets storage stream per chunk.
+        // genesis (block 0) legitimately keeps its own change sets (init_genesis wrote them and the
+        // scaffold does not clear those tables), so this checks block B specifically rather than
+        // global emptiness — and confirms block 0 still has change sets, proving the test measures
+        // the right thing and the import, not the scaffold, is the differentiator.
+        {
+            let provider = reader.blockchain_provider().database_provider_ro()?;
+            let tx = provider.tx_ref();
+
+            assert!(
+                !provider.account_block_changeset(0)?.is_empty(),
+                "genesis account change sets should still be present (only block B is skipped)"
+            );
+            assert!(
+                provider.account_block_changeset(b)?.is_empty(),
+                "import must write NO account change sets for block B"
+            );
+            assert!(
+                provider.storage_changeset(b)?.is_empty(),
+                "import must write NO storage change sets for block B"
+            );
+
+            // the plain/hashed tables, in contrast, are fully populated. the exact storage-row
+            // count also includes `test_genesis`'s own system-contract slots (dumped by the
+            // exporter), so assert the meaningful invariant — plain and hashed hold the same number
+            // of rows — plus a floor of the whale slots and the contract's two slots.
+            assert!(tx.entries::<PlainAccountState>()? >= 6, "plain accounts must be populated");
+            assert!(tx.entries::<HashedAccounts>()? >= 6, "hashed accounts must be populated");
+            let plain_storage_rows = tx.entries::<PlainStorageState>()?;
+            assert!(
+                plain_storage_rows >= MULTI_CHUNK_SLOTS as usize + 2,
+                "plain storage must hold at least the whale slots plus the contract's two slots \
+                 (got {plain_storage_rows})"
+            );
+            assert_eq!(
+                tx.entries::<HashedStorages>()?,
+                plain_storage_rows,
+                "hashed storage rows must match plain storage rows exactly"
+            );
+
+            // spot-check the hashed tables directly: the whale's deep probe slot lives under
+            // keccak256(address)/keccak256(slot) with its value, exactly as a whole-account import
+            // would write it
+            let hashed_addr = keccak256(big);
+            let hashed_slot = keccak256(probe_slot);
+            let mut cursor = tx.cursor_dup_read::<HashedStorages>()?;
+            let entry = cursor
+                .seek_by_key_subkey(hashed_addr, hashed_slot)?
+                .filter(|e| e.key == hashed_slot)
+                .expect("whale probe slot must be present in HashedStorages");
+            assert_eq!(
+                entry.value,
+                U256::from_be_bytes(probe_value.0),
+                "hashed storage value for the deep probe slot must match"
+            );
+        }
+
+        // read the state back: balances, code, and deep storage slots intact
+        assert_eq!(reader.last_block_number()?, b);
+        let state = reader.latest()?;
+        assert_eq!(state.account_balance(&eoa_a)?, Some(U256::from(100u64)));
+        assert_eq!(state.account_balance(&eoa_f)?, Some(U256::from(600u64)));
+        assert_eq!(state.basic_account(&big)?.expect("whale restored").nonce, 4);
+        assert_eq!(
+            state.account_code(&big)?.map(|c| c.original_bytes()),
+            Some(code.clone()),
+            "whale code must round-trip"
+        );
+        assert_eq!(state.storage(contract, slot_a)?, Some(U256::from(111u64)));
+        assert_eq!(state.storage(contract, slot_b)?, Some(U256::from(222u64)));
+        assert_eq!(
+            state.storage(big, word(0))?,
+            Some(U256::from(1u64)),
+            "the whale's first slot (first chunk) must survive"
+        );
+        assert_eq!(
+            state.storage(big, probe_slot)?,
+            Some(U256::from_be_bytes(probe_value.0)),
+            "a slot several chunks deep must survive the per-chunk import"
+        );
+        assert_eq!(
+            state.storage(big, word(MULTI_CHUNK_SLOTS - 1))?,
+            Some(U256::from(MULTI_CHUNK_SLOTS)),
+            "the whale's last slot (last chunk) must survive"
+        );
+
+        Ok(())
+    }
+
+    /// A pack whose accounts are NOT in strictly ascending address order is rejected with a clear
+    /// error before any state root is computed.
+    ///
+    /// The exporter can never emit such a pack, so this crafts one directly with the writer
+    /// (two accounts in descending address order) to prove the guard turns a corrupt or
+    /// hand-crafted pack into a loud, specific failure rather than a cryptic MDBX append_dup error.
+    #[tokio::test]
+    async fn import_rejects_out_of_order_pack() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+
+        // a fresh source only to obtain a real genesis root/header for the window + pack meta
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Out Of Order Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+        let genesis_header = source.sealed_header_by_number(0)?.expect("genesis header");
+        let state_root = genesis_header.state_root;
+
+        let b = 1u64;
+        let h1 = synthetic_header(b, genesis_header.hash(), state_root, 0, true);
+        let window = vec![h1.clone()];
+        let final_state = BlockNumHash::new(b, h1.hash());
+
+        // hand-write a corrupt pack: the snapshot header pins the exported root (so `create`
+        // accepts it), then two accounts appended in DESCENDING address order.
+        let pack_dir = TempDir::new()?;
+        let higher = Address::from([0xcc; 20]);
+        let lower = Address::from([0x11; 20]);
+        {
+            let mut writer =
+                ExecStatePackWriter::create(pack_dir.path(), state_root, &[h1.header().clone()])?;
+            let acct = |address: Address| ExecStateAccount {
+                address,
+                account: GenesisAccount {
+                    nonce: Some(1),
+                    balance: U256::from(1u64),
+                    code: None,
+                    storage: None,
+                    private_key: None,
+                },
+            };
+            writer.append_account(&acct(higher))?;
+            writer.append_account(&acct(lower))?;
+            writer.finish()?;
+        }
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Out Of Order Dest");
+        let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+        let restorer = SnapshotRestorer::open(&reth_config, db, &dst_tm)?;
+        restorer.import_chain_scaffold(&window, final_state)?;
+        let mut reader = ExecStatePackReader::open(pack_dir.path())?;
+
+        let err = restorer
+            .import_state(&mut reader)
+            .expect_err("a descending-address pack must be rejected");
+        assert!(
+            err.to_string().contains("strictly ascending address order"),
+            "expected an ascending-order rejection, got: {err:?}"
+        );
 
         Ok(())
     }

@@ -61,12 +61,12 @@ if ! cargo nextest --version &> /dev/null; then
     fi
 fi
 
-# set environment
-CARGO_INCREMENTAL=0 # disable incremental compilation
-RUSTFLAGS="-D warnings -D unused_extern_crates"
-CARGO_TERM_COLOR=always
-RUST_BACKTRACE=1
-CARGO_PROFILE_DEV_DEBUG=0
+# set environment (exported so the cargo invocations below actually see them)
+export CARGO_INCREMENTAL=0 # disable incremental compilation
+export RUSTFLAGS="-D warnings -D unused_extern_crates"
+export CARGO_TERM_COLOR=always
+export RUST_BACKTRACE=1
+export CARGO_PROFILE_DEV_DEBUG=0
 
 # Fetch the status of the git repository and filter for lines that indicate modified tracked files
 MODIFIED_TRACKED_FILES=$(git status --porcelain --untracked-files=no)
@@ -102,6 +102,9 @@ echo "clippy for workspace: default and all features passed"
 #
 # default features
 cargo nextest run --workspace --no-fail-fast
+# adiri-gated suite: the consensus-registry fork tests and their determinism oracles only
+# compile under these features, so no default-feature run above ever builds or runs them
+cargo nextest run -p tn-reth --features adiri,test-utils --no-fail-fast
 # run the e2e restart and epoch tests, they are seperate to avoid any port/node confusion.
 # Prebuild the node binary once into the shared target tree and hand it to the e2e tests via
 # TN_BIN_PATH (mirroring `make test-e2e`), so the ignored suite reuses it instead of cold-building

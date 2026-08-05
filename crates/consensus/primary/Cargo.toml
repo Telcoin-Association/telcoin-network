@@ -16,6 +16,7 @@ backoff = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
+rand_chacha = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
     "sync",

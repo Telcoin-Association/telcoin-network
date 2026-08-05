@@ -32,7 +32,6 @@ reth-primitives = { workspace = true }
 reth-consensus = { workspace = true }
 reth-evm-ethereum = { workspace = true }
 reth-engine-primitives = { workspace = true }
-reth-engine-tree = { workspace = true }
 reth-revm = { workspace = true }
 reth-evm = { workspace = true }
 reth-node-builder = { workspace = true }
@@ -53,7 +52,9 @@ reth-eth-wire = { workspace = true }
 reth-tasks = { workspace = true }
 reth-tokio-util = { workspace = true }
 reth-tracing = { workspace = true }
+reth-metrics = { workspace = true }
 
+metrics = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 futures = { workspace = true }
@@ -70,6 +71,7 @@ reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
 
 [dev-dependencies]
+metrics-util = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
 secp256k1 = { workspace = true }
 proptest = { workspace = true }

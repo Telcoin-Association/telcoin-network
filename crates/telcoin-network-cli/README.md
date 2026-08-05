@@ -190,20 +190,20 @@ telcoin-network genesis \
     --consensus-registry-owner 0xGOVERNANCE_MULTISIG \
     --basefee-address 0xBASEFEE_RECIPIENT \
     --initial-stake-per-validator 1000000 \
-    --epoch-duration-in-secs 86400
+    --epoch-duration-in-secs 28800
 ```
 
 ### genesis flags
 
 | Flag                                                 | Default        | Description                                                                               |
 | ---------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------- |
-| `--chain-id`                                         | `2017` (0x7e1) | Numeric chain ID. Accepts decimal or `0x`-prefixed hex                                    |
+| `--chain-id`                                         | `911329` (0xde7e1) | Numeric chain ID. Accepts decimal or `0x`-prefixed hex                                |
 | `--consensus-registry-owner`                         | `0x...07a0`    | Owner address for the ConsensusRegistry contract. Use a governance multisig in production |
 | `--basefee-address`                                  | `0x...07a0`    | Address that receives all transaction base fees                                           |
 | `--initial-stake-per-validator`, `--stake`           | `1000000`      | TEL staked per validator at genesis (input in whole TEL, stored as wei)                   |
 | `--min-withdraw-amount`, `--min_withdraw`            | `1000`         | Minimum TEL withdrawal amount                                                             |
 | `--epoch-block-rewards`, `--block_rewards_per_epoch` | `25806`        | Total block rewards per epoch in TEL                                                      |
-| `--epoch-duration-in-secs`, `--epoch_length`         | `86400`        | Epoch duration in seconds (default: 24 hours)                                             |
+| `--epoch-duration-in-secs`, `--epoch_length`         | `28800`        | Epoch duration in seconds (default: 8 hours)                                              |
 | `--max-header-delay-ms`                              | none           | Max delay between header proposals (milliseconds)                                         |
 | `--min-header-delay-ms`                              | none           | Min delay between header proposals (milliseconds)                                         |
 | `--max-batch-delay-ms`                               | none           | Max delay before a worker seals a batch of pending transactions (milliseconds)            |
@@ -263,6 +263,23 @@ telcoin-network node \
 Available named chains: `adiri` (alias: `testnet`), `mainnet`.
 
 The `--chain` flag overrides local genesis files with the embedded config for that network.
+
+#### Run an observer against testnet
+
+Build a release version of the node software with the `adiri` feature (required to join the
+adiri testnet — the node refuses the `--chain adiri` flag at startup without it):
+`cargo build -p telcoin-network --bin telcoin-network --release --features adiri`
+
+Generate a config and keys for your observer node:
+`target/release/telcoin-network keytool generate observer --datadir DATADIR --address 0x4444444444444444444444444444444444444444 --bls-passphrase-source ask`
+
+This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444. Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing). Use an address you control or a dummy like above. This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
+
+Start your observer node:
+`target/release/telcoin-network node -vvv --http --observer --chain adiri --bls-passphrase-source ask --datadir DATADIR`
+
+Make sure DATADIR matches the config command above and use the same password for reading the key.
+
 
 ### Using local config
 
@@ -383,7 +400,7 @@ The `admin` and `txpool` modules are not available at this time.
 
 | Flag                         | Default | Description                                                                                |
 | ---------------------------- | ------- | ------------------------------------------------------------------------------------------ |
-| `--txpool.max-account-slots` | `256`   | Max pending transactions per sender (Reth default is 16; Telcoin Network overrides to 256) |
+| `--txpool.max-account-slots` | `256`   | Max pending transactions per sender. Telcoin Network raises Reth's default of 16 to 256; any explicit value is honored, including 16 |
 
 ## Networking
 

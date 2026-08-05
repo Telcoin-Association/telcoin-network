@@ -3,13 +3,15 @@
 # Archive-mode guard: fail the build if a pruning entry point enters the node.
 #
 # Every pinned consensus-registry read (committee membership, epoch records, epoch state, worker
-# fee configs) resolves historical state through `state_by_block_hash`. Reth serves that state
-# from the pinned block only while the history indices covering it survive; once pruning removes
-# them, the provider fails the read with `StateAtBlockPruned`. That failure is loud, but it lands
-# mid-consensus (committee construction, epoch entry), so the reachable outcomes are a stalled
-# epoch transition or a halted node.
+# fee configs) resolves historical state through the one `pinned_state_and_env` helper in
+# crates/tn-reth/src/env/epoch.rs. Reth serves that state from the pinned block only while the
+# history indices covering it survive. Once pruning removes them the read either fails with
+# `StateAtBlockPruned` (pinned block below the prune watermark) or, worse, silently serves TIP
+# state (at or above the watermark, with the key's own shards gone). The loud half still lands
+# mid-consensus (committee construction, epoch entry), so the reachable outcomes there are a
+# stalled epoch transition or a halted node; the silent half corrupts the read outright.
 #
-# `RethConfig::ensure_archive_mode` (crates/tn-reth/src/lib.rs) already refuses to start a node
+# `RethConfig::ensure_archive_mode` (crates/tn-reth/src/cli.rs) already refuses to start a node
 # whose CONFIGURATION requests pruning. This guard covers the two things a configuration check
 # cannot see:
 #
@@ -59,9 +61,10 @@ configs) resolve historical state through `state_by_block_hash`. Pruning that hi
 fail those reads with StateAtBlockPruned, mid-consensus, once a pinned block falls below the
 history watermark.
 
-If this is intentional, the change is not just this line: audit every ARCHIVE-MODE site in
-crates/tn-reth/src/lib.rs, decide what a pinned read means under pruning, and update
-`RethConfig::ensure_archive_mode` and this guard together.
+If this is intentional, the change is not just this line: audit the ARCHIVE-MODE note on
+`pinned_state_and_env` in crates/tn-reth/src/env/epoch.rs, decide what a pinned read means under
+pruning, and update `RethConfig::ensure_archive_mode` (crates/tn-reth/src/cli.rs) and this guard
+together.
 EOF
     exit 1
 fi

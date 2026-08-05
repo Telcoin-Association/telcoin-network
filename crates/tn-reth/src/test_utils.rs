@@ -1,12 +1,37 @@
-//! Transaction factory to create legit transactions for execution.
+//! Test-support toolkit for `tn-reth`, compiled only with the `test-utils` feature or
+//! `cfg(test)`. Despite the historical name, this is much more than a transaction factory.
+//! Grouped by role:
+//!
+//! - [`TransactionFactory`]: deterministic keypair plus nonce tracking to create, sign, and submit
+//!   EIP-1559, legacy, and EIP-4844 transactions.
+//! - `RethEnv` test constructors and read helpers: `new_for_test`, `state_by_block_hash`, `tn_evm`,
+//!   `execution_outcome_for_tests`, and `ConsensusRegistry` reads (`get_validator_rewards`,
+//!   `get_bls_pubkey`, `get_validator_info`, `validators_for_epoch_at_block`,
+//!   `get_worker_fee_configs`), plus the pinned `WorkerConfigs` table read
+//!   [`read_worker_config_entries_at`].
+//! - Batch fixtures: `transaction`, `batch`, `batches`, `fixture_batch_with_transactions`,
+//!   `batch_with_transactions`.
+//! - Genesis builders: `seeded_genesis_from_random_batch(es)`, and the
+//!   `test_genesis_with_consensus_registry*` family, which runs the real pre-genesis ceremony (see
+//!   `env/genesis.rs`) so the registry/worker-configs state matches the current bytecode.
+//! - Governance and committee helpers: `governance_owner_factory`, `governance_burn_tx`,
+//!   `create_committee_from_state`.
+//! - Consensus/payload-execution helpers: `consensus_output_for_tests`, and
+//!   `execute_payload_and_update_canonical_chain`, which builds a block and commits it as the
+//!   canonical tip, standing in for the engine's payload builder.
+//! - [`plant_finalized_marker`]: writes the finalized/safe database markers directly — a test-only
+//!   backdoor into storage state for reconstructing pre-fix crash layouts.
 
 use crate::{
-    error::TnRethResult,
+    error::{StateReadResult, TnRethResult},
     evm::TNEvm,
     payload::TNPayload,
     recover_raw_transaction,
-    system_calls::{ConsensusRegistry, EpochState, CONSENSUS_REGISTRY_ADDRESS},
-    ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool,
+    system_calls::{
+        decode_worker_fee_configs, ConsensusRegistry, EpochState, WorkerConfigs,
+        CONSENSUS_REGISTRY_ADDRESS,
+    },
+    ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool, SYSTEM_ADDRESS,
 };
 use alloy::{
     consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant, TxLegacy},
@@ -20,31 +45,41 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
-use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
+use reth_evm::{execute::Executor as _, ConfigureEvm, Evm as _, EvmFactory as _};
 use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
-    DatabaseProviderFactory as _, StateProvider, StateProviderBox, StateProviderFactory,
+    DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory,
 };
-use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
+use reth_revm::{
+    context::result::ExecutionResult, database::StateProviderDatabase, db::BundleState, State,
+};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
     SECP256K1,
 };
-use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
-use tn_config::NodeInfo;
+use std::{
+    collections::{HashMap, VecDeque},
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+};
+use tn_config::{NodeInfo, WORKER_CONFIGS_ADDRESS};
 use tn_types::{
-    address, calculate_transaction_root, gas_accumulator::RewardsCounter,
+    address, calculate_transaction_root,
+    gas_accumulator::{GasAccumulator, WorkerConfigEntry, WorkerFeeConfig},
     generate_proof_of_possession_bls_for_test, keccak256, now, test_chain_spec_arc, test_genesis,
     AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsKeypair,
-    BlsPublicKey, Bytes, Committee, CommitteeBuilder, Encodable2718, EthSignature, ExecHeader,
-    ExecutionKeypair, Genesis, GenesisAccount, NodeP2pInfo, RecoveredBlock, SealedHeader,
-    TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256,
-    EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_30M,
-    MIN_PROTOCOL_BASE_FEE, U256,
+    BlsPublicKey, BlsSignature, Bytes, Certificate, CommittedSubDag, Committee, CommitteeBuilder,
+    ConsensusHeader, ConsensusOutput, Encodable2718, EthSignature, ExecHeader, ExecutionKeypair,
+    Genesis, GenesisAccount, NodeP2pInfo, RecoveredBlock, ReputationScores, SealedHeader,
+    SignatureVerificationState, TaskManager, Transaction, TransactionSigned, TxEip1559, TxHash,
+    TxKind, WorkerId, B256, EMPTY_OMMER_ROOT_HASH, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS,
+    ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE, U256,
 };
+use tracing::debug;
 // re-exports for tests
 pub use crate::evm::precompile_test_utils;
 pub use alloy::eips::{
@@ -53,7 +88,7 @@ pub use alloy::eips::{
 pub use reth_primitives_traits::proofs::calculate_withdrawals_root;
 
 /// Typedef for a complex type to make clippy happy (and be a bit more readable?).
-pub type TNEvmTestType = TNEvm<State<StateProviderDatabase<Box<dyn StateProvider>>>>;
+pub type TNEvmTestType = TNEvm<State<StateProviderDatabase<StateProviderBox>>>;
 
 // methods for tests
 impl RethEnv {
@@ -61,29 +96,21 @@ impl RethEnv {
     pub fn new_for_test<P: AsRef<Path>>(
         db_path: P,
         task_manager: &TaskManager,
-        rewards: Option<RewardsCounter>,
+        rewards: Option<GasAccumulator>,
     ) -> eyre::Result<Self> {
         Self::new_for_temp_chain(test_chain_spec_arc(), db_path, task_manager, rewards)
     }
 
     /// Retrieve the state at the provided block hash.
     pub fn state_by_block_hash(&self, hash: BlockHash) -> TnRethResult<StateProviderBox> {
-        Ok(self.inner.blockchain_provider.state_by_block_hash(hash)?)
+        Ok(self.blockchain_provider().state_by_block_hash(hash)?)
     }
 
     /// Create an EVM-environment from state provider.
     pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
         let header = self.header(hash)?.expect("provided hash in header table");
-        let state: Box<dyn reth_provider::StateProvider> = self.state_by_block_hash(hash)?;
-        let db = State::builder()
-            .with_database(StateProviderDatabase::new(state))
-            .with_bundle_update()
-            .build();
-        Ok(self
-            .inner
-            .evm_config
-            .evm_factory()
-            .create_evm(db, self.inner.evm_config.evm_env(&header)?))
+        let db = self.read_only_state_db(hash)?;
+        Ok(self.evm_config().evm_factory().create_evm(db, self.evm_config().evm_env(&header)?))
     }
 
     /// Test utility to execute batch and return execution outcome.
@@ -159,7 +186,7 @@ impl RethEnv {
             self.latest()
                 .map_err(|e| eyre::eyre!("provider retrieves latest for test batch: {e:?}"))?,
         );
-        let executor = self.inner.evm_config.executor(&mut db);
+        let executor = self.evm_config().executor(&mut db);
         let res = executor
             .execute(&RecoveredBlock::new_unhashed(block, signers))
             .map_err(|e| eyre::eyre!("execute one block for test: {e:?}"))?;
@@ -211,6 +238,39 @@ impl RethEnv {
             calldata,
         )?;
         Ok(info)
+    }
+
+    /// Read the committee validators for the provided epoch from the [ConsensusRegistry], pinned
+    /// to the state of the block identified by `block_hash`.
+    ///
+    /// Every node issuing this read at the same block decodes the identical committee — even
+    /// after a mid-epoch governance `burn` swap-and-pops the stored committee arrays; an
+    /// unpinned canonical-tip read would not. No unpinned sibling exists: this is the only
+    /// per-epoch validator-info accessor, and it is `test-utils`-gated because production takes
+    /// the whole committee from `RethEnv::epoch_state_at_epoch_start` instead.
+    pub fn validators_for_epoch_at_block(
+        &self,
+        epoch: u32,
+        block_hash: B256,
+    ) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
+        debug!(target: "engine", ?block_hash, "retrieving validators for epoch {epoch} at pinned block");
+        let header = self
+            .sealed_header_by_hash(block_hash)?
+            .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+        let calldata = ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into();
+        self.read_consensus_registry_at_header(&header, calldata).map_err(Into::into)
+    }
+
+    /// Read worker fee configs from the `WorkerConfigs` contract at the canonical tip.
+    ///
+    /// The returned `Vec`'s length is the on-chain `numWorkers()` at the canonical tip (the
+    /// arity between the count and the per-worker arrays is validated in
+    /// `Self::worker_fee_configs_inner`). Callers size their in-memory worker state (e.g. the
+    /// `GasAccumulator`) to match, rather than asserting a preconceived count.
+    pub fn get_worker_fee_configs(&self) -> StateReadResult<Vec<WorkerFeeConfig>> {
+        let canonical_tip = self.canonical_tip();
+        let (_num_workers, configs) = self.worker_fee_configs_inner(&canonical_tip)?;
+        Ok(configs)
     }
 }
 
@@ -532,7 +592,7 @@ impl TransactionFactory {
         Ok(signer)
     }
 
-    /// Create and submit the next transaction to the provided [TransactionPool].
+    /// Create and submit the next transaction to the provided [`WorkerTxPool`].
     pub async fn create_and_submit_eip1559_pool_tx(
         &mut self,
         chain: Arc<RethChainSpec>,
@@ -734,7 +794,7 @@ pub fn execute_payload_and_update_canonical_chain(
         reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
     // update chain state - normally handled by tn_engine::payload_builder
     let canonical_header = block.recovered_block.clone_sealed_header();
-    let canonical_in_memory_state = reth_env.inner.blockchain_provider.canonical_in_memory_state();
+    let canonical_in_memory_state = reth_env.blockchain_provider().canonical_in_memory_state();
     canonical_in_memory_state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
     canonical_in_memory_state.set_canonical_head(canonical_header.clone());
     reth_env.finish_executing_output(vec![block.clone()], None)?;
@@ -751,15 +811,37 @@ pub fn execute_payload_and_update_canonical_chain(
 /// Current versions commit both atomically in `RethEnv::finish_executing_output`, so tests use
 /// this direct write to construct the pre-fix state.
 pub fn plant_finalized_marker(reth_env: &RethEnv, header: SealedHeader) -> eyre::Result<()> {
-    let provider = reth_env.inner.blockchain_provider.database_provider_rw()?;
+    let provider = reth_env.blockchain_provider().database_provider_rw()?;
     provider.save_finalized_block_number(header.number)?;
     provider.save_safe_block_number(header.number)?;
     provider.commit()?;
     // a restarting node seeds the finalized/safe watches from the (stale) database rows at
     // provider construction; mirror that so watch readers see the planted marker
-    reth_env.inner.blockchain_provider.set_finalized(header.clone());
-    reth_env.inner.blockchain_provider.set_safe(header);
+    reth_env.blockchain_provider().set_finalized(header.clone());
+    reth_env.blockchain_provider().set_safe(header);
     Ok(())
+}
+
+/// Execute `getAllWorkerConfigs()` against the state of `block` and decode the raw return bytes
+/// through the production seam (`decode_worker_fee_configs`) — the exact decode the closing
+/// block's `record_next_epoch_base_fees` uses — returning the on-chain worker count and one
+/// [`WorkerConfigEntry`] per worker (fee strategy plus the raw `data` word).
+///
+/// Cross-crate epoch-close tests use this to read the next-epoch base fee a closing block
+/// recorded in an EIP-1559 worker's `data` word, pinned at that block's state and observed
+/// through the same system-call + decode path that produced the write.
+pub fn read_worker_config_entries_at(
+    env: &RethEnv,
+    block: B256,
+) -> eyre::Result<(u16, Vec<WorkerConfigEntry>)> {
+    let mut tn_evm = env.tn_evm(block)?;
+    let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
+    let res = tn_evm.transact_system_call(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+    let data = match res.result {
+        ExecutionResult::Success { output, .. } => output.into_data(),
+        other => eyre::bail!("getAllWorkerConfigs failed at pinned block {block}: {other:?}"),
+    };
+    decode_worker_fee_configs(&data).map_err(|e| eyre::eyre!(e))
 }
 
 /// Build a test genesis whose `ConsensusRegistry` is freshly deployed from the current artifact
@@ -853,5 +935,39 @@ pub fn try_test_genesis_with_consensus_registry_and_workers(
         initial_stake_config,
         governance,
         worker_configs,
+    )
+}
+
+/// Helper function for creating a consensus output for tests.
+pub fn consensus_output_for_tests(
+    round: u32,
+    epoch: u32,
+    subdag_index: u64,
+    close_epoch: bool,
+) -> ConsensusOutput {
+    let mut leader = Certificate::default();
+    // set signature for deterministic test results
+    leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+        BlsSignature::default(),
+    ));
+    leader.update_header_created_at_for_test(tn_types::now());
+    leader.update_header_round_for_test(round);
+    leader.update_header_epoch_for_test(epoch);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        subdag_index,
+        reputation_scores,
+        previous_sub_dag,
+    );
+    ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeader::default().digest(),
+        subdag_index,
+        close_epoch,
+        VecDeque::new(),
+        Vec::new(),
     )
 }

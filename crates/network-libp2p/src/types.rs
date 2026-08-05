@@ -52,13 +52,6 @@ pub trait IntoRpcError<E> {
     fn into_error(error: E) -> Self;
 }
 
-/// The topic for NVVs to subscribe to for published worker batches.
-pub const WORKER_BATCH_TOPIC: &str = "tn_batches";
-/// The topic for NVVs to subscribe to for published primary certificates.
-pub const PRIMARY_CERT_TOPIC: &str = "tn_certificates";
-/// The topic for NVVs to subscribe to for published consensus chain.
-pub const CONSENSUS_HEADER_TOPIC: &str = "tn_consensus_headers";
-
 /// The role of a consensus network instance: primary or worker.
 ///
 /// A node runs both as fully isolated libp2p swarms in one process. This is the
@@ -404,6 +397,13 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Result<bool, SubscriptionError>>,
     },
+    /// Unsubscribe from a topic.
+    Unsubscribe {
+        /// The topic to unsubscribe from.
+        topic: String,
+        /// The reply to caller: true if this node was subscribed.
+        reply: oneshot::Sender<bool>,
+    },
     /// Publish a message to topic subscribers.
     Publish {
         /// The topic to publish the message on.
@@ -659,6 +659,20 @@ where
         self.sender.send(NetworkCommand::Subscribe { topic, publishers: None, reply }).await?;
         let res = already_subscribed.await?;
         res.map_err(Into::into)
+    }
+
+    /// Unsubscribe from a topic.
+    ///
+    /// Gossipsub subscriptions live on the process-lifetime swarm, so a topic subscribed for one
+    /// epoch stays subscribed until it is explicitly dropped. This also clears the topic's
+    /// authorized-publisher entry, restoring the "not subscribed here" state that
+    /// `verify_gossip` expects for an absent entry.
+    ///
+    /// Return `true` if this node was subscribed to the topic.
+    pub async fn unsubscribe(&self, topic: String) -> NetworkResult<bool> {
+        let (reply, was_subscribed) = oneshot::channel();
+        self.sender.send(NetworkCommand::Unsubscribe { topic, reply }).await?;
+        Ok(was_subscribed.await?)
     }
 
     /// Publish a message on a certain topic.

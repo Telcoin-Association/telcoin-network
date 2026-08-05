@@ -64,6 +64,14 @@ const DATA_NAME: &str = "state_data";
 /// (`MAX_RECORD_SIZE` = 16 MiB, [`crate::archive::pack_iter`]), leaving margin for BCS overhead.
 const STORAGE_CHUNK_SLOTS: usize = 64 * 1024;
 
+/// Upper bound on the header count a pack may declare, enforced before any allocation sized by the
+/// untrusted `header_count`. A genuine pack carries the snapshot header plus at most
+/// `BLOCKHASH_ANCESTORS` (256) ancestors — 257 in all — so this generous cap never rejects a
+/// legitimate pack, while bounding the eager `Vec::with_capacity` in [`ExecStatePackReader::open`]
+/// against a crafted/corrupt count (which would otherwise request a multi-TB allocation before any
+/// per-record CRC/size guard runs).
+const MAX_HEADER_COUNT: u32 = 4096;
+
 /// First record in the pack. Minimal and fixed: it carries the authoritative state
 /// root and describes the shape of the stream that follows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +121,7 @@ struct AccountRecord {
     address: Address,
     nonce: u64,
     balance: B256,
-    code: Option<Vec<u8>>,
+    code: Option<Bytes>,
 }
 
 impl AccountRecord {
@@ -127,7 +135,7 @@ impl AccountRecord {
             account: GenesisAccount {
                 nonce: Some(self.nonce),
                 balance: U256::from_be_bytes(self.balance.0),
-                code: self.code.map(Bytes::from),
+                code: self.code,
                 storage,
                 private_key: None,
             },
@@ -140,7 +148,7 @@ impl AccountRecord {
             address: self.address,
             nonce: self.nonce,
             balance: U256::from_be_bytes(self.balance.0),
-            code: self.code.map(Bytes::from),
+            code: self.code,
         }
     }
 }
@@ -269,11 +277,21 @@ impl ExecStatePackWriter {
             account.account.code.clone(),
         )?;
         if let Some(storage) = &account.account.storage {
-            // BTreeMap iterates in ascending key order — a stable, deterministic chunk order.
-            let slots: Vec<(B256, B256)> = storage.iter().map(|(k, v)| (*k, *v)).collect();
-            for chunk in slots.chunks(STORAGE_CHUNK_SLOTS) {
-                self.append_storage_chunk(chunk)?;
+            // BTreeMap iterates in ascending key order — a stable, deterministic chunk order. Build
+            // each chunk straight from the iterator and move it into its record, so an account's
+            // storage is never copied into a full intermediate Vec and then again per chunk.
+            let mut chunk: Vec<(B256, B256)> =
+                Vec::with_capacity(STORAGE_CHUNK_SLOTS.min(storage.len()));
+            for (k, v) in storage.iter() {
+                chunk.push((*k, *v));
+                if chunk.len() == STORAGE_CHUNK_SLOTS {
+                    self.append_storage_chunk_owned(std::mem::replace(
+                        &mut chunk,
+                        Vec::with_capacity(STORAGE_CHUNK_SLOTS),
+                    ))?;
+                }
             }
+            self.append_storage_chunk_owned(chunk)?;
         }
         Ok(())
     }
@@ -297,7 +315,7 @@ impl ExecStatePackWriter {
             address,
             nonce,
             balance: B256::from(balance.to_be_bytes::<32>()),
-            code: code.map(|code| code.to_vec()),
+            code,
         };
         Self::append(&mut self.data, &ExecStateRecord::Account(record))
     }
@@ -309,11 +327,20 @@ impl ExecStatePackWriter {
         &mut self,
         slots: &[(B256, B256)],
     ) -> Result<(), ExecStatePackError> {
+        self.append_storage_chunk_owned(slots.to_vec())
+    }
+
+    /// Append one owned chunk of storage slots for the current account, moving it into its record
+    /// (no extra copy) and bumping the tally. Empty chunks are ignored.
+    fn append_storage_chunk_owned(
+        &mut self,
+        slots: Vec<(B256, B256)>,
+    ) -> Result<(), ExecStatePackError> {
         if slots.is_empty() {
             return Ok(());
         }
         self.stats.storage_slots += slots.len() as u64;
-        Self::append(&mut self.data, &ExecStateRecord::Storage(slots.to_vec()))
+        Self::append(&mut self.data, &ExecStateRecord::Storage(slots))
     }
 
     /// Write the trailing [`ExecStateStats`] footer, commit the pack to disk, and
@@ -372,6 +399,15 @@ impl ExecStatePackReader {
         };
         if meta.header_count == 0 {
             return Err(ExecStatePackError::MissingHeaders);
+        }
+        // Reject an implausible count BEFORE the capacity reservation below: `header_count` is read
+        // straight from the (untrusted) meta, and a crafted value would otherwise make
+        // `with_capacity` request a huge allocation before any per-record guard runs.
+        if meta.header_count > MAX_HEADER_COUNT {
+            return Err(ExecStatePackError::TooManyHeaders {
+                declared: meta.header_count,
+                max: MAX_HEADER_COUNT,
+            });
         }
 
         let mut headers = Vec::with_capacity(meta.header_count as usize);
@@ -597,6 +633,14 @@ pub enum ExecStatePackError {
     MetaNotFirst,
     /// The pack declared zero headers, or ended before all declared headers were read.
     MissingHeaders,
+    /// The pack declared more headers than any legitimate pack contains. Bounds the up-front
+    /// allocation on the untrusted read path.
+    TooManyHeaders {
+        /// Header count declared by the pack meta.
+        declared: u32,
+        /// Maximum accepted count ([`MAX_HEADER_COUNT`]).
+        max: u32,
+    },
     /// The snapshot header's `state_root` does not match the meta's `state_root`.
     StateRootMismatch,
     /// The snapshot header's number/hash do not match the meta.
@@ -627,6 +671,9 @@ impl fmt::Display for ExecStatePackError {
             Self::CorruptPack => write!(f, "corrupt pack: record out of place"),
             Self::MetaNotFirst => write!(f, "first record was not the meta record"),
             Self::MissingHeaders => write!(f, "pack is missing one or more declared headers"),
+            Self::TooManyHeaders { declared, max } => {
+                write!(f, "pack declares {declared} headers, exceeding the maximum of {max}")
+            }
             Self::StateRootMismatch => {
                 write!(f, "snapshot header state_root does not match meta state_root")
             }
@@ -818,6 +865,42 @@ mod test {
     }
 
     #[test]
+    fn reader_stops_at_first_footer_ignoring_appended_bytes() {
+        // Safety net for findings #13/#14: `ExecStatePackWriter::create` opens the data file in
+        // APPEND mode, so writing into a dirty dir would produce a "doubled" pack (a full second
+        // pack after the first's `End` footer). The reader must terminate at the FIRST footer, so
+        // trailing prior-attempt bytes are inert and can never contribute wrong state to a
+        // recomputed root.
+        let dir = TempDir::with_prefix("exec_state_doubled").expect("temp dir");
+
+        // First (real) pack: meta + one header + account A + footer.
+        let root1 = B256::from([1u8; 32]);
+        let acct_a = account(0xAA, 1, false);
+        let mut w1 =
+            ExecStatePackWriter::create(dir.path(), root1, &[header(10, root1)]).expect("create 1");
+        w1.append_account(&acct_a).expect("append A");
+        w1.finish().expect("finish 1");
+
+        // Second `create` on the same dir APPENDS a whole second pack after the first's footer.
+        let root2 = B256::from([2u8; 32]);
+        let acct_b = account(0xBB, 1, false);
+        let mut w2 =
+            ExecStatePackWriter::create(dir.path(), root2, &[header(20, root2)]).expect("create 2");
+        w2.append_account(&acct_b).expect("append B");
+        w2.finish().expect("finish 2");
+
+        // The reader reads the FIRST pack only (meta1, its header, account A) and stops at End1.
+        let mut reader = ExecStatePackReader::open(dir.path()).expect("open");
+        assert_eq!(reader.meta().state_root, root1, "reader must read the first pack's meta");
+        let got: Vec<_> = reader.accounts().collect::<Result<_, _>>().expect("accounts");
+        assert_eq!(
+            got,
+            vec![acct_a],
+            "reader must return only the first pack's account; appended bytes are inert"
+        );
+    }
+
+    #[test]
     fn verify_detects_state_root_mismatch() {
         let dir = TempDir::with_prefix("exec_state_pack_srm").expect("temp dir");
         let mut pack = open_raw(dir.path());
@@ -898,5 +981,46 @@ mod test {
         // The container's version gate (fed EXEC_STATE_PACK_VERSION) rejects it on open.
         let err = ExecStatePackReader::open(dir.path()).expect_err("must reject newer version");
         assert!(matches!(err, ExecStatePackError::Open(_)));
+    }
+
+    #[test]
+    fn open_rejects_implausible_header_count() {
+        let dir = TempDir::with_prefix("exec_state_pack_thc").expect("temp dir");
+        let mut pack = open_raw(dir.path());
+        // A crafted meta declaring far more headers than any legitimate pack. `open` must reject it
+        // up front rather than eagerly reserving a `Vec` sized by the untrusted count (a would-be
+        // multi-TB allocation), before reading any header record.
+        let meta = ExecStateMeta {
+            state_root: B256::ZERO,
+            block_number: 0,
+            block_hash: B256::ZERO,
+            header_count: u32::MAX,
+        };
+        pack.append(&ExecStateRecord::Meta(meta)).unwrap();
+        pack.commit().unwrap();
+        drop(pack);
+
+        let err = ExecStatePackReader::open(dir.path())
+            .expect_err("must reject implausible header_count");
+        assert!(
+            matches!(err, ExecStatePackError::TooManyHeaders { declared, .. } if declared == u32::MAX)
+        );
+    }
+
+    #[test]
+    fn account_code_bytes_encodes_like_vec() {
+        // `AccountRecord.code` is stored as `Option<Bytes>` (avoiding a per-account `to_vec`),
+        // where it used to be `Option<Vec<u8>>`. Under the pack's BCS codec both encode
+        // identically — (Option tag) + (ULEB128 len) + (raw bytes) — so the wire format is
+        // unchanged and `EXEC_STATE_PACK_VERSION` need not bump. This test locks that
+        // invariant.
+        let raw = vec![0x60u8, 0x00, 0x2a, 0xff, 0x01];
+        let as_bytes: Option<Bytes> = Some(Bytes::from(raw.clone()));
+        let as_vec: Option<Vec<u8>> = Some(raw);
+        assert_eq!(tn_types::encode(&as_bytes), tn_types::encode(&as_vec));
+
+        let none_bytes: Option<Bytes> = None;
+        let none_vec: Option<Vec<u8>> = None;
+        assert_eq!(tn_types::encode(&none_bytes), tn_types::encode(&none_vec));
     }
 }

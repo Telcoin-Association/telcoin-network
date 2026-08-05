@@ -87,7 +87,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // manually create engine
@@ -336,7 +336,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
@@ -505,7 +505,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
@@ -696,7 +696,7 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // manually create engine
@@ -1400,7 +1400,7 @@ async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Res
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // manually create engine
@@ -1577,7 +1577,7 @@ async fn epoch_block_height_is_closing_block_plus_one() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
@@ -1740,7 +1740,7 @@ async fn test_derive_base_fees_eip1559_variant_matches_oracle() -> eyre::Result<
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
@@ -1854,7 +1854,7 @@ async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // the empty-close path resolves the leader's execution address through the rewards
     // counter's committee, so build the committee from on-chain registry state
@@ -2277,11 +2277,10 @@ async fn test_epoch_record_chain_across_mid_epoch_ejection() -> eyre::Result<()>
 
     // committee reads through the same `getCommitteeBlsPubkeys` path the node performs for
     // `write_epoch_record`. The node pins that read to the epoch-closing block; every read
-    // below happens while the canonical tip IS the relevant closing block, so the tip read
-    // resolves the identical state.
+    // below happens while the canonical tip IS the relevant closing block.
     let keys_for_epoch = |e: u32| -> eyre::Result<Vec<BlsPublicKey>> {
         Ok(reth_env
-            .bls_pubkeys_for_epoch(e)?
+            .bls_pubkeys_for_epoch_at_block(e, reth_env.canonical_tip().hash())?
             .iter()
             .filter_map(|bls| BlsPublicKey::from_literal_bytes(bls.as_ref()).ok())
             .collect())
@@ -2562,7 +2561,7 @@ async fn spawn_consensus(
     batches: HashMap<B256, Batch>,
     config: ConsensusConfig<MemDatabase>,
     task_manager: &TaskManager,
-    mut consensus_chain: ConsensusChain,
+    consensus_chain: ConsensusChain,
 ) {
     // components for tasks
     let committee = fixture.committee();
@@ -2586,7 +2585,7 @@ async fn spawn_consensus(
         task_manager,
         network,
         consensus_chain.clone(),
-        u64::max_value(),
+        u64::MAX,
     );
 
     // Set up mock worker.
@@ -2595,7 +2594,7 @@ async fn spawn_consensus(
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await

@@ -9,6 +9,7 @@ use tn_storage as _;
 #[cfg(test)]
 use tn_test_utils_committee as _;
 
+mod canonical_reader;
 mod codec;
 #[allow(clippy::mutable_key_type)]
 mod committee;
@@ -28,6 +29,7 @@ mod worker;
 pub mod error;
 pub mod forks;
 
+pub use canonical_reader::*;
 pub use codec::*;
 pub use committee::*;
 pub use consensus_chain_traits::*;

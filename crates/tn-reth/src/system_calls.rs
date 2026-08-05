@@ -2,9 +2,30 @@
 //!
 //! These compile into types for interacting with smart contracts through
 //! System Calls.
+//!
+//! The `sol!` blocks bind three contracts from the tn-contracts submodule:
+//! - `ConsensusRegistry` — validator lifecycle (mint/stake/activate/exit/burn), epoch and committee
+//!   views, and the three epoch-boundary mutators the protocol invokes as system calls in the
+//!   closing block: `applyIncentives`, then `applySlashes`, then `concludeEpoch`.
+//! - `LegacyConsensusRegistry` — the pre-fork registry's epoch-close surface, frozen so pre-fork
+//!   epoch closes replay byte-identically (see the code-hash gate in `evm/block.rs`).
+//! - `WorkerConfigs` — per-worker base-fee strategy used for base fee adjustment, plus the
+//!   `setWorkerConfigsData` mutator the epoch-closing block invokes to record each EIP-1559
+//!   worker's next-epoch base fee. Its `getAllWorkerConfigs` return is decoded in exactly one
+//!   place, [`decode_worker_fee_configs`], shared by the pinned read path and the closing block.
+//!
+//! Two pinned addresses live here: `SYSTEM_ADDRESS` (0xfff...fffe), the reserved caller the EVM
+//! uses for system transactions (the custom handler exempts it from fee/beneficiary
+//! accounting), and `CONSENSUS_REGISTRY_ADDRESS`, the registry's fixed deployment address.
+//!
+//! NOTE: slashing is not live — the protocol calls `applySlashes` with an empty array. Do not
+//! assume validators can currently be slashed in-protocol.
 
 use alloy::{primitives::address, sol};
-use tn_types::{Address, Epoch};
+use tn_types::{
+    gas_accumulator::{WorkerConfigEntry, WorkerFeeConfig},
+    Address, Epoch,
+};
 
 /// The system address.
 pub(super) const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
@@ -155,12 +176,20 @@ sol!(
             address owner_
         ) external;
 
-        /// Conclude the current epoch. Caller must pass a new committee of eligible validators.
-        function concludeEpoch(address[] calldata newCommittee) external;
-        /// Apply incentives for the epoch. This must be called before `concludeEpoch`.
+        /// Distribute the concluding epoch's issuance to leaders. First of the three
+        /// epoch-boundary system calls; the protocol sequences it before `applySlashes` so
+        /// weights reflect pre-slash collateral. May be empty while issuance is disabled.
         function applyIncentives(RewardInfo[] calldata rewardInfos) external;
-        /// Apply negative incentives for the epoch. This must be called before `concludeEpoch`.
+        /// Apply the concluding epoch's slashes, ejecting validators slashed to zero. Second of
+        /// the three boundary calls; MUST run before `concludeEpoch` so the committee the protocol
+        /// then assembles, and the size it validates against, both reflect any ejections. Always
+        /// empty while slashing is disabled.
         function applySlashes(Slash[] calldata slashes) external;
+        /// Settle queued stake version changes and rotate the epoch, seating `newCommittee`. Final
+        /// boundary call; the protocol reads `nextCommitteeSize` and assembles `newCommittee`
+        /// after `applySlashes`, so the size check here cannot revert against a stale pre-slash
+        /// view and settlement reads post-slash balances.
+        function concludeEpoch(address[] calldata newCommittee) external;
         /// One-time in-protocol fork migration: back-fills the appended per-status `validatorSets`
         /// and the cached `eligibleValidatorCount` from the preserved `currentStatus` source of
         /// truth after the registry bytecode is swapped in place. System-gated and idempotent.
@@ -221,7 +250,7 @@ sol!(
         /// Returns the validator's (outstandingBalance, initialStake, rewards).
         function getBalanceBreakdown(address validatorAddress) external view returns (uint256, uint256, uint256);
         /// Returns the EIP-712 digest a validator signs to accept a delegation.
-        function delegationDigest(bytes memory blsPubkey, address validatorAddress, address delegator) external view returns (bytes32);
+        function delegationDigest(bytes memory blsPubkey, address validatorAddress, address delegator, uint256 deadline) external view returns (bytes32);
         /// Issuance not yet distributed to validators (public variable getter).
         function undistributedIssuance() external view returns (uint256);
         /// Sets the GSMA region identifier for a validator (0=unspecified, 1-255=assigned regions).
@@ -236,13 +265,13 @@ sol!(
         constructor(
             uint8[] memory strategies,
             uint64[] memory values,
-            uint128[] memory datas,
+            uint184[] memory datas,
             address owner_,
         );
         /// Get the stored fee config for a worker.
         function getWorkerConfig(uint16 workerId)
             external view
-            returns (uint8 strategy, uint64 value, uint128 data);
+            returns (uint8 strategy, uint64 value, uint184 data);
         /// Get every worker's config in a single call.
         function getAllWorkerConfigs()
             external view
@@ -250,15 +279,56 @@ sol!(
                 uint16 count,
                 uint8[] memory strategies,
                 uint64[] memory values,
-                uint128[] memory datas,
+                uint184[] memory datas,
             );
         /// Set the number of workers for the next epoch.
         function setNumWorkers(uint16 numWorkers_) external;
         /// Set the config for a worker by worker id.
         /// NOTE: this must be called before calling `setNumWorkers`.
-        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value, uint128 data) external;
+        function setWorkerConfig(uint16 workerId, uint8 strategy, uint64 value, uint184 data) external;
+        /// Update strategy-specific packed data for multiple workers. System call only;
+        /// each worker's strategy and value are preserved, and only previously configured
+        /// workers may be updated.
+        function setWorkerConfigsData(uint16[] calldata workerIds, uint184[] calldata datas) external;
+        /// Update config values for multiple workers. System call only; each worker's
+        /// strategy and data are preserved, and only previously configured workers may be
+        /// updated.
+        function setWorkerConfigsValue(uint16[] calldata workerIds, uint64[] calldata values) external;
+        /// Raise the highest strategy id the contract accepts. Owner only and strictly
+        /// increasing, in lockstep with the protocol release that ships the new strategy —
+        /// and only after every validator is confirmed running it (see
+        /// [`decode_worker_fee_configs`] for why a mixed fleet diverges).
+        function setMaxStrategy(uint8 newMaxStrategy) external;
+        /// The highest strategy id the contract currently accepts.
+        function MAX_STRATEGY() external view returns (uint8);
         /// Retrieve the number of workers for the protocol.
         function numWorkers() external view returns (uint16);
+    }
+);
+
+// The epoch-close surface of the PRE-fork `ConsensusRegistry` deployment. While the deployed
+// registry still carries the pre-fork code hash, epoch closes must replay this exact two-call
+// sequence byte-for-byte — re-executed pre-fork blocks must derive identical state roots
+// without leaning on contract-semantics arguments about which extra calls would no-op; the
+// code-hash gate in `evm/block.rs` routes between the two. Frozen: these signatures must stay
+// byte-identical to the calls the historical chain executed.
+sol!(
+    /// Pre-fork `ConsensusRegistry` epoch-close interface.
+    contract LegacyConsensusRegistry {
+        /// The rewards applied before concluding the epoch. Field layout is identical to
+        /// `ConsensusRegistry::RewardInfo`.
+        #[derive(Debug)]
+        struct RewardInfo {
+            /// The validator to receive rewards.
+            address validatorAddress;
+            /// The number of consensus blocks for which they were the leader.
+            uint256 consensusHeaderCount;
+        }
+
+        /// Distribute the concluding epoch's issuance. Runs before `concludeEpoch`.
+        function applyIncentives(RewardInfo[] calldata rewardInfos) external;
+        /// Conclude the current epoch with the new committee.
+        function concludeEpoch(address[] calldata newCommittee) external;
     }
 );
 
@@ -267,7 +337,7 @@ sol!(
 pub struct EpochState {
     /// The epoch number.
     pub epoch: Epoch,
-    /// The [EpochInfo].
+    /// The `EpochInfo` read from the registry.
     pub epoch_info: ConsensusRegistry::EpochInfo,
     /// The collection of validator info.
     pub validators: Vec<ConsensusRegistry::ValidatorInfo>,
@@ -278,4 +348,133 @@ pub struct EpochState {
     /// This time plus the `EpochInfo::epochDuration` creates the timestamp for the next epoch
     /// boundary.
     pub epoch_start: u64,
+}
+
+/// Decode a `getAllWorkerConfigs()` return payload into the on-chain worker count and one
+/// [`WorkerConfigEntry`] per worker.
+///
+/// The single decode seam for the `WorkerConfigs` table: the pinned read path
+/// (`RethEnv::worker_fee_configs_inner`) and the epoch-closing block's base-fee recording both
+/// route through here, so the strategy mapping and the arity check cannot drift between the node
+/// that reads a worker's fee strategy and the block that prices its next-epoch fee.
+///
+/// Errors are returned as strings for the caller to classify: every failure here is a
+/// deterministic product of the return payload (identical on every node reading the same block),
+/// so callers map them into their chain-global error variant.
+///
+/// Fail-open on unknown strategy ids: a strategy this node does not recognize (only possible when
+/// a future contract version introduces one before this node is upgraded) is NOT an error — it
+/// falls back to [`WorkerFeeConfig::Eip1559`] with a warning, preserving liveness instead of
+/// halting all validators on the unrecognized id.
+///
+/// The fallback is deterministic per BUILD, not across builds — and this seam feeds a state
+/// WRITE, not just the read path: the closing block's `setWorkerConfigsData` takes both its
+/// membership (an unknown id maps to `Eip1559` and is therefore written; `Static` rows are
+/// skipped) and its `data` values from these entries, so two builds that disagree about a
+/// strategy id produce different closing-block state roots — and that block's hash is the
+/// quorum-signed `EpochRecord::final_state`. LOCKSTEP FLEET-UPGRADE REQUIREMENT (same discipline
+/// as `SYSTEM_CALL_GAS_LIMIT` in `evm/mod.rs` and the fork rollout in `tn_types::forks`): every
+/// validator must be confirmed running the release that ships a new strategy id BEFORE governance
+/// sends `setMaxStrategy(N)` and assigns it. A uniform old-build fleet does not split, but is not
+/// benign either — every node identically reinterprets the row's `value` as a 1559 `target_gas`
+/// and writes a silently wrong fee into consensus state.
+pub(crate) fn decode_worker_fee_configs(
+    bytes: &[u8],
+) -> Result<(u16, Vec<WorkerConfigEntry>), String> {
+    let ret =
+        <WorkerConfigs::getAllWorkerConfigsCall as alloy::sol_types::SolCall>::abi_decode_returns(
+            bytes,
+        )
+        .map_err(|e| {
+            format!("worker configs return decode failed (contract absent at this block?): {e}")
+        })?;
+
+    let num_workers = ret.count as usize;
+    if ret.strategies.len() != num_workers
+        || ret.values.len() != num_workers
+        || ret.datas.len() != num_workers
+    {
+        return Err(format!(
+            "worker config arity mismatch: count={num_workers}, strategies={}, values={}, datas={}",
+            ret.strategies.len(),
+            ret.values.len(),
+            ret.datas.len(),
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(num_workers);
+    for (worker_id, ((&strategy, &value), &data)) in
+        ret.strategies.iter().zip(ret.values.iter()).zip(ret.datas.iter()).enumerate()
+    {
+        let config = match strategy {
+            0 => WorkerFeeConfig::Eip1559 { target_gas: value },
+            1 => WorkerFeeConfig::Static { fee: value },
+            s => {
+                // The contract rejects unknown strategies, so this branch only fires when a
+                // future contract version introduces a strategy this node hasn't been
+                // updated to understand. Fall back to EIP-1559 to preserve liveness instead
+                // of halting all validators.
+                tracing::warn!(
+                    target: "tn::reth",
+                    worker_id,
+                    strategy = s,
+                    "unknown fee strategy; falling back to strategy 0 (Eip1559)"
+                );
+                WorkerFeeConfig::Eip1559 { target_gas: value }
+            }
+        };
+        entries.push(WorkerConfigEntry { config, data });
+    }
+
+    Ok((ret.count, entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::{
+        primitives::{aliases::U184, keccak256},
+        sol_types::SolCall,
+    };
+
+    /// The hand-written `delegationDigest` binding must track the on-chain 4-argument selector. If
+    /// the contract selector changes and this binding does not, `tn_delegationDigest` reverts
+    /// at runtime instead of failing to compile, so pin the selector here.
+    #[test]
+    fn delegation_digest_binding_selector_is_current() {
+        let expected: [u8; 4] =
+            keccak256("delegationDigest(bytes,address,address,uint256)")[..4].try_into().unwrap();
+        assert_eq!(ConsensusRegistry::delegationDigestCall::SELECTOR, expected);
+    }
+
+    /// An unknown strategy id must decode fail-open to `Eip1559` (deterministic per build), never
+    /// `Err`: this seam feeds both the entry-time config read and the closing block's
+    /// `setWorkerConfigsData` write set, so erroring here would halt every validator the moment a
+    /// newer contract version introduces a strategy id this build predates. Pins the fallback arm
+    /// (previously untested) alongside a known-strategy row to prove the mapping is per-row.
+    #[test]
+    fn unknown_strategy_decodes_fail_open_to_eip1559() {
+        use tn_types::gas_accumulator::WorkerFeeConfig;
+
+        let encoded = WorkerConfigs::getAllWorkerConfigsCall::abi_encode_returns(
+            &WorkerConfigs::getAllWorkerConfigsReturn {
+                count: 2,
+                strategies: vec![2, 1],
+                values: vec![777, 42],
+                datas: vec![U184::from(5u64), U184::ZERO],
+            },
+        );
+
+        let (count, entries) =
+            decode_worker_fee_configs(&encoded).expect("unknown strategy is fail-open, not Err");
+        assert_eq!(count, 2);
+        assert_eq!(
+            entries[0].config,
+            WorkerFeeConfig::Eip1559 { target_gas: 777 },
+            "unknown id 2 must fall back to Eip1559 over the row's value"
+        );
+        assert_eq!(entries[0].data, U184::from(5u64), "the row's data word rides along");
+        assert_eq!(entries[1].config, WorkerFeeConfig::Static { fee: 42 });
+        assert_eq!(entries[1].data, U184::ZERO);
+    }
 }

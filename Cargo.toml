@@ -122,7 +122,6 @@ reth-config = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
-reth-engine-tree = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
 reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3" }
@@ -252,6 +251,7 @@ hyper-util = { version = "0.1", default-features = false, features = [
 tower-http = { version = "0.6", default-features = false, features = [
     "timeout",
 ] }
+socket2 = { version = "0.6", default-features = false, features = ["all"] }
 const-str = "0.5.6"
 opentelemetry = { version = "0.31.0", default-features = false }
 opentelemetry_sdk = { version = "0.31.0", default-features = false }

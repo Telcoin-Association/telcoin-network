@@ -276,7 +276,7 @@ async fn test_certificate_store_last_two_rounds() {
 
     // store them in both main and secondary index
     store.write_all(certs.iter()).unwrap();
-    store.persist::<CertificateDigestByRound>().await;
+    store.persist::<CertificateDigestByRound>().await.expect("persist");
 
     // WHEN
     let result = store.last_two_rounds_certs().unwrap();
@@ -336,7 +336,7 @@ async fn test_certificate_store_after_round() {
 
     // store them in both main and secondary index
     store.write_all(certs.iter()).unwrap();
-    store.persist::<CertificateDigestByRound>().await; // Let the writes settle
+    store.persist::<CertificateDigestByRound>().await.expect("persist"); // Let the writes settle
 
     tracing::debug!("Stored certificates: {} seconds", now.elapsed().as_secs_f32());
 
@@ -484,7 +484,7 @@ async fn test_certificate_store_delete_store() {
 
     store.delete(to_delete[0]).unwrap();
     store.delete(to_delete[1]).unwrap();
-    store.persist::<Certificates>().await; // Make sure the deletes are complete...
+    store.persist::<Certificates>().await.expect("persist"); // Make sure the deletes are complete...
 
     // THEN
     assert!(store.read(to_delete[0]).unwrap().is_none());

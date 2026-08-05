@@ -16,17 +16,24 @@
 //! `parse_listener_address_for_swarm`, `wait_for_network_peers` — plus the [`RunEpochMode`] /
 //! [`ReplayResult`] types that thread control flow through the loop.
 
-use crate::{engine::ExecutionNode, manager::EpochManager, worker::worker_task_manager_name};
-use std::{collections::HashSet, time::Duration};
+use crate::{
+    engine::ExecutionNode, manager::EpochManager, metrics::EpochMetrics,
+    worker::worker_task_manager_name,
+};
+use std::{
+    collections::HashSet,
+    future::{ready, Future},
+    time::Duration,
+};
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::ConsensusBus;
 use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
-    gas_accumulator::{compute_next_base_fee_eip1559, GasAccumulator, WorkerFeeConfig},
+    gas_accumulator::{next_base_fee_for_config, GasAccumulator},
     BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase,
-    EpochRecord, Notifier, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
+    EpochRecord, Notifier, SealedHeader, TaskJoinError, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -94,24 +101,27 @@ where
     ///    [`EpochRecord`] if missing so later lookups can treat epoch 0 like any other.
     /// 2. Create the per-epoch [`TaskManager`] and open the epoch pack files via `open_epoch_pack`.
     /// 3. If the mode calls for replay, re-forward any missed consensus output. If that replay
-    ///    crosses the epoch boundary, close the epoch immediately, clear the consensus DB, and
-    ///    return early as [`RunEpochMode::NewEpoch`] — consensus is never configured this
-    ///    iteration. Otherwise, block until the engine has executed the last replayed output before
-    ///    going live.
+    ///    crosses the epoch boundary, close the epoch immediately, write its [`EpochRecord`], clear
+    ///    the consensus DB, and return early as [`RunEpochMode::NewEpoch`] — consensus is never
+    ///    configured this iteration. Otherwise, block until the engine has executed the last
+    ///    replayed output before going live.
     /// 4. Subscribe to consensus output, configure consensus, and create the primary/worker
-    ///    components. The one-time per-process network setup is gated on `network_first_init`,
-    ///    which is driven by `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the
-    ///    replay-and-close return above can defer setup to a following iteration without skipping
-    ///    it.
+    ///    components. The previous and next committees' keys are resolved first in ONE batched read
+    ///    pinned to the epoch-start header and threaded into both steps as parameters. The one-time
+    ///    per-process network setup is gated on `network_first_init`, which is driven by
+    ///    `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the replay-and-close
+    ///    return above can defer setup to a following iteration without skipping it.
     /// 5. Start the primary (if this node is an active CVV), the subscriber, the worker batch
     ///    builder, and the engine batch builder; reattach any orphaned batches.
     /// 6. `tokio::select!` over three exits: node shutdown, the epoch boundary
     ///    (`wait_for_epoch_boundary`), and the epoch task manager ending early (a CVV resync or a
-    ///    task error). Only the boundary arm closes the epoch and writes its [`EpochRecord`].
+    ///    task error). Of these, only the boundary arm closes the epoch and writes its
+    ///    [`EpochRecord`]; the replay-and-close (step 3) and leftover-drain (step 7) recovery paths
+    ///    write the record on their own closes.
     /// 7. Notify consensus shutdown, abort and drain the epoch task manager, then resolve the
     ///    outcome. On a non-boundary exit, drain leftover output to the engine: if that drain hits
-    ///    the boundary, close the epoch here too. Clear epoch-scoped DB tables when a boundary was
-    ///    crossed.
+    ///    the boundary, close the epoch and write its [`EpochRecord`] here too. Clear epoch-scoped
+    ///    DB tables when a boundary was crossed.
     ///
     /// The returned [`RunEpochMode`] tells the caller (`run_epochs` in the `node` module) which
     /// transition occurred: [`RunEpochMode::NewEpoch`] when the boundary was crossed (advance the
@@ -156,14 +166,20 @@ where
         // CURRENT epoch's stored committee arrays immediately) re-reads the IDENTICAL
         // epoch-start membership - RewardsCounter rows, quorum thresholds, leader schedule -
         // instead of the post-burn tip set, so entry timing can no longer change the node's
-        // view of the epoch.
+        // view of the epoch. The neighbor-committee hoist below (previous and next, batched in
+        // one pinned EVM at the same header) is an entry read too and inherits the same
+        // stability.
         //
         // That value-stability is also the safety argument under concurrent execution -
         // `send_leftover_consensus_output_to_engine` forwards leftover output without waiting,
         // so the engine may still be executing (calling `inc_block`) while this entry runs:
-        // `apply`'s resize no-ops, its fee writes rewrite the same values, and
-        // `GasAccumulator::set_num_workers` refuses to shrink below an in-flight worker id -
-        // NOT quiescence. See the `mode_change_reentry_is_idempotent` IT.
+        // `apply`'s resize no-ops and its fee writes rewrite the same values. The guard is
+        // value-stability, NOT quiescence and NOT any refusal inside `set_num_workers` (it
+        // truncates unconditionally): the pinned re-read yields the identical count so the resize
+        // no-ops, and a shrink below an in-flight worker id would trip `inc_block`'s production
+        // panic rather than pass silently. `GasAccumulator::set_num_workers`'s own doc states
+        // that bound canonically - keep the two in sync. See the
+        // `mode_change_reentry_is_idempotent` IT.
         //
         // Seed the accumulator's worker count and per-worker base fees for the entered epoch
         // from the pinned header (the previous epoch's closing block). This is the single seam
@@ -228,6 +244,10 @@ where
                 // If things go down at exactly the wrong time we might have to replay the epoch end
                 // so account for that.
                 self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
+                // write the record before clearing tables: a crash after an epoch-0 replay-close
+                // that left no durable record 0 would trip the epoch-0 guard above on every
+                // restart (peers cannot backfill epoch 0), bricking the node
+                self.write_epoch_record(committee.epoch(), engine).await?;
                 self.clear_consensus_db_for_next_epoch()?;
                 return Ok(RunEpochMode::NewEpoch);
             }
@@ -244,9 +264,55 @@ where
 
         // subscribe to output early to prevent missed messages
         let mut consensus_output = self.consensus_bus.subscribe_consensus_output();
-        let consensus_config = self
-            .configure_consensus(engine, network_config, committee, &epoch_start_header)
-            .await?;
+
+        // Neighbor committees from on-chain state - canonical source of truth - resolve through
+        // ONE pinned EVM at the held epoch-start header. The previous epoch's committee array
+        // is frozen once this epoch starts (a mid-epoch burn mutates the current and future
+        // epochs' arrays, never a past epoch's), and the registry at the pin already serves the
+        // next epoch's committee, so a post-burn re-entry derives the same sets (see the
+        // ENTRY-READ INVARIANT above).
+        //
+        // READ-FAILURE POLICY: this is a consensus input, so the failure is classified by
+        // committee determinism (`StateReadError`) and BOTH classes halt - there is no fail-open
+        // arm here, despite what `StateReadError::ChainGlobal`'s variant doc says about
+        // keep-current staying committee-consistent. There is nothing to keep: the node is
+        // ENTERING the epoch, so it holds no prior neighbor sets, and entering with an
+        // unverifiable neighbor committee mis-scopes peer banning and next-committee
+        // pre-resolution for the whole epoch. Halting is a single-node liveness failure.
+        //
+        // A Provider fault is node-local (peers reading the same block may succeed), so retry
+        // briefly before halting; ChainGlobal returns from the first attempt. The pin is
+        // `epoch_start_header`, a fixed `SealedHeader` captured before this retry, so every
+        // attempt provably reads the same block. The `try_into` arity checks are `eyre`, not
+        // `StateReadError`, so they stay OUTSIDE the retried closure.
+        let epochs: Vec<_> =
+            if entered == 0 { vec![entered + 1] } else { vec![entered - 1, entered + 1] };
+        let sets = retry_provider_faults("neighbor committees at the epoch-start pin", || {
+            engine.validators_for_epochs_at_header(&epochs, &epoch_start_header)
+        })
+        .await
+        .map_err(|e| {
+            eyre::eyre!(
+                "failed neighbor-committee read at the epoch-start pin - halting rather than \
+                 entering epoch {entered} with an unverifiable neighbor committee: {e}"
+            )
+        })?;
+        let (previous_committee_keys, next_committee_keys): (HashSet<BlsPublicKey>, Vec<_>) =
+            if entered == 0 {
+                // epoch 0 has no previous committee
+                let [next] = sets.try_into().map_err(|_| {
+                    eyre::eyre!("neighbor-committee batch arity mismatch for epoch 0")
+                })?;
+                (HashSet::new(), next)
+            } else {
+                let [previous, next] = sets.try_into().map_err(|_| {
+                    eyre::eyre!("neighbor-committee batch arity mismatch for epoch {entered}")
+                })?;
+                (previous.into_iter().collect(), next)
+            };
+
+        let consensus_config =
+            self.configure_consensus(network_config, committee, next_committee_keys).await?;
 
         // The networks need their one-time, per-process setup (start listening, register bootstrap
         // peers) on the first iteration that actually reaches `create_consensus`. This is usually
@@ -268,6 +334,7 @@ where
                 consensus_bus.clone(),
                 consensus_config.clone(),
                 &epoch_start_header,
+                previous_committee_keys,
             )
             .await?;
         // Networks are now set up; subsequent epochs rotate committees instead of re-seeding.
@@ -366,7 +433,10 @@ where
                 .await?;
 
                 // Write the epoch record to DB and save in manager for next epoch.
-                self.write_epoch_record(&primary, engine).await?;
+                self.write_epoch_record(current_epoch, engine).await?;
+
+                // Export the epoch's final execution state (no-op unless --enable-state-export).
+                self.export_epoch_state(&primary, &reth_env).await?;
 
                 info!(target: "epoch-manager", "epoch boundary success - clearing consensus db tables for next epoch");
                 epoch_boundary_reached = true;
@@ -421,6 +491,9 @@ where
             // If things go down at exactly the wrong time we might have reached the epoch end
             // so account for that.
             self.close_epoch(None, &reth_env, &gas_accumulator, target_hash).await?;
+            // this arm closed the epoch, so it writes the record too — otherwise the epoch has
+            // no durable record and the next live close fails as out-of-order
+            self.write_epoch_record(current_epoch, engine).await?;
             res = RunEpochMode::NewEpoch;
             clear_tables_for_next_epoch = true;
         } else {
@@ -668,11 +741,11 @@ where
 /// Recompute each worker's next-epoch base fee from the gas it accumulated this epoch and the
 /// worker's fee strategy read from the `WorkerConfigs` contract.
 ///
-/// Reads one [`WorkerFeeConfig`] per worker at the canonical tip — which inside
-/// [`Self::close_epoch`] (after `wait_for_consensus_execution`) is exactly the epoch's closing
-/// block — then applies the strategy via [`next_base_fee_for_config`] and writes the result back to
-/// each worker's base-fee container. This is the deterministic seam every committee member runs
-/// identically at the boundary.
+/// Reads one [`WorkerFeeConfig`](tn_types::gas_accumulator::WorkerFeeConfig) per worker at the
+/// canonical tip — which inside [`Self::close_epoch`] (after `wait_for_consensus_execution`) is
+/// exactly the epoch's closing block — then applies the strategy via [`next_base_fee_for_config`]
+/// and writes the result back to each worker's base-fee container. This is the deterministic seam
+/// every committee member runs identically at the boundary.
 ///
 /// The read's config count is the on-chain `numWorkers()` at the closing block, i.e. the worker
 /// count for the NEXT epoch (a mid-epoch `setNumWorkers` only takes effect at the boundary by
@@ -690,6 +763,11 @@ where
 /// Inert on existing chains: the genesis fee strategy is `Eip1559 { target_gas: u64::MAX }`, which
 /// floors every worker at `MIN_PROTOCOL_BASE_FEE`. Fees only move once governance sets a real
 /// per-worker target.
+///
+/// The identity check lives here and the per-worker fold in
+/// [`apply_close_time_fee_updates`]; the closing block itself records the same values on-chain
+/// (`record_next_epoch_base_fees` in `tn-reth`), computed from the same accumulator and the same
+/// pinned block, so all three seams agree bit-for-bit.
 async fn adjust_base_fees(
     reth_env: &RethEnv,
     gas_accumulator: &GasAccumulator,
@@ -719,7 +797,7 @@ async fn adjust_base_fees(
     // Only a proven identity VIOLATION or an exhausted provider fault halts.
     let (entered_epoch, epoch_info) = match retry_provider_faults(
         "close-time epoch info (identity check)",
-        || reth_env.get_current_epoch_info_at_header(&tip),
+        || ready(reth_env.get_current_epoch_info_at_header(&tip)),
     )
     .await
     {
@@ -745,14 +823,14 @@ async fn adjust_base_fees(
     };
 
     let block_height = epoch_info.blockHeight;
-    debug_assert_eq!(
-        tip.number + 1,
-        block_height,
-        "close-time base-fee identity: canonical tip {} + 1 != entered-epoch {entered_epoch} \
-         blockHeight {block_height}",
-        tip.number,
-    );
     if tip.number + 1 != block_height {
+        error!(
+            target: "epoch-manager",
+            tip_number = tip.number,
+            entered_epoch,
+            block_height,
+            "close-time base-fee identity: canonical tip + 1 != entered-epoch blockHeight"
+        );
         return Err(eyre::eyre!(
             "close-time base-fee identity violated: canonical tip {} + 1 != entered-epoch \
              {entered_epoch} blockHeight {block_height} at tip {:?} - refusing to price base fees \
@@ -762,6 +840,25 @@ async fn adjust_base_fees(
         ));
     }
 
+    apply_close_time_fee_updates(reth_env, gas_accumulator, &tip).await
+}
+
+/// The post-identity-check half of [`adjust_base_fees`]: read the worker fee configs at the
+/// closing block `tip` and fold each worker's next-epoch base fee into `gas_accumulator`.
+///
+/// Split out so the read-failure policy can be exercised at any pinned header without driving a
+/// real epoch-closing block. The closing block itself now records the same fees on-chain (see
+/// `record_next_epoch_base_fees` in `tn-reth`), which is fatal when the `WorkerConfigs` contract
+/// is unreadable — so a test that strips the contract from genesis can no longer produce a
+/// closing block to call the outer function against.
+///
+/// See [`adjust_base_fees`] for the identity check this assumes has already passed, and the
+/// read-failure classification both halves share.
+async fn apply_close_time_fee_updates(
+    reth_env: &RethEnv,
+    gas_accumulator: &GasAccumulator,
+    tip: &SealedHeader,
+) -> eyre::Result<()> {
     // FAIL-OPEN (CHAIN-GLOBAL FAILURES ONLY): a chain-global config-read failure must not abort
     // the epoch close. Keep the current per-worker base fees and worker count untouched -- both
     // are already consensus-consistent (seeded from the same chain at epoch entry, then held
@@ -773,7 +870,7 @@ async fn adjust_base_fees(
     // and move to the new fees), so it must never fail open: retry, then halt. Pinned to the SAME
     // `tip` the identity check validated (one-header discipline).
     match retry_provider_faults("close-time worker fee configs", || {
-        reth_env.get_worker_fee_configs_at_block(tip.hash())
+        ready(reth_env.get_worker_fee_configs_at_block(tip.hash()))
     })
     .await
     {
@@ -807,27 +904,42 @@ async fn adjust_base_fees(
     Ok(())
 }
 
-/// Total attempts (first try + retries) for each close-time chain read in [`adjust_base_fees`]
-/// before a node-local provider fault halts the close.
+/// Total attempts (first try + retries) for each classified pinned chain read at an epoch seam —
+/// the close-time reads in [`adjust_base_fees`], the epoch-record committee reads, and the
+/// epoch-entry reads — before a node-local provider fault escalates to the caller (a halt at every
+/// current site).
 const CLOSE_READ_ATTEMPTS: u32 = 3;
 
-/// Pause between close-time read retries in [`retry_provider_faults`].
+/// Pause between read retries in [`retry_provider_faults`].
 const CLOSE_READ_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Run `read` up to [`CLOSE_READ_ATTEMPTS`] times, sleeping [`CLOSE_READ_RETRY_BACKOFF`] between
 /// tries, retrying ONLY on [`StateReadError::Provider`].
 ///
-/// Provider faults are node-local (a transient I/O error may clear on a re-read), so a bounded
-/// retry preserves liveness before the caller escalates to a halt. Chain-global failures are
-/// deterministic products of the pinned block — re-reading cannot change them — so they return
-/// immediately for the caller's fail-open arm. Success passes straight through.
-async fn retry_provider_faults<T>(
+/// Provider faults are node-local (a transient I/O error may clear on a re-read: every pinned
+/// read constructs a fresh state provider per attempt), so a bounded retry preserves liveness
+/// before the caller escalates to a halt. Chain-global failures are deterministic products of the
+/// pinned block — re-reading cannot change them — so they return immediately for the caller's
+/// fail-open-or-halt arm. Success passes straight through.
+///
+/// `read` returns a future so the async epoch-record and epoch-entry committee reads share this
+/// policy with the synchronous close-time reads (which adapt with [`std::future::ready`]). Each
+/// attempt calls `read` afresh, so every retry re-runs the whole read — which is why every caller
+/// must fix its pin OUTSIDE the closure, or successive attempts could resolve different blocks.
+///
+/// Every retry is counted through [`EpochMetrics::record_provider_fault_retry`], labelled by
+/// `what`. Once a provider fault at an epoch seam is survivable it becomes invisible until it is
+/// not, and a `warn!` alone will not surface a node quietly retrying at every boundary.
+pub(super) async fn retry_provider_faults<T, Fut>(
     what: &'static str,
-    mut read: impl FnMut() -> Result<T, StateReadError>,
-) -> Result<T, StateReadError> {
+    mut read: impl FnMut() -> Fut,
+) -> Result<T, StateReadError>
+where
+    Fut: Future<Output = Result<T, StateReadError>>,
+{
     let mut attempt = 1u32;
     loop {
-        match read() {
+        match read().await {
             Err(StateReadError::Provider(detail)) if attempt < CLOSE_READ_ATTEMPTS => {
                 warn!(
                     target: "epoch-manager",
@@ -835,36 +947,14 @@ async fn retry_provider_faults<T>(
                     max_attempts = CLOSE_READ_ATTEMPTS,
                     what,
                     detail,
-                    "node-local provider fault on close-time read - retrying"
+                    "node-local provider fault on pinned chain read - retrying"
                 );
+                EpochMetrics::record_provider_fault_retry(what);
                 attempt += 1;
                 tokio::time::sleep(CLOSE_READ_RETRY_BACKOFF).await;
             }
             other => return other,
         }
-    }
-}
-
-/// Apply a worker's [`WorkerFeeConfig`] to compute its next-epoch base fee.
-///
-/// `Eip1559 { target_gas }` nudges the fee toward the gas target via
-/// [`compute_next_base_fee_eip1559`] (floored at `MIN_PROTOCOL_BASE_FEE`); `Static { fee }` pins
-/// the fee to the governance-set value, ignoring gas usage.
-///
-/// This is the ONE fee formula: [`adjust_base_fees`] applies it at a live epoch close and
-/// `fold_next_epoch_base_fees` (in the parent module) applies it when deriving the entered
-/// epoch's fees from the previous epoch's chain state, so both seams produce identical values
-/// from identical inputs.
-pub(crate) fn next_base_fee_for_config(
-    config: WorkerFeeConfig,
-    current_base_fee: u64,
-    gas_used: u64,
-) -> u64 {
-    match config {
-        WorkerFeeConfig::Eip1559 { target_gas } => {
-            compute_next_base_fee_eip1559(current_base_fee, gas_used, target_gas)
-        }
-        WorkerFeeConfig::Static { fee } => fee,
     }
 }
 
@@ -898,60 +988,25 @@ fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manager::{derive_base_fees_for_entered_epoch, sync_num_workers_from_chain};
+    use rand::{rngs::StdRng, SeedableRng as _};
     use std::{cell::Cell, sync::Arc};
     use tempfile::TempDir;
     use tn_config::WORKER_CONFIGS_ADDRESS;
     use tn_reth::{
-        payload::TNPayload, system_calls::CONSENSUS_REGISTRY_ADDRESS,
-        test_utils::test_genesis_with_consensus_registry, NewCanonicalChain, RethChainSpec,
+        payload::TNPayload,
+        system_calls::CONSENSUS_REGISTRY_ADDRESS,
+        test_utils::{
+            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
+            read_worker_config_entries_at, test_genesis_with_consensus_registry,
+            test_genesis_with_consensus_registry_and_workers, TransactionFactory,
+        },
+        RethChainSpec,
     };
     use tn_types::{
-        BlsSignature, Certificate, CommittedSubDag, ConsensusHeader, ReputationScores,
-        SignatureVerificationState, MIN_PROTOCOL_BASE_FEE,
+        gas_accumulator::WorkerFeeConfig, Address, GenesisAccount, WorkerId, B256,
+        MIN_PROTOCOL_BASE_FEE, U256,
     };
-
-    #[test]
-    fn eip1559_config_with_max_target_is_inert_at_min() {
-        // Genesis/default strategy: Eip1559 { target_gas: u64::MAX }. Against an unreachable target
-        // the fee can only ratchet down and floors at MIN, so a worker at MIN stays at MIN
-        // regardless of gas used -- the inert guarantee that keeps existing chains unchanged.
-        let cfg = WorkerFeeConfig::Eip1559 { target_gas: u64::MAX };
-        assert_eq!(
-            next_base_fee_for_config(cfg, MIN_PROTOCOL_BASE_FEE, 5_000_000),
-            MIN_PROTOCOL_BASE_FEE
-        );
-        // a non-MIN fee ratchets down (and never below MIN)
-        let down = next_base_fee_for_config(cfg, MIN_PROTOCOL_BASE_FEE * 1000, 0);
-        assert!((MIN_PROTOCOL_BASE_FEE..MIN_PROTOCOL_BASE_FEE * 1000).contains(&down));
-    }
-
-    #[test]
-    fn eip1559_config_moves_fee_with_gas_vs_target() {
-        let target = 1_000_000u64;
-        let current = 1_000_000u64;
-        let cfg = WorkerFeeConfig::Eip1559 { target_gas: target };
-        // gas above target -> fee increases; below -> decreases; at target -> unchanged.
-        assert!(next_base_fee_for_config(cfg, current, 2_000_000) > current);
-        assert!(next_base_fee_for_config(cfg, current, 0) < current);
-        assert_eq!(next_base_fee_for_config(cfg, current, target), current);
-    }
-
-    #[test]
-    fn static_config_pins_to_configured_fee() {
-        // Static ignores gas usage and the current fee, always returning the governance-set value.
-        assert_eq!(
-            next_base_fee_for_config(
-                WorkerFeeConfig::Static { fee: 12_345 },
-                MIN_PROTOCOL_BASE_FEE,
-                999_999
-            ),
-            12_345
-        );
-        assert_eq!(
-            next_base_fee_for_config(WorkerFeeConfig::Static { fee: 500 }, 1_000_000, 0),
-            500
-        );
-    }
 
     #[tokio::test(start_paused = true)]
     async fn retry_provider_faults_halts_after_exhausting_attempts() {
@@ -961,7 +1016,7 @@ mod tests {
         let calls = Cell::new(0u32);
         let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            Err(StateReadError::Provider("mdbx i/o fault".into()))
+            ready(Err(StateReadError::Provider("mdbx i/o fault".into())))
         })
         .await;
 
@@ -976,11 +1031,11 @@ mod tests {
         let calls = Cell::new(0u32);
         let res = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            if calls.get() == 1 {
+            ready(if calls.get() == 1 {
                 Err(StateReadError::Provider("transient i/o fault".into()))
             } else {
                 Ok(7u64)
-            }
+            })
         })
         .await;
 
@@ -995,7 +1050,7 @@ mod tests {
         let calls = Cell::new(0u32);
         let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
             calls.set(calls.get() + 1);
-            Err(StateReadError::ChainGlobal("contract absent".into()))
+            ready(Err(StateReadError::ChainGlobal("contract absent".into())))
         })
         .await;
 
@@ -1003,56 +1058,19 @@ mod tests {
         assert_eq!(calls.get(), 1, "chain-global failures are never retried");
     }
 
-    /// Drive ONE epoch-closing block on `reth_env` (parent = genesis) outside the full engine:
-    /// build the block from a boundary [`ConsensusOutput`] (its payload runs `concludeEpoch`),
-    /// commit it as the canonical head, and finalize it. Afterwards the canonical tip IS an
-    /// epoch-0 closing block, so the close-time identity (`tip + 1 == entered blockHeight`)
-    /// holds for `adjust_base_fees`. Mirrors tn-reth's `execute_payload_and_update_canonical_chain`
-    /// test helper via the public [`RethEnv`] surface.
-    fn execute_epoch_closing_block(
-        reth_env: &RethEnv,
-        chain: &Arc<RethChainSpec>,
-    ) -> eyre::Result<()> {
-        let mut leader = Certificate::default();
-        leader.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
-            BlsSignature::default(),
-        ));
-        leader.update_header_created_at_for_test(tn_types::now());
-        leader.update_header_round_for_test(2);
-        let sub_dag = CommittedSubDag::new(
-            vec![Certificate::default(), leader.clone()],
-            leader,
-            1,
-            ReputationScores::default(),
-            None,
-        );
-        let output = ConsensusOutput::new_closed_with_subdag(
-            sub_dag,
-            ConsensusHeader::default().digest(),
-            1,
-        );
-
-        let parent = chain.sealed_genesis_header();
-        let payload = TNPayload::new_for_test(parent.clone(), &output);
-        let block =
-            reth_env.build_block_from_batch_payload(payload, &Vec::new(), parent.hash(), &[])?;
-        let header = block.recovered_block.clone_sealed_header();
-        let canonical_state = reth_env.canonical_in_memory_state();
-        canonical_state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
-        canonical_state.set_canonical_head(header.clone());
-        reth_env.finish_executing_output(vec![block], None)?;
-        reth_env.finalize_block(header)?;
-        Ok(())
-    }
-
-    /// Keep-current arm (first coverage of the close-time fail-open): a
-    /// CHAIN-GLOBAL config-read failure (WorkerConfigs contract absent, the alloc-stripped-genesis
-    /// trick) at a REAL closing block returns `Ok` and keeps the per-worker base fees, the worker
-    /// count, and the accumulated gas untouched. The identity read PASSES here (registry
-    /// present, `concludeEpoch` ran in the tip), isolating the failure to the config read's
-    /// fail-open arm.
+    /// Keep-current arm of the close-time fail-open: a CHAIN-GLOBAL config-read failure
+    /// (WorkerConfigs contract absent, the alloc-stripped-genesis trick) returns `Ok` and keeps
+    /// the per-worker base fees, the worker count, and the accumulated gas untouched.
+    ///
+    /// Calls the inner [`apply_close_time_fee_updates`] at a genesis tip rather than the outer
+    /// [`adjust_base_fees`] behind a real closing block: the closing block now records the same
+    /// fees on-chain and is FATAL when `WorkerConfigs` is unreadable, so this fixture (which
+    /// exists precisely to make that contract unreadable) can no longer produce one. Pinning the
+    /// inner function keeps the coverage that matters — the fail-open arm still preserves fees
+    /// and count — and it is also the shape a node whose tip predates this feature hits, where
+    /// the closing block carries no recorded fees at all.
     #[tokio::test]
-    async fn adjust_base_fees_keeps_fees_and_count_on_read_failure() -> eyre::Result<()> {
+    async fn close_time_fee_updates_keep_fees_and_count_on_read_failure() -> eyre::Result<()> {
         // registry genesis WITHOUT the WorkerConfigs account: the config read is guaranteed to
         // fail chain-globally (call to codeless address succeeds with empty data -> decode fails)
         let mut genesis = test_genesis_with_consensus_registry(4);
@@ -1062,13 +1080,7 @@ mod tests {
         let task_manager = TaskManager::new("adjust fees fail open");
         let reth_env =
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
-
-        // close epoch 0 so the canonical tip is a closing block and the identity gate passes
-        execute_epoch_closing_block(&reth_env, &chain)?;
         let tip = reth_env.canonical_tip();
-        let (entered_epoch, epoch_info) = reth_env.get_current_epoch_info_at_header(&tip)?;
-        assert_eq!(entered_epoch, 1, "registry state crossed to the entered epoch");
-        assert_eq!(tip.number + 1, epoch_info.blockHeight, "close-time identity holds at the tip");
 
         // non-default fees, gas, and count on the accumulator
         let acc = GasAccumulator::new(2);
@@ -1078,7 +1090,7 @@ mod tests {
         acc.inc_block(1, 2_000_000, 30_000_000);
 
         // chain-global failure -> keep-current fail-open: Ok, everything untouched
-        adjust_base_fees(&reth_env, &acc).await?;
+        apply_close_time_fee_updates(&reth_env, &acc, &tip).await?;
 
         assert_eq!(acc.num_workers(), 2, "worker count unchanged");
         assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
@@ -1116,6 +1128,328 @@ mod tests {
         assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
         assert_eq!(acc.base_fee(1).base_fee(), 9_099, "worker 1 fee unchanged");
         assert_eq!(acc.get_values(0), (1, 1_000_000, 30_000_000), "worker 0 gas unchanged");
+
+        Ok(())
+    }
+
+    /// Identity-violation arm: with the registry present but NO closing block executed, the
+    /// canonical tip is genesis and the identity read succeeds with epoch 0's record
+    /// (`blockHeight` 0), so `tip + 1 != blockHeight` and the guard halts the close with the
+    /// descriptive error instead of pricing base fees off a non-closing block.
+    #[tokio::test]
+    async fn adjust_base_fees_errors_when_tip_is_not_a_closing_block() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("adjust_fees_identity_violation")?;
+        let task_manager = TaskManager::new("adjust fees identity violation");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(4_242);
+
+        let err = adjust_base_fees(&reth_env, &acc)
+            .await
+            .expect_err("non-closing tip must violate the close-time identity");
+        assert!(
+            err.to_string().contains("close-time base-fee identity violated"),
+            "unexpected error: {err}"
+        );
+
+        // the guard trips before the config read, so fees stay untouched
+        assert_eq!(acc.base_fee(0).base_fee(), 4_242, "worker 0 fee unchanged");
+
+        Ok(())
+    }
+
+    /// Build one worker block on `parent` carrying `base_fee` and `txs`, execute it (running
+    /// the epoch-closing system calls when `output` is flagged), commit it as the canonical +
+    /// finalized tip, and mirror the engine's post-execution accounting by folding the executed
+    /// header's gas into `acc`.
+    ///
+    /// The `inc_block` AFTER execution is the production ordering (`tn_engine`'s
+    /// payload builder): for an epoch-closing block it means the closing system calls read the
+    /// accumulator WITHOUT this block's own gas — the executor folds that gas in itself.
+    fn execute_worker_block(
+        reth_env: &RethEnv,
+        acc: &GasAccumulator,
+        parent: SealedHeader,
+        output: &ConsensusOutput,
+        base_fee: u64,
+        worker_id: WorkerId,
+        txs: Vec<Vec<u8>>,
+    ) -> eyre::Result<SealedHeader> {
+        let gas_limit = parent.gas_limit;
+        let payload = TNPayload::new(
+            parent,
+            Address::random(),
+            0,
+            B256::random(),
+            output,
+            B256::ZERO,
+            base_fee,
+            gas_limit,
+            B256::random(),
+            worker_id,
+        );
+        let block = execute_payload_and_update_canonical_chain(reth_env, payload, txs)?;
+        let header = block.recovered_block.clone_sealed_header();
+        acc.inc_block(worker_id, header.gas_used, header.gas_limit);
+        Ok(header)
+    }
+
+    /// CROSS-LAYER CAPSTONE: the three production computations of a worker's next-epoch base
+    /// fee agree bit-identically at every epoch close:
+    ///
+    ///  (a) the on-chain `WorkerConfigs.data` word the closing block's 4th system call records
+    ///      (`record_next_epoch_base_fees` in `tn-reth`), read back at the closing block's
+    ///      state through the production decode seam;
+    ///  (b) the epoch-entry derivation every node runs ([`derive_base_fees_for_entered_epoch`]);
+    ///  (c) the live producer's close-time accumulator update ([`adjust_base_fees`]);
+    ///
+    /// each pinned against an independent [`next_base_fee_for_config`] oracle computed from raw
+    /// header gas and the epoch's entry fee. This equality is a consensus invariant: the batch
+    /// validator snapshots one entry fee per epoch and compares for EXACT equality, so a
+    /// one-wei divergence between any two of these seams rejects every peer batch for a whole
+    /// epoch — and replacing (b) with a read of (a) is only safe while all three agree.
+    ///
+    /// Drives TWO real epoch closes over one chain (worker 0 `Eip1559 { target_gas: 1M }`,
+    /// worker 1 `Static` — a mixed strategy set), with genuine per-worker user-tx gas and real
+    /// transfers in BOTH closing blocks so the closing block's own-gas fold-in is exercised at
+    /// each boundary. Fixture guards pin that the eip1559 fee moves away from MIN, from the
+    /// epoch's entry fee, AND from the value computed without the closing block's own gas — a
+    /// wrong fee source, a dropped total, or an off-by-one-block gas fold all fail loudly.
+    ///
+    /// Epoch 0 runs at a preloaded `START_FEE` (accumulator slot and epoch-0 block headers
+    /// carry the same value — the input-consistency production guarantees by pricing batches
+    /// from the accumulator), standing in for any epoch N with a real fee so the ±12.5% moves
+    /// are exercised at full scale rather than degenerating to MIN±1. The second boundary is
+    /// fully organic: epoch 1 runs at the fee the FIRST close wrote on-chain, so boundary 2
+    /// starts from a written fee, not genesis defaults.
+    #[tokio::test]
+    async fn close_record_adjust_and_entry_derivation_agree_across_boundaries() -> eyre::Result<()>
+    {
+        const TARGET_GAS: u64 = 1_000_000;
+        const START_FEE: u64 = 1_000_000;
+        const STATIC_FEE: u64 = 12_345;
+        const TX_GAS_PRICE: u128 = 2_000_000;
+        let cfg0 = WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS };
+
+        // fund an EOA so every epoch (and both closing blocks) carries real user-tx gas
+        let mut sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(913));
+        let genesis = test_genesis_with_consensus_registry_and_workers(
+            4,
+            vec![(0u8, TARGET_GAS), (1u8, STATIC_FEE)],
+        )
+        .extend_accounts([(
+            sender.address(),
+            GenesisAccount::default().with_balance(U256::from(1_000_000_000_000_000_000_u64)),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("cross_layer_fee_agreement")?;
+        let task_manager = TaskManager::new("cross layer fee agreement");
+        let recipient = Address::repeat_byte(0xab);
+        let mut transfer = |chain: &Arc<RethChainSpec>| {
+            sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                TX_GAS_PRICE,
+                Some(recipient),
+                U256::from(1),
+                Default::default(),
+            )
+        };
+
+        // the LIVE accumulator, shared with the block executor (wired into the EVM config so
+        // the closing block's record reads exactly this state)
+        let acc = GasAccumulator::new(1);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // epoch-0 entry: size the accumulator from genesis WorkerConfigs state (the production
+        // epoch-0 entry seam), then preload worker 0's stand-in entry fee; worker 1 keeps MIN
+        sync_num_workers_from_chain(&reth_env, &acc, 0)?;
+        assert_eq!(acc.num_workers(), 2, "accumulator sized from the on-chain worker count");
+        acc.base_fee(0).set_base_fee(START_FEE);
+
+        // ceremony genesis deploys WorkerConfigs with every data word unwritten
+        let (_, entries) =
+            read_worker_config_entries_at(&reth_env, chain.sealed_genesis_header().hash())?;
+        assert!(entries[0].data.is_zero(), "no close has recorded a fee yet");
+        assert!(entries[1].data.is_zero(), "no close has recorded a fee yet");
+
+        // ----- epoch 0: worker 0 produces (fee START_FEE), worker 1 produces (fee MIN) -----
+        let out1 = consensus_output_for_tests(1, 0, 1, false);
+        let h1 = execute_worker_block(
+            &reth_env,
+            &acc,
+            chain.sealed_genesis_header(),
+            &out1,
+            START_FEE,
+            0,
+            vec![transfer(&chain), transfer(&chain)],
+        )?;
+        assert!(h1.gas_used > 0, "worker 0's epoch-0 block must carry real gas");
+
+        let out2 = consensus_output_for_tests(2, 0, 2, false);
+        let h2 = execute_worker_block(
+            &reth_env,
+            &acc,
+            h1.clone(),
+            &out2,
+            MIN_PROTOCOL_BASE_FEE,
+            1,
+            vec![transfer(&chain)],
+        )?;
+        assert!(h2.gas_used > 0, "worker 1's epoch-0 block must carry real gas");
+
+        // the closing block: worker 0, epoch-close flagged, with real transfers riding it
+        let out3 = consensus_output_for_tests(3, 0, 3, true);
+        let h3 = execute_worker_block(
+            &reth_env,
+            &acc,
+            h2.clone(),
+            &out3,
+            START_FEE,
+            0,
+            vec![transfer(&chain), transfer(&chain)],
+        )?;
+        assert!(h3.gas_used > 0, "the closing block must carry its own user-tx gas");
+        assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 closed");
+
+        // independent oracle for boundary 1: the ONE formula over the entry fee and the
+        // epoch's total worker-0 gas INCLUDING the closing block's own
+        let epoch0_gas_w0 = h1.gas_used + h3.gas_used;
+        let oracle_1 = next_base_fee_for_config(cfg0, START_FEE, epoch0_gas_w0);
+        // fixture guards: the value discriminates a MIN write, a no-op write, and a total
+        // that dropped the closing block's own gas
+        assert_ne!(oracle_1, MIN_PROTOCOL_BASE_FEE, "fixture: fee must move off MIN");
+        assert_ne!(oracle_1, START_FEE, "fixture: fee must move off the entry fee");
+        assert_ne!(
+            oracle_1,
+            next_base_fee_for_config(cfg0, START_FEE, h1.gas_used),
+            "fixture: the closing block's own gas must change the priced fee",
+        );
+
+        // live totals at the close (before clear): also the scan-equivalence reference
+        let (_, live_gas_w0, _) = acc.get_values(0);
+        let (_, live_gas_w1, _) = acc.get_values(1);
+        assert_eq!(live_gas_w0, epoch0_gas_w0, "inc_block total = header gas total");
+        assert_eq!(live_gas_w1, h2.gas_used);
+
+        // (c) the live producer's close-time update over the shared accumulator
+        adjust_base_fees(&reth_env, &acc).await?;
+        let close_time_w0 = acc.base_fee(0).base_fee();
+        let close_time_w1 = acc.base_fee(1).base_fee();
+
+        // (a) the on-chain record at the closing block's state
+        let (num_workers, entries) = read_worker_config_entries_at(&reth_env, h3.hash())?;
+        assert_eq!(num_workers, 2);
+        assert_eq!(entries[0].config, cfg0, "strategy survives the data write");
+        assert_eq!(entries[1].config, WorkerFeeConfig::Static { fee: STATIC_FEE });
+        assert!(entries[1].data.is_zero(), "a static worker's data word is never written");
+        let recorded_w0 = entries[0].data.to::<u64>();
+
+        // (b) the epoch-entry derivation every node runs, pinned to the same closing block
+        let derived_1 = derive_base_fees_for_entered_epoch(&reth_env, 1, &h3)?;
+        assert_eq!(derived_1.num_workers, 2);
+        // header scan ≡ the live accumulator's inc_block totals for the closed epoch
+        assert_eq!(derived_1.gas_totals.get(&0).copied().unwrap_or_default(), live_gas_w0);
+        assert_eq!(derived_1.gas_totals.get(&1).copied().unwrap_or_default(), live_gas_w1);
+
+        // THE EQUALITY at boundary 1: (a) == (b) == (c) == oracle, per worker
+        assert_eq!(recorded_w0, oracle_1, "(a) on-chain record != oracle");
+        assert_eq!(derived_1.fees[0], Some(oracle_1), "(b) entry derivation != oracle");
+        assert_eq!(close_time_w0, oracle_1, "(c) close-time accumulator != oracle");
+        assert_eq!(derived_1.fees[1], Some(STATIC_FEE), "(b) static worker != configured fee");
+        assert_eq!(close_time_w1, STATIC_FEE, "(c) static worker != configured fee");
+
+        // enter epoch 1 exactly as production: clear the epoch's gas, then derive+apply —
+        // which must rewrite the very fees the close-time update left in place
+        acc.clear();
+        derived_1.apply(&acc);
+        assert_eq!(acc.base_fee(0).base_fee(), oracle_1, "entry apply rewrites the close value");
+        assert_eq!(acc.base_fee(1).base_fee(), STATIC_FEE);
+
+        // ----- epoch 1: runs at the fee the first close WROTE (not genesis defaults) -----
+        let fee_epoch1 = acc.base_fee(0).base_fee();
+        let out4 = consensus_output_for_tests(1, 1, 4, false);
+        let h4 = execute_worker_block(
+            &reth_env,
+            &acc,
+            h3.clone(),
+            &out4,
+            fee_epoch1,
+            0,
+            vec![transfer(&chain), transfer(&chain)],
+        )?;
+        assert!(h4.gas_used > 0);
+
+        let out5 = consensus_output_for_tests(2, 1, 5, false);
+        let h5 = execute_worker_block(
+            &reth_env,
+            &acc,
+            h4.clone(),
+            &out5,
+            STATIC_FEE,
+            1,
+            vec![transfer(&chain)],
+        )?;
+        assert!(h5.gas_used > 0);
+
+        // epoch 1's closing block, again carrying real user-tx gas of its own
+        let out6 = consensus_output_for_tests(3, 1, 6, true);
+        let h6 = execute_worker_block(
+            &reth_env,
+            &acc,
+            h5.clone(),
+            &out6,
+            fee_epoch1,
+            0,
+            vec![transfer(&chain), transfer(&chain)],
+        )?;
+        assert!(h6.gas_used > 0, "the second closing block must carry its own user-tx gas");
+        assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 2, "epoch 1 closed");
+
+        // independent oracle for boundary 2, folded from the WRITTEN boundary-1 fee
+        let epoch1_gas_w0 = h4.gas_used + h6.gas_used;
+        let oracle_2 = next_base_fee_for_config(cfg0, oracle_1, epoch1_gas_w0);
+        assert_ne!(oracle_2, oracle_1, "fixture: the second boundary must move the fee again");
+        assert_ne!(oracle_2, MIN_PROTOCOL_BASE_FEE);
+        assert_ne!(
+            oracle_2,
+            next_base_fee_for_config(cfg0, oracle_1, h4.gas_used),
+            "fixture: the second closing block's own gas must change the priced fee",
+        );
+
+        let (_, live_gas_w0_e1, _) = acc.get_values(0);
+        let (_, live_gas_w1_e1, _) = acc.get_values(1);
+        assert_eq!(live_gas_w0_e1, epoch1_gas_w0);
+        assert_eq!(live_gas_w1_e1, h5.gas_used);
+
+        // (c) at boundary 2
+        adjust_base_fees(&reth_env, &acc).await?;
+
+        // (a) at boundary 2
+        let (num_workers, entries) = read_worker_config_entries_at(&reth_env, h6.hash())?;
+        assert_eq!(num_workers, 2);
+        assert!(entries[1].data.is_zero(), "static worker still never written");
+
+        // (b) at boundary 2
+        let derived_2 = derive_base_fees_for_entered_epoch(&reth_env, 2, &h6)?;
+        assert_eq!(derived_2.num_workers, 2);
+        assert_eq!(derived_2.gas_totals.get(&0).copied().unwrap_or_default(), epoch1_gas_w0);
+        assert_eq!(derived_2.gas_totals.get(&1).copied().unwrap_or_default(), h5.gas_used);
+
+        // THE EQUALITY at boundary 2 — starting from a written fee, not genesis defaults
+        assert_eq!(entries[0].data.to::<u64>(), oracle_2, "(a) on-chain record != oracle");
+        assert_eq!(derived_2.fees[0], Some(oracle_2), "(b) entry derivation != oracle");
+        assert_eq!(acc.base_fee(0).base_fee(), oracle_2, "(c) close-time accumulator != oracle");
+        assert_eq!(derived_2.fees[1], Some(STATIC_FEE));
+        assert_eq!(acc.base_fee(1).base_fee(), STATIC_FEE);
 
         Ok(())
     }

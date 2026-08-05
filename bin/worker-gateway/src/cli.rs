@@ -99,6 +99,40 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_MAX_CONNECTIONS", default_value = "500")]
     pub(crate) max_connections: NonZeroUsize,
 
+    /// Transport-stall deadline for inbound connections (`TCP_USER_TIMEOUT`):
+    /// a connection whose peer leaves written response data unacknowledged, or
+    /// its receive window closed, for this long is forcibly closed by the
+    /// kernel. This kills a fully stalled reader at the transport layer, at a
+    /// cost: the option replaces the kernel's default retransmit budget
+    /// (typically ~15min via `tcp_retries2`), so a peer whose path stays
+    /// black-holed past the deadline is dropped where stock TCP might have
+    /// recovered. Linux-family kernels only; elsewhere only
+    /// `--max-connection-duration` bounds a stalled reader. `0` disables.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_TCP_USER_TIMEOUT",
+        default_value = "30s",
+        value_parser = humantime::parse_duration
+    )]
+    pub(crate) tcp_user_timeout: Duration,
+
+    /// Hard cap on a single inbound connection's total lifetime, keep-alive
+    /// sessions included. The cap fires independent of connection progress, so
+    /// it also bounds a client that trickles reads slowly enough to keep the
+    /// transport-stall guard from firing. The close is abrupt: an exchange
+    /// still in flight when a long-lived keep-alive session hits the cap is
+    /// cut off mid-stream, so size the cap well above the longest legitimate
+    /// transfer. Must be at least the gateway's own single-request bound
+    /// (`--header-read-timeout` plus the whole-request deadline) so the first
+    /// request on a connection can never be cut off. `0` disables.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_MAX_CONNECTION_DURATION",
+        default_value = "10m",
+        value_parser = humantime::parse_duration
+    )]
+    pub(crate) max_connection_duration: Duration,
+
     /// Maximum request body the gateway will accept, in bytes. Requests whose
     /// body exceeds this are rejected with a JSON-RPC "request too large" error
     /// before being forwarded.
@@ -171,6 +205,12 @@ pub(crate) struct Settings {
     pub(crate) header_read_timeout: Duration,
     /// Maximum concurrently-open inbound connections.
     pub(crate) max_connections: NonZeroUsize,
+    /// Transport-stall deadline (`TCP_USER_TIMEOUT`) for inbound connections,
+    /// or `None` when disabled.
+    pub(crate) tcp_user_timeout: Option<Duration>,
+    /// Hard cap on a single inbound connection's total lifetime, or `None`
+    /// when uncapped.
+    pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
     /// Per-client-IP rate limit, or `None` when disabled.
@@ -196,6 +236,28 @@ impl Cli {
             ensure_not_gateway(self.listen_addr, &upstream.rpc_url)?;
             ensure_not_gateway(self.listen_addr, &upstream.readiness_url)
         })?;
+        let max_connection_duration = resolve_optional_duration(self.max_connection_duration);
+        // The longest a single request stays live from the gateway's own point
+        // of view: up to `header_read_timeout` reading the head before the
+        // service's whole-request deadline (see [`crate::app`]) is even armed,
+        // plus that deadline itself. A connection cap below this bound could
+        // cut off a request the gateway still considers live, so reject the
+        // combination at startup.
+        let single_request_bound = self
+            .header_read_timeout
+            .saturating_add(self.upstream_request_timeout.saturating_add(self.header_read_timeout));
+        max_connection_duration.map_or(Ok(()), |cap| {
+            eyre::ensure!(
+                cap >= single_request_bound,
+                "--max-connection-duration ({}) is shorter than the gateway's own \
+                 single-request bound (--header-read-timeout plus the whole-request deadline \
+                 --upstream-request-timeout + --header-read-timeout = {}); raise the cap or \
+                 set it to 0 to disable it",
+                humantime::format_duration(cap),
+                humantime::format_duration(single_request_bound),
+            );
+            Ok(())
+        })?;
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -205,6 +267,8 @@ impl Cli {
             upstream_request_timeout: self.upstream_request_timeout,
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
+            tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
+            max_connection_duration,
             max_request_bytes: self.max_request_bytes,
             rate_limit_per_ip: resolve_rate_limit(
                 self.rate_limit_per_ip,
@@ -242,6 +306,12 @@ impl Cli {
             }
         }
     }
+}
+
+/// Turn a duration flag into `Some(duration)`, or `None` when zero (the
+/// flag's disabled sentinel, mirroring the `0`-disables rate-limit flags).
+fn resolve_optional_duration(value: Duration) -> Option<Duration> {
+    (!value.is_zero()).then_some(value)
 }
 
 /// Turn a `(rate, burst)` flag pair into a [`RateLimit`], or `None` when the
@@ -334,6 +404,60 @@ mod tests {
         .into_settings()?;
         assert_eq!(settings.upstreams.len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn zero_disables_write_path_guards() -> eyre::Result<()> {
+        let settings = Cli::parse_from([
+            "worker-gateway",
+            "--upstream-rpc-url=http://127.0.0.1:8544",
+            "--upstream-readiness-url=http://127.0.0.1:8551/health/workers",
+            "--tcp-user-timeout=0s",
+            "--max-connection-duration=0",
+        ])
+        .into_settings()?;
+        assert_eq!(settings.tcp_user_timeout, None);
+        assert_eq!(settings.max_connection_duration, None);
+        Ok(())
+    }
+
+    #[test]
+    fn write_path_guards_default_on() -> eyre::Result<()> {
+        let settings = cli_with(
+            None,
+            Some("http://127.0.0.1:8544"),
+            Some("http://127.0.0.1:8551/health/workers"),
+        )
+        .into_settings()?;
+        assert_eq!(settings.tcp_user_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(settings.max_connection_duration, Some(Duration::from_secs(600)));
+        Ok(())
+    }
+
+    #[test]
+    fn connection_cap_below_request_deadline_is_rejected() {
+        // Default single-request bound is 10s (header phase) + 30s + 10s
+        // (whole-request deadline) = 50s; a cap of the bare whole-request
+        // deadline (40s) could still cut off a request whose headers took the
+        // full header window to arrive.
+        let result = Cli::parse_from([
+            "worker-gateway",
+            "--upstream-rpc-url=http://127.0.0.1:8544",
+            "--upstream-readiness-url=http://127.0.0.1:8551/health/workers",
+            "--max-connection-duration=40s",
+        ])
+        .into_settings();
+        assert!(result.is_err(), "a cap below the single-request bound must be a startup error");
+
+        // The boundary itself is accepted.
+        let boundary = Cli::parse_from([
+            "worker-gateway",
+            "--upstream-rpc-url=http://127.0.0.1:8544",
+            "--upstream-readiness-url=http://127.0.0.1:8551/health/workers",
+            "--max-connection-duration=50s",
+        ])
+        .into_settings();
+        assert!(boundary.is_ok(), "a cap equal to the single-request bound must be accepted");
     }
 
     #[test]

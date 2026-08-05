@@ -6,9 +6,9 @@ use std::{path::Path, str::FromStr, sync::Arc};
 use telcoin_network_cli::{node::NodeCommand, NoArgs};
 use tn_config::Config;
 use tn_node::engine::{ExecutionNode, TnBuilder};
-use tn_reth::{RethChainSpec, RethCommand, RethConfig, RethEnv};
+use tn_reth::{init_txpool_defaults, RethChainSpec, RethCommand, RethConfig, RethEnv};
 use tn_types::{
-    gas_accumulator::RewardsCounter, Address, TaskManager, TimestampSec, Withdrawals, B256,
+    gas_accumulator::GasAccumulator, Address, TaskManager, TimestampSec, Withdrawals, B256,
 };
 
 /// Convenience type for testing Execution Node.
@@ -23,7 +23,7 @@ pub fn default_test_execution_node(
     opt_chain: Option<Arc<RethChainSpec>>,
     opt_address: Option<Address>,
     tmp_dir: &Path,
-    rewards: Option<RewardsCounter>,
+    rewards: Option<GasAccumulator>,
 ) -> eyre::Result<TestExecutionNode> {
     let (builder, _) = execution_builder::<NoArgs>(
         opt_chain.clone(),
@@ -64,7 +64,9 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         default_args.to_vec()
     };
 
-    // use same approach as telcoin-network binary
+    // use same approach as telcoin-network binary, including seeding reth's pool defaults before
+    // the parse resolves `--txpool.max-account-slots`
+    init_txpool_defaults();
     let command = NodeCommand::<CliExt>::try_parse_from(cli_args)?;
 
     let NodeCommand { instance, ext, reth, healthcheck, .. } = command;
@@ -90,8 +92,15 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         RethConfig::new(reth_command, instance, tmp_dir, true, Arc::new(tn_config.chain_spec()));
     // create engine node
     let reth_db = RethEnv::new_database(&node_config, tmp_dir.join("db"))?;
-    let builder =
-        TnBuilder { node_config, tn_config, metrics: None, healthcheck, reth_db, exex_fns: vec![] };
+    let builder = TnBuilder {
+        node_config,
+        tn_config,
+        metrics: None,
+        healthcheck,
+        enable_state_export: false,
+        reth_db,
+        exex_fns: vec![],
+    };
 
     Ok((builder, ext))
 }
