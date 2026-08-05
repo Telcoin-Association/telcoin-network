@@ -561,6 +561,7 @@ async fn test_empty_close_epoch_unknown_leader_fail_stops() -> eyre::Result<()> 
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         subdag,
@@ -675,6 +676,7 @@ async fn test_empty_close_epoch_without_committee_fail_stops() -> eyre::Result<(
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         subdag,

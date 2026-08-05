@@ -533,6 +533,14 @@ fn restore_consensus_and_records(
         // final consensus header before declaring success.
         let tip = pack.latest_consensus_header().await;
         drop(pack);
+        // Read-back failure and tip mismatch are different diagnoses and get different messages: a
+        // mismatch means the bundle rebuilt into the wrong chain, whereas an `Err` means the pack
+        // could not be read at all. Both roll the epoch dir back, matching the import error path
+        // above, since this restore wrote that directory itself and owns the cleanup.
+        let tip = tip.map_err(|e| {
+            let _ = fs::remove_dir_all(&epoch_dir);
+            eyre!("failed to read back the rebuilt consensus pack tip for epoch {n}: {e}")
+        })?;
         let tip_ok = matches!(
             &tip,
             Some(header)

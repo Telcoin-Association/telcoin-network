@@ -1315,10 +1315,17 @@ where
         // `parent_beacon_block_root` (hash) via `last_executed_consensus_block` — the
         // slot-hint-immune signal — and hand both to `check_restore_consistency`, which
         // decides whether the pair is coherent.
+        //
+        // The `?` is load-bearing: `last_executed_consensus_block` distinguishes a legitimately
+        // absent header (`Ok(None)`) from a failed storage lookup (`Err`), and only the former may
+        // reach the guard. Collapsing a read failure into `None` would make this abort with the
+        // "incomplete state restore" diagnosis below, which tells the operator to delete their
+        // chain-data directories and re-import — catastrophic advice for a datadir that is
+        // actually intact.
         let tip = self.consensus_bus.recent_blocks().borrow().latest_execution_block();
         let producing_header =
             state_sync::last_executed_consensus_block(&self.consensus_bus, &self.consensus_chain)
-                .await;
+                .await?;
         check_restore_consistency(&tip, producing_header.as_ref())?;
 
         Ok(())
@@ -1357,7 +1364,9 @@ where
 /// `tip` is reth's canonical execution tip (as seeded into `recent_blocks`), and `producing_header`
 /// is the tip's producing consensus header as resolved by
 /// [`last_executed_consensus_block`](state_sync::last_executed_consensus_block) — `None` when the
-/// header is absent from the consensus store.
+/// header is absent from the consensus store. Absent means absent: that lookup surfaces a failed
+/// storage read as an `Err` the caller propagates, so a read failure never arrives here disguised
+/// as `None` and never triggers the destructive remediation advice below.
 ///
 /// Invariant relied on: "execution follows consensus" — `save_consensus_output` persists a block's
 /// producing consensus HEADER to the consensus store BEFORE that block executes. So any healthy
