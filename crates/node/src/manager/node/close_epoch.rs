@@ -44,11 +44,23 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 /// elapsed by the time this wait begins, so the cert is normally present immediately.
 const CERT_WAIT: Duration = Duration::from_secs(90);
 
-/// Remove every `epoch-*.tmp` directory under the exports root — orphaned temp export dirs left by
-/// a crashed or interrupted prior run. Called ONCE at node startup, where it is safe because no
-/// export is in flight; the per-boundary path deliberately clears only its own epoch's temp so it
-/// can never delete another epoch's still-in-flight export working dir. Final `epoch-{N}` dirs have
-/// no extension, so they are never swept.
+/// True iff `name` is exactly the temp-dir name the export path writes for some epoch, i.e.
+/// `epoch-{N}.tmp` where `{N}` is a canonical (no sign, no leading zeros) [`Epoch`] rendering.
+/// [`sweep_stale_tmp_exports`] deletes only matches; anything else in the exports root was not
+/// written by the exporter and is not ours to remove.
+fn is_stale_tmp_export_name(name: &str) -> bool {
+    name.strip_prefix("epoch-").and_then(|rest| rest.strip_suffix(".tmp")).is_some_and(|digits| {
+        digits.parse::<Epoch>().is_ok_and(|epoch| epoch.to_string() == digits)
+    })
+}
+
+/// Remove every `epoch-{N}.tmp` directory under the exports root: orphaned temp export dirs left
+/// by a crashed or interrupted prior run. That exact shape is the only temp the export path ever
+/// writes, so nothing else is swept: final `epoch-{N}` dirs have no `.tmp` suffix, and stray
+/// entries (operator files or dirs that merely end in `.tmp`) never match. Called ONCE at node
+/// startup, where it is safe because no export is in flight; the per-boundary path deliberately
+/// clears only its own epoch's temp so it can never delete another epoch's still-in-flight export
+/// working dir.
 ///
 /// Best-effort: a missing exports root or a removal failure is logged at warn and otherwise
 /// ignored, since a failure here must never crash the node.
@@ -64,8 +76,14 @@ pub(super) fn sweep_stale_tmp_exports(export_root: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        // `epoch-{N}.tmp` (final dirs are `epoch-{N}` with no extension, so they are never swept).
-        if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
+        // Exactly `epoch-{N}.tmp`, and a directory: the one shape the export path writes (final
+        // dirs are `epoch-{N}` with no `.tmp` suffix, so they never match). The directory check
+        // also keeps stray `*.tmp` regular files off the `remove_dir_all` failure path, which
+        // would otherwise warn on every export-enabled startup without ever removing them.
+        let is_stale_tmp_export =
+            path.file_name().and_then(|name| name.to_str()).is_some_and(is_stale_tmp_export_name)
+                && entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+        if is_stale_tmp_export {
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 warn!(target: "tn::snapshot", path = ?path, error = %e, "failed to remove stale temp export dir");
             }
@@ -74,7 +92,7 @@ pub(super) fn sweep_stale_tmp_exports(export_root: &Path) {
 }
 
 /// Best-effort removal of an export temp dir, logging at warn on failure so a leftover temp is
-/// observable (the next boundary's [`sweep_stale_tmp_exports`] will retry it). Replaces the silent
+/// observable (the next startup's [`sweep_stale_tmp_exports`] will retry it). Replaces the silent
 /// `let _ = remove_dir_all(..)` cleanups on the export completion task's failure/skip paths.
 fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
     match std::fs::remove_dir_all(tmp_dir) {
@@ -788,8 +806,8 @@ mod tests {
 
     #[test]
     fn sweep_removes_only_temp_export_dirs() {
-        // Finding #13: the boundary sweep must clear every `epoch-*.tmp` (this epoch's and orphans
-        // from prior epochs) while leaving completed `epoch-{N}` dirs and unrelated files
+        // Finding #13: the startup sweep must clear every `epoch-{N}.tmp` orphaned by a prior run
+        // while leaving completed `epoch-{N}` dirs and everything the exporter did not write
         // untouched.
         let root = tempfile::tempdir().expect("temp dir");
         let export_root = root.path();
@@ -797,6 +815,13 @@ mod tests {
             std::fs::create_dir_all(export_root.join(name)).expect("mkdir");
         }
         std::fs::write(export_root.join("keep.txt"), b"x").expect("write file");
+        // Not exporter-written: a `.tmp` directory without the `epoch-{N}` stem, a directory whose
+        // epoch is not a canonical `Epoch` rendering, and a regular file that is name-shaped like
+        // a temp export. The sweep must leave all three (the file without even attempting the
+        // `remove_dir_all` that would warn on every export-enabled startup).
+        std::fs::create_dir_all(export_root.join("stray.tmp")).expect("mkdir");
+        std::fs::create_dir_all(export_root.join("epoch-x.tmp")).expect("mkdir");
+        std::fs::write(export_root.join("epoch-7.tmp"), b"x").expect("write file");
 
         sweep_stale_tmp_exports(export_root);
 
@@ -804,6 +829,9 @@ mod tests {
         assert!(!export_root.join("epoch-2.tmp").exists(), "orphaned temp dir must be swept");
         assert!(export_root.join("epoch-5").exists(), "completed export dir must survive");
         assert!(export_root.join("keep.txt").exists(), "unrelated file must survive");
+        assert!(export_root.join("stray.tmp").exists(), "non-epoch `.tmp` dir must survive");
+        assert!(export_root.join("epoch-x.tmp").exists(), "non-numeric `.tmp` dir must survive");
+        assert!(export_root.join("epoch-7.tmp").exists(), "`.tmp` regular file must survive");
 
         // A missing exports root is a no-op (must not panic).
         sweep_stale_tmp_exports(&export_root.join("does-not-exist"));
