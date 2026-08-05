@@ -21,7 +21,7 @@ use crate::{
 };
 use eyre::{eyre, WrapErr as _};
 use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recent_consensus};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, future::ready, sync::Arc};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
@@ -45,6 +45,7 @@ mod close_epoch;
 mod run_epoch;
 mod start_epoch;
 pub use close_epoch::build_epoch_record;
+use run_epoch::retry_provider_faults;
 pub(crate) use run_epoch::RunEpochMode;
 
 /// Name of the process-lifetime [`TaskManager`] that owns tasks outliving any single epoch
@@ -233,11 +234,8 @@ pub async fn catchup_accumulator(
         // Size the accumulator from the on-chain worker count BEFORE the per-worker writes
         // below, reading at the epoch's first block's parent resolved from the SAME pinned
         // epoch state.
-        sync_num_workers_from_chain(
-            &reth_env,
-            gas_accumulator,
-            epoch_state.epoch_info.blockHeight,
-        )?;
+        sync_num_workers_from_chain(&reth_env, gas_accumulator, epoch_state.epoch_info.blockHeight)
+            .await?;
 
         let nonce: u64 = block.nonce.into();
         let (last_executed_epoch, last_executed_round) = deconstruct_nonce(nonce);
@@ -292,30 +290,39 @@ pub async fn catchup_accumulator(
 /// mid-epoch syncing node, and it is immune to mid-epoch `setNumWorkers` writes, which by design
 /// only take effect at the next boundary.
 ///
-/// FAIL-HARD: any read failure (header unresolvable, `WorkerConfigs` contract absent or
-/// unreadable) is an error. Both callers - [`catchup_accumulator`] at startup and the epoch-0
-/// arm of `run_epoch`'s entry seeding - must not proceed on an unverifiable count: per-worker
-/// writes keyed by worker id would land in a wrongly sized accumulator.
+/// READ-FAILURE POLICY: the count keys every per-worker write, so its failure is classified by
+/// [`StateReadError`](tn_reth::error::StateReadError) and BOTH classes halt. There is deliberately
+/// no fail-open arm: both callers — [`catchup_accumulator`] at startup and the epoch-0 arm of
+/// `run_epoch`'s entry seeding — are ENTERING, so they hold no prior count to keep, and proceeding
+/// on an unverifiable one would land worker-id-keyed writes in a wrongly sized accumulator. A
+/// [`Provider`](tn_reth::error::StateReadError::Provider) fault is node-local (peers reading the
+/// same block may succeed), so it is retried briefly first.
 ///
 /// Reading at the closing block also makes the count value-stable for the whole epoch: a
 /// mid-epoch (ModeChange) re-entry re-reads the identical count while the engine may still be
 /// executing leftover output, so the resize is a no-op - the value-stability contract on
 /// [`GasAccumulator::set_num_workers`]. No caller needs to quiesce execution first.
-pub fn sync_num_workers_from_chain(
+pub async fn sync_num_workers_from_chain(
     reth_env: &RethEnv,
     gas_accumulator: &GasAccumulator,
     epoch_first_block: u64,
 ) -> eyre::Result<()> {
     let read_block = epoch_first_block.saturating_sub(1);
+    // The pin is fixed HERE, outside the retry below: `read_block` is derived from the caller's
+    // `epoch_first_block`, not re-sampled per attempt, so every attempt provably resolves the same
+    // header and the retry cannot drift onto a different block.
     let header = reth_env
         .sealed_header_by_number(read_block)
         .wrap_err_with(|| format!("failed to read header {read_block} while syncing worker count"))?
         .ok_or_else(|| eyre!("no header at block {read_block} while syncing worker count"))?;
 
-    let (num_workers, _entries) =
-        reth_env.get_worker_fee_configs_at_block(header.hash()).wrap_err_with(|| {
-            format!("failed to read WorkerConfigs at block {read_block} while syncing worker count")
-        })?;
+    let (num_workers, _entries) = retry_provider_faults("epoch-entry worker count", || {
+        ready(reth_env.get_worker_fee_configs_at_block(header.hash()))
+    })
+    .await
+    .wrap_err_with(|| {
+        format!("failed to read WorkerConfigs at block {read_block} while syncing worker count")
+    })?;
 
     let current = gas_accumulator.num_workers();
     if current != num_workers {
@@ -381,11 +388,14 @@ impl EpochBaseFees {
 /// word that maps to `MIN_PROTOCOL_BASE_FEE`) lives in
 /// [`entry_fee_for_worker`](tn_types::gas_accumulator::entry_fee_for_worker).
 ///
-/// FAIL-HARD: every read failure bubbles — node-local provider faults and chain-global failures
-/// alike. Base fees are exact-match consensus values, so entering an epoch with a fee this node
-/// cannot verify is a safety failure while halting is only a single-node liveness failure. This is
-/// deliberately stricter than the close-time update's chain-global fail-open, which is safe there
-/// only because keeping the current fees is a value every committee member computes identically.
+/// READ-FAILURE POLICY: the fees are a consensus input, so their failure is classified by
+/// [`StateReadError`](tn_reth::error::StateReadError) and BOTH classes halt. There is deliberately
+/// no fail-open arm — deliberately stricter than the close-time update's chain-global fail-open,
+/// which is safe there only because keeping the current fees is a value every committee member
+/// computes identically: the node is ENTERING the epoch, so it holds no prior fees to keep, and
+/// entering on an unverifiable fee is a consensus-safety failure while halting is a single-node
+/// liveness failure. A [`Provider`](tn_reth::error::StateReadError::Provider) fault is node-local
+/// (peers reading the same block may succeed), so it is retried briefly first.
 ///
 /// Three guards protect the read (this fn is pub-exported, so callers beyond `run_epoch` exist):
 /// - `entered` must be at least 1: epoch 0 has no previous epoch to close, and its entry is seeded
@@ -405,7 +415,7 @@ impl EpochBaseFees {
 ///   for `entered >= 1`, a zero height cannot reach the comparison as a false match.
 /// - The read must return at least one worker (unreachable while the contract clamps its count;
 ///   mirrors the snapshot side's guard).
-pub fn read_base_fees_for_entered_epoch(
+pub async fn read_base_fees_for_entered_epoch(
     reth_env: &RethEnv,
     entered: Epoch,
     closing_header: &SealedHeader,
@@ -419,15 +429,23 @@ pub fn read_base_fees_for_entered_epoch(
 
     // Pin check: the header must be the boundary the fees were written at, validated through the
     // same predicate the snapshot restore's entry-readiness precondition runs.
-    let (epoch_at_pin, epoch_info) =
-        reth_env.get_current_epoch_info_at_header(closing_header).wrap_err_with(|| {
-            format!(
-                "failed to read the registry epoch record at epoch {entered}'s pinned closing \
+    //
+    // Both reads below retry node-local provider faults. The pin is already fixed OUTSIDE the
+    // closures — `closing_header` is a `&SealedHeader` the caller resolved — so no `_from_tip`
+    // re-sampling dance is needed to satisfy the retry's contract that every attempt resolve the
+    // same block: there is nothing per-attempt left to vary.
+    let (epoch_at_pin, epoch_info) = retry_provider_faults("epoch-entry pin guard", || {
+        ready(reth_env.get_current_epoch_info_at_header(closing_header))
+    })
+    .await
+    .wrap_err_with(|| {
+        format!(
+            "failed to read the registry epoch record at epoch {entered}'s pinned closing \
                  block {} ({:?})",
-                closing_header.number,
-                closing_header.hash()
-            )
-        })?;
+            closing_header.number,
+            closing_header.hash()
+        )
+    })?;
     if epoch_at_pin != entered || epoch_info.blockHeight != closing_header.number + 1 {
         return Err(eyre!(
             "header {} ({:?}) is not epoch {entered}'s closing-block pin: the registry at it \
@@ -440,14 +458,17 @@ pub fn read_base_fees_for_entered_epoch(
         ));
     }
 
-    let (num_workers, entries) =
-        reth_env.get_worker_fee_configs_at_block(closing_header.hash()).wrap_err_with(|| {
-            format!(
-                "failed to read WorkerConfigs at epoch {entered}'s pinned closing block {} ({:?})",
-                closing_header.number,
-                closing_header.hash()
-            )
-        })?;
+    let (num_workers, entries) = retry_provider_faults("epoch-entry base fees", || {
+        ready(reth_env.get_worker_fee_configs_at_block(closing_header.hash()))
+    })
+    .await
+    .wrap_err_with(|| {
+        format!(
+            "failed to read WorkerConfigs at epoch {entered}'s pinned closing block {} ({:?})",
+            closing_header.number,
+            closing_header.hash()
+        )
+    })?;
     if num_workers == 0 {
         return Err(eyre!(
             "WorkerConfigs at epoch {entered}'s pinned closing block {} reports zero workers; \

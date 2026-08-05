@@ -613,12 +613,12 @@ async fn test_sync_num_workers_from_chain_adjusts_to_on_chain_count() -> eyre::R
 
     // the startup default (1 worker) grows to the on-chain count
     let gas_accumulator = GasAccumulator::new(1);
-    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block)?;
+    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block).await?;
     assert_eq!(gas_accumulator.num_workers(), 2, "undersized accumulator grows to on-chain count");
 
     // an oversized accumulator shrinks to the on-chain count
     let gas_accumulator = GasAccumulator::new(3);
-    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block)?;
+    sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block).await?;
     assert_eq!(gas_accumulator.num_workers(), 2, "oversized accumulator shrinks to on-chain count");
 
     Ok(())
@@ -644,7 +644,8 @@ async fn test_sync_num_workers_errors_when_contract_absent() -> eyre::Result<()>
     let epoch_first_block = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
 
     let gas_accumulator = GasAccumulator::new(3);
-    let result = sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block);
+    let result =
+        sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_first_block).await;
     assert!(result.is_err(), "a missing WorkerConfigs contract must be a hard error");
     assert_eq!(gas_accumulator.num_workers(), 3, "a failed sync must not resize the accumulator");
 
@@ -849,7 +850,7 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
     // post-catchup: fees still hold the MIN default — the entry read below owns them
     assert_eq!(restarted.base_fee(1).base_fee(), MIN_PROTOCOL_BASE_FEE);
 
-    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
+    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing).await?;
     entry.apply(&restarted);
 
     // worker 1 never produced a block, yet its governance-set Static { fee: 500 } is recovered
@@ -1495,7 +1496,7 @@ async fn test_entry_reads_static_fee_at_boundary() -> eyre::Result<()> {
         "the failure state: a fresh accumulator holds the MIN default before derivation",
     );
 
-    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
+    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing).await?;
     entry.apply(&recovered);
 
     // the committee-agreed fee is recovered instead of running the epoch at MIN
@@ -1523,7 +1524,7 @@ async fn test_entry_reads_static_fee_at_boundary() -> eyre::Result<()> {
     assert_eq!(recovered.get_values(0), (0, 0, 0), "apply must not touch gas counters");
 
     // idempotence: the entry fee is a pure function of the closing block's chain state
-    let entry_again = read_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
+    let entry_again = read_base_fees_for_entered_epoch(&reth_env, 1, &closing).await?;
     assert_eq!(entry, entry_again, "the entry read must be deterministic and idempotent");
 
     Ok(())
@@ -1838,7 +1839,7 @@ async fn test_entry_read_matches_close_written_eip1559_fee() -> eyre::Result<()>
     assert_eq!(entries[0].data.to::<u64>(), expected, "written data != oracle");
 
     // (b) the READ: the production entry read returns the written value
-    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
+    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing).await?;
     assert_eq!(entry.num_workers, 1);
     assert_eq!(entry.fees, vec![expected], "entry read != written data");
 
@@ -1972,7 +1973,7 @@ async fn test_entry_reads_written_fee_after_empty_close() -> eyre::Result<()> {
     assert_ne!(entries[0].data.to::<u64>(), poisoned_fold, "write must not price from the header");
 
     // the entry read returns the written value — the committee fee, not the poison fold
-    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing)?;
+    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &closing).await?;
     assert_eq!(entry.num_workers, 1);
     assert_eq!(
         entry.fees,
@@ -2038,7 +2039,7 @@ async fn test_entry_reads_idle_worker_fee_from_closing_data() -> eyre::Result<()
 
     // epoch-0 entry: size the accumulator from genesis WorkerConfigs state (the production
     // epoch-0 seam), then preload worker 1's stand-in fee; worker 0 keeps MIN
-    sync_num_workers_from_chain(&reth_env, &acc, 0)?;
+    sync_num_workers_from_chain(&reth_env, &acc, 0).await?;
     assert_eq!(acc.num_workers(), 2, "accumulator sized from the on-chain worker count");
     let worker1_fee = 1_000_000u64;
     acc.base_fee(1).set_base_fee(worker1_fee);
@@ -2078,7 +2079,7 @@ async fn test_entry_reads_idle_worker_fee_from_closing_data() -> eyre::Result<()
     assert_eq!(entries[0].data.to::<u64>(), MIN_PROTOCOL_BASE_FEE);
 
     // (b) the READ at boundary 1: the idle worker's entry fee IS the written word
-    let entry_1 = read_base_fees_for_entered_epoch(&reth_env, 1, &block2_header)?;
+    let entry_1 = read_base_fees_for_entered_epoch(&reth_env, 1, &block2_header).await?;
     assert_eq!(entry_1.num_workers, 2);
     assert_eq!(entry_1.fees, vec![MIN_PROTOCOL_BASE_FEE, fee_entering_1]);
 
@@ -2116,7 +2117,7 @@ async fn test_entry_reads_idle_worker_fee_from_closing_data() -> eyre::Result<()
     assert_eq!(entries[1].data.to::<u64>(), fee_entering_2, "written data != boundary-2 oracle");
 
     // (b) the READ entering epoch 2 returns it, and apply installs it
-    let entry_2 = read_base_fees_for_entered_epoch(&reth_env, 2, &block4_header)?;
+    let entry_2 = read_base_fees_for_entered_epoch(&reth_env, 2, &block4_header).await?;
     assert_eq!(entry_2.num_workers, 2);
     assert_eq!(entry_2.fees[1], fee_entering_2, "entry read covers the idle worker");
     // worker 0 ran epoch 1 at MIN with zero gas: written and read back as MIN
@@ -2134,7 +2135,7 @@ async fn test_entry_reads_idle_worker_fee_from_closing_data() -> eyre::Result<()
 /// boundary) — and the worker count and every worker's base fee read+apply from that pinned
 /// state (`read_base_fees_for_entered_epoch`, the production entry path). Epoch 0 has no prior
 /// epoch: the count syncs from genesis `WorkerConfigs` state and fees keep the MIN defaults.
-fn run_epoch_entry_sequence(
+async fn run_epoch_entry_sequence(
     reth_env: &RethEnv,
     gas_accumulator: &GasAccumulator,
 ) -> eyre::Result<()> {
@@ -2142,13 +2143,11 @@ fn run_epoch_entry_sequence(
     // from boundary-written-once scalars, so any mid-epoch tip yields the identical header
     let (entered_state, epoch_start_header) = reth_env.epoch_state_at_epoch_start()?;
     if entered_state.epoch == 0 {
-        sync_num_workers_from_chain(
-            reth_env,
-            gas_accumulator,
-            entered_state.epoch_info.blockHeight,
-        )?;
+        sync_num_workers_from_chain(reth_env, gas_accumulator, entered_state.epoch_info.blockHeight)
+            .await?;
     } else {
-        read_base_fees_for_entered_epoch(reth_env, entered_state.epoch, &epoch_start_header)?
+        read_base_fees_for_entered_epoch(reth_env, entered_state.epoch, &epoch_start_header)
+            .await?
             .apply(gas_accumulator);
     }
     Ok(())
@@ -2219,7 +2218,7 @@ async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
     // FIRST entry (mid-epoch-1): read from epoch 0's closing block, then apply
     let gas_accumulator = GasAccumulator::new(1);
     let block_height_first = reth_env.epoch_state_from_canonical_tip()?.epoch_info.blockHeight;
-    run_epoch_entry_sequence(&reth_env, &gas_accumulator)?;
+    run_epoch_entry_sequence(&reth_env, &gas_accumulator).await?;
     assert_eq!(gas_accumulator.num_workers(), 2, "count read from the closing block's configs");
     assert_eq!(
         gas_accumulator.base_fee(0).base_fee(),
@@ -2262,7 +2261,7 @@ async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
             assert_eq!(hammer_accumulator.base_fee(1).base_fee(), WORKER1_FEE);
         }
     });
-    let reentry = run_epoch_entry_sequence(&reth_env, &gas_accumulator);
+    let reentry = run_epoch_entry_sequence(&reth_env, &gas_accumulator).await;
     hammer.join().expect("in-flight inc_block/base_fee must not panic across the re-entry");
     reentry?;
 
@@ -2319,7 +2318,7 @@ async fn test_boundary_added_worker_data_written_at_creation_close() -> eyre::Re
     let reth_env = execution_node.get_reth_env().await;
 
     // epoch-0 entry: the production epoch-0 seam sizes from genesis state
-    sync_num_workers_from_chain(&reth_env, &acc, 0)?;
+    sync_num_workers_from_chain(&reth_env, &acc, 0).await?;
     assert_eq!(acc.num_workers(), 1, "the running epoch's accumulator holds the pinned count");
 
     // mid-epoch-0 governance adds worker 1 (Eip1559 { target_gas: 1M }): setWorkerConfig FIRST
@@ -2398,7 +2397,7 @@ async fn test_boundary_added_worker_data_written_at_creation_close() -> eyre::Re
 
     // entering epoch 1, the production entry read prices the new worker identically and
     // apply() resizes the accumulator to include it
-    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &block2_header)?;
+    let entry = read_base_fees_for_entered_epoch(&reth_env, 1, &block2_header).await?;
     assert_eq!(entry.num_workers, 2, "the entry read returns the grown worker count");
     assert_eq!(entry.fees[1], fresh_slot_fee, "entry read != creation-close write");
     acc.clear();

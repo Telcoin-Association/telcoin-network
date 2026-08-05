@@ -202,17 +202,15 @@ where
             // MIN defaults (epoch-0 blocks carry MIN by construction, and configured worker
             // fees only activate entering epoch 1 - the first epoch a closing block has priced).
             // Size the accumulator from the genesis `WorkerConfigs` state.
-            super::sync_num_workers_from_chain(
-                &reth_env,
-                &gas_accumulator,
-                epoch_info.blockHeight,
-            )?;
+            super::sync_num_workers_from_chain(&reth_env, &gas_accumulator, epoch_info.blockHeight)
+                .await?;
         } else {
             // Read failure is a hard error: fees are exact-match consensus values, so producing
             // with an unverifiable fee is a safety failure while halting is only a single-node
             // liveness failure. One state read at the pinned block - O(1) in the epoch's length,
             // so even a mid-epoch (ModeChange) re-entry costs nothing.
-            super::read_base_fees_for_entered_epoch(&reth_env, entered, &epoch_start_header)?
+            super::read_base_fees_for_entered_epoch(&reth_env, entered, &epoch_start_header)
+                .await?
                 .apply(&gas_accumulator);
         }
         // Produce a "dummy" epoch 0 EpochRecord if missing.
@@ -1186,6 +1184,7 @@ mod tests {
             RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
 
         let err = read_base_fees_for_entered_epoch(&reth_env, 0, &chain.sealed_genesis_header())
+            .await
             .expect_err("epoch 0 has no previous closing block to read");
         assert!(
             err.to_string().contains("sync_num_workers_from_chain"),
@@ -1213,6 +1212,7 @@ mod tests {
 
         let genesis_header = chain.sealed_genesis_header();
         let err = read_base_fees_for_entered_epoch(&reth_env, 1, &genesis_header)
+            .await
             .expect_err("a non-boundary header must fail the pin check");
         let msg = err.to_string();
         assert!(msg.contains("closing-block pin"), "error must name the pin: {msg}");
@@ -1334,7 +1334,7 @@ mod tests {
 
         // epoch-0 entry: size the accumulator from genesis WorkerConfigs state (the production
         // epoch-0 entry seam), then preload worker 0's stand-in entry fee; worker 1 keeps MIN
-        sync_num_workers_from_chain(&reth_env, &acc, 0)?;
+        sync_num_workers_from_chain(&reth_env, &acc, 0).await?;
         assert_eq!(acc.num_workers(), 2, "accumulator sized from the on-chain worker count");
         acc.base_fee(0).set_base_fee(START_FEE);
 
@@ -1419,7 +1419,7 @@ mod tests {
         // (b) the production entry read every node runs, pinned to the same closing block.
         // (No scan-vs-accumulator gas pin remains: the derivation's whole-epoch header scan is
         // gone, and inc_block ≡ header gas is already pinned directly above.)
-        let read_1 = read_base_fees_for_entered_epoch(&reth_env, 1, &h3)?;
+        let read_1 = read_base_fees_for_entered_epoch(&reth_env, 1, &h3).await?;
         assert_eq!(read_1.num_workers, 2);
 
         // THE EQUALITY at boundary 1: (a) == (b) == (c) == oracle, per worker
@@ -1501,7 +1501,7 @@ mod tests {
         assert!(entries[1].data.is_zero(), "static worker still never written");
 
         // (b) at boundary 2
-        let read_2 = read_base_fees_for_entered_epoch(&reth_env, 2, &h6)?;
+        let read_2 = read_base_fees_for_entered_epoch(&reth_env, 2, &h6).await?;
         assert_eq!(read_2.num_workers, 2);
 
         // THE EQUALITY at boundary 2 — starting from a written fee, not genesis defaults
