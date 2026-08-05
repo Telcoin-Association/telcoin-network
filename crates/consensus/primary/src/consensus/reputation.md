@@ -344,6 +344,13 @@ would change the concrete swap selection once (a one-time coordinated change).
 Either way the latent hazard is removed permanently. Add a golden test
 asserting a fixed seed maps to a fixed good-node index.
 
+**Status.** Implemented. `swap` now seeds `ChaCha12Rng` directly, and
+`test_swap_good_node_selection_is_pinned` in
+`src/consensus/tests/leader_schedule_tests.rs` pins the mapping from
+`leader_round` to good-node index. The pinned indices were checked against the
+ones `StdRng` produces under `rand 0.9.2` and are identical, so the pin changed
+no behavior.
+
 ### F6: The classification statistics are integer, but any future float is a fork risk
 
 **Statement.** Classification uses integer mean/variance and one float:
