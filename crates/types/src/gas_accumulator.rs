@@ -437,6 +437,23 @@ impl GasAccumulator {
     }
 }
 
+/// The largest `current_base_fee` [`compute_next_base_fee_eip1559`] may hand to alloy.
+///
+/// alloy's [`calc_next_block_base_fee`] adds its delta to `base_fee` with a plain `+`. That
+/// addition is unchecked, so it panics under `overflow-checks` (the `dev`, `test` and `e2e`
+/// profiles) and wraps silently under `release`, where a wrapped fee is a consensus value every
+/// node agrees on and therefore validates cleanly instead of forking.
+///
+/// With `gas_used` already clamped to `gas_limit`, the delta alloy computes is at most
+/// `base_fee * (gas_limit - gas_target) / (gas_target * 8)`, and `gas_limit - gas_target` never
+/// exceeds `gas_target`, so the delta never exceeds `base_fee / 8`. Bounding `base_fee` by
+/// `u64::MAX - u64::MAX / 8` therefore keeps `base_fee + base_fee / 8` inside `u64`.
+///
+/// This bound holds in the saturating regime too. For a `target_gas > u64::MAX / 2` the synthetic
+/// `gas_limit` saturates at `u64::MAX`, alloy recovers `gas_target = u64::MAX / 2`, and
+/// `gas_limit - gas_target` still does not exceed `gas_target`, so the `/ 8` ceiling is unchanged.
+const SAFE_MAX_BASE_FEE: u64 = u64::MAX - u64::MAX / 8;
+
 /// EIP-1559-style base fee adjustment computed once per epoch.
 ///
 /// Compares `gas_used` (total gas consumed by a single worker during the epoch)
@@ -446,10 +463,13 @@ impl GasAccumulator {
 /// Delegates the formula to alloy's [`calc_next_block_base_fee`] using
 /// [`BaseFeeParams::ethereum`] (`elasticity_multiplier = 2`,
 /// `max_change_denominator = 8`). The synthetic `gas_limit` passed to alloy is
-/// `target_gas * 2` so alloy recovers the same `gas_target`. `gas_used` is
-/// clamped to `gas_limit` to enforce the EIP-1559 elasticity bound and avoid
-/// the unbounded delta arithmetic alloy would otherwise produce when callers
-/// pass `gas_used > gas_limit`.
+/// `target_gas * 2` so alloy recovers the same `gas_target`, except for a
+/// `target_gas > u64::MAX / 2`, where the multiply saturates and alloy instead
+/// recovers `u64::MAX / 2`. Both inputs into alloy's delta arithmetic are
+/// clamped so that arithmetic cannot leave `u64`: `gas_used` to `gas_limit`,
+/// enforcing the EIP-1559 elasticity bound, and `current_base_fee` to
+/// [`SAFE_MAX_BASE_FEE`], bounding the unchecked addition alloy performs on the
+/// fee-increase arm.
 ///
 /// The result is clamped to `[MIN_PROTOCOL_BASE_FEE, u64::MAX]`.
 pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, target_gas: u64) -> u64 {
@@ -460,6 +480,7 @@ pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, targe
     let params = BaseFeeParams::ethereum();
     let gas_limit = target_gas.saturating_mul(params.elasticity_multiplier as u64);
     let gas_used = gas_used.min(gas_limit);
+    let current_base_fee = current_base_fee.min(SAFE_MAX_BASE_FEE);
     let new_base_fee = calc_next_block_base_fee(gas_used, gas_limit, current_base_fee, params);
     new_base_fee.max(MIN_PROTOCOL_BASE_FEE)
 }
@@ -590,6 +611,56 @@ mod tests {
         let base = 1_000_000_000_000_000u64;
         let result = compute_next_base_fee_eip1559(base, u64::MAX, 1);
         assert_eq!(result, base + base / 8);
+    }
+
+    /// Mutation guard for the `.min(SAFE_MAX_BASE_FEE)` clamp: with the clamp removed, alloy's
+    /// unchecked `base_fee + delta` overflows on every case here: a panic under the test
+    /// profile's `overflow-checks`, and a wrapped (far lower) fee in a release build.
+    #[test]
+    fn ceiling_base_fee_never_overflows() {
+        let target = 15_000_000u64;
+
+        // the exact threshold: the unclamped sum is 2^64, which wraps to 0 and would surface as
+        // MIN_PROTOCOL_BASE_FEE after the floor
+        let threshold = 16_397_105_843_297_379_215u64;
+        let at_threshold = compute_next_base_fee_eip1559(threshold, target * 2, target);
+        assert!(
+            at_threshold >= SAFE_MAX_BASE_FEE,
+            "a fee increase must never collapse the fee: {at_threshold}"
+        );
+
+        // the widest word `entry_fee_for_worker` accepts, at the maximal +12.5% move
+        let at_max = compute_next_base_fee_eip1559(u64::MAX, target * 2, target);
+        assert_eq!(at_max, SAFE_MAX_BASE_FEE + SAFE_MAX_BASE_FEE / 8);
+
+        // the smallest over-target move still takes alloy's `max(1, ..)` floored delta
+        let barely_over = compute_next_base_fee_eip1559(u64::MAX, target + 1, target);
+        assert!(barely_over >= SAFE_MAX_BASE_FEE, "must not wrap: {barely_over}");
+    }
+
+    /// The clamp is a no-op for every fee the protocol can actually hold, so no epoch that did not
+    /// already overflow changes value. `SAFE_MAX_BASE_FEE` itself is the largest unaffected input.
+    #[test]
+    fn clamp_does_not_change_in_range_fees() {
+        let target = 15_000_000u64;
+        assert_eq!(compute_next_base_fee_eip1559(1000, target * 2, target), 1125);
+        assert_eq!(
+            compute_next_base_fee_eip1559(SAFE_MAX_BASE_FEE, target * 2, target),
+            SAFE_MAX_BASE_FEE + SAFE_MAX_BASE_FEE / 8
+        );
+        // one below the clamp still moves by the full 12.5%
+        let below = SAFE_MAX_BASE_FEE - 1;
+        assert_eq!(compute_next_base_fee_eip1559(below, target * 2, target), below + below / 8);
+    }
+
+    /// A saturating `target_gas` is the other axis into alloy's delta arithmetic; the clamp has to
+    /// hold there too, where `gas_target` is `u64::MAX / 2` rather than the configured target.
+    #[test]
+    fn ceiling_base_fee_never_overflows_with_saturating_target() {
+        [u64::MAX / 2 + 1, u64::MAX - 1, u64::MAX].iter().for_each(|&target| {
+            let out = compute_next_base_fee_eip1559(u64::MAX, u64::MAX, target);
+            assert!(out >= SAFE_MAX_BASE_FEE, "target {target} wrapped to {out}");
+        });
     }
 
     #[test]
