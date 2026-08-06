@@ -63,9 +63,9 @@ use tokio::time::Instant;
 use tracing::info;
 
 use crate::common::{
-    address_from_word, current_epoch, get_balance, get_block, get_block_number, get_key,
+    address_from_word, current_epoch, get_balance, get_block_number, get_key,
     get_latest_consensus_header_number, get_tx_receipt_block, kill_child, network_advancing,
-    parse_hex_u64, send_tel, start_validator, wait_for_epoch_at_least, wait_for_mid_epoch,
+    read_base_fee, send_tel, start_validator, wait_for_epoch_at_least, wait_for_mid_epoch,
     wait_for_rpc, EpochSnapshot, ProcessGuard,
 };
 
@@ -963,19 +963,6 @@ async fn land_tx_and_read_fee(
     let block = get_tx_receipt_block(node, &tx_hash)?;
     let fee = read_base_fee(node, block)?;
     Ok((block, fee))
-}
-
-/// Read the `baseFeePerGas` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
-///
-/// The testnet runs a single worker (worker 0), so every block's base fee is worker 0's fee.
-fn read_base_fee(node: &str, block_number: u64) -> eyre::Result<u64> {
-    let block = get_block(node, Some(block_number))?;
-    let raw = block
-        .get("baseFeePerGas")
-        .ok_or_else(|| eyre::eyre!("block {block_number} on {node} has no baseFeePerGas field"))?;
-    parse_hex_u64(raw).ok_or_else(|| {
-        eyre::eyre!("block {block_number} on {node} baseFeePerGas is not a hex u64: {raw:?}")
-    })
 }
 
 /// Poll `node` for up to `max_secs` until it has produced at least `block_number`, then return
