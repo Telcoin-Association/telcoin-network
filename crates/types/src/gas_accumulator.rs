@@ -518,10 +518,28 @@ pub fn next_base_fee_for_config(
 /// row governance switched from `Eip1559` keeps its last recorded word forever, so `data` is stale
 /// by design for this variant (see the data-semantics doc on [`WorkerConfigEntry`]).
 ///
-/// `Eip1559` reads the recorded word. A zero word maps to `MIN_PROTOCOL_BASE_FEE`, which is
-/// exactly what the whole-epoch header derivation this read replaced computes for every epoch that
-/// closed before the write path activated, so the cutover is value-identical on all pre-activation
-/// history; the same floor lifts a hypothetical governance-written `1..=6` to the protocol minimum.
+/// `Eip1559` reads the recorded word. A zero word maps to `MIN_PROTOCOL_BASE_FEE`, and on
+/// pre-activation history that is the same value the whole-epoch header derivation this read
+/// replaced computed — but the cutover is value-identical only under two premises, neither of which
+/// this function can enforce:
+///
+/// 1. Every pre-activation `Eip1559` row still reads `data == 0`. The write path activates at
+///    `CONSENSUS_REGISTRY_FORK_EPOCH` (in [`crate::forks`]; adiri-gated, so no intra-doc link),
+///    whose pre-deploy checklist requires confirming exactly that on the live contract, and whose
+///    adiri rollout constraint forbids ANY `WorkerConfigs` write until the fork epoch has passed —
+///    a `setWorkerConfig` that lands a word included, and so is a fee-neutral-looking `Static { fee
+///    }` -> `Eip1559 { target_gas: u64::MAX }` flip, which has this read price MIN where the header
+///    derivation priced ~0.875 · `fee`. See that constant's doc for the full constraint; a non-zero
+///    word landed pre-fork splits the fleet through the exact-equality basefee check, and one above
+///    `u64::MAX` fail-hards it (below).
+/// 2. Pre-activation header base fees never rose above MIN on the live chain. The deleted
+///    derivation anchored its fold on the header `base_fee_per_gas` of the worker's LAST genuine
+///    block, falling back to MIN only on the epoch-0 base case, a worker with no block in the
+///    scanned range, or a `Static` config — so MIN is what it computed only where that anchor was
+///    itself MIN. This is an empirical fact about adiri (no governance target has moved a worker's
+///    fee off the protocol minimum yet), NOT a structural identity.
+///
+/// The same floor lifts a hypothetical governance-written `1..=6` to the protocol minimum.
 ///
 /// # Errors
 ///
