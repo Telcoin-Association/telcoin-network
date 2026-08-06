@@ -104,6 +104,9 @@ pub use reth_node_core::{
     node_config::DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
+/// Test-only re-export so engine tests can construct static-file provider errors.
+#[cfg(feature = "test-utils")]
+pub use reth_provider::StaticFileSegment;
 pub use reth_provider::{
     providers::StaticFileProvider, CanonStateNotificationStream, ChangedAccount,
 };
