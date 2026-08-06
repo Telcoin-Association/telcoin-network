@@ -266,11 +266,13 @@ impl RethEnv {
     /// The returned `Vec`'s length is the on-chain `numWorkers()` at the canonical tip (the
     /// arity between the count and the per-worker arrays is validated in
     /// `Self::worker_fee_configs_inner`). Callers size their in-memory worker state (e.g. the
-    /// `GasAccumulator`) to match, rather than asserting a preconceived count.
+    /// `GasAccumulator`) to match, rather than asserting a preconceived count. Each row's `data`
+    /// word is projected out here; tests that need it read entries through
+    /// [`read_worker_config_entries_at`].
     pub fn get_worker_fee_configs(&self) -> StateReadResult<Vec<WorkerFeeConfig>> {
         let canonical_tip = self.canonical_tip();
-        let (_num_workers, configs) = self.worker_fee_configs_inner(&canonical_tip)?;
-        Ok(configs)
+        let (_num_workers, entries) = self.worker_fee_configs_inner(&canonical_tip)?;
+        Ok(entries.into_iter().map(|entry| entry.config).collect())
     }
 }
 

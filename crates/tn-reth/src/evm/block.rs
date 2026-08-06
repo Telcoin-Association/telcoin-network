@@ -407,22 +407,25 @@ where
     /// that seats the new committee: a node entering the epoch reads each worker's fee from one
     /// state slot instead of scanning the whole prior epoch's headers to recompute it.
     ///
-    /// The value written for a worker MUST equal what the live producer's post-close
-    /// `adjust_base_fees` (in `tn_node::manager`) and every node's epoch-entry header-scan
-    /// derivation (`derive_base_fees_for_entered_epoch`) compute for it — the batch validator
-    /// snapshots a plain `u64` per epoch and compares base fees for exact equality, so a
-    /// one-wei divergence makes peers reject each other's batches for a whole epoch. Three
-    /// details carry that equivalence:
+    /// The epoch entry CONSUMES this word rather than re-deriving it: the next epoch's entry read
+    /// (`read_base_fees_for_entered_epoch` in `tn_node::manager`) returns it through
+    /// `entry_fee_for_worker` (`tn-types`), which owns the per-row interpretation — so whatever is
+    /// written here IS the fee the fleet enters the next epoch on. The batch validator snapshots a
+    /// plain `u64` per epoch and compares base fees for exact equality, which leaves two binding
+    /// equalities: (a) the value written MUST equal the [`next_base_fee_for_config`] oracle over
+    /// the accumulator's current fee and the worker's epoch gas including this block's own, and
+    /// (b) it MUST equal what the live producer's close-time `adjust_base_fees` (in
+    /// `tn_node::manager`) computes, for as long as that tripwire survives (its removal is a noted
+    /// FOLLOW-UP in `tn-node`). Three details carry those equalities:
     ///
     /// - The worker set comes from the CONTRACT's `numWorkers`, not the accumulator's. Governance
     ///   may have grown the worker set mid-epoch (a `setNumWorkers` only takes effect at this
-    ///   boundary), and both other seams read the count at this same closing block. A worker with
-    ///   no accumulator slot yet prices from `(MIN_PROTOCOL_BASE_FEE, 0 gas)`, which is exactly
-    ///   what `adjust_base_fees`' resize-then-compute and the entry walk's slot-creation anchor
-    ///   produce for a fresh slot.
+    ///   boundary), and the close-time adjustment reads the count at this same closing block. A
+    ///   worker with no accumulator slot yet prices from `(MIN_PROTOCOL_BASE_FEE, 0 gas)` — the
+    ///   fresh-slot rule shared with `adjust_base_fees`' resize-then-compute.
     /// - This block's own gas is folded into its worker's total. The accumulator does not include
-    ///   it yet (`inc_block` runs after the payload executes), while the post-close adjustment and
-    ///   the header scan both count this block.
+    ///   it yet (`inc_block` runs after the payload executes), while the close-time adjustment
+    ///   counts this block (it runs post-`inc_block`).
     /// - The accumulator is only READ. It is shared live with the batch validator and the node
     ///   manager, so resizing or clearing it here would corrupt state those readers depend on.
     ///

@@ -87,7 +87,7 @@ use reth_revm::{
 };
 use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_types::{
-    gas_accumulator::WorkerFeeConfig, Address, Bytes, Epoch, ExecHeader, SealedHeader,
+    gas_accumulator::WorkerConfigEntry, Address, Bytes, Epoch, ExecHeader, SealedHeader,
     SolCall as _, B256,
 };
 use tracing::{debug, error, warn};
@@ -524,7 +524,7 @@ impl RethEnv {
     /// Read worker fee configs from the [`WorkerConfigs`] contract at the block identified by
     /// `block_hash`.
     ///
-    /// Returns the on-chain worker count and one [`WorkerFeeConfig`] per worker. Failures are
+    /// Returns the on-chain worker count and one [`WorkerConfigEntry`] per worker. Failures are
     /// classified per [`StateReadError`] (see `worker_fee_configs_inner`); `block_hash`
     /// failing to resolve to a sealed header is [`StateReadError::Provider`] — the pinned block
     /// exists on the committee by construction, so a miss reflects this node's local view, not a
@@ -532,7 +532,7 @@ impl RethEnv {
     pub fn get_worker_fee_configs_at_block(
         &self,
         block_hash: B256,
-    ) -> StateReadResult<(usize, Vec<WorkerFeeConfig>)> {
+    ) -> StateReadResult<(usize, Vec<WorkerConfigEntry>)> {
         let header = self.pinned_header_by_hash(block_hash)?;
         self.worker_fee_configs_inner(&header)
     }
@@ -560,7 +560,7 @@ impl RethEnv {
     /// Read fee configs for all workers from the [`WorkerConfigs`] contract at the given header.
     ///
     /// Builds an EVM against `header`'s state and issues a single `getAllWorkerConfigs()` call.
-    /// Returns the on-chain worker count alongside the decoded [`WorkerFeeConfig`]s.
+    /// Returns the on-chain worker count alongside the decoded [`WorkerConfigEntry`] rows.
     ///
     /// Failures are classified per [`StateReadError`]. The classification boundary: the state
     /// provider construction and any database fault the EVM hits while lazily reading state are
@@ -572,17 +572,21 @@ impl RethEnv {
     ///
     /// Fail-open on unknown strategy ids: a strategy this node does not recognize (only possible
     /// when a future contract version introduces one before this node is upgraded) is NOT an
-    /// error — it falls back to [`WorkerFeeConfig::Eip1559`] with a warning, preserving liveness
-    /// instead of halting all validators on the unrecognized id.
+    /// error — it falls back to
+    /// [`WorkerFeeConfig::Eip1559`](tn_types::gas_accumulator::WorkerFeeConfig::Eip1559) with a
+    /// warning, preserving liveness instead of halting all validators on the unrecognized id.
     ///
     /// The decode, arity check, and strategy mapping live in
     /// [`decode_worker_fee_configs`](crate::system_calls::decode_worker_fee_configs), shared with
-    /// the epoch-closing block's base-fee recording so the two cannot drift. Callers of this
-    /// method want fee strategies only, so each row's `data` word is dropped here.
+    /// the epoch-closing block's base-fee recording so the two cannot drift. Entries carry each
+    /// row's `data` word alongside its strategy: the epoch-entry fee read is the consumer that
+    /// needs it, taking the next-epoch base fee the closing block recorded there instead of
+    /// re-deriving it. Callers that want strategies only project `entry.config` out. See
+    /// [`WorkerConfigEntry`] for when the word is authoritative.
     pub(crate) fn worker_fee_configs_inner(
         &self,
         header: &SealedHeader,
-    ) -> StateReadResult<(usize, Vec<WorkerFeeConfig>)> {
+    ) -> StateReadResult<(usize, Vec<WorkerConfigEntry>)> {
         let (mut db, evm_env) = self.pinned_state_and_env(header)?;
         let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
@@ -606,7 +610,7 @@ impl RethEnv {
         let (num_workers, entries) =
             decode_worker_fee_configs(&data).map_err(StateReadError::ChainGlobal)?;
 
-        Ok((num_workers as usize, entries.into_iter().map(|entry| entry.config).collect()))
+        Ok((num_workers as usize, entries))
     }
 
     /// Build an EVM at the canonical tip, execute a read-only [ConsensusRegistry] call, and
@@ -778,10 +782,15 @@ impl RethEnv {
     /// Read the CURRENT epoch number and [`EpochInfo`](ConsensusRegistry::EpochInfo) from the
     /// [`ConsensusRegistry`] at `header`, with failures classified per [`StateReadError`].
     ///
-    /// This is the close-time identity read for the epoch manager's `adjust_base_fees`: at an
-    /// epoch's closing block the registry state has already crossed to the entered epoch
-    /// (`concludeEpoch` ran inside that block), so the returned info is the entered epoch's record
-    /// and its `blockHeight` must equal `header.number + 1`. It reads exactly what
+    /// This is the ONE boundary predicate for "did this block close an epoch": the epoch
+    /// manager's close-time identity check (`adjust_base_fees`), the entry read's pin guard
+    /// (`read_base_fees_for_entered_epoch`, both in `tn-node`), and the snapshot restore's
+    /// [`entry_readiness_precondition`](crate::snapshot::SnapshotRestorer::entry_readiness_precondition)
+    /// all validate the same boundary through it — deliberately shared so the three seams cannot
+    /// drift on what counts as a closing block. At an epoch's closing block the registry state
+    /// has already crossed to the entered epoch (`concludeEpoch` ran inside that block), so the
+    /// returned info is the entered epoch's record and its `blockHeight` must equal
+    /// `header.number + 1`. It reads exactly what
     /// [`Self::epoch_state_at_header`] reads for the same check but skips the committee/BLS/
     /// epoch-start lookups (a gating check needs only the epoch identity) and — unlike that
     /// method, whose failures collapse into `eyre` strings — keeps node-local provider faults
@@ -959,6 +968,7 @@ mod tests {
     use tn_types::{
         gas_accumulator::{
             next_base_fee_for_config, GasAccumulator, RewardsCounter, WorkerConfigEntry,
+            WorkerFeeConfig,
         },
         generate_proof_of_possession_bls_for_test, BlsKeypair, GenesisAccount, NodeP2pInfo,
         TaskManager, MIN_PROTOCOL_BASE_FEE, U256,
@@ -2919,11 +2929,23 @@ mod tests {
         assert_eq!(configs[0], WorkerFeeConfig::Eip1559 { target_gas: 30_000_000 });
         assert_eq!(configs[1], WorkerFeeConfig::Static { fee: 500 });
 
-        // the block-pinned read primitive reports the same count at genesis
-        let (num_workers, configs_at_block) =
+        // the block-pinned read primitive reports the same count and strategies at genesis
+        let (num_workers, entries) =
             reth_env.get_worker_fee_configs_at_block(chain.sealed_genesis_header().hash())?;
         assert_eq!(num_workers, 2);
-        assert_eq!(configs_at_block, configs);
+        assert_eq!(entries.iter().map(|entry| entry.config).collect::<Vec<_>>(), configs);
+
+        // the ceremony seeds every row's `data` word zero (see `create_consensus_registry_
+        // genesis_accounts`), and the epoch-closing block's base-fee record is the only other
+        // writer - no epoch has closed at genesis, so every row still reads the never-recorded
+        // zero, including the Static row, which the record skips entirely
+        for (worker_id, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry.data,
+                U184::ZERO,
+                "worker {worker_id} carries a non-zero data word at ceremony genesis"
+            );
+        }
 
         Ok(())
     }
@@ -3050,17 +3072,17 @@ mod tests {
         assert_eq!(epoch_one_read_header.hash(), close_block_hash);
 
         // epoch 1's count (read at its start-parent) reflects the governance change...
-        let (num_workers, configs) =
+        let (num_workers, entries) =
             reth_env.get_worker_fee_configs_at_block(epoch_one_read_header.hash())?;
         assert_eq!(num_workers, 2);
-        assert_eq!(configs[1], WorkerFeeConfig::Static { fee: 500 });
+        assert_eq!(entries[1].config, WorkerFeeConfig::Static { fee: 500 });
 
         // ...while epoch 0's count (read at genesis) still reports the original single worker
         let genesis_hash = reth_env
             .sealed_header_by_number(epoch_zero_read_block)?
             .expect("genesis header")
             .hash();
-        let (num_workers, _configs) = reth_env.get_worker_fee_configs_at_block(genesis_hash)?;
+        let (num_workers, _entries) = reth_env.get_worker_fee_configs_at_block(genesis_hash)?;
         assert_eq!(num_workers, 1);
 
         Ok(())

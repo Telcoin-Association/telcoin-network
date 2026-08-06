@@ -95,10 +95,12 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 /// - read the LIVE deployed `WorkerConfigs` and confirm `numWorkers()` and, for every `i <
 ///   numWorkers`, `_workerConfigSet[i] == true` (a storage probe — the mapping is internal): the
 ///   first post-fork closing block's `setWorkerConfigsData` system call reverts
-///   `MissingWorkerConfig` on any unset row, aborting the one-shot fork-boundary close. Do this
-///   alongside the post-fork hash re-pinning above, since an artifact rebuild silently moves those
-///   hashes. Informational reference only, NOT a compiled constant: at the time of writing, the
-///   embedded artifact's post-fork `WorkerConfigs` splice hashes to
+///   `MissingWorkerConfig` on any unset row, aborting the one-shot fork-boundary close.
+///   Additionally confirm `data == 0` for every `Eip1559` row on the live contract — the entry read
+///   prices epochs from that word (see the rollout constraint below). Do this alongside the
+///   post-fork hash re-pinning above, since an artifact rebuild silently moves those hashes.
+///   Informational reference only, NOT a compiled constant: at the time of writing, the embedded
+///   artifact's post-fork `WorkerConfigs` splice hashes to
 ///   `0x58304c00bbfaa7e348220efb95843614756207311245abc4949f91bb3ddb2ff7`;
 /// - the `WorkerConfigs` bytecode swap ships at this same fork epoch (see
 ///   [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`]) — both swaps land in the epoch-closing block of
@@ -110,6 +112,18 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 /// - both swaps fail closed on their pre-fork pin ([`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`],
 ///   [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`]): an unexpected on-chain deployment aborts the block
 ///   (fatal error) rather than migrating over an incompatible layout;
+/// - adiri rollout constraint: until this fork epoch has passed on a fleet running the entry-read
+///   build, governance must not touch ANY `WorkerConfigs` row — no `setWorkerConfig` writes, no
+///   strategy flips, no `data` writes. The deployed pre-fork contract's
+///   `setWorkerConfig(uint16,uint8,uint64,uint128)` writes the same `_workerConfigs` rows the entry
+///   read consumes and pre-fork closes never overwrite `data`, so a non-zero word landed pre-fork
+///   has entry-read nodes pricing the epoch from it while older builds scan-derive MIN (the
+///   exact-equality basefee check splits the fleet), and a word above `u64::MAX` fail-hards the
+///   whole entry-read fleet at the same entry — chain halted, unrecoverable by any governance
+///   transaction, coordinated binary patch only. A strategy flip is no safer even when it looks
+///   fee-neutral: `Static { S }` → `Eip1559 { u64::MAX }` (neither a `target_gas` move nor a
+///   `Static` fee change) has older builds deriving ~0.875·S from the header scan while entry-read
+///   nodes read `data == 0` → MIN;
 /// - post-fork governance runbook: the `WorkerConfigs` swap replaces code only, so the appended
 ///   `maxStrategy` slot (slot 4) stays `0` and every owner call assigning `Static` (strategy id 1)
 ///   reverts `InvalidStrategy`. The owner must send one `setMaxStrategy(1)` transaction after the

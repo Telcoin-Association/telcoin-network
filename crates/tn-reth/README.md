@@ -16,7 +16,9 @@ from the code at the cited paths; when the code and this file disagree, the code
   into `RethEnv`.
 - Each batch in the output becomes one EVM block. An output with no batches and no epoch close is
   skipped entirely; an epoch-closing output with no batches still produces a synthetic closing
-  block (its `ommers_hash` is zero — see `is_worker_batch_block` in `src/snapshot.rs`).
+  block, identifiable by `ommers_hash == B256::ZERO` — the engine passes a zero batch digest for
+  it (`execute_consensus_output` in `crates/engine/src/payload_builder.rs`; see the header field
+  mapping below).
 - Blocks are canonicalized directly: `finish_executing_output` (`src/env/execution.rs`) persists
   the blocks **and** the finalized/safe markers in a single database transaction, then broadcasts
   the canonical-state notification. There is no beacon/engine API, no fork choice, and no reorgs
@@ -38,7 +40,7 @@ TN repurposes several Ethereum header fields for protocol data. Assembly happens
 | Field | TN meaning |
 |---|---|
 | `nonce` | `((epoch as u64) << 32) \| round` of the leader certificate (`tn-types` `primary/header.rs`; decoded by `deconstruct_nonce`). Epoch = high 32 bits, round = low 32 bits. |
-| `difficulty` | `batch_index << 16 \| worker_id`. **`worker_id` is the LOW 16 bits; `batch_index` occupies the upper bits** (`TNBlockExecutionCtx` docs and `context_for_next_block` in `src/evm/config.rs`). `first_batch()` exploits this: `difficulty < 65536` ⇔ `batch_index == 0`. `worker_id_from_header` in `src/snapshot.rs` reads the low 16 bits. |
+| `difficulty` | `batch_index << 16 \| worker_id`. **`worker_id` is the LOW 16 bits; `batch_index` occupies the upper bits** (`TNBlockExecutionCtx` docs and `context_for_next_block` in `src/evm/config.rs`). `first_batch()` exploits this: `difficulty < 65536` ⇔ `batch_index == 0`. `worker_id_from_header` (canonical in `tn-types` `gas_accumulator.rs`, re-exported from `src/snapshot.rs`) reads the low 16 bits. |
 | `mix_hash` | Computed in `crates/engine/src/payload_builder.rs`: `output_digest ^ batch_digest` when the output has batches, plain `output_digest` otherwise. Exposed as `prevrandao` (EIP-4399). |
 | `extra_data` | Empty for a normal block. For an epoch-closing block: the 32-byte keccak256 of the leader certificate's aggregate BLS signature. The replay path (`context_for_block` in `src/evm/config.rs`) accepts only length 0 or 32 and errors on anything else. |
 | `parent_beacon_block_root` | Digest of the `ConsensusHeader` that committed the executed transactions. Written to the EIP-4788 beacon-roots contract once per consensus output (only on the first batch, `apply_pre_execution_changes` in `src/evm/block.rs`). |
