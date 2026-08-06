@@ -85,9 +85,21 @@ pub enum WorkerFeeConfig {
 ///
 /// The engine encodes `difficulty` as `batch_index << 16 | worker_id` (matching how
 /// [`GasAccumulator::inc_block`] callers attribute blocks), so the worker id is the low 16 bits and
-/// the batch index occupies the upper bits. This is the single canonical implementation shared by
-/// the per-worker fee/gas derivation (`tn_node`) and the snapshot fee-derivability precheck
-/// (`tn_reth`), so both attribute headers with the exact same rule — no drift.
+/// the batch index occupies the upper bits.
+///
+/// ONE production consumer: `catchup_accumulator`'s startup accumulator restore (in
+/// `node::manager`), which bounds every scanned header's worker id against the on-chain worker
+/// count and then folds each header's gas into that worker's slot. It is NOT a fee derivation — the
+/// entered epoch's fees come from the closing block's `WorkerConfigs` record through
+/// [`entry_fee_for_worker`], which needs no header attribution at all. `tn-reth`'s `snapshot`
+/// module re-exports the name; every use there is a test.
+///
+/// The MASK does have a second implementation to stay in sync with:
+/// `tn-reth/src/evm/block.rs`'s `BlockCtx::worker_id` reads the same low 16 bits off the execution
+/// context while a block is being built (and points back here), so a block's attribution is
+/// identical whether it is taken from the context during execution or from the sealed header
+/// afterwards. The accumulator's per-worker totals depend on that agreement, so the two move
+/// together.
 pub fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
     (header.difficulty.into_limbs()[0] & 0xffff) as u16
 }
