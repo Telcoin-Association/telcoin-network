@@ -123,6 +123,8 @@ Each handler charges a fixed gas amount upfront. The tables below compare each c
 
 These costs do **not** include the base transaction cost (21,000) or calldata costs; those are charged by the EVM before the precompile runs.
 
+Native-balance mutations (`balance_incr` / `balance_decr` in `claim`, `burn`, and the faucet `mint`) are priced as account **accesses** only, never as writes — balances are not precompile storage, and the account is already touched by the call. Every headroom figure below rests on that assumption.
+
 ### EVM gas reference (Cancun)
 
 | Operation         | Condition             | Gas                   |
@@ -145,6 +147,8 @@ These costs do **not** include the base transaction cost (21,000) or calldata co
 | Function                      | Gas   | Notes        |
 | ----------------------------- | ----- | ------------ |
 | `totalSupply`, `hasMintRole`  | 2,100 | 1 cold SLOAD |
+
+**Status: Tight** — 1.00× headroom. Exactly covers the single cold SLOAD. `hasMintRole` is only compiled with the `faucet` feature; a query for the governance address short-circuits before the read and so overpays by the full 2,100.
 
 ### `mint` (mainnet) — 41,000 gas
 
@@ -208,7 +212,7 @@ These costs do **not** include the base transaction cost (21,000) or calldata co
 | SSTORE role slot | cold, 0→nonzero | 22,100     |
 | **Total**        |                 | **22,100** |
 
-**Status: Undercharged** — 1.00× headroom. Exceeds gas constant by 100 in worst case (new grant). Re-grants (nonzero→nonzero) cost only 5,000.
+**Status: Undercharged** — 0.995× headroom. Exceeds gas constant by 100 in worst case (new grant). Re-grants (nonzero→nonzero) cost only 5,000.
 
 ### `revokeMintRole` (faucet) — 22,000 gas
 

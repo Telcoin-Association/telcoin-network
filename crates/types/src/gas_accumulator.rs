@@ -546,10 +546,12 @@ pub fn next_base_fee_for_config(
 ///    `u64::MAX` fail-hards it (below).
 /// 2. Pre-activation header base fees never rose above MIN on the live chain. The deleted
 ///    derivation anchored its fold on the header `base_fee_per_gas` of the worker's LAST genuine
-///    block, falling back to MIN only on the epoch-0 base case, a worker with no block in the
-///    scanned range, or a `Static` config — so MIN is what it computed only where that anchor was
-///    itself MIN. This is an empirical fact about adiri (no governance target has moved a worker's
-///    fee off the protocol minimum yet), NOT a structural identity.
+///    block, falling back to MIN only on the epoch-0 base case, a slot not yet configured at the
+///    boundary, or an anchor that was itself MIN — an idle worker with no block in the scanned
+///    range was walked back to the last epoch it produced in, and a `Static` row was pinned to its
+///    configured fee. So MIN is what it computed only where that anchor was itself MIN. This is an
+///    empirical fact about adiri (no governance target has moved a worker's fee off the protocol
+///    minimum yet), NOT a structural identity.
 ///
 /// The same floor lifts a hypothetical governance-written `1..=6` to the protocol minimum.
 ///

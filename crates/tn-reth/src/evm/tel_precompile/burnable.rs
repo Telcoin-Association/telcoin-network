@@ -170,7 +170,8 @@ pub(super) fn handle_mint(
     /// `Mint` log (2 topics, 64 bytes of data) is emitted: `22_100 + 22_100 + 1_637 = 45_837`.
     /// At `41_000` this covers `0.89x` of the worst case, so a first mint is **undercharged** by
     /// `4_837` relative to equivalent Solidity. Overwriting an existing pending mint touches two
-    /// warm `nonzero -> nonzero` slots and costs `11_637`, comfortably inside the budget.
+    /// cold `nonzero -> nonzero` slots (this handler never `SLOAD`s them first) and costs `11_637`,
+    /// comfortably inside the budget.
     ///
     /// Derived in this module's `README.md`, "Gas costs" / "`mint` (mainnet)".
     const GAS_COST: u64 = 41_000;
@@ -246,10 +247,10 @@ pub(super) fn handle_claim(
     /// warm `SSTORE`s clearing the two pending slots and bumping supply (`3 * 2_900`), and the
     /// `Claim` and `Transfer` logs (`1_381 + 1_756`), totalling `20_737`. At `25_000` this covers
     /// `1.21x` of the worst case, the thinnest margin of any handler in this precompile that
-    /// over-covers its worst case at all — the two views charge exactly `1.00x`, and `mint`,
-    /// `burn`, and `grantMintRole` are undercharged. The two `nonzero -> 0` clears earn `9_600` in
-    /// refunds at transaction end, but refunds never reduce the amount that has to be available
-    /// upfront.
+    /// over-covers its worst case at all — the views charge exactly `1.00x`, and `burn` is
+    /// undercharged, as is the mainnet `mint` in a non-`faucet` build and `grantMintRole` in a
+    /// `faucet` one. The two `nonzero -> 0` clears earn `9_600` in refunds at transaction end, but
+    /// refunds never reduce the amount that has to be available upfront.
     ///
     /// Derived in this module's `README.md`, "Gas costs" / "`claim`".
     const GAS_COST: u64 = 25_000;

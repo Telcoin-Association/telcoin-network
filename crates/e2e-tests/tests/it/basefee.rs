@@ -33,9 +33,10 @@
 //! - These testnets run with skip-empty-execution: blocks are produced only when transactions exist
 //!   or an epoch closes. The epoch-boundary/close blocks are produced by the *closing* producer and
 //!   carry the chain-seeded (previous-epoch) fee — they do **not** reflect the fee they record for
-//!   the next epoch. That new fee first appears on the next block committed, which is a
-//!   **transaction-bearing block inside the new epoch** — or, if that epoch stays idle, its own
-//!   closing block.
+//!   the next epoch. That new fee first appears on the next **transaction-bearing block inside the
+//!   new epoch**, and only there: an empty epoch-closing block copies its parent's fee verbatim
+//!   (`crates/engine/src/payload_builder.rs:124`), so an epoch that stays idle closes on the
+//!   previous fee rather than the one it recorded.
 //! - The testnet is single-worker (worker 0), so every block's `base_fee_per_gas` is worker 0's
 //!   fee. A submitted transaction must carry a `gas_price >= base_fee` or the pool treats it as
 //!   underpriced and it never lands — for the static-fee tests we price transactions above the

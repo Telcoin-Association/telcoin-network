@@ -1242,12 +1242,18 @@ pub(crate) fn get_tx_receipt_block(node: &str, tx_hash: &str) -> eyre::Result<u6
 ///
 /// These testnets run a single worker (worker 0), so every block's base fee is worker 0's fee.
 ///
-/// Do **not** assume a block's fee is the fee of the epoch containing it. An epoch's *first* block
-/// carries that epoch's fee (this is what `basefee.rs` asserts against), but an idle epoch's single
-/// closing block has been observed carrying a different value. Anchor a fee assertion to something
-/// read out of chain state — see `state_export_import::recorded_entry_fee`, which reads the
-/// `WorkerConfigs` word a node actually enters on — rather than inferring the expected value from
-/// another block's header.
+/// Do **not** assume a block's fee is the fee of the epoch containing it. Only a
+/// **transaction-bearing** block reliably carries its epoch's fee: it takes
+/// `batch.base_fee_per_gas` (`crates/engine/src/payload_builder.rs:190`), which is the fee the
+/// worker built the batch at. An empty epoch-closing block instead copies its parent's
+/// `base_fee_per_gas` verbatim (`:124`), so in a run of idle epochs every block carries the last
+/// transaction-bearing block's fee, however many boundaries back that was — including the idle
+/// epoch's own single closing block.
+///
+/// Anchor a fee assertion to something read out of chain state — see
+/// `state_export_import::recorded_entry_fee`, which reads the `WorkerConfigs` word a node actually
+/// enters on — rather than inferring the expected value from another block's header, and read it
+/// off a block that carried transactions.
 pub(crate) fn read_base_fee(node: &str, block_number: u64) -> eyre::Result<u64> {
     let block = get_block(node, Some(block_number))?;
     let raw = block

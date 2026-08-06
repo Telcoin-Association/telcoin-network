@@ -219,9 +219,10 @@ pub(super) fn handle_has_mint_role(
     /// Flat charge for the one storage read this view performs.
     ///
     /// A single cold `SLOAD` of the queried address's mint-role slot at the Cancun price:
-    /// `1 * 2_100 = 2_100`, i.e. `1.00x` coverage. A governance caller short-circuits in
-    /// [`has_mint_role`] before the read and so overpays by the full `2_100`; the constant is
-    /// priced for the read that actually happens rather than for that special case.
+    /// `1 * 2_100 = 2_100`, i.e. `1.00x` coverage. A query *for* the governance address
+    /// short-circuits in [`has_mint_role`] before the read — the check is on the calldata argument,
+    /// not the caller — so that one input overpays by the full `2_100` regardless of who asks; the
+    /// constant is priced for the read that actually happens rather than for that special case.
     ///
     /// Derived in this module's `README.md`, "Gas costs" / "View functions".
     const GAS_COST: u64 = 2_100;
