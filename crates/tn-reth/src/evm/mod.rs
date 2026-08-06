@@ -67,10 +67,37 @@ pub use utils::calculate_gas_penalty;
 /// Gas budget for a single protocol system call.
 ///
 /// System calls run at `gas_price: 0` and do not count toward the block gas limit, so this
-/// bound exists only to stop runaway execution. It is sized well above the block gas limit to
-/// give the epoch-closing `concludeEpoch` call headroom: that call applies rewards, slashes,
-/// and queued stake settlement across the full validator set in one transaction.
+/// bound exists only to stop runaway execution. The 100M headroom (vs the historical 30M
+/// budget) is for the one-shot `migrateValidatorSets()` walk at the ConsensusRegistry fork
+/// boundary (see `tn-types` `forks.rs`), which touches every validator in a single call; the
+/// regular boundary calls fit far below it.
+///
+/// LOCKSTEP FLEET-UPGRADE REQUIREMENT: this value participates in consensus.
+/// `transact_system_call` swaps `block.gas_limit` to this value for the call's duration, and a
+/// binary built with the old 30M diverges from a 100M binary on any system call needing more
+/// than 30M — exactly the calls the headroom exists for. Every validator must run a binary
+/// with the same value before any close can depend on it. (Relatedly, the epoch boundary is
+/// three calls — `applyIncentives`, `applySlashes`, `concludeEpoch` — vs two on `main`;
+/// `applySlashes` is present in the deployed testnet and mainnet genesis bytecode and an
+/// empty-array call is a state-neutral no-op, so existing history replays unchanged.)
+///
+/// Read-path note: contract reads that share the system-call plumbing (including RPC reads via
+/// `read_contract_at_block`) inherit this ceiling — an accepted consequence of the raise.
+///
+/// Observability: the `tn_reth.epoch_close_*` gauges (`crate::metrics`) publish what each
+/// epoch-boundary call spends against this budget, and the budget itself, so consumption is a
+/// ratio a dashboard can watch rather than something discovered when a close halts the fleet.
 pub(crate) const SYSTEM_CALL_GAS_LIMIT: u64 = 100_000_000;
+
+/// Gas budget for a single pre-genesis constructor CREATE
+/// (`TNEvm::transact_pre_genesis_create`).
+///
+/// Deliberately 30M — the chain's block gas limit — as a deploy-size ceiling for the genesis
+/// ceremony, NOT a stale copy of the old 30M system-call budget (that constant is
+/// [`SYSTEM_CALL_GAS_LIMIT`] and moved to 100M for epoch-boundary headroom). Pre-genesis
+/// creates run at `gas_price: 0` with the block gas limit raised to match, so the bound exists
+/// to stop runaway constructor execution at the same scale a live block would allow.
+pub(crate) const PRE_GENESIS_CREATE_GAS_LIMIT: u64 = 30_000_000;
 
 /// TN EVM implementation.
 ///
@@ -317,9 +344,10 @@ where
     /// Deploy a contract during pre-genesis construction (a CREATE, not a call).
     ///
     /// Uses the same relaxed environment as `transact_system_call` — zero gas price and base fee,
-    /// nonce and chain-id checks disabled — under its own fixed 30M gas budget with the block gas
-    /// limit raised to match, but issues a `TxKind::Create` and returns the full result state for
-    /// the caller to commit (no `SYSTEM_ADDRESS` stripping convention here).
+    /// nonce and chain-id checks disabled — under its own [`PRE_GENESIS_CREATE_GAS_LIMIT`]
+    /// budget with the block gas limit raised to match, but issues a `TxKind::Create` and
+    /// returns the full result state for the caller to commit (no `SYSTEM_ADDRESS` stripping
+    /// convention here).
     pub(crate) fn transact_pre_genesis_create(
         &mut self,
         caller: Address,
@@ -330,7 +358,7 @@ where
             kind: TxKind::Create,
             // Explicitly set nonce to 0 so revm does not do any nonce checks
             nonce: 0,
-            gas_limit: 30_000_000,
+            gas_limit: PRE_GENESIS_CREATE_GAS_LIMIT,
             value: U256::ZERO,
             data,
             // Setting the gas price to zero enforces that no value is transferred as part of the

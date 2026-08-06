@@ -115,8 +115,10 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
         .await
         .unwrap();
 
-    // AND we add some commits without any final scores
-    for sequence_number in 0..10 {
+    // AND we add some commits without any final scores. Numbering starts at 1: a fresh chain's
+    // latest consensus number is 0 and `save_consensus_output` hard-rejects any number that
+    // does not strictly advance it (number 0 used to be silently dropped).
+    for sequence_number in 1..10 {
         let cert = Certificate::default();
         let sub_dag = CommittedSubDag::new(
             vec![cert.clone()],
@@ -124,6 +126,7 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
             sequence_number,
             ReputationScores::new(&committee),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
@@ -148,7 +151,14 @@ async fn test_consensus_store_read_latest_final_reputation_scores() {
         }
 
         let cert = Certificate::default();
-        let sub_dag = CommittedSubDag::new(vec![cert.clone()], cert, sequence_number, scores, None);
+        let sub_dag = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            sequence_number,
+            scores,
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
 
         consensus_chain.write_subdag_for_test(sequence_number, sub_dag).await;
     }

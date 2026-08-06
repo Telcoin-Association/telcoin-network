@@ -7,7 +7,8 @@
 //! - `RethEnv` test constructors and read helpers: `new_for_test`, `state_by_block_hash`, `tn_evm`,
 //!   `execution_outcome_for_tests`, and `ConsensusRegistry` reads (`get_validator_rewards`,
 //!   `get_bls_pubkey`, `get_validator_info`, `validators_for_epoch_at_block`,
-//!   `get_worker_fee_configs`).
+//!   `get_worker_fee_configs`), plus the pinned `WorkerConfigs` table read
+//!   [`read_worker_config_entries_at`].
 //! - Batch fixtures: `transaction`, `batch`, `batches`, `fixture_batch_with_transactions`,
 //!   `batch_with_transactions`.
 //! - Genesis builders: `seeded_genesis_from_random_batch(es)`, and the
@@ -26,8 +27,11 @@ use crate::{
     evm::TNEvm,
     payload::TNPayload,
     recover_raw_transaction,
-    system_calls::{ConsensusRegistry, EpochState, CONSENSUS_REGISTRY_ADDRESS},
-    ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool,
+    system_calls::{
+        decode_worker_fee_configs, ConsensusRegistry, EpochState, WorkerConfigs,
+        CONSENSUS_REGISTRY_ADDRESS,
+    },
+    ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool, SYSTEM_ADDRESS,
 };
 use alloy::{
     consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant, TxLegacy},
@@ -41,14 +45,16 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
-use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
+use reth_evm::{execute::Executor as _, ConfigureEvm, Evm as _, EvmFactory as _};
 use reth_primitives::sign_message;
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     CanonChainTracker as _, ChainStateBlockWriter as _, DBProvider as _,
     DatabaseProviderFactory as _, StateProviderBox, StateProviderFactory,
 };
-use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
+use reth_revm::{
+    context::result::ExecutionResult, database::StateProviderDatabase, db::BundleState, State,
+};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
 use secp256k1::{
     rand::{rngs::StdRng, Rng, SeedableRng as _},
@@ -60,10 +66,10 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tn_config::NodeInfo;
+use tn_config::{NodeInfo, WORKER_CONFIGS_ADDRESS};
 use tn_types::{
     address, calculate_transaction_root,
-    gas_accumulator::{RewardsCounter, WorkerFeeConfig},
+    gas_accumulator::{GasAccumulator, WorkerConfigEntry, WorkerFeeConfig},
     generate_proof_of_possession_bls_for_test, keccak256, now, test_chain_spec_arc, test_genesis,
     AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsKeypair,
     BlsPublicKey, BlsSignature, Bytes, Certificate, CommittedSubDag, Committee, CommitteeBuilder,
@@ -90,7 +96,7 @@ impl RethEnv {
     pub fn new_for_test<P: AsRef<Path>>(
         db_path: P,
         task_manager: &TaskManager,
-        rewards: Option<RewardsCounter>,
+        rewards: Option<GasAccumulator>,
     ) -> eyre::Result<Self> {
         Self::new_for_temp_chain(test_chain_spec_arc(), db_path, task_manager, rewards)
     }
@@ -260,11 +266,13 @@ impl RethEnv {
     /// The returned `Vec`'s length is the on-chain `numWorkers()` at the canonical tip (the
     /// arity between the count and the per-worker arrays is validated in
     /// `Self::worker_fee_configs_inner`). Callers size their in-memory worker state (e.g. the
-    /// `GasAccumulator`) to match, rather than asserting a preconceived count.
+    /// `GasAccumulator`) to match, rather than asserting a preconceived count. Each row's `data`
+    /// word is projected out here; tests that need it read entries through
+    /// [`read_worker_config_entries_at`].
     pub fn get_worker_fee_configs(&self) -> StateReadResult<Vec<WorkerFeeConfig>> {
         let canonical_tip = self.canonical_tip();
-        let (_num_workers, configs) = self.worker_fee_configs_inner(&canonical_tip)?;
-        Ok(configs)
+        let (_num_workers, entries) = self.worker_fee_configs_inner(&canonical_tip)?;
+        Ok(entries.into_iter().map(|entry| entry.config).collect())
     }
 }
 
@@ -816,6 +824,28 @@ pub fn plant_finalized_marker(reth_env: &RethEnv, header: SealedHeader) -> eyre:
     Ok(())
 }
 
+/// Execute `getAllWorkerConfigs()` against the state of `block` and decode the raw return bytes
+/// through the production seam (`decode_worker_fee_configs`) — the exact decode the closing
+/// block's `record_next_epoch_base_fees` uses — returning the on-chain worker count and one
+/// [`WorkerConfigEntry`] per worker (fee strategy plus the raw `data` word).
+///
+/// Cross-crate epoch-close tests use this to read the next-epoch base fee a closing block
+/// recorded in an EIP-1559 worker's `data` word, pinned at that block's state and observed
+/// through the same system-call + decode path that produced the write.
+pub fn read_worker_config_entries_at(
+    env: &RethEnv,
+    block: B256,
+) -> eyre::Result<(u16, Vec<WorkerConfigEntry>)> {
+    let mut tn_evm = env.tn_evm(block)?;
+    let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
+    let res = tn_evm.transact_system_call(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+    let data = match res.result {
+        ExecutionResult::Success { output, .. } => output.into_data(),
+        other => eyre::bail!("getAllWorkerConfigs failed at pinned block {block}: {other:?}"),
+    };
+    decode_worker_fee_configs(&data).map_err(|e| eyre::eyre!(e))
+}
+
 /// Build a test genesis whose `ConsensusRegistry` is freshly deployed from the current artifact
 /// (so the new ABI surface like `getValidatorsInfo` exists) and seeded with `num_validators`
 /// active validators forming the genesis committee.
@@ -933,6 +963,20 @@ pub fn consensus_output_for_tests(
         subdag_index,
         reputation_scores,
         previous_sub_dag,
+        // Anchor on `epoch`'s root rather than the genesis placeholder, which would freeze the
+        // shuffle seed to one constant for every epoch and leave the epoch-close tests in
+        // `crate::env::epoch` pinning that constant instead of a seed-dependent committee.
+        //
+        // CAVEAT: this re-derives the root on EVERY call, ignoring `subdag_index`, so it models
+        // production only for the FIRST commit of `epoch`. `CommittedSubDag::new` documents
+        // `seed_chain` as the previous commit's value (the epoch root only at the first commit),
+        // and this fixture does not thread that chain forward. Two calls with the same `epoch`
+        // therefore produce the same seed even though they stand in for different commits. That is
+        // currently harmless because the seed is only read when `close_epoch` is true
+        // (`TNPayload::new`) and every such call site here uses a freshly incremented epoch. A new
+        // test that closes the same epoch twice would silently pin a degenerate seed: thread the
+        // prior output's `committee_shuffle_seed()` in instead of calling this helper again.
+        tn_types::EpochSeedChainValue::epoch_root(epoch),
     );
     ConsensusOutput::new(
         sub_dag,

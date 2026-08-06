@@ -24,6 +24,7 @@
 //! yet executed is replayed to the engine, with a guard that refuses to cross an
 //! epoch boundary.
 
+use super::run_epoch::retry_provider_faults;
 use crate::{
     engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode, worker::WorkerNode,
     EngineToPrimaryRpc,
@@ -51,7 +52,7 @@ use tn_rpc::RpcNodeInfo;
 use tn_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
     CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    Multiaddr, NetworkPublicKey, P2pNode, SealedHeader, TaskManager, TaskSpawner,
+    EpochDigest, Multiaddr, NetworkPublicKey, P2pNode, SealedHeader, TaskManager, TaskSpawner,
     DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
@@ -130,14 +131,39 @@ where
     /// `EpochInfo`/epoch-start scalars are unchanged by the pin, since `concludeEpoch` writes them
     /// exactly once at the boundary.
     /// On-chain BLS key bytes are decoded here and a decode failure aborts committee construction.
+    ///
+    /// READ-FAILURE POLICY: the read is a consensus input, so its failure is classified by
+    /// committee determinism ([`StateReadError`](tn_reth::error::StateReadError)) and BOTH classes
+    /// halt. There is deliberately no fail-open arm, despite what
+    /// [`ChainGlobal`](tn_reth::error::StateReadError::ChainGlobal)'s variant doc says about
+    /// keep-current staying committee-consistent: the node is ENTERING the epoch, so it holds no
+    /// prior committee to keep, and entering on an unverifiable one is a consensus-safety failure
+    /// while halting is a single-node liveness failure. A
+    /// [`Provider`](tn_reth::error::StateReadError::Provider) fault is node-local (peers reading
+    /// the same block may succeed), so it is retried briefly first.
     pub(super) async fn get_committee_with_epoch_start_info(
         &self,
         engine: &ExecutionNode,
     ) -> eyre::Result<(Committee, EpochInfo, u64, SealedHeader)> {
+        // Sample the bootstrap tip ONCE, OUTSIDE the retry below. This is what makes the retry
+        // safe: the pin the read resolves is a function of the tip (`concludeEpoch` rewrites
+        // both the epoch number and its `blockHeight` at EVERY boundary, not once ever), so
+        // re-sampling per attempt could resolve a different header on a later attempt. With the
+        // sample held here, every attempt provably resolves the same pin.
+        let tip = engine.get_reth_env().await.canonical_tip();
         let (
             EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start },
             epoch_start_header,
-        ) = engine.epoch_state_at_epoch_start().await?;
+        ) = retry_provider_faults("epoch-entry state read", || {
+            engine.epoch_state_at_epoch_start_from_tip(&tip)
+        })
+        .await
+        .map_err(|e| {
+            eyre!(
+                "failed epoch-entry state read - halting rather than entering an epoch with an \
+                 unverifiable committee: {e}"
+            )
+        })?;
         let validators = validators
             .iter()
             .zip(bls_pubkeys.iter())
@@ -242,6 +268,11 @@ where
         // prefetch is a best-effort network warm-up: the next committee's keys are reused from
         // the config (already read at the pin — no second chain read to fail), and a failed
         // epoch + 2 read is logged and skipped rather than aborting epoch start.
+        //
+        // Deliberately NOT wrapped in `retry_provider_faults`, unlike the hard entry reads: a
+        // provider fault here costs a network warm-up, not correctness, and paying up to
+        // CLOSE_READ_ATTEMPTS x CLOSE_READ_RETRY_BACKOFF on the epoch-entry critical path to
+        // salvage one is a bad trade. Both failure classes skip.
         prefetches.extend(consensus_config.next_committee_keys().iter());
         match engine.validators_for_epoch_at_header(committee.epoch() + 2, epoch_start_header).await
         {
@@ -269,11 +300,21 @@ where
     /// different pin than the rest of the entry path. Folding in the next committee's keys —
     /// read at the same pin — lets the network pre-resolve the successor committee. Produces a
     /// config scoped to this epoch only.
+    ///
+    /// `prior_epoch_record` is the digest of the previous epoch's `EpochRecord` resolved by
+    /// `open_epoch_pack` (default digest for epoch 0). It anchors the canonical epoch-close
+    /// seed message this epoch's proposers sign and voters verify, so it MUST be the real
+    /// chain-derived digest - never a silent default. For seed-signature-active epochs
+    /// `open_epoch_pack` additionally guarantees the digest is certificate-backed: it is only
+    /// released after the record's `EpochCertificate` verified with a super-quorum of the
+    /// prior committee (see `certified_prior_epoch_anchor`), so an uncertified locally-divergent
+    /// record can never be captured as this epoch's anchor.
     pub(super) async fn configure_consensus(
         &self,
         network_config: &NetworkConfig,
         committee: Committee,
         next_committee_keys: Vec<BlsPublicKey>,
+        prior_epoch_record: EpochDigest,
     ) -> eyre::Result<ConsensusConfig<DB>> {
         let validators = committee.bls_keys();
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
@@ -286,6 +327,7 @@ where
             committee,
             network_config.clone(),
             next_committee_keys,
+            prior_epoch_record,
         )?;
 
         Ok(consensus_config)
@@ -693,9 +735,13 @@ where
     /// committee peers — the peer manager drops dials to peers already connected — then waits
     /// for peers before spawning the network on the epoch-scoped spawner.
     ///
-    /// The batch topic is subscribed, restricted to committee publishers so non-CVVs can
-    /// prefetch batches (harmless for CVVs). Non-CVVs push the transactions they accept to
-    /// the committee over RPC rather than gossiping them (issue #804).
+    /// The batch topic is subscribed only by committee validators, restricted to committee
+    /// publishers, so they can prefetch batch bodies into `NodeBatchesCache` ahead of the vote
+    /// path. Observers skip it and unsubscribe: they receive batch bodies inside the verified
+    /// consensus output and epoch packs they already download (`crates/state-sync`), so the
+    /// digest gossip would only fetch the same bytes a second time (issue #960). Non-CVVs push
+    /// the transactions they accept to the committee over RPC rather than gossiping them
+    /// (issue #804).
     #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_network_for_epoch(
         &mut self,
@@ -765,15 +811,28 @@ where
 
         Self::wait_for_network_peers(network_handle.inner_handle(), "worker network").await?;
 
-        // Get gossip from committee members about batches every epoch.
-        // Useful for non-CVVs to prefetch and harmless for CVVs.
-        network_handle
-            .inner_handle()
-            .subscribe_with_publishers(
-                tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id()),
-                committee_keys.into_iter().collect(),
-            )
-            .await?;
+        // Decide the batch-digest gossip subscription for this epoch (issue #960). Committee
+        // validators subscribe to warm the vote path's batch cache; observers unsubscribe,
+        // because state-sync already delivers batch bodies with the consensus output they
+        // follow, so the prefetch would refetch bytes they are downloading anyway.
+        //
+        // The decision is two-sided rather than a bare skip because the worker swarm is
+        // process-lifetime: a validator that subscribed in one epoch stays subscribed into every
+        // later epoch unless the subscription is explicitly dropped. Skipping alone would also
+        // skip the only refresh of this topic's authorized-publisher allowlist, freezing it on
+        // the committee that was current when the node last subscribed.
+        let batch_topic = tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id());
+        let mode = self.consensus_bus.current_node_mode();
+        if should_subscribe_batch_topic(mode) {
+            debug!(target: "epoch-manager", ?mode, "subscribing to worker batch topic");
+            network_handle
+                .inner_handle()
+                .subscribe_with_publishers(batch_topic, committee_keys.into_iter().collect())
+                .await?;
+        } else {
+            debug!(target: "epoch-manager", ?mode, "skipping worker batch topic - follows consensus output");
+            network_handle.inner_handle().unsubscribe(batch_topic).await?;
+        }
 
         // spawn worker network
         WorkerNetwork::new(
@@ -811,12 +870,14 @@ where
             .authority_id()
             .map(|id| consensus_config.in_committee(&id))
             .unwrap_or(false);
+        // A failed storage lookup inside prime_consensus aborts epoch startup loudly rather
+        // than priming the rounds from a silently-defaulted consensus header.
         state_sync::prime_consensus(
             consensus_bus.app(),
             consensus_config,
             self.consensus_chain.clone(),
         )
-        .await;
+        .await?;
         let mode = if !in_committee || self.builder.tn_config.observer {
             NodeMode::Observer
         } else {
@@ -945,5 +1006,48 @@ impl ReplayResult {
     /// Take `Self::last_replayed_hash` if it exists.
     pub(super) fn take_last_replayed_hash(&mut self) -> Option<ConsensusHeaderDigest> {
         self.last_replayed_hash.take()
+    }
+}
+
+/// Whether a node in this [`NodeMode`] should subscribe to the worker batch-digest gossip topic.
+///
+/// Only nodes that consume individual current-epoch batches benefit: a committee validator
+/// prefetches the body into `NodeBatchesCache` so the vote path finds it locally instead of
+/// fetching it on demand. That includes `CvvInactive` — a validator catching up to rejoin warms
+/// the cache it will vote against, and a mode-change re-entry does not clear that cache, so the
+/// warm-up survives its promotion. An `Observer` never votes and receives batch bodies inside the
+/// verified consensus output and epoch packs it already downloads (`crates/state-sync`), so for it
+/// the prefetch is pure duplicate bandwidth.
+///
+/// Equivalent to [`ConsensusBus::is_cvv`], written as an exhaustive match so a new [`NodeMode`]
+/// variant fails to compile until this decision is made for it.
+fn should_subscribe_batch_topic(mode: NodeMode) -> bool {
+    match mode {
+        NodeMode::CvvActive | NodeMode::CvvInactive => true,
+        NodeMode::Observer => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_subscribe_batch_topic, NodeMode};
+
+    /// An active committee validator prefetches batches for the vote path.
+    #[test]
+    fn active_cvv_subscribes_to_batch_topic() {
+        assert!(should_subscribe_batch_topic(NodeMode::CvvActive));
+    }
+
+    /// A validator catching up to rejoin warms the cache it is about to vote against; the cache
+    /// survives the mode-change re-entry that promotes it.
+    #[test]
+    fn inactive_cvv_subscribes_to_batch_topic() {
+        assert!(should_subscribe_batch_topic(NodeMode::CvvInactive));
+    }
+
+    /// An observer follows consensus output and would only refetch bytes it already downloads.
+    #[test]
+    fn observer_does_not_subscribe_to_batch_topic() {
+        assert!(!should_subscribe_batch_topic(NodeMode::Observer));
     }
 }

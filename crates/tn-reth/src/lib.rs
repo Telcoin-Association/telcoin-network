@@ -104,6 +104,9 @@ pub use reth_node_core::{
     node_config::DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use reth_primitives_traits::crypto::secp256k1::sign_message;
+/// Test-only re-export so engine tests can construct static-file provider errors.
+#[cfg(feature = "test-utils")]
+pub use reth_provider::StaticFileSegment;
 pub use reth_provider::{
     providers::StaticFileProvider, CanonStateNotificationStream, ChangedAccount,
 };
@@ -150,6 +153,21 @@ pub use types::*;
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
+
+/// True when this binary was compiled with the `faucet` cargo feature.
+///
+/// The faucet feature replaces the TEL precompile's timelocked, governance-only
+/// `mint(uint256)` entry point with the instant, role-gated `mint(address,uint256)`
+/// faucet variant, so a faucet build and a default build compute different state roots
+/// for the same block once either mint selector is called. Startup code uses this
+/// constant to refuse to join networks where that divergence would split consensus.
+///
+/// # Invariant
+///
+/// A runtime constant (rather than a `#[cfg]` in the caller) is the ground truth for
+/// the whole binary: cargo feature unification means any crate in the build graph that
+/// enables `tn-reth/faucet` flips this value for every consumer of this crate.
+pub const FAUCET_ENABLED: bool = cfg!(feature = "faucet");
 
 /// Process-global holder of the chain's base-fee recipient address.
 ///

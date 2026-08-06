@@ -9,7 +9,7 @@ use std::{
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
     Authority, AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Epoch,
-    Hash as _, HeaderDigest, Multiaddr, NetworkPublicKey, Notifier,
+    EpochDigest, Hash as _, HeaderDigest, Multiaddr, NetworkPublicKey, Notifier,
 };
 use tracing::info;
 
@@ -25,6 +25,11 @@ struct ConsensusConfigInner<DB> {
     local_network: LocalNetwork,
     network_config: NetworkConfig,
     genesis: HashMap<HeaderDigest, Certificate>,
+    /// Digest of the previous epoch's `EpochRecord` ([`EpochDigest::default`] for epoch 0).
+    ///
+    /// Single source of truth for the canonical epoch-close seed message: proposers sign it and
+    /// voters verify header seed signatures against it, so both sides must read the same value.
+    prior_epoch_record: EpochDigest,
 }
 
 /// The configuration for consensus.
@@ -56,6 +61,7 @@ where
         key_config: KeyConfig,
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
+        prior_epoch_record: EpochDigest,
     ) -> eyre::Result<Self> {
         // Production entry point: enforce the operational floors that the shared, test-facing
         // `new_with_committee` deliberately skips so DAG test fixtures may use small `gc_depth`
@@ -74,6 +80,7 @@ where
             committee,
             network_config,
             next_committee_keys,
+            prior_epoch_record,
         )
     }
 
@@ -96,6 +103,33 @@ where
             committee,
             network_config,
             vec![],
+            EpochDigest::default(),
+        )
+    }
+
+    /// Creates a test configuration with a pre-loaded committee and an explicit
+    /// `prior_epoch_record`.
+    ///
+    /// **WARNING: This method is exposed publicly for testing ONLY.**
+    /// Mirrors [`Self::new_with_committee_for_test`] but seeds a specific `prior_epoch_record`
+    /// instead of [`EpochDigest::default`], so tests can exercise the epoch-close seed path with a
+    /// non-default cross-epoch anchor (the value a proposer signs and a voter verifies against).
+    pub fn new_with_committee_and_prior_epoch_record_for_test(
+        config: Config,
+        node_storage: DB,
+        key_config: KeyConfig,
+        committee: Committee,
+        network_config: NetworkConfig,
+        prior_epoch_record: EpochDigest,
+    ) -> eyre::Result<Self> {
+        Self::new_with_committee(
+            config,
+            node_storage,
+            key_config,
+            committee,
+            network_config,
+            vec![],
+            prior_epoch_record,
         )
     }
 
@@ -110,6 +144,7 @@ where
         committee: Committee,
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
+        prior_epoch_record: EpochDigest,
     ) -> eyre::Result<Self> {
         // Production entry point: enforce the operational floors (see
         // [`Parameters::validate_operational_floors`]); the shared test-facing constructor skips
@@ -123,6 +158,7 @@ where
             committee,
             network_config,
             next_committee_keys,
+            prior_epoch_record,
         )
     }
 
@@ -140,6 +176,7 @@ where
         committee: Committee,
         network_config: NetworkConfig,
         next_committee_keys: Vec<BlsPublicKey>,
+        prior_epoch_record: EpochDigest,
     ) -> eyre::Result<Self> {
         // Reject a configuration whose consensus parameters exceed the protocol ceilings the
         // consensus-pack reader relies on, so a node can never commit an output it cannot later
@@ -174,6 +211,7 @@ where
                 local_network,
                 network_config,
                 genesis,
+                prior_epoch_record,
             }),
             shutdown,
         })
@@ -211,6 +249,15 @@ where
     /// Returns the keys for the next committee.
     pub fn next_committee_keys(&self) -> &[BlsPublicKey] {
         &self.inner.next_committee_keys
+    }
+
+    /// Returns the digest of the previous epoch's `EpochRecord`.
+    ///
+    /// [`EpochDigest::default`] for epoch 0, which has no prior record. This anchors the
+    /// canonical epoch-close seed message: proposers sign over it and voters verify header
+    /// seed signatures against it.
+    pub fn prior_epoch_record(&self) -> EpochDigest {
+        self.inner.prior_epoch_record
     }
 
     /// Returns a reference to the node's persistent storage database for the current epoch.

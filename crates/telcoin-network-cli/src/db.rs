@@ -5,7 +5,10 @@
 //! `MissingBatches` check and classifying each missing batch as Absent (a real data gap) vs
 //! Misordered (present, but in the wrong consensus-header group).
 
-use crate::{node::NamedChain, version::SHORT_VERSION};
+use crate::{
+    node::{validate_faucet_build, NamedChain},
+    version::SHORT_VERSION,
+};
 use clap::{Args, Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::{bail, eyre};
@@ -188,6 +191,10 @@ impl DbLoadStateArgs {
             Some(NamedChain::MainNet) => Config::load_mainnet(&datadir, false, SHORT_VERSION)?,
             None => Config::load(&datadir, false, SHORT_VERSION)?,
         };
+
+        // A faucet-compiled binary must not prepare mainnet chain data either: same guard as
+        // the node command, refused before any datadir mutation.
+        validate_faucet_build(tn_reth::FAUCET_ENABLED, tn_config.genesis())?;
 
         // Reject a non-resumable bundle BEFORE `restore_pack` mutates the datadir, so a refusal
         // leaves the target untouched.
@@ -531,12 +538,13 @@ fn restore_pack(
     let restorer = SnapshotRestorer::open(reth_config, db, &task_manager)?;
     restorer.import_chain_scaffold(&window, final_state)?;
     let root = restorer.import_state(&mut reader)?;
-    // Reject a bundle the node could not resume from BEFORE declaring the import complete: if the
-    // snapshot's epoch has no worker activity to anchor base-fee derivation, a node started from it
-    // would walk below the snapshot into state it does not have and halt. Fail here with a clear,
-    // worker-naming message instead of letting that surface as a cryptic runtime crash later.
+    // Reject a bundle the node could not resume from BEFORE declaring the import complete. The
+    // restored node seeds its first epoch entry from ONE pinned read at the snapshot's final block,
+    // so that block must be the one that closed an epoch and its `WorkerConfigs` rows must all read
+    // back as fees. Fail here with a clear, block- and worker-naming message instead of letting
+    // that surface as a cryptic runtime crash at the node's first epoch entry.
     restorer
-        .check_resumable_fees(&window)
+        .entry_readiness_precondition(final_state)
         .map_err(|e| eyre!("{e}; bootstrap from a later epoch's bundle instead"))?;
     restorer.finish(final_state)?;
     Ok((final_state, root))
@@ -634,6 +642,14 @@ fn restore_consensus_and_records(
         // final consensus header before declaring success.
         let tip = pack.latest_consensus_header().await;
         drop(pack);
+        // Read-back failure and tip mismatch are different diagnoses and get different messages: a
+        // mismatch means the bundle rebuilt into the wrong chain, whereas an `Err` means the pack
+        // could not be read at all. Both roll the epoch dir back, matching the import error path
+        // above, since this restore wrote that directory itself and owns the cleanup.
+        let tip = tip.map_err(|e| {
+            let _ = fs::remove_dir_all(&epoch_dir);
+            eyre!("failed to read back the rebuilt consensus pack tip for epoch {n}: {e}")
+        })?;
         let tip_ok = matches!(
             &tip,
             Some(header)

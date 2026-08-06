@@ -24,7 +24,7 @@ use tn_types::{
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlsPublicKey, Certificate,
     ConsensusResult, ConsensusResultDigest, Database, Epoch, EpochCertificate, EpochDigest,
-    EpochRecord, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
+    EpochRecord, EpochSeedMessage, Hash as _, Header, HeaderDigest, ProtocolSignature, Round,
     SignatureVerificationState, TnSender as _, Vote,
 };
 use tokio::{sync::Mutex as TokioMutex, time::timeout};
@@ -166,6 +166,15 @@ where
             .consensus_bus
             .last_consensus_block(&self.consensus_chain)
             .await
+            .inspect_err(|e| {
+                // A failed lookup is logged loudly but degrades to the same conservative
+                // "nothing executed" reading a legitimately-absent header gets: this path only
+                // decides whether to drop into catch-up mode, so liveness is preserved while
+                // the storage failure is surfaced instead of silently swallowed.
+                error!(target: "primary", "failed to load last consensus block while checking if this node is behind: {e}");
+            })
+            .ok()
+            .flatten()
             .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
         // When empty outputs are skipped by execution, no new EVM block is produced.
@@ -724,6 +733,36 @@ where
             num_parents <= committee.size(),
             HeaderError::TooManyParents(num_parents, committee.size()).into()
         );
+
+        // Verify the author's seed signature over the canonical per-`(author, round)` seed message
+        // before any blocking wait or state mutation. A certificate needs 2f+1 votes, so refusing
+        // to vote here guarantees every certified header carries at least ONE honest attestation
+        // that its seed signature is valid: with an honest author the 2f+1 can be the author's own
+        // self-vote (see `certifier.rs`, which bypasses `vote_inner`) plus f Byzantine voters plus
+        // f honest voters, so f+1 honest attestations are not guaranteed. One honest attestation is
+        // enough for the property that matters - the epoch seed chain the closing leader feeds
+        // cannot be forked or forged (#1032).
+        //
+        // The accessor is the fork gate (#1086): `Header::seed_signature` is `Some` exactly when
+        // `tn_types::forks::seed_signature_active` holds for the header's epoch. Pre-fork headers
+        // carry no seed signature on the wire (the decoded legacy default is unreachable through
+        // the accessor), so verification is skipped entirely for them and their vote path is
+        // identical to origin/main.
+        let author = committee
+            .authority(header.author())
+            .ok_or_else(|| HeaderError::UnknownAuthority(header.author().to_string()))?;
+        let seed_message = EpochSeedMessage::new(
+            committee.epoch(),
+            header.round(),
+            self.consensus_config.prior_epoch_record(),
+        );
+        header.seed_signature().map_or(Ok(()), |seed_signature| -> PrimaryNetworkResult<()> {
+            ensure!(
+                seed_message.verify(seed_signature, author.protocol_key()),
+                HeaderError::InvalidSeedSignature.into()
+            );
+            Ok(())
+        })?;
 
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up

@@ -72,8 +72,14 @@ fn test_committed_subdag_serde_roundtrip() {
     let leader = certificates.last().cloned().unwrap();
     let reputation = ReputationScores::new(&committee);
 
-    let original_subdag =
-        CommittedSubDag::new(certificates.clone(), leader.clone(), 1, reputation, None);
+    let original_subdag = CommittedSubDag::new(
+        certificates.clone(),
+        leader.clone(),
+        1,
+        reputation,
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
 
     // Serialize
     let bytes = encode(&original_subdag);

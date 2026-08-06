@@ -26,7 +26,10 @@
 //!   `test_utils.rs`; production reads the committee through
 //!   [`RethEnv::epoch_state_at_epoch_start`].
 //! - [`RethEnv::epoch_state_at_epoch_start`] pins to the entered epoch's start state: the previous
-//!   epoch's closing block (`epoch_info.blockHeight - 1`), or genesis for epoch 0.
+//!   epoch's closing block (`epoch_info.blockHeight - 1`), or genesis for epoch 0. It samples the
+//!   canonical tip to bootstrap that pin; callers that must prove every attempt of a retried read
+//!   resolves the SAME pin sample the tip themselves and use
+//!   [`RethEnv::epoch_state_at_epoch_start_from_tip`].
 //!
 //! Pinning matters because the registry's committee arrays mutate MID-epoch: a governance
 //! `burn` swap-and-pops the ejected validator out of the CURRENT epoch's stored committee
@@ -40,9 +43,9 @@
 //! a pruner — `PruningArgs` in `cli.rs` is built with every field disabled — so historical
 //! state always resolves fully indexed. If pruning were ever enabled, reth's historical
 //! provider could silently fall back to TIP state for a pruned block, turning a "pinned" read
-//! into exactly the nondeterminism pinning exists to prevent. See the ARCHIVE-MODE note in
-//! [`RethEnv::read_consensus_registry_batch_at_header`]; revisit every pinned read here before
-//! enabling pruning.
+//! into exactly the nondeterminism pinning exists to prevent. Every pinned read here builds its
+//! state through the one `pinned_state_and_env` helper, which carries the normative ARCHIVE-MODE
+//! note; revisit it before enabling pruning.
 //!
 //! # Error classification
 //!
@@ -53,19 +56,38 @@
 //! (revert, halt, decode failure, absent contract — identical on every node, so failing open
 //! stays fleet-consistent). The boundary lives in the private `classified_system_call` helper:
 //! `EVMError::Database` maps to `Provider`; every other transact failure maps to `ChainGlobal`.
+//!
+//! Every consensus-critical pinned read is classified. Epoch state:
+//! [`RethEnv::epoch_state_at_header`], [`RethEnv::epoch_state_at_epoch_start`] and its
+//! [`_from_tip`](RethEnv::epoch_state_at_epoch_start_from_tip) form, and
+//! [`RethEnv::get_current_epoch_info_at_header`]. Committee pubkeys:
+//! [`RethEnv::bls_pubkeys_for_epoch_at_header`], [`RethEnv::bls_pubkeys_for_epochs_at_header`],
+//! and their by-hash siblings [`RethEnv::bls_pubkeys_for_epoch_at_block`] /
+//! [`RethEnv::bls_pubkeys_for_epochs_at_block`]. Worker fees:
+//! [`RethEnv::get_worker_fee_configs_at_block`].
+//!
+//! [`RethEnv::epoch_state_from_canonical_tip`] deliberately stays `eyre`: it is a tip read, so no
+//! caller can act on the classification (a tip read is not committee-deterministic to begin
+//! with). The `read_consensus_registry*` family stays [`EvmReadResult`] because the RPC layer
+//! maps [`EvmReadError::Revert`]'s raw output bytes into an eth_call-style error, which
+//! [`StateReadError`]'s string-only variants cannot carry.
 
-use eyre::OptionExt as _;
 use reth_errors::ProviderError;
 use reth_eth_wire::BlockHashNumber;
-use reth_evm::{ConfigureEvm as _, Evm as _, EvmFactory as _};
+use reth_evm::{ConfigureEvm as _, Evm as _, EvmEnv, EvmFactory as _};
 use reth_provider::{
     BlockIdReader as _, BlockNumReader as _, ChainStateBlockReader as _,
     ChainStateBlockWriter as _, DBProvider as _, DatabaseProviderFactory as _, HeaderProvider as _,
+    StateProviderBox,
 };
-use reth_revm::context::result::{EVMError, ExecutionResult, ResultAndState};
+use reth_revm::{
+    context::result::{EVMError, ExecutionResult, ResultAndState},
+    database::StateProviderDatabase,
+    State,
+};
 use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_types::{
-    gas_accumulator::WorkerFeeConfig, Address, Bytes, Epoch, ExecHeader, SealedHeader,
+    gas_accumulator::WorkerConfigEntry, Address, Bytes, Epoch, ExecHeader, SealedHeader,
     SolCall as _, B256,
 };
 use tracing::{debug, error, warn};
@@ -75,7 +97,10 @@ use crate::{
         EvmReadError, EvmReadResult, StateReadError, StateReadResult, TnRethError, TnRethResult,
     },
     evm::TNEvm,
-    system_calls::{ConsensusRegistry, EpochState, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS},
+    system_calls::{
+        decode_worker_fee_configs, ConsensusRegistry, EpochState, WorkerConfigs,
+        CONSENSUS_REGISTRY_ADDRESS,
+    },
     RethEnv, SYSTEM_ADDRESS,
 };
 
@@ -184,7 +209,9 @@ impl RethEnv {
     pub fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         let canonical_tip = self.canonical_tip();
         debug!(target: "engine", ?canonical_tip, "retrieving epoch state from canonical tip");
-        self.epoch_state_at_header(&canonical_tip)
+        // Stays `eyre` on purpose: this is a TIP read, so its result is not
+        // committee-deterministic to begin with and no caller can act on the classification.
+        Ok(self.epoch_state_at_header(&canonical_tip)?)
     }
 
     /// Read the committee and epoch information from the [ConsensusRegistry] at `header`.
@@ -194,24 +221,23 @@ impl RethEnv {
     /// `epoch_info.blockHeight..=header.number` (catchup and epoch-entry base-fee seeding) rely
     /// on this pin: reading the range start from a different header (e.g. the canonical tip)
     /// could yield a silently empty range if finality ever lags the canonical tip.
-    pub fn epoch_state_at_header(&self, header: &SealedHeader) -> eyre::Result<EpochState> {
+    ///
+    /// Failures are classified per [`StateReadError`] so consensus-critical callers can retry a
+    /// node-local provider fault instead of halting on it.
+    pub fn epoch_state_at_header(&self, header: &SealedHeader) -> StateReadResult<EpochState> {
         // create EVM with the state at the pinned header
-        let mut db = self.read_only_state_db(header.hash())?;
+        let (mut db, evm_env) = self.pinned_state_and_env(header)?;
         debug!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state at header");
-        let mut tn_evm = self
-            .inner
-            .evm_config
-            .evm_factory()
-            .create_evm(&mut db, self.inner.evm_config.evm_env(header)?);
+        let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
         // current epoch number
-        let epoch = self.call_consensus_registry::<_, u32>(
+        let epoch = Self::classified_registry_read::<_, u32>(
             &mut tn_evm,
             ConsensusRegistry::getCurrentEpochCall {}.abi_encode().into(),
         )?;
 
         // current epoch info
-        let epoch_info = self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(
+        let epoch_info = Self::classified_registry_read::<_, ConsensusRegistry::EpochInfo>(
             &mut tn_evm,
             ConsensusRegistry::getCurrentEpochInfoCall {}.abi_encode().into(),
         )?;
@@ -223,21 +249,34 @@ impl RethEnv {
         // canonical chain resolve to this same header, and the
         // `epoch_state_at_epoch_start_pins_pre_burn_committee` test pins the tip/pinned
         // `epoch_start` equality.
+        //
+        // Both failures in the fetch branch are node-local (Provider), not chain-global:
+        // `header_by_number` reads the DATABASE while the caller's header may come from the
+        // in-memory canonical state, so an executed-but-not-yet-persisted closing block can
+        // legitimately miss on this node while every peer resolves it.
         let closing_number = epoch_info.blockHeight.saturating_sub(1);
         let epoch_start = if closing_number == header.number {
             header.timestamp
         } else {
-            self.header_by_number(closing_number)?
-                .ok_or_eyre("failed to retrieve closing epoch information")?
+            self.header_by_number(closing_number)
+                .map_err(|e| {
+                    StateReadError::Provider(format!("closing header {closing_number} lookup: {e}"))
+                })?
+                .ok_or_else(|| {
+                    StateReadError::Provider(format!(
+                        "failed to retrieve closing epoch information: missing block \
+                         {closing_number}"
+                    ))
+                })?
                 .timestamp
         };
 
         // retrieve the committee
-        let validators = self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
+        let validators = Self::classified_registry_read::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
             &mut tn_evm,
             ConsensusRegistry::getCommitteeValidatorsCall { epoch }.abi_encode().into(),
         )?;
-        let bls_pubkeys = self.call_consensus_registry::<_, Vec<alloy::primitives::Bytes>>(
+        let bls_pubkeys = Self::classified_registry_read::<_, Vec<alloy::primitives::Bytes>>(
             &mut tn_evm,
             ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into(),
         )?;
@@ -272,20 +311,56 @@ impl RethEnv {
     /// report the entered epoch. If the pinned epoch disagrees with the tip's, the registry's
     /// `blockHeight == closing block + 1` convention broke; this method fails hard rather than
     /// return a possibly-stale committee.
-    pub fn epoch_state_at_epoch_start(&self) -> eyre::Result<(EpochState, SealedHeader)> {
+    ///
+    /// Samples the canonical tip itself, so two calls can bootstrap off two different tips. A
+    /// caller that RETRIES this read must sample the tip once and use
+    /// [`Self::epoch_state_at_epoch_start_from_tip`] instead — see that method's docs for why the
+    /// difference is load-bearing.
+    pub fn epoch_state_at_epoch_start(&self) -> StateReadResult<(EpochState, SealedHeader)> {
+        self.epoch_state_at_epoch_start_from_tip(&self.canonical_tip())
+    }
+
+    /// [`Self::epoch_state_at_epoch_start`] with the bootstrap tip supplied by the caller.
+    ///
+    /// The pin this resolves is a function of `tip`: the bootstrap read takes the current epoch
+    /// number and its `blockHeight` AT `tip`, and `concludeEpoch` rewrites both at EVERY epoch
+    /// boundary (they are written once per epoch, not once ever). A caller that re-samples the
+    /// canonical tip per attempt could therefore resolve a different pin on a later attempt; one
+    /// that samples `tip` ONCE outside its retry loop proves every attempt resolves the same
+    /// header. Retrying callers must use this form for that reason — see
+    /// `manager::node::start_epoch`'s epoch-entry read.
+    ///
+    /// `tip` need not be the live canonical tip, only a header whose registry state names the
+    /// epoch to enter; passing an older header pins that header's epoch instead.
+    pub fn epoch_state_at_epoch_start_from_tip(
+        &self,
+        tip: &SealedHeader,
+    ) -> StateReadResult<(EpochState, SealedHeader)> {
         // boundary-written-once identity read: deterministic at any tip
-        let (epoch, epoch_info) = self.get_current_epoch_info_at_header(&self.canonical_tip())?;
+        let (epoch, epoch_info) = self.get_current_epoch_info_at_header(tip)?;
 
         let pin_header = if epoch == 0 {
-            self.sealed_header_by_number(0)?.ok_or_else(|| eyre::eyre!("missing genesis header"))?
+            // The pin headers are node-local lookups: the block exists on the committee by
+            // construction, so a miss or an error reflects THIS node's database, not the chain.
+            self.sealed_header_by_number(0)
+                .map_err(|e| StateReadError::Provider(format!("genesis header lookup: {e}")))?
+                .ok_or_else(|| StateReadError::Provider("missing genesis header".into()))?
         } else {
-            let closing_number = epoch_info
-                .blockHeight
-                .checked_sub(1)
-                .ok_or_else(|| eyre::eyre!("current epoch {epoch} reports blockHeight 0"))?;
-            self.sealed_header_by_number(closing_number)?.ok_or_else(|| {
-                eyre::eyre!("missing closing block {closing_number} for current epoch {epoch}")
-            })?
+            // A `blockHeight` of 0 for a non-zero epoch is the registry contradicting its own
+            // `blockHeight == closing block + 1` convention: chain-global, identical on every
+            // node, and no retry can change it.
+            let closing_number = epoch_info.blockHeight.checked_sub(1).ok_or_else(|| {
+                StateReadError::ChainGlobal(format!("current epoch {epoch} reports blockHeight 0"))
+            })?;
+            self.sealed_header_by_number(closing_number)
+                .map_err(|e| {
+                    StateReadError::Provider(format!("closing header {closing_number} lookup: {e}"))
+                })?
+                .ok_or_else(|| {
+                    StateReadError::Provider(format!(
+                        "missing closing block {closing_number} for current epoch {epoch}"
+                    ))
+                })?
         };
         debug!(
             target: "engine",
@@ -305,6 +380,8 @@ impl RethEnv {
         // closing header already reports the entered epoch. This can only fire if the registry's
         // `blockHeight == closing block + 1` convention ever breaks — running a stale committee
         // is a consensus-safety failure, so fail hard instead of returning the mismatched state.
+        // Chain-global: both epochs are deterministic products of their pinned blocks, so every
+        // node reading the same pair observes the same disagreement and no retry can clear it.
         if state.epoch != epoch {
             error!(
                 target: "engine",
@@ -313,12 +390,11 @@ impl RethEnv {
                 tip_epoch = epoch,
                 "epoch-start pin and canonical tip disagree on the current epoch"
             );
-            return Err(eyre::eyre!(
+            return Err(StateReadError::ChainGlobal(format!(
                 "epoch state pinned to block {} reports epoch {} but the canonical tip reports \
                  epoch {epoch}",
-                pin_header.number,
-                state.epoch
-            ));
+                pin_header.number, state.epoch
+            )));
         }
 
         Ok((state, pin_header))
@@ -330,15 +406,33 @@ impl RethEnv {
     /// Every node issuing this read at the same block decodes the identical key set — even
     /// after a mid-epoch governance `burn` swap-and-pops the stored committee arrays; an
     /// unpinned canonical-tip read would not.
+    ///
+    /// Failures are classified per [`StateReadError`]; `block_hash` failing to resolve is
+    /// [`StateReadError::Provider`] (see [`Self::pinned_header_by_hash`]).
     pub fn bls_pubkeys_for_epoch_at_block(
         &self,
         epoch: u32,
         block_hash: B256,
-    ) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
-        let header = self
-            .sealed_header_by_hash(block_hash)?
-            .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
+    ) -> StateReadResult<Vec<alloy::primitives::Bytes>> {
+        let header = self.pinned_header_by_hash(block_hash)?;
         self.bls_pubkeys_for_epoch_at_header(epoch, &header)
+    }
+
+    /// Read the BLS pubkeys for several epochs' committees from the [ConsensusRegistry], pinned
+    /// to the state of the block identified by `block_hash`.
+    ///
+    /// The by-hash sibling of [`Self::bls_pubkeys_for_epochs_at_header`], for callers holding
+    /// only a block hash (the epoch-record close, which pins to the epoch-closing block it
+    /// records as `final_state`). ONE header lookup and ONE pinned EVM serve the whole batch, so
+    /// every set in the result provably derives from the same block — two separate single-epoch
+    /// by-hash reads would each resolve the header independently.
+    pub fn bls_pubkeys_for_epochs_at_block(
+        &self,
+        epochs: &[Epoch],
+        block_hash: B256,
+    ) -> StateReadResult<Vec<Vec<alloy::primitives::Bytes>>> {
+        let header = self.pinned_header_by_hash(block_hash)?;
+        self.bls_pubkeys_for_epochs_at_header(epochs, &header)
     }
 
     /// Read the BLS pubkeys for the committee of the provided epoch from the
@@ -351,43 +445,51 @@ impl RethEnv {
         &self,
         epoch: u32,
         header: &SealedHeader,
-    ) -> eyre::Result<Vec<alloy::primitives::Bytes>> {
-        self.bls_pubkeys_for_epochs_at_header(&[epoch], header)?
-            .pop()
-            .ok_or_else(|| eyre::eyre!("consensus registry batch read returned no result"))
+    ) -> StateReadResult<Vec<alloy::primitives::Bytes>> {
+        // An arity mismatch on a one-element batch is a bug in this node's code, not a transient
+        // fault, so it is chain-global: retrying cannot change it.
+        self.bls_pubkeys_for_epochs_at_header(&[epoch], header)?.pop().ok_or_else(|| {
+            StateReadError::ChainGlobal("consensus registry batch read returned no result".into())
+        })
     }
 
     /// Read the BLS pubkeys for several epochs' committees from the [ConsensusRegistry], pinned
     /// to `header`'s state.
     ///
     /// One `getCommitteeBlsPubkeys` call per epoch, all executed against ONE pinned EVM via
-    /// [`Self::read_consensus_registry_batch_at_header`]; the returned key sets are ordered to
+    /// [`Self::classified_registry_batch_at_header`]; the returned key sets are ordered to
     /// match `epochs`.
     pub fn bls_pubkeys_for_epochs_at_header(
         &self,
         epochs: &[Epoch],
         header: &SealedHeader,
-    ) -> eyre::Result<Vec<Vec<alloy::primitives::Bytes>>> {
+    ) -> StateReadResult<Vec<Vec<alloy::primitives::Bytes>>> {
         let calldatas = epochs
             .iter()
             .map(|&epoch| {
                 ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into()
             })
             .collect();
-        self.read_consensus_registry_batch_at_header(header, calldatas).map_err(Into::into)
+        self.classified_registry_batch_at_header(header, calldatas)
     }
 
     /// Read the [`ConsensusRegistry`] [`EpochInfo`](ConsensusRegistry::EpochInfo) for `epoch` at
     /// the block identified by `block_hash`.
     ///
     /// Builds an EVM pinned to `block_hash`'s state and issues a single `getEpochInfo(uint32)`
-    /// call. The registry keeps a ring buffer of the four most recent epochs and reverts
-    /// (`InvalidEpoch`) for anything outside it, so a successful return is guaranteed to be the
-    /// requested epoch's record. Used by the epoch manager to recover the previous epoch's block
-    /// range from its closing block when deriving next-epoch base fees.
+    /// call. The registry serves the window `[current - 3, current + 2]` and reverts
+    /// (`InvalidEpoch`) outside it — but a FUTURE epoch inside the window does not revert: it
+    /// returns a synthesized projection whose `blockHeight` is 0 (the interface's "not yet
+    /// begun" sentinel) with config fields as they would be stamped if the epoch began now.
+    /// This method exists to recover a *begun* epoch's record (the epoch manager derives the
+    /// previous epoch's block range from its closing block when seeding next-epoch base fees),
+    /// so it rejects non-identity records rather than handing callers a sentinel `blockHeight`
+    /// they would use as a block-scan floor: the returned `epochId` must equal the request
+    /// (re-checked here so a binding drift cannot mislabel a record), and `blockHeight == 0` is
+    /// only legitimate for epoch 0, whose first block is genesis.
     ///
-    /// Fails with a descriptive error if `block_hash` does not resolve to a sealed header or the
-    /// registry call does not succeed.
+    /// Fails with a descriptive error if `block_hash` does not resolve to a sealed header, the
+    /// registry call does not succeed, or the returned record is synthesized/mismatched.
     pub fn get_epoch_info_at_block(
         &self,
         epoch: Epoch,
@@ -396,22 +498,33 @@ impl RethEnv {
         let header = self
             .sealed_header_by_hash(block_hash)?
             .ok_or_else(|| eyre::eyre!("sealed header not found for block hash {block_hash:?}"))?;
-        let mut db = self.read_only_state_db(header.hash())?;
-        let mut tn_evm = self
-            .inner
-            .evm_config
-            .evm_factory()
-            .create_evm(&mut db, self.inner.evm_config.evm_env(&header)?);
+        let (mut db, evm_env) = self.pinned_state_and_env(&header)?;
+        let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
         let calldata = ConsensusRegistry::getEpochInfoCall { epoch }.abi_encode().into();
-        self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)
-            .map_err(Into::into)
+        let info =
+            self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)?;
+
+        if info.epochId != epoch {
+            eyre::bail!(
+                "getEpochInfo({epoch}) at block {block_hash:?} returned a record for epoch {}",
+                info.epochId
+            );
+        }
+        if info.blockHeight == 0 && epoch != 0 {
+            eyre::bail!(
+                "getEpochInfo({epoch}) at block {block_hash:?} returned a not-yet-begun record \
+                 (blockHeight 0): epoch {epoch} had not started as of this block"
+            );
+        }
+
+        Ok(info)
     }
 
     /// Read worker fee configs from the [`WorkerConfigs`] contract at the block identified by
     /// `block_hash`.
     ///
-    /// Returns the on-chain worker count and one [`WorkerFeeConfig`] per worker. Failures are
+    /// Returns the on-chain worker count and one [`WorkerConfigEntry`] per worker. Failures are
     /// classified per [`StateReadError`] (see `worker_fee_configs_inner`); `block_hash`
     /// failing to resolve to a sealed header is [`StateReadError::Provider`] — the pinned block
     /// exists on the committee by construction, so a miss reflects this node's local view, not a
@@ -419,9 +532,21 @@ impl RethEnv {
     pub fn get_worker_fee_configs_at_block(
         &self,
         block_hash: B256,
-    ) -> StateReadResult<(usize, Vec<WorkerFeeConfig>)> {
-        let header = self
-            .sealed_header_by_hash(block_hash)
+    ) -> StateReadResult<(usize, Vec<WorkerConfigEntry>)> {
+        let header = self.pinned_header_by_hash(block_hash)?;
+        self.worker_fee_configs_inner(&header)
+    }
+
+    /// Resolve `block_hash` to its sealed header for a pinned read, classified per
+    /// [`StateReadError`].
+    ///
+    /// Both the lookup error and a `None` are [`StateReadError::Provider`]: the pinned block
+    /// exists on the committee by construction, so failing to resolve it reflects THIS node's
+    /// local view (a provider fault, or a block this node has not indexed yet), not a
+    /// chain-global fact. A peer issuing the same read may succeed, so callers must retry or
+    /// halt rather than fail open.
+    fn pinned_header_by_hash(&self, block_hash: B256) -> StateReadResult<SealedHeader> {
+        self.sealed_header_by_hash(block_hash)
             .map_err(|e| {
                 StateReadError::Provider(format!("header lookup for {block_hash:?}: {e}"))
             })?
@@ -429,14 +554,13 @@ impl RethEnv {
                 StateReadError::Provider(format!(
                     "sealed header not found for block hash {block_hash:?}"
                 ))
-            })?;
-        self.worker_fee_configs_inner(&header)
+            })
     }
 
     /// Read fee configs for all workers from the [`WorkerConfigs`] contract at the given header.
     ///
     /// Builds an EVM against `header`'s state and issues a single `getAllWorkerConfigs()` call.
-    /// Returns the on-chain worker count alongside the decoded [`WorkerFeeConfig`]s.
+    /// Returns the on-chain worker count alongside the decoded [`WorkerConfigEntry`] rows.
     ///
     /// Failures are classified per [`StateReadError`]. The classification boundary: the state
     /// provider construction and any database fault the EVM hits while lazily reading state are
@@ -448,18 +572,22 @@ impl RethEnv {
     ///
     /// Fail-open on unknown strategy ids: a strategy this node does not recognize (only possible
     /// when a future contract version introduces one before this node is upgraded) is NOT an
-    /// error — it falls back to [`WorkerFeeConfig::Eip1559`] with a warning, preserving liveness
-    /// instead of halting all validators on the unrecognized id.
+    /// error — it falls back to
+    /// [`WorkerFeeConfig::Eip1559`](tn_types::gas_accumulator::WorkerFeeConfig::Eip1559) with a
+    /// warning, preserving liveness instead of halting all validators on the unrecognized id.
+    ///
+    /// The decode, arity check, and strategy mapping live in
+    /// [`decode_worker_fee_configs`](crate::system_calls::decode_worker_fee_configs), shared with
+    /// the epoch-closing block's base-fee recording so the two cannot drift. Entries carry each
+    /// row's `data` word alongside its strategy: the epoch-entry fee read is the consumer that
+    /// needs it, taking the next-epoch base fee the closing block recorded there instead of
+    /// re-deriving it. Callers that want strategies only project `entry.config` out. See
+    /// [`WorkerConfigEntry`] for when the word is authoritative.
     pub(crate) fn worker_fee_configs_inner(
         &self,
         header: &SealedHeader,
-    ) -> StateReadResult<(usize, Vec<WorkerFeeConfig>)> {
-        let mut db = self.read_only_state_db(header.hash()).map_err(|e| {
-            StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
-        })?;
-        let evm_env = self.inner.evm_config.evm_env(header).map_err(|e| {
-            StateReadError::ChainGlobal(format!("evm env for {}: {e}", header.hash()))
-        })?;
+    ) -> StateReadResult<(usize, Vec<WorkerConfigEntry>)> {
+        let (mut db, evm_env) = self.pinned_state_and_env(header)?;
         let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
         let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
@@ -477,54 +605,12 @@ impl RethEnv {
                 )))
             }
         };
-        let ret =
-            <WorkerConfigs::getAllWorkerConfigsCall as alloy::sol_types::SolCall>::abi_decode_returns(
-                &data,
-            )
-            .map_err(|e| {
-                StateReadError::ChainGlobal(format!(
-                    "worker configs return decode failed (contract absent at this block?): {e}"
-                ))
-            })?;
+        // decode/arity failures are deterministic products of the pinned block, so they land in
+        // ChainGlobal alongside the revert and absent-contract cases above
+        let (num_workers, entries) =
+            decode_worker_fee_configs(&data).map_err(StateReadError::ChainGlobal)?;
 
-        let num_workers = ret.count as usize;
-        if ret.strategies.len() != num_workers
-            || ret.values.len() != num_workers
-            || ret.datas.len() != num_workers
-        {
-            return Err(StateReadError::ChainGlobal(format!(
-                "worker config arity mismatch: count={num_workers}, strategies={}, values={}, datas={}",
-                ret.strategies.len(),
-                ret.values.len(),
-                ret.datas.len(),
-            )));
-        }
-
-        let mut configs = Vec::with_capacity(num_workers);
-        for (worker_id, (&strategy, &value)) in
-            ret.strategies.iter().zip(ret.values.iter()).enumerate()
-        {
-            let config = match strategy {
-                0 => WorkerFeeConfig::Eip1559 { target_gas: value },
-                1 => WorkerFeeConfig::Static { fee: value },
-                s => {
-                    // The contract rejects unknown strategies, so this branch only fires when a
-                    // future contract version introduces a strategy this node hasn't been
-                    // updated to understand. Fall back to EIP-1559 to preserve liveness instead
-                    // of halting all validators.
-                    tracing::warn!(
-                        target: "tn::reth",
-                        worker_id,
-                        strategy = s,
-                        "unknown fee strategy; falling back to strategy 0 (Eip1559)"
-                    );
-                    WorkerFeeConfig::Eip1559 { target_gas: value }
-                }
-            };
-            configs.push(config);
-        }
-
-        Ok((num_workers, configs))
+        Ok((num_workers as usize, entries))
     }
 
     /// Build an EVM at the canonical tip, execute a read-only [ConsensusRegistry] call, and
@@ -585,11 +671,12 @@ impl RethEnv {
     /// Build a single EVM at `header`'s state and execute several read-only [ConsensusRegistry]
     /// calls against it, decoding each result to `T`.
     ///
-    /// Every calldata in a batch must decode to the same Solidity type `T`. Current callers: the
-    /// tip-pinned five `getValidatorsInfo(status)` reads → `Vec<ValidatorInfo>` (through
-    /// [`Self::read_consensus_registry_batch`]), and
-    /// [`Self::bls_pubkeys_for_epochs_at_header`]'s per-epoch `getCommitteeBlsPubkeys` reads →
-    /// `Vec<Bytes>`, the first caller to batch at an explicit pin.
+    /// Every calldata in a batch must decode to the same Solidity type `T`. The current caller is
+    /// the tip-pinned five `getValidatorsInfo(status)` reads → `Vec<ValidatorInfo>` (through
+    /// [`Self::read_consensus_registry_batch`]). Consensus-critical pinned batches use the
+    /// classified sibling [`Self::classified_registry_batch_at_header`] instead; this form stays
+    /// for the RPC layer, which maps [`EvmReadError::Revert`]'s raw output bytes into an
+    /// eth_call-style error that [`StateReadError`]'s string-only variants cannot carry.
     ///
     /// All calls observe ONE pinned state snapshot, so a multi-call query (e.g. unioning
     /// per-status validator sets) cannot straddle a block commit and double-count or drop a
@@ -607,23 +694,10 @@ impl RethEnv {
             <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
         >,
     {
-        // Create EVM with the state at the pinned header.
-        //
-        // ARCHIVE-MODE ASSUMPTION: this node never constructs a pruner (`PruningArgs` are built
-        // with every field disabled and no `PrunerBuilder` exists in the repo), so
-        // `state_by_block_hash` always resolves fully indexed history. If pruning is ever
-        // enabled, reth's `HistoricalStateProvider` can hit a missing history shard and return
-        // `HistoryInfo::MaybeInPlainState`, silently falling back to TIP state for this
-        // "pinned" read — exactly the nondeterminism pinning exists to prevent. Revisit every
-        // pinned registry read before enabling pruning.
-        let mut db = self
-            .read_only_state_db(header.hash())
-            .map_err(|e| EvmReadError::Internal(e.to_string()))?;
-        let evm_env = self
-            .inner
-            .evm_config
-            .evm_env(header)
-            .map_err(|e| EvmReadError::Internal(e.to_string()))?;
+        // Downgrading the classification is lossless here: both setup failures already collapsed
+        // into `Internal` before the classified helper existed.
+        let (mut db, evm_env) =
+            self.pinned_state_and_env(header).map_err(|e| EvmReadError::Internal(e.to_string()))?;
         let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
         // reuse the one pinned EVM for every read; `call_consensus_registry` is non-committing,
@@ -633,6 +707,72 @@ impl RethEnv {
             .map(|calldata| self.call_consensus_registry(&mut tn_evm, calldata))
             .collect()
     }
+
+    /// Build a single EVM at `header`'s state and execute several read-only [ConsensusRegistry]
+    /// calls against it, decoding each result to `T`, with failures classified per
+    /// [`StateReadError`].
+    ///
+    /// The [`StateReadResult`]-typed sibling of
+    /// [`Self::read_consensus_registry_batch_at_header`]: same ONE-pinned-EVM batching and same
+    /// result ordering, but each call routes through [`Self::classified_registry_read`] so a
+    /// node-local provider fault stays distinguishable from a chain-global failure. Every
+    /// consensus-critical pinned batch — the per-epoch committee reads
+    /// ([`Self::bls_pubkeys_for_epochs_at_header`]) — uses this form.
+    fn classified_registry_batch_at_header<T>(
+        &self,
+        header: &SealedHeader,
+        calldatas: Vec<Bytes>,
+    ) -> StateReadResult<Vec<T>>
+    where
+        T: alloy::sol_types::SolValue,
+        T: From<
+            <<T as alloy::sol_types::SolValue>::SolType as alloy::sol_types::SolType>::RustType,
+        >,
+    {
+        let (mut db, evm_env) = self.pinned_state_and_env(header)?;
+        let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
+
+        // reuse the one pinned EVM for every read; `classified_registry_read` is non-committing,
+        // so each read sees the same base state.
+        calldatas
+            .into_iter()
+            .map(|calldata| Self::classified_registry_read(&mut tn_evm, calldata))
+            .collect()
+    }
+
+    /// Build the state database and EVM environment pinned to `header`, classified per
+    /// [`StateReadError`].
+    ///
+    /// Returns the `(db, env)` pair rather than a constructed EVM because `create_evm(&mut db,
+    /// env)` borrows `db`, so the caller must own both. This is the ONE place a pinned read's
+    /// state is built — every `*_at_header` / `*_at_block` reader here routes through it.
+    ///
+    /// The classification split: state-provider construction is [`StateReadError::Provider`]
+    /// (node-local — this node's database failing to resolve the pinned block's state, where a
+    /// peer issuing the same read may succeed), while EVM environment construction is
+    /// [`StateReadError::ChainGlobal`] (a deterministic function of the header's own fields and
+    /// the chain spec, identical on every node).
+    ///
+    /// ARCHIVE-MODE ASSUMPTION: this node never constructs a pruner (`PruningArgs` are built
+    /// with every field disabled and no `PrunerBuilder` exists in the repo), so
+    /// `state_by_block_hash` always resolves fully indexed history. If pruning is ever enabled,
+    /// reth's `HistoricalStateProvider` can hit a missing history shard and return
+    /// `HistoryInfo::MaybeInPlainState`, silently falling back to TIP state for this "pinned"
+    /// read — exactly the nondeterminism pinning exists to prevent. Revisit every pinned read
+    /// before enabling pruning.
+    fn pinned_state_and_env(
+        &self,
+        header: &SealedHeader,
+    ) -> StateReadResult<(State<StateProviderDatabase<StateProviderBox>>, EvmEnv)> {
+        let db = self.read_only_state_db(header.hash()).map_err(|e| {
+            StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
+        })?;
+        let evm_env = self.inner.evm_config.evm_env(header).map_err(|e| {
+            StateReadError::ChainGlobal(format!("evm env for {}: {e}", header.hash()))
+        })?;
+        Ok((db, evm_env))
+    }
+
     /// Extract the epoch number from a header's nonce.
     pub fn extract_epoch_from_header(header: &ExecHeader) -> Epoch {
         let nonce: u64 = header.nonce.into();
@@ -642,10 +782,15 @@ impl RethEnv {
     /// Read the CURRENT epoch number and [`EpochInfo`](ConsensusRegistry::EpochInfo) from the
     /// [`ConsensusRegistry`] at `header`, with failures classified per [`StateReadError`].
     ///
-    /// This is the close-time identity read for the epoch manager's `adjust_base_fees`: at an
-    /// epoch's closing block the registry state has already crossed to the entered epoch
-    /// (`concludeEpoch` ran inside that block), so the returned info is the entered epoch's record
-    /// and its `blockHeight` must equal `header.number + 1`. It reads exactly what
+    /// This is the ONE boundary predicate for "did this block close an epoch": the epoch
+    /// manager's close-time identity check (`adjust_base_fees`), the entry read's pin guard
+    /// (`read_base_fees_for_entered_epoch`, both in `tn-node`), and the snapshot restore's
+    /// [`entry_readiness_precondition`](crate::snapshot::SnapshotRestorer::entry_readiness_precondition)
+    /// all validate the same boundary through it — deliberately shared so the three seams cannot
+    /// drift on what counts as a closing block. At an epoch's closing block the registry state
+    /// has already crossed to the entered epoch (`concludeEpoch` ran inside that block), so the
+    /// returned info is the entered epoch's record and its `blockHeight` must equal
+    /// `header.number + 1`. It reads exactly what
     /// [`Self::epoch_state_at_header`] reads for the same check but skips the committee/BLS/
     /// epoch-start lookups (a gating check needs only the epoch identity) and — unlike that
     /// method, whose failures collapse into `eyre` strings — keeps node-local provider faults
@@ -655,12 +800,7 @@ impl RethEnv {
         &self,
         header: &SealedHeader,
     ) -> StateReadResult<(Epoch, ConsensusRegistry::EpochInfo)> {
-        let mut db = self.read_only_state_db(header.hash()).map_err(|e| {
-            StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
-        })?;
-        let evm_env = self.inner.evm_config.evm_env(header).map_err(|e| {
-            StateReadError::ChainGlobal(format!("evm env for {}: {e}", header.hash()))
-        })?;
+        let (mut db, evm_env) = self.pinned_state_and_env(header)?;
         let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
         // both reads observe the ONE pinned EVM state
@@ -810,13 +950,14 @@ mod tests {
         payload::TNPayload,
         system_calls::ConsensusRegistry::ValidatorStatus,
         test_utils::{
-            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
-            governance_burn_tx, governance_owner_factory, test_genesis_with_consensus_registry,
-            TransactionFactory,
+            consensus_output_for_tests, create_committee_from_state,
+            execute_payload_and_update_canonical_chain, governance_burn_tx,
+            governance_owner_factory, test_genesis_with_consensus_registry,
+            test_genesis_with_consensus_registry_and_workers, TransactionFactory,
         },
         RethChainSpec,
     };
-    use alloy::primitives::utils::parse_ether;
+    use alloy::primitives::{aliases::U184, utils::parse_ether};
     use rand::{rngs::StdRng, SeedableRng as _};
     use reth_revm::{
         cached::CachedReads, database::StateProviderDatabase, DatabaseCommit as _, State,
@@ -825,22 +966,34 @@ mod tests {
     use tempfile::TempDir;
     use tn_config::NodeInfo;
     use tn_types::{
+        gas_accumulator::{
+            next_base_fee_for_config, GasAccumulator, RewardsCounter, WorkerConfigEntry,
+            WorkerFeeConfig,
+        },
         generate_proof_of_possession_bls_for_test, BlsKeypair, GenesisAccount, NodeP2pInfo,
-        TaskManager, U256,
+        TaskManager, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
-    /// In-protocol `ConsensusRegistry` fork over the PRE-fork testnet registry.
+    /// In-protocol `ConsensusRegistry` + `WorkerConfigs` fork over the PRE-fork testnet genesis.
     ///
     /// `test_genesis()` embeds the committed testnet `genesis.yaml`, whose `ConsensusRegistry`
     /// account carries the pre-fork runtime code and validator storage with NO per-status sets —
-    /// the exact on-chain shape the fork upgrades in place. The epoch-closing block that
-    /// concludes `FORK_EPOCH - 1` swaps in the new runtime and runs `migrateValidatorSets()`
-    /// FIRST, then the rewards + conclude calls run on the new code over the byte-identical
-    /// preserved storage.
+    /// the exact on-chain shape the fork upgrades in place — and whose `WorkerConfigs` account
+    /// carries the old uint128-data build without the `setWorkerConfigsData` selector. The
+    /// epoch-closing block that concludes `FORK_EPOCH - 1` swaps in the new registry runtime and
+    /// runs `migrateValidatorSets()` FIRST, then swaps the `WorkerConfigs` runtime (code only),
+    /// then the rewards + conclude + base-fee-record calls run on the new code over the
+    /// byte-identical preserved storage.
     ///
     /// Asserts: the pre-fork code does not answer the new-ABI eligible-count call; post-fork the
     /// new code is live and the migration populated a non-empty eligible set; a preserved BLS
-    /// pubkey survives the swap as 96-byte compressed; and the fork block's `state_root` is
+    /// pubkey survives the swap as 96-byte compressed; the `WorkerConfigs` code hash equals the
+    /// current artifact's (and not the pre-fork pin) with storage preserved (`numWorkers` still
+    /// 1, worker 0 still EIP-1559 with the genesis `u64::MAX` gas target); the SAME closing
+    /// block's fourth system call wrote worker 0's next-epoch base fee through the swapped-in
+    /// code (exactly `MIN_PROTOCOL_BASE_FEE` for the untouched genesis config); `MAX_STRATEGY()`
+    /// flips from the old build's hard-coded `1` to `0` (the appended, unset slot — the
+    /// documented post-swap governance-runbook state); and the fork block's `state_root` is
     /// identical across two independent executions (determinism — every node re-derives the
     /// same root).
     ///
@@ -891,6 +1044,14 @@ mod tests {
             );
         }
 
+        // pre-fork WorkerConfigs fixture guard: the live old build hard-codes MAX_STRATEGY() = 1
+        // (a readable failure here means the committed genesis fixture was regenerated)
+        assert_eq!(
+            max_strategy_at_block(&env1, genesis_header.hash())?,
+            1,
+            "pre-fork WorkerConfigs must answer MAX_STRATEGY() with its hard-coded 1"
+        );
+
         // --- produce the fork boundary block on the production path ---
         let block = execute_payload_and_update_canonical_chain(&env1, payload.clone(), vec![])?;
         let header = block.recovered_block.clone_sealed_header();
@@ -940,6 +1101,67 @@ mod tests {
             assert_eq!(bls.len(), 96, "preserved BLS pubkey must remain 96-byte compressed");
         }
 
+        // --- the WorkerConfigs swap landed in the same closing block ---
+        {
+            use reth_provider::StateProvider as _;
+
+            // (a) code hash == the embedded current artifact's, and off the pre-fork pin
+            let code = env1
+                .latest()?
+                .account_code(&WORKER_CONFIGS_ADDRESS)?
+                .expect("worker configs account must have code");
+            let artifact = RethEnv::fetch_value_from_json_str(
+                tn_config::WORKER_CONFIGS_JSON,
+                Some("deployedBytecode.object"),
+            )?;
+            let artifact_code = alloy::hex::decode(
+                artifact.as_str().expect("worker configs deployedBytecode.object is a string"),
+            )?;
+            assert_eq!(
+                code.0.hash_slow(),
+                alloy::primitives::keccak256(&artifact_code),
+                "post-fork WorkerConfigs code hash must match the embedded current artifact"
+            );
+            assert_ne!(
+                code.0.hash_slow(),
+                tn_types::forks::WORKER_CONFIGS_PRE_FORK_CODE_HASH,
+                "the swap must move the WorkerConfigs code hash off the pre-fork pin"
+            );
+        }
+
+        // (b) storage survived the code-only swap: numWorkers and worker 0's config semantics
+        // read back unchanged through the swapped-in code; (c) the SAME closing block's fourth
+        // system call recorded worker 0's next-epoch base fee in its data word
+        let (num_workers, entries) = worker_config_entries_at_block(&env1, header.hash())?;
+        assert_eq!(num_workers, 1, "preserved numWorkers must still read 1 post-swap");
+        assert_eq!(
+            entries[0].config,
+            WorkerFeeConfig::Eip1559 { target_gas: u64::MAX },
+            "preserved worker 0 config semantics must be unchanged post-swap"
+        );
+        // fee oracle: a default accumulator (MIN fee, zero gas) plus a closing block with no
+        // user transactions hold the untouched genesis config (u64::MAX gas target) at the floor
+        assert_eq!(header.gas_used, 0, "fork-boundary closing block carries no user-tx gas");
+        let expected_fee = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: u64::MAX },
+            MIN_PROTOCOL_BASE_FEE,
+            header.gas_used,
+        );
+        assert_eq!(expected_fee, MIN_PROTOCOL_BASE_FEE, "oracle: u64::MAX target floors at MIN");
+        assert_eq!(
+            entries[0].data,
+            U184::from(expected_fee),
+            "the closing block must write worker 0's next-epoch base fee (== MIN_PROTOCOL_BASE_FEE)"
+        );
+
+        // (d) the appended maxStrategy slot reads 0 post-swap — the documented state governance
+        // clears with one setMaxStrategy(1) transaction after the fork
+        assert_eq!(
+            max_strategy_at_block(&env1, header.hash())?,
+            0,
+            "post-swap MAX_STRATEGY() must read the appended, unset slot as 0"
+        );
+
         // --- determinism: an independent execution of the identical block yields the same root ---
         let tmp2 = TempDir::new().unwrap();
         let tm2 = TaskManager::new("fork test env2");
@@ -966,7 +1188,10 @@ mod tests {
     ///
     /// Asserts: the closing block executes; the registry code hash is untouched (no swap —
     /// epoch 3 is far from the fork boundary); the post-fork-only eligible-count call still
-    /// fails; and the block's `state_root` is identical across two independent executions.
+    /// fails; the `WorkerConfigs` code hash also stays at its pre-fork pin AND nothing was
+    /// written (the legacy close has no fourth system call, so the old build's uint128 data
+    /// words still decode as all-zero through the production seam); and the block's
+    /// `state_root` is identical across two independent executions.
     #[cfg(feature = "adiri")]
     #[tokio::test]
     async fn test_pre_fork_epoch_close_uses_legacy_registry_read() -> eyre::Result<()> {
@@ -1041,6 +1266,17 @@ mod tests {
                 "a normal pre-fork epoch close must not swap the registry code"
             );
 
+            // the WorkerConfigs code is equally untouched: only the fork boundary swaps it
+            let wc_code = env1
+                .latest()?
+                .account_code(&WORKER_CONFIGS_ADDRESS)?
+                .expect("worker configs account must have code");
+            assert_eq!(
+                wc_code.0.hash_slow(),
+                tn_types::forks::WORKER_CONFIGS_PRE_FORK_CODE_HASH,
+                "a normal pre-fork epoch close must not swap the worker configs code"
+            );
+
             let state = StateProviderDatabase::new(env1.latest()?);
             let mut cached = CachedReads::default();
             let mut db = State::builder()
@@ -1061,6 +1297,15 @@ mod tests {
             );
         }
 
+        // --- and the legacy close wrote nothing: it has no fourth system call, so the old
+        // build's uint128 data words still decode as all-zero through the production seam ---
+        let (num_workers, entries) = worker_config_entries_at_block(&env1, header.hash())?;
+        assert_eq!(num_workers, 1, "pre-fork genesis deploys a single worker");
+        assert!(
+            entries.iter().all(|entry| entry.data == U184::ZERO),
+            "a pre-fork close must leave every worker data word unwritten"
+        );
+
         // --- determinism: an independent execution of the identical block yields the same root ---
         let tmp2 = TempDir::new().unwrap();
         let tm2 = TaskManager::new("legacy read test env2");
@@ -1070,6 +1315,130 @@ mod tests {
             block2.recovered_block.clone_sealed_header().state_root,
             produced_state_root,
             "pre-fork epoch-close state_root must be identical across independent executions"
+        );
+
+        Ok(())
+    }
+
+    /// An epoch-closing block publishes what each of its system calls spent.
+    ///
+    /// The boundary calls are submitted at `gas_price: 0`, so their gas never enters the block's
+    /// `gas_used` and no other metric can see it (#1031) — while #1012 raised the per-call budget
+    /// to 100M without any measurement of what the calls actually consume. This drives a real
+    /// close through the production path and asserts the gauges observe it: each of the four
+    /// post-fork calls reports nonzero gas inside the budget it was granted, the total is their
+    /// sum, and the one-shot `registry_migration` series is absent away from the fork boundary.
+    ///
+    /// The local recorder is why `record_epoch_close_gas` resolves its handles on every close
+    /// instead of caching them: a cached handle binds to whichever recorder was installed first in
+    /// the process, which would make this assertion depend on test ordering (`crate::metrics`).
+    #[tokio::test]
+    async fn test_epoch_close_records_system_call_gas() -> eyre::Result<()> {
+        use crate::evm::SYSTEM_CALL_GAS_LIMIT;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        /// Read one gauge out of the snapshot, selecting by `call` label when one is given.
+        ///
+        /// Generic over the description slot so the recorder's own string type never has to be
+        /// named here.
+        fn gauge<D>(
+            snapshot: &[(metrics_util::CompositeKey, Option<metrics::Unit>, D, DebugValue)],
+            name: &str,
+            call: Option<&str>,
+        ) -> Option<f64> {
+            snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    key.key().name() == name
+                        && call.is_none_or(|call| {
+                            key.key().labels().any(|l| l.key() == "call" && l.value() == call)
+                        })
+                })
+                .and_then(|(.., value)| match value {
+                    DebugValue::Gauge(g) => Some(g.0),
+                    DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+                })
+        }
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(5).into());
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("epoch close gas metrics");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+
+        let output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // block execution is inline on this thread, so the thread-local recorder observes it
+        metrics::with_local_recorder(&recorder, || {
+            execute_payload_and_update_canonical_chain(&env, payload, vec![])
+        })?;
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        const PER_CALL: &str = "tn_reth.epoch_close_system_call_gas_used";
+        let budget = SYSTEM_CALL_GAS_LIMIT as f64;
+
+        // the four calls a post-fork close makes, each real work inside the budget it was granted
+        let spent: Vec<f64> =
+            ["apply_incentives", "apply_slashes", "conclude_epoch", "record_base_fees"]
+                .into_iter()
+                .map(|call| {
+                    let gas = gauge(&snapshot, PER_CALL, Some(call))
+                        .unwrap_or_else(|| panic!("{call} gas must be recorded: {snapshot:?}"));
+                    assert!(gas > 0.0, "{call} must report the gas it spent, got {gas}");
+                    assert!(gas < budget, "{call} spent {gas}, at or over its {budget} budget");
+                    gas
+                })
+                .collect();
+
+        assert_eq!(
+            gauge(&snapshot, "tn_reth.epoch_close_gas_used", None),
+            Some(spent.iter().sum::<f64>()),
+            "the total gauge must sum exactly the calls that ran"
+        );
+        assert_eq!(
+            gauge(&snapshot, "tn_reth.epoch_close_system_call_gas_limit", None),
+            Some(budget),
+            "the budget gauge must publish the compiled-in limit"
+        );
+
+        // epoch 0 is not the registry fork boundary, so no migration ran
+        assert!(
+            gauge(&snapshot, PER_CALL, Some("registry_migration")).is_none(),
+            "no registry migration away from the fork boundary: {snapshot:?}"
+        );
+
+        Ok(())
+    }
+
+    /// A block that closes no epoch publishes no epoch-close gas at all.
+    ///
+    /// Absent rather than zero. Ordinary blocks vastly outnumber closing ones, so publishing a
+    /// zero for each would overwrite the last real close's figures within seconds and leave the
+    /// gauges reading as though concluding an epoch were free.
+    #[tokio::test]
+    async fn test_block_without_epoch_close_records_no_gas() -> eyre::Result<()> {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(5).into());
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("epoch close gas metrics (no close)");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+
+        let output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            execute_payload_and_update_canonical_chain(&env, payload, vec![])
+        })?;
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(
+            !snapshot.iter().any(|(key, ..)| key.key().name().starts_with("tn_reth.epoch_close")),
+            "a block that closes no epoch must record no epoch-close gas: {snapshot:?}"
         );
 
         Ok(())
@@ -1265,6 +1634,32 @@ mod tests {
         let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
         let canonical_header = block2.recovered_block.clone_sealed_header();
 
+        // system-call state hygiene through the close: SYSTEM_ADDRESS is a caller convention
+        // and must never enter the bundle (the executor strips it before every commit), and the
+        // closing block carries exactly one reverts entry — the wrapper's single post-finish
+        // merge (an in-finish merge would push a phantom second entry)
+        assert!(
+            !block2.execution_output.state.state.contains_key(&SYSTEM_ADDRESS),
+            "SYSTEM_ADDRESS must not enter the epoch-closing bundle"
+        );
+        assert_eq!(
+            block2.execution_output.state.reverts.len(),
+            1,
+            "one merged reverts entry per closing block"
+        );
+
+        // a default (empty) RewardsCounter close allocates nothing: the boundary's
+        // applyIncentives ran with an empty rewardInfos array, so every genesis committee
+        // member still reads zero rewards
+        for v in &validators {
+            let rewards = reth_env.read_consensus_registry::<U256>(
+                ConsensusRegistry::getRewardsCall { validatorAddress: v.execution_address }
+                    .abi_encode()
+                    .into(),
+            )?;
+            assert!(rewards.is_zero(), "empty-counter close must allocate no rewards");
+        }
+
         // now close the second epoch so the new validator is active
         expected_epoch += 1;
         let consensus_output = consensus_output_for_tests(2, expected_epoch, 3, true);
@@ -1300,12 +1695,55 @@ mod tests {
         let new_epoch_info = reth_env
             .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)?;
 
+        // Epoch 3 is the first shuffled committee (committees are fixed two epochs ahead, so 0-2
+        // all run the genesis five). Six validators are eligible for five seats, so the shuffle
+        // drops exactly one, and WHICH one is a function of the epoch-close seed.
+        //
+        // That seed is fork-gated, and the two sides of the gate drop DIFFERENT validators here,
+        // so no single hardcoded committee is correct for both builds. `make attest` runs this
+        // test twice: once with default features, where `seed_signature_active` is true from
+        // genesis and the seed is the epoch seed chain value, and once with `--features adiri`,
+        // where the gate is dormant while `SEED_SIGNATURE_FORK_EPOCH` is the `u32::MAX`
+        // placeholder and the seed stays the legacy keccak256 of the leader certificate's
+        // aggregate BLS signature. Pinning either literal on its own turns the other pass red, so
+        // derive the pin from the gate rather than picking a side.
+        //
+        // Epoch 3's membership was decided by the close of epoch 1 (`block2`), so the gate is
+        // evaluated at THAT epoch, not at the epoch being read.
+        //
+        // Verify these addresses against the addresses themselves, never against the vec's
+        // ordering: `0x5555..` and `0x901ce5be..` both leave it in increasing address order, so
+        // ordering CANNOT tell them apart. Changing `consensus_output_for_tests`,
+        // `EpochSeedChainValue`, or the registry shuffle moves this membership; re-pin it from an
+        // actual run of BOTH feature configurations.
+        let committee_seed_epoch = expected_epoch - 1;
+        let shuffle_seat = if tn_types::forks::seed_signature_active(committee_seed_epoch) {
+            // epoch seed chain seed: the shuffle drops `validator_2_eoa`, seating `validator_5`
+            validator_5
+        } else {
+            // legacy leader-aggregate seed: the shuffle drops `validator_5`, seating
+            // `validator_2_eoa`'s address. This is the pin `origin/main` carries, main having no
+            // seed chain to draw from.
+            validator_2_address
+        };
+
+        // The shuffle's choice propagates past this assert: a validator that keeps its seat in the
+        // committee just fixed cannot finish exiting at the next boundary, while an unseated one
+        // does. So validator 2's exit trajectory further down is decided by the same gate, and is
+        // expressed in terms of this one binding rather than re-deriving the condition there.
+        let validator_2_keeps_seat = shuffle_seat == validator_2_address;
+
+        // replay-critical order normalization: the installed committee is address-sorted
+        // (generate_conclude_epoch_calldata sorts after the shuffle) — asserted as a property,
+        // independent of the exact-membership golden below
+        assert!(new_epoch_info.committee.is_sorted(), "installed committee must be address-sorted");
+
         // ensure validators in increasing order by address
         let expected_new_committee = vec![
             validator_1,
             validator_3,
             validator_4,
-            validator_2_address,
+            shuffle_seat,
             new_validator.execution_address,
         ];
 
@@ -1362,6 +1800,11 @@ mod tests {
         let canonical_header = block5.recovered_block.clone_sealed_header();
 
         // create evm to read latest state
+        //
+        // NOTE: the assertions below deliberately run AFTER an epoch close, so they check that
+        // `PendingExit` and the active/pending-exit counts SURVIVE an epoch boundary rather than
+        // merely that `beginExit` set them in its own block. That is the interaction most exposed
+        // to a change in the epoch-close randomness source, so keep the close ahead of the reads.
         let state = StateProviderDatabase::new(reth_env.latest()?);
         let mut cached_reads = CachedReads::default();
         let mut db = State::builder()
@@ -1384,7 +1827,18 @@ mod tests {
                 calldata,
             )?;
         debug!(target: "engine", ?validator_2_info, "getting validator 2 info");
-        assert_eq!(validator_2_info.currentStatus, ValidatorStatus::PendingExit);
+        // `beginExit` ran in block4 and the epoch close in block5 followed it. Whether that close
+        // COMPLETED the exit depends on whether validator 2 still holds a seat in the committee
+        // the shuffle fixed above: a seated validator stays `PendingExit` until it leaves the
+        // committee, an unseated one reaches `Exited` at the boundary. Both are correct registry
+        // behavior, and which one this fixture sees is decided by the epoch-close seed, so the
+        // expectation keys on the same gate as the committee pin.
+        let (expected_status, expected_pending_exits) = if validator_2_keeps_seat {
+            (ValidatorStatus::PendingExit, 1)
+        } else {
+            (ValidatorStatus::Exited, 0)
+        };
+        assert_eq!(validator_2_info.currentStatus, expected_status);
 
         // With the per-status sets, `getValidatorsInfo(Active)` returns strictly-active validators;
         // the committee-eligible pool is the union of Active/PendingActivation/PendingExit, so the
@@ -1408,10 +1862,13 @@ mod tests {
                 .abi_encode()
                 .into(),
             )?;
-        assert_eq!(pending_exit.len(), 1);
+        assert_eq!(pending_exit.len(), expected_pending_exits);
+        // When the close already completed the exit there is no pending-exit entry to identify, so
+        // compare optionally rather than indexing: `None` is the correct answer in that build, and
+        // an `expect` here would turn a legitimate trajectory into a panic.
         assert_eq!(
-            pending_exit.first().expect("one pending validator").validatorAddress,
-            validator_2_address
+            pending_exit.first().map(|v| v.validatorAddress),
+            validator_2_keeps_seat.then_some(validator_2_address)
         );
 
         // close epoch again to exit validator
@@ -1508,7 +1965,7 @@ mod tests {
         // capture pre-burn committee pubkeys for the current and both future epochs
         let pre_burn = (0u32..=2)
             .map(|e| reth_env.bls_pubkeys_for_epoch_at_block(e, reth_env.canonical_tip().hash()))
-            .collect::<eyre::Result<Vec<_>>>()?;
+            .collect::<StateReadResult<Vec<_>>>()?;
 
         // eject a middle slot so the swap-and-pop reorder is visible
         let target = committee[1].validatorAddress;
@@ -1610,7 +2067,9 @@ mod tests {
 
         // applyIncentives with rewards for the burned + a surviving validator: the isRetired
         // branch skips the burned validator while the survivor accrues rewards. Then
-        // concludeEpoch over the shrunken committee, matching the protocol's boundary sequence.
+        // concludeEpoch over the shrunken committee. (A hand-rolled pair, not the protocol's
+        // boundary sequence - the executor issues three calls with applySlashes interposed; see
+        // test_epoch_boundary_slash_ejects_through_production_close.)
         let alive = committee[0].validatorAddress;
         let mut tn_evm = reth_env.tn_evm(canonical_header.hash())?;
         let mut new_committee: Vec<Address> =
@@ -1669,11 +2128,13 @@ mod tests {
     /// The epoch-boundary slashing sequence: a slash-to-zero ejection lands mid-sequence and the
     /// close still succeeds because the committee is assembled from post-slash state.
     ///
-    /// Drives the exact three-call order the block executor issues - `applyIncentives`, then
-    /// `applySlashes`, then `concludeEpoch` - with a slash that empties a validator's stake.
-    /// Pins the sequencing contract an automated slash producer must uphold: the committee size
-    /// and eligible pool are read AFTER `applySlashes` commits, so the ejection is reflected
-    /// before `concludeEpoch` validates the committee. Also pins the preserved reward economics:
+    /// Hand-rolls the three-call boundary order - `applyIncentives`, then `applySlashes`, then
+    /// `concludeEpoch` - on a raw `tn_evm`, with a slash that empties a validator's stake. Pins
+    /// the CONTRACT-side outcome an automated slash producer relies on: the committee size and
+    /// eligible pool reflect the ejection once `applySlashes` commits, so a post-slash committee
+    /// passes `concludeEpoch` validation. (The ordering as the block executor actually issues it
+    /// is pinned end-to-end by `test_epoch_boundary_slash_ejects_through_production_close`.)
+    /// Also pins the preserved reward economics:
     /// incentives run before slashes, so the closing epoch's rewards are weighted on pre-slash
     /// collateral and even the about-to-be-ejected validator collects its final epoch.
     #[tokio::test]
@@ -1794,6 +2255,107 @@ mod tests {
         Ok(())
     }
 
+    /// The production close path ejects a slash-to-zero validator: a slash injected through the
+    /// `TNPayload` seam rides `finish()`'s boundary sequence and the close succeeds because the
+    /// committee is assembled from post-slash state.
+    ///
+    /// This is the end-to-end pin for the executor's call ordering (`applyIncentives` →
+    /// `applySlashes` → committee reads → `concludeEpoch`), driving the real
+    /// `apply_closing_epoch_contract_call` rather than hand-rolling the sequence like the
+    /// siblings above. Each assertion kills a distinct mis-ordering:
+    /// - the block succeeding at all: the slash landed before the committee reads (a stale
+    ///   five-member committee would revert `InvalidCommitteeSize` on-chain and error the block);
+    /// - `exitEpoch == 1`: the slash landed BEFORE `concludeEpoch` rotated the epoch
+    ///   (`_consensusBurn` records the current epoch at slash time; a slash issued after the
+    ///   rotation would record 2, and close-success alone cannot discriminate that reorder);
+    /// - the shrunken current + shuffled committees: the ejection propagated into committee
+    ///   assembly.
+    ///
+    /// The inverted-order negative variant is deliberately absent: the fixed production path
+    /// cannot issue the calls out of order, and the contract half (stale committee ⇒
+    /// `InvalidCommitteeSize` revert) is already pinned by
+    /// `test_stale_pre_slash_committee_reverts_close`.
+    #[tokio::test]
+    async fn test_epoch_boundary_slash_ejects_through_production_close() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Seam Slash Ejection Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // close epoch 0 through the production payload path so the seam-injected close below
+        // runs at a realistic mid-chain boundary rather than directly on genesis state
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let canonical_header = block1.recovered_block.clone_sealed_header();
+
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 1);
+        assert_eq!(committee.len(), 5);
+        let victim = committee[0].validatorAddress;
+
+        // slash sizing: the env runs a default (empty) RewardsCounter, so the boundary's
+        // `applyIncentives` credits nothing and the pre-boundary outstanding balance equals the
+        // balance `applySlashes` compares — a full-outstanding slash is a slash-to-zero
+        let (outstanding, _initial, _rewards) = reth_env
+            .read_consensus_registry::<(U256, U256, U256)>(
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: victim }
+                    .abi_encode()
+                    .into(),
+            )?;
+
+        // close epoch 1 through the PRODUCTION path with the slash injected through the seam:
+        // finish() must sequence it between applyIncentives and the committee reads
+        let consensus_output = consensus_output_for_tests(2, 1, 2, true);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output)
+            .with_epoch_boundary_slashes(vec![ConsensusRegistry::Slash {
+                validatorAddress: victim,
+                amount: outstanding,
+            }]);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+
+        // the slash landed: retired, ejected from the eligible pool, size clamped
+        let retired = reth_env.read_consensus_registry::<bool>(
+            ConsensusRegistry::isRetiredCall { validatorAddress: victim }.abi_encode().into(),
+        )?;
+        assert!(retired, "slash-to-zero through the production close retires the validator");
+        let eligible = reth_env.read_consensus_registry::<U256>(
+            ConsensusRegistry::getEligibleValidatorCountCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(eligible, U256::from(4));
+        let next_size = reth_env.read_consensus_registry::<u16>(
+            ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+        )?;
+        assert_eq!(next_size, 4);
+
+        // ordering discriminator: `_consensusBurn` → `_exit(validator, currentEpoch)` records
+        // the epoch at slash time. The close rotated 1 → 2, so a slash issued after
+        // `concludeEpoch` would record 2; only the slash-before-conclude order records 1.
+        let victim_info = reth_env.read_consensus_registry::<ConsensusRegistry::ValidatorInfo>(
+            ConsensusRegistry::getValidatorCall { validatorAddress: victim }.abi_encode().into(),
+        )?;
+        assert_eq!(victim_info.exitEpoch, 1, "slash must land before the epoch rotates");
+
+        // the epoch rotated over a post-slash committee that excludes the victim
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 2);
+        assert_eq!(committee.len(), 4);
+        assert!(committee.iter().all(|v| v.validatorAddress != victim));
+
+        // the committee this concludeEpoch installed (stored at newEpoch + 2 = 4) was shuffled
+        // from the post-slash pool: four members, victim absent
+        let shuffled =
+            reth_env.validators_for_epoch_at_block(4, reth_env.canonical_tip().hash())?;
+        assert_eq!(shuffled.len(), 4);
+        assert!(shuffled.iter().all(|v| v.validatorAddress != victim));
+
+        Ok(())
+    }
+
     /// A committee sized from PRE-slash state makes `concludeEpoch` revert with
     /// `InvalidCommitteeSize` when a slash-to-zero ejection lands in between.
     ///
@@ -1801,7 +2363,9 @@ mod tests {
     /// `nextCommitteeSize`, so a slash producer that reads the size before `applySlashes`
     /// commits produces a fatal on-chain revert (a deterministic fleet halt), not a silent
     /// mis-seat. The block executor's read-after-slash sequencing exists to prevent exactly
-    /// this; the test pins the failure mode so it trips loudly if that ordering regresses.
+    /// this; this test pins the CONTRACT half (the revert and its selector), while the
+    /// executor's own ordering is pinned through the production close path by
+    /// `test_epoch_boundary_slash_ejects_through_production_close`.
     #[tokio::test]
     async fn test_stale_pre_slash_committee_reverts_close() -> eyre::Result<()> {
         use reth_revm::context::result::ExecutionResult;
@@ -1858,7 +2422,7 @@ mod tests {
                     "InvalidCommitteeSize(uint256,uint256)".as_bytes(),
                 )[..4];
                 assert_eq!(
-                    &output[..4],
+                    output.get(..4).expect("revert output carries at least a 4-byte selector"),
                     selector,
                     "stale committee must revert with InvalidCommitteeSize"
                 );
@@ -1882,6 +2446,7 @@ mod tests {
 
         let committee =
             reth_env.validators_for_epoch_at_block(0, reth_env.canonical_tip().hash())?;
+        assert_eq!(committee.len(), 5);
         let victim = committee[0].validatorAddress;
         let mut tn_evm = reth_env.tn_evm(chain.sealed_genesis_header().hash())?;
 
@@ -1939,6 +2504,133 @@ mod tests {
         assert!(res.result.is_success(), "concludeEpoch succeeds: {:?}", res.result);
         res.state.remove(&SYSTEM_ADDRESS);
         tn_evm.db_mut().commit(res.state);
+
+        Ok(())
+    }
+
+    /// Boundary-block determinism at default features: two independent executions of the
+    /// byte-identical epoch-closing payload derive the same `state_root` and install the same
+    /// next-epoch state.
+    ///
+    /// Every node must re-derive the identical boundary block or the fleet forks — the core
+    /// safety property of the epoch close. Until now it was pinned only inside two
+    /// `adiri`-gated tests that CI never compiles, so a default-build regression (e.g. a
+    /// nondeterministic iteration order feeding `applyIncentives`, or an RNG-draw reorder in
+    /// the committee shuffle) had no tripwire.
+    #[tokio::test]
+    async fn test_epoch_close_deterministic_across_envs() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+        // one payload, cloned across both executions: `new_for_test` randomizes
+        // beneficiary/mix_hash/digest per call, and mix_hash seeds the committee shuffle
+        let output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+
+        let tmp1 = TempDir::new().unwrap();
+        let tm1 = TaskManager::new("determinism env1");
+        let env1 = RethEnv::new_for_temp_chain(chain.clone(), tmp1.path(), &tm1, None)?;
+        let block1 = execute_payload_and_update_canonical_chain(&env1, payload.clone(), vec![])?;
+        let header1 = block1.recovered_block.clone_sealed_header();
+
+        let tmp2 = TempDir::new().unwrap();
+        let tm2 = TaskManager::new("determinism env2");
+        let env2 = RethEnv::new_for_temp_chain(chain.clone(), tmp2.path(), &tm2, None)?;
+        let block2 = execute_payload_and_update_canonical_chain(&env2, payload, vec![])?;
+        let header2 = block2.recovered_block.clone_sealed_header();
+
+        assert_eq!(
+            header1.state_root, header2.state_root,
+            "epoch-closing state_root must be identical across independent executions"
+        );
+
+        // the installed next-epoch state matches read-for-read: same epoch record, same
+        // shuffled committee (stored at newEpoch + 2), same keys
+        let state1 = env1.epoch_state_from_canonical_tip()?;
+        let state2 = env2.epoch_state_from_canonical_tip()?;
+        assert_eq!(state1.epoch, 1);
+        assert_eq!(state1.epoch, state2.epoch);
+        assert_eq!(state1.epoch_info, state2.epoch_info);
+        assert_eq!(
+            env1.validators_for_epoch_at_block(3, env1.canonical_tip().hash())?,
+            env2.validators_for_epoch_at_block(3, env2.canonical_tip().hash())?
+        );
+        assert_eq!(
+            env1.bls_pubkeys_for_epoch_at_block(3, env1.canonical_tip().hash())?,
+            env2.bls_pubkeys_for_epoch_at_block(3, env2.canonical_tip().hash())?
+        );
+
+        Ok(())
+    }
+
+    /// Reward accounting through the production close: seeded leader counts flow
+    /// `RewardsCounter` → `applyIncentives(RewardInfo[])` → on-chain balances, with the epoch
+    /// issuance split exactly between equal-count leaders.
+    ///
+    /// Pins the `BTreeMap<Address, u32>` → `RewardInfo[]` mapping in
+    /// `apply_closing_epoch_contract_call` with a NON-empty rewards array at unit level —
+    /// previously exercised only by the engine e2e suite. The fixture's `epochIssuance`
+    /// (25,806 TEL) is even, so two equal-weight leaders each collect exactly half
+    /// (`div_ceil(2)` matches the engine assertions and is exact here).
+    #[tokio::test]
+    async fn test_rewards_counter_flows_through_production_close() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(5);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::new("Rewards Close Test");
+        let counter = RewardsCounter::default();
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(GasAccumulator::new_with_rewards(1, counter.clone())),
+        )?;
+
+        // seed the counter exactly as run_epoch does at epoch entry: the genesis committee,
+        // then equal leader tallies for two members
+        let epoch_state = reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch_state.validators.len(), 5);
+        let member_addresses: Vec<Address> =
+            epoch_state.validators.iter().map(|v| v.validatorAddress).collect();
+        let issuance = epoch_state.epoch_info.epochIssuance;
+        let committee = create_committee_from_state(epoch_state).await?;
+        counter.set_committee(committee.clone());
+        let authorities: Vec<_> = committee.authorities().into_iter().collect();
+        let (leader_a, leader_b) = (&authorities[0], &authorities[1]);
+        for _ in 0..3 {
+            counter.inc_leader_count(&leader_a.id());
+            counter.inc_leader_count(&leader_b.id());
+        }
+        assert_eq!(counter.get_address_counts().len(), 2);
+
+        // close epoch 0 through the production path; finish() drains the counter into
+        // applyIncentives(RewardInfo[]) with a two-entry array
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+
+        // equal weights split the (even) issuance exactly; non-leaders collect nothing
+        let expected_each = issuance.div_ceil(U256::from(2));
+        assert_eq!(expected_each * U256::from(2), issuance, "fixture issuance splits exactly");
+        for leader in [leader_a, leader_b] {
+            let rewards = reth_env.read_consensus_registry::<U256>(
+                ConsensusRegistry::getRewardsCall { validatorAddress: leader.execution_address() }
+                    .abi_encode()
+                    .into(),
+            )?;
+            assert_eq!(rewards, expected_each, "equal-count leader collects an exact half");
+        }
+        let non_leader = member_addresses
+            .iter()
+            .find(|address| {
+                **address != leader_a.execution_address()
+                    && **address != leader_b.execution_address()
+            })
+            .expect("five members, two leaders");
+        let rewards = reth_env.read_consensus_registry::<U256>(
+            ConsensusRegistry::getRewardsCall { validatorAddress: *non_leader }.abi_encode().into(),
+        )?;
+        assert!(rewards.is_zero(), "non-leader collects nothing");
 
         Ok(())
     }
@@ -2290,10 +2982,15 @@ mod tests {
         let pinned_b3 = reth_env.bls_pubkeys_for_epoch_at_block(3, pin.hash())?;
         assert_eq!(pinned_b2, pre_b2, "epoch 2 pubkeys at the pin are the pre-burn set");
         assert_eq!(pinned_b3, pre_b3, "epoch 3 pubkeys at the pin are the pre-burn set");
-        // the batch variant resolves both epochs through ONE pinned EVM and orders its results
-        // to match the input: batch == the single pinned reads
+        // the batch variants resolve both epochs through ONE pinned EVM and order their results
+        // to match the input: batch == the single pinned reads, by header and by hash
         let batched = reth_env.bls_pubkeys_for_epochs_at_header(&[2, 3], &pin)?;
         assert_eq!(batched, vec![pinned_b2.clone(), pinned_b3.clone()]);
+        let batched_by_hash = reth_env.bls_pubkeys_for_epochs_at_block(&[2, 3], pin.hash())?;
+        assert_eq!(
+            batched_by_hash, batched,
+            "the by-hash batch resolves the same header as the by-header batch"
+        );
         assert!(pinned_b2.contains(&target_bls));
         assert!(pinned_b3.contains(&target_bls));
 
@@ -2413,11 +3110,23 @@ mod tests {
         assert_eq!(configs[0], WorkerFeeConfig::Eip1559 { target_gas: 30_000_000 });
         assert_eq!(configs[1], WorkerFeeConfig::Static { fee: 500 });
 
-        // the block-pinned read primitive reports the same count at genesis
-        let (num_workers, configs_at_block) =
+        // the block-pinned read primitive reports the same count and strategies at genesis
+        let (num_workers, entries) =
             reth_env.get_worker_fee_configs_at_block(chain.sealed_genesis_header().hash())?;
         assert_eq!(num_workers, 2);
-        assert_eq!(configs_at_block, configs);
+        assert_eq!(entries.iter().map(|entry| entry.config).collect::<Vec<_>>(), configs);
+
+        // the ceremony seeds every row's `data` word zero (see `create_consensus_registry_
+        // genesis_accounts`), and the epoch-closing block's base-fee record is the only other
+        // writer - no epoch has closed at genesis, so every row still reads the never-recorded
+        // zero, including the Static row, which the record skips entirely
+        for (worker_id, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry.data,
+                U184::ZERO,
+                "worker {worker_id} carries a non-zero data word at ceremony genesis"
+            );
+        }
 
         Ok(())
     }
@@ -2544,17 +3253,17 @@ mod tests {
         assert_eq!(epoch_one_read_header.hash(), close_block_hash);
 
         // epoch 1's count (read at its start-parent) reflects the governance change...
-        let (num_workers, configs) =
+        let (num_workers, entries) =
             reth_env.get_worker_fee_configs_at_block(epoch_one_read_header.hash())?;
         assert_eq!(num_workers, 2);
-        assert_eq!(configs[1], WorkerFeeConfig::Static { fee: 500 });
+        assert_eq!(entries[1].config, WorkerFeeConfig::Static { fee: 500 });
 
         // ...while epoch 0's count (read at genesis) still reports the original single worker
         let genesis_hash = reth_env
             .sealed_header_by_number(epoch_zero_read_block)?
             .expect("genesis header")
             .hash();
-        let (num_workers, _configs) = reth_env.get_worker_fee_configs_at_block(genesis_hash)?;
+        let (num_workers, _entries) = reth_env.get_worker_fee_configs_at_block(genesis_hash)?;
         assert_eq!(num_workers, 1);
 
         Ok(())
@@ -2616,6 +3325,651 @@ mod tests {
             matches!(err, StateReadError::ChainGlobal(_)),
             "absent registry must classify as ChainGlobal, got: {err}"
         );
+
+        // the full epoch-state read splits the same way: unresolvable pin state is Provider...
+        let err = reth_env.epoch_state_at_header(&phantom).expect_err("phantom header must fail");
+        assert!(
+            matches!(err, StateReadError::Provider(_)),
+            "epoch state at an unresolvable header must classify as Provider, got: {err}"
+        );
+
+        // ...and an absent registry at a resolvable block is ChainGlobal
+        let err = reth_env
+            .epoch_state_at_header(&chain.sealed_genesis_header())
+            .expect_err("absent registry must fail");
+        assert!(
+            matches!(err, StateReadError::ChainGlobal(_)),
+            "epoch state with an absent registry must classify as ChainGlobal, got: {err}"
+        );
+
+        // the pinned committee-pubkey reads, single and batched, split identically: an
+        // unresolvable block hash never reaches the contract, so it is Provider...
+        let err = reth_env
+            .bls_pubkeys_for_epoch_at_block(0, B256::random())
+            .expect_err("unknown block hash must fail");
+        assert!(
+            matches!(err, StateReadError::Provider(_)),
+            "committee read at an unknown block hash must classify as Provider, got: {err}"
+        );
+        let err = reth_env
+            .bls_pubkeys_for_epochs_at_block(&[0, 1], B256::random())
+            .expect_err("unknown block hash must fail");
+        assert!(
+            matches!(err, StateReadError::Provider(_)),
+            "batched committee read at an unknown block hash must classify as Provider, got: {err}"
+        );
+
+        // ...while the absent registry at genesis is ChainGlobal for both shapes
+        let genesis_hash = chain.sealed_genesis_header().hash();
+        let err = reth_env
+            .bls_pubkeys_for_epoch_at_block(0, genesis_hash)
+            .expect_err("absent registry must fail");
+        assert!(
+            matches!(err, StateReadError::ChainGlobal(_)),
+            "committee read with an absent registry must classify as ChainGlobal, got: {err}"
+        );
+        let err = reth_env
+            .bls_pubkeys_for_epochs_at_block(&[0, 1], genesis_hash)
+            .expect_err("absent registry must fail");
+        assert!(
+            matches!(err, StateReadError::ChainGlobal(_)),
+            "batched committee read with an absent registry must classify as ChainGlobal, got: \
+             {err}"
+        );
+
+        Ok(())
+    }
+
+    /// Execute `MAX_STRATEGY()` against the state of `block_hash` and decode the `uint8`.
+    ///
+    /// Both the live pre-fork `WorkerConfigs` build (which hard-codes the ceiling as the
+    /// constant `1`) and the current artifact (which reads the appended `maxStrategy` storage
+    /// slot) expose this selector, so one probe pins the documented value flip across the
+    /// fork's code-only swap: `1` before, `0` after (until governance's `setMaxStrategy(1)`).
+    #[cfg(feature = "adiri")]
+    fn max_strategy_at_block(reth_env: &RethEnv, block_hash: B256) -> eyre::Result<u8> {
+        let mut tn_evm = reth_env.tn_evm(block_hash)?;
+        let calldata = WorkerConfigs::MAX_STRATEGYCall {}.abi_encode().into();
+        let res = tn_evm.transact_system_call(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+        let data = match res.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => eyre::bail!("MAX_STRATEGY failed at pinned block: {other:?}"),
+        };
+        Ok(<WorkerConfigs::MAX_STRATEGYCall as alloy::sol_types::SolCall>::abi_decode_returns(
+            &data,
+        )?)
+    }
+
+    /// Execute `getAllWorkerConfigs()` against the state of `block_hash` and decode the raw
+    /// return bytes through the production seam ([`decode_worker_fee_configs`]) — the exact
+    /// decode the closing block's `record_next_epoch_base_fees` uses, so these tests observe
+    /// the write through the same path that produced it.
+    fn worker_config_entries_at_block(
+        reth_env: &RethEnv,
+        block_hash: B256,
+    ) -> eyre::Result<(u16, Vec<WorkerConfigEntry>)> {
+        let mut tn_evm = reth_env.tn_evm(block_hash)?;
+        let calldata = WorkerConfigs::getAllWorkerConfigsCall {}.abi_encode().into();
+        let res = tn_evm.transact_system_call(SYSTEM_ADDRESS, WORKER_CONFIGS_ADDRESS, calldata)?;
+        let data = match res.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => eyre::bail!("getAllWorkerConfigs failed at pinned block: {other:?}"),
+        };
+        decode_worker_fee_configs(&data).map_err(|e| eyre::eyre!(e))
+    }
+
+    /// The closing block's 4th system call records an EIP-1559 worker's NEXT-epoch base fee in
+    /// its `WorkerConfigs.data` word, bit-identical to
+    /// `next_base_fee_for_config(config, accumulator fee at close, accumulator gas + the closing
+    /// block's own user-tx gas)` — the same value `adjust_base_fees` and the epoch-entry
+    /// derivation compute from the same inputs.
+    ///
+    /// The fixture is chosen so the expected value differs from `MIN_PROTOCOL_BASE_FEE`, from
+    /// the starting fee, AND from the value computed without the closing block's own gas — so a
+    /// wrong fee source, a dropped gas total, or an off-by-one-block gas fold all fail loudly.
+    #[tokio::test]
+    async fn test_close_records_eip1559_next_epoch_base_fee_in_worker_data() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+        const START_FEE: u64 = 1_000_000;
+        const EPOCH_GAS: u64 = 1_500_000;
+
+        // fund an EOA so the closing block carries real user-tx gas
+        let mut sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(77));
+        let genesis = test_genesis_with_consensus_registry_and_workers(5, vec![(0u8, TARGET_GAS)])
+            .extend_accounts([(
+                sender.address(),
+                GenesisAccount::default().with_balance(U256::from(parse_ether("1")?)),
+            )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Base Fee Record Test");
+
+        // the shared accumulator the block executor reads: a moved fee and mid-epoch gas
+        let acc = GasAccumulator::new(1);
+        acc.base_fee(0).set_base_fee(START_FEE);
+        acc.inc_block(0, EPOCH_GAS, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // ceremony genesis deploys the current WorkerConfigs with data == 0 (never written)
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, chain.sealed_genesis_header().hash())?;
+        assert_eq!(num_workers, 1);
+        assert_eq!(entries[0].data, U184::ZERO, "genesis data word starts unwritten");
+
+        // close epoch 0 with a real user transaction in the closing block
+        let tx = sender.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(Address::from_slice(&[0xab; 20])),
+            U256::from(1),
+            Bytes::new(),
+        );
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![tx])?;
+        let closing_header = block.recovered_block.clone_sealed_header();
+
+        // independent oracle: the ONE fee formula over the accumulator fee and the total epoch
+        // gas INCLUDING the closing block's own user-tx gas
+        let own_gas = closing_header.gas_used;
+        assert!(own_gas > 0, "closing block must carry user-tx gas");
+        let expected = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS },
+            START_FEE,
+            EPOCH_GAS + own_gas,
+        );
+        // fixture guards: the expected value discriminates against a MIN write, a no-op write,
+        // and a total that dropped the closing block's own gas
+        assert_ne!(expected, MIN_PROTOCOL_BASE_FEE);
+        assert_ne!(expected, START_FEE);
+        assert_ne!(
+            expected,
+            next_base_fee_for_config(
+                WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS },
+                START_FEE,
+                EPOCH_GAS,
+            ),
+        );
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 1);
+        assert_eq!(
+            entries[0].data,
+            U184::from(expected),
+            "recorded next-epoch base fee must equal the independent oracle"
+        );
+        // the data write preserves the worker's strategy and value
+        assert_eq!(entries[0].config, WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS });
+
+        Ok(())
+    }
+
+    /// Mixed strategies at the close: the EIP-1559 worker's `data` word gets its oracle fee
+    /// while the Static worker is skipped entirely — its `data` stays 0 (the fee already lives
+    /// in the config's `value`) no matter what fee or gas its accumulator slot carries.
+    #[tokio::test]
+    async fn test_close_records_eip1559_worker_and_skips_static_worker() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+        const START_FEE: u64 = 1_000_000;
+        const EPOCH_GAS: u64 = 500_000;
+        const STATIC_FEE: u64 = 777;
+
+        let genesis = test_genesis_with_consensus_registry_and_workers(
+            5,
+            vec![(0u8, TARGET_GAS), (1u8, STATIC_FEE)],
+        );
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Mixed Strategy Record Test");
+
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(START_FEE);
+        acc.inc_block(0, EPOCH_GAS, 30_000_000);
+        // distinctive state on the static worker's slot: none of it may reach the chain
+        acc.base_fee(1).set_base_fee(5_555);
+        acc.inc_block(1, 123_456, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let closing_header = block.recovered_block.clone_sealed_header();
+
+        let expected = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS },
+            START_FEE,
+            EPOCH_GAS,
+        );
+        assert_ne!(expected, MIN_PROTOCOL_BASE_FEE);
+        assert_ne!(expected, START_FEE);
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 2);
+        assert_eq!(entries[0].data, U184::from(expected), "eip1559 worker records its oracle");
+        assert_eq!(entries[1].data, U184::ZERO, "static worker is never written");
+        assert_eq!(entries[1].config, WorkerFeeConfig::Static { fee: STATIC_FEE });
+
+        Ok(())
+    }
+
+    /// An all-Static worker set produces an empty write set: the close succeeds while issuing
+    /// no `setWorkerConfigsData` call at all — every worker's `data` word is still 0 at the
+    /// closing block.
+    #[tokio::test]
+    async fn test_close_with_all_static_workers_records_nothing() -> eyre::Result<()> {
+        let genesis =
+            test_genesis_with_consensus_registry_and_workers(5, vec![(1u8, 500), (1u8, 900)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("All Static Record Test");
+
+        // populated slots prove the skip is strategy-driven, not empty-accumulator-driven
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(4_242);
+        acc.inc_block(0, 1_000_000, 30_000_000);
+        acc.base_fee(1).set_base_fee(9_099);
+        acc.inc_block(1, 2_000_000, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // the close must succeed without any base-fee write
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let closing_header = block.recovered_block.clone_sealed_header();
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 2);
+        assert_eq!(entries[0].data, U184::ZERO, "static worker 0 stays unwritten");
+        assert_eq!(entries[1].data, U184::ZERO, "static worker 1 stays unwritten");
+        assert_eq!(entries[0].config, WorkerFeeConfig::Static { fee: 500 });
+        assert_eq!(entries[1].config, WorkerFeeConfig::Static { fee: 900 });
+
+        Ok(())
+    }
+
+    /// The closing block's OWN user-tx gas is folded into its worker's epoch total before
+    /// pricing: the recorded fee equals the oracle computed WITH the closing block's gas and
+    /// differs from the oracle computed WITHOUT it (the accumulator alone — `inc_block` for
+    /// this block only runs after the payload executes).
+    #[tokio::test]
+    async fn test_close_folds_closing_block_gas_into_recorded_fee() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+        const START_FEE: u64 = 1_000_000;
+        const EPOCH_GAS: u64 = 1_200_000;
+
+        let mut sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(78));
+        let genesis = test_genesis_with_consensus_registry_and_workers(5, vec![(0u8, TARGET_GAS)])
+            .extend_accounts([(
+                sender.address(),
+                GenesisAccount::default().with_balance(U256::from(parse_ether("1")?)),
+            )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Own Gas Fold Test");
+
+        let acc = GasAccumulator::new(1);
+        acc.base_fee(0).set_base_fee(START_FEE);
+        acc.inc_block(0, EPOCH_GAS, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // two real transfers ride the closing block
+        let recipient = Address::from_slice(&[0xcd; 20]);
+        let txs = vec![
+            sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(recipient),
+                U256::from(1),
+                Bytes::new(),
+            ),
+            sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(recipient),
+                U256::from(1),
+                Bytes::new(),
+            ),
+        ];
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, txs)?;
+        let closing_header = block.recovered_block.clone_sealed_header();
+
+        let own_gas = closing_header.gas_used;
+        assert!(own_gas > 0, "closing block must carry user-tx gas");
+        let config = WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS };
+        let including = next_base_fee_for_config(config, START_FEE, EPOCH_GAS + own_gas);
+        let excluding = next_base_fee_for_config(config, START_FEE, EPOCH_GAS);
+        // fixture guard: the target makes the two totals price differently
+        assert_ne!(including, excluding, "fixture must discriminate the own-gas fold");
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 1);
+        assert_eq!(
+            entries[0].data,
+            U184::from(including),
+            "recorded fee must include the closing block's own gas"
+        );
+        assert_ne!(
+            entries[0].data,
+            U184::from(excluding),
+            "recorded fee must not be priced from the accumulator alone"
+        );
+
+        Ok(())
+    }
+
+    /// The closing block's own gas is folded into the PRODUCING worker's total only: with two
+    /// EIP-1559 workers and the closing block produced by worker 1 (not the worker-0 default
+    /// every other close test uses), worker 1's recorded fee is priced WITH the closing block's
+    /// user-tx gas while worker 0's is priced from its accumulator gas alone.
+    ///
+    /// This is the only test that discriminates the fold's TARGET selection
+    /// (`worker_id == own_worker` over `ctx.worker_id()` in `record_next_epoch_base_fees`):
+    /// with a worker-0 closing block, a `worker_id()` that always answers 0 and a fold applied
+    /// to every worker are both indistinguishable from the correct close. The fixture guards
+    /// pin both discriminations at runtime — the fold must move worker 1's oracle, and a leak
+    /// of the closing block's gas into worker 0 must move worker 0's.
+    #[tokio::test]
+    async fn test_close_folds_own_gas_into_producing_worker_only() -> eyre::Result<()> {
+        use crate::snapshot::worker_id_from_header;
+        use tn_types::{Hash as _, WorkerId};
+
+        const TARGET_GAS_0: u64 = 2_000_000;
+        const START_FEE_0: u64 = 2_000_000;
+        const EPOCH_GAS_0: u64 = 1_100_000;
+        const TARGET_GAS_1: u64 = 1_000_000;
+        const START_FEE_1: u64 = 1_000_000;
+        const EPOCH_GAS_1: u64 = 1_500_000;
+        const CLOSING_WORKER: WorkerId = 1;
+
+        let mut sender = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(79));
+        let genesis = test_genesis_with_consensus_registry_and_workers(
+            5,
+            vec![(0u8, TARGET_GAS_0), (0u8, TARGET_GAS_1)],
+        )
+        .extend_accounts([(
+            sender.address(),
+            GenesisAccount::default().with_balance(U256::from(parse_ether("1")?)),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Own Gas Producer Attribution Test");
+
+        // both workers carry moved fees and non-zero mid-epoch gas, so either slot would show a
+        // misattributed fold at full magnitude
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(START_FEE_0);
+        acc.inc_block(0, EPOCH_GAS_0, 30_000_000);
+        acc.base_fee(1).set_base_fee(START_FEE_1);
+        acc.inc_block(1, EPOCH_GAS_1, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // two real transfers ride the closing block
+        let recipient = Address::from_slice(&[0xef; 20]);
+        let txs = vec![
+            sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(recipient),
+                U256::from(1),
+                Bytes::new(),
+            ),
+            sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(recipient),
+                U256::from(1),
+                Bytes::new(),
+            ),
+        ];
+
+        // close epoch 0 from CLOSING_WORKER: `new_for_test` hardcodes worker 0, so build the
+        // payload through the production constructor with the same test inputs
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let parent = chain.sealed_genesis_header();
+        let payload = TNPayload::new(
+            parent.clone(),
+            Address::random(),
+            0, // batch_index
+            B256::random(),
+            &consensus_output,
+            consensus_output.digest().into(),
+            parent.base_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE),
+            parent.gas_limit,
+            B256::random(),
+            CLOSING_WORKER,
+        );
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, txs)?;
+        let closing_header = block.recovered_block.clone_sealed_header();
+
+        // the sealed header attributes the closing block to worker 1 through the production
+        // mask (the same low-16-bits read the executor's own-gas fold keys on)
+        assert_eq!(
+            worker_id_from_header(&closing_header),
+            CLOSING_WORKER,
+            "closing block must be attributed to worker 1"
+        );
+        let own_gas = closing_header.gas_used;
+        assert!(own_gas > 0, "closing block must carry user-tx gas");
+
+        let config_0 = WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS_0 };
+        let config_1 = WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS_1 };
+        // producing worker: accumulator gas plus the closing block's own gas
+        let expected_1 = next_base_fee_for_config(config_1, START_FEE_1, EPOCH_GAS_1 + own_gas);
+        // non-producing worker: accumulator gas alone
+        let expected_0 = next_base_fee_for_config(config_0, START_FEE_0, EPOCH_GAS_0);
+
+        // fixture guards: the fold must matter for worker 1 (an unfolded worker 1 prices
+        // differently), a leak into worker 0 must be visible (worker 0 with the closing gas
+        // prices differently), and every value sits away from MIN and the start fees
+        let unfolded_1 = next_base_fee_for_config(config_1, START_FEE_1, EPOCH_GAS_1);
+        assert_ne!(
+            expected_1, unfolded_1,
+            "fixture must discriminate the fold on the producing worker"
+        );
+        let leaked_0 = next_base_fee_for_config(config_0, START_FEE_0, EPOCH_GAS_0 + own_gas);
+        assert_ne!(
+            expected_0, leaked_0,
+            "fixture must discriminate own-gas leakage into the non-producing worker"
+        );
+        for fee in [expected_0, expected_1, unfolded_1, leaked_0] {
+            assert_ne!(fee, MIN_PROTOCOL_BASE_FEE, "fixture fees must not pin at MIN");
+        }
+        assert_ne!(expected_0, START_FEE_0);
+        assert_ne!(expected_1, START_FEE_1);
+        assert_ne!(expected_0, expected_1, "a swapped write must not alias the two workers");
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 2);
+        assert_eq!(
+            entries[1].data,
+            U184::from(expected_1),
+            "producing worker's record must fold the closing block's own gas"
+        );
+        assert_eq!(
+            entries[0].data,
+            U184::from(expected_0),
+            "non-producing worker's record must be priced from its accumulator gas alone"
+        );
+        // the data writes preserve both workers' strategies
+        assert_eq!(entries[0].config, config_0);
+        assert_eq!(entries[1].config, config_1);
+
+        Ok(())
+    }
+
+    /// A worker governance adds MID-epoch (contract `numWorkers` 1 -> 2 while the shared
+    /// accumulator still has 1 slot) is priced at the close from the CONTRACT's count with the
+    /// fresh-slot anchor `next_base_fee_for_config(config, MIN_PROTOCOL_BASE_FEE, 0)`; the
+    /// pre-existing worker still gets its normal oracle, and the close only READS the shared
+    /// accumulator — it must not resize it (entry logic owns that).
+    #[tokio::test]
+    async fn test_close_prices_mid_epoch_added_worker_without_resizing_accumulator(
+    ) -> eyre::Result<()> {
+        const TARGET_GAS_0: u64 = 2_000_000;
+        const START_FEE_0: u64 = 2_000_000;
+        const EPOCH_GAS_0: u64 = 2_500_000;
+        const TARGET_GAS_1: u64 = 1_000_000;
+
+        let genesis =
+            test_genesis_with_consensus_registry_and_workers(5, vec![(0u8, TARGET_GAS_0)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Mid Epoch Worker Add Test");
+
+        let acc = GasAccumulator::new(1);
+        acc.base_fee(0).set_base_fee(START_FEE_0);
+        acc.inc_block(0, EPOCH_GAS_0, 30_000_000);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // block 1 (mid-epoch-0): the owner configures worker 1 then grows the count
+        // (setWorkerConfig must precede setNumWorkers per the contract)
+        let mut governance = governance_owner_factory();
+        let set_config_tx = governance.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setWorkerConfigCall {
+                workerId: 1,
+                strategy: 0,
+                value: TARGET_GAS_1,
+                data: U184::ZERO,
+            }
+            .abi_encode()
+            .into(),
+        );
+        let set_num_workers_tx = governance.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setNumWorkersCall { numWorkers_: 2 }.abi_encode().into(),
+        );
+        let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(
+            &reth_env,
+            payload,
+            vec![set_config_tx, set_num_workers_tx],
+        )?;
+        let canonical_header = block1.recovered_block.clone_sealed_header();
+
+        // sanity: the governance txs landed (a silent revert would fake a 1-worker close)
+        assert_eq!(reth_env.get_worker_fee_configs()?.len(), 2);
+        assert_eq!(acc.num_workers(), 1, "accumulator untouched by governance txs");
+
+        // block 2: close epoch 0 over the 2-worker contract / 1-worker accumulator split
+        let consensus_output = consensus_output_for_tests(2, 1, 2, true);
+        let payload = TNPayload::new_for_test(canonical_header, &consensus_output);
+        let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let closing_header = block2.recovered_block.clone_sealed_header();
+
+        // the close must not resize the live accumulator shared with the batch validator
+        assert_eq!(acc.num_workers(), 1, "close must only READ the accumulator, never resize it");
+
+        let expected_0 = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS_0 },
+            START_FEE_0,
+            EPOCH_GAS_0,
+        );
+        assert_ne!(expected_0, MIN_PROTOCOL_BASE_FEE);
+        assert_ne!(expected_0, START_FEE_0);
+        // fresh-slot anchor: a worker with no accumulator slot prices from (MIN, 0 gas) —
+        // exactly what adjust_base_fees' resize-then-compute and the entry walk produce
+        let expected_1 = next_base_fee_for_config(
+            WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS_1 },
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+        );
+
+        let (num_workers, entries) =
+            worker_config_entries_at_block(&reth_env, closing_header.hash())?;
+        assert_eq!(num_workers, 2, "contract count grew at the boundary");
+        assert_eq!(entries[0].data, U184::from(expected_0), "worker 0 records its normal oracle");
+        assert_eq!(
+            entries[1].data,
+            U184::from(expected_1),
+            "governance-added worker records the fresh-slot anchor"
+        );
+        assert_ne!(entries[1].data, U184::ZERO, "the added worker WAS written");
+        assert_eq!(entries[1].config, WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS_1 });
+
+        Ok(())
+    }
+
+    /// A closing block over a chain whose `WorkerConfigs` account is absent must ABORT with an
+    /// error naming the base-fee recording — the close is fatal on an unreadable contract, it
+    /// must not silently skip the 4th system call and commit a diverging block.
+    #[tokio::test]
+    async fn test_close_fatal_when_worker_configs_unreadable() -> eyre::Result<()> {
+        // registry genesis WITHOUT the WorkerConfigs account: the three registry calls succeed,
+        // then the base-fee record's read decodes empty return data and fails deterministically
+        let mut genesis = test_genesis_with_consensus_registry(5);
+        genesis.alloc.remove(&WORKER_CONFIGS_ADDRESS);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Fatal Without Contract Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let err = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])
+            .expect_err("closing block without WorkerConfigs must abort");
+
+        // the error chain names the recording step (alternate format walks the full chain)
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("recording next-epoch base fees"),
+            "close failure must name the base-fee recording step, got: {msg}"
+        );
+
+        // the abort happened before anything committed: the canonical tip is still genesis
+        assert_eq!(reth_env.canonical_tip().number, 0, "no closing block may commit");
 
         Ok(())
     }

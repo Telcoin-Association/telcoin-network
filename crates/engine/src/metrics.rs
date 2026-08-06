@@ -32,6 +32,12 @@ pub(crate) struct EngineMetrics {
     pub(crate) block_gas_used: Histogram,
     /// Empty non-epoch-closing outputs skipped without producing a block.
     pub(crate) empty_outputs_skipped_total: Counter,
+    /// Bounded retries of the durable output persist after a node-local provider fault
+    /// (the engine halts only once the attempt budget is exhausted).
+    pub(crate) persist_provider_fault_retries_total: Counter,
+    /// Consensus outputs whose durable persist failed after every attempt, rolling back
+    /// the speculative in-memory advance and escalating out of the engine task.
+    pub(crate) persist_failures_total: Counter,
 }
 
 #[cfg(test)]
@@ -54,6 +60,8 @@ mod tests {
             metrics.blocks_executed_total.increment(3);
             metrics.block_gas_used.record(21_000.0);
             metrics.empty_outputs_skipped_total.increment(1);
+            metrics.persist_provider_fault_retries_total.increment(2);
+            metrics.persist_failures_total.increment(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -73,5 +81,9 @@ mod tests {
         find("tn_engine.execution_duration_seconds");
         find("tn_engine.block_gas_used");
         find("tn_engine.empty_outputs_skipped_total");
+        let (_, _, _, value) = find("tn_engine.persist_provider_fault_retries_total");
+        assert!(matches!(value, DebugValue::Counter(2)));
+        let (_, _, _, value) = find("tn_engine.persist_failures_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
     }
 }
