@@ -87,7 +87,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // manually create engine
@@ -336,7 +336,7 @@ async fn test_catchup_accumulator_with_empty_outputs() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
@@ -506,7 +506,7 @@ async fn test_catchup_accumulator_partial_execution() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
@@ -697,7 +697,7 @@ async fn test_sync_then_catchup_recovers_two_worker_accumulator() -> eyre::Resul
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // manually create engine
@@ -1402,7 +1402,7 @@ async fn test_derive_base_fees_recovers_committee_fee_at_boundary() -> eyre::Res
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // manually create engine
@@ -1579,7 +1579,7 @@ async fn epoch_block_height_is_closing_block_plus_one() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
@@ -1742,7 +1742,7 @@ async fn test_derive_base_fees_eip1559_variant_matches_oracle() -> eyre::Result<
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(10);
@@ -1856,7 +1856,7 @@ async fn test_derive_base_fees_excludes_synthetic_close_block() -> eyre::Result<
         Some(chain.clone()),
         None,
         &temp_dir.path().join("reth"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // the empty-close path resolves the leader's execution address through the rewards
     // counter's committee, so build the committee from on-chain registry state

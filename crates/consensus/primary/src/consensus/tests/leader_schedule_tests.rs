@@ -452,3 +452,68 @@ async fn test_leader_schedule_from_store() {
 
     assert_ne!(leader_2.id(), new_leader_2.id());
 }
+
+/// Golden test pinning which good node `LeaderSwapTable::swap` selects for a given round.
+///
+/// The swapped in node becomes the leader for `leader_round`, and the leader certificate is
+/// hashed into the `CommittedSubDag` digest, so nodes that disagree on this selection fork the
+/// chain rather than merely diverging in performance. `swap` therefore seeds `ChaCha12Rng`
+/// explicitly rather than `StdRng`, which `rand` documents as non portable and is free to
+/// re-implement in any release.
+///
+/// The expected indices below are the ones `StdRng` produced under rand 0.9.2, so this test also
+/// records that introducing the pin changed no behavior.
+///
+/// If this test fails after a dependency bump, leader selection has changed. That is a consensus
+/// break to investigate, not an expectation to update.
+#[tokio::test]
+async fn test_swap_good_node_selection_is_pinned() {
+    // GIVEN a committee of ten where seven nodes score well and three score poorly
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .committee_size(NonZeroUsize::new(10).unwrap())
+        .build();
+    let committee = fixture.committee();
+    let authority_ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    authority_ids.iter().enumerate().for_each(|(i, id)| {
+        scores.add_score(id, if i < 7 { 10 } else { 2 });
+    });
+
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+
+    // The golden values are indices into `good_nodes`, so they only carry their intended meaning
+    // if that list has the expected length and the authority we swap is actually a bad node.
+    assert_eq!(table.good_nodes.len(), 7);
+    assert!(table.bad_nodes.contains_key(&authority_ids[7]));
+
+    // (leader_round, expected index into good_nodes)
+    let golden: [(Round, usize); 5] = [(2, 2), (4, 3), (6, 6), (8, 5), (10, 4)];
+
+    // WHEN a bad node is swapped, THEN the replacement is drawn from a pinned sequence
+    golden.iter().for_each(|(round, expected_index)| {
+        let swapped =
+            table.swap(&authority_ids[7], *round).expect("a bad node is always swapped out");
+        let actual_index = table
+            .good_nodes
+            .iter()
+            .position(|good| good.id() == swapped.id())
+            .expect("the swapped in node must come from good_nodes");
+
+        assert_eq!(
+            actual_index, *expected_index,
+            "leader swap selection changed for round {round}, which forks consensus"
+        );
+    });
+
+    // Guard against a degenerate pass: if the selection were constant, the assertions above would
+    // hold for any PRNG that always returned the same index.
+    let distinct: BTreeSet<usize> = golden.iter().map(|(_, index)| *index).collect();
+    assert_eq!(distinct.len(), golden.len(), "golden indices must not be constant");
+
+    // The same round must always yield the same replacement.
+    let first = table.swap(&authority_ids[7], 2).expect("a bad node is always swapped out");
+    let again = table.swap(&authority_ids[7], 2).expect("a bad node is always swapped out");
+    assert_eq!(first.id(), again.id());
+}

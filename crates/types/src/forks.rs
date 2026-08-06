@@ -22,6 +22,24 @@ use alloy::primitives::{b256, B256};
 pub const CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH: B256 =
     b256!("0x5318ebc5cd8123cfb0808fac0f3c0b95ed6f45f67c0853fea0766b52035fea53");
 
+/// Keccak-256 hash of the pre-fork `WorkerConfigs` runtime bytecode deployed on the live adiri
+/// testnet (the worker-configs account's `code` in the committed
+/// `chain-configs/testnet/genesis.yaml`).
+///
+/// The live deployment is an old, pre-#161 tn-contracts build: its `WorkerConfig.data` field is a
+/// `uint128`, and it exposes none of the `setWorkerConfigsData`, `setWorkerConfigsValue`, or
+/// `setMaxStrategy` selectors the current artifact defines. The protocol therefore has no way to
+/// write worker fee state back to the deployed contract, which is why the fork splices the current
+/// artifact's runtime code over it at [`CONSENSUS_REGISTRY_FORK_EPOCH`], alongside the registry
+/// swap.
+///
+/// That splice is gated fail-closed on this hash: if the on-chain `WorkerConfigs` code hashes to
+/// anything else, the block aborts rather than upgrading over an unknown storage layout.
+///
+/// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
+pub const WORKER_CONFIGS_PRE_FORK_CODE_HASH: B256 =
+    b256!("0x5e8a93f4eb1b5d645f32e5b8615463a996aaf4d8af2a90a444378a2d4b4b3bf2");
+
 #[cfg(feature = "adiri")]
 /// The epoch below which Adiri testnet may have had duplicate batches.
 pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
@@ -68,16 +86,35 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 /// confirmed by the operator dry-run below, not promised here.
 ///
 /// Pre-deploy checklist for the epoch-setting PR:
-/// - pin the swapped-in (post-fork) runtime code hash the same way
-///   [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`] pins the pre-fork code, with a pin test against the
-///   embedded `ConsensusRegistry.json` artifact: after the fork runs live, a tn-contracts artifact
-///   bump would otherwise change the bytes re-execution swaps in and break historical state roots;
+/// - pin the swapped-in (post-fork) runtime code hashes of **both** contracts the same way
+///   [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`] and [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`] pin the
+///   pre-fork code, with pin tests against the embedded `ConsensusRegistry.json` and
+///   `WorkerConfigs.json` artifacts: after the fork runs live, a tn-contracts artifact bump would
+///   otherwise change the bytes re-execution swaps in and break historical state roots;
+/// - read the LIVE deployed `WorkerConfigs` and confirm `numWorkers()` and, for every `i <
+///   numWorkers`, `_workerConfigSet[i] == true` (a storage probe — the mapping is internal): the
+///   first post-fork closing block's `setWorkerConfigsData` system call reverts
+///   `MissingWorkerConfig` on any unset row, aborting the one-shot fork-boundary close. Do this
+///   alongside the post-fork hash re-pinning above, since an artifact rebuild silently moves those
+///   hashes. Informational reference only, NOT a compiled constant: at the time of writing, the
+///   embedded artifact's post-fork `WorkerConfigs` splice hashes to
+///   `0x58304c00bbfaa7e348220efb95843614756207311245abc4949f91bb3ddb2ff7`;
+/// - the `WorkerConfigs` bytecode swap ships at this same fork epoch (see
+///   [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`]) — both swaps land in the epoch-closing block of
+///   `CONSENSUS_REGISTRY_FORK_EPOCH - 1`, so a build applying one but not the other diverges;
 /// - confirm the live validator/ConsensusNFT count leaves headroom under the 100M system-call gas
 ///   cap that bounds the one-shot `migrateValidatorSets()` walk;
 /// - operator dry-run: resync a fork-build node against a live adiri archive across the fork
 ///   boundary and confirm matching state roots (also measures the live migration gas);
-/// - the swap fails closed on [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`]: an unexpected on-chain
-///   deployment aborts the block (fatal error) rather than migrating over an incompatible layout.
+/// - both swaps fail closed on their pre-fork pin ([`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`],
+///   [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`]): an unexpected on-chain deployment aborts the block
+///   (fatal error) rather than migrating over an incompatible layout;
+/// - post-fork governance runbook: the `WorkerConfigs` swap replaces code only, so the appended
+///   `maxStrategy` slot (slot 4) stays `0` and every owner call assigning `Static` (strategy id 1)
+///   reverts `InvalidStrategy`. The owner must send one `setMaxStrategy(1)` transaction after the
+///   fork before any Static assignment. This is not urgent: neither the protocol write path
+///   (`setWorkerConfigsData` / `setWorkerConfigsValue`) nor the epoch-boundary read path consults
+///   `maxStrategy`, so a zeroed ceiling gates future governance actions only.
 pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
 
 #[cfg(feature = "adiri")]
@@ -271,5 +308,30 @@ mod tests {
                 "an unset override must not shift the gate at epoch {epoch}",
             );
         });
+    }
+
+    /// Pin [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`] to the worker-configs code committed in
+    /// `chain-configs/testnet/genesis.yaml`.
+    ///
+    /// Unconditional (not `adiri`-gated) so it runs in default-feature CI even though the fork
+    /// machinery consuming the constant is `adiri`-only.
+    #[test]
+    fn test_pre_fork_worker_configs_code_hash_pinned() {
+        let genesis = crate::adiri_genesis();
+        // `tn-config::WORKER_CONFIGS_ADDRESS`, hardcoded because tn-config depends on tn-types
+        // and the reverse edge would be circular.
+        let worker_configs = address!("0xFee0FEe0fee0fEE0FEe0fee0FEE0fEe0feE0FEe0");
+        let code = genesis
+            .alloc
+            .get(&worker_configs)
+            .and_then(|account| account.code.as_ref())
+            .expect("testnet genesis must allocate WorkerConfigs runtime code");
+        assert_eq!(
+            keccak256(code),
+            WORKER_CONFIGS_PRE_FORK_CODE_HASH,
+            "WORKER_CONFIGS_PRE_FORK_CODE_HASH mirrors the LIVE adiri deployment — do not \
+             blindly update this constant to make the test pass; if genesis.yaml was regenerated, \
+             reassess the fork plan and `CONSENSUS_REGISTRY_FORK_EPOCH` first",
+        );
     }
 }
