@@ -934,7 +934,9 @@ impl SnapshotRestorer {
 ///    through a foreign governance write) fails HERE — naming the worker and word — instead of
 ///    halting the node at its first epoch entry later. `Static` rows keep their fee in the config's
 ///    value and ignore `data` entirely, so a garbage word on a `Static` row is accepted by design.
-/// 3. **At least one worker.** A zero-worker count cannot seed any entry.
+/// 3. **At least one worker.** A zero-worker count cannot seed any entry. Unlike (1) and (2) this
+///    one is unreachable through any in-repo path — see the comment at the check itself for the
+///    searches that establish that, and for why it is kept anyway.
 ///
 /// Shared by the restore side ([`SnapshotRestorer::entry_readiness_precondition`]) and the export
 /// side (which runs it against a candidate bundle's anchor block before writing the pack) — one
@@ -964,6 +966,21 @@ pub fn check_entry_readiness(reth_env: &RethEnv, header_b: &SealedHeader) -> eyr
     let (num_workers, entries) = reth_env
         .get_worker_fee_configs_at_block(header_b.hash())
         .wrap_err("snapshot restore: reading WorkerConfigs at the snapshot's final block")?;
+    // (3) UNREACHABLE BY CONSTRUCTION, and therefore deliberately untested: there is no honest
+    // fixture for this branch, only one that pokes storage the contract would never write.
+    // `numWorkers` has exactly two writers and both floor it at 1 — `WorkerConfigs.sol`'s
+    // constructor and `setNumWorkers`, each opening with `revert NumWorkersBelowMinimum()` on
+    // zero. `rg -n 'numWorkers\s*=[^=]' tn-contracts/src/` returns only those two assignments, so
+    // that pair is exhaustive. Upstream of the contract, `GenesisArgs::parse_worker_fee_configs`
+    // rejects an empty config list, and a reverted constructor fails genesis creation outright
+    // (`ensure_pre_genesis_create_success`, pinned by
+    // `genesis_ceremony_rejects_empty_worker_configs`) instead of committing runtime code over
+    // empty storage — the one state that would read back as zero here. An absent contract is a
+    // different failure that never reaches this line: `decode_worker_fee_configs` cannot decode
+    // empty return data and errors out of the read above. Kept regardless, because a snapshot
+    // pack's provenance is outside restore's trust boundary: if a hand-built genesis or a
+    // future contract revision ever does produce zero, it must name itself here rather than
+    // surface later as an empty accumulator at epoch entry.
     if num_workers == 0 {
         return Err(eyre!(
             "snapshot restore: WorkerConfigs at final block {b} reports zero workers; the \

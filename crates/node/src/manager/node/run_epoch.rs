@@ -333,15 +333,17 @@ where
         // pre-resolution for the whole epoch. Halting is a single-node liveness failure.
         //
         // A Provider fault is node-local (peers reading the same block may succeed), so retry
-        // briefly before halting; ChainGlobal returns from the first attempt. The pin is
-        // `epoch_start_header`, a fixed `SealedHeader` captured before this retry, so every
-        // attempt provably reads the same block. The `try_into` arity checks are `eyre`, not
-        // `StateReadError`, so they stay OUTSIDE the retried closure.
+        // briefly before halting; ChainGlobal returns from the first attempt. `epoch_start_header`
+        // is threaded through the retry as the pin, so every attempt provably reads the same
+        // block. The `try_into` arity checks are `eyre`, not `StateReadError`, so they stay
+        // OUTSIDE the retried closure.
         let epochs: Vec<_> =
             if entered == 0 { vec![entered + 1] } else { vec![entered - 1, entered + 1] };
-        let sets = retry_provider_faults("neighbor committees at the epoch-start pin", || {
-            engine.validators_for_epochs_at_header(&epochs, &epoch_start_header)
-        })
+        let sets = retry_provider_faults(
+            "neighbor committees at the epoch-start pin",
+            &epoch_start_header,
+            |pin| engine.validators_for_epochs_at_header(&epochs, pin),
+        )
         .await
         .map_err(|e| {
             eyre::eyre!(
@@ -993,7 +995,8 @@ async fn adjust_base_fees(
     // Only a proven identity VIOLATION or an exhausted provider fault halts.
     let (entered_epoch, epoch_info) = match retry_provider_faults(
         "close-time epoch info (identity check)",
-        || ready(reth_env.get_current_epoch_info_at_header(&tip)),
+        &tip,
+        |pin| ready(reth_env.get_current_epoch_info_at_header(pin)),
     )
     .await
     {
@@ -1065,8 +1068,8 @@ async fn apply_close_time_fee_updates(
     // A node-local provider fault is NOT committee-deterministic (peers may read fine
     // and move to the new fees), so it must never fail open: retry, then halt. Pinned to the SAME
     // `tip` the identity check validated (one-header discipline).
-    match retry_provider_faults("close-time worker fee configs", || {
-        ready(reth_env.get_worker_fee_configs_at_block(tip.hash()))
+    match retry_provider_faults("close-time worker fee configs", tip, |pin| {
+        ready(reth_env.get_worker_fee_configs_at_block(pin.hash()))
     })
     .await
     {
@@ -1121,22 +1124,29 @@ const CLOSE_READ_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 ///
 /// `read` returns a future so the async epoch-record and epoch-entry committee reads share this
 /// policy with the synchronous close-time reads (which adapt with [`std::future::ready`]). Each
-/// attempt calls `read` afresh, so every retry re-runs the whole read — which is why every caller
-/// must fix its pin OUTSIDE the closure, or successive attempts could resolve different blocks.
+/// attempt calls `read` afresh, so every retry re-runs the whole read — against the SAME `pin`.
+/// That is why the pin is a PARAMETER rather than something the closure captures: the compiler
+/// forces every caller to resolve it before the first attempt, and hands it to `read` by
+/// reference, so a closure that re-resolved a pin of its own would visibly be ignoring the one it
+/// was given. Re-sampling per attempt is what the retry cannot tolerate — successive attempts
+/// would resolve different blocks. `P` is generic so each site threads whatever it pins (a
+/// [`SealedHeader`], a `BlockNumHash`, …).
 ///
 /// Every retry is counted through [`EpochMetrics::record_provider_fault_retry`], labelled by
 /// `what`. Once a provider fault at an epoch seam is survivable it becomes invisible until it is
 /// not, and a `warn!` alone will not surface a node quietly retrying at every boundary.
-pub(super) async fn retry_provider_faults<T, Fut>(
+pub(super) async fn retry_provider_faults<'pin, P, T, Fut>(
     what: &'static str,
-    mut read: impl FnMut() -> Fut,
+    pin: &'pin P,
+    mut read: impl FnMut(&'pin P) -> Fut,
 ) -> Result<T, StateReadError>
 where
+    P: ?Sized,
     Fut: Future<Output = Result<T, StateReadError>>,
 {
     let mut attempt = 1u32;
     loop {
-        match read().await {
+        match read(pin).await {
             Err(StateReadError::Provider(detail)) if attempt < CLOSE_READ_ATTEMPTS => {
                 warn!(
                     target: "epoch-manager",
@@ -1185,24 +1195,31 @@ fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manager::{read_base_fees_for_entered_epoch, sync_num_workers_from_chain};
+    use crate::manager::{
+        read_base_fees_for_entered_epoch, sync_num_workers_from_chain, EpochBaseFees,
+    };
     use rand::{rngs::StdRng, SeedableRng as _};
-    use std::{cell::Cell, sync::Arc};
+    use std::{
+        cell::{Cell, RefCell},
+        sync::Arc,
+        time::Instant,
+    };
     use tempfile::TempDir;
     use tn_config::WORKER_CONFIGS_ADDRESS;
     use tn_reth::{
         payload::TNPayload,
-        system_calls::CONSENSUS_REGISTRY_ADDRESS,
+        system_calls::{WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS},
         test_utils::{
             consensus_output_for_tests, execute_payload_and_update_canonical_chain,
-            read_worker_config_entries_at, test_genesis_with_consensus_registry,
-            test_genesis_with_consensus_registry_and_workers, TransactionFactory,
+            governance_owner_factory, read_worker_config_entries_at,
+            test_genesis_with_consensus_registry, test_genesis_with_consensus_registry_and_workers,
+            TransactionFactory,
         },
         RethChainSpec,
     };
     use tn_types::{
-        gas_accumulator::WorkerFeeConfig, Address, GenesisAccount, WorkerId, B256,
-        MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::WorkerFeeConfig, Address, ExecHeader, GenesisAccount, SolCall as _,
+        WorkerId, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Pin the anchor-wait derivation to the producer's own ceiling: recompute the vote
@@ -1238,7 +1255,7 @@ mod tests {
         // CLOSE_READ_ATTEMPTS times total, then surfaces as the Provider error for the caller
         // to escalate into a halt.
         let calls = Cell::new(0u32);
-        let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
+        let res: Result<(), StateReadError> = retry_provider_faults("test read", &(), |_| {
             calls.set(calls.get() + 1);
             ready(Err(StateReadError::Provider("mdbx i/o fault".into())))
         })
@@ -1253,7 +1270,7 @@ mod tests {
         // A transient provider fault (fails once, then reads fine) must NOT halt the node: the
         // retry absorbs it and the successful value passes through.
         let calls = Cell::new(0u32);
-        let res = retry_provider_faults("test read", || {
+        let res = retry_provider_faults("test read", &(), |_| {
             calls.set(calls.get() + 1);
             ready(if calls.get() == 1 {
                 Err(StateReadError::Provider("transient i/o fault".into()))
@@ -1272,7 +1289,7 @@ mod tests {
         // Chain-global failures are deterministic products of the pinned block - re-reading
         // cannot change them, so they return immediately for the caller's fail-open arm.
         let calls = Cell::new(0u32);
-        let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
+        let res: Result<(), StateReadError> = retry_provider_faults("test read", &(), |_| {
             calls.set(calls.get() + 1);
             ready(Err(StateReadError::ChainGlobal("contract absent".into())))
         })
@@ -1280,6 +1297,179 @@ mod tests {
 
         assert!(matches!(res, Err(StateReadError::ChainGlobal(_))));
         assert_eq!(calls.get(), 1, "chain-global failures are never retried");
+    }
+
+    /// The retry policy under a REAL provider fault, driven through a production call site: the
+    /// entry read's pin guard (`read_base_fees_for_entered_epoch`'s first retried read) against a
+    /// header whose hash this node's DB cannot resolve. `RethEnv`'s pinned state-provider
+    /// construction classifies an unresolvable pin as [`StateReadError::Provider`], so the retry
+    /// absorbs two faults and the third surfaces under the call site's `wrap_err_with` context.
+    ///
+    /// The retry evidence here is real elapsed time — 2 x [`CLOSE_READ_RETRY_BACKOFF`] — so this
+    /// test deliberately runs on a real clock. `#[tokio::test(start_paused = true)]` is not usable:
+    /// a paused clock auto-advances past both backoffs (erasing the evidence), and its auto-advance
+    /// only fires when the runtime has nothing else to poll, which a live `RethEnv` does not
+    /// guarantee.
+    ///
+    /// The entry read's OTHER retried site ("epoch-entry base fees") is deliberately not covered
+    /// by a fault test: it pins the very header the guard above already resolved, so a pin that
+    /// faults there faults the guard first — there is no way to fail the second read without
+    /// failing the first, and manufacturing one would mean adding a seam that production does not
+    /// have.
+    #[tokio::test]
+    async fn entry_read_retries_a_real_provider_fault_then_halts() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("entry_read_provider_fault")?;
+        let task_manager = TaskManager::new("entry read provider fault");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+
+        // a phantom pin: nothing in this node's DB resolves its hash, so state construction fails
+        let phantom = SealedHeader::new(ExecHeader::default(), B256::random());
+        let started = Instant::now();
+        let err = read_base_fees_for_entered_epoch(&reth_env, 1, &phantom)
+            .await
+            .expect_err("an unresolvable pin must fail the entry read");
+        let elapsed = started.elapsed();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "failed to read the registry epoch record at epoch 1's pinned closing \
+                 block 0"
+            ),
+            "the fault must surface under the call site's context: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{:?}", phantom.hash())),
+            "the context must name the pin's hash: {msg}"
+        );
+        assert!(
+            elapsed >= CLOSE_READ_RETRY_BACKOFF * (CLOSE_READ_ATTEMPTS - 1),
+            "an exhausted read must have slept through every backoff, took {elapsed:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Pin stability across attempts: every attempt receives the IDENTICAL pin — the same object,
+    /// not merely an equal value. This is the property the `pin` parameter exists to protect (a
+    /// per-attempt re-resolve is exactly what would let successive attempts read different
+    /// blocks), so it is asserted on pointer identity, which an `==` on a re-resolved-but-equal
+    /// header would not catch.
+    #[tokio::test(start_paused = true)]
+    async fn retry_provider_faults_hands_every_attempt_the_same_pin() {
+        let pin = SealedHeader::new(
+            ExecHeader { number: 7, ..Default::default() },
+            B256::repeat_byte(0x5a),
+        );
+        let seen: RefCell<Vec<(*const SealedHeader, B256)>> = RefCell::new(Vec::new());
+
+        let res: Result<(), StateReadError> =
+            retry_provider_faults("test read", &pin, |p: &SealedHeader| {
+                seen.borrow_mut().push((std::ptr::from_ref(p), p.hash()));
+                ready(Err(StateReadError::Provider("mdbx i/o fault".into())))
+            })
+            .await;
+
+        assert!(matches!(res, Err(StateReadError::Provider(_))));
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), CLOSE_READ_ATTEMPTS as usize, "one pin per attempt");
+        assert!(
+            seen.iter().all(|&(ptr, hash)| ptr == std::ptr::from_ref(&pin) && hash == pin.hash()),
+            "every attempt must receive the caller's pin object: {seen:?}"
+        );
+    }
+
+    /// Metric plumbing THROUGH the retry helper: [`EpochMetrics::record_provider_fault_retry`]
+    /// fires once per absorbed fault, labelled with the caller's `what`.
+    ///
+    /// An exhausted read emits `CLOSE_READ_ATTEMPTS - 1` retries, not `CLOSE_READ_ATTEMPTS`: the
+    /// constant counts TOTAL attempts (first try + retries) and the final failure is escalated to
+    /// the caller rather than retried.
+    ///
+    /// The recorder installs a thread-local, so the retry runs on a current-thread runtime driven
+    /// from inside `metrics::with_local_recorder` — an async test would poll the future on a thread
+    /// the guard never covered.
+    #[test]
+    fn retry_provider_faults_counts_each_retry_with_the_read_label() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("current-thread runtime");
+
+        metrics::with_local_recorder(&recorder, || {
+            let res: Result<(), StateReadError> =
+                rt.block_on(retry_provider_faults("epoch-entry pin guard", &(), |_| {
+                    ready(Err(StateReadError::Provider("mdbx i/o fault".into())))
+                }));
+            assert!(matches!(res, Err(StateReadError::Provider(_))));
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let (key, _, _, value) = snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == "tn_epoch.provider_fault_retries_total")
+            .expect("the retry counter must be registered");
+        assert!(
+            matches!(value, DebugValue::Counter(n) if *n == (CLOSE_READ_ATTEMPTS - 1) as u64),
+            "an exhausted read emits CLOSE_READ_ATTEMPTS - 1 retries, got {value:?}"
+        );
+        assert!(
+            key.key().labels().any(|l| l.key() == "read" && l.value() == "epoch-entry pin guard"),
+            "the counter must carry the caller's read label"
+        );
+    }
+
+    /// A worker-count SHRINK through [`EpochBaseFees::apply`] — the direction no production call
+    /// site currently takes, and the one the accumulator handles least gently.
+    ///
+    /// Every live boundary reaches `apply` with the count already truncated by
+    /// `apply_close_time_fee_updates`, so the resize no-ops there; a shrink only lands here on the
+    /// `close_epoch(None, ..)` recovery closes and the close-time chain-global fail-open (see
+    /// `apply`'s doc). The struct's fields are `pub`, so the shape is asserted directly instead of
+    /// behind a governance `setNumWorkers` that does not exist in the tree yet.
+    ///
+    /// Pins both halves of the contract: the truncation itself, and the residual the doc names —
+    /// the removed slot is GONE, so a leftover batch attributed to it panics in
+    /// [`GasAccumulator::inc_block`] rather than silently diverging the epoch's gas totals (the
+    /// same tripwire `inc_block_after_shrink_panics` pins in `tn-types`).
+    #[test]
+    fn entry_apply_truncates_the_accumulator_on_a_worker_shrink() {
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(4_242);
+        acc.base_fee(1).set_base_fee(9_099);
+        // gas on the SURVIVING worker: `apply` resizes the slot vector, so this is the half of the
+        // truncation that has to be preserved rather than dropped. Incrementing the removed worker
+        // instead would assert nothing — its slot is gone, and worker 0's counters would read
+        // `(0, 0, 0)` whatever `apply` did.
+        acc.inc_block(0, 1_000_000, 30_000_000);
+
+        // the entered epoch's closing block reports ONE worker: governance removed worker 1
+        EpochBaseFees { num_workers: 1, fees: vec![7_777] }.apply(&acc);
+
+        assert_eq!(acc.num_workers(), 1, "the accumulator truncates to the on-chain count");
+        assert_eq!(acc.base_fee(0).base_fee(), 7_777, "the surviving worker takes the read fee");
+        assert_eq!(
+            acc.get_values(0),
+            (1, 1_000_000, 30_000_000),
+            "the surviving worker's gas counters are untouched by apply"
+        );
+    }
+
+    /// The residual `apply`'s doc accepts: after the shrink above, a block attributed to the
+    /// removed worker halts the node instead of landing in a slot that no longer exists.
+    #[test]
+    #[should_panic(expected = "worker id 1 out of range")]
+    fn entry_apply_shrink_leaves_a_removed_worker_id_fatal() {
+        let acc = GasAccumulator::new(2);
+        EpochBaseFees { num_workers: 1, fees: vec![MIN_PROTOCOL_BASE_FEE] }.apply(&acc);
+        acc.inc_block(1, 10, 20);
     }
 
     /// Keep-current arm of the close-time fail-open: a CHAIN-GLOBAL config-read failure
@@ -1431,6 +1621,203 @@ mod tests {
         assert!(msg.contains("closing-block pin"), "error must name the pin: {msg}");
         assert!(msg.contains("reports epoch 0"), "error must name the registry's view: {msg}");
         assert!(msg.contains("expected epoch 1"), "error must name the expected epoch: {msg}");
+
+        Ok(())
+    }
+
+    /// The pin guard's SECOND disjunct alone: the registry at the pin reports the RIGHT epoch but
+    /// the wrong first block, so `epoch_at_pin == entered` and only
+    /// `epoch_info.blockHeight != closing_header.number + 1` rejects the header.
+    ///
+    /// The sibling test above trips both halves at once (genesis reports epoch 0 for a caller
+    /// claiming epoch 1), so deleting the `blockHeight` comparison would leave it green. This one
+    /// isolates the comparison, and the reachable shape is `closing + 1` UPWARD, not `closing - 1`:
+    /// one block before the boundary the registry still reports `entered - 1`, which is the first
+    /// disjunct again. One block after, the registry has already crossed to `entered` and only its
+    /// `blockHeight` (still the boundary's `closing + 1`) disagrees.
+    ///
+    /// The assertions therefore pin the epoch/block PAIR the mismatch produces — reported and
+    /// expected epochs equal, reported and expected first blocks one apart — which the three
+    /// substrings the sibling asserts cannot discriminate (all four come from one format string).
+    /// The genuine pin is exercised in the same fixture so a broken boundary cannot masquerade as
+    /// the guard firing.
+    #[tokio::test]
+    async fn entry_read_rejects_a_post_boundary_pin_on_block_height_alone() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("entry_read_post_boundary_pin")?;
+        let task_manager = TaskManager::new("entry read post boundary pin");
+        let acc = GasAccumulator::new(1);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // block 1 genuinely closes epoch 0: the registry now reports epoch 1 beginning at block 2
+        let closing = execute_worker_block(
+            &reth_env,
+            &acc,
+            chain.sealed_genesis_header(),
+            &consensus_output_for_tests(1, 0, 1, true),
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+            vec![],
+        )?;
+        assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 must have closed");
+
+        // fixture guard: the real pin is accepted, so the boundary below is genuine
+        read_base_fees_for_entered_epoch(&reth_env, 1, &closing)
+            .await
+            .expect("the genuine closing block must pass the pin guard");
+
+        // block 2 is epoch 1's FIRST block: same epoch at the pin, first block now one too low
+        let after = execute_worker_block(
+            &reth_env,
+            &acc,
+            closing.clone(),
+            &consensus_output_for_tests(1, 1, 2, false),
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+            vec![],
+        )?;
+        assert_eq!(after.number, closing.number + 1);
+
+        let err = read_base_fees_for_entered_epoch(&reth_env, 1, &after)
+            .await
+            .expect_err("a pin one block past the boundary must fail the blockHeight comparison");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reports epoch 1 beginning at block 2"),
+            "the registry must report the EXPECTED epoch at the pin (first disjunct silent): {msg}"
+        );
+        assert!(
+            msg.contains("expected epoch 1 beginning at block 3"),
+            "only the first-block half may disagree: {msg}"
+        );
+
+        Ok(())
+    }
+
+    /// The entry read's fee-mapping halt: an `Eip1559` row whose `data` word exceeds `u64::MAX`
+    /// aborts the entry instead of truncating an arbitrary word into a consensus-critical base fee.
+    ///
+    /// The arm is a TRIPWIRE, unreachable on a canonical chain: the pin guard forces a genuine
+    /// closing block, and that block's `record_next_epoch_base_fees` runs in `finish` — after user
+    /// transactions — rewriting EVERY `Eip1559` row's word with a `u64`, so a poison landed by
+    /// governance in the closing block is overwritten before the entry can read it. Reaching the
+    /// arm therefore means FORGING a boundary pin, exactly as the snapshot side's
+    /// `entry_readiness_rejects_poisoned_eip1559_data_word` does.
+    ///
+    /// The forge differs from the snapshot side's because the seams differ. That test imports a
+    /// pack, so it can hand the restorer a synthetic header carrying the poisoned block's state
+    /// ROOT. A live `RethEnv` resolves pinned state by block HASH out of its own DB, so a header
+    /// with an invented hash resolves nothing (that is the `Provider` fault the retry test drives).
+    /// The forge here instead keeps the poisoned block's real hash — so the DB serves its state —
+    /// and rewrites only the header's `number` down to the genuine closing block's, which is what
+    /// keeps the registry's `blockHeight == pin + 1` boundary claim intact. Header provenance is
+    /// outside this read's trust boundary either way; the WORD check is what catches the shape.
+    ///
+    /// Asserts all FOUR fields the wrapper carries — worker id, entered epoch, and the PIN's own
+    /// block number and hash — the last two being why the forge is visible in the message at all
+    /// (the pin reports block 1 while its state comes from block 2).
+    #[tokio::test]
+    async fn entry_read_halts_on_an_oversized_eip1559_data_word() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+        // `u64::MAX + 1`: one past what a base fee can be, still far inside a `uint184`. Held as
+        // decimal text and parsed at the call site so the row's own `U184` type is inferred — this
+        // crate has no direct `alloy` dependency to name it with.
+        const POISON: &str = "18446744073709551616";
+
+        let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(0u8, TARGET_GAS)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("entry_read_poisoned_word")?;
+        let task_manager = TaskManager::new("entry read poisoned word");
+        let acc = GasAccumulator::new(1);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // block 1 closes epoch 0; the close itself records a sane word for worker 0
+        let closing = execute_worker_block(
+            &reth_env,
+            &acc,
+            chain.sealed_genesis_header(),
+            &consensus_output_for_tests(1, 0, 1, true),
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+            vec![],
+        )?;
+        let (_, entries) = read_worker_config_entries_at(&reth_env, closing.hash())?;
+        assert!(
+            entries[0].data.to::<u64>() >= MIN_PROTOCOL_BASE_FEE,
+            "fixture: the close must have recorded a sane word, which is why the poison cannot \
+             ride the closing block itself"
+        );
+
+        // block 2 (mid-epoch-1): the owner rewrites worker 0's row with an oversized word; no
+        // close runs here, so nothing rewrites it back
+        let mut governance = governance_owner_factory();
+        let poison_tx = governance.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setWorkerConfigCall {
+                workerId: 0,
+                strategy: 0,
+                value: TARGET_GAS,
+                data: POISON.parse().expect("u64::MAX + 1 fits a uint184"),
+            }
+            .abi_encode()
+            .into(),
+        );
+        let poisoned = execute_worker_block(
+            &reth_env,
+            &acc,
+            closing.clone(),
+            &consensus_output_for_tests(1, 1, 2, false),
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+            vec![poison_tx],
+        )?;
+        let (_, entries) = read_worker_config_entries_at(&reth_env, poisoned.hash())?;
+        assert_eq!(
+            entries[0].data.to_string(),
+            POISON,
+            "fixture: the owner tx must land the oversized word"
+        );
+        assert!(
+            matches!(entries[0].config, WorkerFeeConfig::Eip1559 { .. }),
+            "fixture: the poisoned row must still decode as EIP-1559"
+        );
+
+        // forge the boundary pin: the poisoned block's real HASH (so its state resolves) under the
+        // genuine closing block's NUMBER (so `blockHeight == pin + 1` still holds)
+        let mut forged = poisoned.header().clone();
+        forged.number = closing.number;
+        let forged = SealedHeader::new(forged, poisoned.hash());
+
+        let err = read_base_fees_for_entered_epoch(&reth_env, 1, &forged)
+            .await
+            .expect_err("an oversized EIP-1559 word must halt the entry read");
+        let msg = err.to_string();
+        assert!(msg.contains("worker 0"), "must name the worker: {msg}");
+        assert!(msg.contains("epoch 1's entry base fee"), "must name the entered epoch: {msg}");
+        assert!(
+            msg.contains(&format!("pinned closing block {}", closing.number)),
+            "must name the PIN's block number: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{:?}", poisoned.hash())),
+            "must name the pin's block hash: {msg}"
+        );
+        assert!(msg.contains("exceeds u64::MAX"), "must name the oversized word: {msg}");
 
         Ok(())
     }

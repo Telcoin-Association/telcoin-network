@@ -2,7 +2,7 @@
 
 This directory implements a **native token-issuance precompile** for the Telcoin (TEL) token. The precompile owns the on-chain mint/claim/burn lifecycle and exposes a single read-only view (`totalSupply`). It does **not** expose an ERC-20 transfer/approve/permit surface — those flows live in user-space contracts and rely on native value transfers, which are equivalent to ERC-20 transfers because TEL balances are native account balances.
 
-The precompile is registered as a `DynPrecompile` inside reth's `PrecompilesMap` at address `0x00000000000000000000000000000000000007e1`. Any `CALL` or `STATICCALL` targeting this address is intercepted by the dispatcher in `mod.rs` and routed to the appropriate handler based on the 4-byte function selector.
+The precompile is registered as a `DynPrecompile` inside reth's `PrecompilesMap` at address `0x00000000000000000000000000000000000007e1`. Any `CALL` or `STATICCALL` targeting this address is intercepted by the dispatcher in `mod.rs`, which routes on the 4-byte function selector. Routing is not unconditional for a `STATICCALL`: only the read-only selectors are served in a static frame — `totalSupply`, plus `hasMintRole` under the `faucet` feature — and every state-mutating selector is refused before dispatch. See "`STATICCALL` write protection" under Security considerations.
 
 ## Module map
 
@@ -69,6 +69,7 @@ No pending state, no timelock. Mint roles can be granted/revoked by governance.
 | `burn`                             | Governance only                                    |
 | `grantMintRole` / `revokeMintRole` | Governance only (faucet feature)                   |
 | `hasMintRole` / `totalSupply`      | Any account (read-only)                            |
+| Any selector inside a `STATICCALL` | Read-only only — `totalSupply` (plus `hasMintRole` under `faucet`); mutating selectors refused regardless of caller |
 
 Governance is identified by `GOVERNANCE_SAFE_ADDRESS` from `tn-config`.
 
@@ -86,9 +87,19 @@ The rationale is that none of those selectors needed to live at the protocol lev
 
 Shrinking the surface to issuance-only is the actual reason for the deletion; the resulting protocol is simpler and exposes less authority than a full ERC-20 implementation would.
 
-#### `DELEGATECALL` semantics under revm
+### `DELEGATECALL` semantics under revm
 
 For completeness: a contract that `DELEGATECALL`s into `0x7e1` runs the precompile's logic, but every `SSTORE` the precompile performs targets the literal address argument it passes — `TELCOIN_PRECOMPILE_ADDRESS` — not the calling contract's storage. The precompile dispatcher routes through `EvmInternals::sstore(TELCOIN_PRECOMPILE_ADDRESS, …)`, and revm's journaled state writes to the address argument verbatim with no `DELEGATECALL`-aware rewrite. A regression test in `crates/tn-reth/tests/it/tel_precompile_props.rs` (`test_delegatecall_writes_target_precompile_storage`) pins this behaviour against future revm upgrades.
+
+### `STATICCALL` write protection
+
+Registering `0x7e1` as a `DynPrecompile` short-circuits bytecode execution: revm's handler runs the precompile before it loads any bytecode for the target, so the `require_non_staticcall!` check that `SSTORE` and `LOG` expand through never runs for calls routed into the dispatcher, and the journal beneath it carries no static-context flag that would catch the writes instead. Write protection for a precompile is the precompile's own responsibility.
+
+The dispatcher therefore classifies selectors itself, and it classifies by *read-only* rather than by *mutating*. `totalSupply` — plus `hasMintRole` under the `faucet` feature — stay callable inside a `STATICCALL` frame; every other selector is refused with `static call: state mutation not permitted` before its handler is reached. Default-deny is the point: a selector added to the dispatcher later is guarded unless someone explicitly names it read-only, so the direction of a future mistake is a refused read rather than an unguarded write. One consequence is that an unrecognised selector inside a static frame reports that same rejection rather than `Unknown function selector`; both revert the frame.
+
+This matters because staticcall-into-precompile is a live pattern in this codebase — `ConsensusRegistry` reaches the sibling BLS precompile that way — and because without the check an authorized caller's `STATICCALL` into `mint` or `grantMintRole` was accepted and wrote storage.
+
+Four regression tests pin both directions, reaching the precompile through the `STATICCALL` relay in `crates/tn-reth/tests/it/precompile_relays.rs`: `test_staticcall_cannot_mutate_precompile_state` and `test_staticcall_still_serves_read_only_selectors` (mainnet, in `tel_precompile_props.rs`), and `test_staticcall_cannot_grant_mint_role` and `test_staticcall_still_serves_has_mint_role` (`faucet`, in `tel_precompile_faucet_props.rs`).
 
 ### Timelock bypass (`faucet` feature)
 
@@ -112,6 +123,8 @@ Each handler charges a fixed gas amount upfront. The tables below compare each c
 
 These costs do **not** include the base transaction cost (21,000) or calldata costs; those are charged by the EVM before the precompile runs.
 
+Native-balance mutations (`balance_incr` / `balance_decr` in `claim`, `burn`, and the faucet `mint`) are priced as account **accesses** only, never as writes — balances are not precompile storage, and the account is already touched by the call. Every headroom figure below rests on that assumption.
+
 ### EVM gas reference (Cancun)
 
 | Operation         | Condition             | Gas                   |
@@ -134,6 +147,8 @@ These costs do **not** include the base transaction cost (21,000) or calldata co
 | Function                      | Gas   | Notes        |
 | ----------------------------- | ----- | ------------ |
 | `totalSupply`, `hasMintRole`  | 2,100 | 1 cold SLOAD |
+
+**Status: Tight** — 1.00× headroom. Exactly covers the single cold SLOAD. `hasMintRole` is only compiled with the `faucet` feature; a query for the governance address short-circuits before the read and so overpays by the full 2,100.
 
 ### `mint` (mainnet) — 41,000 gas
 
@@ -197,7 +212,7 @@ These costs do **not** include the base transaction cost (21,000) or calldata co
 | SSTORE role slot | cold, 0→nonzero | 22,100     |
 | **Total**        |                 | **22,100** |
 
-**Status: Undercharged** — 1.00× headroom. Exceeds gas constant by 100 in worst case (new grant). Re-grants (nonzero→nonzero) cost only 5,000.
+**Status: Undercharged** — 0.995× headroom. Exceeds gas constant by 100 in worst case (new grant). Re-grants (nonzero→nonzero) cost only 5,000.
 
 ### `revokeMintRole` (faucet) — 22,000 gas
 
@@ -211,8 +226,8 @@ These costs do **not** include the base transaction cost (21,000) or calldata co
 ### Status key
 
 - **Undercharged** (headroom < 1.0×): The gas constant is lower than the worst-case EVM cost. The precompile charges less gas than an equivalent Solidity contract would consume. The operation is subsidized relative to EVM costs.
-- **Tight** (headroom 1.0×–1.2×): The gas constant barely covers the worst-case EVM cost. No margin for implementation overhead or future gas schedule changes.
-- **OK** (headroom > 1.2×): Sufficient margin above worst-case EVM cost.
+- **Tight** (headroom 1.0×–1.25×): The gas constant barely covers the worst-case EVM cost. No margin for implementation overhead or future gas schedule changes.
+- **OK** (headroom > 1.25×): Sufficient margin above worst-case EVM cost.
 
 ## Testing
 

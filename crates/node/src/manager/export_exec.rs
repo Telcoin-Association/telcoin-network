@@ -186,11 +186,19 @@ fn run_worker(mut rx: mpsc::Receiver<WorkerMsg>) {
 /// `out_dir`.
 ///
 /// Returns `Ok(Some(outcome))` on a completed export, or `Ok(None)` when the snapshot is
-/// intentionally skipped because a node could not resume from it — an idle epoch (an EIP-1559
-/// worker with no genuine block in the window) leaves the base-fee derivation nothing to anchor, so
-/// a node bootstrapped from the bundle would walk below the snapshot and halt, and `db load-state`
-/// would reject it anyway. The check is the same one the importer runs and is done before the
-/// expensive state walk, so idle epochs cost only the header scan.
+/// intentionally skipped because a node could not resume from it. What decides that is
+/// [`check_entry_readiness`] run against the pinned anchor — the same check `db load-state` applies
+/// at import, so a pack written here is one the importer will accept: the anchor must have closed
+/// an epoch, and its `WorkerConfigs` rows must all read back as entry fees. Worker idleness is not
+/// a skip condition. A restored node reads each worker's entry fee out of the `WorkerConfigs` row
+/// pinned at that block — for an `Eip1559` worker, the `data` word the block itself recorded — so
+/// an epoch in which a worker produced nothing exports like any other;
+/// `skips_export_when_tip_is_not_an_epoch_boundary` (below) covers the skip that does fire.
+///
+/// A skip is not free — [`gather_headers`] has already read the anchor plus up to
+/// [`BLOCKHASH_ANCESTORS`] ancestor headers by the time the check runs — but ordering it before
+/// [`export_state_pack`](tn_reth::snapshot::PinnedStateView::export_state_pack) still saves the
+/// full plain-state walk, which dominates both.
 fn export_once(
     reth_env: &RethEnv,
     block: BlockNumHash,

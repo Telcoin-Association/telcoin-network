@@ -307,22 +307,22 @@ pub async fn sync_num_workers_from_chain(
     gas_accumulator: &GasAccumulator,
     epoch_first_block: u64,
 ) -> eyre::Result<()> {
+    // `read_block` is derived from the caller's `epoch_first_block`, so the header resolved here is
+    // the pin the retry below threads into every attempt.
     let read_block = epoch_first_block.saturating_sub(1);
-    // The pin is fixed HERE, outside the retry below: `read_block` is derived from the caller's
-    // `epoch_first_block`, not re-sampled per attempt, so every attempt provably resolves the same
-    // header and the retry cannot drift onto a different block.
     let header = reth_env
         .sealed_header_by_number(read_block)
         .wrap_err_with(|| format!("failed to read header {read_block} while syncing worker count"))?
         .ok_or_else(|| eyre!("no header at block {read_block} while syncing worker count"))?;
 
-    let (num_workers, _entries) = retry_provider_faults("epoch-entry worker count", || {
-        ready(reth_env.get_worker_fee_configs_at_block(header.hash()))
-    })
-    .await
-    .wrap_err_with(|| {
-        format!("failed to read WorkerConfigs at block {read_block} while syncing worker count")
-    })?;
+    let (num_workers, _entries) =
+        retry_provider_faults("epoch-entry worker count", &header, |pin| {
+            ready(reth_env.get_worker_fee_configs_at_block(pin.hash()))
+        })
+        .await
+        .wrap_err_with(|| {
+            format!("failed to read WorkerConfigs at block {read_block} while syncing worker count")
+        })?;
 
     let current = gas_accumulator.num_workers();
     if current != num_workers {
@@ -361,12 +361,25 @@ impl EpochBaseFees {
     /// Safe to run while the engine is still executing leftover consensus output on a ModeChange
     /// re-entry: both values are pinned to the previous epoch's closing block, so the re-entry
     /// re-reads the identical count — the resize no-ops — and rewrites the identical fees. That
-    /// value-stability argument covers ModeChange re-entry ONLY. On the NewEpoch path a governance
-    /// shrink takes effect at the boundary and [`GasAccumulator::set_num_workers`] truncates
-    /// unconditionally (staying above in-flight worker ids is the CALLER obligation its doc
-    /// records); there the bound comes from the boundary-drain ordering — the closed epoch's
-    /// output is executed through the boundary before the entry runs — with the accepted residual
-    /// that a leftover batch from a removed worker would panic in `GasAccumulator::inc_block`.
+    /// value-stability argument covers ModeChange re-entry ONLY. Where the count moves,
+    /// [`GasAccumulator::set_num_workers`] truncates unconditionally (staying above in-flight
+    /// worker ids is the CALLER obligation its doc records), with the accepted residual that a
+    /// leftover batch from a removed worker would panic in `GasAccumulator::inc_block`.
+    ///
+    /// A governance shrink takes effect at the boundary, but on the LIVE boundary this resize is
+    /// not the one that applies it. `apply_close_time_fee_updates` (in `run_epoch`) is a third
+    /// production `set_num_workers` caller alongside this method and
+    /// [`sync_num_workers_from_chain`], and it runs first — at close time, off `entries.len()` read
+    /// at the very closing block this entry then pins — so the live NewEpoch entry finds the count
+    /// already truncated and its own resize no-ops. A shrink therefore reaches production THROUGH
+    /// this method only on the closes that skip the close-time update: the two
+    /// `close_epoch(None, ..)` recovery closes in `run_epoch` (which carry three shapes between
+    /// them — replay-and-close, crash-after-close, and leftover-drain), and the two chain-global
+    /// fail-open arms on the close path, which both leave the count untruncated —
+    /// `adjust_base_fees`' identity read, which returns before `apply_close_time_fee_updates` is
+    /// reached at all, and `apply_close_time_fee_updates`' own config read, which returns without
+    /// resizing. On those paths the bound is the boundary-drain
+    /// ordering — the closed epoch's output is executed through the boundary before the entry runs.
     pub fn apply(&self, gas_accumulator: &GasAccumulator) {
         gas_accumulator.set_num_workers(self.num_workers);
         for (worker_id, fee) in self.fees.iter().enumerate() {
@@ -431,22 +444,22 @@ pub async fn read_base_fees_for_entered_epoch(
     // Pin check: the header must be the boundary the fees were written at, validated through the
     // same predicate the snapshot restore's entry-readiness precondition runs.
     //
-    // Both reads below retry node-local provider faults. The pin is already fixed OUTSIDE the
-    // closures — `closing_header` is a `&SealedHeader` the caller resolved — so no `_from_tip`
-    // re-sampling dance is needed to satisfy the retry's contract that every attempt resolve the
-    // same block: there is nothing per-attempt left to vary.
-    let (epoch_at_pin, epoch_info) = retry_provider_faults("epoch-entry pin guard", || {
-        ready(reth_env.get_current_epoch_info_at_header(closing_header))
-    })
-    .await
-    .wrap_err_with(|| {
-        format!(
-            "failed to read the registry epoch record at epoch {entered}'s pinned closing \
+    // Both reads below retry node-local provider faults, threading `closing_header` — a pin the
+    // CALLER resolved — as the retry's pin, so no `_from_tip` re-sampling dance is needed: there is
+    // nothing per-attempt left to vary.
+    let (epoch_at_pin, epoch_info) =
+        retry_provider_faults("epoch-entry pin guard", closing_header, |pin| {
+            ready(reth_env.get_current_epoch_info_at_header(pin))
+        })
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "failed to read the registry epoch record at epoch {entered}'s pinned closing \
                  block {} ({:?})",
-            closing_header.number,
-            closing_header.hash()
-        )
-    })?;
+                closing_header.number,
+                closing_header.hash()
+            )
+        })?;
     if epoch_at_pin != entered || epoch_info.blockHeight != closing_header.number + 1 {
         return Err(eyre!(
             "header {} ({:?}) is not epoch {entered}'s closing-block pin: the registry at it \
@@ -459,17 +472,25 @@ pub async fn read_base_fees_for_entered_epoch(
         ));
     }
 
-    let (num_workers, entries) = retry_provider_faults("epoch-entry base fees", || {
-        ready(reth_env.get_worker_fee_configs_at_block(closing_header.hash()))
-    })
-    .await
-    .wrap_err_with(|| {
-        format!(
-            "failed to read WorkerConfigs at epoch {entered}'s pinned closing block {} ({:?})",
-            closing_header.number,
-            closing_header.hash()
-        )
-    })?;
+    let (num_workers, entries) =
+        retry_provider_faults("epoch-entry base fees", closing_header, |pin| {
+            ready(reth_env.get_worker_fee_configs_at_block(pin.hash()))
+        })
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "failed to read WorkerConfigs at epoch {entered}'s pinned closing block {} ({:?})",
+                closing_header.number,
+                closing_header.hash()
+            )
+        })?;
+    // UNREACHABLE BY CONSTRUCTION, and deliberately untested for the same reason as its twin in
+    // `tn_reth::snapshot::check_entry_readiness`. See the comment there for the searches that
+    // establish it: both writers of `numWorkers` in `WorkerConfigs.sol` floor it at 1, the CLI
+    // rejects an empty `--worker-fee-config` list, and a reverted constructor fails genesis
+    // creation instead of committing the empty storage that would read back as zero. Kept as the
+    // epoch-entry half of that pair, so a zero from a hand-built genesis or a future contract
+    // revision names itself here instead of surfacing as an empty accumulator.
     if num_workers == 0 {
         return Err(eyre!(
             "WorkerConfigs at epoch {entered}'s pinned closing block {} reports zero workers; \
