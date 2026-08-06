@@ -211,8 +211,8 @@ These costs do **not** include the base transaction cost (21,000) or calldata co
 ### Status key
 
 - **Undercharged** (headroom < 1.0×): The gas constant is lower than the worst-case EVM cost. The precompile charges less gas than an equivalent Solidity contract would consume. The operation is subsidized relative to EVM costs.
-- **Tight** (headroom 1.0×–1.2×): The gas constant barely covers the worst-case EVM cost. No margin for implementation overhead or future gas schedule changes.
-- **OK** (headroom > 1.2×): Sufficient margin above worst-case EVM cost.
+- **Tight** (headroom 1.0×–1.25×): The gas constant barely covers the worst-case EVM cost. No margin for implementation overhead or future gas schedule changes.
+- **OK** (headroom > 1.25×): Sufficient margin above worst-case EVM cost.
 
 ## Testing
 

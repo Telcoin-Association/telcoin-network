@@ -84,6 +84,13 @@ pub(super) fn handle_total_supply(
     internals: &mut EvmInternals<'_>,
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for the one storage read this view performs.
+    ///
+    /// A single cold `SLOAD` of [`TOTAL_SUPPLY_SLOT`] at the Cancun price: `1 * 2_100 = 2_100`.
+    /// The charge is exactly the EVM cost of the read (`1.00x` coverage); there is no logging,
+    /// account access, or write to price in.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "View functions".
     const GAS_COST: u64 = 2_100;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
@@ -157,6 +164,15 @@ pub(super) fn handle_mint(
     caller: Address,
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for creating a timelocked pending mint.
+    ///
+    /// Worst case is the *first* mint, where both pending slots move cold `0 -> nonzero` and the
+    /// `Mint` log (2 topics, 64 bytes of data) is emitted: `22_100 + 22_100 + 1_637 = 45_837`.
+    /// At `41_000` this covers `0.89x` of the worst case, so a first mint is **undercharged** by
+    /// `4_837` relative to equivalent Solidity. Overwriting an existing pending mint touches two
+    /// warm `nonzero -> nonzero` slots and costs `11_637`, comfortably inside the budget.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "`mint` (mainnet)".
     const GAS_COST: u64 = 41_000;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
@@ -223,6 +239,17 @@ pub(super) fn handle_claim(
     caller: Address,
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for finalizing a pending mint.
+    ///
+    /// The worst case is nine metered operations: three cold `SLOAD`s of the amount, timestamp,
+    /// and supply slots (`3 * 2_100`), a cold `load_account` of the recipient (`2_600`), three
+    /// warm `SSTORE`s clearing the two pending slots and bumping supply (`3 * 2_900`), and the
+    /// `Claim` and `Transfer` logs (`1_381 + 1_756`), totalling `20_737`. At `25_000` this covers
+    /// `1.21x` of the worst case, the thinnest margin of any handler in this precompile. The two
+    /// `nonzero -> 0` clears earn `9_600` in refunds at transaction end, but refunds never reduce
+    /// the amount that has to be available upfront.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "`claim`".
     const GAS_COST: u64 = 25_000;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
@@ -320,6 +347,15 @@ pub(super) fn handle_burn(
     caller: Address,
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for destroying tokens held by the precompile.
+    ///
+    /// A cold `load_account` of the precompile itself (`2_600`), a cold `SLOAD` plus warm
+    /// `nonzero -> nonzero` `SSTORE` of the supply slot (`2_100 + 2_900`), and the `Burn` and
+    /// `Transfer` logs (`1_006 + 1_756`): `10_362` total. At `8_000` this covers `0.77x` of the
+    /// worst case, so `burn` is **undercharged** by `2_362` relative to equivalent Solidity.
+    /// Burning is governance-only, so the subsidy is not reachable by untrusted callers.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "`burn`".
     const GAS_COST: u64 = 8_000;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
