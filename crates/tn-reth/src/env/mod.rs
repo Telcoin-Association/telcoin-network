@@ -69,6 +69,30 @@ struct RethEnvInner {
     evm_config: TnEvmConfig,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// TEST-ONLY: number of pending injected pre-commit persist faults.
+    ///
+    /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
+    /// and fails with a `TnRethError::Provider` before touching the database, simulating a
+    /// node-local storage fault on the durable write. Armed via
+    /// `RethEnv::inject_persist_provider_faults` (see `env/execution.rs`).
+    #[cfg(any(feature = "test-utils", test))]
+    persist_fault_injections: std::sync::atomic::AtomicU32,
+    /// TEST-ONLY: number of pending injected LATE (post-`save_blocks`) persist faults.
+    ///
+    /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
+    /// and fails with a `TnRethError::Provider` AFTER `save_blocks` has advanced the
+    /// process-wide static-file writers, immediately before the database commit, simulating
+    /// a node-local fault on the marker writes or the commit itself. Armed via
+    /// `RethEnv::inject_late_persist_provider_faults` (see `env/execution.rs`).
+    #[cfg(any(feature = "test-utils", test))]
+    persist_late_fault_injections: std::sync::atomic::AtomicU32,
+    /// TEST-ONLY: how many times `RethEnv::persist_executed_output` has been entered.
+    ///
+    /// Incremented on entry, before any injected fault is consumed, so the value is the
+    /// number of persist ATTEMPTS the engine's bounded retry actually made. Read through
+    /// `RethEnv::persist_attempt_count` (see `env/execution.rs`).
+    #[cfg(any(feature = "test-utils", test))]
+    persist_attempts: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Debug for RethEnv {
@@ -127,6 +151,12 @@ impl RethEnv {
                 blockchain_provider,
                 evm_config,
                 task_spawner,
+                #[cfg(any(feature = "test-utils", test))]
+                persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(any(feature = "test-utils", test))]
+                persist_late_fault_injections: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(any(feature = "test-utils", test))]
+                persist_attempts: std::sync::atomic::AtomicU32::new(0),
             }),
         })
     }
