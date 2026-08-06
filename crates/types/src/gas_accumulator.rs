@@ -95,11 +95,11 @@ pub enum WorkerFeeConfig {
 /// module re-exports the name; every use there is a test.
 ///
 /// The MASK does have a second implementation to stay in sync with:
-/// `tn-reth/src/evm/block.rs`'s `BlockCtx::worker_id` reads the same low 16 bits off the execution
-/// context while a block is being built (and points back here), so a block's attribution is
-/// identical whether it is taken from the context during execution or from the sealed header
-/// afterwards. The accumulator's per-worker totals depend on that agreement, so the two move
-/// together.
+/// `tn-reth/src/evm/block.rs`'s `TNBlockExecutionCtx::worker_id` reads the same low 16 bits off
+/// the execution context while a block is being built (and points back here), so a block's
+/// attribution is identical whether it is taken from the context during execution or from the
+/// sealed header afterwards. The accumulator's per-worker totals depend on that agreement, so the
+/// two move together.
 pub fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
     (header.difficulty.into_limbs()[0] & 0xffff) as u16
 }

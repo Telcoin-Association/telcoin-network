@@ -374,9 +374,11 @@ impl EpochBaseFees {
     /// already truncated and its own resize no-ops. A shrink therefore reaches production THROUGH
     /// this method only on the closes that skip the close-time update: the two
     /// `close_epoch(None, ..)` recovery closes in `run_epoch` (replay-and-close and
-    /// leftover-drain), and the close-time update's own chain-global fail-open arm, which returns
-    /// without resizing. On those paths the bound is the boundary-drain ordering — the closed
-    /// epoch's output is executed through the boundary before the entry runs.
+    /// leftover-drain), and the two chain-global fail-open arms on the close path, which both
+    /// leave the count untruncated — `adjust_base_fees`' identity read, which returns before
+    /// `apply_close_time_fee_updates` is reached at all, and `apply_close_time_fee_updates`' own
+    /// config read, which returns without resizing. On those paths the bound is the boundary-drain
+    /// ordering — the closed epoch's output is executed through the boundary before the entry runs.
     pub fn apply(&self, gas_accumulator: &GasAccumulator) {
         gas_accumulator.set_num_workers(self.num_workers);
         for (worker_id, fee) in self.fees.iter().enumerate() {

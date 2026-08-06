@@ -245,9 +245,11 @@ pub(super) fn handle_claim(
     /// and supply slots (`3 * 2_100`), a cold `load_account` of the recipient (`2_600`), three
     /// warm `SSTORE`s clearing the two pending slots and bumping supply (`3 * 2_900`), and the
     /// `Claim` and `Transfer` logs (`1_381 + 1_756`), totalling `20_737`. At `25_000` this covers
-    /// `1.21x` of the worst case, the thinnest margin of any handler in this precompile. The two
-    /// `nonzero -> 0` clears earn `9_600` in refunds at transaction end, but refunds never reduce
-    /// the amount that has to be available upfront.
+    /// `1.21x` of the worst case, the thinnest margin of any handler in this precompile that
+    /// over-covers its worst case at all — the two views charge exactly `1.00x`, and `mint`,
+    /// `burn`, and `grantMintRole` are undercharged. The two `nonzero -> 0` clears earn `9_600` in
+    /// refunds at transaction end, but refunds never reduce the amount that has to be available
+    /// upfront.
     ///
     /// Derived in this module's `README.md`, "Gas costs" / "`claim`".
     const GAS_COST: u64 = 25_000;
