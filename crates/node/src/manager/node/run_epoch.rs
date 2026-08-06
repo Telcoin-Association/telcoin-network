@@ -1208,17 +1208,18 @@ mod tests {
     use tn_config::WORKER_CONFIGS_ADDRESS;
     use tn_reth::{
         payload::TNPayload,
-        system_calls::CONSENSUS_REGISTRY_ADDRESS,
+        system_calls::{WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS},
         test_utils::{
             consensus_output_for_tests, execute_payload_and_update_canonical_chain,
-            read_worker_config_entries_at, test_genesis_with_consensus_registry,
-            test_genesis_with_consensus_registry_and_workers, TransactionFactory,
+            governance_owner_factory, read_worker_config_entries_at,
+            test_genesis_with_consensus_registry, test_genesis_with_consensus_registry_and_workers,
+            TransactionFactory,
         },
         RethChainSpec,
     };
     use tn_types::{
-        gas_accumulator::WorkerFeeConfig, Address, ExecHeader, GenesisAccount, WorkerId, B256,
-        MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::WorkerFeeConfig, Address, ExecHeader, GenesisAccount, SolCall as _,
+        WorkerId, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Pin the anchor-wait derivation to the producer's own ceiling: recompute the vote
@@ -1687,6 +1688,128 @@ mod tests {
             msg.contains("expected epoch 1 beginning at block 3"),
             "only the first-block half may disagree: {msg}"
         );
+
+        Ok(())
+    }
+
+    /// The entry read's fee-mapping halt: an `Eip1559` row whose `data` word exceeds `u64::MAX`
+    /// aborts the entry instead of truncating an arbitrary word into a consensus-critical base fee.
+    ///
+    /// The arm is a TRIPWIRE, unreachable on a canonical chain: the pin guard forces a genuine
+    /// closing block, and that block's `record_next_epoch_base_fees` runs in `finish` — after user
+    /// transactions — rewriting EVERY `Eip1559` row's word with a `u64`, so a poison landed by
+    /// governance in the closing block is overwritten before the entry can read it. Reaching the
+    /// arm therefore means FORGING a boundary pin, exactly as the snapshot side's
+    /// `entry_readiness_rejects_poisoned_eip1559_data_word` does.
+    ///
+    /// The forge differs from the snapshot side's because the seams differ. That test imports a
+    /// pack, so it can hand the restorer a synthetic header carrying the poisoned block's state
+    /// ROOT. A live `RethEnv` resolves pinned state by block HASH out of its own DB, so a header
+    /// with an invented hash resolves nothing (that is the `Provider` fault the retry test drives).
+    /// The forge here instead keeps the poisoned block's real hash — so the DB serves its state —
+    /// and rewrites only the header's `number` down to the genuine closing block's, which is what
+    /// keeps the registry's `blockHeight == pin + 1` boundary claim intact. Header provenance is
+    /// outside this read's trust boundary either way; the WORD check is what catches the shape.
+    ///
+    /// Asserts all FOUR fields the wrapper carries — worker id, entered epoch, and the PIN's own
+    /// block number and hash — the last two being why the forge is visible in the message at all
+    /// (the pin reports block 1 while its state comes from block 2).
+    #[tokio::test]
+    async fn entry_read_halts_on_an_oversized_eip1559_data_word() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+        // `u64::MAX + 1`: one past what a base fee can be, still far inside a `uint184`. Held as
+        // decimal text and parsed at the call site so the row's own `U184` type is inferred — this
+        // crate has no direct `alloy` dependency to name it with.
+        const POISON: &str = "18446744073709551616";
+
+        let genesis = test_genesis_with_consensus_registry_and_workers(4, vec![(0u8, TARGET_GAS)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("entry_read_poisoned_word")?;
+        let task_manager = TaskManager::new("entry read poisoned word");
+        let acc = GasAccumulator::new(1);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // block 1 closes epoch 0; the close itself records a sane word for worker 0
+        let closing = execute_worker_block(
+            &reth_env,
+            &acc,
+            chain.sealed_genesis_header(),
+            &consensus_output_for_tests(1, 0, 1, true),
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+            vec![],
+        )?;
+        let (_, entries) = read_worker_config_entries_at(&reth_env, closing.hash())?;
+        assert!(
+            entries[0].data.to::<u64>() >= MIN_PROTOCOL_BASE_FEE,
+            "fixture: the close must have recorded a sane word, which is why the poison cannot \
+             ride the closing block itself"
+        );
+
+        // block 2 (mid-epoch-1): the owner rewrites worker 0's row with an oversized word; no
+        // close runs here, so nothing rewrites it back
+        let mut governance = governance_owner_factory();
+        let poison_tx = governance.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setWorkerConfigCall {
+                workerId: 0,
+                strategy: 0,
+                value: TARGET_GAS,
+                data: POISON.parse().expect("u64::MAX + 1 fits a uint184"),
+            }
+            .abi_encode()
+            .into(),
+        );
+        let poisoned = execute_worker_block(
+            &reth_env,
+            &acc,
+            closing.clone(),
+            &consensus_output_for_tests(1, 1, 2, false),
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+            vec![poison_tx],
+        )?;
+        let (_, entries) = read_worker_config_entries_at(&reth_env, poisoned.hash())?;
+        assert_eq!(
+            entries[0].data.to_string(),
+            POISON,
+            "fixture: the owner tx must land the oversized word"
+        );
+        assert!(
+            matches!(entries[0].config, WorkerFeeConfig::Eip1559 { .. }),
+            "fixture: the poisoned row must still decode as EIP-1559"
+        );
+
+        // forge the boundary pin: the poisoned block's real HASH (so its state resolves) under the
+        // genuine closing block's NUMBER (so `blockHeight == pin + 1` still holds)
+        let mut forged = poisoned.header().clone();
+        forged.number = closing.number;
+        let forged = SealedHeader::new(forged, poisoned.hash());
+
+        let err = read_base_fees_for_entered_epoch(&reth_env, 1, &forged)
+            .await
+            .expect_err("an oversized EIP-1559 word must halt the entry read");
+        let msg = err.to_string();
+        assert!(msg.contains("worker 0"), "must name the worker: {msg}");
+        assert!(msg.contains("epoch 1's entry base fee"), "must name the entered epoch: {msg}");
+        assert!(
+            msg.contains(&format!("pinned closing block {}", closing.number)),
+            "must name the PIN's block number: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{:?}", poisoned.hash())),
+            "must name the pin's block hash: {msg}"
+        );
+        assert!(msg.contains("exceeds u64::MAX"), "must name the oversized word: {msg}");
 
         Ok(())
     }
