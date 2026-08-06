@@ -35,8 +35,8 @@ use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
     Address, Batch, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
     ConsensusHeaderDigest, ConsensusOutput, Encodable2718, GenesisAccount, Hash as _, Notifier,
-    ReputationScores, SealedBlock, TaskManager, TransactionTrait as _, B256, EMPTY_WITHDRAWALS,
-    MIN_PROTOCOL_BASE_FEE, U256,
+    ReputationScores, SealedBlock, SealedHeader, TaskManager, TransactionTrait as _, B256,
+    EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
@@ -3384,6 +3384,144 @@ async fn test_post_commit_failure_preserves_committed_head() -> eyre::Result<()>
         canon_rx.try_recv().is_err(),
         "the canon-state broadcast happens after the engine-update send, which failed"
     );
+
+    Ok(())
+}
+
+/// Drive `execute_consensus_output` with an output whose `batch_digests` deque is one entry longer
+/// than its flattened batch count, and return the result alongside the reth env.
+///
+/// The shape mirrors what the adiri duplicate-batch bug produces: the subscriber pushes a digest
+/// for every header payload key but skips the batch when the digest is a duplicate
+/// (`crates/consensus/executor/src/subscriber.rs`), so the deque ends up longer than the batches.
+/// Here one batch is paired with that batch's digest listed twice.
+///
+/// The leader's epoch is 0, i.e. at or below `ADIRI_DUP_BATCH_EPOCH`, so the `adiri` build takes
+/// the tolerated fall-through arm and the default build takes the `Err` arm. Genesis is seeded from
+/// the batch so the fall-through arm can actually execute rather than failing for an unrelated
+/// reason.
+async fn execute_uneven_output(
+    tmp_dir: &std::path::Path,
+) -> eyre::Result<(Result<SealedHeader, TnEngineError>, RethEnv)> {
+    let chain = test_chain_spec_arc();
+    let batch = tn_reth::test_utils::batches(chain, 1).remove(0);
+
+    // seed genesis with the batch's senders so the block is executable
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, std::iter::once(&batch));
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir,
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one batch, but its digest listed twice
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let batch_digest = batch.digest();
+    let batch_digests: VecDeque<BlockHash> = VecDeque::from([batch_digest, batch_digest]);
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches: vec![batch] }],
+    );
+
+    // the premise of both arms: the two lengths disagree, and the epoch is inside the adiri window
+    assert_eq!(consensus_output.flatten_batches().len(), 1, "one flattened batch");
+    assert_eq!(consensus_output.batch_digests().len(), 2, "two batch digests");
+    assert_eq!(consensus_output.leader().epoch(), 0, "epoch must be <= ADIRI_DUP_BATCH_EPOCH");
+
+    //=== drive execution on a blocking task, mirroring the production execution task
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    // hold the receiver so `finish_executing_output` can deliver the tip update on the Ok arm
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header);
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+    })
+    .await?;
+
+    Ok((result, reth_env))
+}
+
+/// Arm 1 of the batch/digest count check: on a default build an uneven output is rejected with
+/// [`TnEngineError::ConsensusOutputUnevenBatches`] before anything executes.
+///
+/// This arm was unreachable until the un-`cfg`-gated `debug_assert_eq!` above the check was
+/// removed: every profile a test can run under (`test`, and `[profile.e2e]`, which sets
+/// `debug-assertions = true`) panicked on the assert first.
+#[cfg(not(feature = "adiri"))]
+#[tokio::test]
+async fn test_uneven_batches_and_digests_rejected() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    let (result, reth_env) = execute_uneven_output(tmp_dir.path()).await?;
+
+    assert_matches!(
+        result,
+        Err(TnEngineError::ConsensusOutputUnevenBatches(1, 2)),
+        "uneven batches and digests must be rejected fail-closed"
+    );
+
+    // the check fires before any block is built
+    assert_eq!(
+        reth_env.canonical_in_memory_state().canonical_chain().count(),
+        0,
+        "no block may be built for a rejected output"
+    );
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+
+    Ok(())
+}
+
+/// Arm 2 of the batch/digest count check: on an `adiri` build at an epoch at or below
+/// `ADIRI_DUP_BATCH_EPOCH` the same uneven output is *tolerated* and executes.
+///
+/// That tolerance is why the duplicate-batch history of adiri testnet can be resynced. It is also
+/// why the removed `debug_assert_eq!` was a bug rather than a harmless duplicate: it panicked on
+/// exactly these epochs in any debug-assertions build.
+///
+/// Not covered by CI's test job, which runs `--workspace --exclude tn-faucet` with no
+/// `--all-features` (`.github/workflows/pr.yaml`). Run with
+/// `cargo nextest run -p tn-engine --features adiri`.
+#[cfg(feature = "adiri")]
+#[tokio::test]
+async fn test_uneven_batches_and_digests_tolerated_on_early_adiri_epoch() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // the fixture's epoch is 0, which is inside the tolerated window for any value of the constant
+    let (result, reth_env) = execute_uneven_output(tmp_dir.path()).await?;
+
+    let canonical_header = result.expect("uneven output must be tolerated on an early adiri epoch");
+    assert_eq!(canonical_header.number, 1, "the one flattened batch produced one block");
+    assert_eq!(reth_env.last_block_number()?, 1, "the block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 1, "the block was finalized");
 
     Ok(())
 }

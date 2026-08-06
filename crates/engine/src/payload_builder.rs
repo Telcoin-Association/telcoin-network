@@ -59,13 +59,18 @@ pub fn execute_consensus_output(
     let _guard = span.enter();
     debug!(target: "engine", ?output, "executing output");
 
-    // assert vecs match
-    debug_assert_eq!(
-        batches.len(),
-        output.batch_digests().len(),
-        "uneven number of sealed blocks from batches and batch digests"
-    );
-    // This should maybe panic but for prod code at least error out since this an invalid condition.
+    // The flattened batches and the batch-digest deque share one flat index space:
+    // `get_batch_digest(i)` reads the deque while the transactions come from the batch vectors, and
+    // `close_epoch_for_last_batch(i)` derives the epoch-close boundary from the deque's length. So
+    // unequal lengths mispair digests with payloads (wrong `ommers_hash`/`mix_hash`) and can fire
+    // the epoch-close system calls on the wrong block or on none. This is an invalid condition and
+    // is rejected fail-closed in every build profile.
+    //
+    // Do NOT re-add a `debug_assert_eq!` over this same predicate. One used to sit directly above,
+    // un-`cfg`-gated, so it fired ahead of the `adiri` tolerance below: any debug-assertions build
+    // (including `[profile.e2e]`, which the e2e suite uses) panicked on exactly the early epochs
+    // that tolerance exists to survive, and it also made the `Err` arm below unreachable under
+    // every profile a test can run in.
     if batches.len() != output.batch_digests().len() {
         #[cfg(not(feature = "adiri"))]
         return Err(TnEngineError::ConsensusOutputUnevenBatches(
@@ -76,10 +81,11 @@ pub fn execute_consensus_output(
         #[cfg(feature = "adiri")]
         if epoch > tn_types::forks::ADIRI_DUP_BATCH_EPOCH {
             // ADIRI BUG
-            // Epoch 74 and possibly other early epochs of adiri testnet had a bug with duplicate
-            // batches. We have to recreate it in order to sync testnet so we skip this
-            // error (it will happen and needs to be ignored) on adiri with early
-            // epochs.
+            // Epochs at or below `ADIRI_DUP_BATCH_EPOCH` (160) of adiri testnet had a bug with
+            // duplicate batches: the subscriber pushes a digest for every header payload key but
+            // skips the batch for a duplicate, leaving the deque longer than the flattened batches.
+            // We have to recreate it in order to sync testnet so we skip this error (it will happen
+            // and needs to be ignored) on adiri with early epochs.
             return Err(TnEngineError::ConsensusOutputUnevenBatches(
                 batches.len(),
                 output.batch_digests().len(),
