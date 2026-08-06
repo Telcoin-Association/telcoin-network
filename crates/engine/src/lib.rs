@@ -88,7 +88,7 @@ pub struct ExecutorEngine {
     /// Accumulator for epoch gas usage.
     gas_accumulator: GasAccumulator,
     /// Channel to notify consensus about processed outputs.
-    /// Sends (leader_round, consensus_num_hash, Option<SealedHeader>) after each
+    /// Sends (leader_round, consensus_num_hash, `Option<SealedHeader>`) after each
     /// ConsensusOutput is processed.
     engine_update_tx: mpsc::Sender<EngineUpdate>,
 }

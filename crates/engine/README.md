@@ -71,7 +71,7 @@ Everything else the engine reads is indexed, not checked. `output.batches()[cert
 out of bounds today — both indices come from `flatten_batches()` (`primary/output.rs:194-203`),
 which enumerates exactly those two nested collections. If that ever stops holding, the engine panics
 in its blocking task instead of returning a `TnEngineError`; the dropped oneshot then surfaces as
-`ChannelClosed` (`src/error.rs:46-50`) and halts the engine anyway.
+`ChannelClosed` (`src/error.rs:37-41`) and halts the engine anyway.
 
 ### Digest ↔ batch positional alignment is emergent, not asserted here
 
