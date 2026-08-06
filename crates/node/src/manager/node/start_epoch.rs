@@ -145,17 +145,17 @@ where
         &self,
         engine: &ExecutionNode,
     ) -> eyre::Result<(Committee, EpochInfo, u64, SealedHeader)> {
-        // Sample the bootstrap tip ONCE, OUTSIDE the retry below. This is what makes the retry
-        // safe: the pin the read resolves is a function of the tip (`concludeEpoch` rewrites
-        // both the epoch number and its `blockHeight` at EVERY boundary, not once ever), so
-        // re-sampling per attempt could resolve a different header on a later attempt. With the
-        // sample held here, every attempt provably resolves the same pin.
+        // Sample the bootstrap tip ONCE and thread it through the retry below as its pin. This is
+        // what makes the retry safe: the pin the read resolves is a function of the tip
+        // (`concludeEpoch` rewrites both the epoch number and its `blockHeight` at EVERY boundary,
+        // not once ever), so re-sampling per attempt could resolve a different header on a later
+        // attempt.
         let tip = engine.get_reth_env().await.canonical_tip();
         let (
             EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start },
             epoch_start_header,
-        ) = retry_provider_faults("epoch-entry state read", || {
-            engine.epoch_state_at_epoch_start_from_tip(&tip)
+        ) = retry_provider_faults("epoch-entry state read", &tip, |pin| {
+            engine.epoch_state_at_epoch_start_from_tip(pin)
         })
         .await
         .map_err(|e| {

@@ -314,10 +314,10 @@ where
         // and its `final_state` derive from the same header by construction instead of by
         // timing.
         //
-        // `parent_state` is sampled ONCE, before the retry below, and both committees resolve
-        // through ONE batched by-hash read. Sampling once is required, not merely tidy: the watch
-        // is live, so re-sampling it per attempt would both shift the pin between attempts and
-        // desynchronize the committee reads from the `parent_state` passed to
+        // `parent_state` is sampled ONCE and threaded into the retry below as its pin, and both
+        // committees resolve through ONE batched by-hash read. Sampling once is required, not
+        // merely tidy: the watch is live, so re-sampling it per attempt would both shift the pin
+        // between attempts and desynchronize the committee reads from the `parent_state` passed to
         // `build_epoch_record` as `final_state`, destroying the same-header-by-construction
         // property the paragraph above claims.
         //
@@ -331,18 +331,20 @@ where
         // where it did before the retry existed. The net delta is two extra tries on Provider.
         let parent_state = self.consensus_bus.latest_execution_block_num_hash();
         let epochs = [epoch, epoch + 1];
-        let committees = retry_provider_faults("epoch-record committee reads", || {
-            engine.validators_for_epochs_at_block(&epochs, parent_state.hash)
-        })
-        .await
-        .map_err(|e| {
-            eyre!(
-                "failed committee read at epoch-closing block {} ({:?}) for the epoch {epoch} \
-                 record - halting rather than recording a committee this node cannot verify: {e}",
-                parent_state.number,
-                parent_state.hash
-            )
-        })?;
+        let committees =
+            retry_provider_faults("epoch-record committee reads", &parent_state, |pin| {
+                engine.validators_for_epochs_at_block(&epochs, pin.hash)
+            })
+            .await
+            .map_err(|e| {
+                eyre!(
+                    "failed committee read at epoch-closing block {} ({:?}) for the epoch \
+                     {epoch} record - halting rather than recording a committee this node cannot \
+                     verify: {e}",
+                    parent_state.number,
+                    parent_state.hash
+                )
+            })?;
         let [committee_keys, next_committee_keys]: [Vec<BlsPublicKey>; 2] =
             committees.try_into().map_err(|_| {
                 eyre!("committee batch read arity mismatch for the epoch {epoch} record")

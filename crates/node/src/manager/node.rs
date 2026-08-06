@@ -307,22 +307,22 @@ pub async fn sync_num_workers_from_chain(
     gas_accumulator: &GasAccumulator,
     epoch_first_block: u64,
 ) -> eyre::Result<()> {
+    // `read_block` is derived from the caller's `epoch_first_block`, so the header resolved here is
+    // the pin the retry below threads into every attempt.
     let read_block = epoch_first_block.saturating_sub(1);
-    // The pin is fixed HERE, outside the retry below: `read_block` is derived from the caller's
-    // `epoch_first_block`, not re-sampled per attempt, so every attempt provably resolves the same
-    // header and the retry cannot drift onto a different block.
     let header = reth_env
         .sealed_header_by_number(read_block)
         .wrap_err_with(|| format!("failed to read header {read_block} while syncing worker count"))?
         .ok_or_else(|| eyre!("no header at block {read_block} while syncing worker count"))?;
 
-    let (num_workers, _entries) = retry_provider_faults("epoch-entry worker count", || {
-        ready(reth_env.get_worker_fee_configs_at_block(header.hash()))
-    })
-    .await
-    .wrap_err_with(|| {
-        format!("failed to read WorkerConfigs at block {read_block} while syncing worker count")
-    })?;
+    let (num_workers, _entries) =
+        retry_provider_faults("epoch-entry worker count", &header, |pin| {
+            ready(reth_env.get_worker_fee_configs_at_block(pin.hash()))
+        })
+        .await
+        .wrap_err_with(|| {
+            format!("failed to read WorkerConfigs at block {read_block} while syncing worker count")
+        })?;
 
     let current = gas_accumulator.num_workers();
     if current != num_workers {
@@ -431,22 +431,22 @@ pub async fn read_base_fees_for_entered_epoch(
     // Pin check: the header must be the boundary the fees were written at, validated through the
     // same predicate the snapshot restore's entry-readiness precondition runs.
     //
-    // Both reads below retry node-local provider faults. The pin is already fixed OUTSIDE the
-    // closures — `closing_header` is a `&SealedHeader` the caller resolved — so no `_from_tip`
-    // re-sampling dance is needed to satisfy the retry's contract that every attempt resolve the
-    // same block: there is nothing per-attempt left to vary.
-    let (epoch_at_pin, epoch_info) = retry_provider_faults("epoch-entry pin guard", || {
-        ready(reth_env.get_current_epoch_info_at_header(closing_header))
-    })
-    .await
-    .wrap_err_with(|| {
-        format!(
-            "failed to read the registry epoch record at epoch {entered}'s pinned closing \
+    // Both reads below retry node-local provider faults, threading `closing_header` — a pin the
+    // CALLER resolved — as the retry's pin, so no `_from_tip` re-sampling dance is needed: there is
+    // nothing per-attempt left to vary.
+    let (epoch_at_pin, epoch_info) =
+        retry_provider_faults("epoch-entry pin guard", closing_header, |pin| {
+            ready(reth_env.get_current_epoch_info_at_header(pin))
+        })
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "failed to read the registry epoch record at epoch {entered}'s pinned closing \
                  block {} ({:?})",
-            closing_header.number,
-            closing_header.hash()
-        )
-    })?;
+                closing_header.number,
+                closing_header.hash()
+            )
+        })?;
     if epoch_at_pin != entered || epoch_info.blockHeight != closing_header.number + 1 {
         return Err(eyre!(
             "header {} ({:?}) is not epoch {entered}'s closing-block pin: the registry at it \
@@ -459,17 +459,18 @@ pub async fn read_base_fees_for_entered_epoch(
         ));
     }
 
-    let (num_workers, entries) = retry_provider_faults("epoch-entry base fees", || {
-        ready(reth_env.get_worker_fee_configs_at_block(closing_header.hash()))
-    })
-    .await
-    .wrap_err_with(|| {
-        format!(
-            "failed to read WorkerConfigs at epoch {entered}'s pinned closing block {} ({:?})",
-            closing_header.number,
-            closing_header.hash()
-        )
-    })?;
+    let (num_workers, entries) =
+        retry_provider_faults("epoch-entry base fees", closing_header, |pin| {
+            ready(reth_env.get_worker_fee_configs_at_block(pin.hash()))
+        })
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "failed to read WorkerConfigs at epoch {entered}'s pinned closing block {} ({:?})",
+                closing_header.number,
+                closing_header.hash()
+            )
+        })?;
     if num_workers == 0 {
         return Err(eyre!(
             "WorkerConfigs at epoch {entered}'s pinned closing block {} reports zero workers; \

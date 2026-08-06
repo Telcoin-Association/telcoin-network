@@ -333,15 +333,17 @@ where
         // pre-resolution for the whole epoch. Halting is a single-node liveness failure.
         //
         // A Provider fault is node-local (peers reading the same block may succeed), so retry
-        // briefly before halting; ChainGlobal returns from the first attempt. The pin is
-        // `epoch_start_header`, a fixed `SealedHeader` captured before this retry, so every
-        // attempt provably reads the same block. The `try_into` arity checks are `eyre`, not
-        // `StateReadError`, so they stay OUTSIDE the retried closure.
+        // briefly before halting; ChainGlobal returns from the first attempt. `epoch_start_header`
+        // is threaded through the retry as the pin, so every attempt provably reads the same
+        // block. The `try_into` arity checks are `eyre`, not `StateReadError`, so they stay
+        // OUTSIDE the retried closure.
         let epochs: Vec<_> =
             if entered == 0 { vec![entered + 1] } else { vec![entered - 1, entered + 1] };
-        let sets = retry_provider_faults("neighbor committees at the epoch-start pin", || {
-            engine.validators_for_epochs_at_header(&epochs, &epoch_start_header)
-        })
+        let sets = retry_provider_faults(
+            "neighbor committees at the epoch-start pin",
+            &epoch_start_header,
+            |pin| engine.validators_for_epochs_at_header(&epochs, pin),
+        )
         .await
         .map_err(|e| {
             eyre::eyre!(
@@ -993,7 +995,8 @@ async fn adjust_base_fees(
     // Only a proven identity VIOLATION or an exhausted provider fault halts.
     let (entered_epoch, epoch_info) = match retry_provider_faults(
         "close-time epoch info (identity check)",
-        || ready(reth_env.get_current_epoch_info_at_header(&tip)),
+        &tip,
+        |pin| ready(reth_env.get_current_epoch_info_at_header(pin)),
     )
     .await
     {
@@ -1065,8 +1068,8 @@ async fn apply_close_time_fee_updates(
     // A node-local provider fault is NOT committee-deterministic (peers may read fine
     // and move to the new fees), so it must never fail open: retry, then halt. Pinned to the SAME
     // `tip` the identity check validated (one-header discipline).
-    match retry_provider_faults("close-time worker fee configs", || {
-        ready(reth_env.get_worker_fee_configs_at_block(tip.hash()))
+    match retry_provider_faults("close-time worker fee configs", tip, |pin| {
+        ready(reth_env.get_worker_fee_configs_at_block(pin.hash()))
     })
     .await
     {
@@ -1121,22 +1124,29 @@ const CLOSE_READ_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 ///
 /// `read` returns a future so the async epoch-record and epoch-entry committee reads share this
 /// policy with the synchronous close-time reads (which adapt with [`std::future::ready`]). Each
-/// attempt calls `read` afresh, so every retry re-runs the whole read — which is why every caller
-/// must fix its pin OUTSIDE the closure, or successive attempts could resolve different blocks.
+/// attempt calls `read` afresh, so every retry re-runs the whole read — against the SAME `pin`.
+/// That is why the pin is a PARAMETER rather than something the closure captures: the compiler
+/// forces every caller to resolve it before the first attempt, and hands it to `read` by
+/// reference, so a closure that re-resolved a pin of its own would visibly be ignoring the one it
+/// was given. Re-sampling per attempt is what the retry cannot tolerate — successive attempts
+/// would resolve different blocks. `P` is generic so each site threads whatever it pins (a
+/// [`SealedHeader`], a `BlockNumHash`, …).
 ///
 /// Every retry is counted through [`EpochMetrics::record_provider_fault_retry`], labelled by
 /// `what`. Once a provider fault at an epoch seam is survivable it becomes invisible until it is
 /// not, and a `warn!` alone will not surface a node quietly retrying at every boundary.
-pub(super) async fn retry_provider_faults<T, Fut>(
+pub(super) async fn retry_provider_faults<'pin, P, T, Fut>(
     what: &'static str,
-    mut read: impl FnMut() -> Fut,
+    pin: &'pin P,
+    mut read: impl FnMut(&'pin P) -> Fut,
 ) -> Result<T, StateReadError>
 where
+    P: ?Sized,
     Fut: Future<Output = Result<T, StateReadError>>,
 {
     let mut attempt = 1u32;
     loop {
-        match read().await {
+        match read(pin).await {
             Err(StateReadError::Provider(detail)) if attempt < CLOSE_READ_ATTEMPTS => {
                 warn!(
                     target: "epoch-manager",
@@ -1187,7 +1197,11 @@ mod tests {
     use super::*;
     use crate::manager::{read_base_fees_for_entered_epoch, sync_num_workers_from_chain};
     use rand::{rngs::StdRng, SeedableRng as _};
-    use std::{cell::Cell, sync::Arc};
+    use std::{
+        cell::{Cell, RefCell},
+        sync::Arc,
+        time::Instant,
+    };
     use tempfile::TempDir;
     use tn_config::WORKER_CONFIGS_ADDRESS;
     use tn_reth::{
@@ -1201,7 +1215,7 @@ mod tests {
         RethChainSpec,
     };
     use tn_types::{
-        gas_accumulator::WorkerFeeConfig, Address, GenesisAccount, WorkerId, B256,
+        gas_accumulator::WorkerFeeConfig, Address, ExecHeader, GenesisAccount, WorkerId, B256,
         MIN_PROTOCOL_BASE_FEE, U256,
     };
 
@@ -1238,7 +1252,7 @@ mod tests {
         // CLOSE_READ_ATTEMPTS times total, then surfaces as the Provider error for the caller
         // to escalate into a halt.
         let calls = Cell::new(0u32);
-        let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
+        let res: Result<(), StateReadError> = retry_provider_faults("test read", &(), |_| {
             calls.set(calls.get() + 1);
             ready(Err(StateReadError::Provider("mdbx i/o fault".into())))
         })
@@ -1253,7 +1267,7 @@ mod tests {
         // A transient provider fault (fails once, then reads fine) must NOT halt the node: the
         // retry absorbs it and the successful value passes through.
         let calls = Cell::new(0u32);
-        let res = retry_provider_faults("test read", || {
+        let res = retry_provider_faults("test read", &(), |_| {
             calls.set(calls.get() + 1);
             ready(if calls.get() == 1 {
                 Err(StateReadError::Provider("transient i/o fault".into()))
@@ -1272,7 +1286,7 @@ mod tests {
         // Chain-global failures are deterministic products of the pinned block - re-reading
         // cannot change them, so they return immediately for the caller's fail-open arm.
         let calls = Cell::new(0u32);
-        let res: Result<(), StateReadError> = retry_provider_faults("test read", || {
+        let res: Result<(), StateReadError> = retry_provider_faults("test read", &(), |_| {
             calls.set(calls.get() + 1);
             ready(Err(StateReadError::ChainGlobal("contract absent".into())))
         })
@@ -1280,6 +1294,133 @@ mod tests {
 
         assert!(matches!(res, Err(StateReadError::ChainGlobal(_))));
         assert_eq!(calls.get(), 1, "chain-global failures are never retried");
+    }
+
+    /// The retry policy under a REAL provider fault, driven through a production call site: the
+    /// entry read's pin guard (`read_base_fees_for_entered_epoch`'s first retried read) against a
+    /// header whose hash this node's DB cannot resolve. `RethEnv`'s pinned state-provider
+    /// construction classifies an unresolvable pin as [`StateReadError::Provider`], so the retry
+    /// absorbs two faults and the third surfaces under the call site's `wrap_err_with` context.
+    ///
+    /// The retry evidence here is real elapsed time — 2 x [`CLOSE_READ_RETRY_BACKOFF`] — so this
+    /// test deliberately runs on a real clock. `#[tokio::test(start_paused = true)]` is not usable:
+    /// a paused clock auto-advances past both backoffs (erasing the evidence), and its auto-advance
+    /// only fires when the runtime has nothing else to poll, which a live `RethEnv` does not
+    /// guarantee.
+    ///
+    /// The entry read's OTHER retried site ("epoch-entry base fees") is deliberately not covered
+    /// by a fault test: it pins the very header the guard above already resolved, so a pin that
+    /// faults there faults the guard first — there is no way to fail the second read without
+    /// failing the first, and manufacturing one would mean adding a seam that production does not
+    /// have.
+    #[tokio::test]
+    async fn entry_read_retries_a_real_provider_fault_then_halts() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("entry_read_provider_fault")?;
+        let task_manager = TaskManager::new("entry read provider fault");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+
+        // a phantom pin: nothing in this node's DB resolves its hash, so state construction fails
+        let phantom = SealedHeader::new(ExecHeader::default(), B256::random());
+        let started = Instant::now();
+        let err = read_base_fees_for_entered_epoch(&reth_env, 1, &phantom)
+            .await
+            .expect_err("an unresolvable pin must fail the entry read");
+        let elapsed = started.elapsed();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "failed to read the registry epoch record at epoch 1's pinned closing \
+                 block 0"
+            ),
+            "the fault must surface under the call site's context: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{:?}", phantom.hash())),
+            "the context must name the pin's hash: {msg}"
+        );
+        assert!(
+            elapsed >= CLOSE_READ_RETRY_BACKOFF * (CLOSE_READ_ATTEMPTS - 1),
+            "an exhausted read must have slept through every backoff, took {elapsed:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Pin stability across attempts: every attempt receives the IDENTICAL pin — the same object,
+    /// not merely an equal value. This is the property the `pin` parameter exists to protect (a
+    /// per-attempt re-resolve is exactly what would let successive attempts read different
+    /// blocks), so it is asserted on pointer identity, which an `==` on a re-resolved-but-equal
+    /// header would not catch.
+    #[tokio::test(start_paused = true)]
+    async fn retry_provider_faults_hands_every_attempt_the_same_pin() {
+        let pin = SealedHeader::new(
+            ExecHeader { number: 7, ..Default::default() },
+            B256::repeat_byte(0x5a),
+        );
+        let seen: RefCell<Vec<(*const SealedHeader, B256)>> = RefCell::new(Vec::new());
+
+        let res: Result<(), StateReadError> =
+            retry_provider_faults("test read", &pin, |p: &SealedHeader| {
+                seen.borrow_mut().push((std::ptr::from_ref(p), p.hash()));
+                ready(Err(StateReadError::Provider("mdbx i/o fault".into())))
+            })
+            .await;
+
+        assert!(matches!(res, Err(StateReadError::Provider(_))));
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), CLOSE_READ_ATTEMPTS as usize, "one pin per attempt");
+        assert!(
+            seen.iter().all(|&(ptr, hash)| ptr == std::ptr::from_ref(&pin) && hash == pin.hash()),
+            "every attempt must receive the caller's pin object: {seen:?}"
+        );
+    }
+
+    /// Metric plumbing THROUGH the retry helper: [`EpochMetrics::record_provider_fault_retry`]
+    /// fires once per absorbed fault, labelled with the caller's `what`.
+    ///
+    /// An exhausted read emits `CLOSE_READ_ATTEMPTS - 1` retries, not `CLOSE_READ_ATTEMPTS`: the
+    /// constant counts TOTAL attempts (first try + retries) and the final failure is escalated to
+    /// the caller rather than retried.
+    ///
+    /// The recorder installs a thread-local, so the retry runs on a current-thread runtime driven
+    /// from inside `metrics::with_local_recorder` — an async test would poll the future on a thread
+    /// the guard never covered.
+    #[test]
+    fn retry_provider_faults_counts_each_retry_with_the_read_label() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("current-thread runtime");
+
+        metrics::with_local_recorder(&recorder, || {
+            let res: Result<(), StateReadError> =
+                rt.block_on(retry_provider_faults("epoch-entry pin guard", &(), |_| {
+                    ready(Err(StateReadError::Provider("mdbx i/o fault".into())))
+                }));
+            assert!(matches!(res, Err(StateReadError::Provider(_))));
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let (key, _, _, value) = snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == "tn_epoch.provider_fault_retries_total")
+            .expect("the retry counter must be registered");
+        assert!(
+            matches!(value, DebugValue::Counter(n) if *n == (CLOSE_READ_ATTEMPTS - 1) as u64),
+            "an exhausted read emits CLOSE_READ_ATTEMPTS - 1 retries, got {value:?}"
+        );
+        assert!(
+            key.key().labels().any(|l| l.key() == "read" && l.value() == "epoch-entry pin guard"),
+            "the counter must carry the caller's read label"
+        );
     }
 
     /// Keep-current arm of the close-time fail-open: a CHAIN-GLOBAL config-read failure
