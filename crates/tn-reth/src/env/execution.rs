@@ -26,14 +26,22 @@
 //!
 //! # Atomicity contract
 //!
-//! [`RethEnv::finish_executing_output`] persists the blocks and the finalized/safe
+//! [`RethEnv::persist_executed_output`] persists the blocks and the finalized/safe
 //! block-number markers in ONE `provider_rw` transaction with a single commit — a
-//! crash can never leave the persisted tip and the markers out of sync. Only after
-//! that commit does it report the new tip over the engine update channel
-//! (`blocking_send`) and then broadcast the canonical-state notification
-//! (`notify_canon_state`). [`RethEnv::finalize_block`] is in-memory only (the
-//! finalized/safe watches plus pruning persisted blocks from the in-memory state);
-//! its database half happens inside the atomic commit above.
+//! crash can never leave the persisted tip and the markers out of sync, and every
+//! error it returns leaves that transaction uncommitted, so no block became canonical
+//! in the database. Durability is NOT all-or-nothing, though: `save_blocks` also
+//! appends to the process-wide static-file writers, and that progress is fsynced
+//! outside the transaction, so a fault after the append leaves the writers advanced
+//! for reth's startup consistency check to reconcile on restart. Read that method's
+//! error contract before retrying it. Only after that commit
+//! does [`RethEnv::announce_executed_output`] report the new tip over the engine
+//! update channel (`blocking_send`) and then broadcast the canonical-state
+//! notification (`notify_canon_state`); its errors are post-commit and must never
+//! trigger a rollback. [`RethEnv::finish_executing_output`] composes the two for
+//! callers that do not need the commit boundary. [`RethEnv::finalize_block`] is
+//! in-memory only (the finalized/safe watches plus pruning persisted blocks from
+//! the in-memory state); its database half happens inside the atomic commit above.
 
 use std::sync::Arc;
 
@@ -216,8 +224,7 @@ impl RethEnv {
         Ok(())
     }
 
-    /// Atomically persist an executed round of consensus output and announce the new
-    /// canonical tip.
+    /// Atomically persist an executed round of consensus output.
     ///
     /// The blocks AND the finalized/safe markers commit in the same database
     /// transaction (one `provider_rw` commit), so a crash can never leave the
@@ -225,23 +232,29 @@ impl RethEnv {
     /// committed consensus output and is final by construction. The in-memory
     /// finalized/safe watches are updated afterwards by [`Self::finalize_block`].
     ///
-    /// Ordering after the commit: first the new tip is reported over the engine
-    /// update channel (`blocking_send`, feeding the consensus layer's `recent_blocks`
-    /// watch — so this method must run on a blocking thread, and a closed channel
-    /// errors out before any broadcast); only then is the canonical-state
-    /// notification broadcast via `notify_canon_state` to in-process subscribers such
-    /// as the worker's pool maintenance task.
-    pub fn finish_executing_output(
-        &self,
-        blocks: Vec<ExecutedBlock>,
-        engine_update: Option<(Round, ConsensusNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
-    ) -> TnRethResult<()> {
-        // NOTE: this makes all blocks canonical, commits them to the database,
-        // and broadcasts new chain on `canon_state_notification_sender`
-        //
-        // the canon_state_notifications include every block executed in this round
-        //
-        // the worker's pool maintenance task subcribes to these events
+    /// # Error contract
+    ///
+    /// Every error return leaves the DATABASE transaction uncommitted: the last fallible
+    /// step is `provider_rw.commit()`, so on any `Err` no block became canonical in the
+    /// database and the caller must compensate the speculative in-memory advance.
+    ///
+    /// Durability is NOT all-or-nothing, though: `save_blocks` also appends to the
+    /// process-wide static-file writers, and that progress is fsynced outside the
+    /// database transaction. A fault after that append (marker writes, the commit
+    /// itself) aborts the database transaction but leaves the static-file writer
+    /// advanced, so a repeat call trips over it with
+    /// `ProviderError::UnexpectedStaticFileBlockNumber`; reth's startup consistency
+    /// check reconciles the divergence on restart. Callers retrying this method must
+    /// treat that error as terminal (see the engine's `persist_output_with_retry`).
+    /// Post-commit reporting lives in [`Self::announce_executed_output`] so the commit
+    /// boundary is a function boundary rather than an error-classification exercise
+    /// (issue #1090).
+    pub fn persist_executed_output(&self, blocks: &[ExecutedBlock]) -> TnRethResult<()> {
+        #[cfg(any(feature = "test-utils", test))]
+        self.inner.persist_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(any(feature = "test-utils", test))]
+        self.consume_injected_persist_fault()?;
+
         debug!(
             target: "engine",
             first=?blocks.first().map(|b| b.recovered_block.num_hash()),
@@ -251,7 +264,7 @@ impl RethEnv {
 
         // insert blocks to db
         let provider_rw = self.inner.blockchain_provider.database_provider_rw()?;
-        provider_rw.save_blocks(blocks.clone(), reth_provider::SaveBlocksMode::Full)?;
+        provider_rw.save_blocks(blocks.to_vec(), reth_provider::SaveBlocksMode::Full)?;
         // advance the finalized/safe markers in the same transaction as the blocks: every
         // canonical block comes from committed consensus output, so the last saved block is
         // final by construction, and the single commit leaves no crash window where the
@@ -261,9 +274,37 @@ impl RethEnv {
             provider_rw.save_finalized_block_number(last_number)?;
             provider_rw.save_safe_block_number(last_number)?;
         }
-        provider_rw.commit()?;
+        #[cfg(any(feature = "test-utils", test))]
+        self.consume_injected_late_persist_fault()?;
 
+        provider_rw.commit()?;
+        Ok(())
+    }
+
+    /// Announce a durably committed round of consensus output: report the new tip over
+    /// the engine update channel, then broadcast the canonical-state notification.
+    ///
+    /// POST-commit half of the split (issue #1090): by the time this runs the blocks
+    /// are canonical for real, so a failure here (e.g.
+    /// [`TnRethError::EngineUpdateChannelClosed`]) must NOT trigger any rollback of the
+    /// in-memory advance; the in-memory state correctly names the committed tip.
+    ///
+    /// Ordering: first the new tip is reported over the engine update channel
+    /// (`blocking_send`, feeding the consensus layer's `recent_blocks` watch, so this
+    /// method must run on a blocking thread, and a closed channel errors out before any
+    /// broadcast); only then is the canonical-state notification broadcast via
+    /// `notify_canon_state` to in-process subscribers such as the worker's pool
+    /// maintenance task.
+    pub fn announce_executed_output(
+        &self,
+        blocks: Vec<ExecutedBlock>,
+        engine_update: Option<(Round, ConsensusNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
+    ) -> TnRethResult<()> {
         // process update
+        //
+        // the canon_state_notifications include every block executed in this round
+        //
+        // the worker's pool maintenance task subcribes to these events
         //
         // see reth::EngineApiTreeHandler::on_canonical_chain_update
         let chain_update = NewCanonicalChain::Commit { new: blocks };
@@ -297,5 +338,98 @@ impl RethEnv {
         self.canonical_in_memory_state().notify_canon_state(notification);
 
         Ok(())
+    }
+
+    /// Atomically persist an executed round of consensus output and announce the new
+    /// canonical tip.
+    ///
+    /// Composes [`Self::persist_executed_output`] (the atomic durable write; every
+    /// error leaves the database transaction uncommitted) and
+    /// [`Self::announce_executed_output`] (post-commit reporting). Callers that must
+    /// distinguish the commit boundary (to compensate or retry only the durable
+    /// write, as the engine's `execute_consensus_output` does) call the two halves
+    /// directly.
+    pub fn finish_executing_output(
+        &self,
+        blocks: Vec<ExecutedBlock>,
+        engine_update: Option<(Round, ConsensusNumHash, tokio::sync::mpsc::Sender<EngineUpdate>)>,
+    ) -> TnRethResult<()> {
+        self.persist_executed_output(&blocks)?;
+        self.announce_executed_output(blocks, engine_update)
+    }
+
+    /// TEST-ONLY: arm `count` injected pre-commit persist faults.
+    ///
+    /// The next `count` calls to [`Self::persist_executed_output`] fail with a
+    /// [`TnRethError::Provider`] before touching the database, simulating a node-local
+    /// storage fault (disk full, an MDBX write error) on the durable write. Lets
+    /// integration tests exercise the engine's bounded persist retry and its
+    /// pre-commit rollback without a real storage fault (issue #1090).
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn inject_persist_provider_faults(&self, count: u32) {
+        self.inner.persist_fault_injections.store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// TEST-ONLY: consume one armed injected persist fault, if any.
+    ///
+    /// Returns the injected [`TnRethError::Provider`] while a fault is armed and `Ok`
+    /// otherwise. The inner variant (`HeaderNotFound(0)`) is a stand-in: the engine's
+    /// retry policy classifies on the `Provider` class alone, never on the variant.
+    #[cfg(any(feature = "test-utils", test))]
+    fn consume_injected_persist_fault(&self) -> TnRethResult<()> {
+        use std::sync::atomic::Ordering;
+        self.inner
+            .persist_fault_injections
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| armed.checked_sub(1))
+            .map_or(Ok(()), |_| {
+                Err(TnRethError::Provider(reth_provider::ProviderError::HeaderNotFound(
+                    0u64.into(),
+                )))
+            })
+    }
+
+    /// TEST-ONLY: arm `count` injected LATE persist faults.
+    ///
+    /// The next `count` calls to [`Self::persist_executed_output`] fail with a
+    /// [`TnRethError::Provider`] AFTER `save_blocks` has advanced the process-wide
+    /// static-file writers, immediately before `provider_rw.commit()`, simulating a
+    /// node-local fault on the finalized/safe marker writes or the commit itself.
+    /// That ordering is the one that makes an in-process retry impossible: the failed
+    /// attempt's static-file progress is already fsynced, so a repeat call trips
+    /// `ProviderError::UnexpectedStaticFileBlockNumber` (issue #1090).
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn inject_late_persist_provider_faults(&self, count: u32) {
+        self.inner.persist_late_fault_injections.store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// TEST-ONLY: consume one armed injected LATE persist fault, if any.
+    ///
+    /// Returns the injected [`TnRethError::Provider`] while a fault is armed and `Ok`
+    /// otherwise. The inner variant (`HeaderNotFound(0)`) is a stand-in for the marker
+    /// write or commit failing; the defining property is the POSITION (after
+    /// `save_blocks` advanced the static-file writers), not the variant.
+    #[cfg(any(feature = "test-utils", test))]
+    fn consume_injected_late_persist_fault(&self) -> TnRethResult<()> {
+        use std::sync::atomic::Ordering;
+        self.inner
+            .persist_late_fault_injections
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| armed.checked_sub(1))
+            .map_or(Ok(()), |_| {
+                Err(TnRethError::Provider(reth_provider::ProviderError::HeaderNotFound(
+                    0u64.into(),
+                )))
+            })
+    }
+
+    /// TEST-ONLY: how many times [`Self::persist_executed_output`] has been entered.
+    ///
+    /// Counts ATTEMPTS, not failures: the counter increments on entry, before any injected
+    /// fault is consumed, so a test can pin exactly how much of the engine's bounded retry
+    /// budget a given fault ordering spent. Telling "failed fast at attempt 2" apart from
+    /// "burned the whole budget" otherwise takes a wall-clock measurement of the retry
+    /// backoff, which is not a sound assertion (issue #1090).
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn persist_attempt_count(&self) -> u32 {
+        self.inner.persist_attempts.load(std::sync::atomic::Ordering::SeqCst)
     }
 }

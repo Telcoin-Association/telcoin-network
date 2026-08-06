@@ -55,7 +55,9 @@ async fn order_leaders() {
     let (_, leader) = schedule.leader_certificate(6, &state.dag);
 
     // WHEN
-    let mut ordered_leaders = bullshark.order_leaders(leader.unwrap(), &state);
+    let mut ordered_leaders = bullshark
+        .order_leaders(leader.unwrap(), &state)
+        .expect("order_leaders succeeds for a valid even-round leader");
 
     // THEN
     // we expect all the leaders to be returned in round ascending order
@@ -66,6 +68,54 @@ async fn order_leaders() {
 
     // we expect to have ordered all the 3 leaders
     assert!(expected_leader_rounds.is_empty());
+}
+
+#[tokio::test]
+async fn order_leaders_rejects_odd_round_leader() {
+    // GIVEN a populated DAG (rounds 1..=7) and a Bullshark instance.
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _next_parents) =
+        make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
+
+    let gc_depth = 50;
+    let mut state = ConsensusState::new(gc_depth);
+    certificates.iter().for_each(|certificate| {
+        state.try_insert(certificate).unwrap();
+    });
+
+    let schedule = LeaderSchedule::new(committee.clone(), LeaderSwapTable::default());
+    let bullshark = Bullshark::new(
+        committee,
+        NUM_SUB_DAGS_PER_SCHEDULE,
+        schedule,
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+
+    // AND an odd-round certificate standing in as a malformed leader. Leaders are only ever
+    // elected on even rounds, so round 5 violates the `order_leaders` construction invariant.
+    let odd_round_leader = state
+        .dag
+        .get(&5)
+        .and_then(|authorities| authorities.values().next())
+        .map(|(_digest, certificate)| certificate.clone())
+        .expect("round 5 certificate exists in the populated DAG");
+    assert_eq!(odd_round_leader.round() % 2, 1);
+
+    // WHEN / THEN the former `assert_eq!(leader.round() % 2, 0)` panic is now a diagnosable
+    // typed error, so the consensus task shuts down cleanly instead of aborting on a backtrace.
+    let err = bullshark.order_leaders(&odd_round_leader, &state).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ConsensusError::Invariant(ConsensusInvariant::LeaderRoundNotEven(round))
+                if *round == odd_round_leader.round()
+        ),
+        "expected LeaderRoundNotEven typed error, got: {err}",
+    );
 }
 
 #[tokio::test]

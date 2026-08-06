@@ -8,7 +8,10 @@
 //!
 //! The precompile is registered as a [`DynPrecompile`] inside a [`PrecompilesMap`] at
 //! [`TELCOIN_PRECOMPILE_ADDRESS`] (`0x7e1`). Any `CALL`/`STATICCALL` targeting that address is
-//! intercepted and routed to [`telcoin_precompile`] instead of executing bytecode.
+//! intercepted and routed to [`telcoin_precompile`] instead of executing bytecode. Bypassing
+//! bytecode execution also bypasses the interpreter's static-call write protection, so
+//! [`telcoin_precompile`] enforces that itself: inside a `STATICCALL` frame it serves the
+//! read-only selectors and refuses every state-mutating one.
 //!
 //! # Module structure
 //!
@@ -37,6 +40,8 @@
 //!   `claim`, `burn`, and (with faucet) `grantMintRole`/`revokeMintRole`.
 //! - **Mint-role holders** (faucet only): can call the faucet `mint(address, uint256)`.
 //! - **Any account**: can call `totalSupply()` (read-only).
+//! - **Static frames**: regardless of caller, only the read-only selectors (`totalSupply()`, plus
+//!   `hasMintRole` with the faucet feature) are served inside a `STATICCALL`.
 //!
 //! # Feature flags
 //!
@@ -114,9 +119,30 @@ pub fn add_telcoin_precompile(map: &mut PrecompilesMap) {
     });
 }
 
+/// Rejection emitted when a state-mutating selector is reached inside a `STATICCALL` frame.
+const STATIC_CALL_MUTATION: &str = "static call: state mutation not permitted";
+
 /// Top-level dispatcher for the Telcoin precompile.
 ///
 /// Extracts the 4-byte selector from calldata and routes to the matching handler.
+///
+/// # Static-call write protection
+///
+/// [`totalSupplyCall`] and (with the `faucet` feature) [`hasMintRoleCall`] only read state, so they
+/// stay callable inside a `STATICCALL` frame. Every other selector dispatched below writes storage,
+/// native balances, or logs, and is refused when [`PrecompileInput::is_static`] is set.
+///
+/// Enforcing this here is not redundant with the interpreter. Registering this address as a
+/// precompile short-circuits bytecode execution, so the `require_non_staticcall!` check that
+/// `SSTORE` and `LOG` expand through never runs for calls routed to [`telcoin_precompile`], and the
+/// journal beneath it carries no static-context flag to catch the writes either. Write protection
+/// for a precompile is the precompile's own responsibility.
+///
+/// Classifying by *read-only* rather than by *mutating* selector is deliberate: a selector added to
+/// the dispatcher later is guarded unless it is explicitly named read-only here, so the failure
+/// direction is a refused read rather than an unguarded write. One consequence is that an
+/// unrecognised selector inside a static frame reports [`STATIC_CALL_MUTATION`] rather than
+/// `"Unknown function selector"`; both are [`PrecompileError::Other`] and both revert the frame.
 fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
     if input.data.len() < 4 {
         return Err(PrecompileError::Other("Invalid input: too short".into()));
@@ -124,6 +150,15 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
 
     let selector: [u8; 4] = input.data[0..4].try_into().unwrap();
     let calldata = &input.data[4..];
+
+    // Selectors that touch no state. Everything else the `match` below recognises mutates.
+    // `hasMintRole` is dispatched only under the `faucet` feature, so it counts as read-only only
+    // there: this list mirrors the read-only arms of that `match` exactly, under both feature sets.
+    let read_only = matches!(selector, burnable::totalSupplyCall::SELECTOR)
+        || (cfg!(feature = "faucet") && matches!(selector, hasMintRoleCall::SELECTOR));
+    (read_only || !input.is_static)
+        .then_some(())
+        .ok_or_else(|| PrecompileError::Other(STATIC_CALL_MUTATION.into()))?;
 
     match selector {
         // State-mutating functions

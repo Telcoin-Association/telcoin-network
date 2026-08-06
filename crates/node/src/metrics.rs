@@ -34,6 +34,18 @@ impl EpochMetrics {
         };
         metrics::counter!("tn_epoch.runs_total", "mode" => mode).increment(1);
     }
+
+    /// Record one retried pinned chain read at an epoch seam, labelled by which read it was.
+    ///
+    /// Emitted by `retry_provider_faults` on every node-local provider fault it absorbs. Once
+    /// such a fault is survivable it becomes invisible until it is not, so a node quietly
+    /// retrying at every boundary needs to show up somewhere other than a `warn!` line.
+    ///
+    /// An associated function, not a method: the retry helper is shared by the epoch entry,
+    /// record, and close paths and holds no `EpochMetrics`.
+    pub(crate) fn record_provider_fault_retry(read: &'static str) {
+        metrics::counter!("tn_epoch.provider_fault_retries_total", "read" => read).increment(1);
+    }
 }
 
 #[cfg(test)]
@@ -52,6 +64,7 @@ mod tests {
             metrics.boundary_timestamp_seconds.set(1_700_000_000.0);
             metrics.replayed_outputs_total.increment(2);
             metrics.record_epoch_run(&RunEpochMode::Initial);
+            EpochMetrics::record_provider_fault_retry("epoch-entry state read");
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -69,5 +82,11 @@ mod tests {
         assert!(key.key().labels().any(|l| l.key() == "mode" && l.value() == "initial"));
         find("tn_epoch.boundary_timestamp_seconds");
         find("tn_epoch.replayed_outputs_total");
+        let (key, _, _, value) = find("tn_epoch.provider_fault_retries_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        assert!(key
+            .key()
+            .labels()
+            .any(|l| l.key() == "read" && l.value() == "epoch-entry state read"));
     }
 }

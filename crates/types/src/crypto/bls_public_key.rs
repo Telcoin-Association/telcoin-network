@@ -87,12 +87,41 @@ impl From<CorePublicKey> for BlsPublicKey {
 }
 
 impl BlsPublicKey {
+    /// Length of the compressed G2 encoding of a public key, in bytes.
+    ///
+    /// This is the wire form used everywhere in the protocol: the validator signs it, the
+    /// `ConsensusRegistry` stores it, and `to_bytes` produces it.
+    pub const COMPRESSED_BYTES: usize = 96;
+
+    /// Length of the uncompressed G2 encoding of a public key, in bytes.
+    ///
+    /// [`Self::from_literal_bytes`] accepts this form as well as [`Self::COMPRESSED_BYTES`],
+    /// normalizing it to the compressed form, but nothing in the protocol emits it.
+    pub const UNCOMPRESSED_BYTES: usize = 192;
+
     /// Encode the public key to base58. This is used for serialize/deserialize.
     pub fn encode_base58(&self) -> String {
         self.to_string()
     }
 
+    /// Whether `bytes` is long enough to be worth handing to [`Self::from_literal_bytes`].
+    ///
+    /// `blst` screens the length before it touches the curve, so this reproduces that screen for
+    /// callers that want to reject junk *before* paying to schedule the decompress. It is a
+    /// necessary condition only: a correct length still decompresses and can still fail. Any
+    /// length this accepts, `from_literal_bytes` may accept; any length it rejects,
+    /// `from_literal_bytes` rejects too, so screening on it never changes which inputs succeed.
+    pub fn is_plausible_encoding(bytes: &[u8]) -> bool {
+        matches!(bytes.len(), Self::COMPRESSED_BYTES | Self::UNCOMPRESSED_BYTES)
+    }
+
     /// Decode the public key from bytes on-chain and return result to caller.
+    ///
+    /// Accepts the [`Self::COMPRESSED_BYTES`] and [`Self::UNCOMPRESSED_BYTES`] G2 encodings.
+    ///
+    /// This decompresses a BLS12-381 G2 point, which costs tens of microseconds. Callers reachable
+    /// from an unauthenticated surface must keep it off the async runtime's worker threads and
+    /// bound how many run at once (see `tn-rpc`'s `proofOfPossessionMessage` handler).
     ///
     /// WARNING: do not use this method to deserialize bytes from filesystem.
     /// This method is only used to convert the literal bytes for the pubkey.
@@ -273,5 +302,80 @@ impl<'de> Deserialize<'de> for BlsPublicKey {
         D: serde::Deserializer<'de>,
     {
         Ok(BlsPublicKeyBytes::deserialize(deserializer)?.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BlsKeypair;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    /// The two encoding lengths are the ones `blst` actually accepts, taken from a real key rather
+    /// than asserted from the constants alone. If `blst` ever changed either size, the constants
+    /// would silently start screening out keys the parser accepts, so pin them to observed
+    /// behaviour.
+    #[test]
+    fn encoding_length_constants_match_blst() {
+        let keypair = BlsKeypair::generate(&mut StdRng::from_seed([11u8; 32]));
+        let compressed = keypair.public().to_bytes();
+        // `BlsPublicKey` implements `Serialize`, so reach the blst inherent `serialize` through the
+        // deref rather than letting serde's method win resolution
+        let uncompressed = (**keypair.public()).serialize();
+
+        assert_eq!(compressed.len(), BlsPublicKey::COMPRESSED_BYTES);
+        assert_eq!(uncompressed.len(), BlsPublicKey::UNCOMPRESSED_BYTES);
+        assert!(BlsPublicKey::from_literal_bytes(&compressed).is_ok());
+        assert!(BlsPublicKey::from_literal_bytes(&uncompressed).is_ok());
+        assert!(BlsPublicKey::is_plausible_encoding(&compressed));
+        assert!(BlsPublicKey::is_plausible_encoding(&uncompressed));
+    }
+
+    /// The screen is a *necessary* condition for parsing, which is what makes it safe to run
+    /// before [`BlsPublicKey::from_literal_bytes`]: anything it rejects, the parser rejects too, so
+    /// screening first never changes which inputs succeed. Callers rely on this to reject
+    /// malformed input without paying to schedule a decompress.
+    #[test]
+    fn screen_rejects_only_what_the_parser_would_reject() {
+        let keypair = BlsKeypair::generate(&mut StdRng::from_seed([12u8; 32]));
+        let compressed = keypair.public().to_bytes();
+        // sweep past both accepted lengths, reusing real key bytes so the contents are as
+        // parseable as they can be and only the length is ever at fault
+        let sweep = 0..=BlsPublicKey::UNCOMPRESSED_BYTES + 8;
+
+        // pin which lengths survive, so a screen that accepted everything would fail here rather
+        // than emptying the set below and passing vacuously
+        let surviving: Vec<usize> = sweep
+            .clone()
+            .filter(|&len| BlsPublicKey::is_plausible_encoding(&vec![0u8; len]))
+            .collect();
+        assert_eq!(
+            surviving,
+            vec![BlsPublicKey::COMPRESSED_BYTES, BlsPublicKey::UNCOMPRESSED_BYTES],
+            "exactly the two lengths blst accepts may pass the screen"
+        );
+
+        let screened_out: Vec<Vec<u8>> = sweep
+            .map(|len| (0..len).map(|i| compressed[i % compressed.len()]).collect::<Vec<u8>>())
+            .filter(|candidate| !BlsPublicKey::is_plausible_encoding(candidate))
+            .collect();
+        assert!(
+            screened_out.iter().all(|c| BlsPublicKey::from_literal_bytes(c).is_err()),
+            "screen rejected a length that from_literal_bytes would have accepted"
+        );
+    }
+
+    /// The screen is necessary but not sufficient: a correct length still has to decompress, and
+    /// can still fail. Callers must keep handling the parse error rather than treating a passing
+    /// screen as validation.
+    #[test]
+    fn screen_alone_does_not_validate_the_point() {
+        let junk = vec![0xffu8; BlsPublicKey::COMPRESSED_BYTES];
+
+        assert!(BlsPublicKey::is_plausible_encoding(&junk));
+        assert!(
+            BlsPublicKey::from_literal_bytes(&junk).is_err(),
+            "a correctly sized non-point must still fail to parse"
+        );
     }
 }

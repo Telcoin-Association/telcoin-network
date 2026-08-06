@@ -9,6 +9,7 @@ mod info;
 mod node_mode;
 mod output;
 mod reputation;
+mod seed_chain;
 mod vote;
 
 pub use block::*;
@@ -19,6 +20,7 @@ pub use info::*;
 pub use node_mode::*;
 pub use output::*;
 pub use reputation::*;
+pub use seed_chain::*;
 pub use vote::*;
 
 /// The default primary udp port for consensus messages.

@@ -13,9 +13,13 @@ use std::{
 use tempfile::TempDir;
 use tn_batch_builder::test_utils::execute_test_batch;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_engine::{execute_consensus_output, ExecutorEngine, TnEngineError, MAX_QUEUED_OUTPUTS};
+use tn_engine::{
+    execute_consensus_output, ExecutorEngine, TnEngineError, MAX_QUEUED_OUTPUTS,
+    PERSIST_OUTPUT_ATTEMPTS,
+};
 use tn_reth::{
     calculate_gas_penalty,
+    error::TnRethError,
     payload::BuildArguments,
     recover_signed_transaction,
     system_calls::EpochState,
@@ -24,7 +28,7 @@ use tn_reth::{
         seeded_genesis_from_random_batches, test_genesis_with_consensus_registry,
         TransactionFactory, BEACON_ROOTS_ADDRESS, EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
     },
-    FixedBytes, RethChainSpec, RethEnv,
+    FixedBytes, ProviderError, RethChainSpec, RethEnv,
 };
 use tn_test_utils::default_test_execution_node;
 use tn_types::{
@@ -126,7 +130,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // update rewards counter so execution address is visible
     let committee =
@@ -153,6 +157,7 @@ async fn test_empty_output_skips_execution() -> eyre::Result<()> {
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output =
         ConsensusOutput::new_with_subdag(sub_dag, ConsensusHeaderDigest::default(), 0);
@@ -231,7 +236,7 @@ async fn test_queued_outputs_bounded_with_backpressure() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     let committee =
         create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
@@ -262,6 +267,7 @@ async fn test_queued_outputs_bounded_with_backpressure() -> eyre::Result<()> {
             round as u64,
             ReputationScores::default(),
             previous_sub_dag.clone(),
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         let output = ConsensusOutput::new_with_subdag(sub_dag.clone(), parent_hash, i as u64 + 1);
         parent_hash = output.consensus_header_hash();
@@ -341,7 +347,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // update rewards counter so execution address is visible
     let committee =
@@ -370,6 +376,7 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         subdag,
@@ -509,6 +516,239 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     Ok(())
 }
 
+/// This pins the fail-stop for an empty epoch-closing output whose leader is not a member of
+/// the committee installed on the rewards counter: the engine must terminate with
+/// [`TnEngineError::UnknownAuthority`], build no block, and send no tip update.
+///
+/// The lookup miss is unreachable for valid output (see the invariant comment at the
+/// `get_authority_address` call in `payload_builder.rs`), so this constructs the impossible
+/// state directly and asserts the engine refuses to paper over it with a default beneficiary.
+/// A "graceful default" regression here is chain-consistent (every node computes the same
+/// wrong beneficiary), so no downstream validation would ever catch it; only this test does.
+#[tokio::test]
+async fn test_empty_close_epoch_unknown_leader_fail_stops() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    // install a real committee so the miss comes from the leader, not an unset committee
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus
+    //
+    // create consensus output with no batches and close_epoch: true, authored by a non-member:
+    // keep the `Certificate::default()` author instead of overwriting it with a committee
+    // member's id (the delta from the happy-path test above)
+    let timestamp = now();
+    let mut leader = Certificate::default();
+    let sub_dag_index = 0;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // update timestamp so it's not default 0
+    leader.update_header_created_at_for_test(timestamp);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    // the default author is not a committee member; capture it for the error assertion
+    let outside_leader = leader.header().author().clone();
+
+    let subdag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::new(),
+        vec![],
+    );
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let max_round = None;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        engine_update_tx,
+    );
+
+    // send output
+    let broadcast_result = to_engine.send(consensus_output).await;
+    assert!(broadcast_result.is_ok());
+
+    // drop sending channel so the stream closes after the output is processed
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+
+    // spawn engine task
+    task_manager.spawn_task("Test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // the engine must fail-stop on the lookup miss, carrying the offending identifier
+    assert_matches!(
+        engine_task,
+        Err(TnEngineError::UnknownAuthority(id)) if id == outside_leader
+    );
+
+    // no tip update may be sent on a lookup miss
+    assert!(
+        engine_update_rx.try_recv().is_err(),
+        "engine must not send an update for a failed epoch-closing output"
+    );
+
+    // no block may be built on a lookup miss
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.last_block_number()?, 0, "no block may be built on a lookup miss");
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    Ok(())
+}
+
+/// This pins the fail-stop for an empty epoch-closing output executed before any committee is
+/// installed on the rewards counter: even a leader that would be a valid committee member must
+/// terminate the engine with [`TnEngineError::UnknownAuthority`], build no block, and send no
+/// tip update.
+///
+/// Companion to [`test_empty_close_epoch_unknown_leader_fail_stops`]: together they pin both
+/// ways the beneficiary lookup can miss (non-member author, committee never set), so replacing
+/// the fail-stop with a silent default beneficiary turns at least one of them red.
+#[tokio::test]
+async fn test_empty_close_epoch_without_committee_fail_stops() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(4).into());
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    // build the committee to obtain a legitimate member id, but never call `set_committee`:
+    // the rewards counter's committee stays `None` (the delta from the happy-path test above)
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+
+    //=== Consensus
+    //
+    // create consensus output with no batches and close_epoch: true, authored by a valid member
+    let timestamp = now();
+    let mut leader = Certificate::default();
+    let sub_dag_index = 0;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    // update timestamp so it's not default 0
+    leader.update_header_created_at_for_test(timestamp);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    leader.update_header_author_for_test(leader_id.clone());
+
+    let subdag = CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        true,
+        VecDeque::new(),
+        vec![],
+    );
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let reth_env = execution_node.get_reth_env().await;
+    let max_round = None;
+    let genesis_header = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        genesis_header.clone(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator,
+        engine_update_tx,
+    );
+
+    // send output
+    let broadcast_result = to_engine.send(consensus_output).await;
+    assert!(broadcast_result.is_ok());
+
+    // drop sending channel so the stream closes after the output is processed
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+
+    // spawn engine task
+    task_manager.spawn_task("Test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(10), rx).await??;
+    // the engine must fail-stop on the lookup miss, carrying the offending identifier
+    assert_matches!(
+        engine_task,
+        Err(TnEngineError::UnknownAuthority(id)) if id == leader_id
+    );
+
+    // no tip update may be sent on a lookup miss
+    assert!(
+        engine_update_rx.try_recv().is_err(),
+        "engine must not send an update for a failed epoch-closing output"
+    );
+
+    // no block may be built on a lookup miss
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.last_block_number()?, 0, "no block may be built on a lookup miss");
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    Ok(())
+}
+
 /// This tests that leader count is incremented even when execution is skipped
 /// for empty non-epoch-closing output.
 #[tokio::test]
@@ -522,7 +762,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     // update rewards counter so execution address is visible
     let committee =
@@ -550,6 +790,7 @@ async fn test_empty_output_increments_leader_count() -> eyre::Result<()> {
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         subdag,
@@ -702,7 +943,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee from genesis state
@@ -839,6 +1080,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
@@ -865,6 +1107,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     )
     .into();
     let consensus_output_2 = ConsensusOutput::new(
@@ -1084,7 +1327,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
         // assert closing epoch randomness matches extra data field in last block
         let expected_extra = if idx == 7 {
-            Bytes::from(expected_output.keccak_leader_sigs().0)
+            Bytes::from(expected_output.committee_shuffle_seed().0)
         } else {
             Bytes::default()
         };
@@ -1191,7 +1434,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee from genesis state
@@ -1352,6 +1595,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
@@ -1380,6 +1624,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2.clone(),
@@ -1628,7 +1873,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
         // assert closing epoch randomness matches extra data field in last block
         let expected_extra = if idx == 7 {
-            Bytes::from(expected_output.keccak_leader_sigs().0)
+            Bytes::from(expected_output.committee_shuffle_seed().0)
         } else {
             Bytes::default()
         };
@@ -1734,6 +1979,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         sub_dag_index_1,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output_1 = ConsensusOutput::new(
         subdag_1.clone(),
@@ -1759,6 +2005,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         sub_dag_index_2,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2,
@@ -1892,7 +2139,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee from genesis state
@@ -1969,6 +2216,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
@@ -2148,7 +2396,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
         assert_eq!(block.difficulty, U256::from(0 << 16));
         // assert closing epoch randomness matches extra data field in last block
         let expected_extra = if idx == 7 {
-            Bytes::from(consensus_output.keccak_leader_sigs().0)
+            Bytes::from(consensus_output.committee_shuffle_seed().0)
         } else {
             Bytes::default()
         };
@@ -2246,7 +2494,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
         Some(chain.clone()),
         None,
         &tmp_dir.path().join("exc-node"),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
 
     // create committee
@@ -2277,6 +2525,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
         sub_dag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         subdag.clone(),
@@ -2434,7 +2683,7 @@ async fn test_partial_output_failure_rolls_back_in_memory_state() -> eyre::Resul
         Some(chain.clone()),
         None,
         tmp_dir.path(),
-        Some(gas_accumulator.rewards_counter()),
+        Some(gas_accumulator.clone()),
     )?;
     let committee =
         create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
@@ -2455,6 +2704,7 @@ async fn test_partial_output_failure_rolls_back_in_memory_state() -> eyre::Resul
         sub_dag_index,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         sub_dag,
@@ -2510,6 +2760,630 @@ async fn test_partial_output_failure_rolls_back_in_memory_state() -> eyre::Resul
         "a failed output must not broadcast a canon-state notification"
     );
     assert!(engine_update_rx.try_recv().is_err(), "a failed output must not send an engine update");
+
+    Ok(())
+}
+
+/// Regression test for issue #1090 defect (a): a pre-commit failure of the durable persist
+/// (`RethEnv::persist_executed_output`) after every block of the output built successfully must
+/// not leave the eager in-memory canonical advance standing (a "phantom" canonical head that RPC
+/// `latest`/`pending` reads would observe until the node restarts).
+///
+/// Drives `execute_consensus_output` with a two-batch output where both blocks build and advance
+/// the in-memory state, then fails every persist attempt via the injected provider fault
+/// (`PERSIST_OUTPUT_ATTEMPTS` armed faults, so the bounded retry exhausts too). Asserts the
+/// output errors with the provider fault, the in-memory canonical state is back at the
+/// pre-output (genesis) tip, nothing was committed durably, and no canon-state notification or
+/// engine update was emitted.
+///
+/// Confirm-by-mutation: with the `rollback_in_memory_output` compensation removed from the
+/// persist error path in `execute_consensus_output`, the two blocks' advance survives and the
+/// `canonical_chain().count() == 0` / `canonical_tip == genesis` assertions below fail.
+#[tokio::test]
+async fn test_persist_output_failure_rolls_back_in_memory_state() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // pre-conditions: nothing has advanced yet
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    // arm the injector: every persist attempt (first try + retries) hits a provider fault, so
+    // the bounded retry exhausts and the failure escalates
+    reth_env.inject_persist_provider_faults(PERSIST_OUTPUT_ATTEMPTS);
+
+    // subscribe before execution to prove no canon-state notification is emitted for the failure
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+    })
+    .await?;
+
+    // the persist fault escalates as a provider error once the retry budget is exhausted
+    assert_matches!(
+        result,
+        Err(TnEngineError::Reth(TnRethError::Provider(_))),
+        "an exhausted persist retry must escalate the provider fault"
+    );
+
+    // the whole budget was spent: a fault raised before `save_blocks` leaves nothing behind for
+    // the next attempt to trip over, so this is the one ordering a retry can actually work on
+    assert_eq!(
+        reth_env.persist_attempt_count(),
+        PERSIST_OUTPUT_ATTEMPTS,
+        "an early-seam fault must be retried until the budget is exhausted"
+    );
+
+    //=== the phantom head must not survive: in-memory state is rolled back to genesis
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        0,
+        "the blocks' in-memory advance must be rolled back after the persist failed"
+    );
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        genesis_header.hash(),
+        "the canonical head must be reset to the pre-output (genesis) tip"
+    );
+
+    // no durable write: persisted tip and finalized marker stay at genesis
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 0, "no block was finalized");
+
+    // no external observer saw the phantom advance
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "a failed output must not broadcast a canon-state notification"
+    );
+    assert!(engine_update_rx.try_recv().is_err(), "a failed output must not send an engine update");
+
+    Ok(())
+}
+
+/// Issue #1090, late-stage variant of the persist rollback: a provider fault raised AFTER
+/// `save_blocks` has advanced the process-wide static-file writers still compensates the
+/// speculative in-memory advance, so the phantom canonical head cannot survive a late-stage
+/// persist failure.
+///
+/// Mirrors `test_persist_output_failure_rolls_back_in_memory_state` exactly, changing only the
+/// fault seam: `inject_late_persist_provider_faults` fires after `save_blocks` and the
+/// finalized/safe marker writes, immediately before `provider_rw.commit()`, rather than at the
+/// top of `RethEnv::persist_executed_output`. The database transaction is still uncommitted on
+/// that path, so the post-conditions are identical: the in-memory chain segment is empty, the
+/// canonical head is back at the anchor, nothing is durable, and no canon-state or engine-update
+/// notification fired.
+///
+/// Unlike the early-seam case this ordering CANNOT exhaust the retry budget: attempt 1 leaves the
+/// static-file writers advanced, so attempt 2 fails terminally on the mismatch before it reaches
+/// the seam at all. The attempt-count assertion pins that, so the test cannot quietly start
+/// passing for a different reason than the one documented here.
+#[tokio::test]
+async fn test_late_persist_failure_rolls_back_in_memory_state() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // pre-conditions: nothing has advanced yet
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    // arm the LATE injector with the full budget: only the first fault is ever consumed, because
+    // attempt 2 trips over attempt 1's static-file progress before it reaches the seam
+    reth_env.inject_late_persist_provider_faults(PERSIST_OUTPUT_ATTEMPTS);
+
+    // subscribe before execution to prove no canon-state notification is emitted for the failure
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+    })
+    .await?;
+
+    // the persist fault escalates as a provider error
+    assert_matches!(
+        result,
+        Err(TnEngineError::Reth(TnRethError::Provider(_))),
+        "a failed persist must escalate the provider fault"
+    );
+
+    // this ordering cannot exhaust the budget: attempt 1 leaves the static-file writers advanced,
+    // so attempt 2 fails terminally on the mismatch before it ever reaches the seam
+    assert_eq!(
+        reth_env.persist_attempt_count(),
+        2,
+        "a late-seam fault must stop at the terminal repeat attempt, not spend the whole budget"
+    );
+
+    //=== the phantom head must not survive: in-memory state is rolled back to genesis
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        0,
+        "the blocks' in-memory advance must be rolled back after the late persist failed"
+    );
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        genesis_header.hash(),
+        "the canonical head must be reset to the pre-output (genesis) tip"
+    );
+
+    // no durable write: persisted tip and finalized marker stay at genesis
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 0, "no block was finalized");
+
+    // no external observer saw the phantom advance
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "a failed output must not broadcast a canon-state notification"
+    );
+    assert!(engine_update_rx.try_recv().is_err(), "a failed output must not send an engine update");
+
+    Ok(())
+}
+
+/// Issue #1090: once an attempt of `RethEnv::persist_executed_output` has failed AFTER
+/// `save_blocks` fsynced its static-file progress, re-running the call in-process can never
+/// succeed, so the bounded retry must abandon the budget rather than burn it.
+///
+/// Arms exactly ONE late fault: attempt 1 dies immediately before `provider_rw.commit()` with
+/// the static-file writers already advanced past this output's blocks, so attempt 2 re-runs
+/// `save_blocks` for real and trips over that progress. Empirically (three identical runs)
+/// attempt 2 fails with `ProviderError::UnexpectedStaticFileBlockNumber(Headers, 1, 3)`, reth's
+/// "trying to append data to Headers as block #1 but expected block #3", which
+/// `retryable_persist_fault` classifies terminal.
+///
+/// Pins three things: the terminal class is what escalates, the engine stops at attempt 2 of
+/// `PERSIST_OUTPUT_ATTEMPTS` instead of burning the third (asserted on the attempt counter, never
+/// on elapsed time), and the speculative in-memory advance is still compensated on the way out
+/// even though a durable side effect (the static-file writers) survives for reth's startup
+/// consistency check to reconcile.
+#[tokio::test]
+async fn test_repeat_persist_after_static_file_progress_is_terminal() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // pre-conditions: nothing has advanced yet
+    assert_eq!(canonical_in_memory_state.canonical_chain().count(), 0);
+    assert_eq!(reth_env.canonical_tip().hash(), genesis_header.hash());
+
+    // exactly ONE late fault: attempt 1 dies after `save_blocks`, attempt 2 re-runs it for real
+    reth_env.inject_late_persist_provider_faults(1);
+
+    // subscribe before execution to prove no canon-state notification is emitted for the failure
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+    })
+    .await?;
+
+    // attempt 2 trips over attempt 1's fsynced static-file progress, and that class is terminal
+    assert_matches!(
+        result,
+        Err(TnEngineError::Reth(TnRethError::Provider(
+            ProviderError::UnexpectedStaticFileBlockNumber(..)
+        ))),
+        "a repeat persist over the failed attempt's fsynced static-file progress must surface \
+         the static-file mismatch, not a retryable fault"
+    );
+
+    // the terminal class abandons the budget at attempt 2 instead of burning the third attempt
+    assert_eq!(
+        reth_env.persist_attempt_count(),
+        2,
+        "the static-file mismatch is terminal, so the retry must stop at attempt 2 of \
+         {PERSIST_OUTPUT_ATTEMPTS}"
+    );
+
+    //=== the phantom head must not survive: in-memory state is rolled back to genesis
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        0,
+        "the blocks' in-memory advance must be rolled back after the terminal persist failure"
+    );
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        genesis_header.hash(),
+        "the canonical head must be reset to the pre-output (genesis) tip"
+    );
+
+    // no durable write: both attempts left the database transaction uncommitted
+    assert_eq!(reth_env.last_block_number()?, 0, "no block was committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 0, "no block was finalized");
+
+    // no external observer saw the phantom advance
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "a failed output must not broadcast a canon-state notification"
+    );
+    assert!(engine_update_rx.try_recv().is_err(), "a failed output must not send an engine update");
+
+    Ok(())
+}
+
+/// Issue #1090 defect (b): a transient node-local provider fault on the durable persist is
+/// retried within the bounded budget instead of halting the engine.
+///
+/// Arms `PERSIST_OUTPUT_ATTEMPTS - 1` injected faults, so every attempt in the retry window
+/// fails and the final attempt succeeds. Asserts the output executes to completion exactly as on
+/// the fault-free path: both blocks durably committed with the finalized marker advanced, the
+/// in-memory head naming the committed tip, and the engine update and canon-state notification
+/// emitted.
+#[tokio::test]
+async fn test_persist_provider_fault_retry_recovers() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // arm the injector: the whole retry window faults, then the final attempt succeeds
+    reth_env.inject_persist_provider_faults(PERSIST_OUTPUT_ATTEMPTS - 1);
+
+    // subscribe before execution to observe the success-path notification
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // run the output on a blocking task, mirroring the production execution task
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+    })
+    .await?;
+
+    // the transient faults are absorbed by the bounded retry
+    let executed_tip = result?;
+    assert_eq!(executed_tip.number, 2, "both blocks executed");
+
+    // the injector really fired: without this the test passes just as well when the seam fails to
+    // arm and the very first attempt succeeds, leaving the retry window itself untested
+    assert_eq!(
+        reth_env.persist_attempt_count(),
+        PERSIST_OUTPUT_ATTEMPTS,
+        "every attempt in the retry window must run before the final one succeeds"
+    );
+
+    // the output is durably committed and announced exactly as on the fault-free path
+    assert_eq!(reth_env.last_block_number()?, 2, "both blocks committed durably");
+    assert_eq!(reth_env.last_finalized_block_number()?, 2, "finalized marker advanced");
+    assert_eq!(
+        reth_env.canonical_tip().hash(),
+        executed_tip.hash(),
+        "the in-memory head names the committed tip"
+    );
+    assert!(
+        canon_rx.try_recv().is_ok(),
+        "a committed output broadcasts a canon-state notification"
+    );
+    let (_, _, header) =
+        engine_update_rx.try_recv().expect("a committed output sends an engine update");
+    assert_eq!(
+        header.map(|h| h.hash()),
+        Some(executed_tip.hash()),
+        "the engine update names the committed tip"
+    );
+
+    Ok(())
+}
+
+/// Issue #1090 mirror case: a failure AFTER the durable commit (a closed engine-update channel
+/// yields `TnRethError::EngineUpdateChannelClosed` from `RethEnv::announce_executed_output`) must
+/// NOT roll back the in-memory advance. The blocks are canonical for real, and reverting durably
+/// committed blocks would be a worse defect than the phantom head this issue fixes; this pins the
+/// compensator's pre-commit-only scope.
+///
+/// Confirm-by-mutation: with the rollback widened to fire on the announce failure too, the
+/// canonical-head assertions below fail.
+#[tokio::test]
+async fn test_post_commit_failure_preserves_committed_head() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two valid batches -> two blocks in one output.
+    let chain = test_chain_spec_arc();
+    let batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output containing both batches
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![CertifiedBatch { address: batch_producer, batches }],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+    let canonical_in_memory_state = reth_env.canonical_in_memory_state();
+
+    // subscribe before execution: the announce fails at the engine-update send, BEFORE the
+    // canon-state broadcast, so no notification may be observed either
+    let mut canon_rx = canonical_in_memory_state.subscribe_canon_state();
+
+    // close the engine-update channel BEFORE execution: the POST-commit blocking_send fails
+    let (engine_update_tx, engine_update_rx) = tokio::sync::mpsc::channel(64);
+    drop(engine_update_rx);
+
+    // run the output on a blocking task, mirroring the production execution task
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+    })
+    .await?;
+
+    assert_matches!(
+        result,
+        Err(TnEngineError::Reth(TnRethError::EngineUpdateChannelClosed)),
+        "a closed engine-update channel fails the output post-commit"
+    );
+
+    // the blocks are durably canonical: committed tip and markers advanced
+    assert_eq!(
+        reth_env.last_block_number()?,
+        2,
+        "both blocks committed durably before the failure"
+    );
+    assert_eq!(
+        reth_env.last_finalized_block_number()?,
+        2,
+        "finalized marker advanced with the blocks"
+    );
+
+    // and the in-memory head still names the committed tip: NO rollback fired
+    assert_eq!(
+        reth_env.canonical_tip().number,
+        2,
+        "the in-memory canonical head must keep naming the committed tip"
+    );
+    assert_eq!(
+        canonical_in_memory_state.canonical_chain().count(),
+        2,
+        "the committed blocks stay in the in-memory chain (finalize_block never ran)"
+    );
+
+    // ordering: the announce failed before the canon-state broadcast
+    assert!(
+        canon_rx.try_recv().is_err(),
+        "the canon-state broadcast happens after the engine-update send, which failed"
+    );
 
     Ok(())
 }

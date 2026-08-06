@@ -30,8 +30,8 @@ pub use consensus::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_re
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.
 ///
-/// Returns an error when the last executed consensus block cannot be READ from the consensus
-/// store (as opposed to being absent, which primes from a default header as before).
+/// A failed storage lookup is propagated so startup halts loudly; only a genuinely absent
+/// header (fresh chain or a new epoch) defaults and primes the rounds from a fresh start.
 pub async fn prime_consensus<DB: Database>(
     consensus_bus: &ConsensusBusApp,
     config: &ConsensusConfig<DB>,
@@ -106,7 +106,9 @@ pub fn spawn_state_sync<DB: Database>(
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
 /// Returns the number of bytes the encoded Output takes on disk IF this is written to the current
-/// pack or 0 otherwise (old consensus).
+/// pack or 0 if the output already resides in a static (imported) pack. An output whose number
+/// does not advance the chain's latest consensus is an error (it used to be a silent 0-byte
+/// no-op, which let a node resuming from a collapsed height 0 discard every output silently).
 pub async fn save_consensus(
     consensus_output: ConsensusOutput,
     consensus_chain: &mut ConsensusChain,
@@ -116,8 +118,8 @@ pub async fn save_consensus(
     // Note it is ok to leave batches in NodeBatchesCache until the epoch ends (when the table is
     // cleared). Make sure we have persisted the consensus output before we execute.
     consensus_chain.persist_current().await?;
-    // A zero byte count means this output was old consensus not written to the current pack;
-    // recording it as the "most recent" output size would be misleading.
+    // A zero byte count means this output already resides in a static (imported) pack and
+    // nothing was written; recording it as the "most recent" output size would be misleading.
     if output_bytes > 0 {
         metrics.record_consensus_output_bytes(output_bytes);
     }
@@ -148,7 +150,9 @@ pub async fn last_executed_consensus_block(
 ///
 /// Returns an error when the last executed consensus block or the latest recorded consensus
 /// header cannot be READ from the consensus store (as opposed to being absent, which falls
-/// back to a default header as before).
+/// back to a default header at number 0 as before). Halting on a failed lookup matters because
+/// `save_consensus_output` hard-rejects the non-advancing numbers a silently re-rooted default
+/// parent would produce, so resuming from the default would strand the node anyway.
 pub async fn last_consensus_parent(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
@@ -163,6 +167,10 @@ pub async fn last_consensus_parent(
 
 /// Collect and return any consensus headers that were not executed before last shutdown.
 /// This will be consensus that was reached but had not executed before a shutdown.
+///
+/// A failed storage lookup is propagated (the cursors below decide what gets re-executed, so
+/// computing them from silently-defaulted headers at number 0 would skip the replay); a
+/// genuinely absent header legitimately defaults to the fresh-chain genesis header.
 pub async fn get_missing_consensus(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
@@ -176,8 +184,7 @@ pub async fn get_missing_consensus(
     // Not sure we should handle this, but it hurts nothing.
     let last_db_block = consensus_chain
         .consensus_header_latest()
-        .await
-        .unwrap_or_default()
+        .await?
         .unwrap_or_else(|| last_executed_block.clone());
 
     info!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
@@ -210,8 +217,10 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let rx_shutdown = config.shutdown().subscribe();
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
+    // A failed lookup aborts this task (the spawner logs and surfaces the error); only a
+    // genuinely absent header (fresh chain) defaults so streaming starts from genesis.
     let mut last_consensus_header =
-        consensus_bus.last_consensus_block(&consensus_chain).await.unwrap_or_default();
+        consensus_bus.last_consensus_block(&consensus_chain).await?.unwrap_or_default();
     let mut last_consensus_height = last_consensus_header.number;
     let epoch = config.committee().epoch();
 

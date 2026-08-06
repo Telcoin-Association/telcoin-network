@@ -45,9 +45,9 @@ use reth_provider::{
 };
 use reth_revm::context::result::ExecutionResult;
 use tn_types::{
-    Account, Address, BlockHashOrNumber, BlockNumHash, BlockNumber, Bytes, ExecHeader, Receipt,
-    Recovered, SealedBlock, SealedHeader, TransactionMeta, TransactionSigned, TxHash, TxNumber,
-    B256,
+    Account, Address, BlockHashOrNumber, BlockNumHash, BlockNumber, Bytes,
+    CanonicalExecutionReader, ExecHeader, Receipt, Recovered, SealedBlock, SealedHeader,
+    TransactionMeta, TransactionSigned, TxHash, TxNumber, B256,
 };
 
 use crate::{
@@ -556,6 +556,28 @@ impl RethEnv {
     /// (`eth_getCode` equivalent). `None` for EOAs and unknown accounts.
     pub fn account_code(&self, address: &Address) -> TnRethResult<Option<Bytes>> {
         Ok(self.latest()?.account_code(address)?.map(|code| code.original_bytes()))
+    }
+}
+
+impl CanonicalExecutionReader for RethEnv {
+    /// Answer from the committed-DB-only read family (see this module's header): the caller asks
+    /// whether `number` is *durably* canonical, so an in-memory-tip-aware read would defeat the
+    /// question by reporting speculatively executed blocks as confirmed.
+    fn canonical_execution_hash(&self, number: BlockNumber) -> Option<B256> {
+        // A read error (e.g. a transient provider/DB error) is treated as "not confirmed" rather
+        // than as a canonical match, so the caller keeps its conservative fork handling.
+        self.sealed_header_by_number(number)
+            .inspect_err(|error| {
+                tracing::debug!(
+                    target: "tn::reth",
+                    ?error,
+                    number,
+                    "canonical_execution_hash: canonical DB read failed; treating as unconfirmed"
+                );
+            })
+            .ok()
+            .flatten()
+            .map(|header| header.hash())
     }
 }
 

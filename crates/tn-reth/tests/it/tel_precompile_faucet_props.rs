@@ -5,17 +5,20 @@
 //! - Mint role grant/revoke semantics
 //! - Supply accounting with faucet mints
 
+use crate::precompile_relays::{CALL_RELAY_BYTECODE, STATICCALL_RELAY_BYTECODE};
 use alloy::sol_types::SolCall;
 use proptest::prelude::*;
 use reth_revm::primitives::{address, Address};
 use tn_config::GOVERNANCE_SAFE_ADDRESS as GOVERNANCE;
 use tn_reth::{
-    claimCall, grantMintRoleCall, mintCall, revokeMintRoleCall,
+    claimCall, faucet_mint_role_slot, grantMintRoleCall, hasMintRoleCall, mintCall,
+    revokeMintRoleCall,
     test_utils::precompile_test_utils::{
-        assert_not_success, assert_success, TestEnv, RECIPIENT, USER,
+        assert_not_success, assert_success, decode_bool, TestEnv, RECIPIENT, USER,
     },
+    TELCOIN_PRECOMPILE_ADDRESS,
 };
-use tn_types::U256;
+use tn_types::{Bytes, U256};
 
 const FAUCET: Address = address!("0000000000000000000000000000000000000F00");
 
@@ -167,4 +170,82 @@ proptest! {
         );
         assert_not_success(&result);
     }
+}
+
+// ==============================
+// `STATICCALL` write protection (faucet selectors)
+// ==============================
+
+/// A `STATICCALL` reaching a faucet role-management selector is refused, and writes nothing.
+///
+/// The mainnet counterparts of these tests live in `tel_precompile_props.rs`, which `main.rs`
+/// compiles only under `#[cfg(not(feature = "faucet"))]`. Without this test the faucet build's
+/// mutating selectors, and the dispatcher's faucet-only read-only classification, would carry no
+/// static-call coverage at all.
+///
+/// The relay is hosted at [`GOVERNANCE`] because `STATICCALL` does not preserve `msg.sender`: the
+/// precompile authorizes against the relay's own address, so a relay anywhere else would be
+/// rejected with `"unauthorized"` whether or not the guard exists, and the test would pass against
+/// unfixed code. The outer transaction is driven by [`USER`], since revm rejects a transaction
+/// whose sender has code (EIP-3607).
+///
+/// Each relay gets its own environment: within one env the journal caches account code across
+/// transactions while `deploy_code` writes to the database underneath it, so swapping the relay
+/// bytecode mid-test would silently re-run the first relay.
+#[test]
+fn test_staticcall_cannot_grant_mint_role() {
+    let role_slot = faucet_mint_role_slot(FAUCET);
+
+    // Positive control: the same relay frame under `CALL` grants the role.
+    let mut allowed_env = new_faucet_env();
+    allowed_env.deploy_code(GOVERNANCE, Bytes::from_static(CALL_RELAY_BYTECODE));
+    let allowed = allowed_env.exec_to(
+        USER,
+        GOVERNANCE,
+        grantMintRoleCall { addr: FAUCET }.abi_encode(),
+        200_000,
+    );
+    assert_success(&allowed);
+    assert!(decode_bool(&allowed), "CALL into grantMintRole must be accepted");
+    assert_eq!(
+        allowed_env.get_storage(TELCOIN_PRECOMPILE_ADDRESS, role_slot),
+        U256::from(1),
+        "positive control failed: the CALL relay never reached the precompile, so the \
+         STATICCALL assertions below would be vacuous"
+    );
+
+    // Same caller, same calldata, same authorization - only the opcode changes.
+    let mut refused_env = new_faucet_env();
+    refused_env.deploy_code(GOVERNANCE, Bytes::from_static(STATICCALL_RELAY_BYTECODE));
+    let refused = refused_env.exec_to(
+        USER,
+        GOVERNANCE,
+        grantMintRoleCall { addr: FAUCET }.abi_encode(),
+        200_000,
+    );
+    assert_success(&refused);
+    assert!(!decode_bool(&refused), "STATICCALL into grantMintRole must be refused");
+    assert_eq!(
+        refused_env.get_storage(TELCOIN_PRECOMPILE_ADDRESS, role_slot),
+        U256::ZERO,
+        "STATICCALL must not write the mint-role slot"
+    );
+}
+
+/// `hasMintRole` is read-only, so the guard must leave it reachable inside a `STATICCALL`.
+///
+/// This is the faucet-only half of the dispatcher's read-only classification, the arm gated behind
+/// `cfg!(feature = "faucet")`. The role is deliberately not granted first: the assertion is on the
+/// relay's returned success flag (did the precompile serve the call), not on `hasMintRole`'s own
+/// boolean answer, and granting it would require a transaction that loads `GOVERNANCE` into the
+/// journal before the relay is deployed there.
+#[test]
+fn test_staticcall_still_serves_has_mint_role() {
+    let mut env = new_faucet_env();
+    env.deploy_code(GOVERNANCE, Bytes::from_static(STATICCALL_RELAY_BYTECODE));
+
+    let result =
+        env.exec_to(USER, GOVERNANCE, hasMintRoleCall { addr: FAUCET }.abi_encode(), 200_000);
+    assert_success(&result);
+    assert!(decode_bool(&result), "hasMintRole must remain callable under STATICCALL");
 }

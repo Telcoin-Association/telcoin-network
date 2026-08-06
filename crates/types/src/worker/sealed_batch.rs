@@ -68,12 +68,17 @@ pub struct Batch {
     /// The 160-bit address to which all fees collected from the successful mining of this batch
     /// be transferred; formally Hc.
     pub beneficiary: Address,
-    /// A scalar representing EIP1559 base fee which can move up or down each batch according
-    /// to a formula which is a function of gas used in parent batch and gas target
-    /// (batch gas limit divided by elasticity multiplier) of parent batch.
-    /// The algorithm results in the base fee per gas increasing when batchs are
-    /// above the gas target, and decreasing when batchs are below the gas target. The base fee per
-    /// gas is sent to governance address.
+    /// The EIP-1559 base fee in effect for this batch.
+    ///
+    /// Unlike Ethereum, this does not move from batch to batch. The value is keyed by `worker_id`
+    /// and is constant for the whole epoch, so every validator's worker N carries the same base
+    /// fee until the epoch closes; a batch carrying any other value is rejected as
+    /// `InvalidBaseFee`.
+    ///
+    /// It is recomputed only at the epoch boundary, from that worker's gas accumulated over the
+    /// epoch against its target: either by the EIP-1559 formula (floored at
+    /// `MIN_PROTOCOL_BASE_FEE`) or pinned to a fixed value, according to the worker's on-chain fee
+    /// strategy. Collected base fees go to the configured base fee recipient.
     pub base_fee_per_gas: u64,
     /// The worker id for the worker that orginated this batch.
     /// Worker ids will be consistent accross validators (i.e. worker 0 talks to othere worker 0s,

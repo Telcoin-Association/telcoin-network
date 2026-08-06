@@ -31,8 +31,12 @@ pub enum TNRpcError {
         /// Raw ABI-encoded revert bytes, hex-encoded into the error `data` field.
         output: Bytes,
     },
-    /// Internal failure reading the registry. Detail logged server-side only.
-    #[error("consensus registry read failed")]
+    /// Internal failure serving the request. Detail logged server-side only.
+    ///
+    /// Deliberately says nothing about which endpoint or stage failed: it is returned for registry
+    /// reads and for the blocking-dispatch failures behind `proofOfPossessionMessage` alike, and
+    /// the cause is only ever logged server-side.
+    #[error("internal error")]
     Internal,
     /// Caller supplied an invalid parameter (e.g. a malformed BLS public key).
     #[error("{0}")]
@@ -101,7 +105,7 @@ mod tests {
     fn internal_maps_to_internal_error_without_detail() {
         let err: ErrorObject<'static> = TNRpcError::Internal.into();
         assert_eq!(err.code(), -32603);
-        assert_eq!(err.message(), "consensus registry read failed");
+        assert_eq!(err.message(), "internal error");
         assert!(err.data().is_none());
     }
 

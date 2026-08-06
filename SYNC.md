@@ -88,9 +88,13 @@ The snapshot narrows what must be re-derived rather than replacing the trust mod
   from epoch 0. A tampered record chain is rejected.
 - The **consensus pack** for the snapshot epoch is rebuilt and its final header is checked against the
   (certificate-verified) epoch record's final consensus hash.
-- The **execution state** is taken from the bundle as a trusted starting point (its state root is
-  recomputed as it is stored). You trust whoever produced the bundle for the execution state; the
-  committee/consensus history remains self-verifying.
+- The **execution state** is rebuilt from the bundle and bound to the same certificate chain. Its state
+  root is recomputed from scratch as it is stored and must match both the root the pack declares and the
+  `state_root` of the snapshot block, whose hash comes from the (certificate-verified) epoch record's
+  final execution state. The ancestor headers shipped with it must be parent-hash linked up to that
+  block, so the same certificate pins them too. What the bundle's producer still picks unchecked is how
+  far back the header window reaches: a short window is accepted, and blocks below it are scaffolded
+  with zero hashes, so `BLOCKHASH` at those heights reads zero on the restored node.
 
 ### The export bundle
 

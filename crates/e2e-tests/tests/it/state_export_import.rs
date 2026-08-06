@@ -15,20 +15,20 @@
 //! them (`validator-1`). That single exporter produces the bundle the observer imports; the other
 //! three only keep the quorum alive.
 //!
-//! ## Why the network must not be idle
+//! ## What the restored node needs from the snapshot block
 //!
-//! When a node enters an epoch it derives each worker's base fee, and for an EIP-1559 worker that
-//! produced no genuine block in the previous epoch it walks BACKWARD through earlier epochs reading
-//! `WorkerConfigs` state to find a fee anchor (`derive_idle_worker_fee_at`). A full node has all of
-//! history (archive mode), but a snapshot-imported node only has state at the snapshot block `B`
-//! and forward — so an idle exported epoch would make the restored node walk below `B` into state
-//! the snapshot omitted and halt. That is exactly the precondition
-//! `SnapshotRestorer::derive_fee_precondition` guards. To keep the exported epoch (and every epoch
-//! the observer later enters) anchorable at `B`, this test runs a steady transaction stream, so
-//! every epoch contains a genuine worker block. This mirrors a real network, which is never idle. A
-//! companion test in this file (`test_state_export_skips_idle_epoch_bundle`) runs an idle network
-//! to prove the exporter *skips* producing a bundle for an epoch it could not resume from, rather
-//! than writing one that would be rejected at import.
+//! When a node enters an epoch it reads the entered epoch's worker count and per-worker base fees
+//! from ONE pinned block: the previous epoch's closing block, whose own system call recorded each
+//! EIP-1559 worker's next-epoch fee into its `WorkerConfigs` row. A snapshot-imported node pins
+//! that read to the snapshot block `B`, so all it needs is that `B` actually closed an epoch — no
+//! walk into pre-snapshot history, and no dependence on whether any worker produced a block. That
+//! is what `SnapshotRestorer::entry_readiness_precondition` validates at import.
+//!
+//! This test still runs a steady transaction stream, but only so the exported state is non-trivial
+//! (accounts, storage, and code to round-trip) and the observer has real blocks to follow forward.
+//! A companion test in this file (`test_state_export_import_idle_epoch`) runs a fully idle network
+//! to prove the idle case now round-trips end to end — the hazard that used to force the exporter
+//! to skip an idle epoch's bundle is gone.
 //!
 //! ## Why the assertions prove *import*, not just *sync*
 //!
@@ -425,31 +425,41 @@ async fn test_state_export_import_bootstrap_inner() -> eyre::Result<()> {
     Ok(())
 }
 
-/// The exporter must NOT produce a bundle it knows is un-resumable. On an IDLE network (epochs with
-/// no genuine worker block), each epoch `>= 1`'s snapshot fails the fee-derivability precheck, so
-/// the exporter skips it and writes no bundle. Epoch 0 is still exported (entering epoch 1 never
-/// walks below the snapshot, so it is fee-resumable). The importer's reject guard is the
-/// counterpart, unit-tested in `tn-reth`; an idle bundle can no longer reach it via a real
-/// exporter.
+/// A fully IDLE network round-trips a snapshot end to end: the exporter WRITES a bundle for an
+/// epoch that contains no genuine worker block, and an observer bootstraps from that bundle and
+/// follows the chain forward.
+///
+/// This is the inverse of what this test used to assert. An idle EIP-1559 worker used to have no
+/// chain-observable fee anchor in the exported epoch, so a restored node would walk BACKWARD below
+/// the snapshot block `B` into state the snapshot omitted and halt; the exporter defended against
+/// that by refusing to write an idle epoch's bundle at all. The entry read is now ONE pinned read
+/// at `B` — the closing block's own system call recorded each worker's next-epoch fee into its
+/// `WorkerConfigs` row — so worker activity in the exported epoch is irrelevant and the hazard is
+/// gone. The only remaining requirement is that `B` closed an epoch, which every exported boundary
+/// satisfies by construction.
+///
+/// Under skip-empty-execution an idle epoch produces only its epoch-closing block, so this is also
+/// the sparsest possible chain to bootstrap from: the observer's forward sync crosses epochs whose
+/// entire block content is one closing block each.
 #[test]
 #[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
-fn test_state_export_skips_idle_epoch_bundle() -> eyre::Result<()> {
+fn test_state_export_import_idle_epoch() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .enable_time()
         .build()
         .expect("tokio runtime");
-    rt.block_on(test_state_export_skips_idle_epoch_bundle_inner())
+    rt.block_on(test_state_export_import_idle_epoch_inner())
 }
 
-async fn test_state_export_skips_idle_epoch_bundle_inner() -> eyre::Result<()> {
-    info!(target: "restart-test", "test_state_export_skips_idle_epoch_bundle");
-    let tmp_guard = tempfile::TempDir::with_prefix("state_export_skip").expect("tempdir is okay");
+async fn test_state_export_import_idle_epoch_inner() -> eyre::Result<()> {
+    info!(target: "restart-test", "test_state_export_import_idle_epoch");
+    let tmp_guard = tempfile::TempDir::with_prefix("state_export_idle").expect("tempdir is okay");
     let temp_path = tmp_guard.path().to_path_buf();
-    // No funded stream account: this network runs IDLE on purpose. Under skip-empty-execution an
-    // idle epoch produces only its epoch-closing block, which is not a genuine worker batch block,
-    // so each epoch >= 1's snapshot has no fee anchor and the exporter must skip it.
+
+    // No funded stream account and no transaction stream: this network runs IDLE on purpose. That
+    // is the whole point — every exported epoch is one the old fee-walk precondition rejected.
     config_local_testnet_with_epoch_duration(
         &temp_path,
         Some("restart_test".to_string()),
@@ -460,7 +470,7 @@ async fn test_state_export_skips_idle_epoch_bundle_inner() -> eyre::Result<()> {
 
     let bin = e2e_tests::get_telcoin_network_binary();
 
-    // 4-validator committee, exporter on validator-1 (instance 0 -> node0 log), NO tx stream.
+    // 4-validator committee, exporter on validator-1 (instance 0), NO tx stream.
     let mut guard = ProcessGuard::empty();
     let mut client_urls: [String; 4] = Default::default();
     for (i, url) in client_urls.iter_mut().enumerate() {
@@ -473,19 +483,20 @@ async fn test_state_export_skips_idle_epoch_bundle_inner() -> eyre::Result<()> {
                 bin,
                 &temp_path,
                 rpc_port,
-                "state_export_skip",
+                "state_export_idle",
                 0,
                 &["--enable-state-export"],
             )
         } else {
-            start_validator(i, bin, &temp_path, rpc_port, "state_export_skip", 0)
+            start_validator(i, bin, &temp_path, rpc_port, "state_export_idle", 0)
         };
         guard.push(child);
     }
 
     network_advancing(&client_urls)?;
 
-    // Advance a few epochs so the exporter has processed several idle boundaries.
+    // Let the network run a few epochs past the import epoch so the bundle is fully written and
+    // there is a real forward-sync gap for the observer to cross.
     let provider = ProviderBuilder::new().connect_http(client_urls[0].parse()?);
     let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
     wait_until(
@@ -494,38 +505,181 @@ async fn test_state_export_skips_idle_epoch_bundle_inner() -> eyre::Result<()> {
         || async { Ok(registry.getCurrentEpochInfo().call().await?.epochId >= MIN_LEAD_EPOCH) },
     )
     .await?;
+    info!(target: "restart-test", "idle network reached epoch {MIN_LEAD_EPOCH}");
 
-    // Positive proof the exporter ran the precheck and skipped: its node log records the skip. The
-    // exporter is instance 0, so its stdout is captured to node0-run0.log under this test's dir.
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set");
-    let exporter_log = std::path::Path::new(&manifest)
-        .join("test_logs")
-        .join("state_export_skip")
-        .join("node0-run0.log");
-    wait_until(
-        Duration::from_secs(EXPORT_EPOCH_DURATION * 4),
-        "exporter to log an idle-epoch export skip",
-        || async {
-            Ok(std::fs::read_to_string(&exporter_log)
-                .map(|log| log.contains("snapshot would not be resumable"))
-                .unwrap_or(false))
-        },
-    )
-    .await?;
-
-    // Direct observable: the idle epoch-IMPORT_EPOCH bundle was never written. Epoch IMPORT_EPOCH
-    // closed well before MIN_LEAD_EPOCH, so its (skip) export decision is complete by now.
+    // THE HEADLINE ASSERTION: the exporter wrote a bundle for an idle epoch. Written atomically
+    // (temp dir renamed into place), so the directory only appears once complete.
     let bundle_dir = temp_path
         .join("validator-1")
         .join("consensus-db")
         .join("state_exports")
         .join(format!("epoch-{IMPORT_EPOCH}"));
+    wait_until(
+        Duration::from_secs(EXPORT_EPOCH_DURATION * 4),
+        &format!("exporter to write the IDLE epoch-{IMPORT_EPOCH} bundle"),
+        || async { Ok(bundle_dir.is_dir()) },
+    )
+    .await?;
+    for file in ["state_data", "consensus_data", "epoch_records", "epoch_certs"] {
+        assert!(
+            bundle_dir.join(file).is_file(),
+            "export bundle {bundle_dir:?} is missing `{file}`"
+        );
+    }
+    info!(target: "restart-test", ?bundle_dir, "exporter produced a bundle for an IDLE epoch");
+
+    // And it never took the skip path. The exporter is instance 0, so its stdout is captured to
+    // node0-run0.log under this test's log dir. This is the direct negative of the assertion this
+    // test used to make.
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set");
+    let exporter_log = std::path::Path::new(&manifest)
+        .join("test_logs")
+        .join("state_export_idle")
+        .join("node0-run0.log");
+    if let Ok(log) = std::fs::read_to_string(&exporter_log) {
+        assert!(
+            !log.contains("snapshot would not be resumable"),
+            "exporter skipped an export it should now accept (idle epochs are exportable)"
+        );
+    }
+
+    // Anchor the import point to what the network committed: the certified epoch-`IMPORT_EPOCH`
+    // record names the epoch's final executed block (number + hash).
+    let import_record = fetch_verified_epoch_record(
+        &client_urls[0],
+        IMPORT_EPOCH,
+        (EXPORT_EPOCH_DURATION * 4).max(60),
+    )
+    .await?;
+    let import_block = import_record.final_state.number;
+    let import_hash = import_record.final_state.hash;
+    info!(target: "restart-test", IMPORT_EPOCH, import_block, %import_hash, "anchored idle import point");
+
+    // Import the bundle into the fresh, config-only observer datadir. `db load-state` runs the
+    // entry-readiness precondition against the imported state, so a bundle that could not seed the
+    // node's first epoch entry would be rejected right here.
+    let observer_dir = temp_path.join("observer");
+    let output = tokio::task::block_in_place(|| {
+        bin.command()
+            .arg("--datadir")
+            .arg(&observer_dir)
+            .arg("db")
+            .arg("load-state")
+            .arg(&bundle_dir)
+            .output()
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !bundle_dir.exists(),
-        "exporter wrote a bundle for idle epoch {IMPORT_EPOCH} that it should have skipped: \
-         {bundle_dir:?}"
+        output.status.success(),
+        "db load-state rejected an idle-epoch bundle (status {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
     );
-    info!(target: "restart-test", "exporter correctly skipped the idle epoch-{IMPORT_EPOCH} bundle");
+    assert!(
+        stdout.contains(&format!("resume syncing from epoch {IMPORT_EPOCH}")),
+        "db load-state did not write a resume hint for epoch {IMPORT_EPOCH}:\n{stdout}"
+    );
+    info!(target: "restart-test", %stdout, "db load-state accepted the idle-epoch bundle");
+
+    // Snapshot the validator's height; the observer must climb from the import block to at least
+    // here, proving it crossed the gap by syncing forward.
+    let validator_height = provider.get_block_number().await?;
+
+    // Start the observer against the imported datadir.
+    let obs_rpc_port = get_available_tcp_port("127.0.0.1")
+        .expect("Failed to get an ephemeral rpc port for observer!");
+    let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
+    let obs_idx =
+        guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "state_export_idle", 0));
+    let obs_provider = ProviderBuilder::new().connect_http(obs_url.parse()?);
+
+    wait_observer(&mut guard, obs_idx, 60, "observer RPC to answer", || async {
+        obs_provider.get_block_number().await.is_ok()
+    })
+    .await?;
+
+    // It comes up standing on the imported tip, not replaying from genesis. Reaching this point at
+    // all is the proof the restored node's FIRST EPOCH ENTRY succeeded on an idle-epoch snapshot —
+    // the exact case that used to halt it.
+    let obs_start_block = obs_provider.get_block_number().await?;
+    assert!(
+        obs_start_block >= import_block,
+        "observer started at block {obs_start_block}, below the import point {import_block} — it \
+         did not bootstrap from the snapshot"
+    );
+    info!(target: "restart-test", obs_start_block, import_block, "observer started from the idle import point");
+
+    // Forward sync across the epochs it did not import.
+    wait_observer(
+        &mut guard,
+        obs_idx,
+        (EXPORT_EPOCH_DURATION * 8).max(90),
+        "observer to catch up via forward sync from the idle import point",
+        || async { obs_provider.get_block_number().await.is_ok_and(|h| h >= validator_height) },
+    )
+    .await?;
+    info!(target: "restart-test", validator_height, "observer caught up via forward sync");
+
+    // It crossed epoch boundaries forward rather than merely replaying the imported one. Each of
+    // those boundaries ran the entry read against an idle epoch's closing block.
+    wait_observer(
+        &mut guard,
+        obs_idx,
+        (EXPORT_EPOCH_DURATION * 4).max(60),
+        &format!("observer epoch to advance past {IMPORT_EPOCH}"),
+        || async {
+            obs_provider
+                .raw_request::<_, u32>("tn_getCurrentEpoch".into(), ())
+                .await
+                .is_ok_and(|epoch| epoch > IMPORT_EPOCH)
+        },
+    )
+    .await?;
+
+    // The imported block is byte-for-byte the block the network committed as epoch
+    // `IMPORT_EPOCH`'s final state (hash equality, not just same height).
+    let obs_import_block = get_block(&obs_url, Some(import_block))?;
+    let obs_import_hash = obs_import_block
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| eyre::eyre!("observer block {import_block} has no hash field"))?;
+    eyre::ensure!(
+        obs_import_hash.eq_ignore_ascii_case(&import_hash.to_string()),
+        "observer import block {import_block} hash {obs_import_hash} != committed epoch-{IMPORT_EPOCH} \
+         final hash {import_hash}"
+    );
+
+    // Epoch `IMPORT_EPOCH + 1` was not in the bundle, so a verified record for it on the observer
+    // can only have come from syncing forward.
+    let forward_epoch = IMPORT_EPOCH + 1;
+    let forward_record =
+        fetch_verified_epoch_record(&obs_url, forward_epoch, (EXPORT_EPOCH_DURATION * 6).max(75))
+            .await?;
+    let forward_block =
+        get_block(&obs_url, Some(forward_record.final_state.number)).map_err(|e| {
+            eyre::eyre!(
+                "observer missing epoch-{forward_epoch} final block {}: {e}",
+                forward_record.final_state.number
+            )
+        })?;
+    let forward_hash = forward_block.get("hash").and_then(|v| v.as_str()).ok_or_else(|| {
+        eyre::eyre!("observer block {} has no hash field", forward_record.final_state.number)
+    })?;
+    eyre::ensure!(
+        forward_hash.eq_ignore_ascii_case(&forward_record.final_state.hash.to_string()),
+        "observer epoch-{forward_epoch} final block hash {forward_hash} != record hash {}",
+        forward_record.final_state.hash
+    );
+    info!(target: "restart-test", forward_epoch, "observer forward-synced a post-import epoch");
+
+    // Liveness: the observer reflects a transaction submitted to a validator AFTER it joined, so it
+    // follows live consensus output rather than serving a frozen snapshot. Uses the dev-funded
+    // `test-source` account (nonce 0). This is the first and only traffic on the chain, so every
+    // epoch the export and import depended on stayed idle.
+    let key = get_key("test-source");
+    let to_account = address_from_word("state-export-idle-target");
+    send_and_confirm(&client_urls[1], &obs_url, &key, to_account, 0)?;
+    info!(target: "restart-test", "observer reflected a live transaction after an idle-epoch bootstrap");
 
     guard.kill_all();
     Ok(())

@@ -394,6 +394,7 @@ fn consensus_output_for_test(
         subdag_index,
         reputation_scores,
         previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     ConsensusOutput::new(
         sub_dag,

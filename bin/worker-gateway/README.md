@@ -103,6 +103,8 @@ Every flag has an environment-variable fallback.
 | `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `30s` | Upstream per-request deadline. |
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
+| `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
+| `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `26214400` | Max request body size, in bytes. |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
@@ -125,8 +127,23 @@ and the upstream response headers, so a request body trickled in below the
 size limit cannot hold a slot indefinitely.
 
 Upstream response bodies are streamed through, never buffered whole, so
-response size does not translate into gateway memory; a stalled stream is
-bounded by the upstream request timeout.
+response size does not translate into gateway memory. A stalled *upstream* is
+bounded by the upstream request timeout; a stalled or slow-reading *client*
+(the response-side slow loris: that timeout is only observed while the body
+is being polled, which downstream backpressure prevents) is bounded by two
+write-path guards instead: `TCP_USER_TIMEOUT` (`--tcp-user-timeout`, Linux
+kernels) closes a connection whose peer stops acknowledging written data
+(note it replaces the kernel's default ~15min retransmit budget for that
+socket, so a peer black-holed past the deadline is dropped where stock TCP
+might have recovered), and a connection-lifetime cap
+(`--max-connection-duration`) closes any connection, keep-alive sessions
+included, that outlives it, catching a client that trickles reads too slowly
+to be worth a slot but fast enough to defeat the transport guard. The cap
+closes abruptly: an exchange in flight on a long-lived keep-alive session is
+cut off at the cap, so size it well above the longest legitimate transfer.
+It must be at least the gateway's single-request bound
+(`--header-read-timeout` + the whole-request deadline above) so the first
+request on a connection can never be cut off.
 
 Every forwarded request carries the `X-TN-Gateway` hop marker, and an inbound
 request that already carries it is rejected (HTTP `508`), so a misconfigured

@@ -13,7 +13,7 @@ use crate::metrics::ENGINE_METRICS;
 use error::EngineResult;
 pub use error::TnEngineError;
 use futures::{future::OptionFuture, StreamExt};
-pub use payload_builder::execute_consensus_output;
+pub use payload_builder::{execute_consensus_output, PERSIST_OUTPUT_ATTEMPTS};
 use std::collections::VecDeque;
 use tn_reth::{payload::BuildArguments, RethEnv};
 use tn_types::{
