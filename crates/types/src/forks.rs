@@ -123,9 +123,30 @@ pub const SEED_SIGNATURE_FORK_EPOCH: Epoch = u32::MAX;
 /// historical layout at any nesting depth.
 ///
 /// Adiri builds activate at [`SEED_SIGNATURE_FORK_EPOCH`]; all other builds are active from
-/// genesis (mainnet never carries the legacy layout).
+/// genesis (mainnet never carries the legacy layout). Under `test-utils`, an explicit
+/// `TN_SEED_SIGNATURE_FORK_EPOCH` override takes precedence over both (see
+/// [`seed_signature_fork_epoch_override`]), so a test states the fork point it means rather
+/// than inheriting whichever one its feature set happens to select.
 #[inline]
-pub const fn seed_signature_active(epoch: Epoch) -> bool {
+pub fn seed_signature_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "test-utils")]
+    {
+        seed_signature_fork_epoch_override()
+            .map_or_else(|| build_fork_active(epoch), |fork| epoch >= fork)
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        build_fork_active(epoch)
+    }
+}
+
+/// This build's compile-time fork point, with no test override applied.
+///
+/// Unchanged from [`SEED_SIGNATURE_FORK_EPOCH`]'s documented contract: adiri (testnet, which
+/// carries pre-fork history) stays dormant until the constant is lowered, and every other
+/// build (mainnet, which never carries the legacy layout) is active from genesis.
+#[inline]
+const fn build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
     #[expect(
         clippy::absurd_extreme_comparisons,
@@ -141,6 +162,26 @@ pub const fn seed_signature_active(epoch: Epoch) -> bool {
         let _ = epoch;
         true
     }
+}
+
+/// Test-only override of the effective seed-signature fork epoch, read once from
+/// `TN_SEED_SIGNATURE_FORK_EPOCH` (`4294967295` for "never fires", `0` for "active from
+/// genesis").
+///
+/// An environment variable rather than a process-global setter because e2e tests drive real
+/// node processes spawned via `TN_BIN_PATH`, which share no memory with the harness: a static
+/// would silently reach only the in-process tests, and the multi-node tests that actually
+/// exercise epoch close would keep inheriting the build default.
+///
+/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
+/// constant and cannot be repointed at runtime by its environment. An unparseable value is
+/// ignored rather than defaulted, leaving the build's own fork point in force.
+#[cfg(feature = "test-utils")]
+pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
+    static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TN_SEED_SIGNATURE_FORK_EPOCH").ok().and_then(|raw| raw.trim().parse().ok())
+    })
 }
 
 #[cfg(test)]
@@ -171,5 +212,64 @@ mod tests {
              blindly update this constant to make the test pass; if genesis.yaml was regenerated, \
              reassess the fork plan and `CONSENSUS_REGISTRY_FORK_EPOCH` first",
         );
+    }
+
+    /// Pin the seed-signature gate to the rollout contract this build actually implements.
+    ///
+    /// #1032 was reviewed on the claim that the gate is dormant at [`SEED_SIGNATURE_FORK_EPOCH`]
+    /// (`u32::MAX`). That holds only under `adiri`. Every other build — including the default
+    /// one that produces both the shipped node binary and the e2e binary — is active from
+    /// genesis, so epoch 1 takes the post-fork certified-anchor path in production. Nothing
+    /// asserted either half, so the "dormant everywhere" reading survived review; this states
+    /// it outright so no future reader infers dormancy from the constant alone.
+    ///
+    /// Asserts against [`build_fork_active`], the override-free decision, so the result does
+    /// not depend on whether `test-utils` was unified into this build.
+    #[test]
+    fn build_fork_gate_matches_this_builds_rollout_contract() {
+        #[cfg(not(feature = "adiri"))]
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert!(
+                build_fork_active(epoch),
+                "non-adiri builds carry no legacy layout and are active from genesis; epoch \
+                 {epoch} must be post-fork",
+            );
+        });
+        #[cfg(feature = "adiri")]
+        {
+            [0, 1, 2].into_iter().for_each(|epoch| {
+                assert!(
+                    !build_fork_active(epoch),
+                    "adiri stays dormant until the epoch-setting PR lowers \
+                     SEED_SIGNATURE_FORK_EPOCH; epoch {epoch} must be pre-fork",
+                );
+            });
+            assert!(
+                build_fork_active(SEED_SIGNATURE_FORK_EPOCH),
+                "the gate must fire at the fork epoch itself (`>=`, not `>`)",
+            );
+        }
+    }
+
+    /// With no `TN_SEED_SIGNATURE_FORK_EPOCH` in the environment, the test override must be
+    /// completely inert: the gate answers exactly as the compile-time contract does.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn seed_signature_override_is_inert_when_unset() {
+        // The override latches in a process-wide `OnceLock`, so a harness launched WITH the
+        // variable set cannot observe the unset behaviour. Fail loudly rather than assert a
+        // property this process cannot hold — a silent skip here would read as a pass.
+        assert!(
+            seed_signature_fork_epoch_override().is_none(),
+            "this test requires a process without TN_SEED_SIGNATURE_FORK_EPOCH set; the \
+             override is OnceLock-latched, so run the unset case in its own process",
+        );
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert_eq!(
+                seed_signature_active(epoch),
+                build_fork_active(epoch),
+                "an unset override must not shift the gate at epoch {epoch}",
+            );
+        });
     }
 }

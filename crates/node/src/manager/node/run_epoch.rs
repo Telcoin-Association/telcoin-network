@@ -640,23 +640,30 @@ where
         // Epoch 0 has no prior record, so it uses the default digest (matching the epoch-0
         // filler convention above). The resolved record (found, filler, or fetched) is
         // canonical chain state, so every node derives the same digest. For epochs where the
-        // seed-signature fork is active the digest must additionally be backed by a verified
-        // certificate before it is captured (see `certified_prior_epoch_anchor`); pre-fork
-        // epochs never sign or verify epoch-close seed messages (proposer signing is
-        // fork-gated), so they keep the legacy uncertified capture and the certification
-        // error path can never fire for them.
-        let prior_epoch_record = if current_epoch == 0 {
-            EpochDigest::default()
+        // seed-signature fork is active the anchor must additionally be backed by a verified
+        // certificate, so it is taken from `certified_prior_epoch_anchor` rather than from the
+        // record resolved above; pre-fork epochs never sign or verify epoch-close seed messages
+        // (proposer signing is fork-gated), so they keep the legacy uncertified capture and the
+        // certification error path can never fire for them.
+        let (prior_epoch_record, previous_epoch_rec) = if current_epoch == 0 {
+            (EpochDigest::default(), previous_epoch_rec)
         } else if seed_signature_active(current_epoch) {
-            self.certified_prior_epoch_anchor(
-                &committee,
-                previous_epoch,
-                &previous_epoch_rec,
-                &task_spawner,
-            )
-            .await?
+            // The certified record REPLACES the one resolved above, for both the seed anchor and
+            // chain seeding. The resolved read can legitimately be the uncertified epoch-0 dummy
+            // (`save_dummy_epoch0`, which the epoch-record store returns for epoch 0 while its
+            // index is still empty), and that dummy's `..Default::default()` digest differs from
+            // the real epoch-0 record's. Keeping the resolved value and merely cross-checking
+            // digests would read that legitimate case as a divergence and abort, so a node that
+            // opened epoch 1 before epoch 0's record was persisted could never start. Taking the
+            // certified record is strictly stronger than the cross-check it replaces: the anchor
+            // and the chain are seeded from the same certificate-backed bytes by construction,
+            // rather than from two reads that are only assumed to agree.
+            let certified = self
+                .certified_prior_epoch_anchor(&committee, previous_epoch, &task_spawner)
+                .await?;
+            (certified.digest(), certified)
         } else {
-            previous_epoch_rec.digest()
+            (previous_epoch_rec.digest(), previous_epoch_rec)
         };
         self.consensus_chain.new_epoch(previous_epoch_rec, committee).await?;
         Ok(prior_epoch_record)
@@ -728,9 +735,13 @@ where
     /// abort an honest node the vote protocol still considers on
     /// schedule. A missing certificate after the wait, or a stored
     /// certificate that fails verification, is a hard error — never a silent fallback to the
-    /// uncertified digest. The certified record must also hash to the same digest as the
-    /// record the caller resolved for chain seeding; both come from the same first-write-wins
-    /// store so a mismatch should be impossible, and it is likewise a hard error.
+    /// uncertified digest.
+    ///
+    /// Returns the certified [`EpochRecord`] itself rather than just its digest, because the
+    /// caller seeds the chain from it too. An earlier revision returned the digest and the
+    /// caller cross-checked it against the record it had already resolved; that check aborted
+    /// the node whenever the resolved read was the uncertified epoch-0 dummy, which is a
+    /// legitimate state (see the caller's comment in [`Self::open_epoch_pack`]).
     ///
     /// # Fork interaction
     ///
@@ -741,9 +752,8 @@ where
         &self,
         committee: &Committee,
         previous_epoch: Epoch,
-        previous_epoch_rec: &EpochRecord,
         task_spawner: &TaskSpawner,
-    ) -> eyre::Result<EpochDigest> {
+    ) -> eyre::Result<EpochRecord> {
         let current_epoch = committee.epoch();
         let fast = self.consensus_chain.epochs().certified_record_by_epoch(previous_epoch).await;
         let needs_wait = fast.as_ref().err().is_some_and(|e| e.is_retryable());
@@ -768,14 +778,7 @@ where
                  record for epoch {previous_epoch}: {e}"
             )
         })?;
-        let digest = certified.digest();
-        let resolved = previous_epoch_rec.digest();
-        (digest == resolved).then_some(digest).ok_or_else(|| {
-            eyre::eyre!(
-                "certified epoch record {digest} for epoch {previous_epoch} does not match the \
-                 record {resolved} resolved for chain seeding"
-            )
-        })
+        Ok(certified)
     }
 
     /// Forward one consensus output to the engine and record progress.

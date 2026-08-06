@@ -2076,6 +2076,58 @@ mod test {
         assert_eq!(anchor, committee.iter().copied().collect::<BTreeSet<_>>());
     }
 
+    /// The in-memory epoch-0 dummy and the real epoch-0 record are different records with
+    /// different digests, and the dummy answers `record_by_epoch(0)` for as long as the index
+    /// stays empty — which is exactly the window in which epoch 1 opens.
+    ///
+    /// #1032's `certified_prior_epoch_anchor` originally cross-checked the certified epoch-0
+    /// digest against whatever this read returned and aborted the node on a mismatch. Both
+    /// reads are legitimate; they simply do not agree until epoch 0's real record is
+    /// persisted, so the mismatch was an ordinary startup race rather than the corruption the
+    /// check assumed. Anything that needs an epoch-0 digest must take the certified record,
+    /// never this one.
+    #[tokio::test]
+    async fn test_dummy_epoch0_digest_diverges_from_the_real_record() {
+        let temp_dir = TempDir::with_prefix("test_dummy_epoch0_digest_diverges").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
+
+        // The genesis dummy `run_epoch.rs` installs at startup: real committee, everything
+        // else defaulted.
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let dummy = EpochRecord {
+            epoch: 0,
+            committee: committee.clone(),
+            next_committee: committee.clone(),
+            ..Default::default()
+        };
+        db.save_dummy_epoch0(dummy.clone()).await.expect("save dummy epoch 0");
+
+        // While the index is empty, the dummy IS the answer for epoch 0.
+        let served = db.record_by_epoch(0).await.expect("dummy must serve epoch-0 reads");
+        assert_eq!(served.digest(), dummy.digest(), "the dummy is what an epoch-0 read returns");
+
+        // But it is not the record the network certifies. Same epoch and same committee, and
+        // still a different digest — the real record seals a final consensus block, the dummy
+        // seals nothing.
+        let (real0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        assert_eq!(real0.epoch, dummy.epoch, "same epoch");
+        assert_eq!(real0.committee, dummy.committee, "same committee");
+        assert_ne!(
+            real0.digest(),
+            dummy.digest(),
+            "dummy and real epoch-0 record must be assumed to differ: a digest equality check \
+             between them is a false invariant, not a corruption detector",
+        );
+
+        // Once the real record lands the read flips, with no signal to anyone still holding
+        // the dummy's digest. That is what makes the window a race rather than a stable state.
+        db.save(real0.clone(), cert0).await.expect("save real record 0 + cert");
+        let after = db.record_by_epoch(0).await.expect("real record must now serve reads");
+        assert_eq!(after.digest(), real0.digest(), "the epoch-0 read changed answer mid-flight");
+    }
+
     #[tokio::test]
     async fn test_certified_record_by_epoch_accepts_certified_record() {
         // Positive control: a record saved with its quorum certificate is released, and the
