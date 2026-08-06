@@ -64,10 +64,12 @@ pub struct TNPayload {
     /// Randomness digest carried only by the payload that closes the epoch.
     ///
     /// `Some` for the last batch of an epoch-closing `ConsensusOutput`; `None` otherwise. The
-    /// value is the keccak256 of the leader's aggregate BLS signature (see
-    /// `ConsensusOutput::keccak_leader_sigs`). During execution it seeds the deterministic
-    /// shuffle that selects the next committee, and it is recorded in the executed block
-    /// header's `extra_data` so replay recovers the same seed.
+    /// value is whatever `ConsensusOutput::committee_shuffle_seed` yields for the closing epoch,
+    /// which is epoch-gated: the epoch seed chain value as of the closing commit once
+    /// `seed_signature_active` holds, and the legacy keccak256 of the leader certificate's
+    /// aggregate BLS signature for every epoch before the fork. During execution it seeds the
+    /// deterministic shuffle that selects the next committee, and it is recorded in the executed
+    /// block header's `extra_data` so replay recovers the same seed.
     pub close_epoch: Option<B256>,
     /// Worker that created this payload.
     pub worker_id: WorkerId,
@@ -97,11 +99,12 @@ impl TNPayload {
         mix_hash: B256,
         worker_id: WorkerId,
     ) -> Self {
-        // include leader's aggregate bls signature if this is the last payload for the epoch
+        // include the committee-shuffle seed (the epoch seed chain value as of the closing
+        // commit) if this is the last payload for the epoch
         let close_epoch = output
             .close_epoch_for_last_batch(batch_index)
             .is_some_and(|last_batch| last_batch)
-            .then(|| output.keccak_leader_sigs());
+            .then(|| output.committee_shuffle_seed());
 
         Self {
             parent_header,

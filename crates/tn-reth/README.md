@@ -42,7 +42,7 @@ TN repurposes several Ethereum header fields for protocol data. Assembly happens
 | `nonce` | `((epoch as u64) << 32) \| round` of the leader certificate (`tn-types` `primary/header.rs`; decoded by `deconstruct_nonce`). Epoch = high 32 bits, round = low 32 bits. |
 | `difficulty` | `batch_index << 16 \| worker_id`. **`worker_id` is the LOW 16 bits; `batch_index` occupies the upper bits** (`TNBlockExecutionCtx` docs and `context_for_next_block` in `src/evm/config.rs`). `first_batch()` exploits this: `difficulty < 65536` ⇔ `batch_index == 0`. `worker_id_from_header` (canonical in `tn-types` `gas_accumulator.rs`, re-exported from `src/snapshot.rs`) reads the low 16 bits. |
 | `mix_hash` | Computed in `crates/engine/src/payload_builder.rs`: `output_digest ^ batch_digest` when the output has batches, plain `output_digest` otherwise. Exposed as `prevrandao` (EIP-4399). |
-| `extra_data` | Empty for a normal block. For an epoch-closing block: the 32-byte keccak256 of the leader certificate's aggregate BLS signature. The replay path (`context_for_block` in `src/evm/config.rs`) accepts only length 0 or 32 and errors on anything else. |
+| `extra_data` | Empty for a normal block. For an epoch-closing block: the 32-byte epoch-close randomness, which is epoch-gated on `seed_signature_active` (legacy keccak256 of the leader certificate's aggregate BLS signature before the fork epoch, epoch seed chain value as of the closing commit from the fork epoch on). The replay path (`context_for_block` in `src/evm/config.rs`) accepts only length 0 or 32 and errors on anything else. |
 | `parent_beacon_block_root` | Digest of the `ConsensusHeader` that committed the executed transactions. Written to the EIP-4788 beacon-roots contract once per consensus output (only on the first batch, `apply_pre_execution_changes` in `src/evm/block.rs`). |
 | `ommers_hash` | Digest of the executed `Batch`; `B256::ZERO` when the output carried no batches. |
 | `beneficiary` | Execution address of the authority that produced the batch; receives priority fees (`src/payload.rs`, `src/evm/handler.rs`). |
@@ -347,10 +347,13 @@ Block production must be a pure function of certified consensus output. Concrete
   timestamp carried in the payload.
 - No hash-map iteration in state-affecting paths — rewards use `BTreeMap`, committees are sorted
   by address before encoding (`generate_conclude_epoch_calldata`).
-- Epoch-close randomness is `keccak256` of the leader certificate's aggregate BLS signature,
-  computed once in consensus (`tn-types` `primary/output.rs`) and carried in the payload. It
-  seeds the committee-shuffle RNG **and** is stored in `extra_data`, so production
-  (`context_for_next_block`) and replay (`context_for_block`) derive identical state.
+- Epoch-close randomness is epoch-gated (`tn-types` `forks::seed_signature_active`): before the
+  fork epoch it is the legacy keccak256 of the leader certificate's aggregate BLS signature,
+  wire-identical to pre-fork releases; from the fork epoch on it is the epoch seed chain value as
+  of the closing commit, folded per commit in consensus (`tn-types` `primary/output.rs`). Either
+  way it is carried in the payload, seeds the committee-shuffle RNG **and** is stored in
+  `extra_data`, so production (`context_for_next_block`) and replay (`context_for_block`) derive
+  identical state.
 - The shuffle's RNG draw order is consensus-critical and pinned by a golden-value unit test in
   `src/evm/block.rs`; the fee penalty uses platform-independent u128 integer math.
 - Failure handling is deterministic too: unrecoverable transactions are dropped identically on

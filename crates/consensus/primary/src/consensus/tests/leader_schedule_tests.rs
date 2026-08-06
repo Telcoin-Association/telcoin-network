@@ -432,7 +432,14 @@ async fn test_leader_schedule_from_store() {
     }
 
     let cert = Certificate::default();
-    let sub_dag = CommittedSubDag::new(vec![cert.clone()], cert, 0, scores, None);
+    let sub_dag = CommittedSubDag::new(
+        vec![cert.clone()],
+        cert,
+        0,
+        scores,
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
 
     consensus_chain.write_subdag_for_test(1, sub_dag).await;
 

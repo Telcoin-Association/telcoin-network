@@ -525,7 +525,7 @@ impl ConsensusChain {
                 let base_dir = self.base_path.join(format!("epoch-{epoch}"));
                 let path_base_dir = path.join(format!("epoch-{epoch}"));
                 pack.persist().await?;
-                match pack.latest_consensus_header().await {
+                match pack.latest_consensus_header().await? {
                     Some(last_header) => {
                         // The chain was verified as it was streamed.  So if the final block matches
                         // the expected final_consensus then the entire pack
@@ -589,7 +589,7 @@ impl ConsensusChain {
     ) -> Result<Box<dyn ReadStream>, ConsensusChainError> {
         if let Ok(pack) = self.get_static(epoch).await {
             if let Some((epoch_record, _)) = self.epochs().get_epoch_by_number(epoch).await {
-                match pack.latest_consensus_header().await {
+                match pack.latest_consensus_header().await? {
                     Some(last_header) => {
                         let epoch_final_hash = epoch_record.final_consensus.hash;
                         if epoch_record.final_consensus.number == last_header.number
@@ -687,7 +687,7 @@ impl ConsensusChain {
         pack.persist().await?;
         // The chain was verified link-by-link as it streamed; confirm the prefix ends exactly at
         // the requested final consensus so the staged data is trustworthy.
-        match pack.latest_consensus_header().await {
+        match pack.latest_consensus_header().await? {
             Some(last)
                 if last.number == final_number
                     && last.digest() == epoch_record.final_consensus.hash => {}
@@ -735,40 +735,54 @@ impl ConsensusChain {
     /// Save all the batches and consensus header from the ConsensusOutput the pack file for the
     /// current epoch. This should be called "in-order" as consensus is executed.
     /// Returns the number of bytes the encoded Output takes on disk IF this is written to the
-    /// current pack or 0 otherwise (old consensus).
+    /// current pack or 0 if the output already resides in a static (imported) pack.
+    ///
+    /// A number at or below the latest saved consensus is a hard
+    /// [`ConsensusChainError::NonMonotonicConsensusNumber`] error, never a silent skip. The old
+    /// silent `Ok(0)` path let a node whose startup resume collapsed to a default header at
+    /// number 0 discard every subsequent output with no error and no log - identically on every
+    /// node - so consensus height froze with no signal. Failing hard turns that state into a
+    /// loud halt.
     pub async fn save_consensus_output(
         &self,
         consensus: ConsensusOutput,
     ) -> Result<u64, ConsensusChainError> {
         let number = consensus.number();
-        let mut output_bytes = 0;
-        if number > self.latest_consensus.number() {
-            let epoch = consensus.sub_dag().leader_epoch();
-            let pack = &self.current_pack();
-            if epoch != pack.epoch() {
-                // The output's epoch does not match the current pack. Saving it would either
-                // corrupt this pack or poison its async error channel. The pack
-                // layer also rejects this (defense in depth), but the reject is asynchronous so
-                // we must guard here to avoid advancing latest_consensus to a wrong-epoch
-                // pointer for data that was never persisted.
-                // This is an error and should not happen on a properly working node.
-                error!(target: "consensus-chain", epoch, pack_epoch = pack.epoch(), number, "Refused to save consensus output: epoch does not match the current pack.");
-                return Err(ConsensusChainError::InvalidPackEpoch(pack.epoch(), epoch));
-            } else {
-                if !pack.is_static() {
-                    // If this an open pack file then save.
-                    // Note, saving an output that is already in the pack is a no-op, not an error
-                    // so this is fine.
-                    output_bytes = pack.save_consensus_output(consensus).await?;
-                } else if !pack.contains_consensus_header_number(number).await.unwrap_or_default() {
-                    // If this is a static file and this output is missing this is an error...
-                    error!(target: "consensus-chain", epoch, number, "Failed to update latest consensus, data not in expected pack file.");
-                    return Err(ConsensusChainError::CantSaveAndNotAvailable(number));
-                }
-                self.latest_consensus.update(epoch, number).await;
-            }
+        let latest = self.latest_consensus.number();
+        let epoch = consensus.sub_dag().leader_epoch();
+        let pack = &self.current_pack();
+        if number <= latest {
+            // Consensus numbers must strictly increase; a non-increasing number means this
+            // node's view of "latest" and the incoming output stream disagree (e.g. a startup
+            // resume that silently fell back to a default header at number 0).
+            error!(target: "consensus-chain", number, latest, "Refused to save consensus output: number does not advance the latest saved consensus.");
+            Err(ConsensusChainError::NonMonotonicConsensusNumber { latest, number })
+        } else if epoch != pack.epoch() {
+            // The output's epoch does not match the current pack. Saving it would either
+            // corrupt this pack or poison its async error channel. The pack
+            // layer also rejects this (defense in depth), but the reject is asynchronous so
+            // we must guard here to avoid advancing latest_consensus to a wrong-epoch
+            // pointer for data that was never persisted.
+            // This is an error and should not happen on a properly working node.
+            error!(target: "consensus-chain", epoch, pack_epoch = pack.epoch(), number, "Refused to save consensus output: epoch does not match the current pack.");
+            Err(ConsensusChainError::InvalidPackEpoch(pack.epoch(), epoch))
+        } else if !pack.is_static() {
+            // If this an open pack file then save.
+            // Note, saving an output that is already in the pack is a no-op, not an error
+            // so this is fine.
+            let output_bytes = pack.save_consensus_output(consensus).await?;
+            self.latest_consensus.update(epoch, number).await;
+            Ok(output_bytes)
+        } else if !pack.contains_consensus_header_number(number).await.unwrap_or_default() {
+            // If this is a static file and this output is missing this is an error...
+            error!(target: "consensus-chain", epoch, number, "Failed to update latest consensus, data not in expected pack file.");
+            Err(ConsensusChainError::CantSaveAndNotAvailable(number))
+        } else {
+            // The static (imported) pack already holds this output: replay over an imported
+            // epoch only needs to advance latest_consensus, nothing is rewritten.
+            self.latest_consensus.update(epoch, number).await;
+            Ok(0)
         }
-        Ok(output_bytes)
     }
 
     /// Load and return the consensus output from the current epoch.
@@ -780,6 +794,15 @@ impl ConsensusChain {
     }
 
     /// Retrieve a consensus header by digest.
+    ///
+    /// `Ok(None)` strictly means "no such record held here": the digest is unknown to the packs
+    /// this node holds (fresh node, epoch never downloaded, or a header it never saw). A pack
+    /// that exists on disk but cannot be opened is a hard error, never `None` - collapsing that
+    /// failure into `None` let the startup resume path fall back to a default header at number 0
+    /// with no error and no log (see [`Self::latest_consensus_header_from_pack`] for the same
+    /// rationale one layer down). Under the epoch-gated seed-signature serde, pre-fork packs
+    /// stay decodable so the error path should never fire; it is the difference between a loud
+    /// halt and silent chain corruption for every future format change.
     pub async fn consensus_header_by_digest(
         &self,
         epoch: Epoch,
@@ -787,23 +810,21 @@ impl ConsensusChain {
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         let pack = &self.current_pack();
         if epoch == pack.epoch() {
-            return match pack.consensus_header_by_digest(digest).await {
-                Some(r) => Ok(Some(r)),
-                None => {
-                    if let Some(staging) = self.staging() {
-                        // Fallback check on staging before returning an error.
-                        if let Some(r) = staging.pack.consensus_header_by_digest(digest).await {
-                            Ok(Some(r))
-                        } else {
-                            Ok(None)
-                        }
-                    } else {
-                        Ok(None)
-                    }
-                }
-            };
-        }
-        if let Ok(pack) = self.get_static(epoch).await {
+            let direct = pack.consensus_header_by_digest(digest).await;
+            if direct.is_some() {
+                Ok(direct)
+            } else if let Some(staging) = self.staging() {
+                // Fallback check on staging before settling on a legitimate `None`.
+                Ok(staging.pack.consensus_header_by_digest(digest).await)
+            } else {
+                Ok(None)
+            }
+        } else if self.epoch_pack_exists(epoch) {
+            // The pack for this epoch is on disk, so a failure to open it is a real error and
+            // must not degrade into "not found".
+            let pack = self.get_static(epoch).await.inspect_err(|e| {
+                error!(target: "consensus-chain", epoch, ?digest, "epoch pack exists on disk but failed to open: {e}");
+            })?;
             Ok(pack.consensus_header_by_digest(digest).await)
         } else if let Some(staging) = self.staging() {
             if epoch == staging.pack.epoch() {
@@ -812,7 +833,7 @@ impl ConsensusChain {
                 Ok(None)
             }
         } else {
-            // Don't have this epoch data.
+            // Don't have this epoch data: legitimately absent, not a failure.
             Ok(None)
         }
     }
@@ -1077,22 +1098,31 @@ impl ConsensusChain {
     /// Return the latest consensus header for `epoch` by reading directly from the pack index,
     /// bypassing the slot files (LatestConsensus). This is always consistent with
     /// read_last_committed and should be used during startup recovery.
+    ///
+    /// A pack that cannot be opened is an error, never `None`. `None` means "this epoch has
+    /// committed nothing", which seeds the epoch seed chain at its root, so collapsing a failed
+    /// open into `None` would silently re-root the chain and fork execution permanently (see
+    /// [`EpochSeedChainValue`](tn_types::EpochSeedChainValue)). Callers that legitimately probe an
+    /// epoch this node may not hold locally - state sync's partial-pack catch-up - degrade the
+    /// error themselves at the call site, where "not held" is the intended reading.
     pub async fn latest_consensus_header_from_pack(
         &self,
         epoch: Epoch,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         let pack = &self.current_pack();
         if pack.epoch() == epoch {
-            return Ok(pack.latest_consensus_header().await);
+            return Ok(pack.latest_consensus_header().await?);
         }
-        if let Ok(pack) = self.get_static(epoch).await {
-            Ok(pack.latest_consensus_header().await)
-        } else {
-            Ok(None)
-        }
+        self.get_static(epoch).await?.latest_consensus_header().await.map_err(Into::into)
     }
 
     /// Read the last committed rounds for authorities from an epoch.
+    ///
+    /// A pack that cannot be opened is an error, never an empty map, for the same reason as
+    /// [`Self::latest_consensus_header_from_pack`]: an empty map is indistinguishable from "this
+    /// epoch has committed nothing", and startup recovery reads both cursors from this same pack.
+    /// Swallowing the open failure in both made them fail open together, which reproduces one layer
+    /// down exactly the silent re-root the fallible recovery path exists to prevent.
     pub async fn read_last_committed(
         &self,
         epoch: Epoch,
@@ -1101,11 +1131,7 @@ impl ConsensusChain {
         if pack.epoch() == epoch {
             return Ok(pack.read_last_committed().await?);
         }
-        if let Ok(pack) = self.get_static(epoch).await {
-            Ok(pack.read_last_committed().await?)
-        } else {
-            Ok(HashMap::new())
-        }
+        self.get_static(epoch).await?.read_last_committed().await.map_err(Into::into)
     }
 
     /// Read the final committed sub dag with final reputation scores.
@@ -1182,6 +1208,17 @@ impl ConsensusChain {
     /// Return a clone of the staging pack.
     fn staging(&self) -> Option<StagingPack> {
         self.staging.lock().clone()
+    }
+
+    /// True if the on-disk pack data file for `epoch` exists under this chain's base path.
+    ///
+    /// This is the discriminator the fallible read paths use to tell "this node does not hold
+    /// `epoch`" (a legitimate `None` for a fresh node or an epoch never downloaded) from "the
+    /// pack exists but cannot be opened" (a hard error). Collapsing the second case into `None`
+    /// is what let the startup resume path fall back to a default consensus header at number 0
+    /// with no error and no log.
+    fn epoch_pack_exists(&self, epoch: Epoch) -> bool {
+        self.base_path.join(format!("epoch-{epoch}")).join(DATA_NAME).exists()
     }
 
     /// Get a static pack file from the cache if available or create and cache if not.
@@ -1351,6 +1388,18 @@ pub enum ConsensusChainError {
     StreamUnavailable,
     InvalidPackEpoch(Epoch, Epoch),
     CantSaveAndNotAvailable(u64),
+    /// A consensus output arrived with a number at or below the latest saved consensus number
+    /// (fields: `latest`, `number`). Consensus numbers must strictly increase, so this means the
+    /// node's view of "latest" and the incoming output stream disagree - e.g. a startup resume
+    /// that silently collapsed to a default header at number 0. Failing hard (instead of the old
+    /// silent `Ok(0)` skip) turns that state into a loud halt rather than a node that quietly
+    /// discards every subsequent output.
+    NonMonotonicConsensusNumber {
+        /// The latest consensus number already recorded by this chain.
+        latest: u64,
+        /// The non-increasing number carried by the rejected output.
+        number: u64,
+    },
 }
 
 impl Error for ConsensusChainError {}
@@ -1380,6 +1429,9 @@ impl Display for ConsensusChainError {
             }
             ConsensusChainError::CantSaveAndNotAvailable(number) => {
                 write!(f, "Pack file is static and Consensus {number} missing, can't save")
+            }
+            ConsensusChainError::NonMonotonicConsensusNumber { latest, number } => {
+                write!(f, "Consensus output number {number} does not advance the latest saved consensus number {latest}")
             }
         }
     }
@@ -1623,6 +1675,56 @@ mod test {
         assert!(
             consensus_chain.get_consensus_output_current(4).await.is_err(),
             "wrong-epoch output must not be persisted to the epoch-0 pack"
+        );
+    }
+
+    /// A non-increasing consensus number is a hard error, never a silent `Ok(0)` skip.
+    ///
+    /// Reverting `save_consensus_output` to the silent skip lets a node whose startup resume
+    /// collapsed to a default header at number 0 discard every subsequent output while
+    /// reporting success (consensus height frozen with no signal); this test rejects that by
+    /// requiring `NonMonotonicConsensusNumber` and an unchanged `latest_consensus`.
+    #[tokio::test]
+    async fn test_save_consensus_output_non_monotonic_rejected() {
+        let temp_dir = TempDir::with_prefix("test_non_monotonic").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+
+        // Save legitimate epoch-0 outputs 1 and 2.
+        let parent = ConsensusHeader::default().digest();
+        let output1 = make_test_output(&committee, 0, chain.clone(), 1, parent);
+        let output2 = make_test_output(&committee, 1, chain.clone(), 2, output1.digest().into());
+        consensus_chain.save_consensus_output(output1).await.unwrap();
+        consensus_chain.save_consensus_output(output2.clone()).await.unwrap();
+        assert_eq!(consensus_chain.latest_consensus.number(), 2);
+
+        // Re-sending an already-saved number (a stale resume replaying output 2) must fail
+        // hard instead of silently reporting success.
+        let err = consensus_chain
+            .save_consensus_output(output2)
+            .await
+            .expect_err("a non-increasing consensus number must be rejected");
+        assert!(
+            matches!(
+                err,
+                ConsensusChainError::NonMonotonicConsensusNumber { latest: 2, number: 2 }
+            ),
+            "expected NonMonotonicConsensusNumber {{ latest: 2, number: 2 }}, got {err:?}"
+        );
+        assert_eq!(
+            consensus_chain.latest_consensus.number(),
+            2,
+            "latest_consensus must not change on a rejected output"
         );
     }
 
@@ -2311,7 +2413,11 @@ mod test {
 
             // The imported epoch-0 pack must be complete and readable after all the racing.
             let pack = target.get_static(0).await.expect("epoch-0 pack readable after race");
-            let header = pack.latest_consensus_header().await.expect("epoch-0 has a final header");
+            let header = pack
+                .latest_consensus_header()
+                .await
+                .expect("epoch-0 pack readable")
+                .expect("epoch-0 has a final header");
             assert_eq!(header.number, epoch_record.final_consensus.number, "final header number");
             assert_eq!(header.digest(), epoch_record.final_consensus.hash, "final header digest");
         }

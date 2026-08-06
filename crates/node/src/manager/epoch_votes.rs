@@ -17,6 +17,30 @@ use tracing::{error, info, warn};
 
 type VoteQueue = VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>)>;
 
+/// Per-iteration wait for the next epoch vote in [`manage_epoch_votes`]'s collection loop.
+pub(crate) const EPOCH_VOTE_RECV_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// Timeout-count threshold in [`manage_epoch_votes`]: the loop gives up on a local vote quorum
+/// on the first wait that times out with the counter ABOVE this value. The counter increments
+/// once per timed-out wait, so up to `MAX_EPOCH_VOTE_TIMEOUTS + 2` full
+/// [`EPOCH_VOTE_RECV_TIMEOUT`] windows of ordinary vote-propagation lag elapse before the
+/// peer-recovery path is even entered.
+pub(crate) const MAX_EPOCH_VOTE_TIMEOUTS: u32 = 24;
+
+/// Number of peer-recovery attempts [`manage_epoch_votes`] makes (each one
+/// `request_epoch_cert` call) after failing to reach a local vote quorum.
+pub(crate) const EPOCH_CERT_RECOVERY_ATTEMPTS: u32 = 5;
+
+/// Peers tried per recovery attempt: mirrors the `0..3` peer-rotation loop inside
+/// `PrimaryNetworkHandle::request_epoch_cert` (`tn_primary::network`), which this module has
+/// no handle on but whose worst case budget consumers must account for.
+pub(crate) const EPOCH_CERT_RECOVERY_PEERS_PER_ATTEMPT: u32 = 3;
+
+/// Upper bound on one peer request during recovery: the libp2p request-response timeout. The
+/// swarm is built with `request_response::Config::default()` (10s) and `tn-network-libp2p`
+/// never overrides it, so each `request_epoch_cert` peer try is bounded by this.
+pub(crate) const EPOCH_CERT_RECOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Both save and persist an epoch record and cert with logging.
 async fn save_and_persist_with_logs(
     db: &EpochRecordDb,
@@ -77,7 +101,7 @@ async fn manage_epoch_votes(
     }
     // Collect votes from peers
     let mut reached_quorum = false;
-    let mut timeout = Duration::from_millis(2500);
+    let mut timeout = EPOCH_VOTE_RECV_TIMEOUT;
     let mut timeouts = 0;
     let mut alt_recs: HashMap<EpochDigest, usize> = HashMap::default();
     let committee_size = epoch_rec.committee.len() as u64;
@@ -132,7 +156,7 @@ async fn manage_epoch_votes(
                     }
                     Err(_) => {
                         // Timeout: have quorum or tried long enough
-                        if reached_quorum || timeouts > 24 {
+                        if reached_quorum || timeouts > MAX_EPOCH_VOTE_TIMEOUTS {
                             break;
                         }
                         timeouts += 1;
@@ -197,7 +221,7 @@ async fn manage_epoch_votes(
         let network = primary_network.clone();
         // Try to recover by downloading the epoch record and cert from a peer
         let mut got_epoch_record = false;
-        for _ in 0..5 {
+        for _ in 0..EPOCH_CERT_RECOVERY_ATTEMPTS {
             match network.request_epoch_cert(Some(epoch_rec.epoch), None).await {
                 Ok((new_epoch_rec, cert)) => {
                     // Anchor the downloaded record to the locally-trusted committee using the

@@ -29,15 +29,18 @@ pub use consensus::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_re
 
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.
+///
+/// A failed storage lookup is propagated so startup halts loudly; only a genuinely absent
+/// header (fresh chain or a new epoch) defaults and primes the rounds from a fresh start.
 pub async fn prime_consensus<DB: Database>(
     consensus_bus: &ConsensusBusApp,
     config: &ConsensusConfig<DB>,
     consensus_chain: ConsensusChain,
-) {
+) -> eyre::Result<()> {
     // Get the DB and load our last executed consensus block (note there may be unexecuted
     // blocks, catch up will execute them).
     let last_executed_block =
-        last_executed_consensus_block(consensus_bus, &consensus_chain).await.unwrap_or_default();
+        last_executed_consensus_block(consensus_bus, &consensus_chain).await?.unwrap_or_default();
 
     let current_epoch = config.epoch();
 
@@ -54,6 +57,7 @@ pub async fn prime_consensus<DB: Database>(
 
     consensus_bus.committed_round_updates().send_replace(last_consensus_round);
     consensus_bus.primary_round_updates().send_replace(last_consensus_round);
+    Ok(())
 }
 
 /// Spawn the state sync tasks.
@@ -102,7 +106,9 @@ pub fn spawn_state_sync<DB: Database>(
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
 /// Returns the number of bytes the encoded Output takes on disk IF this is written to the current
-/// pack or 0 otherwise (old consensus).
+/// pack or 0 if the output already resides in a static (imported) pack. An output whose number
+/// does not advance the chain's latest consensus is an error (it used to be a silent 0-byte
+/// no-op, which let a node resuming from a collapsed height 0 discard every output silently).
 pub async fn save_consensus(
     consensus_output: ConsensusOutput,
     consensus_chain: &mut ConsensusChain,
@@ -112,8 +118,8 @@ pub async fn save_consensus(
     // Note it is ok to leave batches in NodeBatchesCache until the epoch ends (when the table is
     // cleared). Make sure we have persisted the consensus output before we execute.
     consensus_chain.persist_current().await?;
-    // A zero byte count means this output was old consensus not written to the current pack;
-    // recording it as the "most recent" output size would be misleading.
+    // A zero byte count means this output already resides in a static (imported) pack and
+    // nothing was written; recording it as the "most recent" output size would be misleading.
     if output_bytes > 0 {
         metrics.record_consensus_output_bytes(output_bytes);
     }
@@ -123,35 +129,45 @@ pub async fn save_consensus(
 /// Returns the ConsensusHeader that created the last executed block if can be found.
 /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
 /// issue.
+///
+/// `Ok(None)` means the header is legitimately absent (genesis or a new epoch); a failed
+/// storage lookup is an `Err` that callers must propagate so startup halts loudly instead of
+/// silently resuming from a default header at number 0.
 pub async fn last_executed_consensus_block(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
-) -> Option<ConsensusHeader> {
-    let last = consensus_bus.last_executed_consensus_block(consensus_chain).await;
+) -> eyre::Result<Option<ConsensusHeader>> {
+    let last = consensus_bus.last_executed_consensus_block(consensus_chain).await?;
     debug!(target: "state-sync", ?last, "last executed consensus block");
-    last
+    Ok(last)
 }
 
 /// Return the (hash, number) to use as parent for the next ConsensusHeader.
 /// Accounts for outputs committed to DB but not yet executed (which
 /// replay_missed_consensus handles before the subscriber starts).
+///
+/// Only a genuinely absent header (fresh chain) defaults to the genesis `ConsensusHeader` at
+/// number 0; a failed lookup is an `Err` so a resuming node halts loudly instead of re-rooting
+/// itself at number 0 (`save_consensus_output` now hard-rejects the non-advancing numbers that
+/// re-root would produce, so resuming from the default would strand the node anyway).
 pub async fn last_consensus_parent(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
-) -> (ConsensusHeaderDigest, u64) {
+) -> eyre::Result<(ConsensusHeaderDigest, u64)> {
     let last_executed =
-        last_executed_consensus_block(consensus_bus, consensus_chain).await.unwrap_or_default();
-    let last_db = consensus_chain
-        .consensus_header_latest()
-        .await
-        .unwrap_or_default()
-        .unwrap_or_else(|| last_executed.clone());
+        last_executed_consensus_block(consensus_bus, consensus_chain).await?.unwrap_or_default();
+    let last_db =
+        consensus_chain.consensus_header_latest().await?.unwrap_or_else(|| last_executed.clone());
     let parent = if last_db.number > last_executed.number { last_db } else { last_executed };
-    (parent.digest(), parent.number)
+    Ok((parent.digest(), parent.number))
 }
 
 /// Collect and return any consensus headers that were not executed before last shutdown.
 /// This will be consensus that was reached but had not executed before a shutdown.
+///
+/// A failed storage lookup is propagated (the cursors below decide what gets re-executed, so
+/// computing them from silently-defaulted headers at number 0 would skip the replay); a
+/// genuinely absent header legitimately defaults to the fresh-chain genesis header.
 pub async fn get_missing_consensus(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
@@ -159,14 +175,13 @@ pub async fn get_missing_consensus(
     let mut result = Vec::new();
     // Get the DB and load our last executed consensus block.
     let last_executed_block =
-        last_executed_consensus_block(consensus_bus, consensus_chain).await.unwrap_or_default();
+        last_executed_consensus_block(consensus_bus, consensus_chain).await?.unwrap_or_default();
 
     // Edge case, in case we don't hear from peers but have un-executed blocks...
     // Not sure we should handle this, but it hurts nothing.
     let last_db_block = consensus_chain
         .consensus_header_latest()
-        .await
-        .unwrap_or_default()
+        .await?
         .unwrap_or_else(|| last_executed_block.clone());
 
     info!(target: "state-sync", ?last_executed_block, ?last_db_block, "comparing last executed block and last recorded consensus block");
@@ -199,8 +214,10 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let rx_shutdown = config.shutdown().subscribe();
 
     let mut rx_last_consensus_header = consensus_bus.last_consensus_header().subscribe();
+    // A failed lookup aborts this task (the spawner logs and surfaces the error); only a
+    // genuinely absent header (fresh chain) defaults so streaming starts from genesis.
     let mut last_consensus_header =
-        consensus_bus.last_consensus_block(&consensus_chain).await.unwrap_or_default();
+        consensus_bus.last_consensus_block(&consensus_chain).await?.unwrap_or_default();
     let mut last_consensus_height = last_consensus_header.number;
     let epoch = config.committee().epoch();
 
