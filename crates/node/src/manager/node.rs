@@ -361,12 +361,22 @@ impl EpochBaseFees {
     /// Safe to run while the engine is still executing leftover consensus output on a ModeChange
     /// re-entry: both values are pinned to the previous epoch's closing block, so the re-entry
     /// re-reads the identical count — the resize no-ops — and rewrites the identical fees. That
-    /// value-stability argument covers ModeChange re-entry ONLY. On the NewEpoch path a governance
-    /// shrink takes effect at the boundary and [`GasAccumulator::set_num_workers`] truncates
-    /// unconditionally (staying above in-flight worker ids is the CALLER obligation its doc
-    /// records); there the bound comes from the boundary-drain ordering — the closed epoch's
-    /// output is executed through the boundary before the entry runs — with the accepted residual
-    /// that a leftover batch from a removed worker would panic in `GasAccumulator::inc_block`.
+    /// value-stability argument covers ModeChange re-entry ONLY. Where the count moves,
+    /// [`GasAccumulator::set_num_workers`] truncates unconditionally (staying above in-flight
+    /// worker ids is the CALLER obligation its doc records), with the accepted residual that a
+    /// leftover batch from a removed worker would panic in `GasAccumulator::inc_block`.
+    ///
+    /// A governance shrink takes effect at the boundary, but on the LIVE boundary this resize is
+    /// not the one that applies it. `apply_close_time_fee_updates` (in `run_epoch`) is a third
+    /// production `set_num_workers` caller alongside this method and
+    /// [`sync_num_workers_from_chain`], and it runs first — at close time, off `entries.len()` read
+    /// at the very closing block this entry then pins — so the live NewEpoch entry finds the count
+    /// already truncated and its own resize no-ops. A shrink therefore reaches production THROUGH
+    /// this method only on the closes that skip the close-time update: the two
+    /// `close_epoch(None, ..)` recovery closes in `run_epoch` (replay-and-close and
+    /// leftover-drain), and the close-time update's own chain-global fail-open arm, which returns
+    /// without resizing. On those paths the bound is the boundary-drain ordering — the closed
+    /// epoch's output is executed through the boundary before the entry runs.
     pub fn apply(&self, gas_accumulator: &GasAccumulator) {
         gas_accumulator.set_num_workers(self.num_workers);
         for (worker_id, fee) in self.fees.iter().enumerate() {

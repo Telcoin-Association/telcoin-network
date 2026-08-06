@@ -1195,7 +1195,9 @@ fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manager::{read_base_fees_for_entered_epoch, sync_num_workers_from_chain};
+    use crate::manager::{
+        read_base_fees_for_entered_epoch, sync_num_workers_from_chain, EpochBaseFees,
+    };
     use rand::{rngs::StdRng, SeedableRng as _};
     use std::{
         cell::{Cell, RefCell},
@@ -1421,6 +1423,44 @@ mod tests {
             key.key().labels().any(|l| l.key() == "read" && l.value() == "epoch-entry pin guard"),
             "the counter must carry the caller's read label"
         );
+    }
+
+    /// A worker-count SHRINK through [`EpochBaseFees::apply`] — the direction no production call
+    /// site currently takes, and the one the accumulator handles least gently.
+    ///
+    /// Every live boundary reaches `apply` with the count already truncated by
+    /// `apply_close_time_fee_updates`, so the resize no-ops there; a shrink only lands here on the
+    /// `close_epoch(None, ..)` recovery closes and the close-time chain-global fail-open (see
+    /// `apply`'s doc). The struct's fields are `pub`, so the shape is asserted directly instead of
+    /// behind a governance `setNumWorkers` that does not exist in the tree yet.
+    ///
+    /// Pins both halves of the contract: the truncation itself, and the residual the doc names —
+    /// the removed slot is GONE, so a leftover batch attributed to it panics in
+    /// [`GasAccumulator::inc_block`] rather than silently diverging the epoch's gas totals (the
+    /// same tripwire `inc_block_after_shrink_panics` pins in `tn-types`).
+    #[test]
+    fn entry_apply_truncates_the_accumulator_on_a_worker_shrink() {
+        let acc = GasAccumulator::new(2);
+        acc.base_fee(0).set_base_fee(4_242);
+        acc.base_fee(1).set_base_fee(9_099);
+        acc.inc_block(1, 1_000_000, 30_000_000);
+
+        // the entered epoch's closing block reports ONE worker: governance removed worker 1
+        EpochBaseFees { num_workers: 1, fees: vec![7_777] }.apply(&acc);
+
+        assert_eq!(acc.num_workers(), 1, "the accumulator truncates to the on-chain count");
+        assert_eq!(acc.base_fee(0).base_fee(), 7_777, "the surviving worker takes the read fee");
+        assert_eq!(acc.get_values(0), (0, 0, 0), "gas counters are untouched by apply");
+    }
+
+    /// The residual `apply`'s doc accepts: after the shrink above, a block attributed to the
+    /// removed worker halts the node instead of landing in a slot that no longer exists.
+    #[test]
+    #[should_panic(expected = "worker id 1 out of range")]
+    fn entry_apply_shrink_leaves_a_removed_worker_id_fatal() {
+        let acc = GasAccumulator::new(2);
+        EpochBaseFees { num_workers: 1, fees: vec![MIN_PROTOCOL_BASE_FEE] }.apply(&acc);
+        acc.inc_block(1, 10, 20);
     }
 
     /// Keep-current arm of the close-time fail-open: a CHAIN-GLOBAL config-read failure
