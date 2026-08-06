@@ -542,6 +542,7 @@ mod tests {
         IpAddr::from([0x2001, 0x0db8, 0, subnet, 0, 0, 0, host])
     }
 
+    /// A `PrefixPolicy` from raw v4/v6 prefix lengths, which must be in range.
     fn prefixes(v4: u8, v6: u8) -> PrefixPolicy {
         PrefixPolicy::new(
             PrefixLen::v4(v4).expect("v4 prefix in range"),
