@@ -2819,6 +2819,7 @@ async fn test_persist_output_failure_rolls_back_in_memory_state() -> eyre::Resul
         sub_dag_index,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         sub_dag,
@@ -2951,6 +2952,7 @@ async fn test_late_persist_failure_rolls_back_in_memory_state() -> eyre::Result<
         sub_dag_index,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         sub_dag,
@@ -3082,6 +3084,7 @@ async fn test_repeat_persist_after_static_file_progress_is_terminal() -> eyre::R
         sub_dag_index,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         sub_dag,
@@ -3207,6 +3210,7 @@ async fn test_persist_provider_fault_retry_recovers() -> eyre::Result<()> {
         sub_dag_index,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         sub_dag,
@@ -3319,6 +3323,7 @@ async fn test_post_commit_failure_preserves_committed_head() -> eyre::Result<()>
         sub_dag_index,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
     let consensus_output = ConsensusOutput::new(
         sub_dag,
