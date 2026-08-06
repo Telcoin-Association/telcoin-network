@@ -59,10 +59,14 @@ pub const EXEC_STATE_PACK_VERSION: u16 = 1;
 /// Name of the data file inside the pack directory.
 const DATA_NAME: &str = "state_data";
 
-/// Maximum storage slots per [`ExecStateRecord::Storage`] chunk. Each slot is 64 bytes, so 64k
+/// Maximum storage slots per `Storage` chunk record. Each slot is 64 bytes, so 64k
 /// slots is ~4 MiB decompressed — comfortably under the container's per-record limit
-/// (`MAX_RECORD_SIZE` = 16 MiB, [`crate::archive::pack_iter`]), leaving margin for BCS overhead.
-const STORAGE_CHUNK_SLOTS: usize = 64 * 1024;
+/// (`MAX_RECORD_SIZE` = 16 MiB, `crate::archive::pack_iter`), leaving margin for BCS overhead.
+///
+/// Public so streaming exporters can flush at exactly this bound — reproducing the chunk layout
+/// [`ExecStatePackWriter::append_account`] emits, byte for byte — and so the per-account
+/// working-set ceiling such an exporter must hold in memory is stated in one place.
+pub const STORAGE_CHUNK_SLOTS: usize = 64 * 1024;
 
 /// Upper bound on the header count a pack may declare, enforced before any allocation sized by the
 /// untrusted `header_count`. A genuine pack carries the snapshot header plus at most
@@ -331,8 +335,11 @@ impl ExecStatePackWriter {
     }
 
     /// Append one owned chunk of storage slots for the current account, moving it into its record
-    /// (no extra copy) and bumping the tally. Empty chunks are ignored.
-    fn append_storage_chunk_owned(
+    /// (no extra copy) and bumping the tally. Empty chunks are ignored. A chunk should hold at
+    /// most [`STORAGE_CHUNK_SLOTS`] slots to stay under the container's record limit; streaming
+    /// callers that flush at exactly that bound reproduce
+    /// [`append_account`](Self::append_account)'s chunk layout byte for byte.
+    pub fn append_storage_chunk_owned(
         &mut self,
         slots: Vec<(B256, B256)>,
     ) -> Result<(), ExecStatePackError> {

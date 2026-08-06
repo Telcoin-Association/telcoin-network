@@ -22,7 +22,9 @@
 //! # Storage format is the exec state pack (not JSONL)
 //!
 //! [`PinnedStateView::export_state_pack`] writes an [`ExecStatePackWriter`]: the caller-supplied
-//! state root and block header(s), then one [`ExecStateAccount`] per plain-state account. The pack
+//! state root and block header(s), then one
+//! [`ExecStateAccount`](tn_storage::exec_state_pack::ExecStateAccount) per plain-state account. The
+//! pack
 //! is a compact, CRC32- and zstd-framed binary artifact (see `tn_storage::exec_state_pack`) — it
 //! does not go through reth's private JSONL `init_from_state_dump` path at all. The restore side
 //! rebuilds state from the pack directly using reth's *public* state-insertion and trie building
@@ -87,19 +89,15 @@ use reth_revm::{
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_trie::{IntermediateStateRootState, StateRoot, StateRootProgress};
 use reth_trie_db::DatabaseStateRoot;
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, HashMap},
-    path::Path,
-};
+use std::{iter::Peekable, path::Path};
 use tn_storage::exec_state_pack::{
-    ExecStateAccount, ExecStateAccountMeta, ExecStatePackReader, ExecStatePackWriter,
-    ExecStateStats, StateEntry,
+    ExecStateAccountMeta, ExecStatePackReader, ExecStatePackWriter, ExecStateStats, StateEntry,
+    STORAGE_CHUNK_SLOTS,
 };
 use tn_types::{
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
-    Address, BlockBody, BlockNumHash, Bytes, ExecHeader, GenesisAccount, SealedBlock, SealedHeader,
-    TaskManager, WorkerId, B256, U256,
+    Address, BlockBody, BlockNumHash, Bytes, ExecHeader, SealedBlock, SealedHeader, TaskManager,
+    WorkerId, B256, U256,
 };
 use tracing::{debug, info};
 
@@ -155,10 +153,20 @@ impl PinnedStateView {
     /// one account each, emitted in ascending address order (the `PlainAccountState` cursor order).
     /// Accounts and their storage are produced by a merge join of the `PlainAccountState` and
     /// dup-sorted `PlainStorageState` cursors, walked in lockstep so each table is scanned once;
-    /// bytecode is resolved through a lookup memo keyed by code hash. Zero-valued storage slots are
-    /// omitted (an absent slot is already zero in the trie, so keeping a zeroed row would only
-    /// bloat the pack). Only plain state is written — the restore side rebuilds the hashed,
-    /// history, and trie tables itself.
+    /// bytecode is resolved with one `Bytecodes` point read per contract account against the
+    /// pinned transaction. Zero-valued storage slots are omitted (an absent slot is already zero
+    /// in the trie, so keeping a zeroed row would only bloat the pack). Only plain state is
+    /// written — the restore side rebuilds the hashed, history, and trie tables itself.
+    ///
+    /// # Memory profile
+    ///
+    /// Mirrors the bound [`SnapshotRestorer::import_state`] documents for the opposite direction:
+    /// at most one account header, one [`STORAGE_CHUNK_SLOTS`]-bounded storage chunk buffer
+    /// (~4 MiB), and one account's bytecode are resident at a time. Storage streams from the
+    /// cursor into per-chunk buffers flushed as they fill, so a whale account's storage is never
+    /// fully materialized, and bytecode is re-read per contract account instead of memoized, so
+    /// nothing this function allocates scales with a single account's slot count or with the
+    /// number of distinct bytecodes in state.
     ///
     /// Returns the [`ExecStateStats`] the writer accumulated.
     pub fn export_state_pack(
@@ -171,87 +179,196 @@ impl PinnedStateView {
         let mut writer = ExecStatePackWriter::create(out_dir, state_root, headers)
             .map_err(|e| TnRethError::Snapshot(format!("failed to create state pack: {e}")))?;
 
-        // lookup-only memo: many accounts share bytecode (e.g. proxies). it is only ever point
-        // queried, never iterated, so it has no bearing on output order — that comes solely from
-        // the account cursor walk below.
-        let mut code_cache: HashMap<B256, Bytes> = HashMap::new();
-
         let mut account_cursor =
             tx.cursor_read::<PlainAccountState>().map_err(ProviderError::from)?;
         let mut storage_cursor =
             tx.cursor_dup_read::<PlainStorageState>().map_err(ProviderError::from)?;
 
         // merge-join drivers: both tables are keyed by address in the same order, so a single
-        // forward pass over each suffices.
-        let mut pending_storage = storage_cursor.first().map_err(ProviderError::from)?;
-        let mut pending_account = account_cursor.first().map_err(ProviderError::from)?;
-
-        while let Some((address, account)) = pending_account {
-            // drain the storage cursor up to and including this account's rows. the pending tuple
-            // is Copy, so matching it here does not consume the cursor position we reassign below.
-            let mut storage: BTreeMap<B256, B256> = BTreeMap::new();
-            while let Some((storage_address, entry)) = pending_storage {
-                match storage_address.cmp(&address) {
-                    Ordering::Less => {
-                        // storage for an address with no plain-account row (db inconsistency); it
-                        // contributes no account, so drop it
-                        pending_storage = storage_cursor.next().map_err(ProviderError::from)?;
-                    }
-                    Ordering::Equal => {
-                        if !entry.value.is_zero() {
-                            storage.insert(entry.key, B256::from(entry.value.to_be_bytes::<32>()));
-                        }
-                        pending_storage = storage_cursor.next().map_err(ProviderError::from)?;
-                    }
-                    // storage for a later account; leave it pending
-                    Ordering::Greater => break,
-                }
-            }
-
-            let code = match account.bytecode_hash {
-                Some(hash) if hash != KECCAK_EMPTY => {
-                    let bytes = match code_cache.get(&hash) {
-                        Some(bytes) => bytes.clone(),
-                        None => {
-                            let bytecode = tx
-                                .get::<Bytecodes>(hash)
-                                .map_err(ProviderError::from)?
-                                .ok_or_else(|| {
-                                    TnRethError::Snapshot(format!(
-                                        "bytecode {hash} referenced by account {address} is \
-                                         missing from the Bytecodes table"
-                                    ))
-                                })?;
-                            let bytes = bytecode.original_bytes();
-                            code_cache.insert(hash, bytes.clone());
-                            bytes
-                        }
-                    };
-                    Some(bytes)
-                }
-                _ => None,
+        // forward pass over each suffices. `first()` seeds each iterator, `next()` advances it —
+        // the same cursor discipline the previous hand-rolled loop used.
+        let mut account_started = false;
+        let accounts = std::iter::from_fn(move || {
+            let step = if account_started {
+                account_cursor.next()
+            } else {
+                account_started = true;
+                account_cursor.first()
             };
-
-            let account = ExecStateAccount {
-                address,
-                account: GenesisAccount {
-                    nonce: Some(account.nonce),
-                    balance: account.balance,
-                    code,
-                    storage: (!storage.is_empty()).then_some(storage),
-                    private_key: None,
-                },
+            step.map_err(ProviderError::from).map_err(TnRethError::from).transpose()
+        });
+        let mut storage_started = false;
+        let slots = std::iter::from_fn(move || {
+            let step = if storage_started {
+                storage_cursor.next()
+            } else {
+                storage_started = true;
+                storage_cursor.first()
             };
-            writer.append_account(&account).map_err(|e| {
-                TnRethError::Snapshot(format!("failed to append account {}: {e}", account.address))
-            })?;
+            step.map_err(ProviderError::from).map_err(TnRethError::from).transpose()
+        });
 
-            pending_account = account_cursor.next().map_err(ProviderError::from)?;
-        }
+        // one point read per contract account, deliberately NOT memoized: a memo would retain
+        // every distinct bytecode until the walk ends, so exporter memory would scale with the
+        // number of contracts in state. The read hits the already-open pinned transaction that is
+        // walking both full tables anyway.
+        let resolve_code = move |address: Address, hash: B256| {
+            tx.get::<Bytecodes>(hash)
+                .map_err(ProviderError::from)?
+                .ok_or_else(|| {
+                    TnRethError::Snapshot(format!(
+                        "bytecode {hash} referenced by account {address} is missing from the \
+                         Bytecodes table"
+                    ))
+                })
+                .map(|bytecode| bytecode.original_bytes())
+        };
+
+        export_plain_state(accounts, slots, resolve_code, &mut writer)?;
 
         writer
             .finish()
             .map_err(|e| TnRethError::Snapshot(format!("failed to finish state pack: {e}")))
+    }
+}
+
+/// Sink for the streamed export walk: one header per account followed by that account's bounded
+/// storage chunks.
+///
+/// [`ExecStatePackWriter`] is the production sink; tests substitute a recording sink to observe
+/// the exporter's chunk cadence — that storage is flushed per chunk as the cursor drains, never
+/// materialized whole.
+trait StatePackSink {
+    /// Begin a new account: record its header (address, nonce, balance, and any bytecode).
+    fn account_header(
+        &mut self,
+        address: Address,
+        nonce: u64,
+        balance: U256,
+        code: Option<Bytes>,
+    ) -> TnRethResult<()>;
+
+    /// Append one bounded chunk (at most [`STORAGE_CHUNK_SLOTS`] slots) of the current account's
+    /// storage. `address` identifies the account for error context only.
+    fn storage_chunk(&mut self, address: Address, slots: Vec<(B256, B256)>) -> TnRethResult<()>;
+}
+
+impl StatePackSink for ExecStatePackWriter {
+    fn account_header(
+        &mut self,
+        address: Address,
+        nonce: u64,
+        balance: U256,
+        code: Option<Bytes>,
+    ) -> TnRethResult<()> {
+        self.append_account_header(address, nonce, balance, code)
+            .map_err(|e| TnRethError::Snapshot(format!("failed to append account {address}: {e}")))
+    }
+
+    fn storage_chunk(&mut self, address: Address, slots: Vec<(B256, B256)>) -> TnRethResult<()> {
+        self.append_storage_chunk_owned(slots).map_err(|e| {
+            TnRethError::Snapshot(format!(
+                "failed to append storage chunk for account {address}: {e}"
+            ))
+        })
+    }
+}
+
+/// Merge-join walk over plain accounts and dup-sorted storage rows, streaming each account into
+/// `sink` as one header plus [`STORAGE_CHUNK_SLOTS`]-bounded storage chunks.
+///
+/// Both sources must yield rows in ascending address order (the cursor order of
+/// `PlainAccountState` / `PlainStorageState`); storage rows must additionally arrive in strictly
+/// ascending slot-key order within each account, which [`stream_account_slots`] verifies rather
+/// than assumes since the pack's deterministic chunk layout depends on it. Storage rows for
+/// addresses with no plain-account row (a db inconsistency) contribute no account and are
+/// dropped; zero-valued slots are elided. `resolve_code` is invoked once per contract account
+/// (any account whose `bytecode_hash` is set and is not [`KECCAK_EMPTY`]); resolved bytes are
+/// handed straight to the sink and never retained here.
+///
+/// # Memory profile
+///
+/// At most one account header, one storage chunk buffer (at most [`STORAGE_CHUNK_SLOTS`] slots),
+/// and one resolved bytecode are live at a time; no allocation is sized by a single account's
+/// slot count or by the number of distinct bytecodes.
+fn export_plain_state<A, S, C, W>(
+    mut accounts: A,
+    slots: S,
+    mut resolve_code: C,
+    sink: &mut W,
+) -> TnRethResult<()>
+where
+    A: Iterator<Item = TnRethResult<(Address, Account)>>,
+    S: Iterator<Item = TnRethResult<(Address, StorageEntry)>>,
+    C: FnMut(Address, B256) -> TnRethResult<Bytes>,
+    W: StatePackSink,
+{
+    let mut slots = slots.peekable();
+    accounts.try_for_each(|row| {
+        let (address, account) = row?;
+        let code = account
+            .bytecode_hash
+            .filter(|hash| *hash != KECCAK_EMPTY)
+            .map(|hash| resolve_code(address, hash))
+            .transpose()?;
+        sink.account_header(address, account.nonce, account.balance, code)?;
+        stream_account_slots(&mut slots, address, sink)
+    })
+}
+
+/// Drain `slots` of every row at or before `address` — rows for earlier addresses are orphans the
+/// merge join drops — and stream the kept slots into `sink` in [`STORAGE_CHUNK_SLOTS`]-bounded
+/// chunks, flushing each chunk as soon as it fills. Rows for addresses after `address` are left
+/// un-consumed for the next account.
+///
+/// Slot keys must arrive in strictly ascending order (MDBX's dup-sort invariant); a violation is
+/// reported as an error rather than silently re-sorted, because chunk contents and boundaries —
+/// and therefore the pack's bytes — depend on that order.
+fn stream_account_slots<S, W>(
+    slots: &mut Peekable<S>,
+    address: Address,
+    sink: &mut W,
+) -> TnRethResult<()>
+where
+    S: Iterator<Item = TnRethResult<(Address, StorageEntry)>>,
+    W: StatePackSink,
+{
+    // pull every row that is not a known row for a LATER address (errors are pulled too, so they
+    // propagate out of the fold below); keep this account's non-zero slots, dropping orphans and
+    // zero-valued rows
+    let mut rows = std::iter::from_fn(|| {
+        slots.next_if(|row| !row.as_ref().is_ok_and(|(row_address, _)| *row_address > address))
+    })
+    .filter_map(|row| {
+        row.map(|(row_address, entry)| {
+            (row_address == address && !entry.value.is_zero())
+                .then(|| (entry.key, B256::from(entry.value.to_be_bytes::<32>())))
+        })
+        .transpose()
+    });
+
+    let (last_chunk, _) =
+        rows.try_fold((Vec::new(), None::<B256>), |(mut chunk, previous), row| {
+            let (key, value) = row?;
+            previous.is_none_or(|prev| prev < key).then_some(()).ok_or_else(|| {
+                TnRethError::Snapshot(format!(
+                    "PlainStorageState cursor yielded out-of-order slot {key} for account \
+                     {address}: not strictly above the preceding slot"
+                ))
+            })?;
+            chunk.push((key, value));
+            let chunk = if chunk.len() == STORAGE_CHUNK_SLOTS {
+                sink.storage_chunk(address, chunk)?;
+                Vec::new()
+            } else {
+                chunk
+            };
+            Ok::<_, TnRethError>((chunk, Some(key)))
+        })?;
+    if last_chunk.is_empty() {
+        Ok(())
+    } else {
+        sink.storage_chunk(address, last_chunk)
     }
 }
 
@@ -1013,8 +1130,12 @@ pub use tn_types::gas_accumulator::worker_id_from_header;
 
 #[cfg(test)]
 mod tests {
-    use super::{worker_id_from_header, PinnedStateView, SnapshotRestorer, StateEntry};
+    use super::{
+        export_plain_state, worker_id_from_header, PinnedStateView, SnapshotRestorer, StateEntry,
+        StatePackSink, KECCAK_EMPTY,
+    };
     use crate::{
+        error::{TnRethError, TnRethResult},
         payload::TNPayload,
         system_calls::WorkerConfigs,
         test_utils::{
@@ -1031,15 +1152,17 @@ mod tests {
         tables::{HashedAccounts, HashedStorages, PlainAccountState, PlainStorageState},
         transaction::{DbTx, DbTxMut},
     };
-    use reth_primitives_traits::StorageEntry;
+    use reth_primitives_traits::{Account, StorageEntry};
     use reth_provider::{
         AccountReader, ChangeSetReader, DBProvider, DatabaseProviderFactory, StateProvider,
         StorageChangeSetReader,
     };
-    use std::{collections::BTreeMap, path::Path, sync::Arc};
+    use std::{cell::Cell, collections::BTreeMap, path::Path, rc::Rc, sync::Arc};
     use tempfile::TempDir;
     use tn_config::WORKER_CONFIGS_ADDRESS;
-    use tn_storage::exec_state_pack::{ExecStateAccount, ExecStatePackReader, ExecStatePackWriter};
+    use tn_storage::exec_state_pack::{
+        ExecStateAccount, ExecStatePackReader, ExecStatePackWriter, STORAGE_CHUNK_SLOTS,
+    };
     use tn_types::{
         gas_accumulator::{next_base_fee_for_config, GasAccumulator, WorkerFeeConfig},
         keccak256, test_genesis, Address, BlockNumHash, Bytes, ExecHeader, GenesisAccount,
@@ -1084,6 +1207,255 @@ mod tests {
             .map(|a| a.expect("account"))
             .map(|a: ExecStateAccount| (a.address, a.account))
             .collect()
+    }
+
+    /// One recorded [`StatePackSink`] call from [`RecordingSink`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SinkEvent {
+        /// An account header, with any resolved code.
+        Header(Address, Option<Bytes>),
+        /// A storage chunk: its slots, stamped with the source-pull count at the moment it was
+        /// emitted.
+        Chunk { address: Address, slots: Vec<(B256, B256)>, pulls_at_emit: usize },
+    }
+
+    /// A [`StatePackSink`] double that records every call, stamping each chunk with how many
+    /// storage rows had been pulled from the source when the chunk arrived. The stamp is the
+    /// working-set observable: a streaming exporter emits its first chunk after roughly
+    /// `STORAGE_CHUNK_SLOTS` pulls, while one that materializes an account's storage before
+    /// writing emits it only after ALL of the account's rows were pulled.
+    #[derive(Default)]
+    struct RecordingSink {
+        /// Every sink call, in order.
+        events: Vec<SinkEvent>,
+        /// Shared pull counter, incremented by [`counted_rows`] as the walk drains the source.
+        pulls: Rc<Cell<usize>>,
+    }
+
+    impl StatePackSink for RecordingSink {
+        fn account_header(
+            &mut self,
+            address: Address,
+            _nonce: u64,
+            _balance: U256,
+            code: Option<Bytes>,
+        ) -> TnRethResult<()> {
+            self.events.push(SinkEvent::Header(address, code));
+            Ok(())
+        }
+
+        fn storage_chunk(
+            &mut self,
+            address: Address,
+            slots: Vec<(B256, B256)>,
+        ) -> TnRethResult<()> {
+            self.events.push(SinkEvent::Chunk { address, slots, pulls_at_emit: self.pulls.get() });
+            Ok(())
+        }
+    }
+
+    /// Wrap fixture storage rows with a sink's shared pull counter (pass a clone of its `pulls`)
+    /// so each emitted chunk is stamped with how many rows had been drained when it was flushed.
+    fn counted_rows(
+        rows: Vec<TnRethResult<(Address, StorageEntry)>>,
+        pulls: Rc<Cell<usize>>,
+    ) -> impl Iterator<Item = TnRethResult<(Address, StorageEntry)>> {
+        rows.into_iter().inspect(move |_| pulls.set(pulls.get() + 1))
+    }
+
+    /// Code resolver for fixtures with no contract accounts: any call is a fixture violation.
+    fn no_code_expected(_address: Address, _hash: B256) -> TnRethResult<Bytes> {
+        Err(TnRethError::Snapshot("fixture expects no bytecode resolution".to_string()))
+    }
+
+    /// A plain-state account row with no code.
+    fn plain_account(nonce: u64, balance: u64) -> Account {
+        Account { nonce, balance: U256::from(balance), bytecode_hash: None }
+    }
+
+    /// The exporter must stream a multi-chunk account: every chunk bounded by
+    /// `STORAGE_CHUNK_SLOTS` and emitted as soon as it fills — NOT after the whole account has
+    /// been drained. The `pulls_at_emit` stamps are the working-set proof: an exporter that
+    /// materializes the account first pulls all `total` rows before its first chunk, which this
+    /// test rejects (confirmed by mutation: reverting `stream_account_slots` to collect-then-emit
+    /// fails the first `pulls_at_emit` assertion).
+    #[test]
+    fn export_streams_whale_storage_without_materializing() -> eyre::Result<()> {
+        let whale = Address::from([0x0d; 20]);
+        let extra = 7usize;
+        let total = 2 * STORAGE_CHUNK_SLOTS + extra;
+
+        // ascending slot keys with value = index + 1 (never zero, so nothing is elided)
+        let rows: Vec<TnRethResult<(Address, StorageEntry)>> = (0..total)
+            .map(|i| Ok((whale, StorageEntry::new(word(i as u64), U256::from(i as u64 + 1)))))
+            .collect();
+        let expected_slots = |range: std::ops::Range<usize>| {
+            range.map(|i| (word(i as u64), word(i as u64 + 1))).collect::<Vec<_>>()
+        };
+
+        let mut sink = RecordingSink::default();
+        let slots = counted_rows(rows, sink.pulls.clone());
+        let accounts = std::iter::once(Ok((whale, plain_account(3, 9))));
+        export_plain_state(accounts, slots, no_code_expected, &mut sink)?;
+
+        assert_eq!(sink.events.len(), 4);
+        assert_eq!(sink.events[0], SinkEvent::Header(whale, None));
+        assert_eq!(
+            sink.events[1],
+            SinkEvent::Chunk {
+                address: whale,
+                slots: expected_slots(0..STORAGE_CHUNK_SLOTS),
+                pulls_at_emit: STORAGE_CHUNK_SLOTS,
+            }
+        );
+        assert_eq!(
+            sink.events[2],
+            SinkEvent::Chunk {
+                address: whale,
+                slots: expected_slots(STORAGE_CHUNK_SLOTS..2 * STORAGE_CHUNK_SLOTS),
+                pulls_at_emit: 2 * STORAGE_CHUNK_SLOTS,
+            }
+        );
+        assert_eq!(
+            sink.events[3],
+            SinkEvent::Chunk {
+                address: whale,
+                slots: expected_slots(2 * STORAGE_CHUNK_SLOTS..total),
+                pulls_at_emit: total,
+            }
+        );
+        Ok(())
+    }
+
+    /// Bytecode is resolved exactly once per contract account — never memoized across the walk —
+    /// so exporter memory cannot scale with the number of distinct bytecodes in state. Two
+    /// contracts sharing one code hash cost two point reads; an EOA and an account whose hash is
+    /// `KECCAK_EMPTY` cost none.
+    #[test]
+    fn export_resolves_bytecode_per_contract_account_without_memo() -> eyre::Result<()> {
+        let eoa = Address::from([0x0a; 20]);
+        let contract = Address::from([0x0c; 20]);
+        let contract_twin = Address::from([0x0d; 20]);
+        let empty_hash = Address::from([0x0e; 20]);
+        let code = Bytes::from_static(CODE);
+        let code_hash = keccak256(&code);
+
+        let accounts: Vec<TnRethResult<(Address, Account)>> = vec![
+            Ok((eoa, plain_account(7, 1_000))),
+            Ok((contract, Account { bytecode_hash: Some(code_hash), ..plain_account(1, 42) })),
+            Ok((contract_twin, Account { bytecode_hash: Some(code_hash), ..plain_account(2, 84) })),
+            Ok((empty_hash, Account { bytecode_hash: Some(KECCAK_EMPTY), ..plain_account(3, 5) })),
+        ];
+
+        let reads = Rc::new(Cell::new(0usize));
+        let resolve = {
+            let reads = reads.clone();
+            let code = code.clone();
+            move |_address: Address, hash: B256| -> TnRethResult<Bytes> {
+                reads.set(reads.get() + 1);
+                assert_eq!(hash, code_hash);
+                Ok(code.clone())
+            }
+        };
+
+        let mut sink = RecordingSink::default();
+        export_plain_state(accounts.into_iter(), std::iter::empty(), resolve, &mut sink)?;
+
+        // one point read per contract account: shared code is re-read, not retained
+        assert_eq!(reads.get(), 2);
+        assert_eq!(
+            sink.events,
+            vec![
+                SinkEvent::Header(eoa, None),
+                SinkEvent::Header(contract, Some(code.clone())),
+                SinkEvent::Header(contract_twin, Some(code)),
+                SinkEvent::Header(empty_hash, None),
+            ]
+        );
+        Ok(())
+    }
+
+    /// The pack's chunk layout is deterministic only if slots arrive in ascending key order, so
+    /// the exporter verifies the cursor's dup-sort invariant instead of assuming it: out-of-order
+    /// and duplicate slot keys are both reported as errors, never silently re-sorted.
+    #[test]
+    fn export_rejects_out_of_order_and_duplicate_storage_slots() {
+        let whale = Address::from([0x0d; 20]);
+        let account_rows = || std::iter::once(Ok((whale, plain_account(0, 1))));
+
+        let out_of_order: Vec<TnRethResult<(Address, StorageEntry)>> = vec![
+            Ok((whale, StorageEntry::new(word(5), U256::from(1u64)))),
+            Ok((whale, StorageEntry::new(word(4), U256::from(2u64)))),
+        ];
+        let mut sink = RecordingSink::default();
+        let err = export_plain_state(
+            account_rows(),
+            out_of_order.into_iter(),
+            no_code_expected,
+            &mut sink,
+        )
+        .expect_err("out-of-order slots must be rejected");
+        assert!(err.to_string().contains("out-of-order"), "unexpected error: {err}");
+
+        // duplicate keys violate strict ascent the same way (MDBX dup-sort keys are unique)
+        let duplicate: Vec<TnRethResult<(Address, StorageEntry)>> = vec![
+            Ok((whale, StorageEntry::new(word(4), U256::from(1u64)))),
+            Ok((whale, StorageEntry::new(word(4), U256::from(2u64)))),
+        ];
+        let mut sink = RecordingSink::default();
+        let err =
+            export_plain_state(account_rows(), duplicate.into_iter(), no_code_expected, &mut sink)
+                .expect_err("duplicate slots must be rejected");
+        assert!(err.to_string().contains("out-of-order"), "unexpected error: {err}");
+    }
+
+    /// The merge join preserves the old loop's semantics: storage rows for addresses with no
+    /// plain-account row (before the first account, between accounts) are consumed and dropped,
+    /// zero-valued slots are elided, and each account's chunk carries exactly its own non-zero
+    /// slots. The final chunk of each account flushes only once the terminating row (or source
+    /// end) has been observed, hence the `pulls_at_emit` stamps.
+    #[test]
+    fn export_drops_orphaned_rows_and_zero_slots() -> eyre::Result<()> {
+        let first = Address::from([0x0a; 20]);
+        let second = Address::from([0x0c; 20]);
+
+        let rows: Vec<TnRethResult<(Address, StorageEntry)>> = vec![
+            // orphan: storage for an address before any plain-account row
+            Ok((Address::from([0x01; 20]), StorageEntry::new(word(1), U256::from(1u64)))),
+            Ok((first, StorageEntry::new(word(1), U256::from(11u64)))),
+            // zero-valued: an absent slot is already zero in the trie, so it is elided
+            Ok((first, StorageEntry::new(word(2), U256::ZERO))),
+            Ok((first, StorageEntry::new(word(3), U256::from(33u64)))),
+            // orphan: storage for an address strictly between the two account rows
+            Ok((Address::from([0x0b; 20]), StorageEntry::new(word(1), U256::from(2u64)))),
+            Ok((second, StorageEntry::new(word(7), U256::from(77u64)))),
+        ];
+        let accounts: Vec<TnRethResult<(Address, Account)>> =
+            vec![Ok((first, plain_account(1, 5))), Ok((second, plain_account(2, 6)))];
+
+        let mut sink = RecordingSink::default();
+        let slots = counted_rows(rows, sink.pulls.clone());
+        export_plain_state(accounts.into_iter(), slots, no_code_expected, &mut sink)?;
+
+        assert_eq!(
+            sink.events,
+            vec![
+                SinkEvent::Header(first, None),
+                // flushed after peeking row 5 (the between-accounts orphan) terminated the run
+                SinkEvent::Chunk {
+                    address: first,
+                    slots: vec![(word(1), word(11)), (word(3), word(33))],
+                    pulls_at_emit: 5,
+                },
+                SinkEvent::Header(second, None),
+                SinkEvent::Chunk {
+                    address: second,
+                    slots: vec![(word(7), word(77))],
+                    pulls_at_emit: 6,
+                },
+            ]
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1605,11 +1977,10 @@ mod tests {
     }
 
     /// Several slots more than the exporter packs into a single storage record, so the whale
-    /// account below is emitted across MANY `STORAGE_CHUNK_SLOTS`-bounded storage chunks and the
-    /// streaming import must write each chunk without ever materializing the whole account. Kept
-    /// local (the pack constant is private) and only a few chunks past the boundary to keep the
-    /// heavy multi-slot env cheap.
-    const MULTI_CHUNK_SLOTS: u64 = 4 * 64 * 1024 + 7;
+    /// account below is emitted across MANY [`STORAGE_CHUNK_SLOTS`]-bounded storage chunks and the
+    /// streaming import must write each chunk without ever materializing the whole account. Only a
+    /// few chunks past the boundary to keep the heavy multi-slot env cheap.
+    const MULTI_CHUNK_SLOTS: u64 = 4 * STORAGE_CHUNK_SLOTS as u64 + 7;
 
     /// Import a pack containing a WHALE account whose storage spans many storage chunks and prove
     /// the streaming, per-chunk import is exactly correct.
