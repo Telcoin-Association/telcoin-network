@@ -42,6 +42,10 @@ use crate::{
 /// Current version of the epoch pack file.
 const EPOCH_PACK_VERSION: u16 = 0;
 
+/// Interval between lookups in the bounded waits [`EpochRecordDb::record_by_epoch_with_timeout`]
+/// and [`EpochRecordDb::cert_by_digest_with_timeout`].
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 enum EpochDbMessage {
     /// Save a "dummy" epoch 0 [`EpochRecord`] without a certificate.
     SaveDummy0Record(EpochRecord),
@@ -474,24 +478,51 @@ impl EpochRecordDb {
         }
     }
 
+    /// Poll `lookup` every [`POLL_INTERVAL`] until it yields a value or `timeout` elapses,
+    /// whichever happens first.
+    ///
+    /// The wait always ends with a lookup at the deadline rather than with a sleep: the deadline
+    /// is tested before sleeping, and each sleep is clamped to it. A value stored during the last
+    /// poll interval is therefore still observed, which is the case both callers exist to cover.
+    /// They bridge a known arrival race, so a wait that runs long is precisely a wait whose value
+    /// is likely to land near the deadline. Clamping also keeps a `timeout` shorter than
+    /// [`POLL_INTERVAL`] from being rounded up to a full interval.
+    ///
+    /// Every message is served on one background thread in enqueue order, so a save enqueued
+    /// strictly before the deadline is visible to that final lookup. The residual race is the
+    /// first lookup only: a `timeout` shorter than one round trip to that thread can expire while
+    /// the lookup is in flight, missing a save enqueued behind it. The wait still ends within one
+    /// round trip of the deadline.
+    async fn poll_until_deadline<T, F, Fut>(timeout: Duration, lookup: F) -> Option<T>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Option<T>>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        // TODO issue 573, clean this up: an event-driven wait would replace this poll entirely.
+        loop {
+            if let Some(found) = lookup().await {
+                return Some(found);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            tokio::time::sleep_until(deadline.min(now + POLL_INTERVAL)).await;
+        }
+    }
+
     /// Retrieve an [`EpochRecord`] by epoch number.
     /// This version will wait up to timeout time for the record to show up if not available.
+    ///
+    /// The wait ends with a lookup at the deadline, so a record saved during the last poll
+    /// interval is still returned (see `poll_until_deadline`).
     pub async fn record_by_epoch_with_timeout(
         &self,
         epoch: Epoch,
         timeout: Duration,
     ) -> Option<EpochRecord> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        // TODO issue 573, clean this up.
-        loop {
-            if let Some(rec) = self.record_by_epoch(epoch).await {
-                return Some(rec);
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            if tokio::time::Instant::now() >= deadline {
-                return None;
-            }
-        }
+        Self::poll_until_deadline(timeout, || self.record_by_epoch(epoch)).await
     }
 
     /// Retrieve the [`EpochRecord`] for `epoch` only when a stored [`EpochCertificate`]
@@ -653,21 +684,15 @@ impl EpochRecordDb {
     /// A just-closed epoch's certificate is only aggregated at the next epoch's start, so a caller
     /// that needs epoch N's cert immediately after N closes (e.g. the state exporter) must give the
     /// collector a bounded window to produce it.
+    ///
+    /// The wait ends with a lookup at the deadline, so a certificate saved during the last poll
+    /// interval is still returned (see `poll_until_deadline`).
     pub async fn cert_by_digest_with_timeout(
         &self,
         digest: EpochDigest,
         timeout: Duration,
     ) -> Option<EpochCertificate> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if let Some(cert) = self.cert_by_digest(digest).await {
-                return Some(cert);
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            if tokio::time::Instant::now() >= deadline {
-                return None;
-            }
-        }
+        Self::poll_until_deadline(timeout, || self.cert_by_digest(digest)).await
     }
 
     /// True if the database contains a record for the given epoch number.
@@ -2465,6 +2490,95 @@ mod test {
         assert!(got.is_none(), "expected a timeout with no cert stored");
         // Poll interval is 200ms, so the loop must have waited at least one interval.
         assert!(start.elapsed() >= std::time::Duration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cert_by_digest_with_timeout_sees_cert_saved_in_final_poll_interval() {
+        // The wait must end with a lookup at the deadline, not with a sleep. The certificate is
+        // saved 900ms in: after the last lookup a sleep-then-test loop would make (800ms) and
+        // before the 1s deadline, so only a loop that checks once more at the deadline returns it.
+        //
+        // Virtual time makes that ordering exact rather than merely likely. The db thread is a
+        // real thread, but a paused clock only advances to the next timer while the runtime is
+        // idle, so the save fires between the 800ms lookup and the deadline however slow the
+        // machine is, and the assertion below never turns into a timing race.
+        let temp_dir = TempDir::with_prefix("cert_timeout_final_interval").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        // The record is stored up front, so only the delayed save below can satisfy the wait.
+        let (record, cert) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save_record(record.clone()).await.expect("save record");
+
+        let saver = {
+            let db = db.clone();
+            let cert = cert.clone();
+            let digest = record.digest();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                db.save_certificate(digest, cert).await.expect("save cert");
+            })
+        };
+
+        let got = db
+            .cert_by_digest_with_timeout(record.digest(), std::time::Duration::from_secs(1))
+            .await;
+        saver.await.expect("saver task");
+        let got = got.expect("a cert saved before the deadline must be returned");
+        assert_eq!(got.epoch_hash, cert.epoch_hash);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn record_by_epoch_with_timeout_sees_record_saved_in_final_poll_interval() {
+        // Same property on the record wait, which restart catch-up depends on: a record that lands
+        // in the last poll interval before the deadline is returned rather than turned into the
+        // error that ends the node. See the sibling cert test for why virtual time is exact here.
+        let temp_dir = TempDir::with_prefix("record_timeout_final_interval").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (record, _cert) = make_test_pair(0, &signers, EpochDigest::default());
+
+        let saver = {
+            let db = db.clone();
+            let record = record.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                db.save_record(record).await.expect("save record");
+            })
+        };
+
+        let got = db.record_by_epoch_with_timeout(0, std::time::Duration::from_secs(1)).await;
+        saver.await.expect("saver task");
+        let got = got.expect("a record saved before the deadline must be returned");
+        assert_eq!(got.digest(), record.digest());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cert_by_digest_with_timeout_ends_at_a_deadline_inside_one_poll_interval() {
+        // A timeout shorter than the 200ms poll interval is not rounded up to a full interval: the
+        // sleep is clamped to the deadline, so the wait ends there. A loop that sleeps first
+        // always spends a whole interval no matter how short the timeout is.
+        let temp_dir = TempDir::with_prefix("cert_timeout_short").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (record, _cert) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save_record(record.clone()).await.expect("save record");
+
+        let start = tokio::time::Instant::now();
+        let got = db
+            .cert_by_digest_with_timeout(record.digest(), std::time::Duration::from_millis(50))
+            .await;
+        let waited = start.elapsed();
+        assert!(got.is_none(), "expected a timeout with no cert stored");
+        assert!(
+            waited < std::time::Duration::from_millis(200),
+            "a 50ms timeout must not sleep a full poll interval, waited {waited:?}"
+        );
     }
 
     #[tokio::test]
