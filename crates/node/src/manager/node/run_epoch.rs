@@ -1444,14 +1444,22 @@ mod tests {
         let acc = GasAccumulator::new(2);
         acc.base_fee(0).set_base_fee(4_242);
         acc.base_fee(1).set_base_fee(9_099);
-        acc.inc_block(1, 1_000_000, 30_000_000);
+        // gas on the SURVIVING worker: `apply` resizes the slot vector, so this is the half of the
+        // truncation that has to be preserved rather than dropped. Incrementing the removed worker
+        // instead would assert nothing — its slot is gone, and worker 0's counters would read
+        // `(0, 0, 0)` whatever `apply` did.
+        acc.inc_block(0, 1_000_000, 30_000_000);
 
         // the entered epoch's closing block reports ONE worker: governance removed worker 1
         EpochBaseFees { num_workers: 1, fees: vec![7_777] }.apply(&acc);
 
         assert_eq!(acc.num_workers(), 1, "the accumulator truncates to the on-chain count");
         assert_eq!(acc.base_fee(0).base_fee(), 7_777, "the surviving worker takes the read fee");
-        assert_eq!(acc.get_values(0), (0, 0, 0), "gas counters are untouched by apply");
+        assert_eq!(
+            acc.get_values(0),
+            (1, 1_000_000, 30_000_000),
+            "the surviving worker's gas counters are untouched by apply"
+        );
     }
 
     /// The residual `apply`'s doc accepts: after the shrink above, a block attributed to the
