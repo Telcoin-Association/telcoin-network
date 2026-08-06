@@ -1616,6 +1616,81 @@ mod tests {
         Ok(())
     }
 
+    /// The pin guard's SECOND disjunct alone: the registry at the pin reports the RIGHT epoch but
+    /// the wrong first block, so `epoch_at_pin == entered` and only
+    /// `epoch_info.blockHeight != closing_header.number + 1` rejects the header.
+    ///
+    /// The sibling test above trips both halves at once (genesis reports epoch 0 for a caller
+    /// claiming epoch 1), so deleting the `blockHeight` comparison would leave it green. This one
+    /// isolates the comparison, and the reachable shape is `closing + 1` UPWARD, not `closing - 1`:
+    /// one block before the boundary the registry still reports `entered - 1`, which is the first
+    /// disjunct again. One block after, the registry has already crossed to `entered` and only its
+    /// `blockHeight` (still the boundary's `closing + 1`) disagrees.
+    ///
+    /// The assertions therefore pin the epoch/block PAIR the mismatch produces — reported and
+    /// expected epochs equal, reported and expected first blocks one apart — which the three
+    /// substrings the sibling asserts cannot discriminate (all four come from one format string).
+    /// The genuine pin is exercised in the same fixture so a broken boundary cannot masquerade as
+    /// the guard firing.
+    #[tokio::test]
+    async fn entry_read_rejects_a_post_boundary_pin_on_block_height_alone() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::with_prefix("entry_read_post_boundary_pin")?;
+        let task_manager = TaskManager::new("entry read post boundary pin");
+        let acc = GasAccumulator::new(1);
+        let reth_env = RethEnv::new_for_temp_chain(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            Some(acc.clone()),
+        )?;
+
+        // block 1 genuinely closes epoch 0: the registry now reports epoch 1 beginning at block 2
+        let closing = execute_worker_block(
+            &reth_env,
+            &acc,
+            chain.sealed_genesis_header(),
+            &consensus_output_for_tests(1, 0, 1, true),
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+            vec![],
+        )?;
+        assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 must have closed");
+
+        // fixture guard: the real pin is accepted, so the boundary below is genuine
+        read_base_fees_for_entered_epoch(&reth_env, 1, &closing)
+            .await
+            .expect("the genuine closing block must pass the pin guard");
+
+        // block 2 is epoch 1's FIRST block: same epoch at the pin, first block now one too low
+        let after = execute_worker_block(
+            &reth_env,
+            &acc,
+            closing.clone(),
+            &consensus_output_for_tests(1, 1, 2, false),
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+            vec![],
+        )?;
+        assert_eq!(after.number, closing.number + 1);
+
+        let err = read_base_fees_for_entered_epoch(&reth_env, 1, &after)
+            .await
+            .expect_err("a pin one block past the boundary must fail the blockHeight comparison");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reports epoch 1 beginning at block 2"),
+            "the registry must report the EXPECTED epoch at the pin (first disjunct silent): {msg}"
+        );
+        assert!(
+            msg.contains("expected epoch 1 beginning at block 3"),
+            "only the first-block half may disagree: {msg}"
+        );
+
+        Ok(())
+    }
+
     /// Build one worker block on `parent` carrying `base_fee` and `txs`, execute it (running
     /// the epoch-closing system calls when `output` is flagged), commit it as the canonical +
     /// finalized tip, and mirror the engine's post-execution accounting by folding the executed
