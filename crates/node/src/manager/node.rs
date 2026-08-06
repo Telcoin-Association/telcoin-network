@@ -481,6 +481,13 @@ pub async fn read_base_fees_for_entered_epoch(
                 closing_header.hash()
             )
         })?;
+    // UNREACHABLE BY CONSTRUCTION, and deliberately untested for the same reason as its twin in
+    // `tn_reth::snapshot::check_entry_readiness`. See the comment there for the searches that
+    // establish it: both writers of `numWorkers` in `WorkerConfigs.sol` floor it at 1, the CLI
+    // rejects an empty `--worker-fee-config` list, and a reverted constructor fails genesis
+    // creation instead of committing the empty storage that would read back as zero. Kept as the
+    // epoch-entry half of that pair, so a zero from a hand-built genesis or a future contract
+    // revision names itself here instead of surfacing as an empty accumulator.
     if num_workers == 0 {
         return Err(eyre!(
             "WorkerConfigs at epoch {entered}'s pinned closing block {} reports zero workers; \
