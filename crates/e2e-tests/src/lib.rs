@@ -35,11 +35,24 @@ pub enum TestBinary {
 
 impl TestBinary {
     /// Build a [`std::process::Command`] that runs this binary.
+    ///
+    /// Pins `TN_SEED_SIGNATURE_FORK_EPOCH` on the child so every spawned node runs the fork
+    /// point the harness states rather than the build default (non-adiri builds are otherwise
+    /// active from genesis). With nothing in the harness environment the pin is `u32::MAX`:
+    /// fork dormant, wire-identical to pre-fork mainnet. A harness-level value is forwarded
+    /// verbatim so a fork-active lane can export `TN_SEED_SIGNATURE_FORK_EPOCH=0`, and a
+    /// single test can still override the pin with its own later `env()` call. Only binaries
+    /// built with `tn-types/test-utils` (pulled in via `tn-storage/test-utils`, see
+    /// `make build-e2e-bin`) consult the variable; production binaries ignore it.
     pub fn command(&self) -> std::process::Command {
-        match self {
+        let mut command = match self {
             TestBinary::Prebuilt(path) => std::process::Command::new(path),
             TestBinary::Cargo(run) => run.command(),
-        }
+        };
+        let fork_epoch =
+            std::env::var("TN_SEED_SIGNATURE_FORK_EPOCH").unwrap_or_else(|_| u32::MAX.to_string());
+        command.env("TN_SEED_SIGNATURE_FORK_EPOCH", fork_epoch);
+        command
     }
 }
 
@@ -50,8 +63,9 @@ pub static TELCOIN_BINARY: OnceLock<TestBinary> = OnceLock::new();
 ///
 /// Tests intentionally wrap keys with a trivially weak KDF so suites don't spend CPU on
 /// 1,000,000-round PBKDF2 per node. The round count is not stored on disk; the spawned node
-/// binary - built without any test features - recovers these keys by trying the weak round
-/// count when reading (and warns that they are weakly wrapped).
+/// binary, which does not share this constant (its only test hooks are the storage/types
+/// `test-utils` features), recovers these keys by trying the weak round count when reading
+/// (and warns that they are weakly wrapped).
 const INSECURE_TEST_KDF_ROUNDS: u32 = 1;
 
 /// RPC endpoints for a single node across all transports.
