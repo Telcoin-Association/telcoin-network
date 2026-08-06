@@ -171,6 +171,11 @@ fn epoch_from_dir_name(dir: &Path) -> Option<Epoch> {
 pub struct DbLoadStateArgs {
     /// Path to an exec-state pack directory (contains a `state_data` file), e.g. an `epoch-NN`
     /// export produced by `--enable-state-export`.
+    ///
+    /// The pack's final block must be one that closed an epoch — a restored node seeds its first
+    /// epoch entry from a single state read at that block, so restore validates this and refuses
+    /// the pack otherwise. Bundles written by `--enable-state-export` always satisfy it: an export
+    /// is triggered at epoch close, on the epoch's final block.
     pub pack: PathBuf,
 
     /// Named chain whose genesis to initialize (bundled). If omitted, genesis is loaded from the

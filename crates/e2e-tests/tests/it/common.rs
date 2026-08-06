@@ -1238,6 +1238,32 @@ pub(crate) fn get_tx_receipt_block(node: &str, tx_hash: &str) -> eyre::Result<u6
     }
 }
 
+/// Read the `baseFeePerGas` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
+///
+/// These testnets run a single worker (worker 0), so every block's base fee is worker 0's fee.
+///
+/// Do **not** assume a block's fee is the fee of the epoch containing it. Only a
+/// **transaction-bearing** block reliably carries its epoch's fee: it takes
+/// `batch.base_fee_per_gas` (`crates/engine/src/payload_builder.rs:190`), which is the fee the
+/// worker built the batch at. An empty epoch-closing block instead copies its parent's
+/// `base_fee_per_gas` verbatim (`:124`), so in a run of idle epochs every block carries the last
+/// transaction-bearing block's fee, however many boundaries back that was — including the idle
+/// epoch's own single closing block.
+///
+/// Anchor a fee assertion to something read out of chain state — see
+/// `state_export_import::recorded_entry_fee`, which reads the `WorkerConfigs` word a node actually
+/// enters on — rather than inferring the expected value from another block's header, and read it
+/// off a block that carried transactions.
+pub(crate) fn read_base_fee(node: &str, block_number: u64) -> eyre::Result<u64> {
+    let block = get_block(node, Some(block_number))?;
+    let raw = block
+        .get("baseFeePerGas")
+        .ok_or_else(|| eyre::eyre!("block {block_number} on {node} has no baseFeePerGas field"))?;
+    parse_hex_u64(raw).ok_or_else(|| {
+        eyre::eyre!("block {block_number} on {node} baseFeePerGas is not a hex u64: {raw:?}")
+    })
+}
+
 /// Read the `timestamp` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
 pub(crate) fn read_block_timestamp(node: &str, block_number: u64) -> eyre::Result<u64> {
     let block = get_block(node, Some(block_number))?;

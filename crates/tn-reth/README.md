@@ -331,9 +331,13 @@ recomputing it**. The restore side is the real integrity check (`SnapshotRestore
 - **recomputes the state root from scratch** out of the imported accounts (`StateRoot::from_tx`)
   and hard-fails unless it equals both the pack's declared root and `header(B).state_root` from
   the caller-supplied header window;
-- verifies the shipped window can seed the first epoch-entry base-fee derivation for every
-  EIP-1559-configured worker (otherwise the restored node would walk into omitted history and
-  halt);
+- **validates that `B` closed an epoch** instead of assuming it (`entry_readiness_precondition`):
+  the registry pinned at `B` must report the entered epoch beginning at `B + 1`, since a restored
+  node seeds its first epoch entry from one pinned read at `B` and starts its accumulator catchup
+  at `B + 1`;
+- requires the `WorkerConfigs` read at `B` to report at least one worker and to yield a readable
+  entry base fee for every one of them — an `Eip1559` `data` word wider than `u64` is refused here,
+  naming the worker and the word, instead of halting the restored node at its first epoch entry;
 - persists finalized/safe markers at `B` and re-checks the reconstructed tip number and hash.
 
 What restore does *not* verify: the authenticity of the header window itself — that is the

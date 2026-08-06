@@ -65,6 +65,17 @@ pub(super) fn handle_mint_faucet(
     caller: Address,
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for an instant faucet mint.
+    ///
+    /// Worst case is a non-governance caller, which pays for the role-check `SLOAD` as well:
+    /// cold `SLOAD` of the mint-role slot (`2_100`), cold `load_account` of the recipient
+    /// (`2_600`), cold `SLOAD` plus warm `nonzero -> nonzero` `SSTORE` of the supply slot
+    /// (`2_100 + 2_900`), and the `Mint` and `Transfer` logs (`1_637 + 1_756`): `13_093` total.
+    /// At `30_000` this covers `2.29x` of the worst case. The margin is deliberately loose
+    /// because this path only exists in `faucet` builds, where over-pricing a testnet drip is
+    /// preferable to metering it tightly.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "`mint` (faucet)".
     const GAS_COST: u64 = 30_000;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
@@ -135,6 +146,17 @@ pub(super) fn handle_grant_mint_role(
     caller: Address,
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for granting the mint role.
+    ///
+    /// A single `SSTORE` is the whole operation, and a new grant is the cold `0 -> nonzero` case:
+    /// `22_100` total. At `22_000` this covers `1.00x` (`22_000 / 22_100`, i.e. **undercharged**
+    /// by `100`) in the worst case. Re-granting an address that already holds the role is a cold
+    /// `nonzero -> nonzero` write costing `5_000`.
+    ///
+    /// Kept equal to [`handle_revoke_mint_role`]'s charge so grant and revoke are priced
+    /// symmetrically from a caller's perspective.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "`grantMintRole` (faucet)".
     const GAS_COST: u64 = 22_000;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
@@ -161,6 +183,14 @@ pub(super) fn handle_revoke_mint_role(
     caller: Address,
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for revoking the mint role.
+    ///
+    /// A single cold `nonzero -> 0` `SSTORE`: `5_000` total, which also earns a `4_800` refund at
+    /// transaction end. At `22_000` this covers `4.40x` of the worst case, the loosest margin in
+    /// the precompile, because the constant is held equal to [`handle_grant_mint_role`]'s rather
+    /// than fitted to revoke's much cheaper write.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "`revokeMintRole` (faucet)".
     const GAS_COST: u64 = 22_000;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);
@@ -186,6 +216,15 @@ pub(super) fn handle_has_mint_role(
     calldata: &[u8],
     gas_limit: u64,
 ) -> PrecompileResult {
+    /// Flat charge for the one storage read this view performs.
+    ///
+    /// A single cold `SLOAD` of the queried address's mint-role slot at the Cancun price:
+    /// `1 * 2_100 = 2_100`, i.e. `1.00x` coverage. A query *for* the governance address
+    /// short-circuits in [`has_mint_role`] before the read — the check is on the calldata argument,
+    /// not the caller — so that one input overpays by the full `2_100` regardless of who asks; the
+    /// constant is priced for the read that actually happens rather than for that special case.
+    ///
+    /// Derived in this module's `README.md`, "Gas costs" / "View functions".
     const GAS_COST: u64 = 2_100;
     if gas_limit < GAS_COST {
         return Err(PrecompileError::OutOfGas);

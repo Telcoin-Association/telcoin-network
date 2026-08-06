@@ -2,6 +2,20 @@
 //! Execute output from consensus layer to extend the canonical chain.
 //!
 //! The engine listens to a stream of output from consensus and constructs a new block.
+//!
+//! # Trust boundary
+//!
+//! The [`ConsensusOutput`] this crate executes has already been committed by Bullshark, so the
+//! engine deliberately re-validates almost none of it: it checks the batch/digest count, the digest
+//! index bound, and (on the empty epoch-closing path only) that the leader resolves to a committee
+//! member. Which inputs are trusted, why, and where each enforcing check actually lives is written
+//! down per input in this crate's `README.md` ("Trust boundaries"). Read that before assuming a
+//! missing check here is a bug, and before adding one.
+//!
+//! Two facts from it are worth carrying into any change: digest-to-batch *positional* alignment is
+//! an emergent property of two parallel walks in `crates/consensus/executor/`, not an assertion in
+//! this crate; and `close_epoch` is not part of the consensus digest at all — it is derived
+//! node-locally, and a deserialized [`ConsensusOutput`] always reports `false`.
 
 // silence unused lib deps that are used in IT tests
 #![allow(unused_crate_dependencies)]
@@ -74,7 +88,7 @@ pub struct ExecutorEngine {
     /// Accumulator for epoch gas usage.
     gas_accumulator: GasAccumulator,
     /// Channel to notify consensus about processed outputs.
-    /// Sends (leader_round, consensus_num_hash, Option<SealedHeader>) after each
+    /// Sends (leader_round, consensus_num_hash, `Option<SealedHeader>`) after each
     /// ConsensusOutput is processed.
     engine_update_tx: mpsc::Sender<EngineUpdate>,
 }

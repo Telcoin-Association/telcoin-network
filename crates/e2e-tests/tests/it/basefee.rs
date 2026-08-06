@@ -33,9 +33,10 @@
 //! - These testnets run with skip-empty-execution: blocks are produced only when transactions exist
 //!   or an epoch closes. The epoch-boundary/close blocks are produced by the *closing* producer and
 //!   carry the chain-seeded (previous-epoch) fee — they do **not** reflect the fee they record for
-//!   the next epoch. That new fee first appears on the next block committed, which is a
-//!   **transaction-bearing block inside the new epoch** — or, if that epoch stays idle, its own
-//!   closing block.
+//!   the next epoch. That new fee first appears on the next **transaction-bearing block inside the
+//!   new epoch**, and only there: an empty epoch-closing block copies its parent's fee verbatim
+//!   (`crates/engine/src/payload_builder.rs:124`), so an epoch that stays idle closes on the
+//!   previous fee rather than the one it recorded.
 //! - The testnet is single-worker (worker 0), so every block's `base_fee_per_gas` is worker 0's
 //!   fee. A submitted transaction must carry a `gas_price >= base_fee` or the pool treats it as
 //!   underpriced and it never lands — for the static-fee tests we price transactions above the
@@ -63,9 +64,9 @@ use tokio::time::Instant;
 use tracing::info;
 
 use crate::common::{
-    address_from_word, current_epoch, get_balance, get_block, get_block_number, get_key,
+    address_from_word, current_epoch, get_balance, get_block_number, get_key,
     get_latest_consensus_header_number, get_tx_receipt_block, kill_child, network_advancing,
-    parse_hex_u64, send_tel, start_validator, wait_for_epoch_at_least, wait_for_mid_epoch,
+    read_base_fee, send_tel, start_validator, wait_for_epoch_at_least, wait_for_mid_epoch,
     wait_for_rpc, EpochSnapshot, ProcessGuard,
 };
 
@@ -963,19 +964,6 @@ async fn land_tx_and_read_fee(
     let block = get_tx_receipt_block(node, &tx_hash)?;
     let fee = read_base_fee(node, block)?;
     Ok((block, fee))
-}
-
-/// Read the `baseFeePerGas` (as `u64`) of `block_number` from `node` via `eth_getBlockByNumber`.
-///
-/// The testnet runs a single worker (worker 0), so every block's base fee is worker 0's fee.
-fn read_base_fee(node: &str, block_number: u64) -> eyre::Result<u64> {
-    let block = get_block(node, Some(block_number))?;
-    let raw = block
-        .get("baseFeePerGas")
-        .ok_or_else(|| eyre::eyre!("block {block_number} on {node} has no baseFeePerGas field"))?;
-    parse_hex_u64(raw).ok_or_else(|| {
-        eyre::eyre!("block {block_number} on {node} baseFeePerGas is not a hex u64: {raw:?}")
-    })
 }
 
 /// Poll `node` for up to `max_secs` until it has produced at least `block_number`, then return

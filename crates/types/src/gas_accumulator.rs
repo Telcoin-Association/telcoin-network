@@ -85,9 +85,21 @@ pub enum WorkerFeeConfig {
 ///
 /// The engine encodes `difficulty` as `batch_index << 16 | worker_id` (matching how
 /// [`GasAccumulator::inc_block`] callers attribute blocks), so the worker id is the low 16 bits and
-/// the batch index occupies the upper bits. This is the single canonical implementation shared by
-/// the per-worker fee/gas derivation (`tn_node`) and the snapshot fee-derivability precheck
-/// (`tn_reth`), so both attribute headers with the exact same rule — no drift.
+/// the batch index occupies the upper bits.
+///
+/// ONE production consumer: `catchup_accumulator`'s startup accumulator restore (in
+/// `node::manager`), which bounds every scanned header's worker id against the on-chain worker
+/// count and then folds each header's gas into that worker's slot. It is NOT a fee derivation — the
+/// entered epoch's fees come from the closing block's `WorkerConfigs` record through
+/// [`entry_fee_for_worker`], which needs no header attribution at all. `tn-reth`'s `snapshot`
+/// module re-exports the name; every use there is a test.
+///
+/// The MASK does have a second implementation to stay in sync with:
+/// `tn-reth/src/evm/block.rs`'s `TNBlockExecutionCtx::worker_id` reads the same low 16 bits off
+/// the execution context while a block is being built (and points back here), so a block's
+/// attribution is identical whether it is taken from the context during execution or from the
+/// sealed header afterwards. The accumulator's per-worker totals depend on that agreement, so the
+/// two move together.
 pub fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
     (header.difficulty.into_limbs()[0] & 0xffff) as u16
 }
@@ -518,10 +530,30 @@ pub fn next_base_fee_for_config(
 /// row governance switched from `Eip1559` keeps its last recorded word forever, so `data` is stale
 /// by design for this variant (see the data-semantics doc on [`WorkerConfigEntry`]).
 ///
-/// `Eip1559` reads the recorded word. A zero word maps to `MIN_PROTOCOL_BASE_FEE`, which is
-/// exactly what the whole-epoch header derivation this read replaced computes for every epoch that
-/// closed before the write path activated, so the cutover is value-identical on all pre-activation
-/// history; the same floor lifts a hypothetical governance-written `1..=6` to the protocol minimum.
+/// `Eip1559` reads the recorded word. A zero word maps to `MIN_PROTOCOL_BASE_FEE`, and on
+/// pre-activation history that is the same value the whole-epoch header derivation this read
+/// replaced computed — but the cutover is value-identical only under two premises, neither of which
+/// this function can enforce:
+///
+/// 1. Every pre-activation `Eip1559` row still reads `data == 0`. The write path activates at
+///    `CONSENSUS_REGISTRY_FORK_EPOCH` (in [`crate::forks`]; adiri-gated, so no intra-doc link),
+///    whose pre-deploy checklist requires confirming exactly that on the live contract, and whose
+///    adiri rollout constraint forbids ANY `WorkerConfigs` write until the fork epoch has passed —
+///    a `setWorkerConfig` that lands a word included, and so is a fee-neutral-looking `Static { fee
+///    }` -> `Eip1559 { target_gas: u64::MAX }` flip, which has this read price MIN where the header
+///    derivation priced ~0.875 · `fee`. See that constant's doc for the full constraint; a non-zero
+///    word landed pre-fork splits the fleet through the exact-equality basefee check, and one above
+///    `u64::MAX` fail-hards it (below).
+/// 2. Pre-activation header base fees never rose above MIN on the live chain. The deleted
+///    derivation anchored its fold on the header `base_fee_per_gas` of the worker's LAST genuine
+///    block, falling back to MIN only on the epoch-0 base case, a slot not yet configured at the
+///    boundary, or an anchor that was itself MIN — an idle worker with no block in the scanned
+///    range was walked back to the last epoch it produced in, and a `Static` row was pinned to its
+///    configured fee. So MIN is what it computed only where that anchor was itself MIN. This is an
+///    empirical fact about adiri (no governance target has moved a worker's fee off the protocol
+///    minimum yet), NOT a structural identity.
+///
+/// The same floor lifts a hypothetical governance-written `1..=6` to the protocol minimum.
 ///
 /// # Errors
 ///

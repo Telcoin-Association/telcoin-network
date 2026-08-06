@@ -23,9 +23,6 @@ pub enum BatchBuilderError {
     /// The next batch digest is missing.
     #[error("Missing next batch digest for recovered sealed block with senders.")]
     NextBatchDigestMissing,
-    /// The block body and senders lengths don't match.
-    #[error("Failed to seal block with senders - lengths don't match")]
-    SealBlockWithSenders,
     /// The oneshot channel that receives the ack that the block was persisted and being proposed.
     #[error("Fatal error: failed to receive ack reply that new block was built. Shutting down...")]
     AckChannelClosed,
