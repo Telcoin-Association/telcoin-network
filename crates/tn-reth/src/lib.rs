@@ -147,7 +147,7 @@ pub use evm::{
     grantMintRoleCall, hasMintRoleCall, mintCall, revokeMintRoleCall, totalSupplyCall,
     BLS_G1_PRECOMPILE_ADDRESS, TELCOIN_PRECOMPILE_ADDRESS,
 };
-pub use forward::WorkerRpcForwarder;
+pub use forward::{ForwardTargetPolicy, WorkerRpcForwarder};
 pub use metrics::report_db_metrics;
 pub use types::*;
 
