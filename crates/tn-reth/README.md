@@ -237,6 +237,9 @@ All fee handling lives in `TNEvmHandler` (`src/evm/handler.rs`); system calls by
   set, `basefee_address()` falls back to `GOVERNANCE_SAFE_ADDRESS`. Every node in the fleet must
   agree on this value — a node with a different base-fee address computes different state roots
   and forks off (the doc comment on `set_basefee_address` says exactly this).
+  `Parameters::validate_operational_floors` (`tn-config`) refuses an unset `basefee_address` at
+  the production entry points, so a node whose `parameters.yaml` lost the key fails to start with
+  an error instead of reaching this fallback in silence.
 
 ## Precompiles
 
