@@ -443,4 +443,122 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    /// The committed mainnet placeholder owner: `--consensus-registry-owner` AND the
+    /// dev-funded account of the committed `chain-configs/mainnet/genesis.yaml` (see
+    /// `etc/genesis.sh`); restated here so regeneration reproduces the same identity.
+    const MAINNET_PLACEHOLDER_OWNER: &str = "0x3DCc9a6f3A71F0A6C8C659c65558321c374E917a";
+
+    /// Regenerate the committed `chain-configs/mainnet/{genesis,committee,parameters}.yaml`
+    /// placeholders from the CURRENT tn-contracts artifacts (issue #1063).
+    ///
+    /// WHEN to run: after a tn-contracts submodule/artifact bump, or whenever the tn-config
+    /// mainnet gates fail (`mainnet_genesis_registry_code_matches_current_artifact` /
+    /// `mainnet_chain_configs_load_via_the_node_paths` in `crates/config`, or
+    /// `test_mainnet_genesis_registry_serves_post_fork_reads` in `crates/tn-reth`).
+    ///
+    /// HOW to run: `cargo test -p telcoin-network-cli regenerate_mainnet_chain_configs --
+    /// --ignored` then commit the three rewritten yaml files.
+    ///
+    /// This is the full genesis ceremony (`GenesisArgs::execute`) driven in-process the same
+    /// way the e2e suite drives it (`crates/e2e-tests/src/lib.rs`): mint 4 placeholder
+    /// validators via the in-process keytool, then run the ceremony with flags mirroring the
+    /// committed placeholder identity:
+    /// - chain id 0x1e7 (487), unchanged from the committed genesis;
+    /// - owner + dev-funded account [`MAINNET_PLACEHOLDER_OWNER`];
+    /// - basefee address 0x99..99, preserving the committed parameters.yaml;
+    /// - epoch duration 86400s, decoded from the committed registry `StakeConfig` storage (stake
+    ///   amount / min withdrawal / epoch issuance stay on the clap defaults, which also match the
+    ///   committed storage: 1M TEL / 1k TEL / 25,806 TEL);
+    /// - 1s max/min header delays, preserving the committed parameters.yaml.
+    ///
+    /// The validator BLS/network keys are freshly minted placeholders by design: the
+    /// committed placeholder identities' proof-of-possession signatures cannot be
+    /// reproduced (the keytool mints random keys), and `chain-configs/README.md` documents
+    /// these files as placeholders until the real mainnet ceremony.
+    ///
+    /// All three ceremony outputs are read into memory BEFORE any file under
+    /// `chain-configs/mainnet` is written, so a missing/unreadable output aborts without
+    /// leaving a half-regenerated (2-of-3) config set behind.
+    #[test]
+    #[ignore = "regenerates chain-configs/mainnet in the working tree from the current tn-contracts artifacts; run explicitly after an artifact bump or when the mainnet config gates fail"]
+    fn regenerate_mainnet_chain_configs() {
+        use crate::keytool::KeyArgs;
+        use clap::Parser as _;
+        use tn_types::test_utils::CommandParser;
+
+        let tmp = tempfile::tempdir().expect("tempdir for the mainnet regeneration ceremony");
+        let shared = tmp.path().join("mainnet-genesis");
+        let validators_dir = shared.join("genesis").join("validators");
+        std::fs::create_dir_all(&validators_dir).expect("create genesis validators dir");
+
+        // placeholder validators mirror the committed placeholder execution addresses
+        let placeholders = [
+            ("validator-1", "0x1111111111111111111111111111111111111111"),
+            ("validator-2", "0x2222222222222222222222222222222222222222"),
+            ("validator-3", "0x3333333333333333333333333333333333333333"),
+            ("validator-4", "0x4444444444444444444444444444444444444444"),
+        ];
+        placeholders.iter().for_each(|(name, address)| {
+            let datadir = tmp.path().join(name);
+            let keytool = CommandParser::<KeyArgs>::parse_from([
+                "tn",
+                "generate",
+                "validator",
+                "--address",
+                address,
+            ]);
+            keytool.args.execute(datadir.clone(), None).expect("keytool generate validator");
+            std::fs::copy(
+                datadir.join("node-info.yaml"),
+                validators_dir.join(format!("{name}.yaml")),
+            )
+            .expect("copy node-info.yaml into the shared genesis dir");
+        });
+
+        let ceremony = CommandParser::<GenesisArgs>::parse_from([
+            "tn",
+            "--chain-id",
+            "0x1e7",
+            "--consensus-registry-owner",
+            MAINNET_PLACEHOLDER_OWNER,
+            "--dev-funded-account",
+            MAINNET_PLACEHOLDER_OWNER,
+            "--basefee-address",
+            "0x9999999999999999999999999999999999999999",
+            "--epoch-duration-in-secs",
+            "86400",
+            "--max-header-delay-ms",
+            "1000",
+            "--min-header-delay-ms",
+            "1000",
+        ]);
+        ceremony.args.execute(shared.clone()).expect("mainnet genesis ceremony");
+
+        // splice the ceremony output over the committed placeholders: read ALL three
+        // outputs first (any read failure aborts before chain-configs is touched), then
+        // write, so a partial ceremony can never leave a half-regenerated config set
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("chain-configs")
+            .join("mainnet");
+        let outputs = [
+            (shared.join("genesis").join("genesis.yaml"), target.join("genesis.yaml")),
+            (shared.join("genesis").join("committee.yaml"), target.join("committee.yaml")),
+            (shared.join("parameters.yaml"), target.join("parameters.yaml")),
+        ];
+        let contents: Vec<(std::path::PathBuf, Vec<u8>)> = outputs
+            .into_iter()
+            .map(|(source, destination)| {
+                let bytes = std::fs::read(&source)
+                    .unwrap_or_else(|e| panic!("read ceremony output {}: {e}", source.display()));
+                (destination, bytes)
+            })
+            .collect();
+        contents.iter().for_each(|(destination, bytes)| {
+            std::fs::write(destination, bytes)
+                .unwrap_or_else(|e| panic!("write regenerated {}: {e}", destination.display()))
+        });
+    }
 }
