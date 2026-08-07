@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::{
     config::{GatewayConfig, UpstreamWorker},
-    ratelimit::RateLimit,
+    ratelimit::{PrefixLen, PrefixPolicy, RateLimit},
 };
 
 /// Stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
@@ -155,6 +155,30 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST", default_value_t = 0)]
     pub(crate) rate_limit_per_ip_burst: u32,
 
+    /// IPv6 network prefix, in bits, that a client address is masked to before
+    /// it keys its per-IP bucket. The default `/64` is the smallest subnet
+    /// routed to one customer, so a client rotating addresses inside its own
+    /// allocation keeps spending one bucket instead of minting a fresh one per
+    /// address. Widen it (up to `/128`) only to meter individual addresses.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX",
+        default_value_t = crate::ratelimit::DEFAULT_V6_PREFIX
+    )]
+    pub(crate) rate_limit_per_ip_v6_prefix: u8,
+
+    /// IPv4 network prefix, in bits, that a client address is masked to before
+    /// it keys its per-IP bucket. The default `/32` is a single address: it
+    /// preserves the gateway's per-address behaviour and never groups unrelated
+    /// customers that share one carrier-grade NAT. Narrow it only for a
+    /// deployment whose clients genuinely map to larger IPv4 allocations.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX",
+        default_value_t = crate::ratelimit::DEFAULT_V4_PREFIX
+    )]
+    pub(crate) rate_limit_per_ip_v4_prefix: u8,
+
     /// Sustained gateway-wide request rate across all clients, in requests per
     /// second (`0` disables the global rate limit).
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_GLOBAL", default_value_t = 3_000)]
@@ -215,6 +239,9 @@ pub(crate) struct Settings {
     pub(crate) max_request_bytes: usize,
     /// Per-client-IP rate limit, or `None` when disabled.
     pub(crate) rate_limit_per_ip: Option<RateLimit>,
+    /// Network prefix each client address is masked to before it keys a
+    /// per-client bucket.
+    pub(crate) rate_limit_prefix: PrefixPolicy,
     /// Gateway-wide rate limit, or `None` when disabled.
     pub(crate) rate_limit_global: Option<RateLimit>,
     /// Graceful-shutdown drain deadline.
@@ -258,6 +285,10 @@ impl Cli {
             );
             Ok(())
         })?;
+        let rate_limit_prefix = resolve_prefix_policy(
+            self.rate_limit_per_ip_v4_prefix,
+            self.rate_limit_per_ip_v6_prefix,
+        )?;
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -274,6 +305,7 @@ impl Cli {
                 self.rate_limit_per_ip,
                 self.rate_limit_per_ip_burst,
             ),
+            rate_limit_prefix,
             rate_limit_global: resolve_rate_limit(
                 self.rate_limit_global,
                 self.rate_limit_global_burst,
@@ -324,6 +356,20 @@ fn resolve_rate_limit(rate: u32, burst: u32) -> Option<RateLimit> {
         // the (non-zero) rate rather than panic if that ever fails to hold.
         RateLimit::new(rate, NonZeroU32::new(burst).unwrap_or(rate))
     })
+}
+
+/// Validate the two per-IP prefix flags into a [`PrefixPolicy`]. A length wider
+/// than its address family allows is a startup error rather than a silently
+/// clamped value: a `/200` in a deployment's config is a typo, and quietly
+/// meaning `/32` would hide it.
+fn resolve_prefix_policy(v4: u8, v6: u8) -> eyre::Result<PrefixPolicy> {
+    PrefixLen::v4(v4)
+        .map_err(|err| eyre::eyre!("invalid --rate-limit-per-ip-v4-prefix: {err}"))
+        .and_then(|v4| {
+            PrefixLen::v6(v6)
+                .map_err(|err| eyre::eyre!("invalid --rate-limit-per-ip-v6-prefix: {err}"))
+                .map(|v6| PrefixPolicy::new(v4, v6))
+        })
 }
 
 /// Reject non-`http` upstream URLs at startup. The gateway is HTTP-only (the
@@ -553,6 +599,36 @@ mod tests {
         assert_eq!(per_ip.rate().get(), 40);
         assert_eq!(per_ip.burst().get(), 50);
         Ok(())
+    }
+
+    #[test]
+    fn per_ip_prefix_defaults_are_v4_32_and_v6_64() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[]).into_settings()?;
+        // /32 keeps IPv4 metering per address; /64 collapses an IPv6
+        // allocation's rotating addresses onto one bucket.
+        assert_eq!(settings.rate_limit_prefix.v4_bits(), 32);
+        assert_eq!(settings.rate_limit_prefix.v6_bits(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn per_ip_prefixes_are_configurable() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[
+            "--rate-limit-per-ip-v4-prefix=24",
+            "--rate-limit-per-ip-v6-prefix=48",
+        ])
+        .into_settings()?;
+        assert_eq!(settings.rate_limit_prefix.v4_bits(), 24);
+        assert_eq!(settings.rate_limit_prefix.v6_bits(), 48);
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_range_per_ip_prefix_is_rejected() {
+        let v4 = cli_with_flags(&["--rate-limit-per-ip-v4-prefix=33"]).into_settings();
+        assert!(v4.is_err(), "a /33 IPv4 prefix must fail startup, not be clamped");
+        let v6 = cli_with_flags(&["--rate-limit-per-ip-v6-prefix=129"]).into_settings();
+        assert!(v6.is_err(), "a /129 IPv6 prefix must fail startup, not be clamped");
     }
 
     #[test]

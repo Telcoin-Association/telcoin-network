@@ -8,6 +8,28 @@
 //! [`RethEnvMetrics`] for per-series semantics. [`report_db_metrics`] additionally samples reth
 //! database metrics as a pre-scrape hook.
 //!
+//! Three gauges under the same scope report what the epoch-boundary system calls spend against
+//! the budget they run under: [`EPOCH_CLOSE_SYSTEM_CALL_GAS_USED`] (labelled by `call`),
+//! [`EPOCH_CLOSE_GAS_USED`], and [`EPOCH_CLOSE_SYSTEM_CALL_GAS_LIMIT`]. Nothing else can see that
+//! gas — a system call is submitted with `gas_price: 0`, so it neither pays for gas nor enters
+//! the block's `gas_used`. See [`record_epoch_close_gas`] and `crates/tn-reth/README.md` for the
+//! dashboard and alert queries they are meant to be read with, and for what they do not cover.
+//!
+//! # Two mechanisms in one module
+//!
+//! The counters use the `reth_metrics::Metrics` derive; the epoch-close gauges use the
+//! `metrics::gauge!` / `metrics::describe_gauge!` macros. The split is not stylistic:
+//!
+//! 1. The per-call gauge carries a `call` label, which a derive field cannot express — the derive
+//!    generates one unlabelled series per field.
+//! 2. The macros re-resolve the recorder on every call, whereas the derive's `Default::default()`
+//!    caches the whole struct in a `static OnceLock` (`metrics-derive` `expand.rs`), fixing which
+//!    recorder every later handle records against. That is invisible in production, where one
+//!    recorder is installed before any metric exists, but it makes a test that installs a local
+//!    recorder pass or fail on test ordering. The counter tests below work around it with
+//!    `new_with_labels`; the gauges get the property for free, which is what lets a real epoch
+//!    close be asserted on (`env/epoch.rs`).
+//!
 //! Everything here binds to the process-global `metrics` recorder, so
 //! `tn_metrics::install_recorder` must run first — the node installs it before opening the
 //! database (`RethEnv::new_database`), and [`init`] (called from `RethEnv::new`) then forces
@@ -15,8 +37,9 @@
 
 use reth_metrics::{metrics::Counter, Metrics};
 use std::sync::LazyLock;
+use tracing::warn;
 
-use crate::RethDb;
+use crate::{evm::SYSTEM_CALL_GAS_LIMIT, RethDb};
 
 /// Process-wide metrics for [`crate::RethEnv`].
 ///
@@ -82,10 +105,158 @@ pub fn report_db_metrics(db: &RethDb) {
     db.report_metrics();
 }
 
+/// Gas spent by the epoch-boundary system calls together.
+///
+/// The committed calls the closing block issues to conclude the epoch, NOT every system call it
+/// makes — see the README for what is excluded and why. Each call gets its own budget, so this
+/// total is not the figure [`SYSTEM_CALL_GAS_LIMIT`] bounds; [`EPOCH_CLOSE_SYSTEM_CALL_GAS_USED`]
+/// is.
+const EPOCH_CLOSE_GAS_USED: &str = "tn_reth.epoch_close_gas_used";
+
+/// Gas spent by one epoch-boundary system call, labelled by `call`.
+///
+/// The `call` label is closed over the calls an epoch-closing block can make
+/// (`registry_migration`, `apply_incentives`, `apply_slashes`, `conclude_epoch`,
+/// `record_base_fees`), so it adds no cardinality that grows with the chain.
+const EPOCH_CLOSE_SYSTEM_CALL_GAS_USED: &str = "tn_reth.epoch_close_system_call_gas_used";
+
+/// The per-call gas budget every epoch-boundary system call runs under.
+///
+/// A constant, published so a dashboard or alert expresses headroom as a ratio against the budget
+/// the node actually compiled in rather than against a hardcoded 100000000.
+const EPOCH_CLOSE_SYSTEM_CALL_GAS_LIMIT: &str = "tn_reth.epoch_close_system_call_gas_limit";
+
+/// Gas one epoch-boundary system call may spend before the close logs a warning: four fifths of
+/// [`SYSTEM_CALL_GAS_LIMIT`], or 80M gas.
+///
+/// A warning here is not an incident, it is lead time. [`SYSTEM_CALL_GAS_LIMIT`] participates in
+/// consensus, so raising it is a lockstep fleet upgrade that has to be scheduled; a threshold
+/// that only fired once the budget was gone would provide none.
+///
+/// `registry_migration` is the call the 100M headroom exists for — it walks every validator in one
+/// shot — so it is the one that may legitimately trip this threshold, once, at the fork boundary.
+/// The README's alert query excludes it for that reason.
+const EPOCH_CLOSE_GAS_WARN_THRESHOLD: u64 = SYSTEM_CALL_GAS_LIMIT / 5 * 4;
+
+/// The warning must land strictly before the halt it predicts, or it is not a warning.
+///
+/// A build error rather than a test: the threshold is derived from [`SYSTEM_CALL_GAS_LIMIT`], so
+/// the only way to break the ordering is to edit this arithmetic, and that should not compile.
+const _: () = assert!(EPOCH_CLOSE_GAS_WARN_THRESHOLD < SYSTEM_CALL_GAS_LIMIT);
+
+/// Whether one call has crossed [`EPOCH_CLOSE_GAS_WARN_THRESHOLD`].
+///
+/// Split out from the recording so the boundary is testable without capturing a log line.
+const fn is_thin_headroom(gas: u64) -> bool {
+    gas >= EPOCH_CLOSE_GAS_WARN_THRESHOLD
+}
+
+/// The gas a call SPENT, before EIP-3529 refunds.
+///
+/// This is the quantity a gas limit bounds, and it is not what `ExecutionResult::gas_used`
+/// carries. revm distinguishes `Gas::spent()` (`limit - remaining`) from `Gas::used()`
+/// (`spent - refunded`), and `gas_used` is the latter. The refund is computed after execution and
+/// capped at a fifth of the spend, so it never buys the call more room: a call that exhausts its
+/// limit still halts, while reporting up to a fifth less than it spent.
+///
+/// Publishing `gas_used` would therefore slide the warning threshold with the refund. A call
+/// earning the full refund reports four fifths of its spend, so the 80%-of-budget warning would
+/// not fire until the spend reached the whole 100M — the halt the warning exists to predict. The
+/// refundless case is just as wrong in the other direction: a `conclude_epoch` that exhausted its
+/// budget would be published as 80M, the figure a dashboard reads as a fifth still to spare.
+///
+/// Saturating: two EVM gas figures cannot approach `u64::MAX`, but this runs on a path that is
+/// fatal to the block, so a metric must not be a panic site there.
+pub(crate) const fn gas_spent(gas_used: u64, gas_refunded: u64) -> u64 {
+    gas_used.saturating_add(gas_refunded)
+}
+
+/// What each epoch-boundary system call spent, in the order the closing block issued them.
+///
+/// A list, not a field per call. The boundary's call set is not stable — two calls, then three
+/// (#1012), then four (#1101), plus the legacy pre-fork pair and the one-shot fork migration — and
+/// a fixed struct has to be re-typed for every change. A list absorbs a call that was added, one
+/// that was skipped (`record_base_fees` issues nothing when no worker is EIP-1559), and the legacy
+/// path's shorter sequence, with no type churn.
+///
+/// A call that did not run pushes nothing, so it leaves its series untouched rather than
+/// publishing a zero that reads as "ran, and was free".
+#[derive(Debug, Default)]
+pub(crate) struct EpochCloseGas(Vec<(&'static str, u64)>);
+
+impl EpochCloseGas {
+    /// Record what one system call spent, under the `call` label it is published with.
+    pub(crate) fn push(&mut self, call: &'static str, gas: u64) {
+        self.0.push((call, gas));
+    }
+
+    /// Gas spent by every call that ran.
+    ///
+    /// Saturating: a handful of EVM gas figures cannot sum to anywhere near `u64::MAX`, but the
+    /// total is a metric and must not be a panic site on a path that is fatal to the block.
+    fn total(&self) -> u64 {
+        self.0.iter().fold(0u64, |total, (_, gas)| total.saturating_add(*gas))
+    }
+
+    /// Whether no epoch-boundary system call was recorded.
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Record the gas an epoch-closing block's system calls spent, and warn on thin headroom.
+///
+/// Called once per epoch close from `TNBlockExecutor::finish`, after the boundary calls have
+/// succeeded: a failed call aborts the block, so there is no partial epoch close to report gas
+/// for. Every node runs that closing block, so the series is fleet-wide rather than
+/// proposer-only, and it covers closing blocks re-executed while syncing — a replayed value is
+/// still a true observation of what that epoch cost, which is what makes a `max_over_time` query
+/// over these gauges meaningful.
+///
+/// Publishes nothing at all when no call was recorded, rather than a zero total that would read
+/// as a free boundary — the same rule the per-call series follows.
+pub(crate) fn record_epoch_close_gas(gas: &EpochCloseGas) {
+    if gas.is_empty() {
+        return;
+    }
+
+    metrics::describe_gauge!(
+        EPOCH_CLOSE_GAS_USED,
+        "Gas spent by the epoch-boundary system calls together (not every system call of the \
+         closing block)"
+    );
+    metrics::describe_gauge!(
+        EPOCH_CLOSE_SYSTEM_CALL_GAS_USED,
+        "Gas spent by each epoch-boundary system call, before EIP-3529 refunds"
+    );
+    metrics::describe_gauge!(
+        EPOCH_CLOSE_SYSTEM_CALL_GAS_LIMIT,
+        "Gas budget each epoch-boundary system call runs under"
+    );
+
+    metrics::gauge!(EPOCH_CLOSE_GAS_USED).set(gas.total() as f64);
+    metrics::gauge!(EPOCH_CLOSE_SYSTEM_CALL_GAS_LIMIT).set(SYSTEM_CALL_GAS_LIMIT as f64);
+
+    for &(call, spent) in &gas.0 {
+        metrics::gauge!(EPOCH_CLOSE_SYSTEM_CALL_GAS_USED, "call" => call).set(spent as f64);
+
+        if is_thin_headroom(spent) {
+            warn!(
+                target: "engine",
+                call,
+                gas_spent = spent,
+                gas_limit = SYSTEM_CALL_GAS_LIMIT,
+                "epoch-boundary system call is approaching its gas budget — exhausting it halts \
+                 the chain at an epoch boundary",
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshot};
 
     #[test]
     fn test_metrics_register_and_update() {
@@ -143,5 +314,162 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(0)));
         let (_, _, _, value) = find("tn_reth.invalid_txs_skipped_total");
         assert!(matches!(value, DebugValue::Counter(0)));
+    }
+
+    /// Read one gauge out of a snapshot, selecting by `call` label when one is given.
+    ///
+    /// Generic over the description slot so the recorder's own string type never has to be named
+    /// here.
+    fn gauge<D>(
+        snapshot: &[(metrics_util::CompositeKey, Option<metrics::Unit>, D, DebugValue)],
+        name: &str,
+        call: Option<&str>,
+    ) -> Option<f64> {
+        snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == name
+                    && call.is_none_or(|call| {
+                        key.key().labels().any(|l| l.key() == "call" && l.value() == call)
+                    })
+            })
+            .and_then(|(.., value)| match value {
+                DebugValue::Gauge(g) => Some(g.0),
+                DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+            })
+    }
+
+    /// Record the given calls under a local recorder and return the snapshot.
+    fn record(calls: &[(&'static str, u64)]) -> Snapshot {
+        let mut gas = EpochCloseGas::default();
+        for &(call, spent) in calls {
+            gas.push(call, spent);
+        }
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || record_epoch_close_gas(&gas));
+        snapshotter.snapshot()
+    }
+
+    /// A successful call's spend is its `gas_used` plus the refund it earned.
+    ///
+    /// The whole point of [`gas_spent`]: `ExecutionResult::gas_used` is already net of the refund,
+    /// and these gauges have to publish the figure the budget bounds. Returning `gas_used` here
+    /// would understate a call's budget consumption by up to a fifth.
+    #[test]
+    fn test_gas_spent_adds_the_refund_back() {
+        // the worst case: a full EIP-3529 refund on a call that exhausted its budget
+        assert_eq!(
+            gas_spent(80_000_000, 20_000_000),
+            SYSTEM_CALL_GAS_LIMIT,
+            "spend is used + refunded"
+        );
+        assert_eq!(gas_spent(21_000, 0), 21_000, "no refund leaves the figure unchanged");
+    }
+
+    #[test]
+    fn test_records_a_series_per_call_plus_the_total_and_the_budget() {
+        let snapshot = record(&[
+            ("apply_incentives", 1_000),
+            ("apply_slashes", 2_000),
+            ("conclude_epoch", 3_000),
+            ("record_base_fees", 4_000),
+        ])
+        .into_vec();
+
+        assert_eq!(
+            gauge(&snapshot, EPOCH_CLOSE_GAS_USED, None),
+            Some(10_000.0),
+            "the total gauge must sum every call that ran"
+        );
+        assert_eq!(
+            gauge(&snapshot, EPOCH_CLOSE_SYSTEM_CALL_GAS_LIMIT, None),
+            Some(SYSTEM_CALL_GAS_LIMIT as f64),
+            "the budget gauge must publish the compiled-in limit"
+        );
+
+        for (call, expected) in [
+            ("apply_incentives", 1_000.0),
+            ("apply_slashes", 2_000.0),
+            ("conclude_epoch", 3_000.0),
+            ("record_base_fees", 4_000.0),
+        ] {
+            assert_eq!(
+                gauge(&snapshot, EPOCH_CLOSE_SYSTEM_CALL_GAS_USED, Some(call)),
+                Some(expected),
+                "call={call} gas"
+            );
+        }
+    }
+
+    /// A skipped call must leave its series absent, not publish a zero.
+    ///
+    /// `record_base_fees` is the live case: a closing block with no EIP-1559 worker issues no
+    /// system call at all. `registry_migration` is the other, on every close but one.
+    #[test]
+    fn test_a_call_that_did_not_run_publishes_no_series() {
+        let snapshot = record(&[("apply_incentives", 2_000), ("conclude_epoch", 3_000)]).into_vec();
+
+        for absent in ["registry_migration", "apply_slashes", "record_base_fees"] {
+            assert!(
+                gauge(&snapshot, EPOCH_CLOSE_SYSTEM_CALL_GAS_USED, Some(absent)).is_none(),
+                "a skipped call ({absent}) must not publish a zero"
+            );
+        }
+        assert_eq!(
+            gauge(&snapshot, EPOCH_CLOSE_SYSTEM_CALL_GAS_USED, Some("conclude_epoch")),
+            Some(3_000.0),
+            "the calls that ran must still be recorded"
+        );
+    }
+
+    /// The same rule applied to the aggregate gauges: no observation, no series.
+    ///
+    /// A zero total would read as an epoch boundary that concluded for free, which is exactly the
+    /// misreading the per-call rule above exists to prevent.
+    #[test]
+    fn test_a_close_that_recorded_nothing_publishes_nothing() {
+        let snapshot = record(&[]).into_vec();
+        assert!(snapshot.is_empty(), "an empty close must publish no series at all: {snapshot:?}");
+    }
+
+    /// Pin the warning boundary itself, not just the constant's arithmetic.
+    ///
+    /// The warning is the only signal that fires without a dashboard, so an inverted or deleted
+    /// comparison has to fail a test. Asserting on the constant alone would catch neither. (That
+    /// the threshold sits below the budget at all is a build-time assertion, not a test.)
+    ///
+    /// The literal is deliberate: raising [`SYSTEM_CALL_GAS_LIMIT`] should break this test, since
+    /// the README quotes both figures in its alert query.
+    #[test]
+    fn test_warn_fires_at_four_fifths_of_the_budget_and_not_below() {
+        assert_eq!(EPOCH_CLOSE_GAS_WARN_THRESHOLD, 80_000_000);
+
+        assert!(!is_thin_headroom(0), "an idle boundary must not warn");
+        assert!(
+            !is_thin_headroom(EPOCH_CLOSE_GAS_WARN_THRESHOLD - 1),
+            "one gas below the threshold must not warn"
+        );
+        assert!(is_thin_headroom(EPOCH_CLOSE_GAS_WARN_THRESHOLD), "the threshold itself must warn");
+        assert!(is_thin_headroom(SYSTEM_CALL_GAS_LIMIT), "an exhausted budget must warn");
+    }
+
+    /// Recording twice in one process must reach the recorder installed for the second close.
+    ///
+    /// This is the ordering hazard that rules out the `Metrics` derive for these gauges: handles
+    /// cached by `Default::default()` bind to whichever recorder ran first, so the second close
+    /// would land in the first recorder and this snapshot would come back empty.
+    #[test]
+    fn test_a_second_close_binds_to_the_live_recorder() {
+        let first = record(&[("apply_incentives", 1), ("conclude_epoch", 1)]).into_vec();
+        let second = record(&[("apply_incentives", 2_000), ("conclude_epoch", 3_000)]).into_vec();
+
+        assert_eq!(gauge(&first, EPOCH_CLOSE_GAS_USED, None), Some(2.0));
+        assert_eq!(
+            gauge(&second, EPOCH_CLOSE_GAS_USED, None),
+            Some(5_000.0),
+            "the second close must be recorded against the recorder installed for it"
+        );
     }
 }

@@ -109,7 +109,7 @@ enum PackMessage {
     ContainsBatch(B256, oneshot::Sender<bool>),
     Batch(B256, oneshot::Sender<Option<Batch>>),
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
-    LatestConsensusHeader(oneshot::Sender<Option<ConsensusHeader>>),
+    LatestConsensusHeader(oneshot::Sender<Result<Option<ConsensusHeader>, PackError>>),
     Shutdown,
     // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
     /// become visible to other file handles on the same file (visibility, not durability).
@@ -573,12 +573,15 @@ impl ConsensusPack {
     /// Return the latest consensus header by reading directly from the pack index.
     /// Unlike consensus_header_latest on ConsensusChain, this does not rely on the
     /// slot files (LatestConsensus) and is always consistent with read_last_committed.
-    pub async fn latest_consensus_header(&self) -> Option<ConsensusHeader> {
+    ///
+    /// Fails closed: a read or channel failure is returned, never reported as "no header". See the
+    /// note on the inner reader.
+    pub async fn latest_consensus_header(&self) -> Result<Option<ConsensusHeader>, PackError> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::LatestConsensusHeader(tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
+            rx.await.unwrap_or(Err(PackError::SendFailed))
         } else {
-            None
+            Err(PackError::SendFailed)
         }
     }
 
@@ -1098,11 +1101,28 @@ impl Inner {
     }
 
     /// Retrieve a consensus header by digest.
+    ///
+    /// Returns `None` both for a digest that was never written here (a legitimate, quiet miss)
+    /// and for a record the index claims exists but that could not be read; the latter is logged
+    /// at `error!` first so a stored-but-unreadable header can never be silently mistaken for an
+    /// absent one. The `Option` return shape is kept to bound the blast radius of this
+    /// hardening. Under the epoch-gated seed-signature serde, pre-fork packs stay decodable and
+    /// the logged arms should never fire - they are the difference between a loud signal and
+    /// silent chain corruption for every future format change.
     fn consensus_header_by_digest(
         &mut self,
         digest: ConsensusHeaderDigest,
     ) -> Option<ConsensusHeader> {
-        let pos = self.consensus_digests.load(digest.into()).ok()?;
+        let epoch = self.epoch_meta.epoch;
+        let pos = self
+            .consensus_digests
+            .load(digest.into())
+            .inspect_err(|e| {
+                if !fetch_error_is_absent(e) {
+                    error!(target: "consensus_pack", epoch, ?digest, "consensus digest index lookup failed (not a miss): {e}");
+                }
+            })
+            .ok()?;
         // This is not strickly needed, the fetch below will fail if
         // we try to read past the end of the file but this potentially
         // short circuits a lot of checks for a small cost.
@@ -1110,11 +1130,23 @@ impl Inner {
         if pos >= self.data.file_len() {
             return None;
         }
-        let header = self.data.fetch(pos).ok()?.into_consensus().ok()?;
+        let header = self
+            .data
+            .fetch(pos)
+            .inspect_err(|e| {
+                error!(target: "consensus_pack", epoch, ?digest, pos, "indexed consensus record exists but failed to load from the pack: {e}");
+            })
+            .ok()?
+            .into_consensus()
+            .inspect_err(|e| {
+                error!(target: "consensus_pack", epoch, ?digest, pos, "indexed consensus record exists but did not decode as a consensus header: {e}");
+            })
+            .ok()?;
         // Verify the digest.  There is an extremely unlikely edge case where
         // a repaired DB could write a new header to the same location as an
         // old header.  This makes sure the contract is always intact.
         if header.digest() != digest {
+            error!(target: "consensus_pack", epoch, ?digest, number = header.number, pos, "consensus header loaded from the pack does not hash to its indexed digest");
             return None;
         }
         Some(header)
@@ -1197,13 +1229,18 @@ impl Inner {
     /// Return the latest consensus header by reading directly from the pack index,
     /// bypassing the slot file (LatestConsensus). Used during startup recovery to
     /// get a ground-truth latest header consistent with read_last_committed.
-    fn latest_consensus_header(&mut self) -> Option<ConsensusHeader> {
+    ///
+    /// A read failure is propagated rather than reported as "no header". Recovery uses this
+    /// header's sub-dag as the epoch seed chain anchor, and an absent anchor means "start a fresh
+    /// chain", so collapsing an error into `None` would silently re-root the chain and fork
+    /// execution permanently.
+    fn latest_consensus_header(&mut self) -> Result<Option<ConsensusHeader>, PackError> {
         if self.consensus_pos_idx.is_empty() {
-            return None;
+            return Ok(None);
         }
         let latest_number =
             self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 - 1;
-        self.consensus_header_by_number(latest_number).ok()
+        self.consensus_header_by_number(latest_number).map(Some)
     }
 
     fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
@@ -1304,6 +1341,26 @@ impl Inner {
             rewards_counter.inc_leader_count(header.sub_dag.leader().author());
         }
         Ok(())
+    }
+}
+
+/// True when a [`FetchError`] from a digest-index lookup means the key is simply not present (a
+/// legitimate miss), as opposed to a record that exists but could not be read.
+///
+/// The pack read paths use this to stay quiet on routine misses while logging every other
+/// failure at `error!`: collapsing "exists but unreadable" into a silent `None` is exactly the
+/// failure mode that let a startup resume fall back to a default consensus header at number 0
+/// with no signal. `pub(crate)` so the epoch-record store
+/// ([`crate::epoch_records`]) classifies absence with exactly the same rule instead of growing
+/// a second, divergent classification.
+pub(crate) fn fetch_error_is_absent(err: &FetchError) -> bool {
+    match err {
+        FetchError::NotFound => true,
+        FetchError::DeserializeValue(_)
+        | FetchError::IO(_)
+        | FetchError::CrcFailed
+        | FetchError::RequestedSizeTooLarge(_, _)
+        | FetchError::RequestedDecompressSizeTooLarge(_) => false,
     }
 }
 
@@ -2037,6 +2094,7 @@ pub(crate) mod test {
             1,
             ReputationScores::default(),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         ConsensusOutput::new(
             sub_dag,
@@ -2087,6 +2145,7 @@ pub(crate) mod test {
             sub_dag_index_1,
             reputation_scores,
             previous_sub_dag,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         ConsensusOutput::new(
             subdag_1.clone(),
@@ -2143,6 +2202,7 @@ pub(crate) mod test {
             1,
             ReputationScores::default(),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         let batch_digests: VecDeque<BlockHash> =
             [batch_0.digest(), batch_1.digest(), batch_1.digest(), batch_2.digest()]
@@ -3102,5 +3162,105 @@ pub(crate) mod test {
         let err = verify_epoch_meta(2, &rec1, &meta_for(2, &committee5_next, &rec1))
             .expect_err("shrunken vs full must fail");
         assert!(matches!(err, PackError::InvalidEpoch(2, _)), "got {err:?}");
+    }
+
+    /// Deterministic BLS seed signature for fork-active fixture headers: the keypair comes
+    /// from a seeded rng and BLS signing is deterministic, so the fixture bytes are stable
+    /// across runs.
+    fn nesting_seed_signature(seed: u64) -> tn_types::BlsSignature {
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::Signer as _;
+
+        let keypair = tn_types::BlsKeypair::generate(&mut StdRng::seed_from_u64(seed));
+        keypair.sign(b"pack-nesting-fixture")
+    }
+
+    /// A header pinned to `epoch` whose remaining fields all derive from `tag`, giving each
+    /// fixture header distinct, fully deterministic bytes.
+    fn nesting_header(epoch: tn_types::Epoch, tag: u8) -> tn_types::Header {
+        use tn_types::{AuthorityIdentifier, HeaderDigest};
+
+        HeaderBuilder::default()
+            .author(AuthorityIdentifier::from_bytes([tag; 32]))
+            .round(u32::from(tag))
+            .epoch(epoch)
+            .created_at(u64::from(tag))
+            .parents([HeaderDigest::new([tag; 32])].into_iter().collect())
+            .seed_signature(nesting_seed_signature(u64::from(tag)))
+            .build()
+    }
+
+    /// Tier-1 nesting proof at the pack level (#1032, #1086 PR-1): a [`PackRecord::Consensus`]
+    /// whose sub-DAG nests headers of BOTH wire layouts must round-trip byte-exactly through
+    /// the pack record codec with deep equality and per-element epoch-gate visibility.
+    ///
+    /// Under `adiri` the epoch-0 elements are legacy seven-field headers and the `u32::MAX`
+    /// element carries `seed_signature`, so the record exercises the legacy→V1 and V1→legacy
+    /// visitor hand-offs three levels deep (record → consensus header → sub-DAG → headers);
+    /// without `adiri` every element is fork-active and the same record pins the all-V1 path
+    /// in the default-feature suite.
+    #[test]
+    fn test_pack_record_mixed_epoch_sub_dag_round_trip() {
+        use crate::consensus_pack::PackRecord;
+        use tn_types::{decode, encode, Epoch};
+
+        // Epoch 0 is legacy only under `adiri`; `Epoch::MAX` (the adiri fork placeholder) is
+        // fork-active under every cfg.
+        let headers = vec![
+            nesting_header(0, 0x11),
+            nesting_header(Epoch::MAX, 0x22),
+            nesting_header(0, 0x33),
+        ];
+        let expected_gate: Vec<bool> =
+            headers.iter().map(|header| header.seed_signature().is_some()).collect();
+        // Anti-vacuity: the sub-DAG genuinely mixes both layouts under `adiri`.
+        #[cfg(feature = "adiri")]
+        assert_eq!(vec![false, true, false], expected_gate, "adiri epoch 0 must be legacy");
+        #[cfg(not(feature = "adiri"))]
+        assert_eq!(vec![true, true, true], expected_gate, "non-adiri epochs are all fork-active");
+
+        let consensus = ConsensusHeader {
+            parent_hash: ConsensusHeaderDigest::default(),
+            sub_dag: CommittedSubDag::new_with_headers_for_test(headers),
+            number: 42,
+            extra: Default::default(),
+        };
+        let record = PackRecord::Consensus(Box::new(consensus.clone()));
+
+        // `encode` is exactly the serialization `write_value` runs before framing and
+        // compression, so a byte round trip here is a byte round trip of the stored record.
+        let bytes = encode(&record);
+        let decoded: PackRecord = decode(&bytes);
+        assert_eq!(
+            bytes,
+            encode(&decoded),
+            "re-encode of the decoded pack record must reproduce the original bytes"
+        );
+
+        let decoded_consensus = decoded
+            .into_consensus()
+            .expect("Consensus record must decode back to the Consensus variant");
+        assert_eq!(consensus, decoded_consensus, "pack-record round trip must be deeply equal");
+        assert_eq!(
+            consensus.digest(),
+            decoded_consensus.digest(),
+            "consensus header digest must survive the round trip"
+        );
+        assert_eq!(
+            consensus.sub_dag.digest(),
+            decoded_consensus.sub_dag.digest(),
+            "sub-dag digest must survive the round trip"
+        );
+
+        let decoded_gate: Vec<bool> = decoded_consensus
+            .sub_dag
+            .headers()
+            .iter()
+            .map(|header| header.seed_signature().is_some())
+            .collect();
+        assert_eq!(
+            expected_gate, decoded_gate,
+            "per-element gate visibility must survive the round trip"
+        );
     }
 }

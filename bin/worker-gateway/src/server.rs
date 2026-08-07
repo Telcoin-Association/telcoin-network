@@ -328,7 +328,11 @@ fn set_tcp_user_timeout(_stream: &TcpStream, _timeout: Duration) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::UpstreamWorker, proxy::MAX_REQUEST_BYTES, ratelimit::RateLimit};
+    use crate::{
+        config::UpstreamWorker,
+        proxy::MAX_REQUEST_BYTES,
+        ratelimit::{PrefixPolicy, RateLimit},
+    };
     use axum::{http::HeaderMap, routing::post};
     use std::num::NonZeroU32;
     use tn_types::Notifier;
@@ -618,8 +622,13 @@ mod tests {
         state.readiness.set_ready(0, true);
         // Global limit of one request with no burst headroom: the first request
         // passes, the second (same instant, no refill) is rejected with 429.
-        let limiters =
-            RateLimiters::new(None, Some(RateLimit::new(nz(1), nz(1))), 16).expect("limiters");
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
         let (addr, _shutdown) =
             spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
 
@@ -649,8 +658,13 @@ mod tests {
         // A maximally strict global limit (burst 1). If probes were rate-limited,
         // the second `/health` hit would be 429; they must stay 200 so an
         // orchestrator does not kill the pod under load.
-        let limiters =
-            RateLimiters::new(None, Some(RateLimit::new(nz(1), nz(1))), 16).expect("limiters");
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
         let (addr, _shutdown) =
             spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
 

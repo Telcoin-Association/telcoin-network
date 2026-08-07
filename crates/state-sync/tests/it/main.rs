@@ -33,7 +33,14 @@ async fn test_sync_save_consensus() {
 
     // Create a CommittedSubDag
     let reputation = ReputationScores::new(&committee);
-    let sub_dag = CommittedSubDag::new(certificates.clone(), leader.clone(), 0, reputation, None);
+    let sub_dag = CommittedSubDag::new(
+        certificates.clone(),
+        leader.clone(),
+        0,
+        reputation,
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
 
     // Create ConsensusOutput using struct initialization
     let output =
@@ -82,7 +89,14 @@ async fn test_sync_parent_hash_chain() {
     for i in 1..=3u64 {
         let leader = certificates.last().cloned().unwrap();
         let reputation = ReputationScores::new(&committee);
-        let sub_dag = CommittedSubDag::new(certificates.clone(), leader, i - 1, reputation, None);
+        let sub_dag = CommittedSubDag::new(
+            certificates.clone(),
+            leader,
+            i - 1,
+            reputation,
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
 
         let output =
             ConsensusOutput::new(sub_dag.clone(), parent_hash, i, false, VecDeque::new(), vec![]);
@@ -135,7 +149,14 @@ async fn test_sync_lookup_by_hash() {
     let leader = certificates.last().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
-    let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
+    let sub_dag = CommittedSubDag::new(
+        certificates,
+        leader,
+        0,
+        reputation,
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
 
     let output =
         ConsensusOutput::new(sub_dag.clone(), B256::ZERO.into(), 1, false, VecDeque::new(), vec![]);
@@ -169,7 +190,14 @@ async fn test_digest_determinism() {
     let leader = certificates.last().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
-    let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
+    let sub_dag = CommittedSubDag::new(
+        certificates,
+        leader,
+        0,
+        reputation,
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
 
     let parent_hash: ConsensusHeaderDigest = B256::ZERO.into();
     let number = 1u64;
@@ -195,7 +223,14 @@ async fn test_digest_collision_resistance() {
     let leader = certificates.last().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
-    let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
+    let sub_dag = CommittedSubDag::new(
+        certificates,
+        leader,
+        0,
+        reputation,
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
 
     // Same subdag but different parent_hash
     let digest_parent_zero = ConsensusHeader::digest_from_parts(B256::ZERO.into(), &sub_dag, 1);
@@ -233,7 +268,14 @@ async fn test_digest_mismatch_detection() {
     let leader = certificates.last().cloned().unwrap();
 
     let reputation = ReputationScores::new(&committee);
-    let sub_dag = CommittedSubDag::new(certificates, leader, 0, reputation, None);
+    let sub_dag = CommittedSubDag::new(
+        certificates,
+        leader,
+        0,
+        reputation,
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
 
     // Save block 1 with correct parent (ZERO)
     let output1 =

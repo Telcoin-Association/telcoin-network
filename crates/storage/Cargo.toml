@@ -46,14 +46,19 @@ tn-reth = { workspace = true }
 tn-test-utils = { workspace = true }
 rand = { workspace = true }
 roaring = { workspace = true }
-# Async barrier tests for the durable `persist` need a runtime + timers.
-tokio = { workspace = true, features = [ "macros", "rt", "time" ] }
+# Async barrier tests for the durable `persist` need a runtime + timers. `test-util` is for the
+# paused-clock tests of the bounded waits in `epoch_records`, which would otherwise depend on
+# another workspace member happening to enable it for the whole build.
+tokio = { workspace = true, features = [ "macros", "rt", "time", "test-util" ] }
 
 [features]
 redb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
 default = ["reth-libmdbx"]
-test-utils = []
+# Re-exports tn-types' test hooks: `make build-e2e-bin` enables `tn-storage/test-utils` on the
+# node binary, and the `TN_SEED_SIGNATURE_FORK_EPOCH` override the e2e harness pins lives
+# behind `tn-types/test-utils`. Left empty, the e2e binary cannot consult the override at all.
+test-utils = ["tn-types/test-utils"]
 # Adiri testnet fork logic gated on `tn_types::forks` — pull in the constants.
 adiri = ["tn-types/adiri"]
 

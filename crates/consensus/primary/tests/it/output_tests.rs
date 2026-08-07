@@ -30,6 +30,7 @@ fn test_zero_timestamp_in_sub_dag() {
         1,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
 
     // AND commit timestamp is the leader's timestamp
@@ -64,6 +65,7 @@ fn test_monotonically_incremented_commit_timestamps() {
         1,
         ReputationScores::default(),
         None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
 
     // AND commit timestamp is the leader's timestamp
@@ -89,6 +91,7 @@ fn test_monotonically_incremented_commit_timestamps() {
         2,
         ReputationScores::default(),
         Some(sub_dag_round_2.clone()),
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
 
     // THEN the latest sub dag should have the highest committed timestamp - basically the

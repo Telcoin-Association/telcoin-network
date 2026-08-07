@@ -1,4 +1,4 @@
-# Consensus Reputation Schedule — Evaluation & Invariants Reference
+# Consensus Reputation Schedule: Evaluation & Invariants Reference
 
 This document is the single source of truth for the telcoin-network **consensus**
 reputation system: how scores are earned, how they clear, and how they affect
@@ -226,7 +226,7 @@ constraint in Section 0. None of these are implemented by this document; it is a
 evaluation to inform a maintainer decision, because every option that changes
 scoring or reset cadence is a coordinated fork.
 
-### F1 — Byzantine behavior has no reputation impact (core of #942)
+### F1: Byzantine behavior has no reputation impact (core of #942)
 
 **Statement.** Reputation measures liveness only. Byzantine faults are filtered
 before scoring (Section 1), and the sole consequence of a low score is losing
@@ -248,7 +248,16 @@ DAG. Never source it from local or network-layer observations (F1 determinism).
 This is a design decision, not a patch, and needs maintainer sign-off before any
 code.
 
-### F2 — The hard reset gives reputation no long-term memory (core of #942)
+**Maintainer disposition (sstanfield, PR #983 review).** Liveness-only scoring
+is understood to be intentional Bullshark-lineage design ("I am almost certain"
+it comes from the Bullshark paper): the score measures liveness, not malice,
+byzantine defense stays in certificate/DAG validation and the staking layer,
+and the mechanism exists to minimize how often a flaky committee member is
+selected as leader while staying simple and deterministic. "Personally I think
+this is fine." F1 therefore stands as by-design unless a future decision adds a
+byzantine signal.
+
+### F2: The hard reset gives reputation no long-term memory (core of #942)
 
 **Statement.** Every 60 commits the scores are zeroed with no carry-over
 (Section 2.1). A node flagged "bad" in one window re-enters the next at zero and
@@ -270,15 +279,22 @@ accumulate. Within-window carry already exists (the `clone` branch of
 must be integer arithmetic (F6), and cross-**epoch** carry is unsafe as written
 (F3) because the committee key set changes.
 
-### F3 — The reset window is not epoch-aligned
+### F3: The reset window is not epoch-aligned
 
 **Statement.** Because `sub_dag_index` is the leader nonce and `2^31 mod 60 = 8`,
 the reset phase shifts 8 commit-indices per epoch (Section 2.2). Windows drift
-relative to epoch starts. Separately, naive cross-epoch carry of scores is unsafe:
-the first sub-dag of a new epoch generally does not satisfy the reset predicate,
-so if prior-epoch scores were cloned into a changed committee the
-`total_authorities == committee.size()` assert (`bullshark.rs:101`) would panic
-and halt the chain.
+relative to epoch starts. Separately, naive cross-epoch carry of scores would be
+unsafe if ever implemented: the first sub-dag of a new epoch generally does not
+satisfy the reset predicate, so if prior-epoch scores were cloned into a changed
+committee the `total_authorities == committee.size()` assert
+(`bullshark.rs:101`) would panic and halt the chain. This cannot happen today:
+`Bullshark` and `ConsensusState` are rebuilt from scratch once per epoch
+(`primary.rs:88-93`), recovery is scoped to the current epoch ("ignore previous
+epochs", `state.rs:299-304`), and the store read is hard-scoped to that epoch's
+own pack (`storage/consensus.rs:1023-1036`), so `last_committed_sub_dag` is
+`None` at epoch start and the fresh-init branch (`bullshark.rs:76`) runs. This
+is a guardrail for any future cross-epoch carry, not a description of current
+behavior.
 
 **Evidence.** `bullshark.rs:218` (`leader.nonce()`), `header.rs:179` (nonce
 layout), `bullshark.rs:70-77,101`.
@@ -291,7 +307,7 @@ F4 (making the cadence configurable). If cross-epoch carry is ever wanted, it
 must first re-key scores onto the new committee and drop departed authorities,
 never `clone` blindly.
 
-### F4 — Consensus-critical tuning constants live in code, not genesis
+### F4: Consensus-critical tuning constants live in code, not genesis
 
 **Statement.** `CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS = 60` (`primary.rs:33`) and
 `DEFAULT_BAD_NODES_STAKE_THRESHOLD = 33` (`types/primary/mod.rs:32`) are
@@ -307,23 +323,35 @@ prerequisite for ever tuning the reset (F2/F3) safely. It is behavior-preserving
 if the migrated defaults equal the current constants, but it still touches a
 consensus-critical path and warrants its own PR and tests.
 
-### F5 — `swap()` PRNG is an implicit cross-version consensus dependency
+### F5: `swap()` PRNG is an implicit cross-version consensus dependency
 
 **Statement.** `swap` uses `StdRng::from_seed` to pick the replacement good node
-(`leader_schedule.rs:213`). `rand` does not guarantee `StdRng`'s algorithm is
-stable across major versions; a dependency bump could change the selection for
-the same seed and fork validators on different builds.
+(`leader_schedule.rs:213`). `rand` documents `StdRng` as explicitly
+non-portable: "any future library version may replace the algorithm", and
+directs callers who need reproducibility to use `rand_chacha` directly
+(`rand-0.9.2/src/rngs/std.rs:18-24`). A dependency bump could therefore change
+the selection for the same seed and fork validators on different builds.
 
 **Evidence.** `leader_schedule.rs:209-230`.
 
 **Recommendation.** Pin the PRNG to a versioned, reproducible algorithm
-constructed directly (for example `rand_chacha::ChaCha20Rng::from_seed`) so the
-swap choice is stable independent of the `rand` facade version. This changes the
-concrete swap selection once (a one-time coordinated change) and then removes the
-latent hazard permanently. Add a golden test asserting a fixed seed maps to a
-fixed good-node index.
+constructed directly, so the swap choice is stable independent of the `rand`
+facade version. `rand_chacha::ChaCha12Rng::from_seed` matches the algorithm
+`StdRng` wraps in the locked `rand 0.9.2`, so that pin preserves today's swap
+selection exactly with no coordinated change; `rand_chacha` is already a direct
+workspace dependency (`Cargo.toml:199-200`). Pinning `ChaCha20Rng` instead
+would change the concrete swap selection once (a one-time coordinated change).
+Either way the latent hazard is removed permanently. Add a golden test
+asserting a fixed seed maps to a fixed good-node index.
 
-### F6 — The classification statistics are integer, but any future float is a fork risk
+**Status.** Implemented. `swap` now seeds `ChaCha12Rng` directly, and
+`test_swap_good_node_selection_is_pinned` in
+`src/consensus/tests/leader_schedule_tests.rs` pins the mapping from
+`leader_round` to good-node index. The pinned indices were checked against the
+ones `StdRng` produces under `rand 0.9.2` and are identical, so the pin changed
+no behavior.
+
+### F6: The classification statistics are integer, but any future float is a fork risk
 
 **Statement.** Classification uses integer mean/variance and one float:
 `(variance as f64).sqrt() as u64` (`leader_schedule.rs:94`). IEEE-754 mandates
@@ -338,7 +366,7 @@ whose order is not pinned can diverge.
 adopted, implement it as integer halving or a fixed integer subtraction, never a
 float formula. Treat this as a standing invariant for the subsystem.
 
-### F7 — Test and serde coverage cannot guard a #942 change today
+### F7: Test and serde coverage cannot guard a #942 change today
 
 **Statement.** No test can even observe a byzantine penalty because no penalty
 path exists. The one cross-schedule persistence test
@@ -403,7 +431,7 @@ scores are in the committed digest (Section 0):
   independently-shippable prerequisites that unblock any subsequent change. All
   changes are bound by Section 6.
 
-## Appendix — key locations
+## Appendix: key locations
 
 | What | Where |
 | --- | --- |

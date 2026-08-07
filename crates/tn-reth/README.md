@@ -16,7 +16,9 @@ from the code at the cited paths; when the code and this file disagree, the code
   into `RethEnv`.
 - Each batch in the output becomes one EVM block. An output with no batches and no epoch close is
   skipped entirely; an epoch-closing output with no batches still produces a synthetic closing
-  block (its `ommers_hash` is zero — see `is_worker_batch_block` in `src/snapshot.rs`).
+  block, identifiable by `ommers_hash == B256::ZERO` — the engine passes a zero batch digest for
+  it (`execute_consensus_output` in `crates/engine/src/payload_builder.rs`; see the header field
+  mapping below).
 - Blocks are canonicalized directly: `finish_executing_output` (`src/env/execution.rs`) persists
   the blocks **and** the finalized/safe markers in a single database transaction, then broadcasts
   the canonical-state notification. There is no beacon/engine API, no fork choice, and no reorgs
@@ -38,15 +40,15 @@ TN repurposes several Ethereum header fields for protocol data. Assembly happens
 | Field | TN meaning |
 |---|---|
 | `nonce` | `((epoch as u64) << 32) \| round` of the leader certificate (`tn-types` `primary/header.rs`; decoded by `deconstruct_nonce`). Epoch = high 32 bits, round = low 32 bits. |
-| `difficulty` | `batch_index << 16 \| worker_id`. **`worker_id` is the LOW 16 bits; `batch_index` occupies the upper bits** (`TNBlockExecutionCtx` docs and `context_for_next_block` in `src/evm/config.rs`). `first_batch()` exploits this: `difficulty < 65536` ⇔ `batch_index == 0`. `worker_id_from_header` in `src/snapshot.rs` reads the low 16 bits. |
+| `difficulty` | `batch_index << 16 \| worker_id`. **`worker_id` is the LOW 16 bits; `batch_index` occupies the upper bits** (`TNBlockExecutionCtx` docs and `context_for_next_block` in `src/evm/config.rs`). `first_batch()` exploits this: `difficulty < 65536` ⇔ `batch_index == 0`. `worker_id_from_header` (canonical in `tn-types` `gas_accumulator.rs`, re-exported from `src/snapshot.rs`) reads the low 16 bits. |
 | `mix_hash` | Computed in `crates/engine/src/payload_builder.rs`: `output_digest ^ batch_digest` when the output has batches, plain `output_digest` otherwise. Exposed as `prevrandao` (EIP-4399). |
-| `extra_data` | Empty for a normal block. For an epoch-closing block: the 32-byte keccak256 of the leader certificate's aggregate BLS signature. The replay path (`context_for_block` in `src/evm/config.rs`) accepts only length 0 or 32 and errors on anything else. |
+| `extra_data` | Empty for a normal block. For an epoch-closing block: the 32-byte epoch-close randomness, which is epoch-gated on `seed_signature_active` (legacy keccak256 of the leader certificate's aggregate BLS signature before the fork epoch, epoch seed chain value as of the closing commit from the fork epoch on). The replay path (`context_for_block` in `src/evm/config.rs`) accepts only length 0 or 32 and errors on anything else. |
 | `parent_beacon_block_root` | Digest of the `ConsensusHeader` that committed the executed transactions. Written to the EIP-4788 beacon-roots contract once per consensus output (only on the first batch, `apply_pre_execution_changes` in `src/evm/block.rs`). |
 | `ommers_hash` | Digest of the executed `Batch`; `B256::ZERO` when the output carried no batches. |
 | `beneficiary` | Execution address of the authority that produced the batch; receives priority fees (`src/payload.rs`, `src/evm/handler.rs`). |
 | `base_fee_per_gas` | Taken from the proposed batch; never recomputed or EIP-1559-adjusted during execution (`next_evm_env` in `src/evm/config.rs` uses `payload.base_fee_per_gas` as-is). Base fees are set per worker per epoch and validated at the worker/batch level, allowing parallel per-worker base fees. |
 | `gas_limit` | Taken from the worker's batch (`payload.gas_limit`). |
-| `withdrawals` / `withdrawals_root` | Empty list / `EMPTY_WITHDRAWALS` on normal blocks. On an epoch-closing block the body carries one `Withdrawal` per rewarded validator whose `amount` is the validator's **consensus-leader count, not wei** (`RewardsCounter::generate_withdrawals` in `tn-types` `gas_accumulator.rs`). This is a record only: the TN block executor never credits withdrawal amounts to balances — rewards move through the `concludeEpoch` system call. |
+| `withdrawals` / `withdrawals_root` | Empty list / `EMPTY_WITHDRAWALS` on normal blocks. On an epoch-closing block the body carries one `Withdrawal` per rewarded validator whose `amount` is the validator's **consensus-leader count, not wei** (`RewardsCounter::generate_withdrawals` in `tn-types` `gas_accumulator.rs`). This is a record only: the TN block executor never credits withdrawal amounts to balances — rewards move through the `applyIncentives` system call. |
 | `blob_gas_used` / `excess_blob_gas` | `Some(sum of tx blob gas)` (effectively 0, see blob handling below) and `Some(0)`. |
 | `requests_hash` | Always `EMPTY_REQUESTS_HASH`; the executor returns `Requests::default()` from `finish()` (`src/evm/block.rs`) — there are no EL-triggered requests (no deposit/withdrawal/consolidation request processing). |
 | `timestamp` | The sub-DAG commit timestamp from consensus, not wall clock at execution time. |
@@ -76,27 +78,124 @@ failure**:
 1. *(adiri builds only)* If the epoch being concluded satisfies
    `concluding_epoch + 1 == CONSENSUS_REGISTRY_FORK_EPOCH`, apply the registry fork
    (`apply_consensus_registry_fork`) — code swap plus one-time `migrateValidatorSets()` — so the
-   remaining steps in this same block already run on the upgraded code.
-2. The unified `concludeEpoch(newCommittee, rewardInfos, slashes)` system call
-   (`apply_closing_epoch_contract_call`): the eligible pool (union of `Active`,
-   `PendingActivation`, `PendingExit`) is read from the registry, shuffled by a Fisher-Yates over
-   an `StdRng` seeded with the epoch-close randomness, backfilled from pending-exit validators if
-   the active set is short, and truncated to `getNextCommitteeSize()`; the reward infos carry
-   each validator's consensus-leader count. The registry applies rewards, slashes, and queued
-   stake version settlement internally in that order, so the stage-ordering obligation lives
-   on-chain. An undersized pool fails client-side with `TnRethError::UndersizedCommittee`
-   instead of submitting calldata that reverts on-chain. While the deployed registry still
-   carries the pre-fork adiri code, the close instead replays the legacy `applyIncentives` +
-   `concludeEpoch(address[])` pair through the same code-hash gate as the committee-pool read,
-   keeping pre-fork history re-executable.
-3. `merge_transitions(BundleRetention::Reverts)` folds the system-call state into the bundle.
+   remaining steps in this same block already run on the upgraded code, then the `WorkerConfigs`
+   fork (`apply_worker_configs_fork`), a code-only swap with no initializer call. The two ride the
+   same boundary, in that order, because the registry swap flips this very block's close onto the
+   post-fork sequence, whose fourth call needs the `setWorkerConfigsData` selector the pre-fork
+   `WorkerConfigs` deployment lacks — a build applying one swap but not the other aborts this
+   block.
+2. The four boundary system calls (`apply_closing_epoch_contract_call`), in a client-enforced
+   order that is itself a consensus-safety obligation: `applyIncentives(RewardInfo[])` first
+   (the reward infos carry each validator's consensus-leader count, weighted on pre-slash
+   collateral), then `applySlashes(Slash[])` (the slashes carrier — the protocol passes an
+   empty array today), then `concludeEpoch(address[])` over a committee assembled AFTER the
+   slashes commit: the eligible pool (union of `Active`, `PendingActivation`, `PendingExit`)
+   is read from the registry, shuffled by a Fisher-Yates over an `StdRng` seeded with the
+   epoch-close randomness, backfilled from pending-exit validators if the active set is short,
+   truncated to `getNextCommitteeSize()`, and sorted by address. **The stage-ordering
+   obligation lives in the client** — the registry only enforces the outcome (it validates the
+   committee against post-slash state and reverts `InvalidCommitteeSize` on a stale one). An
+   undersized pool fails client-side with `TnRethError::UndersizedCommittee` instead of
+   submitting calldata that reverts on-chain. Finally `setWorkerConfigsData(uint16[],uint184[])`
+   (`record_next_epoch_base_fees`) writes each EIP-1559 worker's next-epoch base fee into its
+   `WorkerConfigs` `data` word, so a node entering the epoch reads the fee from one state slot
+   instead of rescanning the prior epoch's headers. It trails the registry calls because it
+   touches a different contract — nothing in the epoch transition reads what it writes — and it
+   is skipped entirely when no worker is EIP-1559 (an emptiness every node derives identically
+   from the same contract state, so skipping cannot diverge the fleet). While the deployed
+   registry still carries the pre-fork adiri code, the close instead replays the legacy
+   `applyIncentives` + `concludeEpoch(address[])` pair through the same code-hash gate as the
+   committee-pool read (no interposed `applySlashes` and no base-fee record; the shared selectors
+   are byte-identical), keeping pre-fork history re-executable.
+
+There is deliberately no in-`finish()` transition merge: reth's block-builder/executor wrappers
+merge once after `finish()` returns, and a second merge would push a phantom empty reverts entry
+for every epoch-closing block.
 
 System calls execute as `SYSTEM_ADDRESS` → contract with a fixed 100M gas limit, zero gas price,
 base-fee and nonce checks disabled (`transact_system_call` in `src/evm/mod.rs`);
 `SYSTEM_ADDRESS` is stripped from the changeset before commit so it never enters the state root.
 
-**Slashing is not live.** `concludeEpoch` accepts a `slashes` array and the registry implements
-it, but the client always passes an empty array.
+**Slashing is not live.** `applySlashes(Slash[])` is the slashes carrier and the registry
+implements it, but the client always passes an empty array (production builds);
+`concludeEpoch` takes only the new committee `address[]`.
+
+### Boundary gas
+
+The 100M budget is granted **per call**, not per block, and is independent of the block gas limit:
+a system call is submitted at `gas_price: 0`, so it neither pays for gas nor counts against the
+block. That also means its gas never enters the block's `gas_used`, and no block-level or
+engine-level gas metric can see it.
+
+Every step of the close is fatal on failure, and the revert is a pure function of committed state,
+so a `concludeEpoch` that outgrows its budget halts every node at the same boundary rather than
+degrading. Raising the limit changes block execution and is a lockstep fleet upgrade (see the
+`SYSTEM_CALL_GAS_LIMIT` doc in `src/evm/mod.rs`), so the headroom needs lead time. These gauges
+(`src/metrics.rs`) are where it comes from:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `tn_reth_epoch_close_system_call_gas_used{call="…"}` | gauge | Gas spent by one boundary system call. `call` is `apply_incentives`, `apply_slashes`, `conclude_epoch`, `record_base_fees`, or `registry_migration` (the one-shot registry fork migration, absent on every other close). A call that did not run publishes no series rather than a zero. |
+| `tn_reth_epoch_close_gas_used` | gauge | Gas spent by those calls together. Each has its own budget, so this is the boundary's total cost rather than the bounded figure. |
+| `tn_reth_epoch_close_system_call_gas_limit` | gauge | The compiled-in per-call budget, published so queries express headroom as a ratio instead of hardcoding 100000000. |
+
+These record gas **spent**, before EIP-3529 refunds, because the spend is what the budget bounds.
+That is deliberately not revm's `ExecutionResult::gas_used`, which is the spend net of the refund.
+The refund is computed after execution and capped at a fifth of the spend, so it never buys the
+call more room — publishing `gas_used` would slide the alert threshold with the refund: a call
+earning the full refund reports four fifths of what it spent, so an 80%-of-budget alert would not
+fire until the spend reached the whole 100M, which is the halt it exists to predict.
+
+Every node records these as it executes the closing block, so the series is fleet-wide rather than
+proposer-only, and it covers closing blocks re-executed during a sync — a replayed value is still a
+true observation of what that epoch cost.
+
+Dashboard — worst epoch close seen in the last 30 days, per call:
+
+```promql
+max_over_time(tn_reth_epoch_close_system_call_gas_used[30d])
+```
+
+The same figure as a fraction of the budget, which is the number to watch:
+
+```promql
+max_over_time(tn_reth_epoch_close_system_call_gas_used[30d])
+  / ignoring(call) group_left max_over_time(tn_reth_epoch_close_system_call_gas_limit[30d])
+```
+
+Alert — a node's epoch close crossed four fifths of its budget in the last 30 days, the same
+threshold that makes each close log a warning. `registry_migration` is excluded: it is the call the
+100M headroom exists for, and it is written once at the fork block and then latches forever, so it
+could never clear:
+
+```promql
+max_over_time(
+  tn_reth_epoch_close_system_call_gas_used{call!="registry_migration"}[30d]
+)
+  / ignoring(call) group_left max_over_time(tn_reth_epoch_close_system_call_gas_limit[30d])
+  > 0.8
+```
+
+Reading these correctly needs two properties of a once-per-epoch gauge:
+
+- **They latch, they do not lapse.** The exporter registers no idle timeout, so a gauge is
+  re-rendered with its last value on every scrape until the next close overwrites it. Short range
+  selectors are therefore legal, but a value can be an entire epoch old, and a node that has stopped
+  closing epochs keeps publishing its last figure as though it were current. Pair these with
+  `tn_epoch_current` when freshness matters.
+- **They are absent before the first close.** A restarted node publishes no
+  `tn_reth_epoch_close_*` series at all until it next executes a closing block, which for a node at
+  the start of an epoch is the whole epoch. Alerts must tolerate the absence rather than read it as
+  zero.
+
+What these do **not** cover: only the committed system calls above are instrumented. The closing
+block issues other calls under their own copy of the same budget, each equally fatal. The
+blockhashes (EIP-2935) and beacon-root (EIP-4788) pre-block calls are fixed-cost, so they need no
+watching. The reads are the gap — `shuffle_new_committee`'s committee-pool read scales with the
+eligible validator set and `record_next_epoch_base_fees`' `getAllWorkerConfigs` with the worker
+count, both inherit the same 100M ceiling (contract reads share the system-call plumbing; see the
+`SYSTEM_CALL_GAS_LIMIT` doc), and neither is instrumented. A boundary can still fail on a call
+these gauges never showed.
 
 ## ConsensusRegistry fork gate (adiri)
 
@@ -232,9 +331,13 @@ recomputing it**. The restore side is the real integrity check (`SnapshotRestore
 - **recomputes the state root from scratch** out of the imported accounts (`StateRoot::from_tx`)
   and hard-fails unless it equals both the pack's declared root and `header(B).state_root` from
   the caller-supplied header window;
-- verifies the shipped window can seed the first epoch-entry base-fee derivation for every
-  EIP-1559-configured worker (otherwise the restored node would walk into omitted history and
-  halt);
+- **validates that `B` closed an epoch** instead of assuming it (`entry_readiness_precondition`):
+  the registry pinned at `B` must report the entered epoch beginning at `B + 1`, since a restored
+  node seeds its first epoch entry from one pinned read at `B` and starts its accumulator catchup
+  at `B + 1`;
+- requires the `WorkerConfigs` read at `B` to report at least one worker and to yield a readable
+  entry base fee for every one of them — an `Eip1559` `data` word wider than `u64` is refused here,
+  naming the worker and the word, instead of halting the restored node at its first epoch entry;
 - persists finalized/safe markers at `B` and re-checks the reconstructed tip number and hash.
 
 What restore does *not* verify: the authenticity of the header window itself — that is the
@@ -248,10 +351,13 @@ Block production must be a pure function of certified consensus output. Concrete
   timestamp carried in the payload.
 - No hash-map iteration in state-affecting paths — rewards use `BTreeMap`, committees are sorted
   by address before encoding (`generate_conclude_epoch_calldata`).
-- Epoch-close randomness is `keccak256` of the leader certificate's aggregate BLS signature,
-  computed once in consensus (`tn-types` `primary/output.rs`) and carried in the payload. It
-  seeds the committee-shuffle RNG **and** is stored in `extra_data`, so production
-  (`context_for_next_block`) and replay (`context_for_block`) derive identical state.
+- Epoch-close randomness is epoch-gated (`tn-types` `forks::seed_signature_active`): before the
+  fork epoch it is the legacy keccak256 of the leader certificate's aggregate BLS signature,
+  wire-identical to pre-fork releases; from the fork epoch on it is the epoch seed chain value as
+  of the closing commit, folded per commit in consensus (`tn-types` `primary/output.rs`). Either
+  way it is carried in the payload, seeds the committee-shuffle RNG **and** is stored in
+  `extra_data`, so production (`context_for_next_block`) and replay (`context_for_block`) derive
+  identical state.
 - The shuffle's RNG draw order is consensus-critical and pinned by a golden-value unit test in
   `src/evm/block.rs`; the fee penalty uses platform-independent u128 integer math.
 - Failure handling is deterministic too: unrecoverable transactions are dropped identically on
@@ -281,7 +387,7 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/evm/tel_precompile/` | Native TEL issuance at `0x…07e1` (see its README). |
 | `src/evm/bls_precompile/` | BLS12-381 signature verification at `0x…b151`. |
 | `src/forward.rs` | `WorkerRpcForwarder`: observer → committee transaction forwarding. |
-| `src/metrics.rs` | Block-building drop counters (`unrecoverable` alertable, `invalid` expected). |
+| `src/metrics.rs` | Block-building drop counters (`unrecoverable` alertable, `invalid` expected) and the epoch-close system-call gas gauges. |
 | `src/payload.rs` | `TNPayload` and `BuildArguments`: consensus data shaped for execution. |
 | `src/rpc_server_args.rs` | RPC CLI argument subset and transport-limit defaults. |
 | `src/snapshot.rs` | State-pack export (`PinnedStateView`) and verified restore (`SnapshotRestorer`). |

@@ -36,6 +36,106 @@ async fn test_empty_proposal() {
     // TODO: assert header el state present
 }
 
+/// A header off the REAL proposer path carries a seed signature that verifies against THAT header's
+/// own `(epoch, round)`.
+///
+/// [`EpochSeedMessage::new(epoch, round, ..)`](tn_types::EpochSeedMessage::new) and
+/// [`Header::new(author, round, epoch, ..)`](tn_types::Header::new) sit three lines apart in
+/// [`Proposer::propose_header`] and take the same two `u32`s in OPPOSITE order, so transposing
+/// either pair compiles clean. The consequence is severe and silent locally: every honest voter
+/// would reject every header this node authors, while the node itself sees nothing wrong.
+///
+/// Catches: transposing either argument pair, and signing any round other than the one being
+/// proposed (a hard-coded round, or a round cached once per epoch as the pre-round-binding code
+/// did). Every other seed test in the tree drives the fixture header builder, which stamps its own
+/// signature and never reaches `propose_header`, so nothing else covers this. The expectation is
+/// rebuilt from the values the PROPOSED header reports, so a transposition at either call site
+/// leaves the signature verifying against nothing.
+#[tokio::test]
+async fn test_proposed_header_seed_signature_binds_its_own_epoch_and_round() {
+    use futures::StreamExt as _;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+
+    let cb = ConsensusBus::new();
+    let mut rx_headers = cb.subscribe_headers();
+    let task_manager = TaskManager::default();
+    let proposer = Proposer::new(
+        config.clone(),
+        config.authority_id().expect("authority"),
+        cb.clone(),
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    );
+
+    proposer.spawn(&task_manager);
+
+    let header = rx_headers.recv().await.unwrap();
+
+    // A transposition is only observable when the two values differ. The fixture proposes round 1
+    // in epoch 0, and this pins that precondition so the test can never pass vacuously.
+    assert_ne!(
+        header.epoch(),
+        header.round(),
+        "epoch and round must differ for a transposition to be observable"
+    );
+
+    // The voter's reconstruction: same anchor the handler uses, both scalars taken from the header.
+    let message =
+        EpochSeedMessage::new(header.epoch(), header.round(), config.prior_epoch_record());
+    assert!(
+        message.verify(
+            header.seed_signature().expect("seed signature present for fork-active epoch"),
+            &primary.primary_public_key()
+        ),
+        "the proposed header's seed signature must verify against that header's own (epoch, round)"
+    );
+
+    // Advance one round and re-check. At round 1 a signature over a CONSTANT round is
+    // indistinguishable from a correctly bound one, so round binding only becomes observable once
+    // the proposer moves off its first round. Nothing else in the tree drives `propose_header`
+    // past round 1: with `current_round` replaced by a literal `1`, all 170 lib tests and all 40
+    // integration tests still pass, so without the assertions below the binding is untested.
+    let parents: Vec<_> =
+        fixture.headers().iter().take(3).map(|h| fixture.certificate(h)).collect();
+    cb.parents().send((parents, 1)).await.expect("parents accepted");
+
+    // Skip rather than take the next header: the proposer re-proposes its current round whenever
+    // `max_header_delay` fires again before the parents land, so taking one header here is racy.
+    let proposals = Box::pin(futures::stream::unfold(rx_headers, |mut rx| async move {
+        rx.recv().await.map(|proposed| (proposed, rx))
+    }));
+    let next = tokio::time::timeout(
+        Duration::from_secs(10),
+        proposals
+            .skip_while(|proposed| futures::future::ready(proposed.round() <= header.round()))
+            .next(),
+    )
+    .await
+    .expect("the proposer must advance past its first round once round-1 parents reach quorum")
+    .expect("header channel stays open");
+
+    assert!(
+        EpochSeedMessage::new(next.epoch(), next.round(), config.prior_epoch_record()).verify(
+            next.seed_signature().expect("seed signature present for fork-active epoch"),
+            &primary.primary_public_key()
+        ),
+        "the seed message must be re-signed for every round the proposer advances to"
+    );
+
+    // ...and bound to THAT round specifically, not merely to some round this authority once held.
+    assert!(
+        !EpochSeedMessage::new(next.epoch(), header.round(), config.prior_epoch_record()).verify(
+            next.seed_signature().expect("seed signature present for fork-active epoch"),
+            &primary.primary_public_key()
+        ),
+        "a later round's header must not carry the earlier round's seed signature"
+    );
+}
+
 /// A header at the protocol batch ceiling validates, but one batch over is rejected.  This keeps
 /// the per-header batch count a genuine consensus invariant (not just a proposer convention), which
 /// is what lets the consensus-pack reader bound the batches per output and always reconstruct a

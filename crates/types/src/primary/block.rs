@@ -7,7 +7,7 @@
 //! if not directly participating in consesus.
 
 use super::{CommittedSubDag, ConsensusOutput};
-use crate::{crypto, BlsPublicKey, BlsSignature, Certificate, Digest, Epoch, Hash, Round, B256};
+use crate::{crypto, BlsPublicKey, BlsSignature, Digest, Epoch, Hash, Round, B256};
 use serde::{Deserialize, Serialize};
 
 /// Header for the consensus chain.
@@ -16,7 +16,27 @@ use serde::{Deserialize, Serialize};
 ///
 /// Consensus-layer digests are BLAKE3 ([`crypto::DefaultHashFunction`]), not Keccak-256.
 /// Keccak-256 is used at the execution layer and for the committee-shuffle seed.
-#[derive(PartialEq, Serialize, Deserialize, Clone, Debug)]
+///
+/// # The `Default` value is the pre-genesis anchor
+///
+/// [`Default`] is derived rather than hand written so the epoch seed chain anchor it carries has
+/// exactly ONE definition, [`CommittedSubDag::default`], which pins it to
+/// [`EpochSeedChainValue::genesis_placeholder`](crate::EpochSeedChainValue::genesis_placeholder).
+/// This default is reached on non-test paths (state sync uses it as the pre-genesis consensus
+/// header), so a second, independently written expression here could drift from that one and give
+/// nodes different genesis anchors, forking the seed chain at its first link. The anchor is a fixed
+/// constant and is never derived from node-local epoch state, for the same reason.
+///
+/// NOTE: the resulting digest is build-dependent and is frozen per build flavor by the
+/// `test_consensus_header_default_digest_pinned` pin: the embedded [`Header`](crate::Header)
+/// default (epoch 0) carries `seed_signature` on the wire only where the seed-signature fork
+/// ([`seed_signature_active`](crate::forks::seed_signature_active)) is active for epoch 0
+/// (always on non-adiri builds, never on adiri builds), so the two flavors anchor different
+/// digests. Both flavors also differ from the pre-#1032 anchor, which built this sub-dag
+/// through [`CommittedSubDag::new`] and so anchored its `randomness` at keccak256 of the
+/// default certificate's aggregate signature, where this derived default anchors the pinned
+/// placeholder itself (not a fold over it).
+#[derive(PartialEq, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ConsensusHeader {
     /// The hash of the previous ConsesusHeader in the chain.
     pub parent_hash: ConsensusHeaderDigest,
@@ -54,25 +74,6 @@ impl ConsensusHeader {
         // Not using this yet but include the default in the hash in prep when we do.
         hasher.update(B256::default().as_slice());
         ConsensusHeaderDigest(Digest { digest: hasher.finalize().into() })
-    }
-}
-
-impl Default for ConsensusHeader {
-    fn default() -> Self {
-        let cert = Certificate::default();
-        let sub_dag = CommittedSubDag::new(
-            vec![cert.clone()],
-            cert,
-            0,
-            crate::ReputationScores::default(),
-            None,
-        );
-        Self {
-            parent_hash: ConsensusHeaderDigest::default(),
-            sub_dag,
-            number: 0,
-            extra: B256::default(),
-        }
     }
 }
 
@@ -201,5 +202,35 @@ mod test {
         let enc = encode(&num_hash2);
         let cnum_hash: ConsensusNumHash = decode(&enc);
         assert_eq!(consensus_num_hash, cnum_hash);
+    }
+
+    /// FROZEN digest of the pre-genesis anchor [`crate::ConsensusHeader::default`] under
+    /// `adiri` (epoch 0 is pre-fork there, so the embedded [`crate::Header::default`]
+    /// serializes the seven legacy fields). State sync uses this default as the pre-genesis
+    /// consensus header, so a change here re-anchors the consensus chain's first link: if
+    /// this pin breaks, that is a compatibility decision to take deliberately, NOT a
+    /// constant to refresh.
+    #[cfg(feature = "adiri")]
+    const CONSENSUS_HEADER_DEFAULT_DIGEST_HEX: &str =
+        "cda906d203194ef0c9530b53899b7adb02d71da0ce6d307fd70ededebd6a263a";
+
+    /// FROZEN digest of the pre-genesis anchor [`crate::ConsensusHeader::default`] without
+    /// `adiri`: every epoch is fork-active, so the embedded [`crate::Header::default`]
+    /// carries `seed_signature` on the wire and the anchor deliberately differs from the
+    /// adiri build's (see the [`crate::ConsensusHeader`] `Default` docs). Same warning as
+    /// the adiri pin.
+    #[cfg(not(feature = "adiri"))]
+    const CONSENSUS_HEADER_DEFAULT_DIGEST_HEX: &str =
+        "bcc5222c2dfb715151c596051f5421efa5bf6387d4e9700e91a70f9f51d21e50";
+
+    /// PIN: the pre-genesis anchor digest [`crate::ConsensusHeader::default`], per build
+    /// flavor (the wire layout of the embedded default header is build-dependent).
+    #[test]
+    fn test_consensus_header_default_digest_pinned() {
+        assert_eq!(
+            CONSENSUS_HEADER_DEFAULT_DIGEST_HEX,
+            hex::encode(crate::ConsensusHeader::default().digest()),
+            "pre-genesis anchor digest diverged from the frozen pin"
+        );
     }
 }

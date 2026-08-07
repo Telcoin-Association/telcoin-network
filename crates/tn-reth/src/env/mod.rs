@@ -27,7 +27,7 @@ use reth_provider::{
 };
 use reth_revm::{database::StateProviderDatabase, State};
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_types::{gas_accumulator::RewardsCounter, Address, TaskManager, TaskSpawner, B256};
+use tn_types::{gas_accumulator::GasAccumulator, Address, TaskManager, TaskSpawner, B256};
 use tracing::{debug, info};
 
 use crate::{
@@ -69,6 +69,30 @@ struct RethEnvInner {
     evm_config: TnEvmConfig,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// TEST-ONLY: number of pending injected pre-commit persist faults.
+    ///
+    /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
+    /// and fails with a `TnRethError::Provider` before touching the database, simulating a
+    /// node-local storage fault on the durable write. Armed via
+    /// `RethEnv::inject_persist_provider_faults` (see `env/execution.rs`).
+    #[cfg(any(feature = "test-utils", test))]
+    persist_fault_injections: std::sync::atomic::AtomicU32,
+    /// TEST-ONLY: number of pending injected LATE (post-`save_blocks`) persist faults.
+    ///
+    /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
+    /// and fails with a `TnRethError::Provider` AFTER `save_blocks` has advanced the
+    /// process-wide static-file writers, immediately before the database commit, simulating
+    /// a node-local fault on the marker writes or the commit itself. Armed via
+    /// `RethEnv::inject_late_persist_provider_faults` (see `env/execution.rs`).
+    #[cfg(any(feature = "test-utils", test))]
+    persist_late_fault_injections: std::sync::atomic::AtomicU32,
+    /// TEST-ONLY: how many times `RethEnv::persist_executed_output` has been entered.
+    ///
+    /// Incremented on entry, before any injected fault is consumed, so the value is the
+    /// number of persist ATTEMPTS the engine's bounded retry actually made. Read through
+    /// `RethEnv::persist_attempt_count` (see `env/execution.rs`).
+    #[cfg(any(feature = "test-utils", test))]
+    persist_attempts: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Debug for RethEnv {
@@ -109,10 +133,10 @@ impl RethEnv {
         task_manager: &TaskManager,
         database: RethDb,
         basefee_address: Option<Address>,
-        rewards_counter: RewardsCounter,
+        gas_accumulator: GasAccumulator,
     ) -> eyre::Result<Self> {
         let node_config = reth_config.0.clone();
-        let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), rewards_counter);
+        let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), gas_accumulator);
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
         let blockchain_provider = BlockchainProvider::new(provider_factory)?;
         let task_spawner = task_manager.get_spawner();
@@ -127,6 +151,12 @@ impl RethEnv {
                 blockchain_provider,
                 evm_config,
                 task_spawner,
+                #[cfg(any(feature = "test-utils", test))]
+                persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(any(feature = "test-utils", test))]
+                persist_late_fault_injections: std::sync::atomic::AtomicU32::new(0),
+                #[cfg(any(feature = "test-utils", test))]
+                persist_attempts: std::sync::atomic::AtomicU32::new(0),
             }),
         })
     }
@@ -200,7 +230,7 @@ impl RethEnv {
     }
 
     /// Return the EVM config used to build and execute TN blocks: the chain spec plus
-    /// the rewards counter, wiring the TN handler (base-fee redirection, gas-limit
+    /// the shared gas accumulator, wiring the TN handler (base-fee redirection, gas-limit
     /// penalty) and the TN precompiles.
     pub(crate) fn evm_config(&self) -> &TnEvmConfig {
         &self.inner.evm_config
