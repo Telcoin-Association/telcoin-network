@@ -1,6 +1,6 @@
 //! Configurations for the Telcoin Network.
 
-use crate::{ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs};
+use crate::{ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs, GOVERNANCE_SAFE_ADDRESS};
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Write, time::Duration};
@@ -274,7 +274,21 @@ pub struct Parameters {
     /// Worker timeout when request vote from peers.
     #[serde(default = "Parameters::default_batch_vote_timeout")]
     pub batch_vote_timeout: Duration,
-    /// If set the Address that will recieve basefees.
+    /// The address that receives the base-fee portion of every transaction's gas payment.
+    ///
+    /// CONSENSUS-CRITICAL. The EVM credits this account on every transaction, so its balance
+    /// enters the state root. All nodes on a network must hold the same value. If two nodes
+    /// disagree, they still agree on the batch, the certificate, and the commit order, but they
+    /// build different state roots from the same committed output and the network splits. See the
+    /// `BASEFEE_ADDRESS` documentation in `tn-reth` for the execution-side detail.
+    ///
+    /// An absent key deserializes to `None`. That is declared here rather than left to serde's
+    /// implicit handling of `Option`, because the fallback it selects is three crates away.
+    /// `None` stays legal for test fixtures, but [`Parameters::validate_operational_floors`]
+    /// refuses it at the production entry points, so an operator must state the address. The
+    /// chain presets set it from their embedded parameters, so `--chain mainnet` and
+    /// `--chain adiri` never reach this path.
+    #[serde(default)]
     pub basefee_address: Option<Address>,
     /// The default duration between parallel/fallback fetch requests to peers for missing
     /// certificates.
@@ -363,7 +377,11 @@ impl Default for Parameters {
             max_batch_delay: Parameters::default_max_batch_delay(),
             max_concurrent_requests: Parameters::default_max_concurrent_requests(),
             batch_vote_timeout: Parameters::default_batch_vote_timeout(),
-            basefee_address: None,
+            // Explicit, and identical in effect to the previous `None`: an unset address already
+            // resolved to `GOVERNANCE_SAFE_ADDRESS` inside `set_basefee_address`. Stating it here
+            // keeps the default satisfying `validate_operational_floors`, which now refuses
+            // `None`.
+            basefee_address: Some(GOVERNANCE_SAFE_ADDRESS),
             parallel_fetch_request_delay_interval:
                 Parameters::default_parallel_fetch_request_delay_interval(),
         }
@@ -422,6 +440,13 @@ impl Parameters {
     ///   but includes at most `max_header_num_of_batches` of them, so a zero threshold seals empty
     ///   headers on the fast path and a threshold above the max makes the two conditions mutually
     ///   inconsistent.
+    /// - `basefee_address` must be set. The EVM credits this account on every transaction, so its
+    ///   balance enters the state root and every node on the network must agree on it. A
+    ///   `parameters.yaml` that omits the key parses without error, deserializes to `None`, and
+    ///   silently selects `GOVERNANCE_SAFE_ADDRESS`, which splits state roots against every peer
+    ///   holding a different value. Refusing `None` here converts that silent split into a startup
+    ///   error that names the field. The chain presets and the genesis ceremony both write the key,
+    ///   so this rejects a file that lost it, not a supported configuration.
     pub fn validate_operational_floors(&self) -> eyre::Result<()> {
         eyre::ensure!(
             self.gc_depth > tn_types::GC_ACTIVITY_BUFFER,
@@ -445,6 +470,11 @@ impl Parameters {
             self.header_num_of_batches_threshold,
             self.max_header_num_of_batches,
         );
+        eyre::ensure!(
+            self.basefee_address.is_some(),
+            "basefee_address must be set explicitly: it receives every transaction's base fee, so \
+             its balance enters the state root and all nodes on the network must agree on it",
+        );
         Ok(())
     }
 
@@ -459,12 +489,21 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Max batch delay set to {} ms", self.max_batch_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
+        // Consensus-critical, and the only parameter here whose value enters the state root. Two
+        // operators debugging a state-root split have no other way to compare this value without
+        // reading each other's files.
+        info!(
+            "Basefee address set to {} (consensus-critical: all nodes must agree)",
+            self.basefee_address.unwrap_or(GOVERNANCE_SAFE_ADDRESS)
+        );
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::Parameters;
+    use crate::GOVERNANCE_SAFE_ADDRESS;
+    use tn_types::{address, MAINNET_PARAMETERS, TESTNET_PARAMETERS};
 
     #[test]
     fn default_parameters_are_within_protocol_ceilings() {
@@ -567,5 +606,61 @@ mod test {
             params.validate_operational_floors().is_ok(),
             "threshold == max == 1 is the minimal consistent batch configuration and must be accepted"
         );
+    }
+
+    /// A parameters file that omits `basefee_address` parses without error and yields `None`.
+    ///
+    /// This asserts the concrete value rather than `is_some()`, which would pass under either
+    /// behavior and pin nothing.
+    #[test]
+    fn absent_basefee_address_key_deserializes_to_none() {
+        let params: Parameters =
+            serde_yaml::from_str("gc_depth: 50").expect("a partial parameters file parses");
+        assert_eq!(
+            params.basefee_address, None,
+            "an omitted key must stay observable as None so the floors can refuse it"
+        );
+    }
+
+    /// A production node must not start on a file that lost the key. Without this check the node
+    /// starts, credits the fallback address, and splits state roots against its peers in silence.
+    #[test]
+    fn operational_floors_reject_absent_basefee_address() {
+        let params = Parameters { basefee_address: None, ..Default::default() };
+        let err = params
+            .validate_operational_floors()
+            .expect_err("a production node must not start without an explicit basefee address");
+        assert!(
+            err.to_string().contains("basefee_address"),
+            "the error must name the field an operator has to fix: {err}"
+        );
+    }
+
+    /// Both shipped presets must keep an explicit, correct address.
+    ///
+    /// The addresses are pinned by value. They are consensus-critical, so a change to either is a
+    /// hard fork for that chain and updating this test is the intended cost of making one.
+    #[test]
+    fn shipped_chain_presets_pin_their_basefee_address() {
+        let mainnet: Parameters =
+            serde_yaml::from_str(MAINNET_PARAMETERS).expect("mainnet parameters parse");
+        let adiri: Parameters =
+            serde_yaml::from_str(TESTNET_PARAMETERS).expect("adiri parameters parse");
+        assert_eq!(
+            mainnet.basefee_address,
+            Some(address!("0x9999999999999999999999999999999999999999")),
+            "mainnet's committed basefee address changed"
+        );
+        assert_eq!(
+            adiri.basefee_address,
+            Some(GOVERNANCE_SAFE_ADDRESS),
+            "adiri's committed basefee address changed"
+        );
+        mainnet
+            .validate_operational_floors()
+            .expect("the mainnet preset must satisfy the operational floors");
+        adiri
+            .validate_operational_floors()
+            .expect("the adiri preset must satisfy the operational floors");
     }
 }

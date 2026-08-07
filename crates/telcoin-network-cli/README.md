@@ -477,8 +477,14 @@ The `parameters.yaml` file controls consensus timing and behavior. If the file i
 | `max_batch_delay`                       | `1s`     | Worker timeout before sealing a batch               |
 | `max_concurrent_requests`               | `500000` | Max concurrent requests from untrusted entities     |
 | `batch_vote_timeout`                    | `10s`    | Timeout for batch voting requests                   |
-| `basefee_address`                       | none     | Address that receives transaction base fees         |
+| `basefee_address`                       | required | Base-fee recipient; must match every peer           |
 | `parallel_fetch_request_delay_interval` | `5s`     | Delay between parallel certificate fetch requests   |
+
+`basefee_address` is the one field here without a usable default. It is consensus-critical: the
+EVM credits this account on every transaction, so its balance enters the state root and every node
+on the network must hold the same value. A node started with this key missing is refused at
+startup rather than falling back in silence. The `genesis` commands write the key for you, and the
+`mainnet` and `adiri` chain presets carry their own value.
 
 Example (testnet configuration):
 
