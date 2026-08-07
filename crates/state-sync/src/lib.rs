@@ -130,9 +130,11 @@ pub async fn save_consensus(
 /// If we are not starting at genesis or a new epoch, then not finding this indicates a database
 /// issue.
 ///
-/// `Ok(None)` means the header is legitimately absent (genesis or a new epoch); a failed
-/// storage lookup is an `Err` that callers must propagate so startup halts loudly instead of
-/// silently resuming from a default header at number 0.
+/// `Ok(None)` means the header is confirmed ABSENT from the consensus store; a storage read
+/// failure surfaced by the lookup (for example a sealed static epoch pack that fails to OPEN)
+/// is `Err`, never `Ok(None)`. Record-level reads inside a pack that opened cleanly still
+/// collapse to `None`; that remaining channel is documented at
+/// `ConsensusChain::consensus_header_by_digest` in `tn-storage`.
 pub async fn last_executed_consensus_block(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
@@ -146,10 +148,11 @@ pub async fn last_executed_consensus_block(
 /// Accounts for outputs committed to DB but not yet executed (which
 /// replay_missed_consensus handles before the subscriber starts).
 ///
-/// Only a genuinely absent header (fresh chain) defaults to the genesis `ConsensusHeader` at
-/// number 0; a failed lookup is an `Err` so a resuming node halts loudly instead of re-rooting
-/// itself at number 0 (`save_consensus_output` now hard-rejects the non-advancing numbers that
-/// re-root would produce, so resuming from the default would strand the node anyway).
+/// Returns an error when the last executed consensus block or the latest recorded consensus
+/// header cannot be READ from the consensus store (as opposed to being absent, which falls
+/// back to a default header at number 0 as before). Halting on a failed lookup matters because
+/// `save_consensus_output` hard-rejects the non-advancing numbers a silently re-rooted default
+/// parent would produce, so resuming from the default would strand the node anyway.
 pub async fn last_consensus_parent(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &ConsensusChain,
