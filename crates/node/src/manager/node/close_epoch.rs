@@ -409,8 +409,10 @@ where
     /// `final_state`.
     ///
     /// Unlike a plain copy of the live shared `epochs.pack` / `epoch_certs.pack`, the records/certs
-    /// bundle is a bounded `0..=N` selection built through the records-DB actor in the completion
-    /// task, so a later epoch appending to the live packs cannot race into the export. The task
+    /// bundle is a bounded `0..=N` set assembled in the completion task, so a later epoch appending
+    /// to the live packs cannot race into the export. In the common case it is built by copying the
+    /// previous boundary's published bundle and appending only epoch N's record and cert; when no
+    /// previous bundle validates, it is rebuilt in full through the records-DB actor. The task
     /// also waits a bounded time for epoch N's own certificate (only aggregated at the next epoch's
     /// start) and fails the export without it, so an importer never has to store the tip record
     /// unverified.
@@ -481,6 +483,16 @@ where
         // this returns.
         let consensus_chain = self.consensus_chain.clone();
         let consensus_bus = self.consensus_bus.clone();
+
+        // The previous boundary's published bundle, if any: lets the completion task build the
+        // records/certs bundle by copy + single append instead of a full 0..=N rebuild. It can be
+        // legitimately absent (first epoch, a skipped or failed prior export, operator pruning);
+        // the storage layer then falls back to the full rebuild. Published bundles are only ever
+        // read, never appended to in place.
+        let prev_bundle = epoch.checked_sub(1).map(|prev_epoch| {
+            let prev_dir = export_root.join(format!("epoch-{prev_epoch}"));
+            (prev_dir.join("epoch_records"), prev_dir.join("epoch_certs"))
+        });
 
         // Export into a temp sibling and atomically rename it into place on success, so external
         // tooling only ever observes a complete `epoch-{N}` directory. Clear any leftover temp for
@@ -564,12 +576,16 @@ where
                                 return Ok(());
                             }
 
-                            // write the bounded 0..=N records+certs from the actor, so a later epoch
-                            // appending to the live packs cannot race into this bundle.
+                            // write the bounded 0..=N records+certs bundle: extend the previous
+                            // boundary's published bundle with epoch N's entries when it
+                            // validates, rebuilding in full through the actor otherwise. either
+                            // way the set is bounded, so a later epoch appending to the live
+                            // packs cannot race into this bundle.
                             if let Err(e) = consensus_chain
                                 .epochs()
-                                .export_bounded_bundle(
+                                .export_incremental_bundle(
                                     epoch,
+                                    prev_bundle,
                                     &tmp_dir.join("epoch_records"),
                                     &tmp_dir.join("epoch_certs"),
                                 )
