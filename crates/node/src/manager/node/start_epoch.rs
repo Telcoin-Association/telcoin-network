@@ -46,7 +46,7 @@ use tn_reth::{
         ConsensusRegistry::{self, EpochInfo},
         EpochState,
     },
-    WorkerRpcForwarder,
+    ForwardTargetPolicy, WorkerRpcForwarder,
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
@@ -503,9 +503,15 @@ where
 
         // Observer transaction forwarding: a non-committee worker forwards each transaction it
         // accepts to the JSON-RPC endpoint of the validator that owns it, discovered over
-        // kademlia (issue #804).
-        let forwarder =
-            Arc::new(WorkerRpcForwarder::new(network_handle.get_task_spawner().clone()));
+        // kademlia (issue #804). The endpoint is chosen by a committee member, so the policy
+        // decides which advertised hosts this node is willing to dial (issue #1092); it refuses
+        // non-public hosts unless the operator opted in for a single-host deployment.
+        let forwarder = Arc::new(WorkerRpcForwarder::new(
+            network_handle.get_task_spawner().clone(),
+            ForwardTargetPolicy::from_allow_private(
+                consensus_config.parameters().allow_private_forward_targets,
+            ),
+        ));
 
         let worker = WorkerNode::new(
             worker_id,
