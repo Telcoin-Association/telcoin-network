@@ -14,7 +14,10 @@
 //! - Pruning is disabled: every `PruningArgs` field is off, so nodes keep full history (archive
 //!   mode). Other code relies on this — e.g. ExEx replay treats missing receipts for an existing
 //!   block as database corruption (`TnRethError::ReplayReceiptsMissing`), which is only sound
-//!   because receipts are never pruned.
+//!   because receipts are never pruned, and every pinned consensus-registry read resolves its state
+//!   against fully indexed history. [`RethConfig::ensure_archive_mode`] enforces this at startup
+//!   rather than leaving it to the defaults above, and `etc/archive-mode-guard.sh` fails the build
+//!   if a pruner entry point is introduced.
 //! - The per-sender transaction-pool slot default is raised to
 //!   [`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`] (256, vs reth's 16) by seeding reth's global pool
 //!   defaults via [`init_txpool_defaults`], which must run before any [`TxPoolArgs`] is parsed or
@@ -375,6 +378,59 @@ impl RethConfig {
 
         Self(this)
     }
+
+    /// Assert the archive-mode invariant that every pinned historical read depends on.
+    ///
+    /// Pinned reads (committee membership, epoch records, epoch state, worker fee configs, and
+    /// the general pinned contract read) all resolve their state through
+    /// `RethEnv::read_only_state_db` — the epoch reads via its `pinned_state_and_env` wrapper,
+    /// `read_contract_inner` directly — and reth only serves that state from the requested block
+    /// while the history indices covering it are intact.
+    ///
+    /// Reth catches part of the pruned case loudly: for a pinned block strictly BELOW the
+    /// recorded watermark, `HistoricalStateProviderRef` returns
+    /// `ProviderError::StateAtBlockPruned` rather than serving the wrong state. That failure is
+    /// diagnosable, but it lands in the middle of a consensus read (committee construction, epoch
+    /// entry, base-fee seeding), where the reachable outcomes are a stalled epoch transition or a
+    /// halted node. Refusing to start is the same fact delivered at the one moment an operator
+    /// can still act on it.
+    ///
+    /// The rest of the pruned case is silent, which is the stronger reason to refuse at startup:
+    /// at or above the watermark, a key whose own history shards were pruned away classifies as
+    /// `HistoryInfo::MaybeInPlainState` and the read serves PLAIN (tip) state with no error. That
+    /// arm is reached only when a prune checkpoint exists, so pruning is the only thing that
+    /// substitutes tip state for pinned state.
+    ///
+    /// Note what this does NOT protect against, since the distinction is easy to lose. Those
+    /// watermarks come from the prune checkpoints, so history missing WITHOUT one (an externally
+    /// truncated datadir, a snapshot-restored node with no pre-snapshot history) leaves them
+    /// unset, and reth neither errors nor falls back to tip: the lookup classifies as
+    /// `HistoryInfo::NotYetWritten` and returns `Ok(None)`, so the account or slot reads as never
+    /// written. That is a datadir property rather than a configuration one, and this check cannot
+    /// see it. See `pinned_state_and_env` in `env/epoch.rs` for the full breakdown.
+    ///
+    /// The check is deliberately conservative. `prune_config` returns `None` exactly when no
+    /// pruning was requested, so any `Some` fails here: a per-segment mode, `--full`,
+    /// `--minimal`, or a non-default block interval. A configuration that happens to leave
+    /// account and storage history intact still fails, because deciding which segments a pinned
+    /// read can survive is a review decision, not a startup one.
+    ///
+    /// Two limits are worth stating. This reads the configuration THIS node was built with, so
+    /// it cannot detect a datadir some other binary already pruned; and `prune_config` reflects
+    /// only the CLI-derived [`PruningArgs`], not a reth.toml `[prune]` section (TN never loads
+    /// one, since `NodeConfig::config` stays `None` and the node hand-rolls its init path rather
+    /// than using reth's launcher). Both residuals are covered by `etc/archive-mode-guard.sh`,
+    /// which fails the build if a pruner entry point or a reth.toml load is introduced.
+    pub(crate) fn ensure_archive_mode(&self) -> eyre::Result<()> {
+        self.0.prune_config().map_or(Ok(()), |prune_config| {
+            Err(eyre::eyre!(
+                "pruning is configured ({prune_config:?}) but pinned consensus-registry reads \
+                 require archive mode: once history is pruned, reth fails a pinned read with \
+                 StateAtBlockPruned, so committee, epoch-record, and epoch-state reads would \
+                 break mid-consensus instead of here. Refusing to start"
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -430,5 +486,67 @@ mod tests {
         let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain);
 
         assert_eq!(config.0.txpool.max_account_slots, RETH_MAX_ACCOUNT_SLOTS_PER_SENDER);
+    }
+
+    /// Build a config the way `new_for_temp_chain` does, then hand its [`PruningArgs`] to `enable`
+    /// so a test can turn on exactly one prune knob.
+    ///
+    /// Seeds the pool defaults first for the same reason `new_for_temp_chain` does: reaching
+    /// `NodeConfig::default` locks reth's process-wide per-sender slot default, and these tests
+    /// should not be the thing that pins it at reth's 16 for the rest of the binary.
+    fn config_with_pruning(enable: impl FnOnce(&mut PruningArgs)) -> RethConfig {
+        init_txpool_defaults();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut config = RethConfig(NodeConfig { chain, ..NodeConfig::default() });
+        enable(&mut config.0.pruning);
+        config
+    }
+
+    /// The config the node actually ships must satisfy the archive-mode invariant, or every node
+    /// would refuse to start.
+    #[test]
+    fn test_archive_mode_accepts_production_config() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let reth_command = RethCommand::try_parse_from(["tn-reth"])?;
+        RethConfig::new(reth_command, None, tmp_dir.path(), true, chain).ensure_archive_mode()
+    }
+
+    /// `new_for_temp_chain` fills its config from `NodeConfig::default()` rather than
+    /// [`RethConfig::new`], so that second construction path needs its own coverage: every test env
+    /// in the workspace is built through it and passes the same startup guard.
+    #[test]
+    fn test_archive_mode_accepts_default_node_config() -> eyre::Result<()> {
+        config_with_pruning(|_| {}).ensure_archive_mode()
+    }
+
+    /// Pruning account history is the knob that directly unpins a pinned read: without the
+    /// account-history shards, reth stops resolving the pinned block from its own state.
+    #[test]
+    fn test_archive_mode_rejects_account_history_pruning() {
+        let err = config_with_pruning(|pruning| pruning.account_history_distance = Some(128))
+            .ensure_archive_mode()
+            .expect_err("account-history pruning must be rejected");
+        assert!(err.to_string().contains("archive mode"), "unexpected error: {err}");
+    }
+
+    /// Storage history carries the `ConsensusRegistry` slots the committee is decoded from, so
+    /// pruning it unpins the registry reads specifically.
+    #[test]
+    fn test_archive_mode_rejects_storage_history_pruning() {
+        let err = config_with_pruning(|pruning| pruning.storage_history_distance = Some(128))
+            .ensure_archive_mode()
+            .expect_err("storage-history pruning must be rejected");
+        assert!(err.to_string().contains("archive mode"), "unexpected error: {err}");
+    }
+
+    /// `--full` derives a whole prune-mode set from the chain spec rather than setting a single
+    /// segment, so it exercises the composite path through `PruningArgs::prune_config`.
+    #[test]
+    fn test_archive_mode_rejects_full_node_pruning() {
+        let err = config_with_pruning(|pruning| pruning.full = true)
+            .ensure_archive_mode()
+            .expect_err("full-node pruning must be rejected");
+        assert!(err.to_string().contains("archive mode"), "unexpected error: {err}");
     }
 }

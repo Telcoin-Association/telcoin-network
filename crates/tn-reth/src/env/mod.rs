@@ -135,6 +135,12 @@ impl RethEnv {
         basefee_address: Option<Address>,
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<Self> {
+        // Fail fast on a pruning configuration before any database work happens. Every RethEnv in
+        // the process funnels through here, and every pinned read this env goes on to serve
+        // resolves historical state through `read_only_state_db`, which reth can only answer from
+        // the pinned block while the history covering it is intact.
+        reth_config.ensure_archive_mode()?;
+
         let node_config = reth_config.0.clone();
         let evm_config = TnEvmConfig::new(reth_config.0.chain.clone(), gas_accumulator);
         let provider_factory = Self::init_provider_factory(&node_config, database)?;

@@ -147,19 +147,39 @@ jobs:
           fi
           echo "rocksdb absent from the default feature graph"
 
+  # Guard: pinned consensus-registry reads (committee membership, epoch records, epoch state,
+  # worker fee configs) resolve historical state through `state_by_block_hash`, which reth fails
+  # with StateAtBlockPruned once that history is pruned - mid-consensus, not at startup.
+  # `RethConfig::ensure_archive_mode` rejects a pruning CONFIGURATION at startup; this catches a
+  # pruner wired straight against the provider, or a reth.toml `[prune]` section reth would merge
+  # behind `NodeConfig::prune_config`.
+  # Greps only - nothing is resolved or compiled, so no toolchain or cache is needed.
+  archive-mode-gate:
+    needs: skip-maintainers
+    if: >-
+      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
+      github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert no pruning entry point in the node
+        run: ./etc/archive-mode-guard.sh
+
   # Gate job for branch protection - depends on all checks
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, clippy, test, rocksdb-gate]
+    needs: [fmt, clippy, test, rocksdb-gate, archive-mode-gate]
     steps:
       - name: Check all jobs passed
         run: |
           if [[ "${{ needs.fmt.result }}" == "failure" || \
                 "${{ needs.clippy.result }}" == "failure" || \
                 "${{ needs.test.result }}" == "failure" || \
-                "${{ needs.rocksdb-gate.result }}" == "failure" ]]; then
+                "${{ needs.rocksdb-gate.result }}" == "failure" || \
+                "${{ needs.archive-mode-gate.result }}" == "failure" ]]; then
             echo "One or more checks failed"
             exit 1
           fi
