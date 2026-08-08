@@ -3204,8 +3204,8 @@ pub(crate) mod test {
         use crate::consensus_pack::PackRecord;
         use tn_types::{decode, encode, Epoch};
 
-        // Epoch 0 is legacy only under `adiri`; `Epoch::MAX` (the adiri fork placeholder) is
-        // fork-active under every cfg.
+        // Epoch 0 is legacy only under `adiri`; `Epoch::MAX` (far past the `adiri` fork
+        // epoch) is fork-active in every build.
         let headers = vec![
             nesting_header(0, 0x11),
             nesting_header(Epoch::MAX, 0x22),

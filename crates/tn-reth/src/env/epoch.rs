@@ -1703,8 +1703,8 @@ mod tests {
         // so no single hardcoded committee is correct for both builds. `make attest` runs this
         // test twice: once with default features, where `seed_signature_active` is true from
         // genesis and the seed is the epoch seed chain value, and once with `--features adiri`,
-        // where the gate is dormant while `SEED_SIGNATURE_FORK_EPOCH` is the `u32::MAX`
-        // placeholder and the seed stays the legacy keccak256 of the leader certificate's
+        // where these early epochs sit far below `SEED_SIGNATURE_FORK_EPOCH` so the gate is
+        // dormant and the seed stays the legacy keccak256 of the leader certificate's
         // aggregate BLS signature. Pinning either literal on its own turns the other pass red, so
         // derive the pin from the gate rather than picking a side.
         //
