@@ -98,9 +98,13 @@ echo "clippy for workspace: default and all features passed"
 #
 # default features
 cargo nextest run --workspace --no-fail-fast
-# adiri-gated suite: the consensus-registry fork tests and their determinism oracles only
-# compile under these features, so no default-feature run above ever builds or runs them
-cargo nextest run -p tn-reth --features adiri,test-utils --no-fail-fast
+# adiri-gated suites: the legacy header wire-format pins in tn-types, the consensus-registry
+# fork tests and their determinism oracles in tn-reth, and the pre-fork entry-fee pin in
+# tn-node. These tests only compile under the adiri features. No default-feature run above
+# builds or runs them. With multiple -p flags, cargo requires package-qualified feature
+# names. tn-storage is excluded: two of its consensus_pack tests fail under the adiri
+# features today, independent of this lane.
+cargo nextest run -p tn-types -p tn-reth -p tn-node --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri --no-fail-fast
 # run the e2e restart and epoch tests, they are seperate to avoid any port/node confusion.
 # Prebuild the node binary once into the shared target tree and hand it to the e2e tests via
 # TN_BIN_PATH (mirroring `make test-e2e`), so the ignored suite reuses it instead of cold-building

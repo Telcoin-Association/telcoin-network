@@ -111,6 +111,41 @@ jobs:
       - name: Run tests
         run: cargo nextest run --locked --workspace --exclude tn-faucet --no-fail-fast --profile ci
 
+  # Adiri feature lane: the adiri-gated suites (the legacy header wire-format pins in
+  # tn-types, the consensus-registry fork tests in tn-reth, and the pre-fork entry-fee pin
+  # in tn-node) only compile under the adiri features, so the default-feature test job
+  # above never builds or runs them. tn-storage is excluded: two of its consensus_pack
+  # tests (dup_batch_across_certs, v0_shared_batch_served_as_v1_bytes) fail under the
+  # adiri features today, independent of this lane.
+  adiri-test:
+    needs: skip-maintainers
+    if: >-
+      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
+      github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          shared-key: adiri-test-cache
+          cache-on-failure: "true"
+
+      - name: Run adiri-gated tests
+        run: cargo nextest run --locked -p tn-types -p tn-reth -p tn-node --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri --no-fail-fast --profile ci
+
   # Guard: rocksdb (librocksdb-sys, the entire RocksDB C++ engine and the single largest
   # native compile in the tree) must stay out of the default feature graph. It is gated
   # behind the off-by-default `rocksdb` feature; this catches a future reth bump whose
@@ -152,13 +187,14 @@ jobs:
     name: CI Success
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, clippy, test, rocksdb-gate]
+    needs: [fmt, clippy, test, adiri-test, rocksdb-gate]
     steps:
       - name: Check all jobs passed
         run: |
           if [[ "${{ needs.fmt.result }}" == "failure" || \
                 "${{ needs.clippy.result }}" == "failure" || \
                 "${{ needs.test.result }}" == "failure" || \
+                "${{ needs.adiri-test.result }}" == "failure" || \
                 "${{ needs.rocksdb-gate.result }}" == "failure" ]]; then
             echo "One or more checks failed"
             exit 1
