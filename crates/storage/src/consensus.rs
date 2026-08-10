@@ -819,12 +819,12 @@ impl ConsensusChain {
             } else {
                 Ok(None)
             }
-        } else if self.epoch_pack_exists(epoch) {
-            // The pack for this epoch is on disk, so a failure to open it is a real error and
-            // must not degrade into "not found".
-            let pack = self.get_static(epoch).await.inspect_err(|e| {
-                error!(target: "consensus-chain", epoch, ?digest, "epoch pack exists on disk but failed to open: {e}");
-            })?;
+        } else if let Some(pack) = self.get_static_if_present(epoch).await? {
+            // A sealed epoch whose pack is present but unreadable propagated as `Err` from
+            // `get_static_if_present` just above; only a genuinely absent epoch (files never on
+            // disk) reaches the staging fallback / `Ok(None)` arms below. (The current-epoch
+            // branch still collapses pack-internal read failures to `None`: the in-memory
+            // channel wrapper types them away below this layer.)
             Ok(pack.consensus_header_by_digest(digest).await)
         } else if let Some(staging) = self.staging() {
             if epoch == staging.pack.epoch() {
@@ -1210,17 +1210,6 @@ impl ConsensusChain {
         self.staging.lock().clone()
     }
 
-    /// True if the on-disk pack data file for `epoch` exists under this chain's base path.
-    ///
-    /// This is the discriminator the fallible read paths use to tell "this node does not hold
-    /// `epoch`" (a legitimate `None` for a fresh node or an epoch never downloaded) from "the
-    /// pack exists but cannot be opened" (a hard error). Collapsing the second case into `None`
-    /// is what let the startup resume path fall back to a default consensus header at number 0
-    /// with no error and no log.
-    fn epoch_pack_exists(&self, epoch: Epoch) -> bool {
-        self.base_path.join(format!("epoch-{epoch}")).join(DATA_NAME).exists()
-    }
-
     /// Get a static pack file from the cache if available or create and cache if not.
     async fn get_static(&self, epoch: Epoch) -> Result<ConsensusPack, PackError> {
         let pack = self.current_pack();
@@ -1242,6 +1231,23 @@ impl ConsensusChain {
         let pack = ConsensusPack::open_static(&self.base_path, epoch)?;
         self.recent_packs.lock().push_back(pack.clone());
         Ok(pack)
+    }
+
+    /// Open the sealed static pack for `epoch` if its files exist on disk.
+    ///
+    /// Distinguishes a genuinely absent epoch (`Ok(None)`, a normal miss) from files that are
+    /// present but unreadable (`Err`): a corrupt pack, a damaged or unopenable index, or a
+    /// non-`NotFound` I/O failure is a storage READ error that must surface to the caller
+    /// instead of being collapsed into a miss.
+    async fn get_static_if_present(
+        &self,
+        epoch: Epoch,
+    ) -> Result<Option<ConsensusPack>, ConsensusChainError> {
+        self.get_static(epoch)
+            .await
+            .map(Some)
+            .or_else(|error| error.is_missing_static_files().then_some(None).ok_or(error))
+            .map_err(Into::into)
     }
 }
 
@@ -1847,6 +1853,123 @@ mod test {
                 .expect("output readable after heal");
             compare_outputs(&got, output);
         }
+    }
+
+    /// #1075: `PackError::is_missing_static_files` must be true ONLY when epoch files are
+    /// absent on disk (io `NotFound` from the data-file or an index-file open), and false for
+    /// files that are present but unreadable - the distinction `get_static_if_present` uses to
+    /// keep storage read errors from masquerading as misses.
+    #[test]
+    fn test_is_missing_static_files_classifies_absent_vs_unreadable() {
+        use crate::{
+            archive::error::{load_header::LoadHeaderError, open::OpenError},
+            consensus_pack::{ConsensusPack, PackError, DATA_NAME},
+        };
+
+        let temp_dir = TempDir::with_prefix("test_missing_static").expect("temp dir");
+
+        // Never-created epoch: the data-file open fails with io NotFound.
+        let absent = ConsensusPack::open_static(temp_dir.path(), 7)
+            .err()
+            .expect("open_static of a never-created epoch must fail");
+        assert!(
+            absent.is_missing_static_files(),
+            "io NotFound on the data file must classify as missing: {absent:?}"
+        );
+
+        // Present but unreadable: a garbage data file fails the header load, not NotFound.
+        let epoch_dir = temp_dir.path().join("epoch-7");
+        std::fs::create_dir_all(&epoch_dir).expect("create epoch dir");
+        std::fs::write(epoch_dir.join(DATA_NAME), [0xAB; 64]).expect("write garbage data file");
+        let unreadable = ConsensusPack::open_static(temp_dir.path(), 7)
+            .err()
+            .expect("open_static of a garbage data file must fail");
+        assert!(
+            !unreadable.is_missing_static_files(),
+            "header damage must NOT classify as missing: {unreadable:?}"
+        );
+
+        // The index-file arm: an interrupted import cleanup unlinks an epoch directory entry
+        // by entry, so an index file can be the one that is gone while the data file still
+        // opens. io NotFound there is still "absent on disk", preserving the staging fallback
+        // the pre-classifier lookup had during that window.
+        let index_missing = PackError::Open(std::sync::Arc::new(OpenError::IndexFileOpen(
+            LoadHeaderError::IO(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )));
+        assert!(
+            index_missing.is_missing_static_files(),
+            "io NotFound on an index file must classify as missing: {index_missing:?}"
+        );
+
+        // Same channel, any other io kind: present but unreadable, a read error.
+        let index_unreadable = PackError::Open(std::sync::Arc::new(OpenError::IndexFileOpen(
+            LoadHeaderError::IO(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )));
+        assert!(
+            !index_unreadable.is_missing_static_files(),
+            "a non-NotFound index failure must NOT classify as missing: {index_unreadable:?}"
+        );
+    }
+
+    /// #1075 regression: `consensus_header_by_digest` must distinguish a non-current epoch whose
+    /// static pack is present but UNREADABLE (a storage read error, `Err`) from an epoch that
+    /// was never on disk (a confirmed miss, `Ok(None)`). The startup restore guard treats `None`
+    /// as "no record" and instructs the operator to delete chain data; before this distinction
+    /// an unreadable pack was collapsed into that same `None`.
+    #[tokio::test]
+    async fn test_header_by_digest_distinguishes_unreadable_pack_from_absent() {
+        use crate::consensus_pack::DATA_NAME;
+
+        let temp_dir = TempDir::with_prefix("test_unreadable_pack").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        // Two outputs saved sequentially (consecutive consensus numbers, digest-chained).
+        let genesis_digest = ConsensusHeader::default().digest();
+        let first = make_test_output(&committee, 1, chain.clone(), 1, genesis_digest);
+        let first_digest: ConsensusHeaderDigest = first.digest().into();
+        consensus_chain.save_consensus_output(first).await.unwrap();
+        let second = make_test_output(&committee, 2, chain.clone(), 2, first_digest);
+        let second_digest: ConsensusHeaderDigest = second.digest().into();
+        consensus_chain.save_consensus_output(second).await.unwrap();
+        consensus_chain.persist_current().await.expect("persist");
+
+        // Positive control: the lookup plumbing resolves a header that is really there, so the
+        // negative cases below cannot pass vacuously.
+        let found = consensus_chain
+            .consensus_header_by_digest(0, second_digest)
+            .await
+            .expect("current-epoch lookup must not error")
+            .expect("saved header must resolve");
+        assert_eq!(found.number, 2, "resolved header should be the last saved output");
+
+        // An epoch that never existed on disk is a confirmed miss, not an error.
+        let absent = consensus_chain.consensus_header_by_digest(99, second_digest).await;
+        assert!(
+            matches!(absent, Ok(None)),
+            "a never-created epoch must resolve Ok(None): {absent:?}"
+        );
+
+        // An epoch whose static files are present but unreadable is a storage read ERROR; it
+        // must never be conflated with the miss above (the restore guard would tell the
+        // operator to delete recoverable chain data).
+        let epoch_dir = temp_dir.path().join("epoch-1");
+        std::fs::create_dir_all(&epoch_dir).expect("create epoch dir");
+        std::fs::write(epoch_dir.join(DATA_NAME), [0xAB; 64]).expect("write garbage data file");
+        let unreadable = consensus_chain.consensus_header_by_digest(1, second_digest).await;
+        assert!(
+            unreadable.is_err(),
+            "a present-but-unreadable static pack must surface as Err: {unreadable:?}"
+        );
     }
 
     /// A partial stream of the in-progress (incomplete) current epoch must deliver a verifiable

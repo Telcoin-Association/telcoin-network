@@ -269,8 +269,9 @@ impl<DB: Database> Subscriber<DB> {
     /// `ConsensusHeader` off of this parent. A failed storage lookup propagates so startup
     /// fail-stops instead of numbering new output from a silently-defaulted parent at 0.
     async fn get_last_executed_consensus(&self) -> SubscriberResult<(ConsensusHeaderDigest, u64)> {
-        let result =
-            last_consensus_parent(&self.consensus_bus, &self.inner.consensus_chain).await?;
+        let result = last_consensus_parent(&self.consensus_bus, &self.inner.consensus_chain)
+            .await
+            .map_err(|error| SubscriberError::ConsensusChainRead(format!("{error:#}")))?;
 
         info!(
             target: "subscriber",

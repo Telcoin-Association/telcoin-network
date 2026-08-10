@@ -139,6 +139,15 @@ pub enum SubscriberError {
     #[error("A fetched batch is missing from the collection: {0}")]
     MissingFetchedBatch(BlockHash),
 
+    /// A read from the consensus chain store failed while restoring subscriber state.
+    ///
+    /// Unlike a missing record (which callers model as `None` or a default header), this is a
+    /// surfaced storage READ failure (for example an unreadable or corrupt static epoch pack).
+    /// It is kept distinct so recovery paths never mistake unreadable chain data for absent
+    /// chain data.
+    #[error("Consensus chain read failure: {0}")]
+    ConsensusChainRead(String),
+
     /// An error from spawning consensus.
     #[error("Consensus error (from spawn): {0}")]
     Consensus(#[from] ConsensusError),
