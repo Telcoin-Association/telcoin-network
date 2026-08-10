@@ -89,11 +89,14 @@ use crate::common::{
     wait_for_epoch_at_least, wait_for_mid_epoch, ProcessGuard,
 };
 
-/// Epoch duration (seconds) for this test. Held at 10s (matching the pack-import test in
-/// `sync.rs`) rather than the 5s epoch tests: the export runs a full plain-state walk on a
-/// background thread, then the bundle is copied and atomically renamed into place, so 10s keeps
-/// ample margin for a complete bundle to appear before the observer imports it.
-const EXPORT_EPOCH_DURATION: u64 = 10;
+/// Epoch duration (seconds) for this test. 6s sits a second above the 5s epoch tests' consensus
+/// minimum and still fits the whole per-epoch sequence: the measured mid-epoch landing window is
+/// `[1s, 4s]` and a transfer confirms well inside it. The export itself (a full plain-state walk
+/// on a background thread, then the bundle copied and atomically renamed into place) is gated by
+/// consensus certificate aggregation (`CERT_WAIT` in `close_epoch.rs`, a fixed 90s ceiling), which
+/// does not scale with the epoch duration; that margin lives in the 100s floor on every bundle
+/// wait below, not in a long epoch.
+const EXPORT_EPOCH_DURATION: u64 = 6;
 
 /// Epoch whose bundle the observer imports. Must be `>= 1`: an epoch-0 bundle restores state and
 /// records but writes no resume hint (rebuilding the epoch-0 consensus pack needs a pre-epoch-0
@@ -269,7 +272,10 @@ async fn test_state_export_import_bootstrap_inner() -> eyre::Result<()> {
         .join("state_exports")
         .join(format!("epoch-{IMPORT_EPOCH}"));
     wait_until(
-        Duration::from_secs(EXPORT_EPOCH_DURATION * 4),
+        // Floored at 100s: cert aggregation (`CERT_WAIT`, a fixed 90s that does not shrink with
+        // the epoch duration) gates the export, and this wait starts about one epoch after the
+        // close, so 100s covers the full certificate window plus bundle-copy margin.
+        Duration::from_secs((EXPORT_EPOCH_DURATION * 4).max(100)),
         &format!("exporter to write the epoch-{IMPORT_EPOCH} bundle"),
         || async { Ok(bundle_dir.is_dir()) },
     )
@@ -534,7 +540,10 @@ async fn test_state_export_import_idle_epoch_inner() -> eyre::Result<()> {
         .join("state_exports")
         .join(format!("epoch-{IMPORT_EPOCH}"));
     wait_until(
-        Duration::from_secs(EXPORT_EPOCH_DURATION * 4),
+        // Floored at 100s: cert aggregation (`CERT_WAIT`, a fixed 90s that does not shrink with
+        // the epoch duration) gates the export, and this wait starts about one epoch after the
+        // close, so 100s covers the full certificate window plus bundle-copy margin.
+        Duration::from_secs((EXPORT_EPOCH_DURATION * 4).max(100)),
         &format!("exporter to write the IDLE epoch-{IMPORT_EPOCH} bundle"),
         || async { Ok(bundle_dir.is_dir()) },
     )
@@ -795,7 +804,7 @@ async fn land_fee_warmup_tx(
         if Instant::now() >= deadline {
             eyre::bail!("warm-up transfer to {to} did not confirm within {budget}s");
         }
-        // Poll ~4x/sec: at a 10s epoch a 1s cadence is coarse relative to block confirmation.
+        // Poll ~4x/sec: at a 6s epoch a 1s cadence is coarse relative to block confirmation.
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
@@ -962,7 +971,10 @@ async fn test_state_export_import_recovers_recorded_fee_inner() -> eyre::Result<
         .join("state_exports")
         .join(format!("epoch-{import_epoch}"));
     wait_until(
-        Duration::from_secs(EXPORT_EPOCH_DURATION * 4),
+        // Floored at 100s: cert aggregation (`CERT_WAIT`, a fixed 90s that does not shrink with
+        // the epoch duration) gates the export, and this wait starts about one epoch after the
+        // close, so 100s covers the full certificate window plus bundle-copy margin.
+        Duration::from_secs((EXPORT_EPOCH_DURATION * 4).max(100)),
         &format!("exporter to write the epoch-{import_epoch} bundle"),
         || async { Ok(bundle_dir.is_dir()) },
     )
