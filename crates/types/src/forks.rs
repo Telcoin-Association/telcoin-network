@@ -166,7 +166,7 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 ///   fork before any Static assignment. This is not urgent: neither the protocol write path
 ///   (`setWorkerConfigsData` / `setWorkerConfigsValue`) nor the epoch-boundary read path consults
 ///   `maxStrategy`, so a zeroed ceiling gates future governance actions only.
-pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = 373;
+pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = 375;
 
 #[cfg(feature = "adiri")]
 /// First epoch whose `Header`s carry the `seed_signature` field on the wire (#1032).
