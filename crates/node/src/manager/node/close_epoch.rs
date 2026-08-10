@@ -45,11 +45,23 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 /// elapsed by the time this wait begins, so the cert is normally present immediately.
 const CERT_WAIT: Duration = Duration::from_secs(90);
 
-/// Remove every `epoch-*.tmp` directory under the exports root — orphaned temp export dirs left by
-/// a crashed or interrupted prior run. Called ONCE at node startup, where it is safe because no
-/// export is in flight; the per-boundary path deliberately clears only its own epoch's temp so it
-/// can never delete another epoch's still-in-flight export working dir. Final `epoch-{N}` dirs have
-/// no extension, so they are never swept.
+/// True iff `name` is exactly the temp-dir name the export path writes for some epoch, i.e.
+/// `epoch-{N}.tmp` where `{N}` is a canonical (no sign, no leading zeros) [`Epoch`] rendering.
+/// [`sweep_stale_tmp_exports`] deletes only matches; anything else in the exports root was not
+/// written by the exporter and is not ours to remove.
+fn is_stale_tmp_export_name(name: &str) -> bool {
+    name.strip_prefix("epoch-").and_then(|rest| rest.strip_suffix(".tmp")).is_some_and(|digits| {
+        digits.parse::<Epoch>().is_ok_and(|epoch| epoch.to_string() == digits)
+    })
+}
+
+/// Remove every `epoch-{N}.tmp` directory under the exports root: orphaned temp export dirs left
+/// by a crashed or interrupted prior run. That exact shape is the only temp the export path ever
+/// writes, so nothing else is swept: final `epoch-{N}` dirs have no `.tmp` suffix, and stray
+/// entries (operator files or dirs that merely end in `.tmp`) never match. Called ONCE at node
+/// startup, where it is safe because no export is in flight; the per-boundary path deliberately
+/// clears only its own epoch's temp so it can never delete another epoch's still-in-flight export
+/// working dir.
 ///
 /// Best-effort: a missing exports root or a removal failure is logged at warn and otherwise
 /// ignored, since a failure here must never crash the node.
@@ -65,8 +77,14 @@ pub(super) fn sweep_stale_tmp_exports(export_root: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        // `epoch-{N}.tmp` (final dirs are `epoch-{N}` with no extension, so they are never swept).
-        if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
+        // Exactly `epoch-{N}.tmp`, and a directory: the one shape the export path writes (final
+        // dirs are `epoch-{N}` with no `.tmp` suffix, so they never match). The directory check
+        // also keeps stray `*.tmp` regular files off the `remove_dir_all` failure path, which
+        // would otherwise warn on every export-enabled startup without ever removing them.
+        let is_stale_tmp_export =
+            path.file_name().and_then(|name| name.to_str()).is_some_and(is_stale_tmp_export_name)
+                && entry.file_type().is_ok_and(|file_type| file_type.is_dir());
+        if is_stale_tmp_export {
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 warn!(target: "tn::snapshot", path = ?path, error = %e, "failed to remove stale temp export dir");
             }
@@ -75,7 +93,7 @@ pub(super) fn sweep_stale_tmp_exports(export_root: &Path) {
 }
 
 /// Best-effort removal of an export temp dir, logging at warn on failure so a leftover temp is
-/// observable (the next boundary's [`sweep_stale_tmp_exports`] will retry it). Replaces the silent
+/// observable (the next startup's [`sweep_stale_tmp_exports`] will retry it). Replaces the silent
 /// `let _ = remove_dir_all(..)` cleanups on the export completion task's failure/skip paths.
 ///
 /// Runs the removal on tokio's blocking pool: a partially-written export can be arbitrarily large
@@ -314,10 +332,10 @@ where
         // and its `final_state` derive from the same header by construction instead of by
         // timing.
         //
-        // `parent_state` is sampled ONCE, before the retry below, and both committees resolve
-        // through ONE batched by-hash read. Sampling once is required, not merely tidy: the watch
-        // is live, so re-sampling it per attempt would both shift the pin between attempts and
-        // desynchronize the committee reads from the `parent_state` passed to
+        // `parent_state` is sampled ONCE and threaded into the retry below as its pin, and both
+        // committees resolve through ONE batched by-hash read. Sampling once is required, not
+        // merely tidy: the watch is live, so re-sampling it per attempt would both shift the pin
+        // between attempts and desynchronize the committee reads from the `parent_state` passed to
         // `build_epoch_record` as `final_state`, destroying the same-header-by-construction
         // property the paragraph above claims.
         //
@@ -331,18 +349,20 @@ where
         // where it did before the retry existed. The net delta is two extra tries on Provider.
         let parent_state = self.consensus_bus.latest_execution_block_num_hash();
         let epochs = [epoch, epoch + 1];
-        let committees = retry_provider_faults("epoch-record committee reads", || {
-            engine.validators_for_epochs_at_block(&epochs, parent_state.hash)
-        })
-        .await
-        .map_err(|e| {
-            eyre!(
-                "failed committee read at epoch-closing block {} ({:?}) for the epoch {epoch} \
-                 record - halting rather than recording a committee this node cannot verify: {e}",
-                parent_state.number,
-                parent_state.hash
-            )
-        })?;
+        let committees =
+            retry_provider_faults("epoch-record committee reads", &parent_state, |pin| {
+                engine.validators_for_epochs_at_block(&epochs, pin.hash)
+            })
+            .await
+            .map_err(|e| {
+                eyre!(
+                    "failed committee read at epoch-closing block {} ({:?}) for the epoch \
+                     {epoch} record - halting rather than recording a committee this node cannot \
+                     verify: {e}",
+                    parent_state.number,
+                    parent_state.hash
+                )
+            })?;
         let [committee_keys, next_committee_keys]: [Vec<BlsPublicKey>; 2] =
             committees.try_into().map_err(|_| {
                 eyre!("committee batch read arity mismatch for the epoch {epoch} record")
@@ -389,8 +409,10 @@ where
     /// `final_state`.
     ///
     /// Unlike a plain copy of the live shared `epochs.pack` / `epoch_certs.pack`, the records/certs
-    /// bundle is a bounded `0..=N` selection built through the records-DB actor in the completion
-    /// task, so a later epoch appending to the live packs cannot race into the export. The task
+    /// bundle is a bounded `0..=N` set assembled in the completion task, so a later epoch appending
+    /// to the live packs cannot race into the export. In the common case it is built by copying the
+    /// previous boundary's published bundle and appending only epoch N's record and cert; when no
+    /// previous bundle validates, it is rebuilt in full through the records-DB actor. The task
     /// also waits a bounded time for epoch N's own certificate (only aggregated at the next epoch's
     /// start) and fails the export without it, so an importer never has to store the tip record
     /// unverified.
@@ -461,6 +483,16 @@ where
         // this returns.
         let consensus_chain = self.consensus_chain.clone();
         let consensus_bus = self.consensus_bus.clone();
+
+        // The previous boundary's published bundle, if any: lets the completion task build the
+        // records/certs bundle by copy + single append instead of a full 0..=N rebuild. It can be
+        // legitimately absent (first epoch, a skipped or failed prior export, operator pruning);
+        // the storage layer then falls back to the full rebuild. Published bundles are only ever
+        // read, never appended to in place.
+        let prev_bundle = epoch.checked_sub(1).map(|prev_epoch| {
+            let prev_dir = export_root.join(format!("epoch-{prev_epoch}"));
+            (prev_dir.join("epoch_records"), prev_dir.join("epoch_certs"))
+        });
 
         // Export into a temp sibling and atomically rename it into place on success, so external
         // tooling only ever observes a complete `epoch-{N}` directory. Clear any leftover temp for
@@ -544,12 +576,16 @@ where
                                 return Ok(());
                             }
 
-                            // write the bounded 0..=N records+certs from the actor, so a later epoch
-                            // appending to the live packs cannot race into this bundle.
+                            // write the bounded 0..=N records+certs bundle: extend the previous
+                            // boundary's published bundle with epoch N's entries when it
+                            // validates, rebuilding in full through the actor otherwise. either
+                            // way the set is bounded, so a later epoch appending to the live
+                            // packs cannot race into this bundle.
                             if let Err(e) = consensus_chain
                                 .epochs()
-                                .export_bounded_bundle(
+                                .export_incremental_bundle(
                                     epoch,
+                                    prev_bundle,
                                     &tmp_dir.join("epoch_records"),
                                     &tmp_dir.join("epoch_certs"),
                                 )
@@ -868,8 +904,8 @@ mod tests {
 
     #[test]
     fn sweep_removes_only_temp_export_dirs() {
-        // Finding #13: the boundary sweep must clear every `epoch-*.tmp` (this epoch's and orphans
-        // from prior epochs) while leaving completed `epoch-{N}` dirs and unrelated files
+        // Finding #13: the startup sweep must clear every `epoch-{N}.tmp` orphaned by a prior run
+        // while leaving completed `epoch-{N}` dirs and everything the exporter did not write
         // untouched.
         let root = tempfile::tempdir().expect("temp dir");
         let export_root = root.path();
@@ -877,6 +913,13 @@ mod tests {
             std::fs::create_dir_all(export_root.join(name)).expect("mkdir");
         }
         std::fs::write(export_root.join("keep.txt"), b"x").expect("write file");
+        // Not exporter-written: a `.tmp` directory without the `epoch-{N}` stem, a directory whose
+        // epoch is not a canonical `Epoch` rendering, and a regular file that is name-shaped like
+        // a temp export. The sweep must leave all three (the file without even attempting the
+        // `remove_dir_all` that would warn on every export-enabled startup).
+        std::fs::create_dir_all(export_root.join("stray.tmp")).expect("mkdir");
+        std::fs::create_dir_all(export_root.join("epoch-x.tmp")).expect("mkdir");
+        std::fs::write(export_root.join("epoch-7.tmp"), b"x").expect("write file");
 
         sweep_stale_tmp_exports(export_root);
 
@@ -884,6 +927,9 @@ mod tests {
         assert!(!export_root.join("epoch-2.tmp").exists(), "orphaned temp dir must be swept");
         assert!(export_root.join("epoch-5").exists(), "completed export dir must survive");
         assert!(export_root.join("keep.txt").exists(), "unrelated file must survive");
+        assert!(export_root.join("stray.tmp").exists(), "non-epoch `.tmp` dir must survive");
+        assert!(export_root.join("epoch-x.tmp").exists(), "non-numeric `.tmp` dir must survive");
+        assert!(export_root.join("epoch-7.tmp").exists(), "`.tmp` regular file must survive");
 
         // A missing exports root is a no-op (must not panic).
         sweep_stale_tmp_exports(&export_root.join("does-not-exist"));

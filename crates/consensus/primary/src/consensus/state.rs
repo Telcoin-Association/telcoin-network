@@ -1,7 +1,7 @@
 //! The state of consensus
 
 use crate::{
-    consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError, ConsensusInvariant},
+    consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError},
     ConsensusBus, NodeMode,
 };
 use std::{
@@ -16,7 +16,8 @@ use tn_storage::{
 };
 use tn_types::{
     now, AuthorityIdentifier, Certificate, CommittedSubDag, Committee, ConsensusChainReader,
-    Database, Hash as _, HeaderDigest, Noticer, Round, TaskManager, TnReceiver, TnSender,
+    Database, Epoch, EpochSeedChainError, EpochSeedChainValue, Hash as _, HeaderDigest, Noticer,
+    Round, TaskManager, TnReceiver, TnSender,
 };
 use tracing::{debug, error, info, instrument};
 
@@ -43,10 +44,21 @@ pub struct ConsensusState {
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything
     /// older must be regularly cleaned up through the function `update`.
     pub dag: Dag,
+    /// The epoch seed chain value the next commit folds into.
+    ///
+    /// Private on purpose: it may only be seeded from a fail-closed recovery (see
+    /// [`Consensus::spawn`]) and thereafter advanced through [`Self::set_seed_chain`] with the
+    /// value of a sub-dag that was actually committed. Any other provenance would re-root the
+    /// chain and fork execution permanently.
+    seed_chain: EpochSeedChainValue,
 }
 
 impl ConsensusState {
     /// Create a new empty ConsensusState.  Used for tests.
+    ///
+    /// The seed chain starts at [`EpochSeedChainValue::genesis_placeholder`], which is the pinned
+    /// fixture anchor. Production state is always built by [`Self::new_from_store`], which resolves
+    /// the anchor from the recovered commit.
     pub fn new(gc_depth: Round) -> Self {
         Self {
             last_round: ConsensusRound::default(),
@@ -54,7 +66,22 @@ impl ConsensusState {
             last_committed: Default::default(),
             dag: Default::default(),
             last_committed_sub_dag: None,
+            seed_chain: EpochSeedChainValue::genesis_placeholder(),
         }
+    }
+
+    /// The epoch seed chain value the next commit folds into.
+    pub fn seed_chain(&self) -> EpochSeedChainValue {
+        self.seed_chain
+    }
+
+    /// Advance the epoch seed chain to `seed_chain`.
+    ///
+    /// The caller must pass the value of the sub-dag it has just committed
+    /// ([`CommittedSubDag::seed_chain_value`]), in commit order, so the chain matches what every
+    /// other honest node folds.
+    pub fn set_seed_chain(&mut self, seed_chain: EpochSeedChainValue) {
+        self.seed_chain = seed_chain;
     }
 
     fn new_from_store<DB: Database>(
@@ -62,6 +89,7 @@ impl ConsensusState {
         gc_depth: Round,
         recovered_last_committed: HashMap<AuthorityIdentifier, Round>,
         latest_sub_dag: Option<CommittedSubDag>,
+        seed_chain: EpochSeedChainValue,
         cert_store: DB,
     ) -> Self {
         let last_round = ConsensusRound::new_with_gc_depth(last_committed_round, gc_depth);
@@ -81,6 +109,7 @@ impl ConsensusState {
             last_committed: recovered_last_committed,
             last_committed_sub_dag,
             dag,
+            seed_chain,
         }
     }
 
@@ -275,6 +304,45 @@ pub struct Consensus<DB> {
     certificate_pack: Option<CertificatePack>,
 }
 
+/// Resolve the epoch seed chain anchor from the two cursors recovered at startup, failing closed
+/// on every inconsistent combination.
+///
+/// `latest_sub_dag` and `last_committed_round` are read from the same per-epoch pack, so they must
+/// agree: the chain value has to be anchored to exactly the commit the cursor points at. Every
+/// disagreement is an error rather than a fallback, because the only available fallback - starting
+/// from the epoch root - re-roots the chain mid-epoch, and the chain value reaches the executed
+/// block's `parent_beacon_block_root`, so that fork is permanent and never re-converges.
+///
+/// Split out of [`Consensus::spawn`] so the four `(latest_sub_dag, last_committed_round > 0)`
+/// combinations are directly testable without standing up a node.
+pub(crate) fn resolve_seed_chain_anchor(
+    latest_sub_dag: Option<&CommittedSubDag>,
+    last_committed_round: Round,
+    epoch: Epoch,
+) -> Result<EpochSeedChainValue, EpochSeedChainError> {
+    match (latest_sub_dag, last_committed_round > 0) {
+        // Recovered mid-epoch: continue the chain from the commit the cursor points at.
+        (Some(sub_dag), true) if sub_dag.leader_round() == last_committed_round => {
+            Ok(EpochSeedChainValue::from_committed(sub_dag.randomness()))
+        }
+        // One of the two cursors is stale; folding either would diverge from the network.
+        (Some(sub_dag), true) => Err(EpochSeedChainError::LeaderRoundMismatch {
+            sub_dag_leader_round: sub_dag.leader_round(),
+            last_committed_round,
+        }),
+        // The cursor says this epoch has committed, but the commit itself is unreadable.
+        (None, true) => {
+            Err(EpochSeedChainError::MissingSubDagForCommittedRound { last_committed_round })
+        }
+        // A commit exists with no cursor pointing at it: the pack is inconsistent.
+        (Some(sub_dag), false) => Err(EpochSeedChainError::SubDagWithoutCommittedRound {
+            sub_dag_leader_round: sub_dag.leader_round(),
+        }),
+        // Genuine first commit of the epoch: start from the epoch root.
+        (None, false) => Ok(EpochSeedChainValue::epoch_root(epoch)),
+    }
+}
+
 impl<DB: Database> Consensus<DB> {
     pub async fn spawn(
         consensus_config: ConsensusConfig<DB>,
@@ -297,26 +365,33 @@ impl<DB: Database> Consensus<DB> {
             .unwrap_or_else(|| 0);
 
         // ignore previous epochs
+        //
+        // A pack read failure is propagated rather than collapsed to `None`. `None` means "this
+        // epoch has committed nothing yet", which seeds the epoch seed chain at its root; taking
+        // that branch after a failed read would re-root the chain mid-epoch, and because the
+        // chain value reaches the executed block's `parent_beacon_block_root` that fork is
+        // permanent (see [`EpochSeedChainValue`]).
         let latest_sub_dag = consensus_chain
             .latest_consensus_header_from_pack(current_epoch)
-            .await
-            .unwrap_or_default()
+            .await?
             .map(|h| h.sub_dag);
 
         debug!(target: "epoch-manager", ?latest_sub_dag, "recovered latest subdag:");
-        if let Some(sub_dag) = &latest_sub_dag {
-            // Self-consistency tripwire for recovery. Both operands derive from the same
-            // append-only `ConsensusPack` (a torn tail is reconciled in lockstep at pack open),
-            // so an honest single-node crash cannot tear them apart; this can only fire on an
-            // internal sub-dag construction regression. Surface a typed, recoverable error
-            // instead of aborting recovery with an `assert_eq!` backtrace.
-            (sub_dag.leader_round() == last_committed_round).then_some(()).ok_or_else(|| {
-                ConsensusInvariant::RecoveredLeaderRoundMismatch {
-                    leader_round: sub_dag.leader_round(),
-                    last_committed_round,
-                }
-            })?;
-        }
+
+        // Recovery's self-consistency tripwire lives inside `resolve_seed_chain_anchor`, which
+        // subsumes the standalone `sub_dag.leader_round() == last_committed_round` check main
+        // carries here: it rejects that same disagreement as
+        // `EpochSeedChainError::LeaderRoundMismatch`, and additionally rejects the two cursor
+        // combinations the standalone check cannot see (a committed round with no readable
+        // sub-dag, and a sub-dag with no cursor pointing at it). Both operands derive from the
+        // same append-only `ConsensusPack`, so none of these is reachable on an honest
+        // single-node crash; all three are typed, recoverable errors rather than an
+        // `assert_eq!` backtrace, which is what `ConsensusInvariant` asks for at this site.
+        let seed_chain = resolve_seed_chain_anchor(
+            latest_sub_dag.as_ref(),
+            last_committed_round,
+            current_epoch,
+        )?;
 
         // restore local dag
         let state = ConsensusState::new_from_store(
@@ -324,6 +399,7 @@ impl<DB: Database> Consensus<DB> {
             consensus_config.parameters().gc_depth,
             recovered_last_committed,
             latest_sub_dag,
+            seed_chain,
             consensus_config.node_storage().clone(),
         );
 

@@ -41,6 +41,17 @@ become Prometheus `HELP` text.
 Rules:
 
 - No high-cardinality labels (no peer ids, digests, or epochs as label values).
+- A metric that needs a label has no derive field at all: the derive generates one unlabelled
+  series per field. Use the `metrics::gauge!` / `metrics::counter!` macros with the matching
+  `metrics::describe_*!`, which also resolve the recorder on every call. `tn-reth`'s
+  `tn_reth.epoch_close_system_call_gas_used` (`crates/tn-reth/src/metrics.rs`) is the in-repo
+  example — one series per epoch-boundary system call, keyed by a closed `call` label.
+- The derive's `Default::default()` caches the whole struct in a `static OnceLock`, so the first
+  construction in a process fixes which recorder every later handle records against.
+  `Metrics::new_with_labels` does not cache, so prefer it over `default()` wherever a second
+  recording in one process has to reach a different recorder — which is any test that installs a
+  local recorder. `tn-reth`'s `RethEnvMetrics` tests do exactly this. Production behaviour is
+  identical either way, since the node installs one recorder before the first metric exists.
 - Epoch / round / height are gauge **values**, not labels.
 - Histograms must end in `_seconds` or `_bytes`, or have explicit buckets registered in
   `recorder.rs` — otherwise they render as non-aggregatable quantile summaries.
@@ -64,7 +75,9 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 let recorder = DebuggingRecorder::new();
 let snapshotter = recorder.snapshotter();
 metrics::with_local_recorder(&recorder, || {
-    let metrics = WorkerMetrics::default();
+    // `new_with_labels`, not `default()`: the latter caches in a `OnceLock` and would bind to
+    // whichever recorder was installed the first time this type was constructed in the process
+    let metrics = WorkerMetrics::new_with_labels(Vec::<metrics::Label>::new());
     metrics.batches_sealed_total.increment(1);
 });
 let snapshot = snapshotter.snapshot().into_vec();

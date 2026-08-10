@@ -11,7 +11,7 @@
 //! contract is the absolute source of truth, and the count for an epoch is the contract's state
 //! at the previous epoch's closing block: `catchup_accumulator` (in `node::manager`) sizes the
 //! accumulator from that state at startup, the epoch entry seeding re-seeds it on every entry
-//! (`DerivedBaseFees::apply`, or `sync_num_workers_from_chain` for epoch 0), and
+//! (`EpochBaseFees::apply`, or `sync_num_workers_from_chain` for epoch 0), and
 //! `adjust_base_fees` resizes at epoch close to the count read from the closing block (the next
 //! epoch's count). All resizes go through [`GasAccumulator::set_num_workers`].
 //!
@@ -39,18 +39,19 @@
 //!
 //! Base fee is consensus-affecting, so a node must never produce with a fee it cannot verify
 //! against the chain. The entered epoch's worker count and per-worker fees are therefore owned
-//! by the epoch entry seeding (`run_epoch` in `node::manager`), which derives them on EVERY
-//! entry — live boundary crossing, restart, mid-epoch re-entry, or sync — as a pure function of
-//! the previous epoch's on-chain state (`derive_base_fees_for_entered_epoch`): the previous
-//! epoch's closing block is resolved from the entered epoch's registry-recorded first block,
-//! worker strategies and count are read at it, and workers with no block to read a fee from walk
-//! back through earlier closing blocks (`derive_idle_worker_fee`). Epoch 0 has no prior epoch,
-//! so every [`BaseFeeContainer`] keeps the MIN default. A node that cannot read or verify that
-//! state halts rather than produce with an unverifiable fee. The live producer's close-time
-//! computation (`adjust_base_fees`) folds the same formula over the same inputs, so the value it
-//! carries between close and the next entry is identical to what entry derivation recomputes.
+//! by the epoch entry seeding (`run_epoch` in `node::manager`), which reads them on EVERY entry
+//! — live boundary crossing, restart, mid-epoch re-entry, or sync — from one pinned block: the
+//! previous epoch's closing block, resolved from the entered epoch's registry-recorded first
+//! block. That block's own system call recorded each worker's next-epoch fee in `WorkerConfigs`
+//! storage, so the entry reads count, strategies, and fees from a single state read
+//! (`read_base_fees_for_entered_epoch`, one row per worker through [`entry_fee_for_worker`]).
+//! Epoch 0 has no prior epoch, so every [`BaseFeeContainer`] keeps the MIN default. A node that
+//! cannot read that state halts rather than produce with an unverifiable fee. The live
+//! producer's close-time computation (`adjust_base_fees`) folds the same formula over the same
+//! inputs the closing block's record used, so the value it carries between close and the next
+//! entry is identical to what the entry reads back.
 
-use crate::{AuthorityIdentifier, Committee, SealedHeader, WorkerId, B256};
+use crate::{AuthorityIdentifier, Committee, SealedHeader, WorkerId};
 
 use alloy::{
     eips::eip1559::{calc_next_block_base_fee, BaseFeeParams, MIN_PROTOCOL_BASE_FEE},
@@ -84,30 +85,23 @@ pub enum WorkerFeeConfig {
 ///
 /// The engine encodes `difficulty` as `batch_index << 16 | worker_id` (matching how
 /// [`GasAccumulator::inc_block`] callers attribute blocks), so the worker id is the low 16 bits and
-/// the batch index occupies the upper bits. This is the single canonical implementation shared by
-/// the per-worker fee/gas derivation (`tn_node`) and the snapshot fee-derivability precheck
-/// (`tn_reth`), so both attribute headers with the exact same rule — no drift.
+/// the batch index occupies the upper bits.
+///
+/// ONE production consumer: `catchup_accumulator`'s startup accumulator restore (in
+/// `node::manager`), which bounds every scanned header's worker id against the on-chain worker
+/// count and then folds each header's gas into that worker's slot. It is NOT a fee derivation — the
+/// entered epoch's fees come from the closing block's `WorkerConfigs` record through
+/// [`entry_fee_for_worker`], which needs no header attribution at all. `tn-reth`'s `snapshot`
+/// module re-exports the name; every use there is a test.
+///
+/// The MASK does have a second implementation to stay in sync with:
+/// `tn-reth/src/evm/block.rs`'s `TNBlockExecutionCtx::worker_id` reads the same low 16 bits off
+/// the execution context while a block is being built (and points back here), so a block's
+/// attribution is identical whether it is taken from the context during execution or from the
+/// sealed header afterwards. The accumulator's per-worker totals depend on that agreement, so the
+/// two move together.
 pub fn worker_id_from_header(header: &SealedHeader) -> WorkerId {
     (header.difficulty.into_limbs()[0] & 0xffff) as u16
-}
-
-/// True when `header` is a genuine worker batch block.
-///
-/// Two on-chain block shapes are NOT worker batch blocks and must be excluded from per-worker
-/// fee/gas attribution:
-/// - the genesis block (`number == 0`), which carries no worker payload, and
-/// - the synthetic empty-close block the engine builds when an epoch closes with no batches. That
-///   block is stamped worker 0 and copies its PARENT's base fee (see `tn_engine`'s
-///   `execute_consensus_output`), so attributing it would poison worker 0 with another worker's
-///   fee. It is identified by `ommers_hash == B256::ZERO`: the header's `ommers_hash` carries the
-///   batch digest, and only the synthetic block passes `B256::ZERO` (real batch digests are never
-///   zero).
-///
-/// A non-empty epoch-closing block built from real batches has a non-zero `ommers_hash` and IS a
-/// genuine worker block. Shared canonical implementation used by both `tn_node` (fee/gas
-/// derivation) and `tn_reth` (snapshot fee-derivability precheck).
-pub fn is_worker_batch_block(header: &SealedHeader) -> bool {
-    header.number != 0 && header.ommers_hash != B256::ZERO
 }
 
 /// One row of the on-chain `WorkerConfigs` table: a worker's fee strategy plus the raw `uint184`
@@ -455,6 +449,23 @@ impl GasAccumulator {
     }
 }
 
+/// The largest `current_base_fee` [`compute_next_base_fee_eip1559`] may hand to alloy.
+///
+/// alloy's [`calc_next_block_base_fee`] adds its delta to `base_fee` with a plain `+`. That
+/// addition is unchecked, so it panics under `overflow-checks` (the `dev`, `test` and `e2e`
+/// profiles) and wraps silently under `release`, where a wrapped fee is a consensus value every
+/// node agrees on and therefore validates cleanly instead of forking.
+///
+/// With `gas_used` already clamped to `gas_limit`, the delta alloy computes is at most
+/// `base_fee * (gas_limit - gas_target) / (gas_target * 8)`, and `gas_limit - gas_target` never
+/// exceeds `gas_target`, so the delta never exceeds `base_fee / 8`. Bounding `base_fee` by
+/// `u64::MAX - u64::MAX / 8` therefore keeps `base_fee + base_fee / 8` inside `u64`.
+///
+/// This bound holds in the saturating regime too. For a `target_gas > u64::MAX / 2` the synthetic
+/// `gas_limit` saturates at `u64::MAX`, alloy recovers `gas_target = u64::MAX / 2`, and
+/// `gas_limit - gas_target` still does not exceed `gas_target`, so the `/ 8` ceiling is unchanged.
+const SAFE_MAX_BASE_FEE: u64 = u64::MAX - u64::MAX / 8;
+
 /// EIP-1559-style base fee adjustment computed once per epoch.
 ///
 /// Compares `gas_used` (total gas consumed by a single worker during the epoch)
@@ -464,10 +475,13 @@ impl GasAccumulator {
 /// Delegates the formula to alloy's [`calc_next_block_base_fee`] using
 /// [`BaseFeeParams::ethereum`] (`elasticity_multiplier = 2`,
 /// `max_change_denominator = 8`). The synthetic `gas_limit` passed to alloy is
-/// `target_gas * 2` so alloy recovers the same `gas_target`. `gas_used` is
-/// clamped to `gas_limit` to enforce the EIP-1559 elasticity bound and avoid
-/// the unbounded delta arithmetic alloy would otherwise produce when callers
-/// pass `gas_used > gas_limit`.
+/// `target_gas * 2` so alloy recovers the same `gas_target`, except for a
+/// `target_gas > u64::MAX / 2`, where the multiply saturates and alloy instead
+/// recovers `u64::MAX / 2`. Both inputs into alloy's delta arithmetic are
+/// clamped so that arithmetic cannot leave `u64`: `gas_used` to `gas_limit`,
+/// enforcing the EIP-1559 elasticity bound, and `current_base_fee` to
+/// [`SAFE_MAX_BASE_FEE`], bounding the unchecked addition alloy performs on the
+/// fee-increase arm.
 ///
 /// The result is clamped to `[MIN_PROTOCOL_BASE_FEE, u64::MAX]`.
 pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, target_gas: u64) -> u64 {
@@ -478,6 +492,7 @@ pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, targe
     let params = BaseFeeParams::ethereum();
     let gas_limit = target_gas.saturating_mul(params.elasticity_multiplier as u64);
     let gas_used = gas_used.min(gas_limit);
+    let current_base_fee = current_base_fee.min(SAFE_MAX_BASE_FEE);
     let new_base_fee = calc_next_block_base_fee(gas_used, gas_limit, current_base_fee, params);
     new_base_fee.max(MIN_PROTOCOL_BASE_FEE)
 }
@@ -489,10 +504,11 @@ pub fn compute_next_base_fee_eip1559(current_base_fee: u64, gas_used: u64, targe
 /// the fee to the governance-set value, ignoring gas usage.
 ///
 /// This is the ONE fee formula, and it lives here so every seam that prices a worker's next-epoch
-/// fee dispatches through the same strategy match: `adjust_base_fees` (in `node::manager`) applies
-/// it at a live epoch close and `fold_next_epoch_base_fees` (also in `node::manager`) applies it
-/// when deriving the entered epoch's fees from the previous epoch's chain state, so both seams
-/// produce identical values from identical inputs.
+/// fee dispatches through the same strategy match: `record_next_epoch_base_fees` (in
+/// `tn-reth::evm::block`) applies it inside the closing block to write the fee into the worker's
+/// on-chain `WorkerConfigs.data` word — the record the epoch entry reads back — and
+/// `adjust_base_fees` (in `node::manager`) applies it to the live accumulator at close time, so
+/// both seams produce identical values from identical inputs.
 pub fn next_base_fee_for_config(
     config: WorkerFeeConfig,
     current_base_fee: u64,
@@ -503,6 +519,62 @@ pub fn next_base_fee_for_config(
             compute_next_base_fee_eip1559(current_base_fee, gas_used, target_gas)
         }
         WorkerFeeConfig::Static { fee } => fee,
+    }
+}
+
+/// Read worker `worker_id`'s base fee for the epoch being entered out of the
+/// [`WorkerConfigEntry`] pinned at the previous epoch's closing block.
+///
+/// `Static { fee }` returns the configured fee and ignores `data` entirely — including a garbage
+/// word. A static row's fee already lives in its config, the write path never records one, and a
+/// row governance switched from `Eip1559` keeps its last recorded word forever, so `data` is stale
+/// by design for this variant (see the data-semantics doc on [`WorkerConfigEntry`]).
+///
+/// `Eip1559` reads the recorded word. A zero word maps to `MIN_PROTOCOL_BASE_FEE`, and on
+/// pre-activation history that is the same value the whole-epoch header derivation this read
+/// replaced computed — but the cutover is value-identical only under two premises, neither of which
+/// this function can enforce:
+///
+/// 1. Every pre-activation `Eip1559` row still reads `data == 0`. The write path activates at
+///    `CONSENSUS_REGISTRY_FORK_EPOCH` (in [`crate::forks`]; adiri-gated, so no intra-doc link),
+///    whose pre-deploy checklist requires confirming exactly that on the live contract, and whose
+///    adiri rollout constraint forbids ANY `WorkerConfigs` write until the fork epoch has passed —
+///    a `setWorkerConfig` that lands a word included, and so is a fee-neutral-looking `Static { fee
+///    }` -> `Eip1559 { target_gas: u64::MAX }` flip, which has this read price MIN where the header
+///    derivation priced ~0.875 · `fee`. See that constant's doc for the full constraint; a non-zero
+///    word landed pre-fork splits the fleet through the exact-equality basefee check, and one above
+///    `u64::MAX` fail-hards it (below).
+/// 2. Pre-activation header base fees never rose above MIN on the live chain. The deleted
+///    derivation anchored its fold on the header `base_fee_per_gas` of the worker's LAST genuine
+///    block, falling back to MIN only on the epoch-0 base case, a slot not yet configured at the
+///    boundary, or an anchor that was itself MIN — an idle worker with no block in the scanned
+///    range was walked back to the last epoch it produced in, and a `Static` row was pinned to its
+///    configured fee. So MIN is what it computed only where that anchor was itself MIN. This is an
+///    empirical fact about adiri (no governance target has moved a worker's fee off the protocol
+///    minimum yet), NOT a structural identity.
+///
+/// The same floor lifts a hypothetical governance-written `1..=6` to the protocol minimum.
+///
+/// # Errors
+///
+/// An `Eip1559` word wider than `u64`. Every honest close records a `u64` fee, so a wider word can
+/// only come from a foreign governance write — halting beats truncating an arbitrary word into a
+/// consensus-critical fee. This is a tripwire rather than a live hazard: once the write path is
+/// active the closing block's own system call rewrites every `Eip1559` row's word, so a read
+/// pinned to a closing block only sees words that block itself wrote.
+pub fn entry_fee_for_worker(worker_id: WorkerId, entry: &WorkerConfigEntry) -> Result<u64, String> {
+    match entry.config {
+        WorkerFeeConfig::Static { fee } => Ok(fee),
+        WorkerFeeConfig::Eip1559 { .. } => {
+            let recorded = u64::try_from(entry.data).map_err(|_| {
+                format!(
+                    "worker {worker_id}'s recorded WorkerConfigs data word {} exceeds u64::MAX and \
+                     cannot be a base fee",
+                    entry.data
+                )
+            })?;
+            Ok(recorded.max(MIN_PROTOCOL_BASE_FEE))
+        }
     }
 }
 
@@ -517,29 +589,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worker_attribution_helpers_match_header_encoding() {
+    fn worker_attribution_matches_header_encoding() {
         use crate::{ExecHeader, U256};
-        // `difficulty` encodes `batch_index << 16 | worker_id`; `ommers_hash` is the batch digest.
-        let header = |number: u64, batch_index: u64, wid: u16, ommers: B256| -> SealedHeader {
+        // `difficulty` encodes `batch_index << 16 | worker_id`.
+        let header = |number: u64, batch_index: u64, wid: u16| -> SealedHeader {
             SealedHeader::seal_slow(ExecHeader {
                 number,
                 difficulty: U256::from((batch_index << 16) | wid as u64),
-                ommers_hash: ommers,
                 ..Default::default()
             })
         };
-        let nonzero = B256::from([0xab; 32]);
-
-        // genesis (block 0) is never a genuine batch block
-        assert!(!is_worker_batch_block(&header(0, 0, 0, nonzero)));
-        // the synthetic empty-close block carries a zero ommers_hash (batch-digest slot)
-        assert!(!is_worker_batch_block(&header(5, 0, 0, B256::ZERO)));
-        // a real batch block: non-genesis number, non-zero batch digest
-        assert!(is_worker_batch_block(&header(5, 0, 3, nonzero)));
 
         // worker id is the LOW 16 bits; the batch index (upper bits) is ignored
-        assert_eq!(worker_id_from_header(&header(5, 42, 3, nonzero)), 3);
-        assert_eq!(worker_id_from_header(&header(5, 0, 0xffff, nonzero)), 0xffff);
+        assert_eq!(worker_id_from_header(&header(5, 42, 3)), 3);
+        assert_eq!(worker_id_from_header(&header(5, 0, 0xffff)), 0xffff);
     }
 
     #[test]
@@ -580,6 +643,56 @@ mod tests {
         let base = 1_000_000_000_000_000u64;
         let result = compute_next_base_fee_eip1559(base, u64::MAX, 1);
         assert_eq!(result, base + base / 8);
+    }
+
+    /// Mutation guard for the `.min(SAFE_MAX_BASE_FEE)` clamp: with the clamp removed, alloy's
+    /// unchecked `base_fee + delta` overflows on every case here: a panic under the test
+    /// profile's `overflow-checks`, and a wrapped (far lower) fee in a release build.
+    #[test]
+    fn ceiling_base_fee_never_overflows() {
+        let target = 15_000_000u64;
+
+        // the exact threshold: the unclamped sum is 2^64, which wraps to 0 and would surface as
+        // MIN_PROTOCOL_BASE_FEE after the floor
+        let threshold = 16_397_105_843_297_379_215u64;
+        let at_threshold = compute_next_base_fee_eip1559(threshold, target * 2, target);
+        assert!(
+            at_threshold >= SAFE_MAX_BASE_FEE,
+            "a fee increase must never collapse the fee: {at_threshold}"
+        );
+
+        // the widest word `entry_fee_for_worker` accepts, at the maximal +12.5% move
+        let at_max = compute_next_base_fee_eip1559(u64::MAX, target * 2, target);
+        assert_eq!(at_max, SAFE_MAX_BASE_FEE + SAFE_MAX_BASE_FEE / 8);
+
+        // the smallest over-target move still takes alloy's `max(1, ..)` floored delta
+        let barely_over = compute_next_base_fee_eip1559(u64::MAX, target + 1, target);
+        assert!(barely_over >= SAFE_MAX_BASE_FEE, "must not wrap: {barely_over}");
+    }
+
+    /// The clamp is a no-op for every fee the protocol can actually hold, so no epoch that did not
+    /// already overflow changes value. `SAFE_MAX_BASE_FEE` itself is the largest unaffected input.
+    #[test]
+    fn clamp_does_not_change_in_range_fees() {
+        let target = 15_000_000u64;
+        assert_eq!(compute_next_base_fee_eip1559(1000, target * 2, target), 1125);
+        assert_eq!(
+            compute_next_base_fee_eip1559(SAFE_MAX_BASE_FEE, target * 2, target),
+            SAFE_MAX_BASE_FEE + SAFE_MAX_BASE_FEE / 8
+        );
+        // one below the clamp still moves by the full 12.5%
+        let below = SAFE_MAX_BASE_FEE - 1;
+        assert_eq!(compute_next_base_fee_eip1559(below, target * 2, target), below + below / 8);
+    }
+
+    /// A saturating `target_gas` is the other axis into alloy's delta arithmetic; the clamp has to
+    /// hold there too, where `gas_target` is `u64::MAX / 2` rather than the configured target.
+    #[test]
+    fn ceiling_base_fee_never_overflows_with_saturating_target() {
+        [u64::MAX / 2 + 1, u64::MAX - 1, u64::MAX].iter().for_each(|&target| {
+            let out = compute_next_base_fee_eip1559(u64::MAX, u64::MAX, target);
+            assert!(out >= SAFE_MAX_BASE_FEE, "target {target} wrapped to {out}");
+        });
     }
 
     #[test]
@@ -673,6 +786,72 @@ mod tests {
             next_base_fee_for_config(WorkerFeeConfig::Static { fee: 500 }, 1_000_000, 0),
             500
         );
+    }
+
+    #[test]
+    fn entry_fee_static_ignores_the_data_word() {
+        // a static row's fee lives in its config; the write path never records one, so any word
+        // the row carries is stale by design - never a fee input
+        let cfg = WorkerFeeConfig::Static { fee: 12_345 };
+        assert_eq!(
+            entry_fee_for_worker(0, &WorkerConfigEntry { config: cfg, data: U184::ZERO }),
+            Ok(12_345)
+        );
+        assert_eq!(
+            entry_fee_for_worker(1, &WorkerConfigEntry { config: cfg, data: U184::from(999u64) }),
+            Ok(12_345)
+        );
+        // garbage far beyond u64: still ignored, still no error
+        assert_eq!(
+            entry_fee_for_worker(2, &WorkerConfigEntry { config: cfg, data: U184::MAX }),
+            Ok(12_345)
+        );
+    }
+
+    #[test]
+    fn entry_fee_eip1559_reads_the_recorded_word() {
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 };
+        let entry = WorkerConfigEntry { config: cfg, data: U184::from(1_125_000u64) };
+        assert_eq!(entry_fee_for_worker(0, &entry), Ok(1_125_000));
+    }
+
+    #[test]
+    fn entry_fee_eip1559_zero_word_maps_to_min() {
+        // the cutover case: a never-written row reads MIN, which is what the header-scan
+        // derivation computed for every pre-activation epoch
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: u64::MAX };
+        let entry = WorkerConfigEntry { config: cfg, data: U184::ZERO };
+        assert_eq!(entry_fee_for_worker(0, &entry), Ok(MIN_PROTOCOL_BASE_FEE));
+    }
+
+    #[test]
+    fn entry_fee_eip1559_floors_sub_min_words() {
+        // 1..=6 is unreachable from the write path (a recorded fee is never below MIN) but a
+        // governance write could store one; the floor keeps the protocol minimum
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 };
+        for word in 1..MIN_PROTOCOL_BASE_FEE {
+            let entry = WorkerConfigEntry { config: cfg, data: U184::from(word) };
+            assert_eq!(entry_fee_for_worker(0, &entry), Ok(MIN_PROTOCOL_BASE_FEE), "word {word}");
+        }
+    }
+
+    #[test]
+    fn entry_fee_eip1559_accepts_u64_max_word() {
+        // the widest word an honest close can record
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 };
+        let entry = WorkerConfigEntry { config: cfg, data: U184::from(u64::MAX) };
+        assert_eq!(entry_fee_for_worker(0, &entry), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn entry_fee_eip1559_rejects_word_wider_than_u64() {
+        // one above the widest recordable fee: only a foreign write reaches here, so halt
+        let cfg = WorkerFeeConfig::Eip1559 { target_gas: 1_000_000 };
+        let data = U184::from(u64::MAX) + U184::from(1u64);
+        let err = entry_fee_for_worker(3, &WorkerConfigEntry { config: cfg, data })
+            .expect_err("a word wider than u64 cannot be a base fee");
+        assert!(err.contains("worker 3"), "error must name the worker: {err}");
+        assert!(err.contains(&data.to_string()), "error must name the data word: {err}");
     }
 
     #[test]

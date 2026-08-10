@@ -76,17 +76,26 @@
 //!
 //! # Randomness
 //!
-//! The epoch-close `randomness` (`ctx.close_epoch`) is the keccak256 of the leader
-//! certificate's aggregate BLS signature, computed in `CommittedSubDag::new` and carried through
-//! the payload. It seeds the deterministic committee shuffle AND is stored as the block's
-//! `extra_data`, which is how the replay path (`context_for_block`) rebuilds the ctx from the
-//! sealed header — identical up to `gas_accumulator`, which is the live shared accumulator rather
-//! than header-derived (see the `evm/config.rs` module docs for the replay caveat and the
-//! `block.body.withdrawals` reconstruction follow-up). The RNG draw order inside the shuffle
-//! is consensus-critical: any refactor that reorders the draws selects a different committee.
+//! The epoch-close `randomness` (`ctx.close_epoch`) is whichever seed
+//! `ConsensusOutput::committee_shuffle_seed` yields for the closing epoch, and that is epoch-gated
+//! on `tn_types::forks::seed_signature_active`. For epochs where the gate is inactive (every
+//! `adiri` epoch before `SEED_SIGNATURE_FORK_EPOCH`) it stays the LEGACY seed, keccak256 of the
+//! leader certificate's aggregate BLS signature, wire-identical to pre-fork releases; for active
+//! epochs it is the epoch seed chain value as of the closing commit, folded per commit in
+//! `CommittedSubDag::new`. Do not read this module as describing the seed chain unconditionally:
+//! the whole point of the gate is that pre-fork epochs re-execute exactly as they always did.
+//!
+//! Either way the value is carried through the payload, seeds the deterministic committee shuffle,
+//! AND is stored as the block's `extra_data`, which is how the replay path (`context_for_block`)
+//! rebuilds the ctx from the sealed header — identical up to `gas_accumulator`, which is the live
+//! shared accumulator rather than header-derived (see the `evm/config.rs` module docs for the
+//! replay caveat and the `block.body.withdrawals` reconstruction follow-up). The RNG draw order
+//! inside the shuffle is consensus-critical: any refactor that reorders the draws selects a
+//! different committee.
 
 use crate::{
     error::{TnRethError, TnRethResult},
+    metrics::{gas_spent, EpochCloseGas},
     system_calls::{
         decode_worker_fee_configs,
         ConsensusRegistry::{self, RewardInfo, ValidatorStatus},
@@ -149,13 +158,15 @@ pub struct TNBlockExecutionCtx {
     /// This is the batch that was validated by consensus and executed
     /// to produce the EVM block.
     pub ommers_hash: B256,
-    /// Keccak256 hash of the leader certificate's aggregate BLS signature. `Some` only for the
+    /// The epoch-close committee-shuffle seed. `Some` only for the
     /// final batch of the epoch's last `ConsensusOutput`.
     ///
     /// When included, the executor runs the epoch-closing system calls (see the module docs) and
-    /// seeds the deterministic committee shuffle with this hash. It is computed in
-    /// `CommittedSubDag::new` (with a logged `BlsSignature::default()` fallback if the leader
-    /// signature is missing) and is also stored in the block's `extra_data` — both the marker
+    /// seeds the deterministic committee shuffle with this value. It is derived per commit in
+    /// `CommittedSubDag::new`: for fork-active epochs (#1086, `seed_signature_active`) it folds
+    /// the previous commit's chain value with the leader header's digest-pinned `seed_signature`;
+    /// pre-fork epochs retain the legacy keccak of the leader certificate's aggregate signature.
+    /// It is also stored in the block's `extra_data`: both the marker
     /// clients use to recognize an epoch-closing block and the value the replay path
     /// (`context_for_block`) reads back to rebuild an identical ctx from the sealed header.
     pub close_epoch: Option<B256>,
@@ -236,6 +247,13 @@ pub(crate) struct TNBlockExecutor<Evm, Spec, R: ReceiptBuilder> {
     receipts: Vec<R::Receipt>,
     /// Total gas used by transactions in this block.
     gas_used: u64,
+    /// Gas spent by the epoch-boundary system calls this block issued, accumulated as they run
+    /// and published once by [`Self::finish`] (`crate::metrics::record_epoch_close_gas`).
+    ///
+    /// Every caller of [`Self::transact_and_commit_system_call`] is an epoch-boundary call, so
+    /// this stays empty on the overwhelming majority of blocks — and an empty `Vec` does not
+    /// allocate, so a non-closing block pays nothing for the instrumentation.
+    epoch_close_gas: EpochCloseGas,
 }
 
 // alloy-evm
@@ -252,7 +270,15 @@ where
 {
     /// Creates a new [`TNBlockExecutor`]
     pub(crate) fn new(evm: Evm, ctx: TNBlockExecutionCtx, spec: Spec, receipt_builder: R) -> Self {
-        Self { evm, ctx, receipts: Vec::new(), gas_used: 0, spec, receipt_builder }
+        Self {
+            evm,
+            ctx,
+            receipts: Vec::new(),
+            gas_used: 0,
+            spec,
+            receipt_builder,
+            epoch_close_gas: EpochCloseGas::default(),
+        }
     }
 
     /// Execute a system call from [`SYSTEM_ADDRESS`] to `contract` and commit its state changes.
@@ -269,11 +295,18 @@ where
     /// spurious account into the bundle and diverge the state root. Every commit of a
     /// system-call result must uphold this invariant; the EIP-4788/EIP-2935 pre-block calls do
     /// so with a `retain` of their target contract, which also drops the touched beneficiary.
+    ///
+    /// On success the gas the call SPENT (see [`gas_spent`]) is accumulated under `label` for
+    /// [`Self::finish`] to publish. `label` is the `call` label value the gauge carries, so it is
+    /// a stable machine-readable name rather than the human `description`: the two are separate
+    /// because renaming a log line must not silently rename a metric series. Only the success arm
+    /// records — a revert or halt aborts the block, leaving no epoch close to report gas for.
     fn transact_and_commit_system_call(
         &mut self,
         contract: Address,
         calldata: Bytes,
         description: &str,
+        label: &'static str,
     ) -> TnRethResult<()> {
         let mut res = match self.evm.transact_system_call(SYSTEM_ADDRESS, contract, calldata) {
             Ok(res) => res,
@@ -287,7 +320,9 @@ where
         // return error if the call executed but did not succeed, keeping Revert (decoded
         // reason + selector) distinguishable from Halt
         match &res.result {
-            ExecutionResult::Success { .. } => {}
+            ExecutionResult::Success { gas_used, gas_refunded, .. } => {
+                self.epoch_close_gas.push(label, gas_spent(*gas_used, *gas_refunded));
+            }
             ExecutionResult::Revert { output, gas_used } => {
                 let reason = alloy::sol_types::decode_revert_reason(output)
                     .unwrap_or_else(|| "<undecodable revert reason>".to_string());
@@ -376,6 +411,7 @@ where
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "applying incentives",
+            "apply_incentives",
         )?;
 
         // 2. slashes, landing before the committee is read
@@ -385,6 +421,7 @@ where
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "applying slashes",
+            "apply_slashes",
         )?;
 
         // 3. assemble the committee from the post-slash eligible pool, then conclude
@@ -394,6 +431,7 @@ where
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "closing epoch",
+            "conclude_epoch",
         )?;
 
         // 4. publish the next epoch's per-worker base fees for the epoch that just began
@@ -407,22 +445,25 @@ where
     /// that seats the new committee: a node entering the epoch reads each worker's fee from one
     /// state slot instead of scanning the whole prior epoch's headers to recompute it.
     ///
-    /// The value written for a worker MUST equal what the live producer's post-close
-    /// `adjust_base_fees` (in `tn_node::manager`) and every node's epoch-entry header-scan
-    /// derivation (`derive_base_fees_for_entered_epoch`) compute for it — the batch validator
-    /// snapshots a plain `u64` per epoch and compares base fees for exact equality, so a
-    /// one-wei divergence makes peers reject each other's batches for a whole epoch. Three
-    /// details carry that equivalence:
+    /// The epoch entry CONSUMES this word rather than re-deriving it: the next epoch's entry read
+    /// (`read_base_fees_for_entered_epoch` in `tn_node::manager`) returns it through
+    /// `entry_fee_for_worker` (`tn-types`), which owns the per-row interpretation — so whatever is
+    /// written here IS the fee the fleet enters the next epoch on. The batch validator snapshots a
+    /// plain `u64` per epoch and compares base fees for exact equality, which leaves two binding
+    /// equalities: (a) the value written MUST equal the [`next_base_fee_for_config`] oracle over
+    /// the accumulator's current fee and the worker's epoch gas including this block's own, and
+    /// (b) it MUST equal what the live producer's close-time `adjust_base_fees` (in
+    /// `tn_node::manager`) computes, for as long as that tripwire survives (its removal is a noted
+    /// FOLLOW-UP in `tn-node`). Three details carry those equalities:
     ///
     /// - The worker set comes from the CONTRACT's `numWorkers`, not the accumulator's. Governance
     ///   may have grown the worker set mid-epoch (a `setNumWorkers` only takes effect at this
-    ///   boundary), and both other seams read the count at this same closing block. A worker with
-    ///   no accumulator slot yet prices from `(MIN_PROTOCOL_BASE_FEE, 0 gas)`, which is exactly
-    ///   what `adjust_base_fees`' resize-then-compute and the entry walk's slot-creation anchor
-    ///   produce for a fresh slot.
+    ///   boundary), and the close-time adjustment reads the count at this same closing block. A
+    ///   worker with no accumulator slot yet prices from `(MIN_PROTOCOL_BASE_FEE, 0 gas)` — the
+    ///   fresh-slot rule shared with `adjust_base_fees`' resize-then-compute.
     /// - This block's own gas is folded into its worker's total. The accumulator does not include
-    ///   it yet (`inc_block` runs after the payload executes), while the post-close adjustment and
-    ///   the header scan both count this block.
+    ///   it yet (`inc_block` runs after the payload executes), while the close-time adjustment
+    ///   counts this block (it runs post-`inc_block`).
     /// - The accumulator is only READ. It is shared live with the batch validator and the node
     ///   manager, so resizing or clearing it here would corrupt state those readers depend on.
     ///
@@ -508,6 +549,7 @@ where
             WORKER_CONFIGS_ADDRESS,
             calldata,
             "recording next-epoch base fees",
+            "record_base_fees",
         )
     }
 
@@ -574,6 +616,7 @@ where
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "applying consensus block rewards",
+            "apply_incentives",
         )?;
 
         let mut new_committee = self.shuffle_new_committee(randomness)?;
@@ -582,7 +625,12 @@ where
         let calldata = LegacyConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
             .abi_encode()
             .into();
-        self.transact_and_commit_system_call(CONSENSUS_REGISTRY_ADDRESS, calldata, "closing epoch")
+        self.transact_and_commit_system_call(
+            CONSENSUS_REGISTRY_ADDRESS,
+            calldata,
+            "closing epoch",
+            "conclude_epoch",
+        )
     }
 
     /// The upgraded `ConsensusRegistry` runtime bytecode and its code hash, sourced from the same
@@ -746,6 +794,7 @@ where
             CONSENSUS_REGISTRY_ADDRESS,
             calldata,
             "consensus registry migration",
+            "registry_migration",
         )?;
 
         // Read back the rebuilt eligible count for an operational confirmation log. Best-effort and
@@ -909,8 +958,9 @@ where
     /// [`assemble_new_committee`] free function; this method only performs the on-chain reads and
     /// seeds the RNG so that the assembly logic stays unit-testable without a live EVM state.
     ///
-    /// `randomness` is `ctx.close_epoch` — the keccak256 of the leader certificate's aggregate
-    /// BLS signature — used verbatim as the `StdRng` seed, so every node derives the same RNG
+    /// `randomness` is `ctx.close_epoch`, the epoch-gated committee-shuffle seed (epoch seed chain
+    /// value for fork-active epochs, legacy leader-aggregate keccak before the fork), used
+    /// verbatim as the `StdRng` seed, so every node derives the same RNG
     /// stream. The downstream draw order is consensus-critical: the draws decide which
     /// validators survive the truncation to committee size.
     fn shuffle_new_committee(&mut self, randomness: B256) -> TnRethResult<Vec<Address>> {
@@ -920,7 +970,7 @@ where
 
         debug!(target: "engine",  "validators pre-shuffle {:?}", all_active_validators);
 
-        // create seed from hashed bls agg signature
+        // create seed from the epoch-close randomness carried in `ctx.close_epoch`
         let mut seed = [0; 32];
         seed.copy_from_slice(randomness.as_slice());
         trace!(target: "engine", ?seed, "seed after");
@@ -1291,6 +1341,13 @@ where
             // deliberately NO merge_transitions here: both reth wrappers merge after finish()
             // returns, and revm pushes a reverts entry per merge — merging in here too gives
             // every epoch-closing block a phantom empty bundle.reverts entry (len 2 vs 1)
+
+            // Publish what the boundary's system calls spent. Observation only — nothing below
+            // reads it and no state is touched. It lands here, after the calls have succeeded,
+            // because any failure above already aborted the block: there is no partial epoch
+            // close to report gas for. A system call runs at `gas_price: 0`, so this gas never
+            // enters `self.gas_used` and these gauges are the only place it is visible.
+            crate::metrics::record_epoch_close_gas(&self.epoch_close_gas);
         }
 
         Ok((

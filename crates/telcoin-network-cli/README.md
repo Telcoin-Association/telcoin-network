@@ -463,7 +463,7 @@ Outbound: Unrestricted UDP for QUIC connections to peers.
 
 ## Consensus parameters
 
-The `parameters.yaml` file controls consensus timing and behavior. If the file is absent, defaults are used. Duration values accept human-readable strings (e.g. `3s`, `500ms`).
+The `parameters.yaml` file controls consensus timing and behavior. The node reads it at startup and refuses to start when the file is missing or fails to parse. Duration values accept human-readable strings (e.g. `3s`, `500ms`).
 
 | Field                                   | Default  | Description                                         |
 | --------------------------------------- | -------- | --------------------------------------------------- |
@@ -477,8 +477,23 @@ The `parameters.yaml` file controls consensus timing and behavior. If the file i
 | `max_batch_delay`                       | `1s`     | Worker timeout before sealing a batch               |
 | `max_concurrent_requests`               | `500000` | Max concurrent requests from untrusted entities     |
 | `batch_vote_timeout`                    | `10s`    | Timeout for batch voting requests                   |
-| `basefee_address`                       | none     | Address that receives transaction base fees         |
+| `basefee_address`                       | required | Base-fee recipient; must match every peer           |
 | `parallel_fetch_request_delay_interval` | `5s`     | Delay between parallel certificate fetch requests   |
+| `allow_private_forward_targets`         | `false`  | Let observer forwarding dial non-public RPC hosts   |
+
+### `allow_private_forward_targets`
+
+An observer forwards each transaction it accepts to the JSON-RPC endpoint the owning validator advertised on its node record, so the dial target is chosen by a committee member rather than by this node. Left at the default `false`, an advertised endpoint on a loopback, private (RFC 1918), link-local, unique-local, shared-address-space or unspecified address is refused and logged once at `warn` with the advertising validator's BLS key, so a committee member cannot direct this node's outbound HTTP at hosts inside its own perimeter.
+
+The check reads the host as written and never resolves DNS. It refuses IP literals in every spelling (dotted-quad, decimal, octal, hex, IPv4-mapped and NAT64/6to4 IPv6) and the names reserved to resolve locally (`localhost`, `*.localhost`, `*.local`), but a hostname that merely resolves to a private address is still dialed. Treat this as a guard against an advertised internal address, not as complete egress filtering. Operators who need the stronger property should restrict outbound traffic from observer nodes at the network layer.
+
+Set it to `true` only when every committee member is under the same operator as this node - single-host and docker-compose deployments, where validators legitimately advertise `127.0.0.1`. On a public network it re-enables dialing arbitrary internal addresses.
+
+`basefee_address` is the one field here without a default. It is consensus-critical: the
+EVM credits this account on every transaction, so its balance enters the state root and every node
+on the network must hold the same value. A parameters file that omits the key fails to parse, so
+the node refuses to start rather than falling back in silence. The `genesis` commands write the
+key for you, and the `mainnet` and `adiri` chain presets carry their own value.
 
 Example (testnet configuration):
 

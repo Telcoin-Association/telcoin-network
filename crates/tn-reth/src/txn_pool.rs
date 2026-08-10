@@ -37,7 +37,10 @@ use reth_provider::{
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
-    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError},
+    error::{
+        Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
+        PoolError,
+    },
     AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, EthPooledTransaction,
     PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
     TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
@@ -77,6 +80,9 @@ pub trait TxPool {
     fn get_pending_base_fee(&self) -> u64;
     /// Remove EIP-4844 blob transactions from the pool and delete the sidecars from blob store.
     fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>);
+    /// Remove transactions whose EIP-2718 type is outside the executable allowlist from the
+    /// pool, along with their descendants.
+    fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>);
 }
 
 /// A telcoin network transaction pool.
@@ -329,6 +335,10 @@ impl TxPool for WorkerTxPool {
         self.0.remove_transactions_and_descendants(blobs.clone());
         self.0.delete_blobs(blobs);
     }
+
+    fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>) {
+        self.0.remove_transactions_and_descendants(txs);
+    }
 }
 
 /// An iterator that produces the best transactions from a pool.
@@ -371,6 +381,19 @@ impl BestTxns {
         self.inner.mark_invalid(
             pool_tx,
             &InvalidPoolTransactionError::Eip4844(Eip4844PoolTransactionError::NoEip4844Blobs),
+        );
+    }
+
+    /// Mark a transaction outside the executable type allowlist as invalid.
+    ///
+    /// Mirrors [`Self::ignore_eip4844`]: the nearest upstream error kind stands in for a
+    /// type the batch allowlist refuses (only EIP-7702 decodes today).
+    pub fn ignore_eip7702(&mut self, pool_tx: &Arc<PoolTxn>) {
+        self.inner.mark_invalid(
+            pool_tx,
+            &InvalidPoolTransactionError::Eip7702(
+                Eip7702PoolTransactionError::MissingEip7702AuthorizationList,
+            ),
         );
     }
 }

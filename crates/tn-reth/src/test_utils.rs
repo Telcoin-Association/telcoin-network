@@ -3,7 +3,7 @@
 //! Grouped by role:
 //!
 //! - [`TransactionFactory`]: deterministic keypair plus nonce tracking to create, sign, and submit
-//!   EIP-1559, legacy, and EIP-4844 transactions.
+//!   EIP-1559, legacy, EIP-4844, and EIP-7702 transactions.
 //! - `RethEnv` test constructors and read helpers: `new_for_test`, `state_by_block_hash`, `tn_evm`,
 //!   `execution_outcome_for_tests`, and `ConsensusRegistry` reads (`get_validator_rewards`,
 //!   `get_bls_pubkey`, `get_validator_info`, `validators_for_epoch_at_block`,
@@ -34,8 +34,10 @@ use crate::{
     ExecutedBlock, NewCanonicalChain, RethEnv, WorkerTxPool, SYSTEM_ADDRESS,
 };
 use alloy::{
-    consensus::{SignableTransaction as _, TxEip4844, TxEip4844Variant, TxLegacy},
-    eips::eip7594::BlobTransactionSidecarVariant,
+    consensus::{
+        SignableTransaction as _, TxEip2930, TxEip4844, TxEip4844Variant, TxEip7702, TxLegacy,
+    },
+    eips::{eip7594::BlobTransactionSidecarVariant, eip7702::Authorization},
     hex,
     primitives::{utils::parse_ether, ChainId},
     signers::{
@@ -266,11 +268,13 @@ impl RethEnv {
     /// The returned `Vec`'s length is the on-chain `numWorkers()` at the canonical tip (the
     /// arity between the count and the per-worker arrays is validated in
     /// `Self::worker_fee_configs_inner`). Callers size their in-memory worker state (e.g. the
-    /// `GasAccumulator`) to match, rather than asserting a preconceived count.
+    /// `GasAccumulator`) to match, rather than asserting a preconceived count. Each row's `data`
+    /// word is projected out here; tests that need it read entries through
+    /// [`read_worker_config_entries_at`].
     pub fn get_worker_fee_configs(&self) -> StateReadResult<Vec<WorkerFeeConfig>> {
         let canonical_tip = self.canonical_tip();
-        let (_num_workers, configs) = self.worker_fee_configs_inner(&canonical_tip)?;
-        Ok(configs)
+        let (_num_workers, entries) = self.worker_fee_configs_inner(&canonical_tip)?;
+        Ok(entries.into_iter().map(|entry| entry.config).collect())
     }
 }
 
@@ -419,6 +423,84 @@ impl TransactionFactory {
         self.inc_nonce();
 
         TransactionSigned::new_unhashed(variant.into(), signature)
+    }
+
+    /// Create a signed EIP-2930 access-list transaction.
+    pub fn create_eip2930(
+        &mut self,
+        chain_id: ChainId,
+        gas_limit: Option<u64>,
+        gas_price: u128,
+        to: Address,
+    ) -> TransactionSigned {
+        let gas_limit = gas_limit.unwrap_or(1_000_000);
+
+        // access-list transaction
+        let tx = TxEip2930 {
+            chain_id,
+            nonce: self.nonce,
+            gas_price,
+            gas_limit,
+            to: TxKind::Call(to),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::new(),
+        };
+        let tx_signature_hash = tx.signature_hash();
+
+        // construct transaction and sign
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for next tx
+        self.inc_nonce();
+
+        TransactionSigned::new_unhashed(tx.into(), signature)
+    }
+
+    /// Create a signed EIP-7702 set-code transaction carrying one authorization
+    /// signed by this factory's key, so the envelope is well-formed and its type
+    /// byte is the only reason a fork-blind validator could reject it.
+    pub fn create_eip7702(
+        &mut self,
+        chain_id: ChainId,
+        gas_limit: Option<u64>,
+        gas_price: u128,
+    ) -> TransactionSigned {
+        let gas_limit = gas_limit.unwrap_or(1_000_000);
+
+        // authorization signed by this factory's key; for a self-sponsored delegation
+        // the account nonce at authorization check time is the tx nonce + 1 (the
+        // sender's nonce increments before the authorization list is processed)
+        let authorization = Authorization {
+            chain_id: U256::from(chain_id),
+            address: Address::ZERO,
+            nonce: self.nonce + 1,
+        };
+        let auth_signature = self.sign_hash(authorization.signature_hash());
+        let signed_authorization = authorization.into_signed(auth_signature);
+
+        // set-code transaction
+        let tx = TxEip7702 {
+            chain_id,
+            nonce: self.nonce,
+            gas_limit,
+            max_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: 0,
+            to: address!("a8cb082a5a689e0d594d7da1e2d72a3d63adc1bd"),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list: vec![signed_authorization],
+            input: Bytes::new(),
+        };
+        let tx_signature_hash = tx.signature_hash();
+
+        // construct transaction and sign
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for next tx
+        self.inc_nonce();
+
+        TransactionSigned::new_unhashed(tx.into(), signature)
     }
 
     /// Create and sign an EIP4844 transaction.
@@ -961,6 +1043,20 @@ pub fn consensus_output_for_tests(
         subdag_index,
         reputation_scores,
         previous_sub_dag,
+        // Anchor on `epoch`'s root rather than the genesis placeholder, which would freeze the
+        // shuffle seed to one constant for every epoch and leave the epoch-close tests in
+        // `crate::env::epoch` pinning that constant instead of a seed-dependent committee.
+        //
+        // CAVEAT: this re-derives the root on EVERY call, ignoring `subdag_index`, so it models
+        // production only for the FIRST commit of `epoch`. `CommittedSubDag::new` documents
+        // `seed_chain` as the previous commit's value (the epoch root only at the first commit),
+        // and this fixture does not thread that chain forward. Two calls with the same `epoch`
+        // therefore produce the same seed even though they stand in for different commits. That is
+        // currently harmless because the seed is only read when `close_epoch` is true
+        // (`TNPayload::new`) and every such call site here uses a freshly incremented epoch. A new
+        // test that closes the same epoch twice would silently pin a degenerate seed: thread the
+        // prior output's `committee_shuffle_seed()` in instead of calling this helper again.
+        tn_types::EpochSeedChainValue::epoch_root(epoch),
     );
     ConsensusOutput::new(
         sub_dag,

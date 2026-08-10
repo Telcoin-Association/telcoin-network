@@ -11,7 +11,7 @@ use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::{
     burnCall, claimCall, grantMintRoleCall, hasMintRoleCall, mintCall, revokeMintRoleCall,
     test_utils::precompile_test_utils::{
-        assert_not_success, assert_success, decode_u256, TestEnv, GENESIS_SUPPLY,
+        assert_not_success, assert_success, decode_bool, decode_u256, TestEnv, GENESIS_SUPPLY, USER,
     },
     totalSupplyCall, TELCOIN_PRECOMPILE_ADDRESS, TIMELOCK_DURATION,
 };
@@ -412,4 +412,103 @@ fn test_delegatecall_writes_target_precompile_storage() {
         U256::ZERO,
         "caller's storage must NOT be written by precompile under DELEGATECALL"
     );
+}
+
+// ==============================
+// `STATICCALL` write protection
+// ==============================
+
+use crate::precompile_relays::{CALL_RELAY_BYTECODE, STATICCALL_RELAY_BYTECODE};
+
+/// Pending-mint amount slot for governance: `keccak256(abi.encode(GOVERNANCE_SAFE_ADDRESS, 0))`.
+fn governance_pending_slot() -> U256 {
+    let mut buf = [0u8; 64];
+    buf[12..32].copy_from_slice(GOVERNANCE_SAFE_ADDRESS.as_slice());
+    U256::from_be_bytes(keccak256(buf).0)
+}
+
+/// A `STATICCALL` reaching a state-mutating selector is refused, and writes nothing.
+///
+/// Registering `0x7e1` as a precompile short-circuits bytecode execution, so the interpreter's
+/// `require_non_staticcall!` write protection never runs on the `SSTORE`s and `LOG`s the handlers
+/// perform. Only the dispatcher's own check stands between a static frame and a real mutation.
+///
+/// The relay has to be hosted **at** [`GOVERNANCE_SAFE_ADDRESS`]. `STATICCALL` does not preserve
+/// `msg.sender` (unlike the `DELEGATECALL` case above), so the precompile authorizes against the
+/// relay's own address; a relay at a fresh address would be rejected with `"unauthorized"` whether
+/// or not the static guard exists, and the test would pass vacuously. The outer transaction is
+/// therefore driven by [`USER`], since revm rejects a transaction whose sender has code (EIP-3607).
+///
+/// Test plan:
+/// 1. Host a `CALL` relay at governance and `mint(1234)` through it. This is the positive control:
+///    it proves the authorization path and the write both work through a relay frame.
+/// 2. In a second environment, host the `STATICCALL` relay, identical but for the call opcode and
+///    the dropped `value` operand, and `mint(5678)` through it.
+/// 3. Assert the inner call reported failure and that nothing was written.
+#[test]
+#[cfg(not(feature = "faucet"))]
+fn test_staticcall_cannot_mutate_precompile_state() {
+    let pending_slot = governance_pending_slot();
+
+    // 1. Positive control: the same relay frame under `CALL` mints successfully.
+    //
+    // This uses its own `TestEnv`. Within one env the journal caches account code across
+    // transactions, while `deploy_code` writes to the database underneath it, so redeploying over
+    // a contract that has already executed does not take effect and the second transaction would
+    // silently re-run the first relay.
+    let mut allowed_env = TestEnv::new();
+    allowed_env.deploy_code(GOVERNANCE_SAFE_ADDRESS, Bytes::from_static(CALL_RELAY_BYTECODE));
+    let allowed = allowed_env.exec_to(
+        USER,
+        GOVERNANCE_SAFE_ADDRESS,
+        mintCall { amount: U256::from(1234) }.abi_encode(),
+        200_000,
+    );
+    assert_success(&allowed);
+    assert!(decode_bool(&allowed), "CALL into a mutating selector must be accepted");
+    assert_eq!(
+        allowed_env.get_storage(TELCOIN_PRECOMPILE_ADDRESS, pending_slot),
+        U256::from(1234),
+        "positive control failed: the CALL relay never reached the precompile, so the \
+         STATICCALL assertions below would be vacuous"
+    );
+
+    // 2. Same caller, same calldata shape, same authorization - only the opcode changes.
+    let mut refused_env = TestEnv::new();
+    refused_env.deploy_code(GOVERNANCE_SAFE_ADDRESS, Bytes::from_static(STATICCALL_RELAY_BYTECODE));
+    let refused = refused_env.exec_to(
+        USER,
+        GOVERNANCE_SAFE_ADDRESS,
+        mintCall { amount: U256::from(5678) }.abi_encode(),
+        200_000,
+    );
+    assert_success(&refused);
+
+    // 3. The precompile must have refused, and nothing may have been written.
+    assert!(
+        !decode_bool(&refused),
+        "STATICCALL into a mutating selector must be refused by the precompile"
+    );
+    assert_eq!(
+        refused_env.get_storage(TELCOIN_PRECOMPILE_ADDRESS, pending_slot),
+        U256::ZERO,
+        "STATICCALL must not write the pending-mint slot"
+    );
+}
+
+/// The static guard rejects mutation only: read-only selectors stay callable under `STATICCALL`.
+///
+/// Guards this fix against over-reach. `totalSupply()` is exactly the kind of call a static frame
+/// is supposed to be able to make, and the relay used here is the same one that is refused a
+/// `mint` in [`test_staticcall_cannot_mutate_precompile_state`], so the selector is the only
+/// variable between the two outcomes.
+#[test]
+fn test_staticcall_still_serves_read_only_selectors() {
+    let mut env = TestEnv::new();
+    env.deploy_code(GOVERNANCE_SAFE_ADDRESS, Bytes::from_static(STATICCALL_RELAY_BYTECODE));
+
+    let result =
+        env.exec_to(USER, GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode(), 200_000);
+    assert_success(&result);
+    assert!(decode_bool(&result), "totalSupply() must remain callable under STATICCALL");
 }

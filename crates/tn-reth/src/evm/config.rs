@@ -191,7 +191,8 @@ impl ConfigureEvm for TnEvmConfig {
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
         // `extra_data` is empty for a normal block; an epoch-closing block carries the 32-byte
-        // keccak of the leader's aggregate BLS signature (see `TNBlockAssembler::assemble_block`).
+        // epoch seed chain value as of the closing commit (see
+        // `TNBlockAssembler::assemble_block`).
         // Any other length is a malformed header — error instead of panicking in `from_slice`.
         let close_epoch = match block.extra_data.len() {
             0 => None,

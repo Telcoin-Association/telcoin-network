@@ -378,6 +378,23 @@ pub struct EpochState {
 /// sends `setMaxStrategy(N)` and assigns it. A uniform old-build fleet does not split, but is not
 /// benign either — every node identically reinterprets the row's `value` as a 1559 `target_gas`
 /// and writes a silently wrong fee into consensus state.
+///
+/// Both cases reach further than the closing block, because the `data` word it records is exactly
+/// what the next epoch's entry reads back. A cross-build disagreement therefore splits the fleet at
+/// TWO seams, not one: the closing-block state root above, and the entry base fee itself.
+/// `read_base_fees_for_entered_epoch` (`tn-node`) resolves one fee per worker out of these same
+/// entries through `entry_fee_for_worker` (`tn-types`); that fee is snapshotted into the worker's
+/// `BatchValidator` for the epoch, and `validate_basefee` (`batch-validator`'s `validator.rs`)
+/// compares every incoming batch's `base_fee_per_gas` against it for EXACT equality — so the two
+/// sides reject each other's batches with `InvalidBaseFee` for the whole epoch. And a uniform
+/// old-build fleet does not merely record one wrong fee: that word IS the entered epoch's fee, so
+/// it prices every block of that epoch.
+///
+/// One failure that reads the same word is NOT downstream of this fallback: `entry_fee_for_worker`
+/// erroring on a `data` word wider than `u64` — which halts every node at the same epoch entry —
+/// needs no unknown strategy id at all, since a plain id-0 `Eip1559` row with a governance-written
+/// word reaches it identically. Its live window is adiri before the registry fork, and the adiri
+/// rollout constraint documented on `tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH` covers it.
 pub(crate) fn decode_worker_fee_configs(
     bytes: &[u8],
 ) -> Result<(u16, Vec<WorkerConfigEntry>), String> {

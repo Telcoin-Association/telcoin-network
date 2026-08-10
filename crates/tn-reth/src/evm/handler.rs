@@ -227,6 +227,10 @@ mod tests {
     /// Governance collector credited with the basefee portion of gas payments.
     const BASEFEE_ADDR: Address = address!("4444444000000000000000000000000000000004");
 
+    /// A second, equally valid collector. Used only to show that the configured address is what
+    /// decides which account the base fee lands in.
+    const ALT_BASEFEE_ADDR: Address = address!("5555555000000000000000000000000000000005");
+
     /// Basefee (in wei per gas) used by both reward tests.
     const BASEFEE: u64 = 7;
 
@@ -245,8 +249,10 @@ mod tests {
 
     /// Run [`TNEvmHandler::reward_beneficiary`] against a fresh [`TestEnv`]
     /// for a legacy transaction with the given gas price, spending `gas_limit`
-    /// in full, and return the credited (beneficiary, basefee) balances.
-    fn reward_with(gas_price: u128, gas_limit: u64) -> (U256, U256) {
+    /// in full and crediting base fees to `collector`. Return the balances of
+    /// the beneficiary and of both candidate collectors, so a caller can see
+    /// which account the configured address selected.
+    fn reward_crediting(collector: Address, gas_price: u128, gas_limit: u64) -> (U256, U256, U256) {
         let mut env = TestEnv::new();
         env.evm.ctx.set_block(BlockEnv {
             beneficiary: BENEFICIARY,
@@ -263,10 +269,21 @@ mod tests {
                 .expect("valid test tx env"),
         );
         let mut frame = spent_frame(gas_limit);
-        TNEvmHandler::new(BASEFEE_ADDR)
+        TNEvmHandler::new(collector)
             .reward_beneficiary(&mut env.evm, &mut frame)
             .expect("reward_beneficiary succeeds");
-        (env.get_balance(BENEFICIARY), env.get_balance(BASEFEE_ADDR))
+        (
+            env.get_balance(BENEFICIARY),
+            env.get_balance(BASEFEE_ADDR),
+            env.get_balance(ALT_BASEFEE_ADDR),
+        )
+    }
+
+    /// Credit base fees to [`BASEFEE_ADDR`] and return the (beneficiary, basefee) balances.
+    fn reward_with(gas_price: u128, gas_limit: u64) -> (U256, U256) {
+        let (beneficiary, basefee_collector, _alt) =
+            reward_crediting(BASEFEE_ADDR, gas_price, gas_limit);
+        (beneficiary, basefee_collector)
     }
 
     /// In-range fees split exactly: the beneficiary receives
@@ -289,5 +306,39 @@ mod tests {
         let (beneficiary, basefee_collector) = reward_with(u128::MAX, 2);
         assert_eq!(beneficiary, U256::from(u128::MAX));
         assert_eq!(basefee_collector, U256::from(u128::from(BASEFEE) * 2));
+    }
+
+    /// Two runs that agree on the block, the transaction, and the gas, and differ only in the
+    /// configured base-fee address, credit two different accounts. The credited balances are part
+    /// of the state, so the two runs produce two different state roots.
+    ///
+    /// This pins the claim the `BASEFEE_ADDRESS` documentation in `lib.rs` makes, and it is the
+    /// reason `tn-config` declares [`basefee_address`](tn_config::Parameters) as a required key
+    /// with no serde default: two honest nodes that disagree on this one value still agree on the
+    /// batch, the certificate, and the commit order, and disagree only on the resulting state.
+    /// Without this test a later change could treat the field as cosmetic and nothing would fail.
+    #[test]
+    fn differing_basefee_addresses_credit_different_accounts() {
+        let gas_used = 21_000u64;
+        let credited = U256::from(u128::from(BASEFEE) * u128::from(gas_used));
+
+        let (beneficiary_a, primary_a, alt_a) = reward_crediting(BASEFEE_ADDR, 10, gas_used);
+        let (beneficiary_b, primary_b, alt_b) = reward_crediting(ALT_BASEFEE_ADDR, 10, gas_used);
+
+        // the beneficiary is credited identically, so the collector address is the only difference
+        assert_eq!(beneficiary_a, beneficiary_b, "only the basefee address differs between runs");
+
+        assert_eq!((primary_a, alt_a), (credited, U256::ZERO), "run A must credit BASEFEE_ADDR");
+        assert_eq!(
+            (primary_b, alt_b),
+            (U256::ZERO, credited),
+            "run B must credit ALT_BASEFEE_ADDR"
+        );
+        assert_ne!(
+            (primary_a, alt_a),
+            (primary_b, alt_b),
+            "a different basefee address must produce a different account state, and therefore a \
+             different state root"
+        );
     }
 }

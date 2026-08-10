@@ -88,7 +88,7 @@ use reth_revm::{
 };
 use tn_config::WORKER_CONFIGS_ADDRESS;
 use tn_types::{
-    gas_accumulator::WorkerFeeConfig, Address, Bytes, Epoch, ExecHeader, SealedHeader,
+    gas_accumulator::WorkerConfigEntry, Address, Bytes, Epoch, ExecHeader, SealedHeader,
     SolCall as _, B256,
 };
 use tracing::{debug, error, warn};
@@ -525,7 +525,7 @@ impl RethEnv {
     /// Read worker fee configs from the [`WorkerConfigs`] contract at the block identified by
     /// `block_hash`.
     ///
-    /// Returns the on-chain worker count and one [`WorkerFeeConfig`] per worker. Failures are
+    /// Returns the on-chain worker count and one [`WorkerConfigEntry`] per worker. Failures are
     /// classified per [`StateReadError`] (see `worker_fee_configs_inner`); `block_hash`
     /// failing to resolve to a sealed header is [`StateReadError::Provider`] — the pinned block
     /// exists on the committee by construction, so a miss reflects this node's local view, not a
@@ -533,7 +533,7 @@ impl RethEnv {
     pub fn get_worker_fee_configs_at_block(
         &self,
         block_hash: B256,
-    ) -> StateReadResult<(usize, Vec<WorkerFeeConfig>)> {
+    ) -> StateReadResult<(usize, Vec<WorkerConfigEntry>)> {
         let header = self.pinned_header_by_hash(block_hash)?;
         self.worker_fee_configs_inner(&header)
     }
@@ -561,7 +561,7 @@ impl RethEnv {
     /// Read fee configs for all workers from the [`WorkerConfigs`] contract at the given header.
     ///
     /// Builds an EVM against `header`'s state and issues a single `getAllWorkerConfigs()` call.
-    /// Returns the on-chain worker count alongside the decoded [`WorkerFeeConfig`]s.
+    /// Returns the on-chain worker count alongside the decoded [`WorkerConfigEntry`] rows.
     ///
     /// Failures are classified per [`StateReadError`]. The classification boundary: the state
     /// provider construction and any database fault the EVM hits while lazily reading state are
@@ -573,17 +573,21 @@ impl RethEnv {
     ///
     /// Fail-open on unknown strategy ids: a strategy this node does not recognize (only possible
     /// when a future contract version introduces one before this node is upgraded) is NOT an
-    /// error — it falls back to [`WorkerFeeConfig::Eip1559`] with a warning, preserving liveness
-    /// instead of halting all validators on the unrecognized id.
+    /// error — it falls back to
+    /// [`WorkerFeeConfig::Eip1559`](tn_types::gas_accumulator::WorkerFeeConfig::Eip1559) with a
+    /// warning, preserving liveness instead of halting all validators on the unrecognized id.
     ///
     /// The decode, arity check, and strategy mapping live in
     /// [`decode_worker_fee_configs`](crate::system_calls::decode_worker_fee_configs), shared with
-    /// the epoch-closing block's base-fee recording so the two cannot drift. Callers of this
-    /// method want fee strategies only, so each row's `data` word is dropped here.
+    /// the epoch-closing block's base-fee recording so the two cannot drift. Entries carry each
+    /// row's `data` word alongside its strategy: the epoch-entry fee read is the consumer that
+    /// needs it, taking the next-epoch base fee the closing block recorded there instead of
+    /// re-deriving it. Callers that want strategies only project `entry.config` out. See
+    /// [`WorkerConfigEntry`] for when the word is authoritative.
     pub(crate) fn worker_fee_configs_inner(
         &self,
         header: &SealedHeader,
-    ) -> StateReadResult<(usize, Vec<WorkerFeeConfig>)> {
+    ) -> StateReadResult<(usize, Vec<WorkerConfigEntry>)> {
         let (mut db, evm_env) = self.pinned_state_and_env(header)?;
         let mut tn_evm = self.inner.evm_config.evm_factory().create_evm(&mut db, evm_env);
 
@@ -607,7 +611,7 @@ impl RethEnv {
         let (num_workers, entries) =
             decode_worker_fee_configs(&data).map_err(StateReadError::ChainGlobal)?;
 
-        Ok((num_workers as usize, entries.into_iter().map(|entry| entry.config).collect()))
+        Ok((num_workers as usize, entries))
     }
 
     /// Build an EVM at the canonical tip, execute a read-only [ConsensusRegistry] call, and
@@ -783,10 +787,33 @@ impl RethEnv {
     ///
     /// The last two are both silent and both defeat the point of pinning. Revisit every pinned
     /// read before relaxing either guard.
+    ///
+    /// RESTORED-DATADIR FLOOR: a datadir bootstrapped from a snapshot holds state ONLY at the
+    /// snapshot's final block `B` — window headers below `B` carry real, resolvable hashes but
+    /// no state and no history, and blocks below the window are zero-hash placeholders (see
+    /// `SnapshotRestorer::import_chain_scaffold` in `snapshot.rs`). reth's checkpoint-less
+    /// history walk answers reads anywhere below `B` with `Ok(None)` per account ("never
+    /// written") — no error, no log — so pins below the persisted floor (= `B`) are refused
+    /// HERE, before any state is built, as [`StateReadError::Provider`]: the gap is this node's
+    /// datadir, not the chain, and a peer with full history answers the same read correctly.
     fn pinned_state_and_env(
         &self,
         header: &SealedHeader,
     ) -> StateReadResult<(State<StateProviderDatabase<StateProviderBox>>, EvmEnv)> {
+        // refuse pins below the restored-state floor before touching the provider: below it the
+        // datadir holds headers but no state, and the read would resolve silently to "never
+        // written" values instead of failing
+        self.inner.restored_state_floor.filter(|floor| header.number < *floor).map_or(
+            Ok(()),
+            |floor| {
+                Err(StateReadError::Provider(format!(
+                    "pinned read at block {} is below this datadir's restored-state floor \
+                     (block {floor}, the snapshot's final block): the snapshot shipped no state \
+                     below it",
+                    header.number
+                )))
+            },
+        )?;
         let db = self.read_only_state_db(header.hash()).map_err(|e| {
             StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
         })?;
@@ -805,10 +832,15 @@ impl RethEnv {
     /// Read the CURRENT epoch number and [`EpochInfo`](ConsensusRegistry::EpochInfo) from the
     /// [`ConsensusRegistry`] at `header`, with failures classified per [`StateReadError`].
     ///
-    /// This is the close-time identity read for the epoch manager's `adjust_base_fees`: at an
-    /// epoch's closing block the registry state has already crossed to the entered epoch
-    /// (`concludeEpoch` ran inside that block), so the returned info is the entered epoch's record
-    /// and its `blockHeight` must equal `header.number + 1`. It reads exactly what
+    /// This is the ONE boundary predicate for "did this block close an epoch": the epoch
+    /// manager's close-time identity check (`adjust_base_fees`), the entry read's pin guard
+    /// (`read_base_fees_for_entered_epoch`, both in `tn-node`), and the snapshot restore's
+    /// [`entry_readiness_precondition`](crate::snapshot::SnapshotRestorer::entry_readiness_precondition)
+    /// all validate the same boundary through it — deliberately shared so the three seams cannot
+    /// drift on what counts as a closing block. At an epoch's closing block the registry state
+    /// has already crossed to the entered epoch (`concludeEpoch` ran inside that block), so the
+    /// returned info is the entered epoch's record and its `blockHeight` must equal
+    /// `header.number + 1`. It reads exactly what
     /// [`Self::epoch_state_at_header`] reads for the same check but skips the committee/BLS/
     /// epoch-start lookups (a gating check needs only the epoch identity) and — unlike that
     /// method, whose failures collapse into `eyre` strings — keeps node-local provider faults
@@ -986,6 +1018,7 @@ mod tests {
     use tn_types::{
         gas_accumulator::{
             next_base_fee_for_config, GasAccumulator, RewardsCounter, WorkerConfigEntry,
+            WorkerFeeConfig,
         },
         generate_proof_of_possession_bls_for_test, BlsKeypair, GenesisAccount, NodeP2pInfo,
         TaskManager, MIN_PROTOCOL_BASE_FEE, U256,
@@ -1337,6 +1370,130 @@ mod tests {
         Ok(())
     }
 
+    /// An epoch-closing block publishes what each of its system calls spent.
+    ///
+    /// The boundary calls are submitted at `gas_price: 0`, so their gas never enters the block's
+    /// `gas_used` and no other metric can see it (#1031) — while #1012 raised the per-call budget
+    /// to 100M without any measurement of what the calls actually consume. This drives a real
+    /// close through the production path and asserts the gauges observe it: each of the four
+    /// post-fork calls reports nonzero gas inside the budget it was granted, the total is their
+    /// sum, and the one-shot `registry_migration` series is absent away from the fork boundary.
+    ///
+    /// The local recorder is why `record_epoch_close_gas` resolves its handles on every close
+    /// instead of caching them: a cached handle binds to whichever recorder was installed first in
+    /// the process, which would make this assertion depend on test ordering (`crate::metrics`).
+    #[tokio::test]
+    async fn test_epoch_close_records_system_call_gas() -> eyre::Result<()> {
+        use crate::evm::SYSTEM_CALL_GAS_LIMIT;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        /// Read one gauge out of the snapshot, selecting by `call` label when one is given.
+        ///
+        /// Generic over the description slot so the recorder's own string type never has to be
+        /// named here.
+        fn gauge<D>(
+            snapshot: &[(metrics_util::CompositeKey, Option<metrics::Unit>, D, DebugValue)],
+            name: &str,
+            call: Option<&str>,
+        ) -> Option<f64> {
+            snapshot
+                .iter()
+                .find(|(key, ..)| {
+                    key.key().name() == name
+                        && call.is_none_or(|call| {
+                            key.key().labels().any(|l| l.key() == "call" && l.value() == call)
+                        })
+                })
+                .and_then(|(.., value)| match value {
+                    DebugValue::Gauge(g) => Some(g.0),
+                    DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+                })
+        }
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(5).into());
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("epoch close gas metrics");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+
+        let output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // block execution is inline on this thread, so the thread-local recorder observes it
+        metrics::with_local_recorder(&recorder, || {
+            execute_payload_and_update_canonical_chain(&env, payload, vec![])
+        })?;
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        const PER_CALL: &str = "tn_reth.epoch_close_system_call_gas_used";
+        let budget = SYSTEM_CALL_GAS_LIMIT as f64;
+
+        // the four calls a post-fork close makes, each real work inside the budget it was granted
+        let spent: Vec<f64> =
+            ["apply_incentives", "apply_slashes", "conclude_epoch", "record_base_fees"]
+                .into_iter()
+                .map(|call| {
+                    let gas = gauge(&snapshot, PER_CALL, Some(call))
+                        .unwrap_or_else(|| panic!("{call} gas must be recorded: {snapshot:?}"));
+                    assert!(gas > 0.0, "{call} must report the gas it spent, got {gas}");
+                    assert!(gas < budget, "{call} spent {gas}, at or over its {budget} budget");
+                    gas
+                })
+                .collect();
+
+        assert_eq!(
+            gauge(&snapshot, "tn_reth.epoch_close_gas_used", None),
+            Some(spent.iter().sum::<f64>()),
+            "the total gauge must sum exactly the calls that ran"
+        );
+        assert_eq!(
+            gauge(&snapshot, "tn_reth.epoch_close_system_call_gas_limit", None),
+            Some(budget),
+            "the budget gauge must publish the compiled-in limit"
+        );
+
+        // epoch 0 is not the registry fork boundary, so no migration ran
+        assert!(
+            gauge(&snapshot, PER_CALL, Some("registry_migration")).is_none(),
+            "no registry migration away from the fork boundary: {snapshot:?}"
+        );
+
+        Ok(())
+    }
+
+    /// A block that closes no epoch publishes no epoch-close gas at all.
+    ///
+    /// Absent rather than zero. Ordinary blocks vastly outnumber closing ones, so publishing a
+    /// zero for each would overwrite the last real close's figures within seconds and leave the
+    /// gauges reading as though concluding an epoch were free.
+    #[tokio::test]
+    async fn test_block_without_epoch_close_records_no_gas() -> eyre::Result<()> {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis_with_consensus_registry(5).into());
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("epoch close gas metrics (no close)");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None)?;
+
+        let output = consensus_output_for_tests(2, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            execute_payload_and_update_canonical_chain(&env, payload, vec![])
+        })?;
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(
+            !snapshot.iter().any(|(key, ..)| key.key().name().starts_with("tn_reth.epoch_close")),
+            "a block that closes no epoch must record no epoch-close gas: {snapshot:?}"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_close_epochs() -> eyre::Result<()> {
         let validator_1 = Address::from_slice(&[0x11; 20]);
@@ -1588,6 +1745,44 @@ mod tests {
         let new_epoch_info = reth_env
             .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut tn_evm, calldata)?;
 
+        // Epoch 3 is the first shuffled committee (committees are fixed two epochs ahead, so 0-2
+        // all run the genesis five). Six validators are eligible for five seats, so the shuffle
+        // drops exactly one, and WHICH one is a function of the epoch-close seed.
+        //
+        // That seed is fork-gated, and the two sides of the gate drop DIFFERENT validators here,
+        // so no single hardcoded committee is correct for both builds. `make attest` runs this
+        // test twice: once with default features, where `seed_signature_active` is true from
+        // genesis and the seed is the epoch seed chain value, and once with `--features adiri`,
+        // where the gate is dormant while `SEED_SIGNATURE_FORK_EPOCH` is the `u32::MAX`
+        // placeholder and the seed stays the legacy keccak256 of the leader certificate's
+        // aggregate BLS signature. Pinning either literal on its own turns the other pass red, so
+        // derive the pin from the gate rather than picking a side.
+        //
+        // Epoch 3's membership was decided by the close of epoch 1 (`block2`), so the gate is
+        // evaluated at THAT epoch, not at the epoch being read.
+        //
+        // Verify these addresses against the addresses themselves, never against the vec's
+        // ordering: `0x5555..` and `0x901ce5be..` both leave it in increasing address order, so
+        // ordering CANNOT tell them apart. Changing `consensus_output_for_tests`,
+        // `EpochSeedChainValue`, or the registry shuffle moves this membership; re-pin it from an
+        // actual run of BOTH feature configurations.
+        let committee_seed_epoch = expected_epoch - 1;
+        let shuffle_seat = if tn_types::forks::seed_signature_active(committee_seed_epoch) {
+            // epoch seed chain seed: the shuffle drops `validator_2_eoa`, seating `validator_5`
+            validator_5
+        } else {
+            // legacy leader-aggregate seed: the shuffle drops `validator_5`, seating
+            // `validator_2_eoa`'s address. This is the pin `origin/main` carries, main having no
+            // seed chain to draw from.
+            validator_2_address
+        };
+
+        // The shuffle's choice propagates past this assert: a validator that keeps its seat in the
+        // committee just fixed cannot finish exiting at the next boundary, while an unseated one
+        // does. So validator 2's exit trajectory further down is decided by the same gate, and is
+        // expressed in terms of this one binding rather than re-deriving the condition there.
+        let validator_2_keeps_seat = shuffle_seat == validator_2_address;
+
         // replay-critical order normalization: the installed committee is address-sorted
         // (generate_conclude_epoch_calldata sorts after the shuffle) — asserted as a property,
         // independent of the exact-membership golden below
@@ -1598,7 +1793,7 @@ mod tests {
             validator_1,
             validator_3,
             validator_4,
-            validator_2_address,
+            shuffle_seat,
             new_validator.execution_address,
         ];
 
@@ -1655,6 +1850,11 @@ mod tests {
         let canonical_header = block5.recovered_block.clone_sealed_header();
 
         // create evm to read latest state
+        //
+        // NOTE: the assertions below deliberately run AFTER an epoch close, so they check that
+        // `PendingExit` and the active/pending-exit counts SURVIVE an epoch boundary rather than
+        // merely that `beginExit` set them in its own block. That is the interaction most exposed
+        // to a change in the epoch-close randomness source, so keep the close ahead of the reads.
         let state = StateProviderDatabase::new(reth_env.latest()?);
         let mut cached_reads = CachedReads::default();
         let mut db = State::builder()
@@ -1677,7 +1877,18 @@ mod tests {
                 calldata,
             )?;
         debug!(target: "engine", ?validator_2_info, "getting validator 2 info");
-        assert_eq!(validator_2_info.currentStatus, ValidatorStatus::PendingExit);
+        // `beginExit` ran in block4 and the epoch close in block5 followed it. Whether that close
+        // COMPLETED the exit depends on whether validator 2 still holds a seat in the committee
+        // the shuffle fixed above: a seated validator stays `PendingExit` until it leaves the
+        // committee, an unseated one reaches `Exited` at the boundary. Both are correct registry
+        // behavior, and which one this fixture sees is decided by the epoch-close seed, so the
+        // expectation keys on the same gate as the committee pin.
+        let (expected_status, expected_pending_exits) = if validator_2_keeps_seat {
+            (ValidatorStatus::PendingExit, 1)
+        } else {
+            (ValidatorStatus::Exited, 0)
+        };
+        assert_eq!(validator_2_info.currentStatus, expected_status);
 
         // With the per-status sets, `getValidatorsInfo(Active)` returns strictly-active validators;
         // the committee-eligible pool is the union of Active/PendingActivation/PendingExit, so the
@@ -1701,10 +1912,13 @@ mod tests {
                 .abi_encode()
                 .into(),
             )?;
-        assert_eq!(pending_exit.len(), 1);
+        assert_eq!(pending_exit.len(), expected_pending_exits);
+        // When the close already completed the exit there is no pending-exit entry to identify, so
+        // compare optionally rather than indexing: `None` is the correct answer in that build, and
+        // an `expect` here would turn a legitimate trajectory into a panic.
         assert_eq!(
-            pending_exit.first().expect("one pending validator").validatorAddress,
-            validator_2_address
+            pending_exit.first().map(|v| v.validatorAddress),
+            validator_2_keeps_seat.then_some(validator_2_address)
         );
 
         // close epoch again to exit validator
@@ -2946,11 +3160,23 @@ mod tests {
         assert_eq!(configs[0], WorkerFeeConfig::Eip1559 { target_gas: 30_000_000 });
         assert_eq!(configs[1], WorkerFeeConfig::Static { fee: 500 });
 
-        // the block-pinned read primitive reports the same count at genesis
-        let (num_workers, configs_at_block) =
+        // the block-pinned read primitive reports the same count and strategies at genesis
+        let (num_workers, entries) =
             reth_env.get_worker_fee_configs_at_block(chain.sealed_genesis_header().hash())?;
         assert_eq!(num_workers, 2);
-        assert_eq!(configs_at_block, configs);
+        assert_eq!(entries.iter().map(|entry| entry.config).collect::<Vec<_>>(), configs);
+
+        // the ceremony seeds every row's `data` word zero (see `create_consensus_registry_
+        // genesis_accounts`), and the epoch-closing block's base-fee record is the only other
+        // writer - no epoch has closed at genesis, so every row still reads the never-recorded
+        // zero, including the Static row, which the record skips entirely
+        for (worker_id, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry.data,
+                U184::ZERO,
+                "worker {worker_id} carries a non-zero data word at ceremony genesis"
+            );
+        }
 
         Ok(())
     }
@@ -3077,17 +3303,17 @@ mod tests {
         assert_eq!(epoch_one_read_header.hash(), close_block_hash);
 
         // epoch 1's count (read at its start-parent) reflects the governance change...
-        let (num_workers, configs) =
+        let (num_workers, entries) =
             reth_env.get_worker_fee_configs_at_block(epoch_one_read_header.hash())?;
         assert_eq!(num_workers, 2);
-        assert_eq!(configs[1], WorkerFeeConfig::Static { fee: 500 });
+        assert_eq!(entries[1].config, WorkerFeeConfig::Static { fee: 500 });
 
         // ...while epoch 0's count (read at genesis) still reports the original single worker
         let genesis_hash = reth_env
             .sealed_header_by_number(epoch_zero_read_block)?
             .expect("genesis header")
             .hash();
-        let (num_workers, _configs) = reth_env.get_worker_fee_configs_at_block(genesis_hash)?;
+        let (num_workers, _entries) = reth_env.get_worker_fee_configs_at_block(genesis_hash)?;
         assert_eq!(num_workers, 1);
 
         Ok(())

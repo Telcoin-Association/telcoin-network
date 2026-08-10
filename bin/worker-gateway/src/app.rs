@@ -33,6 +33,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_connection_duration,
         max_request_bytes,
         rate_limit_per_ip,
+        rate_limit_prefix,
         rate_limit_global,
         graceful_shutdown_timeout,
         metrics_addr,
@@ -49,8 +50,12 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
 
     // Edge rate limiters (per-IP and/or global), or `None` when both are
     // disabled; in that case no rate-limit layer or sweep task is installed.
-    let rate_limiters =
-        RateLimiters::new(rate_limit_per_ip, rate_limit_global, DEFAULT_MAX_PER_IP_ENTRIES);
+    let rate_limiters = RateLimiters::new(
+        rate_limit_per_ip,
+        rate_limit_global,
+        DEFAULT_MAX_PER_IP_ENTRIES,
+        rate_limit_prefix,
+    );
     info!(
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),

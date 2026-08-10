@@ -29,7 +29,7 @@ use crate::{
     engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode, worker::WorkerNode,
     EngineToPrimaryRpc,
 };
-use eyre::{eyre, OptionExt};
+use eyre::{eyre, OptionExt, WrapErr as _};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
@@ -46,13 +46,13 @@ use tn_reth::{
         ConsensusRegistry::{self, EpochInfo},
         EpochState,
     },
-    WorkerRpcForwarder,
+    ForwardTargetPolicy, WorkerRpcForwarder,
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
     CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    Multiaddr, NetworkPublicKey, P2pNode, SealedHeader, TaskManager, TaskSpawner,
+    EpochDigest, Multiaddr, NetworkPublicKey, P2pNode, SealedHeader, TaskManager, TaskSpawner,
     DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
@@ -145,17 +145,17 @@ where
         &self,
         engine: &ExecutionNode,
     ) -> eyre::Result<(Committee, EpochInfo, u64, SealedHeader)> {
-        // Sample the bootstrap tip ONCE, OUTSIDE the retry below. This is what makes the retry
-        // safe: the pin the read resolves is a function of the tip (`concludeEpoch` rewrites
-        // both the epoch number and its `blockHeight` at EVERY boundary, not once ever), so
-        // re-sampling per attempt could resolve a different header on a later attempt. With the
-        // sample held here, every attempt provably resolves the same pin.
+        // Sample the bootstrap tip ONCE and thread it through the retry below as its pin. This is
+        // what makes the retry safe: the pin the read resolves is a function of the tip
+        // (`concludeEpoch` rewrites both the epoch number and its `blockHeight` at EVERY boundary,
+        // not once ever), so re-sampling per attempt could resolve a different header on a later
+        // attempt.
         let tip = engine.get_reth_env().await.canonical_tip();
         let (
             EpochState { epoch, epoch_info, validators, bls_pubkeys, epoch_start },
             epoch_start_header,
-        ) = retry_provider_faults("epoch-entry state read", || {
-            engine.epoch_state_at_epoch_start_from_tip(&tip)
+        ) = retry_provider_faults("epoch-entry state read", &tip, |pin| {
+            engine.epoch_state_at_epoch_start_from_tip(pin)
         })
         .await
         .map_err(|e| {
@@ -300,11 +300,21 @@ where
     /// different pin than the rest of the entry path. Folding in the next committee's keys —
     /// read at the same pin — lets the network pre-resolve the successor committee. Produces a
     /// config scoped to this epoch only.
+    ///
+    /// `prior_epoch_record` is the digest of the previous epoch's `EpochRecord` resolved by
+    /// `open_epoch_pack` (default digest for epoch 0). It anchors the canonical epoch-close
+    /// seed message this epoch's proposers sign and voters verify, so it MUST be the real
+    /// chain-derived digest - never a silent default. For seed-signature-active epochs
+    /// `open_epoch_pack` additionally guarantees the digest is certificate-backed: it is only
+    /// released after the record's `EpochCertificate` verified with a super-quorum of the
+    /// prior committee (see `certified_prior_epoch_anchor`), so an uncertified locally-divergent
+    /// record can never be captured as this epoch's anchor.
     pub(super) async fn configure_consensus(
         &self,
         network_config: &NetworkConfig,
         committee: Committee,
         next_committee_keys: Vec<BlsPublicKey>,
+        prior_epoch_record: EpochDigest,
     ) -> eyre::Result<ConsensusConfig<DB>> {
         let validators = committee.bls_keys();
         debug!(target: "epoch-manager", ?validators, "creating committee for validators");
@@ -317,6 +327,7 @@ where
             committee,
             network_config.clone(),
             next_committee_keys,
+            prior_epoch_record,
         )?;
 
         Ok(consensus_config)
@@ -492,9 +503,15 @@ where
 
         // Observer transaction forwarding: a non-committee worker forwards each transaction it
         // accepts to the JSON-RPC endpoint of the validator that owns it, discovered over
-        // kademlia (issue #804).
-        let forwarder =
-            Arc::new(WorkerRpcForwarder::new(network_handle.get_task_spawner().clone()));
+        // kademlia (issue #804). The endpoint is chosen by a committee member, so the policy
+        // decides which advertised hosts this node is willing to dial (issue #1092); it refuses
+        // non-public hosts unless the operator opted in for a single-host deployment.
+        let forwarder = Arc::new(WorkerRpcForwarder::new(
+            network_handle.get_task_spawner().clone(),
+            ForwardTargetPolicy::from_allow_private(
+                consensus_config.parameters().allow_private_forward_targets,
+            ),
+        ));
 
         let worker = WorkerNode::new(
             worker_id,
@@ -859,12 +876,18 @@ where
             .authority_id()
             .map(|id| consensus_config.in_committee(&id))
             .unwrap_or(false);
+        // A failed storage lookup inside prime_consensus aborts epoch startup loudly rather
+        // than priming the rounds from a silently-defaulted consensus header.
         state_sync::prime_consensus(
             consensus_bus.app(),
             consensus_config,
             self.consensus_chain.clone(),
         )
-        .await;
+        .await
+        .wrap_err(
+            "failed to READ the consensus store while priming consensus state: this is a \
+             storage error, not a missing record - do NOT delete the chain-data directories",
+        )?;
         let mode = if !in_committee || self.builder.tn_config.observer {
             NodeMode::Observer
         } else {

@@ -266,9 +266,12 @@ impl<DB: Database> Subscriber<DB> {
     /// Return the block hash and number of the last executed consensus output.
     ///
     /// This method is called on startup to retrieve the needed information to build the next
-    /// `ConsensusHeader` off of this parent.
+    /// `ConsensusHeader` off of this parent. A failed storage lookup propagates so startup
+    /// fail-stops instead of numbering new output from a silently-defaulted parent at 0.
     async fn get_last_executed_consensus(&self) -> SubscriberResult<(ConsensusHeaderDigest, u64)> {
-        let result = last_consensus_parent(&self.consensus_bus, &self.inner.consensus_chain).await;
+        let result = last_consensus_parent(&self.consensus_bus, &self.inner.consensus_chain)
+            .await
+            .map_err(|error| SubscriberError::ConsensusChainRead(format!("{error:#}")))?;
 
         info!(
             target: "subscriber",
@@ -673,6 +676,7 @@ mod tests {
             sub_dag_index,
             ReputationScores::new(committee),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         let digest = ConsensusHeader::digest_from_parts(parent, &sub_dag, number);
         let output = ConsensusOutput::new(sub_dag, parent, number, false, VecDeque::new(), vec![]);
@@ -802,6 +806,7 @@ mod tests {
             0,
             ReputationScores::new(&committee),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         let out1 =
             ConsensusOutput::new(sub_dag1.clone(), parent0, 1, false, VecDeque::new(), vec![]);
@@ -813,6 +818,7 @@ mod tests {
             1,
             ReputationScores::new(&committee),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         let out2 = ConsensusOutput::new(sub_dag2, digest1, 2, false, VecDeque::new(), vec![]);
 

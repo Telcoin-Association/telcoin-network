@@ -1151,6 +1151,9 @@ impl PrimaryNetworkHandle {
             | ConsensusChainError::EpochDbError(_)
             | ConsensusChainError::InvalidPackEpoch(_, _)
             | ConsensusChainError::CantSaveAndNotAvailable(_)
+            // The documented cause is LOCAL state (a resume that collapsed this node's
+            // "latest"), not peer misbehavior, so no penalty is charged to the peer.
+            | ConsensusChainError::NonMonotonicConsensusNumber { .. }
             | ConsensusChainError::IO(_) => None,
         }
     }

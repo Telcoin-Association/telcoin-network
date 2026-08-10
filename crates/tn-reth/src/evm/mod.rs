@@ -83,6 +83,10 @@ pub use utils::calculate_gas_penalty;
 ///
 /// Read-path note: contract reads that share the system-call plumbing (including RPC reads via
 /// `read_contract_at_block`) inherit this ceiling — an accepted consequence of the raise.
+///
+/// Observability: the `tn_reth.epoch_close_*` gauges (`crate::metrics`) publish what each
+/// epoch-boundary call spends against this budget, and the budget itself, so consumption is a
+/// ratio a dashboard can watch rather than something discovered when a close halts the fleet.
 pub(crate) const SYSTEM_CALL_GAS_LIMIT: u64 = 100_000_000;
 
 /// Gas budget for a single pre-genesis constructor CREATE

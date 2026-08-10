@@ -34,7 +34,7 @@ use tracing::{debug, error};
 use crate::archive::{
     data_file::create_dir_synced,
     digest_index::index::HdxIndex,
-    error::{fetch::FetchError, open::OpenError},
+    error::{fetch::FetchError, load_header::LoadHeaderError, open::OpenError},
     fxhasher::FxHasher,
     index::Index as _,
     pack::{write_value, DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
@@ -109,7 +109,7 @@ enum PackMessage {
     ContainsBatch(B256, oneshot::Sender<bool>),
     Batch(B256, oneshot::Sender<Option<Batch>>),
     CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
-    LatestConsensusHeader(oneshot::Sender<Option<ConsensusHeader>>),
+    LatestConsensusHeader(oneshot::Sender<Result<Option<ConsensusHeader>, PackError>>),
     Shutdown,
     // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
     /// become visible to other file handles on the same file (visibility, not durability).
@@ -573,12 +573,15 @@ impl ConsensusPack {
     /// Return the latest consensus header by reading directly from the pack index.
     /// Unlike consensus_header_latest on ConsensusChain, this does not rely on the
     /// slot files (LatestConsensus) and is always consistent with read_last_committed.
-    pub async fn latest_consensus_header(&self) -> Option<ConsensusHeader> {
+    ///
+    /// Fails closed: a read or channel failure is returned, never reported as "no header". See the
+    /// note on the inner reader.
+    pub async fn latest_consensus_header(&self) -> Result<Option<ConsensusHeader>, PackError> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(PackMessage::LatestConsensusHeader(tx)).await.is_ok() {
-            rx.await.unwrap_or(None)
+            rx.await.unwrap_or(Err(PackError::SendFailed))
         } else {
-            None
+            Err(PackError::SendFailed)
         }
     }
 
@@ -1098,11 +1101,28 @@ impl Inner {
     }
 
     /// Retrieve a consensus header by digest.
+    ///
+    /// Returns `None` both for a digest that was never written here (a legitimate, quiet miss)
+    /// and for a record the index claims exists but that could not be read; the latter is logged
+    /// at `error!` first so a stored-but-unreadable header can never be silently mistaken for an
+    /// absent one. The `Option` return shape is kept to bound the blast radius of this
+    /// hardening. Under the epoch-gated seed-signature serde, pre-fork packs stay decodable and
+    /// the logged arms should never fire - they are the difference between a loud signal and
+    /// silent chain corruption for every future format change.
     fn consensus_header_by_digest(
         &mut self,
         digest: ConsensusHeaderDigest,
     ) -> Option<ConsensusHeader> {
-        let pos = self.consensus_digests.load(digest.into()).ok()?;
+        let epoch = self.epoch_meta.epoch;
+        let pos = self
+            .consensus_digests
+            .load(digest.into())
+            .inspect_err(|e| {
+                if !fetch_error_is_absent(e) {
+                    error!(target: "consensus_pack", epoch, ?digest, "consensus digest index lookup failed (not a miss): {e}");
+                }
+            })
+            .ok()?;
         // This is not strickly needed, the fetch below will fail if
         // we try to read past the end of the file but this potentially
         // short circuits a lot of checks for a small cost.
@@ -1110,11 +1130,23 @@ impl Inner {
         if pos >= self.data.file_len() {
             return None;
         }
-        let header = self.data.fetch(pos).ok()?.into_consensus().ok()?;
+        let header = self
+            .data
+            .fetch(pos)
+            .inspect_err(|e| {
+                error!(target: "consensus_pack", epoch, ?digest, pos, "indexed consensus record exists but failed to load from the pack: {e}");
+            })
+            .ok()?
+            .into_consensus()
+            .inspect_err(|e| {
+                error!(target: "consensus_pack", epoch, ?digest, pos, "indexed consensus record exists but did not decode as a consensus header: {e}");
+            })
+            .ok()?;
         // Verify the digest.  There is an extremely unlikely edge case where
         // a repaired DB could write a new header to the same location as an
         // old header.  This makes sure the contract is always intact.
         if header.digest() != digest {
+            error!(target: "consensus_pack", epoch, ?digest, number = header.number, pos, "consensus header loaded from the pack does not hash to its indexed digest");
             return None;
         }
         Some(header)
@@ -1197,13 +1229,18 @@ impl Inner {
     /// Return the latest consensus header by reading directly from the pack index,
     /// bypassing the slot file (LatestConsensus). Used during startup recovery to
     /// get a ground-truth latest header consistent with read_last_committed.
-    fn latest_consensus_header(&mut self) -> Option<ConsensusHeader> {
+    ///
+    /// A read failure is propagated rather than reported as "no header". Recovery uses this
+    /// header's sub-dag as the epoch seed chain anchor, and an absent anchor means "start a fresh
+    /// chain", so collapsing an error into `None` would silently re-root the chain and fork
+    /// execution permanently.
+    fn latest_consensus_header(&mut self) -> Result<Option<ConsensusHeader>, PackError> {
         if self.consensus_pos_idx.is_empty() {
-            return None;
+            return Ok(None);
         }
         let latest_number =
             self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64 - 1;
-        self.consensus_header_by_number(latest_number).ok()
+        self.consensus_header_by_number(latest_number).map(Some)
     }
 
     fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
@@ -1304,6 +1341,26 @@ impl Inner {
             rewards_counter.inc_leader_count(header.sub_dag.leader().author());
         }
         Ok(())
+    }
+}
+
+/// True when a [`FetchError`] from a digest-index lookup means the key is simply not present (a
+/// legitimate miss), as opposed to a record that exists but could not be read.
+///
+/// The pack read paths use this to stay quiet on routine misses while logging every other
+/// failure at `error!`: collapsing "exists but unreadable" into a silent `None` is exactly the
+/// failure mode that let a startup resume fall back to a default consensus header at number 0
+/// with no signal. `pub(crate)` so the epoch-record store
+/// ([`crate::epoch_records`]) classifies absence with exactly the same rule instead of growing
+/// a second, divergent classification.
+pub(crate) fn fetch_error_is_absent(err: &FetchError) -> bool {
+    match err {
+        FetchError::NotFound => true,
+        FetchError::DeserializeValue(_)
+        | FetchError::IO(_)
+        | FetchError::CrcFailed
+        | FetchError::RequestedSizeTooLarge(_, _)
+        | FetchError::RequestedDecompressSizeTooLarge(_) => false,
     }
 }
 
@@ -1897,6 +1954,33 @@ pub enum PackError {
     },
 }
 
+impl PackError {
+    /// True when a static-pack open failed because the epoch's files are absent on disk: the
+    /// data-file or an index-file open bottomed out in io `NotFound`. [`Inner::open_static`]
+    /// opens the data file before anything else, so a missing `epoch-{N}` directory (or a
+    /// never-created epoch) always surfaces as the data file's `NotFound`; an index file can
+    /// bottom out there on its own while the data file still opens, because `stream_import`
+    /// removes an incomplete epoch directory entry by entry before re-importing it, and the
+    /// pre-classifier lookup fell back to staging during that window.
+    ///
+    /// Callers use this to distinguish an epoch whose files are not (or are no longer) on disk
+    /// (a normal miss, answered with `None`) from files that are present but unreadable
+    /// (corrupt pack, damaged header or index, non-`NotFound` I/O failure): a storage READ
+    /// error that must propagate instead of being collapsed into a miss.
+    pub fn is_missing_static_files(&self) -> bool {
+        matches!(
+            self,
+            PackError::Open(open_error)
+                if matches!(
+                    open_error.as_ref(),
+                    OpenError::DataFileOpen(LoadHeaderError::IO(io_error))
+                    | OpenError::IndexFileOpen(LoadHeaderError::IO(io_error))
+                        if io_error.kind() == io::ErrorKind::NotFound
+                )
+        )
+    }
+}
+
 impl Error for PackError {}
 impl Display for PackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1984,8 +2068,8 @@ pub(crate) mod test {
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
         test_genesis, Batch, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-        ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, EpochRecord, ExecHeader, Hash,
-        HeaderBuilder, ReputationScores,
+        ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
+        EpochRecord, ExecHeader, Hash, HeaderBuilder, ReputationScores,
     };
 
     use crate::{
@@ -2037,6 +2121,7 @@ pub(crate) mod test {
             1,
             ReputationScores::default(),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         ConsensusOutput::new(
             sub_dag,
@@ -2087,6 +2172,7 @@ pub(crate) mod test {
             sub_dag_index_1,
             reputation_scores,
             previous_sub_dag,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         ConsensusOutput::new(
             subdag_1.clone(),
@@ -2143,6 +2229,7 @@ pub(crate) mod test {
             1,
             ReputationScores::default(),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         let batch_digests: VecDeque<BlockHash> =
             [batch_0.digest(), batch_1.digest(), batch_1.digest(), batch_2.digest()]
@@ -2165,6 +2252,33 @@ pub(crate) mod test {
                 },
             ],
         )
+    }
+
+    /// Epoch for the shared-batch scenarios: one above the adiri dup-batch replay cutoff
+    /// (`ADIRI_DUP_BATCH_EPOCH`, 160), so the rebuilt output keeps the shared batch under every
+    /// feature set and `compare_outputs` stays cfg-free (#1128). The literal is hard-coded
+    /// because the constant only exists under the `adiri` feature; the assertion below pins the
+    /// relation where the constant is visible. The replay (drop) side at low epochs is pinned by
+    /// `test_shared_batch_replay_below_adiri_dup_cutoff`.
+    const SHARED_BATCH_EPOCH: Epoch = 161;
+
+    #[cfg(feature = "adiri")]
+    const _: () = assert!(SHARED_BATCH_EPOCH > tn_types::forks::ADIRI_DUP_BATCH_EPOCH);
+
+    /// Previous-epoch record linking a pack opened at [`SHARED_BATCH_EPOCH`]: final consensus
+    /// number 0 keeps `start_consensus_number` at 1 and the final consensus hash keeps the
+    /// first output's parent at the default header digest, so the scenario keeps the shape the
+    /// epoch-0 tests use.
+    fn shared_batch_previous_epoch(committee: &Committee) -> EpochRecord {
+        EpochRecord {
+            // 160 here is only `SHARED_BATCH_EPOCH - 1`, not the adiri cutoff; the
+            // open, verify, and stream-import paths do not read this field.
+            epoch: SHARED_BATCH_EPOCH - 1,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            final_consensus: ConsensusNumHash::new(0, ConsensusHeader::default().digest()),
+            ..Default::default()
+        }
     }
 
     pub(crate) fn compare_outputs(output1: &ConsensusOutput, output2: &ConsensusOutput) {
@@ -2440,19 +2554,17 @@ pub(crate) mod test {
     /// Regression test: one batch digest referenced by two certificates within a single
     /// consensus output.  The batch is stored once in the pack file and must be assigned
     /// to both certificates when the output is rebuilt (previously failed with
-    /// PackError::MissingBatch).
+    /// PackError::MissingBatch).  Runs at [`SHARED_BATCH_EPOCH`], above the adiri dup-batch
+    /// replay cutoff, so the expectation holds for every feature set (#1128).
     #[tokio::test]
     async fn test_consensus_pack_dup_batch_across_certs() {
         let temp_dir = TempDir::with_prefix("test_consensus_pack_dup").expect("temp dir");
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let committee = fixture.committee();
-        let previous_epoch = EpochRecord {
-            epoch: 0,
-            committee: committee.bls_keys().iter().copied().collect(),
-            next_committee: committee.bls_keys().iter().copied().collect(),
-            ..Default::default()
-        };
+        // Run above the adiri dup-batch replay cutoff so the duplicate survives the rebuild
+        // under every feature set and one unconditional comparison serves both builds.
+        let committee = fixture.committee().advance_epoch_for_test(SHARED_BATCH_EPOCH);
+        let previous_epoch = shared_batch_previous_epoch(&committee);
         let pack =
             ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
                 .expect("open pack");
@@ -2475,20 +2587,23 @@ pub(crate) mod test {
         drop(pack);
 
         // Read back through the read only static path.
-        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), SHARED_BATCH_EPOCH).expect("open static");
         compare_outputs(&pack.get_consensus_output(1).await.expect("dup batch output"), &output_1);
         compare_outputs(&pack.get_consensus_output(2).await.expect("output after dup"), &output_2);
         drop(pack);
 
         // Stream into a new pack (peer epoch sync path) and read back.
         let temp_dir2 = TempDir::with_prefix("test_consensus_pack_dup2").expect("temp dir");
-        let stream = tokio::fs::File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
-            .await
-            .expect("log file");
+        let stream = tokio::fs::File::open(
+            temp_dir.path().join(format!("epoch-{SHARED_BATCH_EPOCH}")).join(Inner::DATA_NAME),
+        )
+        .await
+        .expect("log file");
         let pack = ConsensusPack::stream_import(
             temp_dir2.path(),
             stream,
-            0,
+            SHARED_BATCH_EPOCH,
             &previous_epoch,
             2,
             Duration::from_secs(5),
@@ -2877,7 +2992,9 @@ pub(crate) mod test {
     /// A v0 (batches-first) pack that stores a SHARED batch (one digest referenced by two certs)
     /// must serve that output as v1 (header-first) bytes that decode back to the identical output,
     /// with the shared batch reassigned to BOTH certs. Guards the exact mixed-testnet path: a
-    /// pre-upgrade v0 file served as v1 for a duplicate-batch output.
+    /// pre-upgrade v0 file served as v1 for a duplicate-batch output. Runs at
+    /// [`SHARED_BATCH_EPOCH`], above the adiri dup-batch replay cutoff, so the expectation
+    /// holds for every feature set (#1128).
     #[tokio::test]
     async fn test_v0_shared_batch_served_as_v1_bytes() {
         use crate::consensus_pack::{bytes_to_output, bytes_to_verified_output};
@@ -2887,8 +3004,10 @@ pub(crate) mod test {
         let temp_dir = TempDir::with_prefix("test_v0_shared_v1").expect("temp dir");
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let committee = fixture.committee();
-        let previous_epoch = test_previous_epoch(&committee);
+        // Above the adiri replay cutoff: the shared batch must reach both certs on rebuild
+        // under every feature set.
+        let committee = fixture.committee().advance_epoch_for_test(SHARED_BATCH_EPOCH);
+        let previous_epoch = shared_batch_previous_epoch(&committee);
 
         // Genuine v0 (batches-first) pack on disk.
         let pack = ConsensusPack::open_append_version(
@@ -2942,6 +3061,106 @@ pub(crate) mod test {
             .expect("verified v1 decode");
             compare_outputs(&verified, original);
         }
+        drop(pack);
+    }
+
+    /// Adiri replay pin: at epochs at or below `ADIRI_DUP_BATCH_EPOCH` the rebuild must DROP a
+    /// shared batch from the second certificate, reproducing the historical duplicate-batch
+    /// outputs so adiri testnet can sync (the gates in `iter_to_output` and
+    /// `iter_to_output_legacy`). Exercises the skip side of both decoders from one v0 pack: the
+    /// legacy (batches-first) local read and the v1 (header-first) decode of the served bytes.
+    /// The push side above the cutoff is exercised by the two shared-batch tests at
+    /// [`SHARED_BATCH_EPOCH`] (#1128).
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_shared_batch_replay_below_adiri_dup_cutoff() {
+        use crate::consensus_pack::bytes_to_output;
+        use std::io::Cursor;
+        use tokio::io::BufReader;
+
+        let temp_dir = TempDir::with_prefix("test_dup_replay").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        // The fixture committee is at epoch 0, at or below the replay cutoff.
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // v0 pack so the local read exercises the legacy (batches-first) decoder.
+        let pack = ConsensusPack::open_append_version(
+            temp_dir.path(),
+            previous_epoch,
+            committee.clone(),
+            0,
+        )
+        .expect("open v0 pack");
+        let original = make_test_output_shared_batch(
+            &committee,
+            chain.clone(),
+            1,
+            ConsensusHeader::default().digest(),
+        );
+        // The replay gate reads the leader epoch of the sub-dag, so the guard pins
+        // that quantity, not the committee epoch it was stamped from.
+        assert!(
+            original.sub_dag().leader_epoch() <= tn_types::forks::ADIRI_DUP_BATCH_EPOCH,
+            "scenario must run at or below the replay cutoff"
+        );
+        pack.save_consensus_output(original.clone()).await.expect("save shared-batch output");
+        pack.persist().await.expect("persist");
+
+        // The digest both certificates reference: the one listed twice in batch_digests.
+        let shared_digest = original
+            .batch_digests()
+            .iter()
+            .find(|digest| {
+                original.batch_digests().iter().filter(|other| other == digest).count() == 2
+            })
+            .copied()
+            .expect("scenario shares one digest across certs");
+
+        let assert_replay_shape = |rebuilt: &ConsensusOutput| {
+            // The sub-dag, parent link and declared digest list (duplicate included) survive
+            // untouched; only the second certificate's materialized batches change.
+            assert_eq!(rebuilt.digest(), original.digest(), "consensus digest must be preserved");
+            assert_eq!(
+                rebuilt.batch_digests(),
+                original.batch_digests(),
+                "declared digests keep the duplicate"
+            );
+            let cert_a = rebuilt.batches().first().expect("two certified batches");
+            let cert_a_original = original.batches().first().expect("two certified batches");
+            assert_eq!(cert_a.address, cert_a_original.address);
+            assert_eq!(cert_a.batches, cert_a_original.batches, "first certificate is untouched");
+            let cert_b = rebuilt.batches().get(1).expect("two certified batches");
+            let cert_b_original = original.batches().get(1).expect("two certified batches");
+            assert_eq!(cert_b.address, cert_b_original.address);
+            let expected: Vec<Batch> = cert_b_original
+                .batches
+                .iter()
+                .filter(|batch| batch.digest() != shared_digest)
+                .cloned()
+                .collect();
+            assert_eq!(expected.len(), 1, "one unshared batch must remain");
+            assert_eq!(
+                cert_b.batches, expected,
+                "replay must drop the shared batch from the second certificate"
+            );
+        };
+
+        // Legacy (batches-first) local read of the v0 pack.
+        assert_replay_shape(&pack.get_consensus_output(1).await.expect("local v0 read"));
+
+        // The same output served as v1 (header-first) bytes and decoded by the v1 path.
+        let bytes = pack.get_consensus_output_bytes(1).await.expect("bytes");
+        let decoded = bytes_to_output(
+            BufReader::new(Cursor::new(bytes)),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await
+        .expect("v1 decode");
+        assert_replay_shape(&decoded);
         drop(pack);
     }
 
@@ -3102,5 +3321,105 @@ pub(crate) mod test {
         let err = verify_epoch_meta(2, &rec1, &meta_for(2, &committee5_next, &rec1))
             .expect_err("shrunken vs full must fail");
         assert!(matches!(err, PackError::InvalidEpoch(2, _)), "got {err:?}");
+    }
+
+    /// Deterministic BLS seed signature for fork-active fixture headers: the keypair comes
+    /// from a seeded rng and BLS signing is deterministic, so the fixture bytes are stable
+    /// across runs.
+    fn nesting_seed_signature(seed: u64) -> tn_types::BlsSignature {
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::Signer as _;
+
+        let keypair = tn_types::BlsKeypair::generate(&mut StdRng::seed_from_u64(seed));
+        keypair.sign(b"pack-nesting-fixture")
+    }
+
+    /// A header pinned to `epoch` whose remaining fields all derive from `tag`, giving each
+    /// fixture header distinct, fully deterministic bytes.
+    fn nesting_header(epoch: tn_types::Epoch, tag: u8) -> tn_types::Header {
+        use tn_types::{AuthorityIdentifier, HeaderDigest};
+
+        HeaderBuilder::default()
+            .author(AuthorityIdentifier::from_bytes([tag; 32]))
+            .round(u32::from(tag))
+            .epoch(epoch)
+            .created_at(u64::from(tag))
+            .parents([HeaderDigest::new([tag; 32])].into_iter().collect())
+            .seed_signature(nesting_seed_signature(u64::from(tag)))
+            .build()
+    }
+
+    /// Tier-1 nesting proof at the pack level (#1032, #1086 PR-1): a [`PackRecord::Consensus`]
+    /// whose sub-DAG nests headers of BOTH wire layouts must round-trip byte-exactly through
+    /// the pack record codec with deep equality and per-element epoch-gate visibility.
+    ///
+    /// Under `adiri` the epoch-0 elements are legacy seven-field headers and the `u32::MAX`
+    /// element carries `seed_signature`, so the record exercises the legacy→V1 and V1→legacy
+    /// visitor hand-offs three levels deep (record → consensus header → sub-DAG → headers);
+    /// without `adiri` every element is fork-active and the same record pins the all-V1 path
+    /// in the default-feature suite.
+    #[test]
+    fn test_pack_record_mixed_epoch_sub_dag_round_trip() {
+        use crate::consensus_pack::PackRecord;
+        use tn_types::{decode, encode, Epoch};
+
+        // Epoch 0 is legacy only under `adiri`; `Epoch::MAX` (the adiri fork placeholder) is
+        // fork-active under every cfg.
+        let headers = vec![
+            nesting_header(0, 0x11),
+            nesting_header(Epoch::MAX, 0x22),
+            nesting_header(0, 0x33),
+        ];
+        let expected_gate: Vec<bool> =
+            headers.iter().map(|header| header.seed_signature().is_some()).collect();
+        // Anti-vacuity: the sub-DAG genuinely mixes both layouts under `adiri`.
+        #[cfg(feature = "adiri")]
+        assert_eq!(vec![false, true, false], expected_gate, "adiri epoch 0 must be legacy");
+        #[cfg(not(feature = "adiri"))]
+        assert_eq!(vec![true, true, true], expected_gate, "non-adiri epochs are all fork-active");
+
+        let consensus = ConsensusHeader {
+            parent_hash: ConsensusHeaderDigest::default(),
+            sub_dag: CommittedSubDag::new_with_headers_for_test(headers),
+            number: 42,
+            extra: Default::default(),
+        };
+        let record = PackRecord::Consensus(Box::new(consensus.clone()));
+
+        // `encode` is exactly the serialization `write_value` runs before framing and
+        // compression, so a byte round trip here is a byte round trip of the stored record.
+        let bytes = encode(&record);
+        let decoded: PackRecord = decode(&bytes);
+        assert_eq!(
+            bytes,
+            encode(&decoded),
+            "re-encode of the decoded pack record must reproduce the original bytes"
+        );
+
+        let decoded_consensus = decoded
+            .into_consensus()
+            .expect("Consensus record must decode back to the Consensus variant");
+        assert_eq!(consensus, decoded_consensus, "pack-record round trip must be deeply equal");
+        assert_eq!(
+            consensus.digest(),
+            decoded_consensus.digest(),
+            "consensus header digest must survive the round trip"
+        );
+        assert_eq!(
+            consensus.sub_dag.digest(),
+            decoded_consensus.sub_dag.digest(),
+            "sub-dag digest must survive the round trip"
+        );
+
+        let decoded_gate: Vec<bool> = decoded_consensus
+            .sub_dag
+            .headers()
+            .iter()
+            .map(|header| header.seed_signature().is_some())
+            .collect();
+        assert_eq!(
+            expected_gate, decoded_gate,
+            "per-element gate visibility must survive the round trip"
+        );
     }
 }
