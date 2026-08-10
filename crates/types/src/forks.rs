@@ -22,6 +22,20 @@ use alloy::primitives::{b256, B256};
 pub const CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH: B256 =
     b256!("0x5318ebc5cd8123cfb0808fac0f3c0b95ed6f45f67c0853fea0766b52035fea53");
 
+/// Keccak-256 hash of the upgraded (post-fork) `ConsensusRegistry` runtime bytecode the
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] boundary swaps in: the embedded `ConsensusRegistry.json`
+/// `deployedBytecode.object` (`tn-config`'s `CONSENSUS_REGISTRY_JSON`, loaded by
+/// `tn-reth::evm::block::consensus_registry_runtime_code`).
+///
+/// Unlike the pre-fork pins this is not a gate — nothing compares against it at runtime. It exists
+/// so an artifact bump is caught at compile-and-test time rather than at replay time: once the
+/// fork has run live, re-executing the fork block must swap in these exact bytes, and a
+/// tn-contracts submodule bump would silently change them and break historical state roots.
+///
+/// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
+pub const CONSENSUS_REGISTRY_POST_FORK_CODE_HASH: B256 =
+    b256!("0xc7079bcf595e0ad09ea00b23bec972a002bcaafe7f58cf8b07323fe1d3747f34");
+
 /// Keccak-256 hash of the pre-fork `WorkerConfigs` runtime bytecode deployed on the live adiri
 /// testnet (the worker-configs account's `code` in the committed
 /// `chain-configs/testnet/genesis.yaml`).
@@ -39,6 +53,18 @@ pub const CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH: B256 =
 /// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
 pub const WORKER_CONFIGS_PRE_FORK_CODE_HASH: B256 =
     b256!("0x5e8a93f4eb1b5d645f32e5b8615463a996aaf4d8af2a90a444378a2d4b4b3bf2");
+
+/// Keccak-256 hash of the upgraded (post-fork) `WorkerConfigs` runtime bytecode the
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] boundary splices over the deployed contract: the embedded
+/// `WorkerConfigs.json` `deployedBytecode.object` (`tn-config`'s `WORKER_CONFIGS_JSON`, loaded by
+/// `tn-reth::evm::block::worker_configs_runtime_code`).
+///
+/// The splice rides the same boundary block as the registry swap, so it carries the same replay
+/// constraint for the same reason: see [`CONSENSUS_REGISTRY_POST_FORK_CODE_HASH`].
+///
+/// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
+pub const WORKER_CONFIGS_POST_FORK_CODE_HASH: B256 =
+    b256!("0x58304c00bbfaa7e348220efb95843614756207311245abc4949f91bb3ddb2ff7");
 
 #[cfg(feature = "adiri")]
 /// The epoch below which Adiri testnet may have had duplicate batches.
@@ -239,6 +265,22 @@ mod tests {
     use super::*;
     use alloy::primitives::{address, keccak256};
 
+    /// The `ConsensusRegistry` build artifact whose `deployedBytecode.object` the fork boundary
+    /// swaps in.
+    ///
+    /// Re-embedded from the tn-contracts submodule rather than read through `tn-config`'s
+    /// `CONSENSUS_REGISTRY_JSON`, because tn-config depends on tn-types and the reverse edge would
+    /// be circular — the same reason the pre-fork tests below hardcode their contract addresses.
+    /// It is the identical file, so the bytes are identical by construction; keep this path in
+    /// step with `tn-config::genesis` if that constant is ever repointed.
+    const CONSENSUS_REGISTRY_ARTIFACT_JSON: &str =
+        include_str!("../../../tn-contracts/artifacts/ConsensusRegistry.json");
+
+    /// The `WorkerConfigs` build artifact whose `deployedBytecode.object` the fork boundary
+    /// splices in. Embedded on the same terms as [`CONSENSUS_REGISTRY_ARTIFACT_JSON`].
+    const WORKER_CONFIGS_ARTIFACT_JSON: &str =
+        include_str!("../../../tn-contracts/artifacts/WorkerConfigs.json");
+
     /// Pin [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`] to the registry code committed in
     /// `chain-configs/testnet/genesis.yaml`.
     ///
@@ -350,5 +392,59 @@ mod tests {
              blindly update this constant to make the test pass; if genesis.yaml was regenerated, \
              reassess the fork plan and `CONSENSUS_REGISTRY_FORK_EPOCH` first",
         );
+    }
+
+    /// Pin [`CONSENSUS_REGISTRY_POST_FORK_CODE_HASH`] to the embedded `ConsensusRegistry.json`
+    /// artifact the fork boundary swaps in.
+    ///
+    /// Unconditional (not `adiri`-gated) so it runs in default-feature CI even though the fork
+    /// machinery consuming the constant is `adiri`-only.
+    #[test]
+    fn test_post_fork_consensus_registry_code_hash_pinned() {
+        assert_eq!(
+            deployed_bytecode_hash(CONSENSUS_REGISTRY_ARTIFACT_JSON),
+            CONSENSUS_REGISTRY_POST_FORK_CODE_HASH,
+            "the embedded ConsensusRegistry artifact drifted from the pinned post-fork code hash \
+             — do not blindly update this constant to make the test pass; these are the bytes the \
+             fork boundary swaps in, so once the fork has run live, shipping a different artifact \
+             breaks historical state roots. Reassess the tn-contracts submodule pin first",
+        );
+    }
+
+    /// Pin [`WORKER_CONFIGS_POST_FORK_CODE_HASH`] to the embedded `WorkerConfigs.json` artifact
+    /// the fork boundary splices in.
+    ///
+    /// Unconditional (not `adiri`-gated) so it runs in default-feature CI even though the fork
+    /// machinery consuming the constant is `adiri`-only.
+    #[test]
+    fn test_post_fork_worker_configs_code_hash_pinned() {
+        assert_eq!(
+            deployed_bytecode_hash(WORKER_CONFIGS_ARTIFACT_JSON),
+            WORKER_CONFIGS_POST_FORK_CODE_HASH,
+            "the embedded WorkerConfigs artifact drifted from the pinned post-fork code hash — do \
+             not blindly update this constant to make the test pass; these are the bytes the fork \
+             boundary splices in, so once the fork has run live, shipping a different artifact \
+             breaks historical state roots. Reassess the tn-contracts submodule pin first",
+        );
+    }
+
+    /// Keccak-256 of an artifact's hex-encoded `deployedBytecode.object`.
+    ///
+    /// Reproduces what the fork boundary pins against: `Bytecode::new_raw(bytes).hash_slow()` over
+    /// these same decoded bytes, which for raw (unanalyzed) legacy bytecode is plain keccak-256 of
+    /// the runtime code — the same value the EVM stores as the account's `code_hash`.
+    ///
+    /// Decoded through `alloy::hex` (not the `hex` crate) to match the runtime loaders in
+    /// `tn-reth::evm::block` byte for byte: the artifact's object string is `0x`-prefixed and only
+    /// alloy's decoder strips that prefix.
+    fn deployed_bytecode_hash(artifact_json: &str) -> B256 {
+        let artifact: serde_json::Value =
+            serde_json::from_str(artifact_json).expect("embedded artifact json is valid");
+        let hex_str = artifact["deployedBytecode"]["object"]
+            .as_str()
+            .expect("artifact deployedBytecode.object is a string");
+        keccak256(
+            alloy::hex::decode(hex_str).expect("artifact deployedBytecode.object is valid hex"),
+        )
     }
 }
