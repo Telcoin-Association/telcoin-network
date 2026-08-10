@@ -115,13 +115,25 @@ test-faucet:
 # rebuilding it through escargot (~3-10s of cargo overhead per test process). Built under the
 # optimized `e2e` profile (opt-level 2 with debug-assertions/overflow-checks kept on; see
 # `[profile.e2e]` in .cargo/config.toml) so the reused binary runs consensus and EVM at speed.
+# Target root for the e2e node-binary build and its consumers, honoring a developer's
+# CARGO_TARGET_DIR: the variable's value when set, cargo's default $(CURDIR)/target
+# otherwise. A relative value is anchored at $(CURDIR) so E2E_BIN stays absolute (nextest
+# runs each test from the package directory); the absolute test is $(filter /%,...) with
+# plain concatenation, not $(abspath), because make functions split on whitespace and
+# $(abspath) would corrupt a path containing spaces. The root is passed to the build as an
+# explicit --target-dir and reused for E2E_BIN, so the producing and the consuming path
+# come from one expression and cannot diverge through any other target-dir channel
+# (CARGO_BUILD_TARGET_DIR or a config.toml build.target-dir keep their pre-change behavior:
+# overridden by the flag).
+E2E_TARGET_ROOT := $(if $(CARGO_TARGET_DIR),$(if $(filter /%,$(CARGO_TARGET_DIR)),$(CARGO_TARGET_DIR),$(CURDIR)/$(CARGO_TARGET_DIR)),$(CURDIR)/target)
+
 .PHONY: build-e2e-bin
 build-e2e-bin:
-	cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir $(CURDIR)/target ;
+	cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir "$(E2E_TARGET_ROOT)" ;
 
 # Location of the binary built by build-e2e-bin, passed to the e2e tests via TN_BIN_PATH.
 # A named cargo profile emits into target/<profile>/, so the `e2e` profile binary lands here.
-E2E_BIN := $(CURDIR)/target/e2e/telcoin-network
+E2E_BIN := $(E2E_TARGET_ROOT)/e2e/telcoin-network
 
 # Seed-signature fork epoch for the e2e lanes (#1032). Defaults to u32::MAX so the default
 # lanes run the fork DORMANT (wire-identical to pre-fork mainnet); non-adiri builds are
@@ -134,11 +146,11 @@ TN_SEED_SIGNATURE_FORK_EPOCH ?= 4294967295
 
 # run restart integration tests
 test-restarts: build-e2e-bin
-	TN_BIN_PATH=$(E2E_BIN) TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # run e2e tests
 test-e2e: build-e2e-bin
-	TN_BIN_PATH=$(E2E_BIN) TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
@@ -213,9 +225,9 @@ revert-submodule:
 
 # workspace tests that don't require faucet credentials
 public-tests: build-e2e-bin
-	TN_BIN_PATH=$(E2E_BIN) cargo nextest run --workspace --exclude tn-faucet --no-fail-fast ;
-	TN_BIN_PATH=$(E2E_BIN) TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
-	TN_BIN_PATH=$(E2E_BIN) TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" cargo nextest run --workspace --exclude tn-faucet --no-fail-fast ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # local checks to ensure PR is ready
 pr:

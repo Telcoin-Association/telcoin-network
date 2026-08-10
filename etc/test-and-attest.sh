@@ -109,8 +109,19 @@ cargo nextest run -p tn-types -p tn-reth -p tn-node --features tn-types/adiri,tn
 # Prebuild the node binary once into the shared target tree and hand it to the e2e tests via
 # TN_BIN_PATH (mirroring `make test-e2e`), so the ignored suite reuses it instead of cold-building
 # the binary inside the first test, which nextest capture would otherwise hide as a multi-minute hang.
-cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir "$(pwd)/target"
-TN_BIN_PATH="$(pwd)/target/e2e/telcoin-network" \
+# Target root for the e2e node-binary build and its consumer, honoring CARGO_TARGET_DIR: its
+# value when set, cargo's default $(pwd)/target otherwise. A relative value is anchored here
+# (the workspace root) so TN_BIN_PATH stays absolute; nextest runs each test from the package
+# directory. The root is passed to the build as an explicit --target-dir and reused for
+# TN_BIN_PATH, so the producing and the consuming path come from one expression and cannot
+# diverge through any other target-dir channel.
+E2E_TARGET_ROOT="${CARGO_TARGET_DIR:-$(pwd)/target}"
+case "$E2E_TARGET_ROOT" in
+    /*) ;;
+    *) E2E_TARGET_ROOT="$(pwd)/$E2E_TARGET_ROOT" ;;
+esac
+cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils --target-dir "$E2E_TARGET_ROOT"
+TN_BIN_PATH="$E2E_TARGET_ROOT/e2e/telcoin-network" \
     cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features
 
 echo "all checks passed - submitting attestation on-chain..."
