@@ -280,6 +280,21 @@ pub struct Parameters {
     /// certificates.
     #[serde(default = "Parameters::default_parallel_fetch_request_delay_interval")]
     pub parallel_fetch_request_delay_interval: Duration,
+
+    /// Allow observer transaction forwarding to dial advertised JSON-RPC endpoints whose host is
+    /// not a public internet address.
+    ///
+    /// An observer forwards each transaction it seals to the endpoint the owning validator
+    /// advertised on its node record, so the dial target is chosen by a committee member rather
+    /// than by this node. Default `false`: an endpoint on a loopback, private, link-local,
+    /// unique-local, shared-address-space or unspecified address is refused, so a committee member
+    /// cannot aim this node's outbound HTTP at hosts inside its own perimeter (issue #1092).
+    ///
+    /// Set `true` only where every committee member is under the same operator as this node --
+    /// single-host and docker-compose deployments, where validators legitimately advertise
+    /// `127.0.0.1` -- since it restores dialing of arbitrary internal addresses.
+    #[serde(default = "Parameters::default_allow_private_forward_targets")]
+    pub allow_private_forward_targets: bool,
 }
 
 impl Parameters {
@@ -327,6 +342,11 @@ impl Parameters {
     fn default_parallel_fetch_request_delay_interval() -> Duration {
         Duration::from_secs(5)
     }
+
+    /// Refuse non-public forwarding targets unless the operator opts in.
+    fn default_allow_private_forward_targets() -> bool {
+        false
+    }
 }
 
 /// Admin server settings.
@@ -366,6 +386,7 @@ impl Default for Parameters {
             basefee_address: None,
             parallel_fetch_request_delay_interval:
                 Parameters::default_parallel_fetch_request_delay_interval(),
+            allow_private_forward_targets: Parameters::default_allow_private_forward_targets(),
         }
     }
 }

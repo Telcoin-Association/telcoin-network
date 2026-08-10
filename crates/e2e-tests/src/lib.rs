@@ -12,7 +12,7 @@ use std::{
     sync::OnceLock,
 };
 use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand, NoArgs};
-use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig};
+use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig, Parameters};
 use tn_node::launch_node;
 use tn_reth::init_txpool_defaults;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
@@ -242,6 +242,16 @@ fn config_local_testnet_inner(
     }
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from(genesis_args);
     create_committee_command.args.execute(shared_genesis_dir.clone())?;
+
+    // Every node in this harness runs on one host and advertises `http://127.0.0.1:<port>`, which
+    // the observer's transaction forwarder refuses by default (issue #1092). This is the
+    // single-host deployment the opt-in exists for, so enable it on the shared parameters before
+    // they are distributed, rather than leaving observer forwarding silently dead in e2e tests.
+    let parameters_path = shared_genesis_dir.join("parameters.yaml");
+    let mut parameters: Parameters = Config::load_from_path(&parameters_path, ConfigFmt::YAML)?;
+    parameters.allow_private_forward_targets = true;
+    Config::write_to_path(&parameters_path, &parameters, ConfigFmt::YAML)?;
+
     // If provided optional accounts then hack them into genesis now...
     if let Some(accounts) = accounts {
         let data_dir = shared_genesis_dir.join("genesis/genesis.yaml");
