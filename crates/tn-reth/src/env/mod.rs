@@ -14,8 +14,14 @@
 //!   the LOCAL chain spec in the supplied config — genesis is never fetched from the network.
 //! - [`RethEnv::new`] has two process-global side effects (base-fee address pinning and metrics
 //!   registration) — see its docs.
+//! - Opening an env loads the datadir's restored-state floor marker when one exists (a datadir
+//!   bootstrapped from a snapshot); pinned state reads below the floor are refused — see
+//!   `pinned_state_and_env` in `env/epoch.rs`.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_db::{init_db, DatabaseEnv};
@@ -69,6 +75,16 @@ struct RethEnvInner {
     evm_config: TnEvmConfig,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// The snapshot's final block `B` — the first block whose state this datadir holds — when it
+    /// was bootstrapped from a snapshot; `None` on a normally-synced node.
+    ///
+    /// Loaded once from the [`RESTORED_STATE_FLOOR_FILE`] marker at construction. The restore
+    /// imports state ONLY at `B`: window headers below `B` carry real, resolvable hashes but no
+    /// state and no history, and blocks below the window are zero-hash placeholders. So
+    /// `pinned_state_and_env` (`env/epoch.rs`) refuses every pin below the floor: reth's
+    /// checkpoint-less history walk would otherwise answer such reads `Ok(None)` per account,
+    /// silently reading every account as "never written".
+    restored_state_floor: Option<u64>,
     /// TEST-ONLY: number of pending injected pre-commit persist faults.
     ///
     /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
@@ -104,10 +120,25 @@ impl std::fmt::Debug for RethEnv {
 /// Set the basefee address.  This will only work on the first call and should be during program
 /// initialization. Calling more than once will do nothing, not calling early can lead to an unset
 /// basefee address and a chain fork.
+///
+/// `None` pins the `GOVERNANCE_SAFE_ADDRESS` default. It is passed by the temp-chain and
+/// snapshot-restore constructors (genesis tooling, `db load-state`, and tests) — see the
+/// `BASEFEE_ADDRESS` docs in `lib.rs` for the first-write-wins hazard. The production node start
+/// (`crates/node/src/manager/node.rs`) always supplies a configured address, because the config
+/// layer declares `parameters.basefee_address` as a required key.
 fn set_basefee_address(address: Option<Address>) {
     // Ignore the error. Should probably panic on error but this will break some test environments.
     let _ = BASEFEE_ADDRESS.set(address.unwrap_or(GOVERNANCE_SAFE_ADDRESS));
 }
+
+/// File name, relative to the datadir root, of the restored-state floor marker.
+///
+/// `SnapshotRestorer::import_chain_scaffold` (`snapshot.rs`) writes it — before any chain data
+/// commits — with the snapshot's final block number (the first block whose state the datadir
+/// holds), and [`RethEnv::new`] reads it on
+/// every construction over the datadir. The file is absent on a normally-synced node. It sits at
+/// the datadir root (beside `db` and `static_files`) so any whole-datadir copy carries it.
+const RESTORED_STATE_FLOOR_FILE: &str = "restored-state-floor";
 
 impl RethEnv {
     /// Produce a new wrapped Reth environment from a config, DB path and task manager.
@@ -140,6 +171,7 @@ impl RethEnv {
         let provider_factory = Self::init_provider_factory(&node_config, database)?;
         let blockchain_provider = BlockchainProvider::new(provider_factory)?;
         let task_spawner = task_manager.get_spawner();
+        let restored_state_floor = Self::read_restored_state_floor(&node_config)?;
         set_basefee_address(basefee_address);
         // baseline the block-building counters at zero now, while the recorder is known to be
         // installed, so a node that never drops a transaction still exports both series
@@ -151,6 +183,7 @@ impl RethEnv {
                 blockchain_provider,
                 evm_config,
                 task_spawner,
+                restored_state_floor,
                 #[cfg(any(feature = "test-utils", test))]
                 persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
@@ -173,6 +206,86 @@ impl RethEnv {
         // with_metrics: record per-operation db latency metrics (noop unless the global
         // metrics recorder is installed, i.e. the node runs with `--metrics`)
         Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?.with_metrics()))
+    }
+
+    /// Absolute path of the restored-state floor marker inside `node_config`'s datadir root.
+    pub(crate) fn restored_state_floor_path(node_config: &NodeConfig<RethChainSpec>) -> PathBuf {
+        Self::restored_state_floor_marker(node_config.datadir().data_dir())
+    }
+
+    /// Absolute path of the restored-state floor marker under a TN datadir root, for callers
+    /// outside this crate that hold only the datadir path: the CLI's failed-import cleanup
+    /// removes the marker through this, so an aborted restore cannot leave a stale floor that
+    /// poisons a later normal sync of the same datadir.
+    pub fn restored_state_floor_marker(datadir: impl AsRef<Path>) -> PathBuf {
+        datadir.as_ref().join(RESTORED_STATE_FLOOR_FILE)
+    }
+
+    /// Read the datadir's restored-state floor marker, if one exists.
+    ///
+    /// A missing file is the normal case (`Ok(None)`): the node was not bootstrapped from a
+    /// snapshot. An unreadable or unparseable file is a hard error rather than `None` — treating
+    /// a corrupt marker as "no floor" would silently re-admit the below-floor pinned reads the
+    /// marker exists to refuse.
+    fn read_restored_state_floor(
+        node_config: &NodeConfig<RethChainSpec>,
+    ) -> eyre::Result<Option<u64>> {
+        let path = Self::restored_state_floor_path(node_config);
+        std::fs::read_to_string(&path)
+            .map(Some)
+            .or_else(|e| (e.kind() == std::io::ErrorKind::NotFound).then_some(None).ok_or(e))
+            .map_err(|e| {
+                eyre::eyre!("failed to read restored-state floor marker {}: {e}", path.display())
+            })?
+            .map(|contents| {
+                contents.trim().parse::<u64>().map_err(|e| {
+                    eyre::eyre!(
+                        "restored-state floor marker {} does not hold a block number: {e}; \
+                         delete the file ONLY if this datadir was never bootstrapped from a \
+                         snapshot — a restored datadir without its floor silently serves empty \
+                         state for pre-snapshot reads",
+                        path.display()
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    /// Persist the datadir's restored-state floor marker: the snapshot's final block `B`, the
+    /// only block whose state the restore imports — nothing below it is readable.
+    ///
+    /// Called by `SnapshotRestorer::import_chain_scaffold` (`snapshot.rs`) BEFORE any chain data
+    /// commits, so no restored datadir can exist without its floor. That ordering only survives
+    /// a crash if the marker is durable first: the scaffold's mdbx and static-file commits
+    /// fsync, while a bare `std::fs::write` can sit in the page cache indefinitely. So this
+    /// stages a temp file, fsyncs it, renames it over the final path (a torn marker can never be
+    /// observed), and fsyncs the parent directory. The marker is read back by [`RethEnv::new`]
+    /// on every later construction over this datadir — never by the env that wrote it:
+    /// `SnapshotRestorer`'s own env was built over the pre-scaffold empty datadir and keeps
+    /// `None`, and the restore's only pinned read targets the snapshot's final block, which the
+    /// floor admits.
+    pub(crate) fn write_restored_state_floor(&self, floor: u64) -> eyre::Result<()> {
+        let path = Self::restored_state_floor_path(self.node_config());
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, format!("{floor}\n")).map_err(|e| {
+            eyre::eyre!("failed to stage restored-state floor marker {}: {e}", tmp.display())
+        })?;
+        std::fs::File::open(&tmp).and_then(|f| f.sync_all()).map_err(|e| {
+            eyre::eyre!("failed to fsync restored-state floor marker {}: {e}", tmp.display())
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            eyre::eyre!("failed to publish restored-state floor marker {}: {e}", path.display())
+        })?;
+        path.parent()
+            .map(|dir| std::fs::File::open(dir).and_then(|d| d.sync_all()))
+            .transpose()
+            .map(|_| ())
+            .map_err(|e| {
+                eyre::eyre!(
+                    "failed to fsync the datadir holding restored-state floor marker {}: {e}",
+                    path.display()
+                )
+            })
     }
 
     /// Initialize the provider factory and related components

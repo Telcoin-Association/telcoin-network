@@ -140,9 +140,13 @@ telcoin-network db load-state /path/to/epoch-N --chain adiri --datadir NEW_DATAD
 
 `--chain` selects the genesis and genesis committee (the trust root) and must match the network the
 bundle came from. `db load-state`:
+- verifies the bundle's entire epoch-record certificate chain against the genesis committee first,
+  in memory, before it writes any chain data — so a bundle from the wrong network, or with a forged
+  certificate, a broken parent link, or a missing certificate, is refused in seconds rather than
+  after the state import has already run,
 - restores the execution state into a new reth database,
-- rebuilds the fully-indexed epoch-records and consensus packs, verifying every record against its
-  certificate (chained from the genesis committee), and
+- rebuilds the fully-indexed epoch-records and consensus packs, re-verifying every record against
+  its certificate as they are persisted, and
 - writes the consensus "latest" slot hint so a restart resumes at epoch N.
 
 ### 3. Starting the node
@@ -166,3 +170,11 @@ chains above — instead of replaying from genesis.
   resume hint is written. Bootstrap from a later epoch.
 - The target datadir must be fresh, all four bundle files must be present, and `--chain` must match the source network.
 - If an import fails it removes only the chain-data directories it created (`db`, `static_files`, `consensus-db`) and leaves your keys and config intact. Never delete the whole datadir (it holds your node keys) — just fix the bundle and re-run.
+- If an import is *killed* rather than failed (SIGKILL, OOM, power loss), that cleanup never runs, so
+  partially written `db`, `static_files`, and `consensus-db` directories are left behind and the next
+  attempt refuses the datadir as non-empty. The remedy is the same surgical one the failure path
+  performs: remove those three directories under the datadir — never the datadir itself, which holds
+  your keys — and re-run. A bundle rejected during the pre-import certificate check creates none of
+  those three directories, so this only applies to a run that was killed after the import started.
+  (`--chain` still materializes `genesis/committee.yaml` if it is absent, since that file is the
+  trust root the check reads; it is config, not chain data, and re-running is unaffected by it.)

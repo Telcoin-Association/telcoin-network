@@ -15,3 +15,4 @@ basefee_address: "0x9999999999999999999999999999999999999999"
 parallel_fetch_request_delay_interval:
   secs: 5
   nanos: 0
+allow_private_forward_targets: false

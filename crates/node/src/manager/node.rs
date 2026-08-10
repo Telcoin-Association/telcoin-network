@@ -1102,12 +1102,16 @@ where
         gas_accumulator: &GasAccumulator,
     ) -> eyre::Result<ExecutionNode> {
         // create execution components (ie - reth env)
+        // `parameters.basefee_address` is a required key with no serde default, so this path
+        // always carries an explicit address; the `Option` below exists for the temp-chain and
+        // snapshot-restore constructors (genesis tooling, `db load-state`, and tests), which pin
+        // the governance default.
         let basefee_address = self.builder.tn_config.parameters.basefee_address;
         let reth_env = RethEnv::new(
             &self.builder.node_config,
             engine_task_manager,
             self.reth_db.clone(),
-            basefee_address,
+            Some(basefee_address),
             gas_accumulator.clone(),
         )?;
         // Give the consensus bus a canonical-DB fallback for `wait_for_execution` (issue #1036):

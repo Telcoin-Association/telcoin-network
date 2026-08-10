@@ -11940,6 +11940,7 @@ dependencies = [
  "tn-worker",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

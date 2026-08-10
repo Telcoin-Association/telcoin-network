@@ -237,6 +237,9 @@ All fee handling lives in `TNEvmHandler` (`src/evm/handler.rs`); system calls by
   set, `basefee_address()` falls back to `GOVERNANCE_SAFE_ADDRESS`. Every node in the fleet must
   agree on this value — a node with a different base-fee address computes different state roots
   and forks off (the doc comment on `set_basefee_address` says exactly this).
+  `Parameters` (`tn-config`) declares `basefee_address` as a required key with no serde default,
+  so a `parameters.yaml` that lost the key fails at parse time with an error that names the field
+  instead of reaching this fallback in silence.
 
 ## Precompiles
 
@@ -309,6 +312,14 @@ no other validator is tried. The advertised endpoint may be `http` or `https`
 (`RpcInfo::validate` in `tn-types` `committee.rs` accepts both), so raw signed transactions can
 transit plaintext HTTP if a validator advertises it; TN adds no authentication or encryption of
 its own on this path.
+
+The dial target is likewise chosen by a committee member rather than by this node, so
+`ForwardTargetPolicy` gates it at the point an advertised URL becomes a provider. `PublicOnly`
+(the default) refuses loopback, private, link-local, unique-local, shared-address-space and
+unspecified IP literals in every spelling, plus the names reserved to resolve locally, and logs
+each refusal once at `warn` with the advertising validator's BLS key. Operators of single-host
+deployments opt back in with the `allow_private_forward_targets` parameter. The check never
+resolves DNS, so a hostname that resolves to an internal address is still dialed.
 
 ### `SYSTEM_ADDRESS` is unreachable by users
 

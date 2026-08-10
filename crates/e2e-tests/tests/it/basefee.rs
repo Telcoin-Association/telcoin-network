@@ -64,10 +64,10 @@ use tokio::time::Instant;
 use tracing::info;
 
 use crate::common::{
-    address_from_word, current_epoch, get_balance, get_block_number, get_key,
+    address_from_word, current_epoch, force_kill_and_reap, get_balance, get_block_number, get_key,
     get_latest_consensus_header_number, get_tx_receipt_block, kill_child, network_advancing,
-    read_base_fee, send_tel, start_validator, wait_for_epoch_at_least, wait_for_mid_epoch,
-    wait_for_rpc, EpochSnapshot, ProcessGuard,
+    read_base_fee, send_tel, send_term, start_validator, wait_for_epoch_at_least,
+    wait_for_mid_epoch, wait_for_rpc, EpochSnapshot, ProcessGuard,
 };
 
 /// Epoch duration (seconds) for the base-fee tests. 5s is the consensus minimum epoch duration;
@@ -109,23 +109,26 @@ const TRANSFER_AMOUNT: u128 = 1_000_000_000_000_000;
 /// only place this module departs from [`EPOCH_DURATION`].
 ///
 /// That test has to fit a whole sequence inside ONE epoch: reap the node killed at the boundary
-/// (SIGTERM plus [`kill_child`]'s poll-for-exit, ~1-2.5s), then submit and confirm the new epoch's
-/// first transaction (~1-2s). At the 5s cadence that sequence can spill past the next boundary and
-/// land the control transaction in the epoch AFTER the one the oracle prices, where the fee has
-/// moved again — a timing flake that would read as a fee mismatch. 10s (the cadence `common.rs`'s
-/// epoch helpers are calibrated to) leaves the sequence ~6s of slack, at the cost of one extra
-/// epoch of warm-up.
-const BOUNDARY_EPOCH_DURATION: u64 = 10;
+/// (SIGTERM plus [`fast_kill`]'s 300ms poll-for-exit; the node's real shutdown takes ~2.3s), then
+/// submit and confirm the new epoch's first transaction (~1-2s). At the 5s cadence that sequence
+/// can spill past the next boundary and land the control transaction in the epoch AFTER the one
+/// the oracle prices, where the fee has moved again: a timing flake that would read as a fee
+/// mismatch. 8s keeps ~3s of worst-case slack for the sequence, at one wall-clock second saved per
+/// boundary the test crosses; [`fast_kill`] exists so the reap costs its true ~2.3s instead of
+/// [`kill_child`]'s 1.2s-quantized poll (up to 3.6s), which is where that slack comes from.
+const BOUNDARY_EPOCH_DURATION: u64 = 8;
 
 /// Consecutive epochs [`test_boundary_kill_restart_recovers_next_epoch_fee`] lands one transaction
 /// in before the boundary kill.
 ///
 /// Each such epoch raises worker 0's fee by one EIP-1559 step (+12.5%, minimum +1 against
-/// `target_gas = 1`), so three of them lift it from [`MIN_PROTOCOL_BASE_FEE`] (7) to ~9 and make
-/// the expected next-epoch fee ~10. That is far enough above MIN, and above the closed epoch's own
-/// fee, that neither a node which defaulted to MIN nor one which kept the previous epoch's value
-/// can satisfy the assertions by coincidence.
-const BOUNDARY_WARMUP_EPOCHS: usize = 3;
+/// `target_gas = 1`), so two of them lift it from [`MIN_PROTOCOL_BASE_FEE`] (7) to 8 and make the
+/// expected next-epoch fee 9. That is enough separation: at every assertion, 9 is distinct from a
+/// node which defaulted to MIN (7) and from one which kept the closed epoch's value (8), so
+/// neither failure mode can satisfy the assertions by coincidence. The decay/readmission
+/// arithmetic in steps 3-4 also stays exact on this band (`decay(step(x)) = x` for every fee in
+/// 7..12, because each step is the +1 minimum and decay is its -1 mirror above MIN).
+const BOUNDARY_WARMUP_EPOCHS: usize = 2;
 
 // ---------------------------------------------------------------------------------------------
 // Test 2 (written first because it is the robust, deterministic core): Static fee at boundary.
@@ -634,7 +637,7 @@ async fn test_boundary_kill_restart_recovers_next_epoch_fee() -> eyre::Result<()
     // One RPC call, taken before the signal: the node's tip at the kill instant.
     let head_at_kill = get_block_number(&client_urls[kill_idx])?;
     if let Some(mut taken) = guard.take(kill_idx) {
-        kill_child(&mut taken);
+        fast_kill(&mut taken);
     }
     info!(
         target: "basefee-test",
@@ -854,6 +857,24 @@ fn start_testnet(temp_path: &Path, test: &str) -> (ProcessGuard, [String; NUM_VA
     network_advancing(&client_urls).expect("network failed to start serving RPC");
 
     (guard, client_urls)
+}
+
+/// Boundary-kill reap: SIGTERM, then poll for exit every 300ms (up to 6s), then SIGKILL + wait.
+///
+/// [`kill_child`]'s shared reap (`common.rs`'s `wait_or_kill`) polls in 1.2s slots, which
+/// quantizes the node's real ~2.3s shutdown up to 3.6s. This reap runs INSIDE the one epoch that
+/// must also fit the control transaction (see [`BOUNDARY_EPOCH_DURATION`]), so the finer poll buys
+/// back over a second of in-epoch slack. The SIGKILL escalation grace (6s) is unchanged; only the
+/// poll cadence differs, and only at this call site: every other kill keeps [`kill_child`].
+fn fast_kill(child: &mut std::process::Child) {
+    send_term(child);
+    let exited = (0..20).any(|_| {
+        std::thread::sleep(Duration::from_millis(300));
+        child.try_wait().ok().flatten().is_some()
+    });
+    if !exited {
+        force_kill_and_reap(child);
+    }
 }
 
 /// Wait out a killed node's downtime, then proceed once a live peer's consensus chain has advanced.

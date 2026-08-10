@@ -318,7 +318,7 @@ impl GenesisArgs {
         if let Some(gc_depth) = self.gc_depth {
             parameters.gc_depth = gc_depth;
         }
-        parameters.basefee_address = Some(self.basefee_address);
+        parameters.basefee_address = self.basefee_address;
 
         // write genesis and config to file
         Config::write_to_path(

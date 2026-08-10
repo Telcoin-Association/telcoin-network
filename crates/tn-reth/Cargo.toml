@@ -66,6 +66,7 @@ alloy = { workspace = true, features = ["genesis"] }
 alloy-evm = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+url = { workspace = true }
 tokio = { workspace = true, features = ["macros", "time"] }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }

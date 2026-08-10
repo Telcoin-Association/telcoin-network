@@ -12,7 +12,7 @@ use std::{
     sync::OnceLock,
 };
 use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand, NoArgs};
-use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig};
+use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig, Parameters};
 use tn_node::launch_node;
 use tn_reth::init_txpool_defaults;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
@@ -242,6 +242,16 @@ fn config_local_testnet_inner(
     }
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from(genesis_args);
     create_committee_command.args.execute(shared_genesis_dir.clone())?;
+
+    // Every node in this harness runs on one host and advertises `http://127.0.0.1:<port>`, which
+    // the observer's transaction forwarder refuses by default (issue #1092). This is the
+    // single-host deployment the opt-in exists for, so enable it on the shared parameters before
+    // they are distributed, rather than leaving observer forwarding silently dead in e2e tests.
+    let parameters_path = shared_genesis_dir.join("parameters.yaml");
+    let mut parameters: Parameters = Config::load_from_path(&parameters_path, ConfigFmt::YAML)?;
+    parameters.allow_private_forward_targets = true;
+    Config::write_to_path(&parameters_path, &parameters, ConfigFmt::YAML)?;
+
     // If provided optional accounts then hack them into genesis now...
     if let Some(accounts) = accounts {
         let data_dir = shared_genesis_dir.join("genesis/genesis.yaml");
@@ -442,9 +452,8 @@ pub fn get_telcoin_network_binary() -> &'static TestBinary {
             "e2e: TN_BIN_PATH not set; building telcoin-network via cargo before the first test. \
              This can take several minutes (opt-level 2 under the `e2e` profile), and nextest \
              hides it until the build finishes (add `--no-capture` to watch it). To skip it, run \
-             `make test-e2e`, or prebuild with `cargo build --profile e2e --bin telcoin-network \
-             --features tn-storage/test-utils` and export \
-             TN_BIN_PATH=\"$(pwd)/target/e2e/telcoin-network\" from the workspace root."
+             `make test-e2e`, or prebuild once and point TN_BIN_PATH at the built binary \
+             (see crates/e2e-tests/README.md)."
         );
         info!("building main binary for e2e tests");
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
@@ -454,13 +463,13 @@ pub fn get_telcoin_network_binary() -> &'static TestBinary {
 
         // Build under the `e2e` profile (opt-level 2, safety checks kept on; defined in
         // .cargo/config.toml) so this in-process build and `make build-e2e-bin` produce and
-        // share one set of artifacts under `target/e2e/`.
+        // share one set of artifacts under `<target root>/e2e/`.
         //
         // No `.current_target()`: passing `--target <triple>` would emit into
-        // `target/<triple>/e2e/`, a tree that shares no artifacts with the plain `target/e2e/`
-        // that `make build-e2e-bin` and ordinary `cargo build --profile e2e` populate, forcing a
-        // guaranteed cold rebuild. Building into `target/e2e/` lets escargot reuse an
-        // already-compiled binary (reported "Fresh" by cargo) instead.
+        // `<target root>/<triple>/e2e/`, a tree that shares no artifacts with the plain
+        // `<target root>/e2e/` that `make build-e2e-bin` and ordinary `cargo build --profile e2e`
+        // populate, forcing a guaranteed cold rebuild. Building into `<target root>/e2e/` lets
+        // escargot reuse an already-compiled binary (reported "Fresh" by cargo) instead.
         TestBinary::Cargo(
             CargoBuild::new()
                 .bin("telcoin-network")
@@ -469,7 +478,21 @@ pub fn get_telcoin_network_binary() -> &'static TestBinary {
                 // overflow-checks kept on (see `[profile.e2e]` in .cargo/config.toml).
                 .args(["--profile", "e2e"])
                 .manifest_path(workspace_root.join("Cargo.toml"))
-                .target_dir(workspace_root.join("target"))
+                // escargot's `.target_dir()` emits a `--target-dir` CLI flag, which outranks the
+                // `CARGO_TARGET_DIR` environment variable. Honor the developer's configured
+                // target root when set (matching `make build-e2e-bin` and `test-and-attest.sh`)
+                // and fall back to cargo's default `<workspace root>/target` otherwise. An empty
+                // value counts as unset (mirroring the shell `:-` fallback at the other two
+                // sites), and a relative value is anchored at the workspace root so this in-test
+                // build shares one tree with the root-invoked builds even though nextest sets
+                // the test cwd to the package directory (`Path::join` keeps an absolute value
+                // as-is).
+                .target_dir(
+                    std::env::var_os("CARGO_TARGET_DIR")
+                        .filter(|dir| !dir.is_empty())
+                        .map(|dir| workspace_root.join(dir))
+                        .unwrap_or_else(|| workspace_root.join("target")),
+                )
                 .run()
                 .expect("Failed to build telcoin-network binary"),
         )

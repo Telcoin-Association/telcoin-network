@@ -1,6 +1,6 @@
 //! Configurations for the Telcoin Network.
 
-use crate::{ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs};
+use crate::{ConfigFmt, ConfigTrait, NodeInfo, TelcoinDirs, GOVERNANCE_SAFE_ADDRESS};
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Write, time::Duration};
@@ -274,12 +274,45 @@ pub struct Parameters {
     /// Worker timeout when request vote from peers.
     #[serde(default = "Parameters::default_batch_vote_timeout")]
     pub batch_vote_timeout: Duration,
-    /// If set the Address that will recieve basefees.
-    pub basefee_address: Option<Address>,
+    /// The address that receives the base-fee portion of every transaction's gas payment.
+    ///
+    /// CONSENSUS-CRITICAL. The EVM credits this account on every transaction, so its balance
+    /// enters the state root. All nodes on a network must hold the same value. If two nodes
+    /// disagree, they still agree on the batch, the certificate, and the commit order, but they
+    /// build different state roots from the same committed output and the network splits. See the
+    /// `BASEFEE_ADDRESS` documentation in `tn-reth` for the execution-side detail.
+    ///
+    /// The key is required: a parameters file that omits it fails to deserialize with an error
+    /// that names the field, wherever that file is parsed. (The one adjacent gap is a missing
+    /// FILE under [`Config::load_or_default`], which substitutes the complete
+    /// [`Parameters::default`] and writes it back to disk; its only caller today is a test
+    /// helper, and the production node start loads through `Config::load`, which errors on a
+    /// missing file.) This field deliberately declares no serde default. A default here would fill
+    /// a fallback on a missing key in silence, which is the exact failure mode of issue #1113
+    /// moved one layer up. Test fixtures obtain an address through [`Parameters::default`],
+    /// which supplies `GOVERNANCE_SAFE_ADDRESS`. The chain presets and the genesis ceremony
+    /// both write the key, so `--chain mainnet`, `--chain adiri`, and ceremony-founded
+    /// networks all parse.
+    pub basefee_address: Address,
     /// The default duration between parallel/fallback fetch requests to peers for missing
     /// certificates.
     #[serde(default = "Parameters::default_parallel_fetch_request_delay_interval")]
     pub parallel_fetch_request_delay_interval: Duration,
+
+    /// Allow observer transaction forwarding to dial advertised JSON-RPC endpoints whose host is
+    /// not a public internet address.
+    ///
+    /// An observer forwards each transaction it seals to the endpoint the owning validator
+    /// advertised on its node record, so the dial target is chosen by a committee member rather
+    /// than by this node. Default `false`: an endpoint on a loopback, private, link-local,
+    /// unique-local, shared-address-space or unspecified address is refused, so a committee member
+    /// cannot aim this node's outbound HTTP at hosts inside its own perimeter (issue #1092).
+    ///
+    /// Set `true` only where every committee member is under the same operator as this node --
+    /// single-host and docker-compose deployments, where validators legitimately advertise
+    /// `127.0.0.1` -- since it restores dialing of arbitrary internal addresses.
+    #[serde(default = "Parameters::default_allow_private_forward_targets")]
+    pub allow_private_forward_targets: bool,
 }
 
 impl Parameters {
@@ -327,6 +360,11 @@ impl Parameters {
     fn default_parallel_fetch_request_delay_interval() -> Duration {
         Duration::from_secs(5)
     }
+
+    /// Refuse non-public forwarding targets unless the operator opts in.
+    fn default_allow_private_forward_targets() -> bool {
+        false
+    }
 }
 
 /// Admin server settings.
@@ -363,9 +401,14 @@ impl Default for Parameters {
             max_batch_delay: Parameters::default_max_batch_delay(),
             max_concurrent_requests: Parameters::default_max_concurrent_requests(),
             batch_vote_timeout: Parameters::default_batch_vote_timeout(),
-            basefee_address: None,
+            // The test-fixture path. Production reads a parameters file, and a file without the
+            // key fails to deserialize, so this value never reaches a production node. The
+            // governance safe is the address an unset `Option` historically resolved to inside
+            // `set_basefee_address`, so fixtures keep their old effective value.
+            basefee_address: GOVERNANCE_SAFE_ADDRESS,
             parallel_fetch_request_delay_interval:
                 Parameters::default_parallel_fetch_request_delay_interval(),
+            allow_private_forward_targets: Parameters::default_allow_private_forward_targets(),
         }
     }
 }
@@ -422,6 +465,10 @@ impl Parameters {
     ///   but includes at most `max_header_num_of_batches` of them, so a zero threshold seals empty
     ///   headers on the fast path and a threshold above the max makes the two conditions mutually
     ///   inconsistent.
+    ///
+    /// `basefee_address` needs no floor here: the field is a required key with no serde default,
+    /// so a `parameters.yaml` that omits it already fails to deserialize, before any constructor
+    /// runs, with an error that names the field.
     pub fn validate_operational_floors(&self) -> eyre::Result<()> {
         eyre::ensure!(
             self.gc_depth > tn_types::GC_ACTIVITY_BUFFER,
@@ -459,16 +506,25 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Max batch delay set to {} ms", self.max_batch_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
+        // Consensus-critical, and the only parameter here whose value enters the state root. Two
+        // operators debugging a state-root split have no other way to compare this value without
+        // reading each other's files.
+        info!(
+            "Basefee address set to {} (consensus-critical: all nodes must agree)",
+            self.basefee_address
+        );
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::Parameters;
-    use crate::{Config, ConfigFmt, ConfigTrait as _, CONSENSUS_REGISTRY_JSON};
+    use crate::{
+        Config, ConfigFmt, ConfigTrait as _, CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS,
+    };
     use tn_types::{
         address, Address, Bytes, Committee, Genesis, MAINNET_COMMITTEE, MAINNET_GENESIS,
-        MAINNET_PARAMETERS,
+        MAINNET_PARAMETERS, TESTNET_PARAMETERS,
     };
 
     /// The fixed mainnet deployment address of the `ConsensusRegistry` system contract.
@@ -662,5 +718,64 @@ mod test {
             params.validate_operational_floors().is_ok(),
             "threshold == max == 1 is the minimal consistent batch configuration and must be accepted"
         );
+    }
+
+    /// A parameters file that omits `basefee_address` must fail to deserialize.
+    ///
+    /// Every other key in the file carries a serde default, so this partial file isolates the one
+    /// required key. Without this pin, a `#[serde(default)]` reintroduced on the field would fill
+    /// a fallback on a missing key in silence, which is the failure mode of issue #1113.
+    #[test]
+    fn absent_basefee_address_key_fails_to_deserialize() {
+        let err = serde_yaml::from_str::<Parameters>("gc_depth: 50")
+            .expect_err("a parameters file without basefee_address must not parse");
+        assert!(
+            err.to_string().contains("basefee_address"),
+            "the error must name the field an operator has to fix: {err}"
+        );
+    }
+
+    /// A parameters file with an explicit `basefee_address: null` must also fail to deserialize.
+    ///
+    /// This is the upgrade shape, not a hypothetical: before this change `Parameters::default()`
+    /// held `None`, and `load_from_path_or_default` writes the default back to disk when the file
+    /// is absent, so a datadir created under the old code can hold `basefee_address: null`. That
+    /// file takes serde's type-error path, not the missing-field path the previous test pins, so
+    /// it needs its own pin.
+    #[test]
+    fn null_basefee_address_key_fails_to_deserialize() {
+        let err = serde_yaml::from_str::<Parameters>("gc_depth: 50\nbasefee_address: null")
+            .expect_err("a parameters file with a null basefee_address must not parse");
+        assert!(
+            err.to_string().contains("basefee_address"),
+            "the error must name the field an operator has to fix: {err}"
+        );
+    }
+
+    /// Both shipped presets must keep an explicit, correct address.
+    ///
+    /// The addresses are pinned by value. They are consensus-critical, so a change to either is a
+    /// hard fork for that chain and updating this test is the intended cost of making one.
+    #[test]
+    fn shipped_chain_presets_pin_their_basefee_address() {
+        let mainnet: Parameters =
+            serde_yaml::from_str(MAINNET_PARAMETERS).expect("mainnet parameters parse");
+        let adiri: Parameters =
+            serde_yaml::from_str(TESTNET_PARAMETERS).expect("adiri parameters parse");
+        assert_eq!(
+            mainnet.basefee_address,
+            address!("0x9999999999999999999999999999999999999999"),
+            "mainnet's committed basefee address changed"
+        );
+        assert_eq!(
+            adiri.basefee_address, GOVERNANCE_SAFE_ADDRESS,
+            "adiri's committed basefee address changed"
+        );
+        mainnet
+            .validate_operational_floors()
+            .expect("the mainnet preset must satisfy the operational floors");
+        adiri
+            .validate_operational_floors()
+            .expect("the adiri preset must satisfy the operational floors");
     }
 }

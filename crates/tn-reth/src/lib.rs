@@ -147,7 +147,7 @@ pub use evm::{
     grantMintRoleCall, hasMintRoleCall, mintCall, revokeMintRoleCall, totalSupplyCall,
     BLS_G1_PRECOMPILE_ADDRESS, TELCOIN_PRECOMPILE_ADDRESS,
 };
-pub use forward::WorkerRpcForwarder;
+pub use forward::{ForwardTargetPolicy, WorkerRpcForwarder};
 pub use metrics::report_db_metrics;
 pub use types::*;
 
@@ -188,7 +188,9 @@ pub const FAUCET_ENABLED: bool = cfg!(feature = "faucet");
 /// default `GOVERNANCE_SAFE_ADDRESS`: `RethEnv::new_for_temp_chain` (`env/genesis.rs`,
 /// also reached through genesis tooling) and `SnapshotRestorer::open` (`snapshot.rs`).
 /// The production node passes the configured `parameters.basefee_address`
-/// (`crates/node/src/manager/node.rs`).
+/// (`crates/node/src/manager/node.rs`). That field is a required key with no serde
+/// default (`tn-config`), so a `parameters.yaml` that lost the key fails at parse
+/// time instead of reaching the default here.
 ///
 /// Consequence: if a `None` path runs first in a process that then starts a real node
 /// configured with a non-default basefee address, the configured address is silently

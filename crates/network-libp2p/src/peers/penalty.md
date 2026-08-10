@@ -96,39 +96,40 @@ ban itself was applied elsewhere.
 
 ### 4.2 `WorkerNetworkError::penalty()` mapping
 
-Source: `crates/consensus/worker/src/network/error.rs:76-138`.
+Source: `crates/consensus/worker/src/network/error.rs:76-139`.
 
 | Error variant                                                                       | Severity | Source                                                 |
 | ----------------------------------------------------------------------------------- | -------- | ------------------------------------------------------ |
 | `BatchValidation(CanonicalChain { .. })`                                            | `Mild`   | `crates/consensus/worker/src/network/error.rs:86`      |
-| `BatchValidation(InvalidEpoch { .. })`                                              | `Medium` | `crates/consensus/worker/src/network/error.rs:88-89`   |
-| `BatchValidation(InvalidTx4844(_))`                                                 | `Medium` | `crates/consensus/worker/src/network/error.rs:88-89`   |
-| `BatchValidation(RecoverTransaction(..))`                                           | `Severe` | `crates/consensus/worker/src/network/error.rs:91`      |
-| `BatchValidation(EmptyBatch)`                                                       | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
-| `BatchValidation(InvalidBaseFee { .. })`                                            | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
-| `BatchValidation(InvalidWorkerId { .. })`                                           | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
-| `BatchValidation(InvalidDigest)`                                                    | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
-| `BatchValidation(GasOverflow)`                                                      | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
-| `BatchValidation(CalculateMaxPossibleGas)`                                          | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
-| `BatchValidation(HeaderMaxGasExceedsGasLimit { .. })`                               | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
-| `BatchValidation(HeaderTransactionBytesExceedsMax(_))`                              | `Fatal`  | `crates/consensus/worker/src/network/error.rs:93-101`  |
-| `InvalidRequest(_)`                                                                 | `Mild`   | `crates/consensus/worker/src/network/error.rs:105-106` |
-| `UnknownStreamRequest(_)`                                                           | `Mild`   | `crates/consensus/worker/src/network/error.rs:105-106` |
-| `StdIo(io_err)` kind `ConnectionReset`/`ConnectionAborted`/`TimedOut`/`Interrupted` | `Mild`   | `crates/consensus/worker/src/network/error.rs:108-114` |
-| `StdIo(io_err)` other kinds                                                         | `Medium` | `crates/consensus/worker/src/network/error.rs:115`     |
-| `NonCommitteeBatch`                                                                 | `Medium` | `crates/consensus/worker/src/network/error.rs:119`     |
-| `InvalidTopic`                                                                      | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
-| `Bcs(_)`                                                                            | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
-| `TooManyBatches { .. }`                                                             | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
-| `UnexpectedBatch(_)`                                                                | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
-| `DuplicateBatch(_)`                                                                 | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
-| `RequestHashMismatch`                                                               | `Fatal`  | `crates/consensus/worker/src/network/error.rs:121-126` |
-| `Timeout(_)`                                                                        | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
-| `DBInsert(_)` / `DBCommit(_)` / `DBRead(_)`                                         | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
-| `StreamClosed`                                                                      | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
-| `Network(_)`                                                                        | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
-| `BatchEpochMismatch(_, _)`                                                          | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
-| `Internal(_)`                                                                       | None     | `crates/consensus/worker/src/network/error.rs:128-135` |
+| `BatchValidation(InvalidEpoch { .. })`                                              | `Medium` | `crates/consensus/worker/src/network/error.rs:88-90`   |
+| `BatchValidation(InvalidTx4844(_))`                                                 | `Medium` | `crates/consensus/worker/src/network/error.rs:88-90`   |
+| `BatchValidation(UnsupportedTxType { .. })`                                         | `Medium` | `crates/consensus/worker/src/network/error.rs:88-90`   |
+| `BatchValidation(RecoverTransaction(..))`                                           | `Severe` | `crates/consensus/worker/src/network/error.rs:92`      |
+| `BatchValidation(EmptyBatch)`                                                       | `Fatal`  | `crates/consensus/worker/src/network/error.rs:94-102`  |
+| `BatchValidation(InvalidBaseFee { .. })`                                            | `Fatal`  | `crates/consensus/worker/src/network/error.rs:94-102`  |
+| `BatchValidation(InvalidWorkerId { .. })`                                           | `Fatal`  | `crates/consensus/worker/src/network/error.rs:94-102`  |
+| `BatchValidation(InvalidDigest)`                                                    | `Fatal`  | `crates/consensus/worker/src/network/error.rs:94-102`  |
+| `BatchValidation(GasOverflow)`                                                      | `Fatal`  | `crates/consensus/worker/src/network/error.rs:94-102`  |
+| `BatchValidation(CalculateMaxPossibleGas)`                                          | `Fatal`  | `crates/consensus/worker/src/network/error.rs:94-102`  |
+| `BatchValidation(HeaderMaxGasExceedsGasLimit { .. })`                               | `Fatal`  | `crates/consensus/worker/src/network/error.rs:94-102`  |
+| `BatchValidation(HeaderTransactionBytesExceedsMax(_))`                              | `Fatal`  | `crates/consensus/worker/src/network/error.rs:94-102`  |
+| `InvalidRequest(_)`                                                                 | `Mild`   | `crates/consensus/worker/src/network/error.rs:106-107` |
+| `UnknownStreamRequest(_)`                                                           | `Mild`   | `crates/consensus/worker/src/network/error.rs:106-107` |
+| `StdIo(io_err)` kind `ConnectionReset`/`ConnectionAborted`/`TimedOut`/`Interrupted` | `Mild`   | `crates/consensus/worker/src/network/error.rs:109-115` |
+| `StdIo(io_err)` other kinds                                                         | `Medium` | `crates/consensus/worker/src/network/error.rs:116`     |
+| `NonCommitteeBatch`                                                                 | `Medium` | `crates/consensus/worker/src/network/error.rs:120`     |
+| `InvalidTopic`                                                                      | `Fatal`  | `crates/consensus/worker/src/network/error.rs:122-127` |
+| `Bcs(_)`                                                                            | `Fatal`  | `crates/consensus/worker/src/network/error.rs:122-127` |
+| `TooManyBatches { .. }`                                                             | `Fatal`  | `crates/consensus/worker/src/network/error.rs:122-127` |
+| `UnexpectedBatch(_)`                                                                | `Fatal`  | `crates/consensus/worker/src/network/error.rs:122-127` |
+| `DuplicateBatch(_)`                                                                 | `Fatal`  | `crates/consensus/worker/src/network/error.rs:122-127` |
+| `RequestHashMismatch`                                                               | `Fatal`  | `crates/consensus/worker/src/network/error.rs:122-127` |
+| `Timeout(_)`                                                                        | None     | `crates/consensus/worker/src/network/error.rs:129-136` |
+| `DBInsert(_)` / `DBCommit(_)` / `DBRead(_)`                                         | None     | `crates/consensus/worker/src/network/error.rs:129-136` |
+| `StreamClosed`                                                                      | None     | `crates/consensus/worker/src/network/error.rs:129-136` |
+| `Network(_)`                                                                        | None     | `crates/consensus/worker/src/network/error.rs:129-136` |
+| `BatchEpochMismatch(_, _)`                                                          | None     | `crates/consensus/worker/src/network/error.rs:129-136` |
+| `Internal(_)`                                                                       | None     | `crates/consensus/worker/src/network/error.rs:129-136` |
 
 ## 5. Penalty Application Sites — Primary Layer
 
@@ -240,7 +241,7 @@ These are deliberate tolerances for benign failures. Changing any of these from
 
 - `InboundFailure::ResponseOmission` — local error, no peer fault. `crates/network-libp2p/src/consensus.rs:981`.
 - PX-disconnect outbound failures — `pending_px_disconnects` short-circuit before penalty. `crates/network-libp2p/src/consensus.rs:940-943`.
-- `WorkerNetworkError::Timeout` / `DBInsert` / `DBCommit` / `DBRead` / `StreamClosed` / `Network` / `BatchEpochMismatch` / `Internal` — local failures or epoch-boundary races. `crates/consensus/worker/src/network/error.rs:128-135`.
+- `WorkerNetworkError::Timeout` / `DBInsert` / `DBCommit` / `DBRead` / `StreamClosed` / `Network` / `BatchEpochMismatch` / `Internal` — local failures or epoch-boundary races. `crates/consensus/worker/src/network/error.rs:129-136`.
 - `PrimaryNetworkError::UnavailableEpoch` / `UnavailableEpochDigest` — a peer "might not have this yet" during sync. `crates/consensus/primary/src/error/network.rs:123-124`.
 - `PrimaryNetworkError::PeerNotInCommittee` — left to `None` to avoid penalizing during epoch transitions. `crates/consensus/primary/src/error/network.rs:125`.
 - `PrimaryNetworkError::Storage` / `Timeout` / `StreamUnavailable` / `Internal` — local failures. `crates/consensus/primary/src/error/network.rs:126-129`.

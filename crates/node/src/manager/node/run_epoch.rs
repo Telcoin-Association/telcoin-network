@@ -2114,6 +2114,73 @@ mod tests {
         Ok(())
     }
 
+    /// On the live adiri testnet EVERY epoch close takes the legacy pre-fork path: the deployed
+    /// registry still carries the pre-fork code, so `apply_closing_epoch_contract_call` routes to
+    /// the two-call legacy sequence, which has no fourth system call and never writes the
+    /// per-worker `WorkerConfigs.data` word. The production entry read every node runs at the
+    /// next epoch ([`read_base_fees_for_entered_epoch`]) therefore sees a zero word and floors it
+    /// to `MIN_PROTOCOL_BASE_FEE` through `entry_fee_for_worker`, whose doc names that floor an
+    /// empirical fact about adiri (no governance write has moved a worker's fee off the protocol
+    /// minimum), NOT a structural identity.
+    ///
+    /// Threat: a change to the legacy close that starts recording a fee word, or a governance
+    /// write to `WorkerConfigs` landing before the fork, changes every adiri node's entry fee
+    /// with no failing test. The `data.is_zero()` assert below is the positive control for the
+    /// first half: it fails the moment the legacy close writes the word. The MIN pin is the
+    /// decision from issues #1106/#1122: a zero word maps to the protocol minimum on entry, and
+    /// this test is the one place the LIVE pre-fork path is held to it.
+    ///
+    /// Drives ONE legacy close directly off the committed adiri genesis (`tn_types::test_genesis`
+    /// embeds `chain-configs/testnet/genesis.yaml`: pre-fork registry plus a `WorkerConfigs`
+    /// deployment with exactly one worker, `Eip1559 { target_gas: u64::MAX }`, data word zero)
+    /// and pins the entry read to the closing header: the pre-fork `concludeEpoch` bumps
+    /// `currentEpoch` 0 -> 1 and stamps `blockHeight = closing.number + 1`, so the pin guard in
+    /// [`read_base_fees_for_entered_epoch`] accepts the header and the read must return exactly
+    /// `[MIN_PROTOCOL_BASE_FEE]`.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn prefork_legacy_close_enters_the_next_epoch_at_the_min_fee() -> eyre::Result<()> {
+        // the committed adiri genesis: pre-fork registry code + pre-fork WorkerConfigs state
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let tmp_dir = TempDir::with_prefix("prefork_min_entry_fee")?;
+        let task_manager = TaskManager::new("prefork min entry fee");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        // ONE legacy epoch close directly off genesis; the registry's pre-fork code hash routes
+        // the boundary through apply_closing_epoch_contract_call_legacy
+        let output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![])?;
+        let h = block.recovered_block.clone_sealed_header();
+
+        // positive controls at the closing block: one worker, still EIP-1559, and the data word
+        // UNWRITTEN. The zero-assert is the control that fails if the legacy close ever starts
+        // writing the fee word.
+        let (num_workers, entries) = read_worker_config_entries_at(&reth_env, h.hash())?;
+        assert_eq!(num_workers, 1, "the committed adiri genesis deploys a single worker");
+        assert_eq!(
+            entries[0].config,
+            WorkerFeeConfig::Eip1559 { target_gas: u64::MAX },
+            "the committed adiri genesis configures worker 0 as EIP-1559"
+        );
+        assert!(
+            entries[0].data.is_zero(),
+            "the legacy close must leave the worker data word unwritten"
+        );
+
+        // the LIVE entry read, pinned to the closing header: epoch 1 begins at h.number + 1
+        let read = read_base_fees_for_entered_epoch(&reth_env, 1, &h).await?;
+        assert_eq!(read.num_workers, 1, "entry read must see the single worker");
+        assert_eq!(
+            read.fees,
+            vec![MIN_PROTOCOL_BASE_FEE],
+            "a zero word maps to the protocol minimum on entry (#1106/#1122)"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn test_check_output_continuity() {
         // stale: anything at or below the last forwarded number

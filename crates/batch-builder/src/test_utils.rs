@@ -46,6 +46,11 @@ impl TxPool for TestPool {
         self.transactions.retain(|tx| !tx.is_eip4844());
         self.by_id.retain(|_, tx| !tx.is_eip4844());
     }
+    fn remove_unsupported_txs(&mut self, _txs: Vec<TxHash>) {
+        // remove non-allowlisted transaction types from the transactions vec and btreemap
+        self.transactions.retain(|tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
+        self.by_id.retain(|_, tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
+    }
 }
 
 impl TestPool {
