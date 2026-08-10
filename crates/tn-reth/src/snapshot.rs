@@ -1176,7 +1176,9 @@ mod tests {
         ExecStateAccount, ExecStatePackReader, ExecStatePackWriter, STORAGE_CHUNK_SLOTS,
     };
     use tn_types::{
-        gas_accumulator::{next_base_fee_for_config, GasAccumulator, WorkerFeeConfig},
+        gas_accumulator::{
+            entry_fee_for_worker, next_base_fee_for_config, GasAccumulator, WorkerFeeConfig,
+        },
         keccak256, test_genesis, Address, BlockNumHash, Bytes, ExecHeader, GenesisAccount,
         SealedHeader, SolCall as _, TaskManager, B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE,
         U256,
@@ -2629,6 +2631,108 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("worker 0"), "error must name the worker: {msg}");
         assert!(msg.contains("exceeds u64::MAX"), "error must name the oversized word: {msg}");
+
+        Ok(())
+    }
+
+    /// An EIP-1559 row whose `data` word is ZERO passes the restore, and the production
+    /// interpretation seam prices the entered epoch at exactly `MIN_PROTOCOL_BASE_FEE`: the
+    /// default-feature pin of the zero-word -> MIN mapping (`entry_fee_for_worker`) that the
+    /// adiri pre-fork close relies on for every live epoch entry (#1122).
+    ///
+    /// A genuine close always rewrites every EIP-1559 row's word LAST (the boundary system calls
+    /// run in `finish`, after user transactions), and it records at least the protocol floor, so
+    /// a zero can only reach a boundary read through the same ordering exploit the poison test
+    /// uses: block 1 genuinely closes epoch 0 (recording a nonzero word, the fixture sentinel
+    /// that keeps the zero-assert below from passing vacuously), block 2 carries the governance
+    /// owner's `setWorkerConfig` write landing the zero, and the snapshot ships under a
+    /// forged-but-self-consistent boundary header: number 1, keeping the registry's
+    /// `blockHeight == B + 1` boundary claim intact, over block 2's real state root. Header
+    /// provenance is outside restore's trust boundary (see the module docs), so readiness must
+    /// judge the WORD, and a zero word is acceptable by decision: it reads as the protocol
+    /// minimum, never as an error.
+    #[tokio::test]
+    async fn entry_readiness_accepts_a_zero_word_eip1559_row_at_the_min_fee() -> eyre::Result<()> {
+        const TARGET_GAS: u64 = 1_000_000;
+
+        let genesis = test_genesis_with_consensus_registry_and_workers(1, vec![(0u8, TARGET_GAS)]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let src_dir = TempDir::new()?;
+        let src_tm = TaskManager::new("Entry Readiness Zero Word Source");
+        let source = RethEnv::new_for_temp_chain(chain.clone(), src_dir.path(), &src_tm, None)?;
+
+        // block 1 closes epoch 0: a real close over the fresh registry
+        let consensus_output = consensus_output_for_tests(2, 0, 1, true);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+        let block1 = execute_payload_and_update_canonical_chain(&source, payload, vec![])?;
+        let closing = block1.recovered_block.clone_sealed_header();
+
+        // fixture sentinel: the close always records at least the protocol floor, never zero,
+        // so the zero asserted below can only come from the governance write
+        let (_, entries) = read_worker_config_entries_at(&source, closing.hash())?;
+        assert!(
+            !entries[0].data.is_zero(),
+            "fixture: the close must record a nonzero word, or the zero-word assert is vacuous"
+        );
+
+        // block 2 (mid-epoch-1): the owner rewrites worker 0's row with a ZERO data word; no
+        // close runs here, so nothing rewrites it back
+        let mut governance = governance_owner_factory();
+        let zero_tx = governance.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            Some(WORKER_CONFIGS_ADDRESS),
+            U256::ZERO,
+            WorkerConfigs::setWorkerConfigCall {
+                workerId: 0,
+                strategy: 0,
+                value: TARGET_GAS,
+                data: U184::ZERO,
+            }
+            .abi_encode()
+            .into(),
+        );
+        let consensus_output = consensus_output_for_tests(2, 1, 2, false);
+        let payload = TNPayload::new_for_test(closing.clone(), &consensus_output);
+        let block2 = execute_payload_and_update_canonical_chain(&source, payload, vec![zero_tx])?;
+        let zeroed = block2.recovered_block.clone_sealed_header();
+
+        // positive controls: the zero word stuck on an EIP-1559 row, and the production seam
+        // floors it to the protocol minimum (the default-feature fee pin)
+        let (num_workers, entries) = read_worker_config_entries_at(&source, zeroed.hash())?;
+        assert_eq!(num_workers, 1);
+        assert_eq!(
+            entries[0].config,
+            WorkerFeeConfig::Eip1559 { target_gas: TARGET_GAS },
+            "the zeroed row must still decode as EIP-1559"
+        );
+        assert_eq!(entries[0].data, U184::ZERO, "the owner tx must land the zero word");
+        assert_eq!(
+            entry_fee_for_worker(0, &entries[0]),
+            Ok(MIN_PROTOCOL_BASE_FEE),
+            "a zero word must price the entered epoch at the protocol minimum"
+        );
+
+        // forge a self-consistent boundary header over the zero-word state: number 1 (so the
+        // registry's blockHeight 2 still reads as B + 1) with block 2's real state root
+        let forged = synthetic_header(1, chain.sealed_genesis_header().hash(), zeroed.state_root);
+        let final_state = BlockNumHash::new(forged.number, forged.hash());
+        let pack_dir = TempDir::new()?;
+        export_pack(&source, zeroed.state_root, &[forged.header().clone()], pack_dir.path());
+
+        let dst_dir = TempDir::new()?;
+        let dst_tm = TaskManager::new("Entry Readiness Zero Word Dest");
+        let restorer = restore_through_import(
+            chain,
+            dst_dir.path(),
+            &dst_tm,
+            &[forged],
+            final_state,
+            pack_dir.path(),
+        )?;
+        restorer.entry_readiness_precondition(final_state)?;
+        restorer.finish(final_state)?;
 
         Ok(())
     }
