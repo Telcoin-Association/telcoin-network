@@ -316,10 +316,15 @@ fn chain_data_dirs(datadir: &Path) -> [PathBuf; 3] {
     [datadir.join("db"), datadir.join("static_files"), datadir.join("consensus-db")]
 }
 
-/// Best-effort removal of the chain-data dirs a failed import created — every [`chain_data_dirs`]
-/// entry not already present in `preexisting`. Skipping pre-existing dirs is a safety guard: even
-/// if `db load-state` were pointed at a populated datadir, this never deletes data the import did
-/// not create. Removal errors are logged, not fatal (the import is already failing).
+/// Best-effort removal of the chain data a failed import created — every [`chain_data_dirs`]
+/// entry not already present in `preexisting`, then the restored-state floor marker
+/// (`import_chain_scaffold` writes it before any chain data commits, so a failed import can
+/// leave it orphaned; a stale floor would poison a later normal sync of this datadir by
+/// refusing pinned reads it can actually serve). The marker goes last: removing it before the
+/// dirs could leave restored chain data without its floor if this cleanup itself dies midway.
+/// Skipping pre-existing dirs is a safety guard: even if `db load-state` were pointed at a
+/// populated datadir, this never deletes data the import did not create. Removal errors are
+/// logged, not fatal (the import is already failing).
 fn clean_created_chain_data(datadir: &Path, preexisting: &HashSet<PathBuf>) {
     for dir in chain_data_dirs(datadir) {
         if preexisting.contains(&dir) {
@@ -333,6 +338,12 @@ fn clean_created_chain_data(datadir: &Path, preexisting: &HashSet<PathBuf>) {
             }
         }
     }
+    let marker = tn_reth::RethEnv::restored_state_floor_marker(datadir);
+    fs::remove_file(&marker)
+        .or_else(|e| (e.kind() == std::io::ErrorKind::NotFound).then_some(()).ok_or(e))
+        .unwrap_or_else(|e| {
+            eprintln!("warning: could not remove {} during import cleanup: {e}", marker.display())
+        });
 }
 
 /// Reject an export bundle that cannot produce a resumable node, returning `Err` before any datadir

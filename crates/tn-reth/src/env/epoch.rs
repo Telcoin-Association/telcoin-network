@@ -760,10 +760,33 @@ impl RethEnv {
     /// `HistoryInfo::MaybeInPlainState`, silently falling back to TIP state for this "pinned"
     /// read — exactly the nondeterminism pinning exists to prevent. Revisit every pinned read
     /// before enabling pruning.
+    ///
+    /// RESTORED-DATADIR FLOOR: a datadir bootstrapped from a snapshot holds state ONLY at the
+    /// snapshot's final block `B` — window headers below `B` carry real, resolvable hashes but
+    /// no state and no history, and blocks below the window are zero-hash placeholders (see
+    /// `SnapshotRestorer::import_chain_scaffold` in `snapshot.rs`). reth's checkpoint-less
+    /// history walk answers reads anywhere below `B` with `Ok(None)` per account ("never
+    /// written") — no error, no log — so pins below the persisted floor (= `B`) are refused
+    /// HERE, before any state is built, as [`StateReadError::Provider`]: the gap is this node's
+    /// datadir, not the chain, and a peer with full history answers the same read correctly.
     fn pinned_state_and_env(
         &self,
         header: &SealedHeader,
     ) -> StateReadResult<(State<StateProviderDatabase<StateProviderBox>>, EvmEnv)> {
+        // refuse pins below the restored-state floor before touching the provider: below it the
+        // datadir holds headers but no state, and the read would resolve silently to "never
+        // written" values instead of failing
+        self.inner.restored_state_floor.filter(|floor| header.number < *floor).map_or(
+            Ok(()),
+            |floor| {
+                Err(StateReadError::Provider(format!(
+                    "pinned read at block {} is below this datadir's restored-state floor \
+                     (block {floor}, the snapshot's final block): the snapshot shipped no state \
+                     below it",
+                    header.number
+                )))
+            },
+        )?;
         let db = self.read_only_state_db(header.hash()).map_err(|e| {
             StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
         })?;
