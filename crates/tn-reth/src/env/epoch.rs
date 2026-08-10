@@ -1249,7 +1249,8 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
         let genesis_header = chain.sealed_genesis_header();
 
-        // a normal epoch close, far from the fork boundary (`u32::MAX - 1`), so no swap can fire
+        // a normal epoch close, far from the fork boundary (`CONSENSUS_REGISTRY_FORK_EPOCH - 1`),
+        // so no swap can fire
         let concluding_epoch = 3;
         let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
         let payload = TNPayload::new_for_test(genesis_header.clone(), &output);

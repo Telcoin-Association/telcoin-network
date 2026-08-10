@@ -91,9 +91,20 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 /// returning `false` (RPC-only, not consensus-critical) and a weakened cross-fork duplicate-key
 /// check (governance-gated NFT minting prevents abuse on the permissioned testnet).
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires (the trigger would need epoch `u32::MAX - 1`,
-/// ~4.29e9 epochs away). Set to a concrete future epoch with ample lead time in a dedicated
-/// epoch-setting PR before deploy.
+/// Armed for adiri (chain 2017) at epoch 373, whose opening boundary lands at 2026-08-11
+/// 02:20:52 UTC — so the swap itself executes one boundary earlier, in the epoch-closing block
+/// of 372. Derived from a live measurement taken during epoch 371 on 2026-08-10 ~19:45 UTC over
+/// adiri's 6-hour epochs; the boundary projection was back-tested against the two preceding
+/// boundaries and reproduced both to within 0–1s, so the wall-clock target above is accurate to
+/// about a second.
+///
+/// This originally targeted epoch 372 (boundary 2026-08-10 20:20:52 UTC) and was retargeted one
+/// boundary later when the image-build window closed before that boundary could be met. The
+/// resulting lead time is short by the standards of the rollout rule below, and was accepted
+/// deliberately: the devnet rehearsal exercised this same machinery through a live fork at
+/// F=740, which is the evidence the compressed schedule rests on. Treat the rollout sequence
+/// below as the hard constraint — the shortened window narrows the margin for a straggler, it
+/// does not relax the requirement.
 ///
 /// Rollout sequence (standard hard-fork rule): every validator must run a fork-capable build
 /// (compiled `--features adiri` — verify the deploy image — and including the epoch-setting PR)
@@ -155,7 +166,7 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 ///   fork before any Static assignment. This is not urgent: neither the protocol write path
 ///   (`setWorkerConfigsData` / `setWorkerConfigsValue`) nor the epoch-boundary read path consults
 ///   `maxStrategy`, so a zeroed ceiling gates future governance actions only.
-pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
+pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = 373;
 
 #[cfg(feature = "adiri")]
 /// First epoch whose `Header`s carry the `seed_signature` field on the wire (#1032).
