@@ -156,17 +156,37 @@ impl ProcessGuard {
 
     /// Send SIGTERM to all, wait for each to exit (SIGKILL if needed), then clear all slots.
     /// Safe to call multiple times.
+    ///
+    /// The exit wait polls EVERY child against one shared 6s deadline (the same shape as
+    /// [`Self::wait_for_natural_exits`]) instead of giving each child its own [`wait_or_kill`]
+    /// window: a 10ms poll reaps the common case (all children already dying from the parallel
+    /// SIGTERM) as soon as the last one exits, instead of rounding each child up to its next
+    /// 1.2s poll slot in sequence.
     pub(crate) fn kill_all(&mut self) {
         // Phase 1: SIGTERM all in parallel for fast graceful shutdown
         self.send_term_all();
 
-        // Phase 2: wait for each to exit, escalate to SIGKILL if needed
-        for slot in self.children.iter_mut() {
-            if let Some(ref mut child) = slot {
-                wait_or_kill(child);
-            }
-            *slot = None;
+        // Phase 2: one shared deadline for every child to exit, polled at 10ms.
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let all_exited =
+            std::iter::repeat(()).take_while(|()| std::time::Instant::now() < deadline).any(|()| {
+                std::thread::sleep(Duration::from_millis(10));
+                self.children
+                    .iter_mut()
+                    .flatten()
+                    .all(|child| child.try_wait().ok().flatten().is_some())
+            });
+
+        // Phase 3: escalate whatever is still running, then clear every slot. `try_wait` on an
+        // already-reaped child returns its stored status, so exited children are never signaled.
+        if !all_exited {
+            self.children.iter_mut().flatten().for_each(|child| {
+                if child.try_wait().ok().flatten().is_none() {
+                    force_kill_and_reap(child);
+                }
+            });
         }
+        self.children.iter_mut().for_each(|slot| *slot = None);
     }
 
     /// Wait (bounded) for every child at `indices` to exit on its own, without signaling any of
@@ -265,12 +285,20 @@ fn wait_or_kill(child: &mut Child) {
         }
         std::thread::sleep(Duration::from_millis(1200));
     }
-    if let Err(e) = child.kill() {
-        error!(target: "e2e-test", ?e, "error sending SIGKILL");
-    }
-    if let Err(e) = child.wait() {
-        error!(target: "e2e-test", ?e, "error waiting for child after SIGKILL");
-    }
+    force_kill_and_reap(child);
+}
+
+/// SIGKILL a child that did not exit within its SIGTERM grace, then reap it.
+///
+/// The shared tail of every kill path ([`wait_or_kill`], [`ProcessGuard::kill_all`], and
+/// `basefee.rs`'s boundary-kill helper). Failures are logged, not propagated: teardown has no
+/// recovery path, and signaling a child that already exited is harmless (`kill` on a reaped
+/// child returns `InvalidInput` without touching any pid).
+pub(crate) fn force_kill_and_reap(child: &mut Child) {
+    child.kill().unwrap_or_else(|e| error!(target: "e2e-test", ?e, "error sending SIGKILL"));
+    child.wait().map(drop).unwrap_or_else(
+        |e| error!(target: "e2e-test", ?e, "error waiting for child after SIGKILL"),
+    );
 }
 
 /// Get the block for block_number or latest block if None for node.
