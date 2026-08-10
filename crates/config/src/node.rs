@@ -282,14 +282,18 @@ pub struct Parameters {
     /// build different state roots from the same committed output and the network splits. See the
     /// `BASEFEE_ADDRESS` documentation in `tn-reth` for the execution-side detail.
     ///
-    /// An absent key deserializes to `None`. That is declared here rather than left to serde's
-    /// implicit handling of `Option`, because the fallback it selects is three crates away.
-    /// `None` stays legal for test fixtures, but [`Parameters::validate_operational_floors`]
-    /// refuses it at the production entry points, so an operator must state the address. The
-    /// chain presets set it from their embedded parameters, so `--chain mainnet` and
-    /// `--chain adiri` never reach this path.
-    #[serde(default)]
-    pub basefee_address: Option<Address>,
+    /// The key is required: a parameters file that omits it fails to deserialize with an error
+    /// that names the field, wherever that file is parsed. (The one adjacent gap is a missing
+    /// FILE under [`Config::load_or_default`], which substitutes the complete
+    /// [`Parameters::default`] and writes it back to disk; its only caller today is a test
+    /// helper, and the production node start loads through `Config::load`, which errors on a
+    /// missing file.) This field deliberately declares no serde default. A default here would fill
+    /// a fallback on a missing key in silence, which is the exact failure mode of issue #1113
+    /// moved one layer up. Test fixtures obtain an address through [`Parameters::default`],
+    /// which supplies `GOVERNANCE_SAFE_ADDRESS`. The chain presets and the genesis ceremony
+    /// both write the key, so `--chain mainnet`, `--chain adiri`, and ceremony-founded
+    /// networks all parse.
+    pub basefee_address: Address,
     /// The default duration between parallel/fallback fetch requests to peers for missing
     /// certificates.
     #[serde(default = "Parameters::default_parallel_fetch_request_delay_interval")]
@@ -377,11 +381,11 @@ impl Default for Parameters {
             max_batch_delay: Parameters::default_max_batch_delay(),
             max_concurrent_requests: Parameters::default_max_concurrent_requests(),
             batch_vote_timeout: Parameters::default_batch_vote_timeout(),
-            // Explicit, and identical in effect to the previous `None`: an unset address already
-            // resolved to `GOVERNANCE_SAFE_ADDRESS` inside `set_basefee_address`. Stating it here
-            // keeps the default satisfying `validate_operational_floors`, which now refuses
-            // `None`.
-            basefee_address: Some(GOVERNANCE_SAFE_ADDRESS),
+            // The test-fixture path. Production reads a parameters file, and a file without the
+            // key fails to deserialize, so this value never reaches a production node. The
+            // governance safe is the address an unset `Option` historically resolved to inside
+            // `set_basefee_address`, so fixtures keep their old effective value.
+            basefee_address: GOVERNANCE_SAFE_ADDRESS,
             parallel_fetch_request_delay_interval:
                 Parameters::default_parallel_fetch_request_delay_interval(),
         }
@@ -440,13 +444,10 @@ impl Parameters {
     ///   but includes at most `max_header_num_of_batches` of them, so a zero threshold seals empty
     ///   headers on the fast path and a threshold above the max makes the two conditions mutually
     ///   inconsistent.
-    /// - `basefee_address` must be set. The EVM credits this account on every transaction, so its
-    ///   balance enters the state root and every node on the network must agree on it. A
-    ///   `parameters.yaml` that omits the key parses without error, deserializes to `None`, and
-    ///   silently selects `GOVERNANCE_SAFE_ADDRESS`, which splits state roots against every peer
-    ///   holding a different value. Refusing `None` here converts that silent split into a startup
-    ///   error that names the field. The chain presets and the genesis ceremony both write the key,
-    ///   so this rejects a file that lost it, not a supported configuration.
+    ///
+    /// `basefee_address` needs no floor here: the field is a required key with no serde default,
+    /// so a `parameters.yaml` that omits it already fails to deserialize, before any constructor
+    /// runs, with an error that names the field.
     pub fn validate_operational_floors(&self) -> eyre::Result<()> {
         eyre::ensure!(
             self.gc_depth > tn_types::GC_ACTIVITY_BUFFER,
@@ -470,11 +471,6 @@ impl Parameters {
             self.header_num_of_batches_threshold,
             self.max_header_num_of_batches,
         );
-        eyre::ensure!(
-            self.basefee_address.is_some(),
-            "basefee_address must be set explicitly: it receives every transaction's base fee, so \
-             its balance enters the state root and all nodes on the network must agree on it",
-        );
         Ok(())
     }
 
@@ -494,7 +490,7 @@ impl Parameters {
         // reading each other's files.
         info!(
             "Basefee address set to {} (consensus-critical: all nodes must agree)",
-            self.basefee_address.unwrap_or(GOVERNANCE_SAFE_ADDRESS)
+            self.basefee_address
         );
     }
 }
@@ -608,28 +604,32 @@ mod test {
         );
     }
 
-    /// A parameters file that omits `basefee_address` parses without error and yields `None`.
+    /// A parameters file that omits `basefee_address` must fail to deserialize.
     ///
-    /// This asserts the concrete value rather than `is_some()`, which would pass under either
-    /// behavior and pin nothing.
+    /// Every other key in the file carries a serde default, so this partial file isolates the one
+    /// required key. Without this pin, a `#[serde(default)]` reintroduced on the field would fill
+    /// a fallback on a missing key in silence, which is the failure mode of issue #1113.
     #[test]
-    fn absent_basefee_address_key_deserializes_to_none() {
-        let params: Parameters =
-            serde_yaml::from_str("gc_depth: 50").expect("a partial parameters file parses");
-        assert_eq!(
-            params.basefee_address, None,
-            "an omitted key must stay observable as None so the floors can refuse it"
+    fn absent_basefee_address_key_fails_to_deserialize() {
+        let err = serde_yaml::from_str::<Parameters>("gc_depth: 50")
+            .expect_err("a parameters file without basefee_address must not parse");
+        assert!(
+            err.to_string().contains("basefee_address"),
+            "the error must name the field an operator has to fix: {err}"
         );
     }
 
-    /// A production node must not start on a file that lost the key. Without this check the node
-    /// starts, credits the fallback address, and splits state roots against its peers in silence.
+    /// A parameters file with an explicit `basefee_address: null` must also fail to deserialize.
+    ///
+    /// This is the upgrade shape, not a hypothetical: before this change `Parameters::default()`
+    /// held `None`, and `load_from_path_or_default` writes the default back to disk when the file
+    /// is absent, so a datadir created under the old code can hold `basefee_address: null`. That
+    /// file takes serde's type-error path, not the missing-field path the previous test pins, so
+    /// it needs its own pin.
     #[test]
-    fn operational_floors_reject_absent_basefee_address() {
-        let params = Parameters { basefee_address: None, ..Default::default() };
-        let err = params
-            .validate_operational_floors()
-            .expect_err("a production node must not start without an explicit basefee address");
+    fn null_basefee_address_key_fails_to_deserialize() {
+        let err = serde_yaml::from_str::<Parameters>("gc_depth: 50\nbasefee_address: null")
+            .expect_err("a parameters file with a null basefee_address must not parse");
         assert!(
             err.to_string().contains("basefee_address"),
             "the error must name the field an operator has to fix: {err}"
@@ -648,12 +648,11 @@ mod test {
             serde_yaml::from_str(TESTNET_PARAMETERS).expect("adiri parameters parse");
         assert_eq!(
             mainnet.basefee_address,
-            Some(address!("0x9999999999999999999999999999999999999999")),
+            address!("0x9999999999999999999999999999999999999999"),
             "mainnet's committed basefee address changed"
         );
         assert_eq!(
-            adiri.basefee_address,
-            Some(GOVERNANCE_SAFE_ADDRESS),
+            adiri.basefee_address, GOVERNANCE_SAFE_ADDRESS,
             "adiri's committed basefee address changed"
         );
         mainnet

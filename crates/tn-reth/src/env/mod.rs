@@ -104,6 +104,12 @@ impl std::fmt::Debug for RethEnv {
 /// Set the basefee address.  This will only work on the first call and should be during program
 /// initialization. Calling more than once will do nothing, not calling early can lead to an unset
 /// basefee address and a chain fork.
+///
+/// `None` pins the `GOVERNANCE_SAFE_ADDRESS` default. It is passed by the temp-chain and
+/// snapshot-restore constructors (genesis tooling, `db load-state`, and tests) — see the
+/// `BASEFEE_ADDRESS` docs in `lib.rs` for the first-write-wins hazard. The production node start
+/// (`crates/node/src/manager/node.rs`) always supplies a configured address, because the config
+/// layer declares `parameters.basefee_address` as a required key.
 fn set_basefee_address(address: Option<Address>) {
     // Ignore the error. Should probably panic on error but this will break some test environments.
     let _ = BASEFEE_ADDRESS.set(address.unwrap_or(GOVERNANCE_SAFE_ADDRESS));

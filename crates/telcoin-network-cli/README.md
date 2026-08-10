@@ -463,7 +463,7 @@ Outbound: Unrestricted UDP for QUIC connections to peers.
 
 ## Consensus parameters
 
-The `parameters.yaml` file controls consensus timing and behavior. If the file is absent, defaults are used. Duration values accept human-readable strings (e.g. `3s`, `500ms`).
+The `parameters.yaml` file controls consensus timing and behavior. The node reads it at startup and refuses to start when the file is missing or fails to parse. Duration values accept human-readable strings (e.g. `3s`, `500ms`).
 
 | Field                                   | Default  | Description                                         |
 | --------------------------------------- | -------- | --------------------------------------------------- |
@@ -480,11 +480,11 @@ The `parameters.yaml` file controls consensus timing and behavior. If the file i
 | `basefee_address`                       | required | Base-fee recipient; must match every peer           |
 | `parallel_fetch_request_delay_interval` | `5s`     | Delay between parallel certificate fetch requests   |
 
-`basefee_address` is the one field here without a usable default. It is consensus-critical: the
+`basefee_address` is the one field here without a default. It is consensus-critical: the
 EVM credits this account on every transaction, so its balance enters the state root and every node
-on the network must hold the same value. A node started with this key missing is refused at
-startup rather than falling back in silence. The `genesis` commands write the key for you, and the
-`mainnet` and `adiri` chain presets carry their own value.
+on the network must hold the same value. A parameters file that omits the key fails to parse, so
+the node refuses to start rather than falling back in silence. The `genesis` commands write the
+key for you, and the `mainnet` and `adiri` chain presets carry their own value.
 
 Example (testnet configuration):
 

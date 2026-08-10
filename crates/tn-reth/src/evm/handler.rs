@@ -313,8 +313,8 @@ mod tests {
     /// of the state, so the two runs produce two different state roots.
     ///
     /// This pins the claim the `BASEFEE_ADDRESS` documentation in `lib.rs` makes, and it is the
-    /// reason [`Parameters::validate_operational_floors`](tn_config::Parameters) refuses an unset
-    /// `basefee_address`: two honest nodes that disagree on this one value still agree on the
+    /// reason `tn-config` declares [`basefee_address`](tn_config::Parameters) as a required key
+    /// with no serde default: two honest nodes that disagree on this one value still agree on the
     /// batch, the certificate, and the commit order, and disagree only on the resulting state.
     /// Without this test a later change could treat the field as cosmetic and nothing would fail.
     #[test]
