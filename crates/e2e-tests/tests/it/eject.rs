@@ -70,6 +70,17 @@ const GENESIS_OBSERVER: &str = "genesis-observer";
 /// that test which scales with epoch length derives from this constant, not [`EPOCH_DURATION`].
 const RESTART_EPOCH_DURATION: u64 = 40;
 
+/// Per-test epoch duration (seconds) for the mid-epoch current-committee ejection test.
+///
+/// [`test_validator_ejected_from_current_committee_mid_epoch`] spends its runtime waiting at
+/// wall-clock epoch boundaries; its only in-epoch sequence is the mid-epoch burn submit and
+/// confirm (about 2s), so it does not need the module-wide [`EPOCH_DURATION`] (10s). 6s keeps
+/// the mid-epoch submission window at [1, 4], wider than the [1, 3] window of the 5s epochs
+/// already shipping in `basefee.rs` and `epochs.rs` ("5s is the consensus minimum epoch
+/// duration"). The test's timeout ceilings deliberately keep reading [`EPOCH_DURATION`]:
+/// relative to 6s epochs every ceiling only gets more generous, so none needs a `.max()` floor.
+const EJECT_EPOCH_DURATION: u64 = 6;
+
 /// Find the epoch that contains `block` by walking the epoch-info ring buffer down from the
 /// current epoch.
 ///
@@ -372,7 +383,7 @@ async fn test_validator_ejected_from_current_committee_mid_epoch() -> eyre::Resu
         (GENESIS_OBSERVER, observer_wallet.address()),
         governance_wallet.address(),
         &nodes,
-        EPOCH_DURATION,
+        EJECT_EPOCH_DURATION,
     )?;
 
     // start nodes (committee + genesis observer); the observer never stakes, it only follows
