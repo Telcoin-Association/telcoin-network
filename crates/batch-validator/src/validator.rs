@@ -3,8 +3,9 @@
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use tn_reth::{recover_raw_transaction, recover_signed_transaction, RethEnv, WorkerTxPool};
 use tn_types::{
-    max_batch_gas, max_batch_size, BatchValidation, BatchValidationError, BlockHash, Epoch,
-    SealedBatch, TransactionSigned, TransactionTrait as _, WorkerId,
+    batch_allowlisted_tx_type, max_batch_gas, max_batch_size, BatchValidation,
+    BatchValidationError, BlockHash, Epoch, SealedBatch, TransactionSigned, TransactionTrait as _,
+    Typed2718 as _, WorkerId,
 };
 
 /// Type convenience for implementing block validation errors.
@@ -69,8 +70,8 @@ impl BatchValidation for BatchValidator {
         // validate txs decode
         let decoded_txs = self.decode_transactions(transactions, digest)?;
 
-        // validate no txs are eip4844
-        self.validate_no_blob_txs(&decoded_txs)?;
+        // validate every tx type is on the executable allowlist
+        self.validate_tx_type_allowlist(&decoded_txs)?;
 
         // validate gas limit
         // Use the parent timestamp for consistency with the batch builder.
@@ -194,15 +195,26 @@ impl BatchValidator {
         }
     }
 
-    /// Validate the block's basefee
-    fn validate_no_blob_txs(
+    /// Validate every transaction's EIP-2718 type is on the executable allowlist.
+    ///
+    /// The protocol admits only legacy, EIP-2930, and EIP-1559 envelopes in batches,
+    /// uniformly across chain configurations; the batch builder and the worker gateway
+    /// enforce the same `batch_allowlisted_tx_type` predicate on the producing side.
+    /// EIP-4844 keeps its dedicated error for continuity with existing peer penalties;
+    /// any other decodable type (EIP-7702 today) maps to `UnsupportedTxType`. A type
+    /// byte outside the envelope's decodable set never reaches this check: it fails
+    /// transaction decode first and surfaces as `RecoverTransaction`.
+    fn validate_tx_type_allowlist(
         &self,
         transactions: &[TransactionSigned],
     ) -> BatchValidationResult<()> {
-        if let Some(blob_tx) = transactions.iter().find(|tx| tx.is_eip4844()) {
-            return Err(BatchValidationError::InvalidTx4844(*blob_tx.hash()));
-        }
-        Ok(())
+        transactions.iter().find(|tx| !batch_allowlisted_tx_type(*tx)).map_or(Ok(()), |tx| {
+            if tx.is_eip4844() {
+                Err(BatchValidationError::InvalidTx4844(*tx.hash()))
+            } else {
+                Err(BatchValidationError::UnsupportedTxType { tx_type: tx.ty(), hash: *tx.hash() })
+            }
+        })
     }
 
     /// Helper function for decoding and recovering transactions.
@@ -664,6 +676,58 @@ mod tests {
             validator.validate_batch(batch.clone().seal_slow()),
             Err(BatchValidationError::InvalidTx4844(_))
         );
+    }
+
+    #[tokio::test]
+    async fn test_invalid_tx_eip7702() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        // eip7702 set-code transaction carrying a signed authorization, so the
+        // only invalid thing about the envelope is its type byte
+        let mut tx_factory = TransactionFactory::new_random();
+        let signed_tx =
+            tx_factory.create_eip7702(validator.reth_env.chainspec().chain_id(), None, 7);
+
+        // test batch with eip7702 tx
+        batch.transactions = vec![signed_tx.encoded_2718()];
+
+        assert_matches!(
+            validator.validate_batch(batch.clone().seal_slow()),
+            Err(BatchValidationError::UnsupportedTxType { tx_type: 4, hash: _ })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valid_batch_legacy_and_eip2930() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        // positive control for the admit direction of the allowlist: the valid
+        // fixture already proves EIP-1559, so cover legacy and EIP-2930
+        let mut tx_factory = TransactionFactory::new_random();
+        let chain_id = validator.reth_env.chainspec().chain_id();
+        let legacy_tx = tx_factory
+            .create_explicit_legacy_tx(
+                Some(chain_id),
+                None,
+                None,
+                None,
+                Some(Address::ZERO),
+                None,
+                None,
+            )
+            .encoded_2718();
+        let eip2930_tx = tx_factory.create_eip2930(chain_id, None, 7, Address::ZERO).encoded_2718();
+        batch.transactions = vec![legacy_tx, eip2930_tx];
+
+        assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
     }
 
     /// Compute the committee slot a sender address would be routed to.

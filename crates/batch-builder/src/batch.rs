@@ -64,6 +64,7 @@ pub fn build_batch<P: TxPool>(
     let mut transactions = Vec::new();
     let mut mined_transactions = Vec::new();
     let mut blob_transactions = Vec::new();
+    let mut unsupported_transactions = Vec::new();
     let mut sender_nonces: HashMap<Address, u64> = HashMap::new();
 
     // begin loop through sorted "best" transactions in pending pool
@@ -85,11 +86,19 @@ pub fn build_batch<P: TxPool>(
         // NOTE: `ValidPoolTransaction::size()` is private
         let tx = pool_tx.to_consensus();
 
-        // ignore blob transactions EIP-4844
-        if tx.is_eip4844() {
-            best_txs.ignore_eip4844(&pool_tx);
-            debug!(target: "worker::batch_builder", ?pool_tx, "marking eip4844 tx invalid");
-            blob_transactions.push(*tx.hash());
+        // ignore any transaction type outside the executable allowlist (EIP-4844
+        // blobs and EIP-7702 today): the batch validator rejects such batches, so
+        // packing one would cost this node a peer penalty on every vote request
+        if !tn_types::batch_allowlisted_tx_type(&tx) {
+            if tx.is_eip4844() {
+                best_txs.ignore_eip4844(&pool_tx);
+                debug!(target: "worker::batch_builder", ?pool_tx, "marking eip4844 tx invalid");
+                blob_transactions.push(*tx.hash());
+            } else {
+                best_txs.ignore_eip7702(&pool_tx);
+                debug!(target: "worker::batch_builder", ?pool_tx, "marking non-allowlisted tx type invalid");
+                unsupported_transactions.push(*tx.hash());
+            }
             continue;
         }
 
@@ -124,6 +133,9 @@ pub fn build_batch<P: TxPool>(
 
     // remove any blob transactions that were submitted
     pool.remove_eip4844_txs(blob_transactions);
+
+    // remove any non-allowlisted transaction types that were submitted
+    pool.remove_unsupported_txs(unsupported_transactions);
 
     // construct changed_accounts for pool nonce updates
     //

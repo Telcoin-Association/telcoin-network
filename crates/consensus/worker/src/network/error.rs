@@ -86,7 +86,8 @@ impl WorkerNetworkError {
                     BatchValidationError::CanonicalChain { .. } => Some(Penalty::Mild),
                     // medium
                     BatchValidationError::InvalidEpoch { .. }
-                    | BatchValidationError::InvalidTx4844(_) => Some(Penalty::Medium),
+                    | BatchValidationError::InvalidTx4844(_)
+                    | BatchValidationError::UnsupportedTxType { .. } => Some(Penalty::Medium),
                     // severe
                     BatchValidationError::RecoverTransaction(_, _) => Some(Penalty::Severe),
                     // fatal
