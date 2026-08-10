@@ -446,7 +446,8 @@ impl RethEnv {
 /// 2. [`import_chain_scaffold`](Self::import_chain_scaffold) clears the genesis alloc from the
 ///    state tables and writes a header-only chain up to `B` (real hashes in the window, zero-hash
 ///    dummies below it), so the state import has a real `header(B)` to check its recomputed root
-///    against.
+///    against. It first records the restored-state floor marker (the window's first block), so
+///    every later env over this datadir refuses pinned state reads below the shipped window.
 /// 3. [`import_state`](Self::import_state) streams the pack's accounts into reth's state tables one
 ///    account header and one bounded storage chunk at a time, recomputes the state root from
 ///    scratch, and hard-fails on any mismatch with `header(B).state_root`.
@@ -520,6 +521,9 @@ impl SnapshotRestorer {
     ///   consistent.
     /// - Writes `HeaderNumbers` (hash → number) for every window header so `BLOCKHASH` resolves by
     ///   hash, and sets every stage checkpoint to `B`.
+    /// - Writes the datadir's restored-state floor marker (= `window[0].number`) BEFORE any of the
+    ///   above commits, so pinned state reads below the shipped window are refused for the life of
+    ///   this datadir (`pinned_state_and_env` in `env/epoch.rs`).
     ///
     /// Static files are committed BEFORE the database provider: the refuse-non-empty check in
     /// [`open`](Self::open) keys on the Headers static-file height, so committing static files
@@ -580,6 +584,14 @@ impl SnapshotRestorer {
                 )
             })
         })?;
+
+        // persist the restored-state floor (= block B, the ONLY block whose state the restore
+        // imports) BEFORE any chain data commits: a crash cannot produce a restored datadir
+        // without its floor. The floor is B and not the window's first block because window
+        // headers below B resolve by hash (their HeaderNumbers rows are written below) yet carry
+        // no state — a pin there would silently read every account as "never written" — while
+        // blocks below the window already fail loudly on an unresolvable hash
+        self.reth_env.write_restored_state_floor(b)?;
 
         info!(
             target: "tn::reth",
@@ -2374,7 +2386,7 @@ mod tests {
         let dst_dir = TempDir::new()?;
         let dst_tm = TaskManager::new("Entry Readiness Accept Dest");
         let restorer = restore_through_import(
-            chain,
+            chain.clone(),
             dst_dir.path(),
             &dst_tm,
             std::slice::from_ref(&closing),
@@ -2383,6 +2395,110 @@ mod tests {
         )?;
         restorer.entry_readiness_precondition(final_state)?;
         restorer.finish(final_state)?;
+
+        // a fresh env over the restored datadir loads the floor the scaffold persisted (= the
+        // snapshot's final block `B`; this single-header window IS `B`)
+        use crate::error::StateReadError;
+        let (dst_config, dst_db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+        let marker = std::fs::read_to_string(RethEnv::restored_state_floor_path(&dst_config.0))?;
+        assert_eq!(
+            marker.trim(),
+            closing.number.to_string(),
+            "the floor marker must hold the snapshot's final block"
+        );
+        let restored = RethEnv::new(&dst_config, &dst_tm, dst_db, None, GasAccumulator::default())?;
+
+        // below the floor: genesis still resolves in this datadir (its header was kept), but its
+        // state was cleared by the scaffold — the floor refuses the pin before any state is read,
+        // classified node-local so callers retry or halt rather than fail open
+        let err = restored
+            .get_current_epoch_info_at_header(&chain.sealed_genesis_header())
+            .expect_err("a pinned read below the restored window must be refused");
+        assert!(
+            matches!(&err, StateReadError::Provider(_)),
+            "the floor refusal must be node-local: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("below this datadir's restored-state floor"),
+            "the refusal must name the restored floor, got: {err}"
+        );
+
+        // positive control: the SAME reader at the snapshot's final block still answers — the
+        // floor admits `B` and the imported state seeds the entered epoch
+        let (epoch, _info) = restored.get_current_epoch_info_at_header(&closing)?;
+        assert_eq!(epoch, 1, "the closing block must still read as the entered epoch");
+
+        Ok(())
+    }
+
+    /// The scaffold persists the restored-state floor marker as the snapshot's FINAL block `B` —
+    /// not the window's first block, because window headers below `B` resolve by hash yet carry
+    /// no state — before any chain data commits, and a fresh env over the datadir refuses pinned
+    /// reads below `B` BEFORE attempting to resolve the pinned hash.
+    #[tokio::test]
+    async fn scaffold_persists_restored_state_floor_and_env_refuses_below_it() -> eyre::Result<()> {
+        use crate::error::StateReadError;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let dst_dir = TempDir::new()?;
+        let tm = TaskManager::new("Restored Floor Scaffold");
+        let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
+        let restorer = SnapshotRestorer::open(&reth_config, db, &tm)?;
+
+        // a window that starts ABOVE block 1: blocks 3..=5. the first header's parent lies
+        // outside the window (linkage is only checked between window members), mirroring a real
+        // bounded window, so blocks 1..=2 become zero-hash placeholders
+        let h3 = synthetic_header(3, B256::from([0x33; 32]), B256::ZERO);
+        let h4 = synthetic_header(4, h3.hash(), B256::ZERO);
+        let h5 = synthetic_header(5, h4.hash(), B256::ZERO);
+        let window = vec![h3.clone(), h4, h5.clone()];
+        restorer.import_chain_scaffold(&window, BlockNumHash::new(5, h5.hash()))?;
+        drop(restorer);
+
+        // the marker holds the final block (5), not the window start (3)
+        let marker = std::fs::read_to_string(RethEnv::restored_state_floor_path(&reth_config.0))?;
+        assert_eq!(marker.trim(), "5", "the floor marker must hold the snapshot's final block");
+
+        let (reth_config, db) = temp_config_and_db(chain, dst_dir.path())?;
+        let env = RethEnv::new(&reth_config, &tm, db, None, GasAccumulator::default())?;
+
+        // below the floor: refused up front, before the (unresolvable) pin hash matters
+        let phantom =
+            SealedHeader::new(ExecHeader { number: 2, ..Default::default() }, B256::random());
+        let err = env
+            .get_current_epoch_info_at_header(&phantom)
+            .expect_err("a pinned read below the floor must be refused");
+        assert!(
+            matches!(&err, StateReadError::Provider(_)),
+            "the floor refusal must be node-local: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("below this datadir's restored-state floor"),
+            "the refusal must name the restored floor, got: {err}"
+        );
+
+        // window interior, REAL hash: blocks in [window start, B) resolve by hash (their
+        // HeaderNumbers rows are written by the scaffold) but carry no state — the silent
+        // empty-read class from #1105 — so the floor must refuse them too
+        let err = env
+            .get_current_epoch_info_at_header(&h3)
+            .expect_err("a pinned read inside the window but below B must be refused");
+        assert!(
+            err.to_string().contains("below this datadir's restored-state floor"),
+            "the window-interior refusal must come from the floor, got: {err}"
+        );
+
+        // boundary control: AT the floor (= B) the guard admits the pin — this read then fails
+        // on the unresolvable random hash instead, with reth's provider message, not the floor's
+        let at_floor =
+            SealedHeader::new(ExecHeader { number: 5, ..Default::default() }, B256::random());
+        let err = env
+            .get_current_epoch_info_at_header(&at_floor)
+            .expect_err("a random pin hash must not resolve");
+        assert!(
+            !err.to_string().contains("below this datadir's restored-state floor"),
+            "the floor must not refuse a pin at the floor itself, got: {err}"
+        );
 
         Ok(())
     }
