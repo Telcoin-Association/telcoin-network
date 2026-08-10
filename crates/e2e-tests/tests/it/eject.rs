@@ -610,7 +610,7 @@ async fn test_validator_ejected_from_current_committee_mid_epoch() -> eyre::Resu
     // a normal transaction still confirms on the shrunken network
     let recipient = Address::from_slice(&[0x77; 20]);
     let transfer = governance_wallet.create_eip1559_encoded(
-        chain,
+        chain.clone(),
         None,
         100,
         Some(recipient),
@@ -622,8 +622,22 @@ async fn test_validator_ejected_from_current_committee_mid_epoch() -> eyre::Resu
     let tx_block = get_tx_receipt_block(&rpc_url, &hash.to_string())?;
     info!(target: "eject-test", tx_block, "post-ejection transfer confirmed");
 
+    // under skip-empty-execution no block follows the transfer until the next epoch close, so
+    // give the observer probe below a prompt block
+    let follow_up = governance_wallet.create_eip1559_encoded(
+        chain,
+        None,
+        100,
+        Some(recipient),
+        parse_ether("1")?,
+        Bytes::default(),
+    );
+    let _pending = provider.send_raw_transaction(&follow_up).await?;
+
     // the ejected validator's node keeps following as an observer: its head advances past the
-    // transfer's block and it serves the shrunken epoch-E record with a verifying cert
+    // transfer's block (the follow-up's block arrives within ~1-2s; a dropped follow-up degrades
+    // to the next epoch close and the timeout stays as a hang ceiling) and it serves the
+    // shrunken epoch-E record with a verifying cert
     wait_for_head_at_least(&victim_url, tx_block + 1, EPOCH_DURATION * 3).await?;
     fetch_verified_epoch_record(&victim_url, e, EPOCH_DURATION * 3).await?;
 
@@ -922,7 +936,7 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
     // again, not merely its sync path.
     let recipient = Address::from_slice(&[0x77; 20]);
     let transfer = governance_wallet.create_eip1559_encoded(
-        chain,
+        chain.clone(),
         None,
         100,
         Some(recipient),
@@ -936,8 +950,21 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
     let tx_block = get_tx_receipt_block(&endpoints[1].http_url, &hash.to_string())?;
     info!(target: "eject-test", tx_block, "post-restart transfer confirmed via the restarted node");
 
+    // under skip-empty-execution no block follows the transfer until the next epoch close, so
+    // give the observer probe below a prompt block
+    let follow_up = governance_wallet.create_eip1559_encoded(
+        chain,
+        None,
+        100,
+        Some(recipient),
+        parse_ether("1")?,
+        Bytes::default(),
+    );
+    let _pending = restarted_provider.send_raw_transaction(&follow_up).await?;
+
     // the burned validator's node keeps following as an observer: its head advances past the
-    // transfer's block (the next block arrives at latest with the E+2 closing block)
+    // transfer's block (the follow-up's block arrives within ~1-2s; a dropped follow-up degrades
+    // to the next epoch close and the timeout stays as a hang ceiling)
     wait_for_head_at_least(&victim_url, tx_block + 1, RESTART_EPOCH_DURATION * 3).await?;
 
     Ok(())
