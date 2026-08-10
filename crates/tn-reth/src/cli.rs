@@ -407,7 +407,10 @@ impl RethConfig {
     /// unset, and reth neither errors nor falls back to tip: the lookup classifies as
     /// `HistoryInfo::NotYetWritten` and returns `Ok(None)`, so the account or slot reads as never
     /// written. That is a datadir property rather than a configuration one, and this check cannot
-    /// see it. See `pinned_state_and_env` in `env/epoch.rs` for the full breakdown.
+    /// see it. For the snapshot-restore half the node now refuses the read instead:
+    /// `pinned_state_and_env` rejects any pin below the restored-state floor the restorer
+    /// persists (#1131). An externally truncated datadir remains invisible to both. See
+    /// `pinned_state_and_env` in `env/epoch.rs` for the full breakdown.
     ///
     /// The check is deliberately conservative. `prune_config` returns `None` exactly when no
     /// pruning was requested, so any `Some` fails here: a per-segment mode, `--full`,
@@ -419,8 +422,9 @@ impl RethConfig {
     /// it cannot detect a datadir some other binary already pruned; and `prune_config` reflects
     /// only the CLI-derived [`PruningArgs`], not a reth.toml `[prune]` section (TN never loads
     /// one, since `NodeConfig::config` stays `None` and the node hand-rolls its init path rather
-    /// than using reth's launcher). Both residuals are covered by `etc/archive-mode-guard.sh`,
-    /// which fails the build if a pruner entry point or a reth.toml load is introduced.
+    /// than using reth's launcher). The reth.toml residual is covered by
+    /// `etc/archive-mode-guard.sh`, which fails the build if a pruner entry point or a reth.toml
+    /// load is introduced; the foreign-datadir residual is beyond any check this repo can run.
     pub(crate) fn ensure_archive_mode(&self) -> eyre::Result<()> {
         self.0.prune_config().map_or(Ok(()), |prune_config| {
             Err(eyre::eyre!(

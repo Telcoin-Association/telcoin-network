@@ -44,9 +44,12 @@
 //! refuses to start a node whose configuration requests pruning, and `etc/archive-mode-guard.sh`
 //! fails the build if a pruner entry point is introduced. Every pinned read here builds its state
 //! through the one `pinned_state_and_env` helper, which carries the normative ARCHIVE-MODE note
-//! and spells out the two ways "history is missing" can present: loudly under a prune
-//! configuration, silently on a datadir whose history was removed without one. Revisit that note
-//! before relaxing either guard.
+//! and spells out the three ways "history is missing" can present: a loud error below a recorded
+//! prune watermark, silent tip substitution above one, and silent never-written reads on a
+//! datadir truncated without one. For reads built through this helper, the last is refused on
+//! restored datadirs by the RESTORED-DATADIR FLOOR check; a read that bypasses the helper
+//! (`read_contract_inner`) is not floor-guarded. Revisit that note before relaxing either
+//! guard.
 //!
 //! # Error classification
 //!
@@ -755,12 +758,13 @@ impl RethEnv {
     /// the chain spec, identical on every node).
     ///
     /// ARCHIVE-MODE ASSUMPTION: this node keeps fully indexed history, so `state_by_block_hash`
-    /// resolves the state at the pinned block rather than some later state. Because every pinned
-    /// read in this crate funnels through here, this is the one place that assumption has to
-    /// hold. It is enforced at two levels: `RethConfig::ensure_archive_mode` refuses to start a
-    /// node whose configuration requests pruning, and `etc/archive-mode-guard.sh` fails the build
-    /// if a pruner entry point or a reth.toml loader is introduced anywhere under `crates/`,
-    /// `bin/`, or `examples/`.
+    /// resolves the state at the pinned block rather than some later state. Every pinned read in
+    /// this crate funnels through here except `read_contract_inner`, which builds its state from
+    /// `read_only_state_db` directly and carries its own note (`env/helpers.rs`), so this is the
+    /// place that assumption has to hold. It is enforced at two levels:
+    /// `RethConfig::ensure_archive_mode` refuses to start a node whose configuration requests
+    /// pruning, and `etc/archive-mode-guard.sh` fails the build if a pruner entry point or a
+    /// reth.toml loader is introduced anywhere under `crates/`, `bin/`, or `examples/`.
     ///
     /// Three failure modes hide behind "history is missing", and only one of them is loud. Keep
     /// them apart: which one you get turns on whether a prune checkpoint was ever written.
@@ -785,8 +789,15 @@ impl RethEnv {
     /// never written, rather than as its value at the pinned block. That is a property of the
     /// datadir rather than of the configuration, so no startup config check can see it.
     ///
-    /// The last two are both silent and both defeat the point of pinning. Revisit every pinned
-    /// read before relaxing either guard.
+    /// The last two are both silent and both defeat the point of pinning. The startup check
+    /// refuses the second only for this node's own configuration; a datadir some other binary
+    /// already pruned still reaches it, because the check reads config, not the datadir. The
+    /// RESTORED-DATADIR FLOOR below refuses the snapshot-restore instance of the third for
+    /// every read built here, while a read that bypasses this helper (`read_contract_inner`) is
+    /// not floor-guarded and a datadir truncated outside the snapshot restorer stays silent;
+    /// per the maintainer call on PR #1060 (2026-08-10), a non-genesis start without a snapshot
+    /// is not a supported configuration, so that last case is out of scope. Revisit every
+    /// pinned read before relaxing any of these guards.
     ///
     /// RESTORED-DATADIR FLOOR: a datadir bootstrapped from a snapshot holds state ONLY at the
     /// snapshot's final block `B` — window headers below `B` carry real, resolvable hashes but
