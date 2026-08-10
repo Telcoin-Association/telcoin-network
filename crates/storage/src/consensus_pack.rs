@@ -2041,8 +2041,8 @@ pub(crate) mod test {
     use tn_test_utils::CommitteeFixture;
     use tn_types::{
         test_genesis, Batch, BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-        ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, EpochRecord, ExecHeader, Hash,
-        HeaderBuilder, ReputationScores,
+        ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
+        EpochRecord, ExecHeader, Hash, HeaderBuilder, ReputationScores,
     };
 
     use crate::{
@@ -2225,6 +2225,33 @@ pub(crate) mod test {
                 },
             ],
         )
+    }
+
+    /// Epoch for the shared-batch scenarios: one above the adiri dup-batch replay cutoff
+    /// (`ADIRI_DUP_BATCH_EPOCH`, 160), so the rebuilt output keeps the shared batch under every
+    /// feature set and `compare_outputs` stays cfg-free (#1128). The literal is hard-coded
+    /// because the constant only exists under the `adiri` feature; the assertion below pins the
+    /// relation where the constant is visible. The replay (drop) side at low epochs is pinned by
+    /// `test_shared_batch_replay_below_adiri_dup_cutoff`.
+    const SHARED_BATCH_EPOCH: Epoch = 161;
+
+    #[cfg(feature = "adiri")]
+    const _: () = assert!(SHARED_BATCH_EPOCH > tn_types::forks::ADIRI_DUP_BATCH_EPOCH);
+
+    /// Previous-epoch record linking a pack opened at [`SHARED_BATCH_EPOCH`]: final consensus
+    /// number 0 keeps `start_consensus_number` at 1 and the final consensus hash keeps the
+    /// first output's parent at the default header digest, so the scenario keeps the shape the
+    /// epoch-0 tests use.
+    fn shared_batch_previous_epoch(committee: &Committee) -> EpochRecord {
+        EpochRecord {
+            // 160 here is only `SHARED_BATCH_EPOCH - 1`, not the adiri cutoff; the
+            // open, verify, and stream-import paths do not read this field.
+            epoch: SHARED_BATCH_EPOCH - 1,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            final_consensus: ConsensusNumHash::new(0, ConsensusHeader::default().digest()),
+            ..Default::default()
+        }
     }
 
     pub(crate) fn compare_outputs(output1: &ConsensusOutput, output2: &ConsensusOutput) {
@@ -2500,19 +2527,17 @@ pub(crate) mod test {
     /// Regression test: one batch digest referenced by two certificates within a single
     /// consensus output.  The batch is stored once in the pack file and must be assigned
     /// to both certificates when the output is rebuilt (previously failed with
-    /// PackError::MissingBatch).
+    /// PackError::MissingBatch).  Runs at [`SHARED_BATCH_EPOCH`], above the adiri dup-batch
+    /// replay cutoff, so the expectation holds for every feature set (#1128).
     #[tokio::test]
     async fn test_consensus_pack_dup_batch_across_certs() {
         let temp_dir = TempDir::with_prefix("test_consensus_pack_dup").expect("temp dir");
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let committee = fixture.committee();
-        let previous_epoch = EpochRecord {
-            epoch: 0,
-            committee: committee.bls_keys().iter().copied().collect(),
-            next_committee: committee.bls_keys().iter().copied().collect(),
-            ..Default::default()
-        };
+        // Run above the adiri dup-batch replay cutoff so the duplicate survives the rebuild
+        // under every feature set and one unconditional comparison serves both builds.
+        let committee = fixture.committee().advance_epoch_for_test(SHARED_BATCH_EPOCH);
+        let previous_epoch = shared_batch_previous_epoch(&committee);
         let pack =
             ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
                 .expect("open pack");
@@ -2535,20 +2560,23 @@ pub(crate) mod test {
         drop(pack);
 
         // Read back through the read only static path.
-        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), SHARED_BATCH_EPOCH).expect("open static");
         compare_outputs(&pack.get_consensus_output(1).await.expect("dup batch output"), &output_1);
         compare_outputs(&pack.get_consensus_output(2).await.expect("output after dup"), &output_2);
         drop(pack);
 
         // Stream into a new pack (peer epoch sync path) and read back.
         let temp_dir2 = TempDir::with_prefix("test_consensus_pack_dup2").expect("temp dir");
-        let stream = tokio::fs::File::open(temp_dir.path().join("epoch-0").join(Inner::DATA_NAME))
-            .await
-            .expect("log file");
+        let stream = tokio::fs::File::open(
+            temp_dir.path().join(format!("epoch-{SHARED_BATCH_EPOCH}")).join(Inner::DATA_NAME),
+        )
+        .await
+        .expect("log file");
         let pack = ConsensusPack::stream_import(
             temp_dir2.path(),
             stream,
-            0,
+            SHARED_BATCH_EPOCH,
             &previous_epoch,
             2,
             Duration::from_secs(5),
@@ -2937,7 +2965,9 @@ pub(crate) mod test {
     /// A v0 (batches-first) pack that stores a SHARED batch (one digest referenced by two certs)
     /// must serve that output as v1 (header-first) bytes that decode back to the identical output,
     /// with the shared batch reassigned to BOTH certs. Guards the exact mixed-testnet path: a
-    /// pre-upgrade v0 file served as v1 for a duplicate-batch output.
+    /// pre-upgrade v0 file served as v1 for a duplicate-batch output. Runs at
+    /// [`SHARED_BATCH_EPOCH`], above the adiri dup-batch replay cutoff, so the expectation
+    /// holds for every feature set (#1128).
     #[tokio::test]
     async fn test_v0_shared_batch_served_as_v1_bytes() {
         use crate::consensus_pack::{bytes_to_output, bytes_to_verified_output};
@@ -2947,8 +2977,10 @@ pub(crate) mod test {
         let temp_dir = TempDir::with_prefix("test_v0_shared_v1").expect("temp dir");
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-        let committee = fixture.committee();
-        let previous_epoch = test_previous_epoch(&committee);
+        // Above the adiri replay cutoff: the shared batch must reach both certs on rebuild
+        // under every feature set.
+        let committee = fixture.committee().advance_epoch_for_test(SHARED_BATCH_EPOCH);
+        let previous_epoch = shared_batch_previous_epoch(&committee);
 
         // Genuine v0 (batches-first) pack on disk.
         let pack = ConsensusPack::open_append_version(
@@ -3002,6 +3034,106 @@ pub(crate) mod test {
             .expect("verified v1 decode");
             compare_outputs(&verified, original);
         }
+        drop(pack);
+    }
+
+    /// Adiri replay pin: at epochs at or below `ADIRI_DUP_BATCH_EPOCH` the rebuild must DROP a
+    /// shared batch from the second certificate, reproducing the historical duplicate-batch
+    /// outputs so adiri testnet can sync (the gates in `iter_to_output` and
+    /// `iter_to_output_legacy`). Exercises the skip side of both decoders from one v0 pack: the
+    /// legacy (batches-first) local read and the v1 (header-first) decode of the served bytes.
+    /// The push side above the cutoff is exercised by the two shared-batch tests at
+    /// [`SHARED_BATCH_EPOCH`] (#1128).
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_shared_batch_replay_below_adiri_dup_cutoff() {
+        use crate::consensus_pack::bytes_to_output;
+        use std::io::Cursor;
+        use tokio::io::BufReader;
+
+        let temp_dir = TempDir::with_prefix("test_dup_replay").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        // The fixture committee is at epoch 0, at or below the replay cutoff.
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // v0 pack so the local read exercises the legacy (batches-first) decoder.
+        let pack = ConsensusPack::open_append_version(
+            temp_dir.path(),
+            previous_epoch,
+            committee.clone(),
+            0,
+        )
+        .expect("open v0 pack");
+        let original = make_test_output_shared_batch(
+            &committee,
+            chain.clone(),
+            1,
+            ConsensusHeader::default().digest(),
+        );
+        // The replay gate reads the leader epoch of the sub-dag, so the guard pins
+        // that quantity, not the committee epoch it was stamped from.
+        assert!(
+            original.sub_dag().leader_epoch() <= tn_types::forks::ADIRI_DUP_BATCH_EPOCH,
+            "scenario must run at or below the replay cutoff"
+        );
+        pack.save_consensus_output(original.clone()).await.expect("save shared-batch output");
+        pack.persist().await.expect("persist");
+
+        // The digest both certificates reference: the one listed twice in batch_digests.
+        let shared_digest = original
+            .batch_digests()
+            .iter()
+            .find(|digest| {
+                original.batch_digests().iter().filter(|other| other == digest).count() == 2
+            })
+            .copied()
+            .expect("scenario shares one digest across certs");
+
+        let assert_replay_shape = |rebuilt: &ConsensusOutput| {
+            // The sub-dag, parent link and declared digest list (duplicate included) survive
+            // untouched; only the second certificate's materialized batches change.
+            assert_eq!(rebuilt.digest(), original.digest(), "consensus digest must be preserved");
+            assert_eq!(
+                rebuilt.batch_digests(),
+                original.batch_digests(),
+                "declared digests keep the duplicate"
+            );
+            let cert_a = rebuilt.batches().first().expect("two certified batches");
+            let cert_a_original = original.batches().first().expect("two certified batches");
+            assert_eq!(cert_a.address, cert_a_original.address);
+            assert_eq!(cert_a.batches, cert_a_original.batches, "first certificate is untouched");
+            let cert_b = rebuilt.batches().get(1).expect("two certified batches");
+            let cert_b_original = original.batches().get(1).expect("two certified batches");
+            assert_eq!(cert_b.address, cert_b_original.address);
+            let expected: Vec<Batch> = cert_b_original
+                .batches
+                .iter()
+                .filter(|batch| batch.digest() != shared_digest)
+                .cloned()
+                .collect();
+            assert_eq!(expected.len(), 1, "one unshared batch must remain");
+            assert_eq!(
+                cert_b.batches, expected,
+                "replay must drop the shared batch from the second certificate"
+            );
+        };
+
+        // Legacy (batches-first) local read of the v0 pack.
+        assert_replay_shape(&pack.get_consensus_output(1).await.expect("local v0 read"));
+
+        // The same output served as v1 (header-first) bytes and decoded by the v1 path.
+        let bytes = pack.get_consensus_output_bytes(1).await.expect("bytes");
+        let decoded = bytes_to_output(
+            BufReader::new(Cursor::new(bytes)),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await
+        .expect("v1 decode");
+        assert_replay_shape(&decoded);
         drop(pack);
     }
 
