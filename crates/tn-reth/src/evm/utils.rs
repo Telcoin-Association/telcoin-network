@@ -8,6 +8,7 @@
 //! (10^9 fixed-point precision) keeps results identical on every node — a consensus
 //! requirement, since the penalty changes account balances.
 
+use reth_revm::primitives::eip7702::PER_EMPTY_ACCOUNT_COST;
 use tracing::debug;
 
 /// Minimum gas limit threshold (10x minimum transaction cost)
@@ -89,6 +90,54 @@ pub fn calculate_gas_penalty(gas_limit: u64, gas_used: u64) -> u64 {
 
     // unused_gas is the fallback if penalty overflows (u128 cast from u64)
     penalty.try_into().unwrap_or(unused_gas as u64)
+}
+
+/// Split a transaction's unused gas into the penalty credited to the basefee
+/// address and the refund returned to the caller, excluding EIP-7702
+/// authorization intrinsic gas from the penalty basis and capping the penalty at
+/// actually-unused gas.
+///
+/// `gas_spent` is pre-refund (`gas.spent()`); `gas_used` is post-refund
+/// (`gas.spent_sub_refunded()`), matching `reimburse_caller`'s existing split.
+///
+/// # Why exclude the authorization intrinsic
+///
+/// The penalty asks "did you use enough of the gas you reserved?" and reads the
+/// answer off `gas.spent()`. EIP-7702 charges a flat 25,000-gas intrinsic per
+/// authorization tuple (`PER_EMPTY_ACCOUNT_COST`) from the tuple count alone,
+/// before any validity check, so a sender can pad the authorization list with
+/// junk tuples to inflate `gas.spent()` past the 10% threshold and collapse the
+/// quadratic penalty on a batch-hogging gas limit — buying `gas.spent()` without
+/// doing any work. Subtracting the authorization intrinsic from the penalty basis
+/// removes that lever. Only the authorization intrinsic is excluded: calldata
+/// (16 gas/byte) fairly prices batch bytes and the base 21,000 is negligible, so
+/// legitimate low-execution transfers keep the pre-fix basis.
+///
+/// # Why cap at unused gas
+///
+/// Subtracting from the basis makes the penalty larger, and in the padded case it
+/// can exceed `unused_gas`. `reimburse_caller` credits the full penalty to the
+/// basefee address while flooring the caller refund at zero, so an uncapped
+/// penalty would pay out `gas_used + penalty > gas_limit` — more than the sender
+/// prepaid, minting value in consensus-critical code. Capping the penalty at
+/// `unused_gas` restores exact conservation (`refund + penalty + gas_used ==
+/// gas_limit`).
+///
+/// For `num_authorizations == 0` (every non-7702 transaction) `auth_intrinsic` is
+/// zero and `calculate_gas_penalty` is already bounded by `gas_limit - gas_spent
+/// <= gas_limit - gas_used = unused_gas`, so the cap never binds and this is
+/// identical to the prior inline math.
+pub(crate) fn gas_penalty_and_refund(
+    gas_limit: u64,
+    gas_spent: u64,
+    gas_used: u64,
+    num_authorizations: usize,
+) -> (u64, u64) {
+    let auth_intrinsic = (num_authorizations as u64).saturating_mul(PER_EMPTY_ACCOUNT_COST);
+    let unused_gas = gas_limit.saturating_sub(gas_used);
+    let penalty =
+        calculate_gas_penalty(gas_limit, gas_spent.saturating_sub(auth_intrinsic)).min(unused_gas);
+    (penalty, unused_gas.saturating_sub(penalty))
 }
 
 #[cfg(test)]
