@@ -20,6 +20,9 @@ pub mod certificate_pack;
 pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
+/// On-demand comparative benchmark harness across the `Database` backends (see `db_bench.rs`).
+#[cfg(test)]
+mod db_bench;
 pub mod epoch_records;
 pub mod exec_state_pack;
 pub mod layered_db;
