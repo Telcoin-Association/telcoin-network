@@ -503,6 +503,67 @@ impl TransactionFactory {
         TransactionSigned::new_unhashed(tx.into(), signature)
     }
 
+    /// Create a signed EIP-7702 set-code transaction whose authorization list is
+    /// padded with `num_authorizations` tuples, for exercising the gas-penalty
+    /// path against a padded list.
+    ///
+    /// Every tuple is charged the flat 25,000-gas intrinsic
+    /// (`PER_EMPTY_ACCOUNT_COST`) from its presence alone — before any validity
+    /// check — so the list inflates `gas.spent()` cheaply. That is the lever the
+    /// gas-penalty bypass exploited: padding pushes reported usage over the 10%
+    /// threshold, collapsing the quadratic penalty on an over-reserved gas limit.
+    ///
+    /// The tuples carry a deliberately mismatched chain id, so revm skips each one
+    /// before signature recovery (revm-handler `apply_auth_list`): none delegate
+    /// and none earn the 12,500-gas refund, leaving pre- and post-refund gas equal
+    /// and the caller's accounting exact. This mirrors the real attack, where the
+    /// tuples never need to be valid.
+    pub fn create_eip7702_with_authorizations(
+        &mut self,
+        chain_id: ChainId,
+        gas_limit: u64,
+        gas_price: u128,
+        num_authorizations: usize,
+    ) -> TransactionSigned {
+        // authorizations on a different chain: still counted for intrinsic gas, but
+        // skipped before recovery so none apply and none earn a refund
+        let wrong_chain_id = U256::from(chain_id) + U256::from(1u64);
+        let authorization_list = (0..num_authorizations)
+            .map(|i| {
+                let authorization = Authorization {
+                    chain_id: wrong_chain_id,
+                    address: Address::ZERO,
+                    nonce: self.nonce + 1 + i as u64,
+                };
+                let auth_signature = self.sign_hash(authorization.signature_hash());
+                authorization.into_signed(auth_signature)
+            })
+            .collect();
+
+        // set-code transaction reserving `gas_limit` while doing almost no work
+        let tx = TxEip7702 {
+            chain_id,
+            nonce: self.nonce,
+            gas_limit,
+            max_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: 0,
+            to: address!("a8cb082a5a689e0d594d7da1e2d72a3d63adc1bd"),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list,
+            input: Bytes::new(),
+        };
+        let tx_signature_hash = tx.signature_hash();
+
+        // construct transaction and sign
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for next tx
+        self.inc_nonce();
+
+        TransactionSigned::new_unhashed(tx.into(), signature)
+    }
+
     /// Create and sign an EIP4844 transaction.
     pub async fn create_and_submit_eip4844(
         &mut self,
