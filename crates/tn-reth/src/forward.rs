@@ -30,7 +30,7 @@
 //!
 //! [`submit_txn_if_mine`]: tn_types::BatchValidation::submit_txn_if_mine
 
-use crate::recover_raw_transaction;
+use crate::{metrics::ForwarderMetrics, recover_raw_transaction};
 use alloy::{
     providers::{Provider as _, RootProvider},
     transports::{RpcError, TransportErrorKind},
@@ -42,7 +42,10 @@ use std::{
     time::Duration,
 };
 use tn_types::{BlsPublicKey, RpcInfo, TaskSpawner, TxnForwarder};
-use tokio::time::timeout;
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::{timeout, Instant},
+};
 use tracing::{debug, warn};
 use url::{Host, Url};
 
@@ -55,6 +58,39 @@ const FORWARD_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`FORWARD_SEND_TIMEOUT`]s. When it elapses the transaction is left unforwarded and the next one
 /// proceeds.
 const FORWARD_TX_BUDGET: Duration = Duration::from_secs(15);
+
+/// Bounds the wall time one spawned forward spends working through its batch, so a task's
+/// lifetime is a constant rather than a function of `transactions.len()`.
+///
+/// [`FORWARD_TX_BUDGET`] bounds one transaction, which on its own is not a bound on the task: a
+/// full batch against an unresponsive committee costs `transactions.len()` budgets back to
+/// back, which for a gas-full batch of roughly 1,400 transfers is close to six hours with the
+/// batch's bytes pinned throughout. This is the per-task ceiling that makes that worst case a
+/// constant. It also caps each transaction's own budget once less than one remains (see
+/// [`next_txn_budget`]), so a task cannot overrun it by a trailing [`FORWARD_TX_BUDGET`].
+///
+/// Sized to clear a healthy full batch with room to spare rather than to be tight: the forward
+/// loop is sequential, so a gas-full batch at a few tens of milliseconds per transaction is
+/// already tens of seconds of legitimate work. Transactions still unforwarded when it elapses
+/// are abandoned and counted, which forwarding being best-effort permits.
+const FORWARD_BATCH_BUDGET: Duration = Duration::from_secs(120);
+
+/// Bounds how many `forward-txns` tasks may be alive at once across every clone of one
+/// forwarder.
+///
+/// A batch that arrives with every permit taken is dropped rather than queued: awaiting a permit
+/// would move the unboundedness from live tasks into pending callers instead of removing it, and
+/// shedding at the door is strictly better than shedding by OOM. Dropping is already this path's
+/// failure mode when no endpoint is usable, and forwarding is documented as best-effort by its
+/// only caller.
+///
+/// Sized against what one permit can pin. A sealed batch is capped at `max_batch_size()`
+/// (1,000,000 bytes), so a full complement of forwards holds on the order of 64 MB of
+/// transaction bytes, each for at most [`FORWARD_BATCH_BUDGET`]. It is not smaller because a
+/// healthy forward is not instantaneous: the task walks its batch one transaction at a time, so
+/// a gas-full batch occupies its permit for seconds even when every endpoint answers promptly,
+/// and a tighter cap would shed batches an unstressed node could have delivered.
+const MAX_CONCURRENT_FORWARDS: usize = 64;
 
 /// JSON-RPC error codes reth returns for a validator-local, transient condition (a full pool,
 /// `-32003`, or an internal/IO error, `-32603`) rather than a verdict on the transaction itself.
@@ -292,6 +328,13 @@ pub struct WorkerRpcForwarder {
     policy: ForwardTargetPolicy,
     /// Providers and refusals for the currently advertised endpoints.
     cache: Arc<Mutex<EndpointCache>>,
+    /// Admission control for the background forwards: one permit per live `forward-txns` task,
+    /// [`MAX_CONCURRENT_FORWARDS`] of them.
+    ///
+    /// Shared through the `Arc` by every clone of this forwarder, which is what makes the cap
+    /// node-wide rather than per-clone. A permit is taken before the spawn and moved into the
+    /// task, so capacity comes back when a forward actually finishes.
+    forwards_in_flight: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for WorkerRpcForwarder {
@@ -303,8 +346,17 @@ impl std::fmt::Debug for WorkerRpcForwarder {
 impl WorkerRpcForwarder {
     /// Create a new forwarder that runs forwards on `task_spawner` and dials only the advertised
     /// hosts `policy` admits.
+    ///
+    /// Registering the forwarder's counters here means a node that never sheds still exports
+    /// them from start, so an absent series stays distinguishable from a broken exporter.
     pub fn new(task_spawner: TaskSpawner, policy: ForwardTargetPolicy) -> Self {
-        Self { task_spawner, policy, cache: Arc::new(Mutex::new(EndpointCache::default())) }
+        ForwarderMetrics::init();
+        Self {
+            task_spawner,
+            policy,
+            cache: Arc::new(Mutex::new(EndpointCache::default())),
+            forwards_in_flight: Arc::new(Semaphore::new(MAX_CONCURRENT_FORWARDS)),
+        }
     }
 
     /// Resolve the advertised endpoints to providers, reusing cached ones where the endpoint
@@ -374,34 +426,50 @@ impl WorkerRpcForwarder {
             })
             .collect()
     }
-}
 
-impl TxnForwarder for WorkerRpcForwarder {
-    fn forward_txns(
+    /// Spawn the background task that forwards one batch, holding `permit` for its lifetime.
+    ///
+    /// Split out from [`TxnForwarder::forward_txns`] so the admission decision and the work it
+    /// admits read separately. The task is bounded in both directions that matter: `permit` caps
+    /// how many of these exist at once ([`MAX_CONCURRENT_FORWARDS`]), and the batch deadline
+    /// caps how long this one lives ([`FORWARD_BATCH_BUDGET`]). The transaction bytes a node can
+    /// have pinned in forwards at any moment are therefore the product of two constants rather
+    /// than a function of its inbound rate.
+    fn spawn_forward(
         &self,
+        permit: OwnedSemaphorePermit,
         transactions: Vec<Vec<u8>>,
         committee_slots: Vec<BlsPublicKey>,
-        validator_rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+        committee_size: u64,
+        providers: BTreeMap<BlsPublicKey, RootProvider>,
     ) {
-        let committee_size = committee_slots.len() as u64;
-        if transactions.is_empty() || committee_size == 0 || validator_rpcs.is_empty() {
-            return;
-        }
-
-        let providers = self.cached_providers(&validator_rpcs);
-        if providers.is_empty() {
-            warn!(
-                target: "worker::forward",
-                "no usable validator RPC endpoints; dropping forwarded transactions"
-            );
-            return;
-        }
         // Fallback order: every usable endpoint, so a transaction whose owning validator has
         // not advertised (or is unreachable) can still reach the committee.
         let fallbacks: Vec<BlsPublicKey> = providers.keys().cloned().collect();
 
         self.task_spawner.spawn_task("forward-txns", async move {
-            for tx in &transactions {
+            // Moved in rather than released when `forward_txns` returned, so capacity comes
+            // back when this forward actually finishes.
+            let _permit = permit;
+            let deadline = Instant::now() + FORWARD_BATCH_BUDGET;
+            let queued = transactions.len();
+            let mut delivered = 0_usize;
+            let mut rejected = 0_usize;
+            let mut unreached = 0_usize;
+            // `map_while` is what ends the batch at the deadline: it runs as the loop pulls each
+            // transaction, so every iteration sees the budget left at that moment and the batch
+            // stops at the first transaction that finds none.
+            let budgeted = transactions
+                .iter()
+                .map_while(|tx| next_txn_budget(deadline, Instant::now()).map(|left| (tx, left)));
+
+            for (tx, txn_budget) in budgeted {
+                // A budget below [`FORWARD_TX_BUDGET`] means the batch deadline is what clamped
+                // it (see [`next_txn_budget`]). On its own that says nothing about how this
+                // transaction ends: a clamped budget can still carry a whole fast-failing
+                // fallback chain to a real verdict, so the tally below also requires that the
+                // budget actually expired.
+                let deadline_clamped = txn_budget < FORWARD_TX_BUDGET;
                 // Route by sender so all transactions from one account land on the same
                 // validator (matches `submit_txn_if_mine`), then fall back to any endpoint.
                 let owner = owning_validator(tx, committee_size, &committee_slots);
@@ -410,7 +478,7 @@ impl TxnForwarder for WorkerRpcForwarder {
                 // Bound the whole fallback chain for this transaction: even if every advertised
                 // validator accepts the connection but never answers, one transaction cannot cost
                 // more than `FORWARD_TX_BUDGET` before the next transaction proceeds.
-                let outcome = timeout(FORWARD_TX_BUDGET, async {
+                let chain = timeout(txn_budget, async {
                     let mut tried = BTreeSet::new();
                     let mut result = ForwardOutcome::NoEndpointReached;
                     for key in ordered {
@@ -456,25 +524,138 @@ impl TxnForwarder for WorkerRpcForwarder {
                     }
                     result
                 })
-                .await
-                .unwrap_or(ForwardOutcome::NoEndpointReached);
+                .await;
+                // `Err` from the timeout is the budget itself expiring, as opposed to the
+                // chain returning [`ForwardOutcome::NoEndpointReached`] as a verdict; the
+                // tally below needs the two apart, so remember which happened before
+                // collapsing them into one outcome.
+                let budget_expired = chain.is_err();
+                let outcome = chain.unwrap_or(ForwardOutcome::NoEndpointReached);
 
                 match outcome {
-                    ForwardOutcome::Delivered => {}
-                    ForwardOutcome::Rejected(reason) => warn!(
-                        target: "worker::forward",
-                        reason = %reason,
-                        "a validator rejected the forwarded transaction; not retrying other validators"
-                    ),
-                    ForwardOutcome::NoEndpointReached => warn!(
-                        target: "worker::forward",
-                        "could not forward transaction to any advertised validator RPC"
-                    ),
+                    ForwardOutcome::Delivered => delivered += 1,
+                    ForwardOutcome::Rejected(reason) => {
+                        rejected += 1;
+                        warn!(
+                            target: "worker::forward",
+                            reason = %reason,
+                            "a validator rejected the forwarded transaction; not retrying other validators"
+                        )
+                    }
+                    // A deadline-clamped budget expired mid-chain: the batch budget, not
+                    // endpoint behavior, is what cut this transaction short, so it belongs to
+                    // the abandoned remainder below, not to `unreached`. Both conditions
+                    // matter: an expired *full* budget is endpoint behavior (a chain of
+                    // unresponsive validators), and a verdict reached inside a clamped budget
+                    // is a real verdict; each of those counts as `unreached` in the arm below.
+                    ForwardOutcome::NoEndpointReached if budget_expired && deadline_clamped => {
+                        warn!(
+                            target: "worker::forward",
+                            "batch budget expired before this transaction could reach a validator RPC"
+                        )
+                    }
+                    ForwardOutcome::NoEndpointReached => {
+                        unreached += 1;
+                        warn!(
+                            target: "worker::forward",
+                            "could not forward transaction to any advertised validator RPC"
+                        )
+                    }
                 }
+            }
+
+            // Everything the batch deadline cut off: whatever `map_while` stopped short of,
+            // plus any transaction whose deadline-clamped budget expired mid-chain. Derived
+            // from the individual outcome tallies rather than from a count of loop iterations
+            // so a sliver-budget transaction counts as abandoned instead of passing as a
+            // full-budget attempt. Counted as well as logged: a batch the node accepted and
+            // then gave up on is an absorbed failure, invisible otherwise.
+            let abandoned = queued.saturating_sub(delivered + rejected + unreached);
+            if abandoned > 0 {
+                warn!(
+                    target: "worker::forward",
+                    abandoned,
+                    delivered,
+                    rejected,
+                    unreached,
+                    budget_secs = FORWARD_BATCH_BUDGET.as_secs(),
+                    "batch forward budget elapsed; abandoning the rest of the batch"
+                );
+                ForwarderMetrics::record_txns_abandoned(
+                    u64::try_from(abandoned).unwrap_or(u64::MAX),
+                );
             }
             Ok(())
         });
     }
+}
+
+impl TxnForwarder for WorkerRpcForwarder {
+    fn forward_txns(
+        &self,
+        transactions: Vec<Vec<u8>>,
+        committee_slots: Vec<BlsPublicKey>,
+        validator_rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+    ) {
+        let committee_size = committee_slots.len() as u64;
+        let queued = transactions.len();
+        // Nothing to forward, or nowhere to forward it to: neither is a fault, so neither warns.
+        let discovered = (queued > 0 && committee_size > 0 && !validator_rpcs.is_empty())
+            .then(|| self.cached_providers(&validator_rpcs));
+        // Endpoints were advertised but none of them resolved to a usable provider. That is a
+        // fault, and the batch is dropped for it.
+        let admissible = discovered.filter(|providers| {
+            let usable = !providers.is_empty();
+            if !usable {
+                warn!(
+                    target: "worker::forward",
+                    "no usable validator RPC endpoints; dropping forwarded transactions"
+                );
+            }
+            usable
+        });
+
+        // Admission control. Reached after the cache refresh above, so eviction of
+        // no-longer-advertised endpoints keeps happening while batches are being shed, and
+        // before any spawn here, so a batch this node has no capacity to forward never becomes
+        // a forward task holding its bytes. (The upstream `disburse-txns` spawn that delivers
+        // the batch to this call is pre-existing and tracked by issue #1132.) Try-acquire, not
+        // acquire: see [`MAX_CONCURRENT_FORWARDS`] for why a batch that finds no permit is
+        // dropped rather than queued behind one.
+        if let Some(providers) = admissible {
+            Arc::clone(&self.forwards_in_flight).try_acquire_owned().map_or_else(
+                |_| {
+                    warn!(
+                        target: "worker::forward",
+                        transactions = queued,
+                        capacity = MAX_CONCURRENT_FORWARDS,
+                        "forward capacity exhausted; dropping a sealed batch rather than queueing it"
+                    );
+                    ForwarderMetrics::record_batch_shed();
+                },
+                move |permit| {
+                    self.spawn_forward(
+                        permit,
+                        transactions,
+                        committee_slots,
+                        committee_size,
+                        providers,
+                    )
+                },
+            )
+        }
+    }
+}
+
+/// Budget for the next transaction of a batch whose whole-batch deadline is `deadline`.
+///
+/// `None` once `now` has reached the deadline, which is how a batch stops early rather than
+/// running for `transactions.len()` per-transaction budgets. Otherwise the per-transaction
+/// [`FORWARD_TX_BUDGET`], clamped to whatever is left, so the last transaction a batch attempts
+/// cannot carry its task past [`FORWARD_BATCH_BUDGET`].
+fn next_txn_budget(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    (!remaining.is_zero()).then(|| remaining.min(FORWARD_TX_BUDGET))
 }
 
 /// Return the BLS key of the committee slot that owns `tx_bytes`, matching the receiver-side
@@ -543,6 +724,7 @@ fn classify_server_error(code: i64, message: String) -> Disposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rand::{rngs::StdRng, SeedableRng};
     use tn_types::{BlsKeypair, TaskManager};
 
@@ -553,6 +735,40 @@ mod tests {
 
     fn test_forwarder_with(policy: ForwardTargetPolicy) -> WorkerRpcForwarder {
         WorkerRpcForwarder::new(TaskManager::default().get_spawner(), policy)
+    }
+
+    /// [`MAX_CONCURRENT_FORWARDS`] as the width the semaphore API wants.
+    fn max_permits() -> u32 {
+        u32::try_from(MAX_CONCURRENT_FORWARDS).unwrap_or(u32::MAX)
+    }
+
+    /// An endpoint that completes the TCP handshake and then never answers.
+    ///
+    /// This is the condition the batch budget exists for: a refused connection fails fast and
+    /// costs nothing, so only an endpoint that accepts and hangs makes a forward spend its
+    /// budget. Accepted connections are held for the life of the process; the collect never
+    /// finishes, which is what keeps them open. `map_while` is what ends the accept loop on a
+    /// persistent accept failure (say EMFILE once enough sockets are held): `incoming()` yields
+    /// `Err` repeatedly in that state, and a plain `flatten` would swallow every one and leave
+    /// this thread busy-spinning for the rest of the process.
+    fn blackhole_endpoint() -> eyre::Result<String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        std::thread::spawn(move || {
+            let _held: Vec<std::net::TcpStream> =
+                listener.incoming().map_while(Result::ok).collect();
+        });
+        Ok(format!("http://{addr}"))
+    }
+
+    /// Read one counter out of a recorder snapshot, `None` if the series is not registered.
+    fn counter(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> Option<u64> {
+        snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+            (key.key().name() == name).then_some(value).and_then(|value| match value {
+                DebugValue::Counter(count) => Some(count),
+                DebugValue::Gauge(_) | DebugValue::Histogram(_) => None,
+            })
+        })
     }
 
     fn test_key(seed: u8) -> BlsPublicKey {
@@ -621,6 +837,128 @@ mod tests {
         assert_eq!(
             cached_urls(&forwarder),
             vec!["http://validator-one.example.com:8545/".to_string()]
+        );
+        Ok(())
+    }
+
+    /// The per-transaction budget is clamped to what is left of the batch budget, and runs out
+    /// with it. This is what makes a task's lifetime a constant instead of a per-batch quantity.
+    #[test]
+    fn next_txn_budget_clamps_to_the_batch_deadline_then_ends_the_batch() {
+        let now = Instant::now();
+
+        // A whole batch budget left: a transaction still gets only its own budget.
+        assert_eq!(next_txn_budget(now + FORWARD_BATCH_BUDGET, now), Some(FORWARD_TX_BUDGET));
+        // Less than one transaction's budget left: clamped, so the last transaction a batch
+        // attempts cannot carry its task past the batch deadline.
+        let sliver = FORWARD_TX_BUDGET / 3;
+        assert_eq!(next_txn_budget(now + sliver, now), Some(sliver));
+        // At the deadline, and past it: no budget, which is how the batch stops.
+        assert_eq!(next_txn_budget(now, now), None);
+        assert_eq!(next_txn_budget(now, now + FORWARD_TX_BUDGET), None);
+    }
+
+    /// With every permit in flight, an arriving batch is dropped at the door.
+    ///
+    /// The bound has to be on live forwards rather than on arrival rate, because arrival rate is
+    /// set by inbound transaction volume and completion rate by remote endpoints. Neither is
+    /// this node's to control, so nothing couples them but this.
+    #[test]
+    fn forward_txns_sheds_a_batch_when_every_permit_is_in_flight() -> eyre::Result<()> {
+        let forwarder = test_forwarder();
+        // A public-host fixture: this test never dials (no permit is free), and the default
+        // policy must admit the endpoint so the batch reaches admission at all.
+        let rpcs = vec![(test_key(1), test_rpc("http://validator-one.example.com:8545")?)];
+        // Stand in for `MAX_CONCURRENT_FORWARDS` forwards already running.
+        let _in_flight =
+            Arc::clone(&forwarder.forwards_in_flight).try_acquire_many_owned(max_permits())?;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            forwarder.forward_txns(vec![vec![0_u8; 32]], vec![test_key(1)], rpcs);
+        });
+
+        // No permit was free, so none was taken, and the shed is visible as a counter rather
+        // than only as a log line.
+        assert_eq!(forwarder.forwards_in_flight.available_permits(), 0);
+        assert_eq!(counter(&snapshotter, "tn_reth.forwarded_batches_shed_total"), Some(1));
+        Ok(())
+    }
+
+    /// A forward takes exactly one permit before it is spawned and returns it when the task
+    /// ends, so capacity tracks forwards that are actually running.
+    #[tokio::test]
+    async fn forward_txns_holds_one_permit_for_the_life_of_the_task() -> eyre::Result<()> {
+        // A port with nothing behind it: the forward fails fast, so the task ends promptly.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = closed.local_addr()?;
+        drop(closed);
+
+        // The manager outlives the forward: dropping it would shut the spawned task down and
+        // release the permit for the wrong reason.
+        let manager = TaskManager::default();
+        // `AllowPrivate`: the fixture endpoint is a loopback socket, which the shipped default
+        // policy would refuse before the admission control under test was ever reached.
+        let forwarder =
+            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate);
+        let rpcs = vec![(test_key(1), test_rpc(&format!("http://{addr}"))?)];
+        forwarder.forward_txns(vec![vec![0_u8; 32]], vec![test_key(1)], rpcs);
+
+        // The spawned task has not been polled yet, so the permit it holds is observable here.
+        assert_eq!(forwarder.forwards_in_flight.available_permits(), MAX_CONCURRENT_FORWARDS - 1);
+
+        // Draining every permit can only complete once the task has dropped the one it took.
+        let drained = timeout(
+            Duration::from_secs(30),
+            Arc::clone(&forwarder.forwards_in_flight).acquire_many_owned(max_permits()),
+        )
+        .await;
+        assert!(drained.is_ok(), "forward task never released its permit");
+        Ok(())
+    }
+
+    /// A batch stops at [`FORWARD_BATCH_BUDGET`] instead of paying one budget per transaction.
+    ///
+    /// Three advertised slots sit behind one blackholed endpoint, so a transaction exhausts its
+    /// whole fallback chain and costs the full [`FORWARD_TX_BUDGET`]. Twenty of them is five
+    /// minutes of work, and without a per-task ceiling the task would live for all of it with
+    /// the batch's bytes pinned. Time is virtual here, so the test measures that shape without
+    /// waiting for it.
+    #[tokio::test(start_paused = true)]
+    async fn forward_txns_abandons_the_rest_of_a_batch_at_the_batch_budget() -> eyre::Result<()> {
+        let endpoint = blackhole_endpoint()?;
+        let manager = TaskManager::default();
+        // `AllowPrivate`: the fixture endpoint is a loopback socket, which the shipped default
+        // policy would refuse before the admission control under test was ever reached.
+        let forwarder =
+            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate);
+        let slots = vec![test_key(1), test_key(2), test_key(3)];
+        let rpcs = slots
+            .iter()
+            .map(|key| test_rpc(&endpoint).map(|rpc| (*key, rpc)))
+            .collect::<eyre::Result<Vec<_>>>()?;
+
+        let start = Instant::now();
+        forwarder.forward_txns(vec![vec![0_u8; 32]; 20], slots, rpcs);
+        let drained = timeout(
+            Duration::from_secs(3600),
+            Arc::clone(&forwarder.forwards_in_flight).acquire_many_owned(max_permits()),
+        )
+        .await;
+        assert!(drained.is_ok(), "forward task was still running an hour in");
+
+        // Positive control: the budget has to be what stopped the batch. If the endpoint had
+        // failed fast instead of hanging, the batch would finish in no time and the ceiling
+        // below would hold vacuously.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= FORWARD_BATCH_BUDGET,
+            "batch finished in {elapsed:?}, so the budget was never the binding limit"
+        );
+        assert!(
+            elapsed <= FORWARD_BATCH_BUDGET + FORWARD_TX_BUDGET,
+            "batch ran {elapsed:?}, past its {FORWARD_BATCH_BUDGET:?} budget"
         );
         Ok(())
     }

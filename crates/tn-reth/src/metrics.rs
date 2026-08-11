@@ -1,12 +1,19 @@
 //! Prometheus metrics for the reth execution environment.
 //!
-//! Two counter series are exported under the `tn_reth` scope, both counting transactions that
-//! `build_block_from_batch_payload` declines to include in a block:
-//! `tn_reth.unrecoverable_txs_dropped_total` (alertable — a certified batch carried a
-//! transaction whose signer could not be recovered) and `tn_reth.invalid_txs_skipped_total`
-//! (expected — duplicates/invalid transactions across independently-batching workers). See
-//! [`RethEnvMetrics`] for per-series semantics. [`report_db_metrics`] additionally samples reth
-//! database metrics as a pre-scrape hook.
+//! Four counter series are exported under the `tn_reth` scope, in two unrelated groups.
+//!
+//! Block building. Two series count transactions that `build_block_from_batch_payload`
+//! declines to include in a block: `tn_reth.unrecoverable_txs_dropped_total` (alertable - a
+//! certified batch carried a transaction whose signer could not be recovered) and
+//! `tn_reth.invalid_txs_skipped_total` (expected - duplicates/invalid transactions across
+//! independently-batching workers). See [`RethEnvMetrics`] for per-series semantics.
+//!
+//! Observer transaction forwarding. Two series count work the forwarder
+//! ([`crate::WorkerRpcForwarder`]) sheds to stay within its own bounds:
+//! `tn_reth.forwarded_batches_shed_total` and `tn_reth.forwarded_txns_abandoned_total`. See
+//! [`ForwarderMetrics`] for per-series semantics.
+//!
+//! [`report_db_metrics`] additionally samples reth database metrics as a pre-scrape hook.
 //!
 //! Three gauges under the same scope report what the epoch-boundary system calls spend against
 //! the budget they run under: [`EPOCH_CLOSE_SYSTEM_CALL_GAS_USED`] (labelled by `call`),
@@ -32,8 +39,10 @@
 //!
 //! Everything here binds to the process-global `metrics` recorder, so
 //! `tn_metrics::install_recorder` must run first — the node installs it before opening the
-//! database (`RethEnv::new_database`), and [`init`] (called from `RethEnv::new`) then forces
-//! registration so both counters exist at zero from process start.
+//! database (`RethEnv::new_database`), and the two registration entry points ([`init`], called
+//! from `RethEnv::new`, and [`ForwarderMetrics::init`], called from
+//! `WorkerRpcForwarder::new`) then force registration so every counter exists at zero from
+//! process start.
 
 use reth_metrics::{metrics::Counter, Metrics};
 use std::sync::LazyLock;
@@ -94,6 +103,59 @@ pub(crate) struct RethEnvMetrics {
     /// second copy is skipped as a duplicate. A steady nonzero rate is normal operation. The
     /// alertable counter is [`RethEnvMetrics::unrecoverable_txs_dropped_total`].
     pub(crate) invalid_txs_skipped_total: Counter,
+}
+
+/// Counter names for the observer forwarder, kept next to their only emission sites so the
+/// registration in [`ForwarderMetrics::init`] and the increments below cannot drift apart.
+const FORWARDED_BATCHES_SHED: &str = "tn_reth.forwarded_batches_shed_total";
+const FORWARDED_TXNS_ABANDONED: &str = "tn_reth.forwarded_txns_abandoned_total";
+
+/// Metrics for the observer transaction forwarder ([`crate::WorkerRpcForwarder`]).
+///
+/// Both series count forwarding work the node deliberately gives up on to keep its own
+/// resource use bounded. Forwarding is best-effort, so shedding is a correct outcome rather
+/// than an error - but it is an *absorbed* failure, invisible until it is not, which is
+/// exactly the category that needs to show up somewhere other than a `warn!` line. Transactions
+/// counted here were accepted by this node's RPC and never handed to a validator.
+///
+/// Associated functions rather than instance handles, matching the epoch manager's
+/// `record_provider_fault_retry`: the emission sites are inside a spawned task that holds no
+/// metrics handle, and late binding to the current recorder is what makes the counters
+/// observable from a unit test.
+pub(crate) struct ForwarderMetrics;
+
+impl ForwarderMetrics {
+    /// Register both forwarder counters with the current recorder without recording an event.
+    ///
+    /// Called from `WorkerRpcForwarder::new`, which runs at epoch start, long after the CLI
+    /// installs the global recorder. The reason to register eagerly is the same one [`init`]
+    /// documents for the block-building counters: an absent series is indistinguishable from a
+    /// broken exporter or a mistyped name, and a `rate()` over a series whose first sample is
+    /// already nonzero renders no step, so a one-shot shed burst on an otherwise quiet node
+    /// would stay invisible.
+    pub(crate) fn init() {
+        metrics::counter!(FORWARDED_BATCHES_SHED).increment(0);
+        metrics::counter!(FORWARDED_TXNS_ABANDONED).increment(0);
+    }
+
+    /// Count one sealed batch dropped without being forwarded because every forward permit was
+    /// already in flight (`MAX_CONCURRENT_FORWARDS`).
+    ///
+    /// Alertable on a sustained rate. An occasional shed means one committee RPC window was
+    /// slow; a sustained one means this node is accepting transactions faster than it can hand
+    /// them on, and the transactions it sheds are lost to the network unless resubmitted.
+    pub(crate) fn record_batch_shed() {
+        metrics::counter!(FORWARDED_BATCHES_SHED).increment(1);
+    }
+
+    /// Count transactions left unforwarded because their batch hit `FORWARD_BATCH_BUDGET`.
+    ///
+    /// Distinct from a shed batch: these belong to a batch that was admitted and partly
+    /// forwarded, so a nonzero value means committee endpoints were slow enough that one batch
+    /// could not be walked inside its budget.
+    pub(crate) fn record_txns_abandoned(count: u64) {
+        metrics::counter!(FORWARDED_TXNS_ABANDONED).increment(count);
+    }
 }
 
 /// Report sampled reth database metrics (table sizes, page usage, freelist).
@@ -314,6 +376,58 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(0)));
         let (_, _, _, value) = find("tn_reth.invalid_txs_skipped_total");
         assert!(matches!(value, DebugValue::Counter(0)));
+    }
+
+    /// [`ForwarderMetrics::init`] must register both forwarder series at zero, and each record
+    /// helper must move only its own series.
+    ///
+    /// The negative half matters as much as the positive one: a single mistyped counter name
+    /// would still produce a nonzero series, so each assertion pins the other counter at the
+    /// value `init` left it with.
+    #[test]
+    fn test_forwarder_metrics_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            ForwarderMetrics::init();
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(matches!(series(&snapshot, FORWARDED_BATCHES_SHED), DebugValue::Counter(0)));
+        assert!(matches!(series(&snapshot, FORWARDED_TXNS_ABANDONED), DebugValue::Counter(0)));
+
+        metrics::with_local_recorder(&recorder, || {
+            ForwarderMetrics::record_batch_shed();
+            ForwarderMetrics::record_batch_shed();
+            ForwarderMetrics::record_txns_abandoned(7);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(matches!(series(&snapshot, FORWARDED_BATCHES_SHED), DebugValue::Counter(2)));
+        assert!(matches!(series(&snapshot, FORWARDED_TXNS_ABANDONED), DebugValue::Counter(7)));
+    }
+
+    /// One series of a [`DebuggingRecorder`] snapshot, looked up by metric name.
+    ///
+    /// A free function rather than the closures the two tests above use, because this one is
+    /// called against two different snapshots: it has to borrow from its argument rather than
+    /// from a captured binding, and a closure cannot express that lifetime. Returning an owned
+    /// value instead is not an option either, since `DebugValue` is not `Clone`.
+    fn series<'a>(
+        snapshot: &'a [(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        name: &str,
+    ) -> &'a DebugValue {
+        snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == name)
+            .map(|(.., value)| value)
+            .unwrap_or_else(|| panic!("metric {name} not registered without an event"))
     }
 
     /// Read one gauge out of a snapshot, selecting by `call` label when one is given.

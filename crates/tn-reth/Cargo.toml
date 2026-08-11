@@ -67,7 +67,7 @@ alloy-evm = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
-tokio = { workspace = true, features = ["macros", "time"] }
+tokio = { workspace = true, features = ["macros", "time", "sync"] }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
 
@@ -79,6 +79,9 @@ secp256k1 = { workspace = true }
 proptest = { workspace = true }
 rand = { workspace = true }
 tn-reth = { workspace = true, features = ["test-utils"] }
+# `rt` and `test-util` back the forwarder's bound tests: they drive spawned forwards and run
+# them on a paused clock so a two-minute budget costs no wall time.
+tokio = { workspace = true, features = ["macros", "time", "sync", "rt", "test-util"] }
 
 [features]
 default = []
