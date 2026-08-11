@@ -20,13 +20,14 @@ use tn_engine::{
 use tn_reth::{
     calculate_gas_penalty,
     error::TnRethError,
-    payload::BuildArguments,
+    payload::{BuildArguments, TNPayload},
     recover_signed_transaction,
     system_calls::EpochState,
     test_utils::{
-        calculate_withdrawals_root, create_committee_from_state,
-        seeded_genesis_from_random_batches, test_genesis_with_consensus_registry,
-        TransactionFactory, BEACON_ROOTS_ADDRESS, EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
+        calculate_withdrawals_root, consensus_output_for_tests, create_committee_from_state,
+        execute_payload_and_update_canonical_chain, seeded_genesis_from_random_batches,
+        test_genesis_with_consensus_registry, TransactionFactory, BEACON_ROOTS_ADDRESS,
+        EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
     },
     FixedBytes, ProviderError, RethChainSpec, RethEnv,
 };
@@ -2613,6 +2614,101 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
     assert_eq!(
         expected_governance_revenue, actual_governance_revenue,
         "governance revenue mismatch — penalty may be using post-refund gas instead of pre-refund gas"
+    );
+
+    Ok(())
+}
+
+/// End-to-end regression for the EIP-7702 gas-penalty bypass (issue #424 hardening).
+///
+/// A padded EIP-7702 authorization list inflates `gas.spent()` past the 10%
+/// penalty-free threshold cheaply — 25,000 gas per junk tuple — which before the
+/// fix zeroed the over-reservation penalty on a batch-hogging gas limit. The fix
+/// excludes the authorization intrinsic from the penalty basis and caps the
+/// penalty at unused gas, so `reimburse_caller` confiscates the whole unused
+/// reservation instead of refunding it.
+///
+/// Routed through `execute_payload_and_update_canonical_chain` rather than a
+/// batch: the transaction-type allowlist drops a 7702 transaction before it can
+/// reach execution, so a batch path would silently execute an empty block. This
+/// executes one padded 7702 transaction reserving the full 30M batch and asserts
+/// the governance-safe balance rose by `basefee * gas_used + penalty *
+/// effective_gas_price` — the capped penalty, applied in a real block.
+///
+/// Confirm-by-mutation: reverting `gas_penalty_and_refund` to the old
+/// `calculate_gas_penalty(gas_limit, gas_spent)` makes the penalty 0 (10.07%
+/// usage is over the threshold), the caller keeps the full refund, and the
+/// governance-revenue assertion below fails.
+#[tokio::test]
+async fn test_padded_7702_authorization_list_pays_capped_penalty() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // reserve the full batch while doing almost no real work
+    const GAS_LIMIT: u64 = 30_000_000;
+    const NUM_AUTHS: usize = 120;
+    // revm's EIP-7702 per-tuple intrinsic at Prague (reth_revm eip7702::PER_EMPTY_ACCOUNT_COST)
+    const PER_EMPTY_ACCOUNT_COST: u64 = 25_000;
+
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+    // priority fee is 0 and gas price == basefee, so effective_gas_price == basefee
+    let basefee = MIN_PROTOCOL_BASE_FEE;
+    let gas_price = basefee as u128;
+    let mut tx_factory = TransactionFactory::new();
+    let padded_tx = tx_factory
+        .create_eip7702_with_authorizations(
+            chain.genesis().config.chain_id,
+            GAS_LIMIT,
+            gas_price,
+            NUM_AUTHS,
+        )
+        .encoded_2718();
+
+    let governance_genesis_balance = reth_env
+        .retrieve_account(&GOVERNANCE_SAFE_ADDRESS)?
+        .map(|acct| acct.balance)
+        .unwrap_or(U256::ZERO);
+
+    // execute a single block containing only the padded transaction
+    let consensus_output = consensus_output_for_tests(2, 0, 1, false);
+    let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+    let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![padded_tx])?;
+    let gas_used = block.recovered_block.clone_sealed_header().gas_used;
+
+    // the padding pushed gas_used over 10% of the limit — the pre-fix path would see
+    // >=10% usage and assess no penalty at all
+    assert!(
+        gas_used > GAS_LIMIT / 10,
+        "padding must push gas_used over the 10% penalty-free threshold (got {gas_used})"
+    );
+
+    // mirror gas_penalty_and_refund with public APIs: the mismatched-chain tuples apply
+    // nothing, so there is no 7702 refund and pre-refund gas equals gas_used
+    let auth_intrinsic = NUM_AUTHS as u64 * PER_EMPTY_ACCOUNT_COST;
+    let unused_gas = GAS_LIMIT - gas_used;
+    let expected_penalty =
+        calculate_gas_penalty(GAS_LIMIT, gas_used.saturating_sub(auth_intrinsic)).min(unused_gas);
+    assert!(expected_penalty > 0, "fix must assess a nonzero penalty on the padded tx");
+
+    // governance revenue = basefee portion of gas + penalty priced at the effective gas price
+    let effective_gas_price = std::cmp::min(gas_price, basefee as u128);
+    let expected_governance_revenue = U256::from(basefee as u128 * gas_used as u128)
+        + U256::from(expected_penalty as u128 * effective_gas_price);
+
+    let governance_balance = reth_env
+        .retrieve_account(&GOVERNANCE_SAFE_ADDRESS)?
+        .map(|acct| acct.balance)
+        .expect("governance safe has an account");
+    let actual_governance_revenue = governance_balance
+        .checked_sub(governance_genesis_balance)
+        .expect("governance safe balance doesn't underflow");
+
+    assert_eq!(
+        expected_governance_revenue, actual_governance_revenue,
+        "governance revenue must include the capped 7702 penalty"
     );
 
     Ok(())

@@ -248,4 +248,79 @@ mod tests {
         let penalty = calculate_gas_penalty(210_001, 10_000);
         assert_eq!(penalty, 54_876, "Should have penalty above minimum threshold");
     }
+
+    /// A padded EIP-7702 authorization list pays a capped, near-maximal penalty.
+    ///
+    /// 120 junk tuples inflate `gas_spent` to 3,021,000 (21,000 base + 120 ×
+    /// 25,000 intrinsic) — 10.07% of a 30M limit, just over the 10% penalty-free
+    /// threshold. `gas_penalty_and_refund` strips the 3,000,000 authorization
+    /// intrinsic from the basis, so the penalty is computed at 21,000 of real
+    /// work (0.07% usage → 29,560,762 uncapped) and then capped at the 26,979,000
+    /// of actually-unused gas. The batch-hogging reservation costs the whole
+    /// unused amount; nothing is refunded.
+    #[test]
+    fn padded_7702_authorization_list_pays_a_capped_near_maximal_penalty() {
+        let gas_limit = 30_000_000;
+        let gas_spent = 3_021_000; // 21,000 + 120 * 25,000
+        let gas_used = gas_spent; // mismatched-chain tuples apply nothing, so no refund
+        let (penalty, refund) = gas_penalty_and_refund(gas_limit, gas_spent, gas_used, 120);
+
+        // the cap binds: the uncapped penalty at 21,000 of real work exceeds unused gas, so
+        // without the cap the handler would credit more than the sender prepaid (minting value)
+        let uncapped = calculate_gas_penalty(gas_limit, 21_000);
+        assert_eq!(uncapped, 29_560_762);
+        assert!(uncapped > gas_limit - gas_spent, "uncapped penalty exceeds unused gas");
+
+        assert_eq!(penalty, 26_979_000, "penalty capped at unused gas");
+        assert_eq!(refund, 0, "nothing left to refund");
+        assert_eq!(penalty + refund + gas_used, gas_limit, "gas is conserved");
+    }
+
+    /// The same 3,021,000 spend with no authorization tuples earns no penalty:
+    /// 10.07% usage is over the 10% threshold, so a transaction doing real
+    /// 3M-gas work is correctly unpenalized. This is exactly the penalty-free
+    /// state the padded transaction above bought without doing the work — the
+    /// gap the authorization-intrinsic exclusion closes.
+    #[test]
+    fn identical_spend_without_padding_is_penalty_free() {
+        let gas_limit = 30_000_000;
+        let gas_spent = 3_021_000;
+        let gas_used = gas_spent;
+        let (penalty, refund) = gas_penalty_and_refund(gas_limit, gas_spent, gas_used, 0);
+
+        assert_eq!(penalty, 0, "3.02M of real work is over the 10% threshold");
+        assert_eq!(refund, 26_979_000, "all unused gas is refunded");
+        assert_eq!(penalty + refund + gas_used, gas_limit, "gas is conserved");
+    }
+
+    /// For every non-7702 transaction (`num_authorizations == 0`) the helper is
+    /// identical to the prior inline math — `calculate_gas_penalty(gas_limit,
+    /// gas_spent)` with the refund as the remainder — and the cap never binds.
+    /// Pins the "zero drift for existing traffic" guarantee across a spread of
+    /// gas profiles, including a below-threshold case with a real nonzero penalty
+    /// and a case where an SSTORE refund makes `gas_used < gas_spent`.
+    #[test]
+    fn zero_authorizations_matches_prior_inline_math() {
+        // (gas_limit, gas_spent, gas_used); gas_spent >= gas_used always holds
+        let cases = [
+            (30_000_000u64, 21_000u64, 21_000u64), // extreme over-reserve, near-maximal penalty
+            (1_000_000, 99_000, 99_000),           // 9.9% usage, small penalty
+            (1_000_000, 500_000, 495_200),         // >10% usage, no penalty, gas_used < gas_spent
+            (210_000, 21_000, 21_000),             // at threshold, no penalty
+            (100_000, 21_000, 21_000),             // below MIN_GAS_LIMIT_THRESHOLD, no penalty
+        ];
+        for (gas_limit, gas_spent, gas_used) in cases {
+            let (penalty, refund) = gas_penalty_and_refund(gas_limit, gas_spent, gas_used, 0);
+            let expected_penalty = calculate_gas_penalty(gas_limit, gas_spent);
+            let unused = gas_limit - gas_used;
+
+            assert_eq!(
+                penalty, expected_penalty,
+                "penalty matches prior math for {gas_limit}/{gas_spent}"
+            );
+            assert_eq!(refund, unused - expected_penalty, "refund is the remainder");
+            assert!(penalty <= unused, "cap never binds for non-7702");
+            assert_eq!(penalty + refund + gas_used, gas_limit, "gas is conserved");
+        }
+    }
 }
