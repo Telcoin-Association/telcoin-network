@@ -39,13 +39,17 @@
 //!
 //! # Archive-mode assumption (every pinned read)
 //!
-//! A pinned read is only as deterministic as the history under it. This node never constructs
-//! a pruner — `PruningArgs` in `cli.rs` is built with every field disabled — so historical
-//! state always resolves fully indexed. If pruning were ever enabled, reth's historical
-//! provider could silently fall back to TIP state for a pruned block, turning a "pinned" read
-//! into exactly the nondeterminism pinning exists to prevent. Every pinned read here builds its
-//! state through the one `pinned_state_and_env` helper, which carries the normative ARCHIVE-MODE
-//! note; revisit it before enabling pruning.
+//! A pinned read is only as deterministic as the history under it. This node keeps full history:
+//! `PruningArgs` in `cli.rs` is built with every field disabled, `RethConfig::ensure_archive_mode`
+//! refuses to start a node whose configuration requests pruning, and `etc/archive-mode-guard.sh`
+//! fails the build if a pruner entry point is introduced. Every pinned read here builds its state
+//! through the one `pinned_state_and_env` helper, which carries the normative ARCHIVE-MODE note
+//! and spells out the three ways "history is missing" can present: a loud error below a recorded
+//! prune watermark, silent tip substitution above one, and silent never-written reads on a
+//! datadir truncated without one. For reads built through this helper, the last is refused on
+//! restored datadirs by the RESTORED-DATADIR FLOOR check; a read that bypasses the helper
+//! (`read_contract_inner`) is not floor-guarded. Revisit that note before relaxing either
+//! guard.
 //!
 //! # Error classification
 //!
@@ -753,13 +757,47 @@ impl RethEnv {
     /// [`StateReadError::ChainGlobal`] (a deterministic function of the header's own fields and
     /// the chain spec, identical on every node).
     ///
-    /// ARCHIVE-MODE ASSUMPTION: this node never constructs a pruner (`PruningArgs` are built
-    /// with every field disabled and no `PrunerBuilder` exists in the repo), so
-    /// `state_by_block_hash` always resolves fully indexed history. If pruning is ever enabled,
-    /// reth's `HistoricalStateProvider` can hit a missing history shard and return
-    /// `HistoryInfo::MaybeInPlainState`, silently falling back to TIP state for this "pinned"
-    /// read — exactly the nondeterminism pinning exists to prevent. Revisit every pinned read
-    /// before enabling pruning.
+    /// ARCHIVE-MODE ASSUMPTION: this node keeps fully indexed history, so `state_by_block_hash`
+    /// resolves the state at the pinned block rather than some later state. Every pinned read in
+    /// this crate funnels through here except `read_contract_inner`, which builds its state from
+    /// `read_only_state_db` directly and carries its own note (`env/helpers.rs`), so this is the
+    /// place that assumption has to hold. It is enforced at two levels:
+    /// `RethConfig::ensure_archive_mode` refuses to start a node whose configuration requests
+    /// pruning, and `etc/archive-mode-guard.sh` fails the build if a pruner entry point or a
+    /// reth.toml loader is introduced anywhere under `crates/`, `bin/`, or `examples/`.
+    ///
+    /// Three failure modes hide behind "history is missing", and only one of them is loud. Keep
+    /// them apart: which one you get turns on whether a prune checkpoint was ever written.
+    ///
+    /// With pruning CONFIGURED and the pinned block strictly BELOW the recorded watermark, reth
+    /// fails loudly. `HistoricalStateProviderRef` compares the block against the account- and
+    /// storage-history watermarks it derives from the `PruneCheckpoints` table and returns
+    /// `ProviderError::StateAtBlockPruned`, which arrives here as [`StateReadError::Provider`].
+    /// Nothing is served wrong; the read just fails, mid-consensus. The startup check exists to
+    /// turn that into a refusal to start.
+    ///
+    /// With pruning CONFIGURED and the pinned block AT OR ABOVE the watermark, it is not loud. If
+    /// the key's own history shards were pruned away, `HistoryInfo::MaybeInPlainState` classifies
+    /// the lookup and the read silently serves PLAIN (tip) state. That arm is reached only when a
+    /// prune checkpoint exists, so pruning is the only thing that substitutes tip state for
+    /// pinned state.
+    ///
+    /// With history missing and NO prune checkpoint (an externally truncated datadir, or a node
+    /// restored from a snapshot with no pre-snapshot history), the watermarks are never set, so
+    /// nothing errors and nothing falls back to tip. A key with no surviving shard classifies as
+    /// `HistoryInfo::NotYetWritten` and the read returns `Ok(None)`: the account or slot reads as
+    /// never written, rather than as its value at the pinned block. That is a property of the
+    /// datadir rather than of the configuration, so no startup config check can see it.
+    ///
+    /// The last two are both silent and both defeat the point of pinning. The startup check
+    /// refuses the second only for this node's own configuration; a datadir some other binary
+    /// already pruned still reaches it, because the check reads config, not the datadir. The
+    /// RESTORED-DATADIR FLOOR below refuses the snapshot-restore instance of the third for
+    /// every read built here, while a read that bypasses this helper (`read_contract_inner`) is
+    /// not floor-guarded and a datadir truncated outside the snapshot restorer stays silent;
+    /// per the maintainer call on PR #1060 (2026-08-10), a non-genesis start without a snapshot
+    /// is not a supported configuration, so that last case is out of scope. Revisit every
+    /// pinned read before relaxing any of these guards.
     ///
     /// RESTORED-DATADIR FLOOR: a datadir bootstrapped from a snapshot holds state ONLY at the
     /// snapshot's final block `B` — window headers below `B` carry real, resolvable hashes but

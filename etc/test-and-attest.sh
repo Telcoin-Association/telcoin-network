@@ -78,6 +78,10 @@ if [ -n "$MODIFIED_TRACKED_FILES" ]; then
     exit 1
 fi
 
+# guard the archive-mode assumption every pinned consensus-registry read depends on (compiles
+# nothing, so it runs first and fails fast)
+./etc/archive-mode-guard.sh
+
 # check cargo fmt first
 cargo +$NIGHTLY fmt -- --check
 

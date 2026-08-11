@@ -343,6 +343,14 @@ impl RethEnv {
     /// On-chain reverts surface as [`EvmReadError::Revert`] (raw output + decoded reason);
     /// everything else — state-db construction, EVM env construction, transact errors, and
     /// `Halt` — collapses into [`EvmReadError::Internal`].
+    ///
+    /// ARCHIVE-MODE ASSUMPTION: this is a pinned read. It builds its state from
+    /// `read_only_state_db` directly rather than through `pinned_state_and_env`, so it
+    /// does not inherit that helper's note, but it depends on fully indexed history for exactly
+    /// the same reason. `RethConfig::ensure_archive_mode` refuses to start a node whose
+    /// configuration requests pruning, and `etc/archive-mode-guard.sh` fails the build if a pruner
+    /// entry point is introduced. See `pinned_state_and_env` in `env/epoch.rs` for the normative
+    /// note and the three ways "history is missing" can present.
     fn read_contract_inner(
         &self,
         header: &SealedHeader,

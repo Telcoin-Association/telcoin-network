@@ -478,4 +478,38 @@ mod tests {
             "error must name the ConsensusRegistry revert, got: {err:#}"
         );
     }
+
+    /// The archive-mode guard is wired into [`RethEnv::new`], so a pruning configuration stops
+    /// node startup rather than only failing an isolated check nothing calls.
+    ///
+    /// `RethEnv::new` is the chokepoint every env in the process passes through, which is why the
+    /// check lives there and why this test asserts the WIRING rather than the predicate (the
+    /// predicate itself is covered by the `ensure_archive_mode` tests in `cli.rs`).
+    #[tokio::test]
+    async fn test_reth_env_new_rejects_pruned_config() -> eyre::Result<()> {
+        init_txpool_defaults();
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Archive Mode Test Task Manager");
+        let mut config = RethConfig(NodeConfig {
+            datadir: DatadirArgs {
+                datadir: MaybePlatformPath::from(tmp_dir.path().to_path_buf()),
+                static_files_path: None,
+                rocksdb_path: None,
+                pprof_dumps_path: None,
+            },
+            chain,
+            ..NodeConfig::default()
+        });
+        let database = RethEnv::new_database(&config, tmp_dir.path())?;
+
+        // enable pruning only after the database exists, so the guard is the sole reason for the
+        // failure below
+        config.0.pruning.account_history_distance = Some(128);
+
+        let err = RethEnv::new(&config, &task_manager, database, None, GasAccumulator::default())
+            .expect_err("RethEnv::new must refuse a pruned config");
+        assert!(err.to_string().contains("archive mode"), "unexpected error: {err}");
+        Ok(())
+    }
 }
