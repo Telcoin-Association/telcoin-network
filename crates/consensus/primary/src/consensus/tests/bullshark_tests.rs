@@ -17,7 +17,7 @@ use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStor
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     AuthorityIdentifier, ConsensusHeaderDigest, ConsensusNumHash, EpochDigest, EpochRecord,
-    ExecHeader, Header, Notifier, SealedHeader, TaskManager, TnReceiver, TnSender, B256,
+    ExecHeader, Header, SealedHeader, ShutdownNotifier, TaskManager, TnReceiver, TnSender, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tracing::info;
@@ -832,8 +832,8 @@ async fn committed_round_after_restart() {
         Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
     let (certificates, _) = make_certificates_with_epoch(&committee, 1..=11, epoch, &genesis, &ids);
 
-    let config = fixture.authorities().next().unwrap().consensus_config();
-    let store = config.node_storage().clone();
+    let fixture_config = fixture.authorities().next().unwrap().consensus_config();
+    let store = fixture_config.node_storage().clone();
     let temp_dir = TempDir::new().unwrap();
     let consensus_chain =
         ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
@@ -847,6 +847,17 @@ async fn committed_round_after_restart() {
 
     let mut consensus_number = 0u64;
     for input_round in (1..=11usize).step_by(2) {
+        // Build a fresh config for each restart so its one-shot shutdown cannot
+        // leak across iterations; node storage is shared so committed state
+        // survives the restart (same pattern as `restart_with_new_committee`).
+        let config = ConsensusConfig::new_with_committee_for_test(
+            fixture_config.config().clone(),
+            fixture_config.node_storage().clone(),
+            fixture_config.key_config().clone(),
+            committee.clone(),
+            NetworkConfig::default(),
+        )
+        .unwrap();
         let bullshark = Bullshark::new(
             committee.clone(),
             NUM_SUB_DAGS_PER_SCHEDULE,
@@ -906,8 +917,8 @@ async fn committed_round_after_restart() {
         info!("Committed round adanced to {}", input_round.saturating_sub(1));
 
         // Shutdown consensus and wait for it to stop.
-        fixture.notify_shutdown();
-        let _ = task_manager.join(Notifier::default()).await;
+        config.shutdown().notify();
+        let _ = task_manager.join(ShutdownNotifier::default()).await;
     }
 }
 
@@ -1173,7 +1184,7 @@ async fn restart_with_new_committee() {
         config.shutdown().notify();
 
         // Ensure consensus stopped.
-        let _ = task_manager.join(Notifier::default()).await;
+        let _ = task_manager.join(ShutdownNotifier::default()).await;
     }
 }
 

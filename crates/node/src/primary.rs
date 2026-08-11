@@ -9,7 +9,7 @@ use tn_primary::{
 };
 use tn_storage::{certificate_pack::CertificatePack, consensus::ConsensusChain};
 use tn_types::{
-    Committee, Database as ConsensusDatabase, Notifier, TaskManager,
+    Committee, Database as ConsensusDatabase, ShutdownNotifier, TaskManager,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tokio::sync::RwLock;
@@ -152,8 +152,8 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         self.internal.read().await.primary.state_sync()
     }
 
-    /// Return the [Noticer] shutdown for consensus.
-    pub async fn shutdown_signal(&self) -> Notifier {
+    /// Return the [ShutdownNotifier] shutdown for consensus.
+    pub async fn shutdown_signal(&self) -> ShutdownNotifier {
         self.internal.read().await.consensus_config.shutdown().clone()
     }
 

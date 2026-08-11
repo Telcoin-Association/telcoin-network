@@ -21,7 +21,7 @@ use tn_network_libp2p::types::NetworkResult;
 use tn_storage::CertificateStore;
 use tn_types::{
     validate_fetched_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
-    Database, Header, Noticer, Notifier, Round, TaskManager, TaskSpawner, TnReceiver,
+    Database, Header, Noticer, Round, ShutdownNotifier, TaskManager, TaskSpawner, TnReceiver,
 };
 use tokio::{
     sync::oneshot,
@@ -460,7 +460,7 @@ async fn fetch_from_peers<F: MissingCertFetcher>(
     fallback_delay: Duration,
 ) -> CertManagerResult<Vec<Certificate>> {
     let (tx_results, mut rx_results) = tokio::sync::mpsc::unbounded_channel();
-    let cancel_signal = Arc::new(Notifier::new());
+    let cancel_signal = Arc::new(ShutdownNotifier::new());
 
     // track requests per peer
     let mut peer_index = 0;

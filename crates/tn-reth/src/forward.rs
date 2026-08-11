@@ -552,7 +552,9 @@ mod tests {
     }
 
     fn test_forwarder_with(policy: ForwardTargetPolicy) -> WorkerRpcForwarder {
-        WorkerRpcForwarder::new(TaskManager::default().get_spawner(), policy)
+        // Leak the manager: a dropped TaskManager latches its one-shot shutdown,
+        // which would cancel any task later spawned through the spawner.
+        WorkerRpcForwarder::new(Box::leak(Box::new(TaskManager::default())).get_spawner(), policy)
     }
 
     fn test_key(seed: u8) -> BlsPublicKey {
