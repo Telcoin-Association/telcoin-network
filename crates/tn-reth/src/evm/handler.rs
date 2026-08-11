@@ -19,7 +19,8 @@
 //! or basefee accounts — otherwise every system call would spuriously mark those accounts
 //! touched in the state diff.
 
-use crate::{basefee_address, calculate_gas_penalty, SYSTEM_ADDRESS};
+use super::utils::gas_penalty_and_refund;
+use crate::{basefee_address, SYSTEM_ADDRESS};
 use reth_revm::{
     context::result::{EVMError, InvalidTransaction},
     context_interface::{
@@ -110,26 +111,30 @@ where
         let basefee = context.block().basefee() as u128;
         let effective_gas_price = context.tx().effective_gas_price(basefee);
 
-        // calculate penalty for inefficient gas limit
+        // split unused gas into a penalty for an inefficient gas limit and the caller refund
         //
-        // this is necessary to disincentivize DOS of batch proposals
-        //
-        // due to the nature of TN consensus, actual gas cannot be determined
-        // until after consensus
-        //
-        // this penalty economically disincentivizes users from setting
-        // >10x estimated gas limits
+        // this is necessary to disincentivize DOS of batch proposals: due to the nature of TN
+        // consensus, actual gas cannot be determined until after consensus, so the penalty
+        // economically disincentivizes users from setting >10x estimated gas limits
         //
         // NOTE: uses pre-refund gas (gas_spent) so SSTORE refunds don't inflate the penalty
         //
+        // the EIP-7702 authorization intrinsic is excluded from the penalty basis: each tuple is
+        // charged a flat 25,000 gas from the tuple count alone (before any validity check), so a
+        // padded authorization list would otherwise let a sender buy gas.spent() past the 10%
+        // threshold and dodge the penalty without doing real work. the penalty is then capped at
+        // unused gas so the credit to the basefee address can never exceed what the sender
+        // prepaid (conservation: refund + penalty + gas_used == gas_limit)
+        //
         // see https://github.com/Telcoin-Association/telcoin-network/issues/424
-        let penalty_gas = calculate_gas_penalty(gas_limit, gas_spent);
+        let (penalty_gas, refund_amount) = gas_penalty_and_refund(
+            gas_limit,
+            gas_spent,
+            gas_used,
+            context.tx().authorization_list_len(),
+        );
 
-        // calculate the actual refund amount (unused gas minus penalty)
-        let unused_gas = gas_limit.saturating_sub(gas_used);
-        let refund_amount = unused_gas.saturating_sub(penalty_gas);
-
-        debug!(target: "engine", ?unused_gas, ?penalty_gas, ?refund_amount, "governance collects: {}", effective_gas_price.saturating_mul(u128::from(penalty_gas)));
+        debug!(target: "engine", ?penalty_gas, ?refund_amount, "governance collects: {}", effective_gas_price.saturating_mul(u128::from(penalty_gas)));
 
         // return gas to caller (minus penalty)
         if refund_amount > 0 {
