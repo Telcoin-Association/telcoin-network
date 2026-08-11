@@ -519,8 +519,103 @@ impl Parameters {
 #[cfg(test)]
 mod test {
     use super::Parameters;
-    use crate::GOVERNANCE_SAFE_ADDRESS;
-    use tn_types::{address, MAINNET_PARAMETERS, TESTNET_PARAMETERS};
+    use crate::{
+        Config, ConfigFmt, ConfigTrait as _, CONSENSUS_REGISTRY_JSON, GOVERNANCE_SAFE_ADDRESS,
+    };
+    use tn_types::{
+        address, Address, Bytes, Committee, Genesis, MAINNET_COMMITTEE, MAINNET_GENESIS,
+        MAINNET_PARAMETERS, TESTNET_PARAMETERS,
+    };
+
+    /// The fixed mainnet deployment address of the `ConsensusRegistry` system contract.
+    ///
+    /// Mirrors `tn_reth::system_calls::CONSENSUS_REGISTRY_ADDRESS`; tn-config sits below
+    /// tn-reth in the dependency graph, so the address is restated here for the compiled-in
+    /// mainnet genesis gate.
+    const CONSENSUS_REGISTRY_ADDRESS: Address =
+        address!("07E17e17E17e17E17e17E17E17E17e17e17E17e1");
+
+    /// How to regenerate the committed mainnet chain-config placeholders when a gate below
+    /// fails (issue #1063).
+    const REGENERATION_LEVER: &str =
+        "regenerate chain-configs/mainnet with `cargo test -p telcoin-network-cli \
+         regenerate_mainnet_chain_configs -- --ignored`";
+
+    /// The embedded mainnet chain-config files must load through the same deserialization
+    /// paths `--chain mainnet` uses.
+    ///
+    /// `Config::load_mainnet` parses `MAINNET_GENESIS`/`MAINNET_PARAMETERS` with
+    /// `serde_yaml::from_str` and materializes `MAINNET_COMMITTEE` to
+    /// `<datadir>/genesis/committee.yaml`, which the epoch manager later reads back via
+    /// `Config::load_from_path::<Committee>` (crates/node/src/manager/node.rs). This gate
+    /// drives all three files through exactly those paths, so a schema-stale committed file
+    /// fails here instead of at node startup.
+    #[test]
+    fn mainnet_chain_configs_load_via_the_node_paths() {
+        let _genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize like Config::load_mainnet");
+        let _parameters: Parameters = serde_yaml::from_str(MAINNET_PARAMETERS)
+            .expect("embedded mainnet parameters.yaml must deserialize like Config::load_mainnet");
+
+        // mirror the node's real committee read: file on disk -> Config::load_from_path
+        let dir = tempfile::tempdir().expect("tempdir for committee round-trip");
+        let committee_path = dir.path().join("committee.yaml");
+        std::fs::write(&committee_path, MAINNET_COMMITTEE)
+            .expect("write embedded mainnet committee.yaml to disk");
+        let committee: Committee = Config::load_from_path(&committee_path, ConfigFmt::YAML)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "embedded mainnet committee.yaml must deserialize as tn_types::Committee \
+                     via Config::load_from_path (the node's read path); schema-stale file \
+                     (issue #1063) - {REGENERATION_LEVER}: {e}"
+                )
+            });
+        assert_eq!(
+            committee.size(),
+            4,
+            "mainnet placeholder committee must seat the 4 placeholder validators"
+        );
+    }
+
+    /// The mainnet genesis `ConsensusRegistry` account must carry the CURRENT tn-contracts
+    /// runtime bytecode.
+    ///
+    /// The genesis ceremony (`RethEnv::create_consensus_registry_genesis_accounts`) splices
+    /// `deployedBytecode.object` of `CONSENSUS_REGISTRY_JSON` into the registry account; the
+    /// node's system calls unconditionally speak that artifact's ABI. A stale committed code
+    /// blob means a mainnet node can neither start epoch 0 (`getCommitteeBlsPubkeys`) nor
+    /// close an epoch (`getValidatorsInfo`/`getNextCommitteeSize`) - issue #1063.
+    #[test]
+    fn mainnet_genesis_registry_code_matches_current_artifact() {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+
+        // same extraction the ceremony performs (deployedBytecode.object, hex-decoded)
+        let artifact: serde_json::Value = serde_json::from_str(CONSENSUS_REGISTRY_JSON)
+            .expect("embedded ConsensusRegistry artifact json must parse");
+        let expected: Bytes = artifact
+            .pointer("/deployedBytecode/object")
+            .and_then(serde_json::Value::as_str)
+            .expect("ConsensusRegistry artifact must contain deployedBytecode.object")
+            .parse()
+            .expect("deployedBytecode.object must be valid hex");
+
+        let actual = genesis
+            .alloc
+            .get(&CONSENSUS_REGISTRY_ADDRESS)
+            .and_then(|account| account.code.clone())
+            .expect("mainnet genesis must allocate code for the ConsensusRegistry account");
+
+        assert!(
+            actual == expected,
+            "chain-configs/mainnet/genesis.yaml seeds the ConsensusRegistry with {} bytes of \
+             runtime code but the current tn-contracts artifact deploys {} bytes; the node's \
+             system calls speak the current ABI, so a mainnet node cannot start or close an \
+             epoch (issue #1063) - {REGENERATION_LEVER}",
+            actual.len(),
+            expected.len(),
+        );
+    }
 
     #[test]
     fn default_parameters_are_within_protocol_ceilings() {

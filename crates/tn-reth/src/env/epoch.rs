@@ -1343,6 +1343,127 @@ mod tests {
         Ok(())
     }
 
+    /// The committed MAINNET genesis must answer the post-fork `ConsensusRegistry` reads the
+    /// default (non-adiri) build issues over the epoch lifecycle - issue #1063.
+    ///
+    /// Every non-adiri node speaks the post-fork ABI unconditionally: the epoch-start path
+    /// reads `getCommitteeBlsPubkeys(epoch)` and `generate_conclude_epoch_calldata` reads
+    /// `getValidatorsInfo(Active)` + `getNextCommitteeSize`. This test boots a temp chain
+    /// directly over `chain-configs/mainnet/genesis.yaml` (via `MAINNET_GENESIS`, the exact
+    /// bytes compiled into the binary) and issues those three reads against genesis state, so
+    /// a stale registry artifact in the committed file fails here instead of on mainnet
+    /// startup. Deliberately NOT feature-gated: no fork-swap safety net exists outside the
+    /// `adiri` build, so the committed mainnet genesis must always carry current-ABI code.
+    ///
+    /// On failure, regenerate the mainnet placeholders with
+    /// `cargo test -p telcoin-network-cli regenerate_mainnet_chain_configs -- --ignored`.
+    #[tokio::test]
+    async fn test_mainnet_genesis_registry_serves_post_fork_reads() -> eyre::Result<()> {
+        let genesis: tn_types::Genesis = serde_yaml::from_str(tn_types::MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("mainnet genesis smoke");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+
+        let state = StateProviderDatabase::new(env.latest()?);
+        let mut cached = CachedReads::default();
+        let mut db =
+            State::builder().with_database(cached.as_db_mut(state)).with_bundle_update().build();
+        let mut evm = env
+            .evm_config()
+            .evm_factory()
+            .create_evm(&mut db, env.evm_config().evm_env(genesis_header.header())?);
+
+        // The registry reads run FIRST (before any committee cross-check) so a stale genesis
+        // fails on the exact #1063 symptom: a reverted post-fork ABI read.
+        //
+        // epoch-close path: the conclude-epoch calldata is assembled from these two reads
+        let active = env
+            .call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
+                &mut evm,
+                ConsensusRegistry::getValidatorsInfoCall { status: ValidatorStatus::Active.into() }
+                    .abi_encode()
+                    .into(),
+            )
+            .expect("mainnet genesis registry must answer getValidatorsInfo(Active) (issue #1063)");
+        assert!(!active.is_empty(), "mainnet genesis Active validator set must be non-empty");
+
+        let next_committee_size = env
+            .call_consensus_registry::<_, u16>(
+                &mut evm,
+                ConsensusRegistry::getNextCommitteeSizeCall {}.abi_encode().into(),
+            )
+            .expect("mainnet genesis registry must answer getNextCommitteeSize (issue #1063)");
+        assert!(next_committee_size > 0, "next committee size must be non-zero");
+
+        // epoch-start path: the genesis-seeded committees for epochs 0, 1, and 2
+        let epoch_committees = (0u32..=2)
+            .map(|epoch| {
+                env.call_consensus_registry::<_, Vec<Bytes>>(
+                    &mut evm,
+                    ConsensusRegistry::getCommitteeBlsPubkeysCall { epoch }.abi_encode().into(),
+                )
+                .map_err(|e| {
+                    eyre::eyre!(
+                        "getCommitteeBlsPubkeys({epoch}) must succeed on the committed \
+                         mainnet genesis (issue #1063): {e}"
+                    )
+                })
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+
+        // cross-check the on-chain answers against the committed committee.yaml
+        let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)
+            .expect("embedded mainnet committee.yaml must deserialize (issue #1063)");
+        let authority_count = committee.size();
+        assert_eq!(
+            active.len(),
+            authority_count,
+            "every mainnet genesis authority must be an Active registry validator"
+        );
+        // the ceremony seats the full genesis validator set as the committee, so the
+        // registry's next committee size must equal the committee.yaml authority count
+        assert_eq!(
+            usize::from(next_committee_size),
+            authority_count,
+            "next committee size must equal the {authority_count} genesis authorities"
+        );
+
+        // Byte-level cross-binding: the BLS pubkeys the registry answers for each genesis
+        // epoch must be exactly the committee.yaml authorities' protocol keys (as a set;
+        // ordering differs between the contract's committee array and the BTreeMap-keyed
+        // yaml). A half-regeneration - fresh genesis with a stale-but-parseable committee
+        // (or vice versa) - fails here even though every count-based check above passes.
+        let expected_keys: std::collections::BTreeSet<Vec<u8>> = committee
+            .authorities()
+            .iter()
+            .map(|authority| authority.protocol_key().to_bytes().to_vec())
+            .collect();
+        epoch_committees.iter().enumerate().for_each(|(epoch, pubkeys)| {
+            assert_eq!(
+                pubkeys.len(),
+                authority_count,
+                "epoch {epoch} committee must seat every genesis authority"
+            );
+            pubkeys.iter().for_each(|key| {
+                assert_eq!(key.len(), 96, "epoch {epoch} BLS pubkeys must be 96-byte compressed")
+            });
+            let onchain_keys: std::collections::BTreeSet<Vec<u8>> =
+                pubkeys.iter().map(|key| key.to_vec()).collect();
+            assert_eq!(
+                onchain_keys, expected_keys,
+                "epoch {epoch} on-chain committee BLS pubkeys must be exactly the \
+                 committee.yaml authority protocol keys (genesis.yaml and committee.yaml \
+                 regenerated inconsistently? issue #1063)"
+            );
+        });
+
+        Ok(())
+    }
+
     /// An epoch-closing block publishes what each of its system calls spent.
     ///
     /// The boundary calls are submitted at `gas_price: 0`, so their gas never enters the block's
