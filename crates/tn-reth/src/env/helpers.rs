@@ -317,7 +317,9 @@ impl RethEnv {
     /// # Errors
     ///
     /// Same split as [`Self::read_contract`]; additionally, `block_hash` failing to resolve to
-    /// a known sealed header is an [`EvmReadError::Internal`].
+    /// a known sealed header is an [`EvmReadError::Internal`], and so is a pin below a restored
+    /// datadir's state floor, refused by `read_only_state_db` (`env/mod.rs`) before any state
+    /// is read instead of silently answering from the missing pre-snapshot history (#1136).
     pub fn read_contract_at_block(
         &self,
         block_hash: B256,
@@ -350,9 +352,8 @@ impl RethEnv {
         contract: Address,
         calldata: Bytes,
     ) -> EvmReadResult<Bytes> {
-        let mut db = self
-            .read_only_state_db(header.hash())
-            .map_err(|e| EvmReadError::Internal(e.to_string()))?;
+        let mut db =
+            self.read_only_state_db(header).map_err(|e| EvmReadError::Internal(e.to_string()))?;
         let evm_env =
             self.evm_config().evm_env(header).map_err(|e| EvmReadError::Internal(e.to_string()))?;
         let mut tn_evm = self.evm_config().evm_factory().create_evm(&mut db, evm_env);
