@@ -2543,6 +2543,70 @@ async fn test_node_record_validation() {
     assert!(network.peer_record_valid(&peer_record).is_none());
 }
 
+/// Repeated `MissingAuthorities` reports for one key must not stack duplicate
+/// in-flight kad queries (issue #1135).
+///
+/// `trigger_missing_authorities` filters on completed outcomes (`known_peers`)
+/// only, so a caller that polls `current_committee_rpcs` re-reports an
+/// unresolved member on every call. Before the fix, each report issued a fresh
+/// `get_record` and inserted a new `kad_record_queries` entry. The swarm is
+/// never polled in this test, so no query can terminate mid-test: every entry
+/// observed below is in flight by construction.
+#[tokio::test]
+async fn test_missing_authorities_dedupes_inflight_kad_queries() -> eyre::Result<()> {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let unknown_a = *BlsKeypair::generate(&mut StdRng::from_seed([11; 32])).public();
+    let unknown_b = *BlsKeypair::generate(&mut StdRng::from_seed([13; 32])).public();
+
+    // positive control: a first-time key must issue exactly one query
+    network.process_peer_manager_event(PeerEvent::MissingAuthorities(vec![unknown_a]))?;
+    assert_eq!(network.kad_record_queries.len(), 1, "first report must issue one query");
+
+    // a polling re-report of the same key alongside a new key: only the new
+    // key may issue a query
+    network
+        .process_peer_manager_event(PeerEvent::MissingAuthorities(vec![unknown_a, unknown_b]))?;
+    assert_eq!(network.kad_record_queries.len(), 2, "re-reported key must not issue a duplicate");
+    assert_eq!(
+        network.kad_record_queries.values().filter(|q| q.request == unknown_a).count(),
+        1,
+        "one in-flight query for the re-reported key"
+    );
+    assert_eq!(
+        network.kad_record_queries.values().filter(|q| q.request == unknown_b).count(),
+        1,
+        "one in-flight query for the new key"
+    );
+
+    // steady-state polling: nothing accumulates
+    network
+        .process_peer_manager_event(PeerEvent::MissingAuthorities(vec![unknown_a, unknown_b]))?;
+    assert_eq!(network.kad_record_queries.len(), 2, "steady-state polling must not accumulate");
+
+    // re-arm: every terminal query path runs `close_kad_query`, so once the
+    // in-flight query for a key ends, the next report must issue a fresh query
+    let old_id = network
+        .kad_record_queries
+        .iter()
+        .find(|(_, query)| query.request == unknown_a)
+        .map(|(id, _)| *id)
+        .ok_or_else(|| eyre!("in-flight query for unknown_a is tracked"))?;
+    network.close_kad_query(&old_id);
+    assert_eq!(network.kad_record_queries.len(), 1, "closed query must leave the map");
+    network.process_peer_manager_event(PeerEvent::MissingAuthorities(vec![unknown_a]))?;
+    assert_eq!(network.kad_record_queries.len(), 2, "closed key must re-arm on the next report");
+    let new_id = network
+        .kad_record_queries
+        .iter()
+        .find(|(_, query)| query.request == unknown_a)
+        .map(|(id, _)| *id)
+        .ok_or_else(|| eyre!("re-armed query for unknown_a is tracked"))?;
+    assert_ne!(old_id, new_id, "re-armed query must be a fresh kad query");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_local_record_has_no_expiry() {
     let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
