@@ -58,7 +58,7 @@ pub use alloy::{
         eip1559::{ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE},
         eip2718::{Decodable2718, Encodable2718, Typed2718},
         eip4844::{env_settings::EnvKzgSettings, BlobAndProofV1, BlobTransactionSidecar},
-        eip7702::{Authorization, SignedAuthorization},
+        eip7702::Authorization,
         BlockHashOrNumber, BlockNumHash,
     },
     genesis::{Genesis, GenesisAccount},
