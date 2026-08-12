@@ -596,20 +596,21 @@ impl TxnForwarder for WorkerRpcForwarder {
         transactions: Vec<Vec<u8>>,
         committee_slots: Vec<BlsPublicKey>,
         validator_rpcs: Vec<(BlsPublicKey, RpcInfo)>,
-    ) {
+    ) -> bool {
         let committee_size = committee_slots.len() as u64;
         let queued = transactions.len();
         // Nothing to forward, or nowhere to forward it to: neither is a fault, so neither warns.
         let discovered = (queued > 0 && committee_size > 0 && !validator_rpcs.is_empty())
             .then(|| self.cached_providers(&validator_rpcs));
         // Endpoints were advertised but none of them resolved to a usable provider. That is a
-        // fault, and the batch is dropped for it.
+        // fault, and the batch is refused for it so the caller keeps its transactions.
         let admissible = discovered.filter(|providers| {
             let usable = !providers.is_empty();
             if !usable {
                 warn!(
                     target: "worker::forward",
-                    "no usable validator RPC endpoints; dropping forwarded transactions"
+                    "no usable validator RPC endpoints; refusing the batch so the caller keeps \
+                     its transactions"
                 );
             }
             usable
@@ -618,20 +619,21 @@ impl TxnForwarder for WorkerRpcForwarder {
         // Admission control. Reached after the cache refresh above, so eviction of
         // no-longer-advertised endpoints keeps happening while batches are being shed, and
         // before any spawn here, so a batch this node has no capacity to forward never becomes
-        // a forward task holding its bytes. (The upstream `disburse-txns` spawn that delivers
-        // the batch to this call is pre-existing and tracked by issue #1132.) Try-acquire, not
-        // acquire: see [`MAX_CONCURRENT_FORWARDS`] for why a batch that finds no permit is
-        // dropped rather than queued behind one.
-        if let Some(providers) = admissible {
+        // a forward task holding its bytes. (`disburse_txns` calls this synchronously and keeps
+        // the batch pooled on refusal: issue #1132.) Try-acquire, not acquire: see
+        // [`MAX_CONCURRENT_FORWARDS`] for why a batch that finds no permit is refused rather
+        // than queued behind one.
+        admissible.is_some_and(|providers| {
             Arc::clone(&self.forwards_in_flight).try_acquire_owned().map_or_else(
                 |_| {
                     warn!(
                         target: "worker::forward",
                         transactions = queued,
                         capacity = MAX_CONCURRENT_FORWARDS,
-                        "forward capacity exhausted; dropping a sealed batch rather than queueing it"
+                        "forward capacity exhausted; refusing a sealed batch rather than queueing it"
                     );
                     ForwarderMetrics::record_batch_shed();
+                    false
                 },
                 move |permit| {
                     self.spawn_forward(
@@ -640,10 +642,11 @@ impl TxnForwarder for WorkerRpcForwarder {
                         committee_slots,
                         committee_size,
                         providers,
-                    )
+                    );
+                    true
                 },
             )
-        }
+        })
     }
 }
 
@@ -1144,6 +1147,37 @@ mod tests {
             classify_server_error(-32000, "nonce too low: next nonce 42, tx nonce 41".to_string()),
             Disposition::Rejected(_)
         ));
+        Ok(())
+    }
+
+    /// With no advertised endpoint, or with only endpoints the policy refuses, the batch is
+    /// not admitted: `forward_txns` returns `false` so the caller keeps its transactions.
+    #[test]
+    fn forward_txns_refuses_when_no_endpoint_is_usable() -> eyre::Result<()> {
+        let forwarder = test_forwarder();
+
+        // No committee validator has advertised an endpoint.
+        assert!(!forwarder.forward_txns(vec![vec![0u8; 8]], vec![test_key(1)], vec![]));
+
+        // The only advertised endpoint is private, so the `PublicOnly` policy refuses it and
+        // no provider resolves.
+        let refused = vec![(test_key(1), test_rpc("http://10.0.0.1:8545")?)];
+        assert!(!forwarder.forward_txns(vec![vec![0u8; 8]], vec![test_key(1)], refused));
+        Ok(())
+    }
+
+    /// One public advertised endpoint resolves a provider, so the batch is admitted to a
+    /// forward task and `forward_txns` returns `true`. Admission is not delivery: the
+    /// background task is free to fail and is not awaited here.
+    #[tokio::test]
+    async fn forward_txns_admits_when_a_provider_resolves() -> eyre::Result<()> {
+        // Keep the task manager alive so the spawned forward task is tracked normally.
+        let task_manager = TaskManager::default();
+        let forwarder =
+            WorkerRpcForwarder::new(task_manager.get_spawner(), ForwardTargetPolicy::PublicOnly);
+        let rpcs = vec![(test_key(1), test_rpc("http://validator.example.com:8545")?)];
+
+        assert!(forwarder.forward_txns(vec![vec![0u8; 8]], vec![test_key(1)], rpcs));
         Ok(())
     }
 }

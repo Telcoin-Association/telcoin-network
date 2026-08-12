@@ -514,6 +514,142 @@ mod tests {
         assert_eq!(pending_pool_len, 3);
     }
 
+    /// An observer worker (no quorum waiter) whose forwarder admits nothing must keep its
+    /// transactions pending: every seal attempt returns `NotValidator`, the pool is not
+    /// drained, and the builder task stays alive to retry on a later build.
+    ///
+    /// The worker's batch channel is interposed so each seal attempt is observable: the
+    /// test receives each sealed batch, runs the real observer `seal` (which runs
+    /// `disburse_txns`), and forwards the result on the ack channel. Two full cycles prove
+    /// the builder processed the first refusal as non-fatal and kept looping.
+    #[tokio::test]
+    async fn test_observer_refused_forward_keeps_txs_in_pool() {
+        let tmp_dir = TempDir::new().unwrap();
+        let TestTools { mut tx_factory, execution_components, task_manager } =
+            get_test_tools(tmp_dir.path());
+        let TestExecutionComponents { reth_env, txpool, chain, .. } = execution_components;
+        let address = Address::from(U160::from(33));
+        let client = LocalNetwork::new_with_empty_id();
+        let worker_to_primary = Arc::new(MockWorkerToPrimaryHang {});
+        client.set_worker_to_primary_local_handler(worker_to_primary);
+        let temp_dir = TempDir::new().unwrap();
+        let store = open_db(temp_dir.path());
+        let seal_timeout = Duration::from_secs(5);
+        let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
+
+        // The real observer worker: no quorum waiter, a forwarder that admits nothing, and
+        // a test network handle that discovers no validator RPC endpoints.
+        let block_provider = Worker::new(
+            0,
+            None::<TestMakeBlockQuorumWaiter>,
+            client,
+            store,
+            seal_timeout,
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+            Arc::new(NoopTxnForwarder),
+            Vec::new(),
+        );
+
+        // build execution block proposer with the interposed channel and a short delay so
+        // the retry after a refused seal arrives quickly
+        let batch_builder = BatchBuilder::new(
+            &reth_env,
+            txpool.clone(),
+            to_worker,
+            address,
+            Duration::from_millis(100),
+            task_manager.get_spawner(),
+            0,
+            MIN_PROTOCOL_BASE_FEE,
+            0,
+        )
+        .expect("batch builder");
+
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
+
+        // create 3 transactions
+        let transaction1 = tx_factory.create_eip1559(
+            chain.clone(),
+            None,
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let transaction2 = tx_factory.create_eip1559(
+            chain.clone(),
+            None,
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let transaction3 = tx_factory.create_eip1559(
+            chain.clone(),
+            None,
+            gas_price,
+            Some(Address::ZERO),
+            value, // 1 TEL
+            Bytes::new(),
+        );
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction1.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if &hash == transaction1.hash());
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction2.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if &hash == transaction2.hash());
+
+        let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
+        assert_matches!(added_result, hash if &hash == transaction3.hash());
+
+        // txpool size
+        let pending_pool_len = txpool.pool_size().pending;
+        assert_eq!(pending_pool_len, 3);
+
+        // spawn batch_builder once worker is ready
+        let batch_builder_task = tokio::spawn(batch_builder.run());
+
+        // plenty of time for each build attempt
+        let duration = std::time::Duration::from_secs(5);
+
+        // First attempt: the builder proposes all 3 transactions and the real observer seal
+        // refuses the batch because it was not admitted to a forward task.
+        let (sealed_batch, ack) = timeout(duration, from_batch_builder.recv())
+            .await
+            .expect("first batch built in time")
+            .expect("batch builder sender open");
+        assert_eq!(sealed_batch.batch().transactions().len(), 3);
+        let res = block_provider.seal(sealed_batch).await;
+        assert!(matches!(res, Err(BlockSealError::NotValidator)));
+        let _ = ack.send(res);
+
+        // Second attempt: another proposal proves the builder processed the first refusal
+        // as non-fatal and kept looping. The same 3 transactions are proposed again.
+        let (sealed_batch, ack) = timeout(duration, from_batch_builder.recv())
+            .await
+            .expect("second batch built in time")
+            .expect("batch builder sender open");
+        assert_eq!(sealed_batch.batch().transactions().len(), 3);
+        let res = block_provider.seal(sealed_batch).await;
+        assert!(matches!(res, Err(BlockSealError::NotValidator)));
+        let _ = ack.send(res);
+
+        // yield to try and give pool a chance to update
+        tokio::task::yield_now().await;
+
+        // The refused attempts must not evict anything from the pool.
+        let pending_pool_len = txpool.pool_size().pending;
+        assert_eq!(pending_pool_len, 3);
+
+        // `NotValidator` is non-fatal, so the builder task must still be running.
+        assert!(!batch_builder_task.is_finished());
+
+        batch_builder_task.abort();
+    }
+
     /// Convenience struct for creating test assets.
     struct TestTools {
         /// Factory for creating and signing valid transactions.
