@@ -65,9 +65,9 @@ pub use tel_precompile::{
 };
 pub use utils::calculate_gas_penalty;
 /// Test-gated exposure so integration and property tests exercise the real penalty/refund
-/// split the handler applies.
+/// split the handler applies, and the EIP-7623 floor clamp it feeds that split.
 #[cfg(any(test, feature = "test-utils"))]
-pub use utils::gas_penalty_and_refund;
+pub use utils::{effective_auth_intrinsic, gas_penalty_and_refund};
 
 /// Gas budget for a single protocol system call.
 ///
