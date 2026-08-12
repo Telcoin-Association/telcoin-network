@@ -1,6 +1,6 @@
 //! Prometheus metrics for the reth execution environment.
 //!
-//! Four counter series are exported under the `tn_reth` scope, in two unrelated groups.
+//! Six counter series are exported under the `tn_reth` scope, in two unrelated groups.
 //!
 //! Block building. Two series count transactions that `build_block_from_batch_payload`
 //! declines to include in a block: `tn_reth.unrecoverable_txs_dropped_total` (alertable - a
@@ -10,7 +10,9 @@
 //!
 //! Observer transaction forwarding. Two series count work the forwarder
 //! ([`crate::WorkerRpcForwarder`]) sheds to stay within its own bounds:
-//! `tn_reth.forwarded_batches_shed_total` and `tn_reth.forwarded_txns_abandoned_total`. See
+//! `tn_reth.forwarded_batches_shed_total` and `tn_reth.forwarded_txns_abandoned_total`. Two more
+//! count the delivery feedback added for issue #1145:
+//! `tn_reth.forward_endpoints_demoted_total` and `tn_reth.forwarded_txns_requeued_total`. See
 //! [`ForwarderMetrics`] for per-series semantics.
 //!
 //! [`report_db_metrics`] additionally samples reth database metrics as a pre-scrape hook.
@@ -109,11 +111,13 @@ pub(crate) struct RethEnvMetrics {
 /// registration in [`ForwarderMetrics::init`] and the increments below cannot drift apart.
 const FORWARDED_BATCHES_SHED: &str = "tn_reth.forwarded_batches_shed_total";
 const FORWARDED_TXNS_ABANDONED: &str = "tn_reth.forwarded_txns_abandoned_total";
+const FORWARD_ENDPOINTS_DEMOTED: &str = "tn_reth.forward_endpoints_demoted_total";
+const FORWARDED_TXNS_REQUEUED: &str = "tn_reth.forwarded_txns_requeued_total";
 
 /// Metrics for the observer transaction forwarder ([`crate::WorkerRpcForwarder`]).
 ///
-/// Both series count forwarding work the node deliberately gives up on to keep its own
-/// resource use bounded. Forwarding is best-effort, so shedding is a correct outcome rather
+/// The shed and abandoned series count forwarding work the node deliberately gives up on to keep
+/// its own resource use bounded. Forwarding is best-effort, so shedding is a correct outcome rather
 /// than an error - but it is an *absorbed* failure, invisible until it is not, which is
 /// exactly the category that needs to show up somewhere other than a `warn!` line. Transactions
 /// counted here were accepted by this node's RPC and never handed to a validator.
@@ -125,7 +129,7 @@ const FORWARDED_TXNS_ABANDONED: &str = "tn_reth.forwarded_txns_abandoned_total";
 pub(crate) struct ForwarderMetrics;
 
 impl ForwarderMetrics {
-    /// Register both forwarder counters with the current recorder without recording an event.
+    /// Register the forwarder counters with the current recorder without recording an event.
     ///
     /// Called from `WorkerRpcForwarder::new`, which runs at epoch start, long after the CLI
     /// installs the global recorder. The reason to register eagerly is the same one [`init`]
@@ -136,6 +140,8 @@ impl ForwarderMetrics {
     pub(crate) fn init() {
         metrics::counter!(FORWARDED_BATCHES_SHED).increment(0);
         metrics::counter!(FORWARDED_TXNS_ABANDONED).increment(0);
+        metrics::counter!(FORWARD_ENDPOINTS_DEMOTED).increment(0);
+        metrics::counter!(FORWARDED_TXNS_REQUEUED).increment(0);
     }
 
     /// Count one sealed batch dropped without being forwarded because every forward permit was
@@ -155,6 +161,24 @@ impl ForwarderMetrics {
     /// could not be walked inside its budget.
     pub(crate) fn record_txns_abandoned(count: u64) {
         metrics::counter!(FORWARDED_TXNS_ABANDONED).increment(count);
+    }
+
+    /// Count endpoints demoted from forward admission after a connection-level send failure
+    /// (issue #1145).
+    ///
+    /// A steady rate on one committee means an advertised endpoint is persistently dead: every
+    /// cooldown expiry admits one probe batch against it and demotes it again. That is the
+    /// intended containment, but the advertisement itself is the operator-actionable fault.
+    pub(crate) fn record_endpoints_demoted(count: u64) {
+        metrics::counter!(FORWARD_ENDPOINTS_DEMOTED).increment(count);
+    }
+
+    /// Count transactions returned to the worker's own pool after their forward got no verdict
+    /// (issue #1145). These are recovered, not lost: the batch builder repackages them on a
+    /// later build. Pairs with [`Self::record_txns_abandoned`], whose transactions are the ones
+    /// this requeue rescues.
+    pub(crate) fn record_txns_requeued(count: u64) {
+        metrics::counter!(FORWARDED_TXNS_REQUEUED).increment(count);
     }
 }
 
@@ -378,7 +402,7 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(0)));
     }
 
-    /// [`ForwarderMetrics::init`] must register both forwarder series at zero, and each record
+    /// [`ForwarderMetrics::init`] must register every forwarder series at zero, and each record
     /// helper must move only its own series.
     ///
     /// The negative half matters as much as the positive one: a single mistyped counter name
@@ -396,16 +420,22 @@ mod tests {
         let snapshot = snapshotter.snapshot().into_vec();
         assert!(matches!(series(&snapshot, FORWARDED_BATCHES_SHED), DebugValue::Counter(0)));
         assert!(matches!(series(&snapshot, FORWARDED_TXNS_ABANDONED), DebugValue::Counter(0)));
+        assert!(matches!(series(&snapshot, FORWARD_ENDPOINTS_DEMOTED), DebugValue::Counter(0)));
+        assert!(matches!(series(&snapshot, FORWARDED_TXNS_REQUEUED), DebugValue::Counter(0)));
 
         metrics::with_local_recorder(&recorder, || {
             ForwarderMetrics::record_batch_shed();
             ForwarderMetrics::record_batch_shed();
             ForwarderMetrics::record_txns_abandoned(7);
+            ForwarderMetrics::record_endpoints_demoted(3);
+            ForwarderMetrics::record_txns_requeued(5);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
         assert!(matches!(series(&snapshot, FORWARDED_BATCHES_SHED), DebugValue::Counter(2)));
         assert!(matches!(series(&snapshot, FORWARDED_TXNS_ABANDONED), DebugValue::Counter(7)));
+        assert!(matches!(series(&snapshot, FORWARD_ENDPOINTS_DEMOTED), DebugValue::Counter(3)));
+        assert!(matches!(series(&snapshot, FORWARDED_TXNS_REQUEUED), DebugValue::Counter(5)));
     }
 
     /// One series of a [`DebuggingRecorder`] snapshot, looked up by metric name.
