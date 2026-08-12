@@ -110,8 +110,8 @@ impl RethEnv {
 
     /// Create an EVM-environment from state provider.
     pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
-        let header = self.header(hash)?.expect("provided hash in header table");
-        let db = self.read_only_state_db(hash)?;
+        let header = self.sealed_header_by_hash(hash)?.expect("provided hash in header table");
+        let db = self.read_only_state_db(&header)?;
         Ok(self.evm_config().evm_factory().create_evm(db, self.evm_config().evm_env(&header)?))
     }
 

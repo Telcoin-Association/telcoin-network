@@ -151,3 +151,31 @@ pub enum StateReadError {
 
 /// Result of a committee-determinism-classified state read (see [`StateReadError`]).
 pub type StateReadResult<T> = Result<T, StateReadError>;
+
+/// Refusal of a pinned state read below a restored datadir's state floor.
+///
+/// Raised by `RethEnv::read_only_state_db` (the shared state constructor for every pinned,
+/// non-committing read) when the pinned block number is below the restored-state floor (the
+/// snapshot's final block `B`, the only block whose state the restore imports). Below `B` the
+/// datadir holds headers but no state, and reth's checkpoint-less history walk would answer the
+/// read with every account "never written" instead of an error. Carried through
+/// [`reth_errors::ProviderError::other`], so every caller observes it as a node-local provider
+/// fault.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "pinned read at block {pinned} is below this datadir's restored-state floor (block {floor}, \
+     the snapshot's final block): the snapshot shipped no state below it"
+)]
+pub struct RestoredStateFloorError {
+    /// The refused pin's block number.
+    pinned: u64,
+    /// The datadir's restored-state floor: the snapshot's final block `B`.
+    floor: u64,
+}
+
+impl RestoredStateFloorError {
+    /// Bundle the refused pin's block number with the floor it fell below.
+    pub(crate) fn new(pinned: u64, floor: u64) -> Self {
+        Self { pinned, floor }
+    }
+}

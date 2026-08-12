@@ -1724,10 +1724,24 @@ where
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
             PeerEvent::MissingAuthorities(missing) => {
+                // Polling callers such as `current_committee_rpcs` report a member as
+                // missing on every call until its record lands in `known_peers`, so the
+                // same key arrives here repeatedly while its lookup is still in flight.
+                // Issue at most one live `get_record` per key: skip keys already tracked
+                // in `kad_record_queries` (issue #1135). The map is safe as the dedupe
+                // source because every terminal query path removes its entry (see
+                // `close_kad_query`), so a skipped key becomes queryable again as soon
+                // as its current query ends. The removal there runs before any result
+                // filtering, so even a query whose record is dropped as stale or
+                // non-committee re-arms the key.
                 for bls_key in missing {
-                    let key = kad::RecordKey::new(&bls_key);
-                    let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-                    self.kad_record_queries.insert(query_id, bls_key.into());
+                    if self.kad_record_queries.values().all(|q| q.request != bls_key) {
+                        let key = kad::RecordKey::new(&bls_key);
+                        let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
+                        self.kad_record_queries.insert(query_id, bls_key.into());
+                    } else {
+                        trace!(target: "network-kad", ?bls_key, "kad record query already in flight");
+                    }
                 }
             }
             PeerEvent::Discovery => {
