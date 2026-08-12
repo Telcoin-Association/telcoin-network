@@ -18,7 +18,7 @@ use tn_engine::{
     PERSIST_OUTPUT_ATTEMPTS,
 };
 use tn_reth::{
-    calculate_gas_penalty,
+    calculate_gas_penalty, effective_auth_intrinsic,
     error::TnRethError,
     gas_penalty_and_refund,
     payload::{BuildArguments, TNPayload},
@@ -2664,6 +2664,7 @@ async fn test_padded_7702_authorization_list_pays_near_maximal_penalty() -> eyre
             GAS_LIMIT,
             gas_price,
             NUM_AUTHS,
+            Bytes::new(),
         )
         .encoded_2718();
 
@@ -2961,6 +2962,252 @@ async fn test_honest_7702_sender_pays_no_penalty() -> eyre::Result<()> {
             "authority code must be the EIP-7702 delegation designator"
         );
     }
+
+    Ok(())
+}
+
+/// End-to-end proof that a floor-bound EIP-7702 sender pays no gas-limit penalty.
+///
+/// One set-code transaction carries 2 junk tuples — mismatched chain id, so each
+/// is charged the flat 25,000-gas per-empty-account intrinsic from its presence
+/// alone, none applies and none refunds — plus 10,000 zero calldata bytes. Zero
+/// bytes are one EIP-7623 token each, so the calldata floor is
+/// 21,000 + 10 x 10,000 = 121,000 while the standard cost is only 21,000 base +
+/// 4 x 10,000 calldata + 2 x 25,000 authorization = 111,000. revm therefore
+/// rewrites `gas.spent()` to the floor and zeroes the refund: the header records
+/// 121,000, exactly 10.0% of the 1,210,000 limit — the penalty-free threshold.
+///
+/// What this guards: the floor is priced from calldata alone and carries no
+/// authorization term, so a floor-bound spend never paid the 50,000 intrinsic on
+/// top of the floor and none of it may be excused from the penalty basis. The
+/// handler's clamp sees floor == spent, excuses nothing, and prices the penalty
+/// on the raw (1,210,000, 121,000) pair — penalty-free.
+///
+/// Confirm-by-mutation: without the clamp the full 50,000 comes off both penalty
+/// arguments, `calculate_gas_penalty(1_160_000, 71_000) = 163_884` of penalty
+/// gas lands on governance, making its credit 7 x (121,000 + 163,884) =
+/// 1,994,188 and shrinking the sender's refund by the same 7 x 163,884 — so both
+/// 847,000 pins below fail loudly if the clamp is deleted. The transaction rides
+/// the full batch path (`execute_test_batch` -> `ExecutorEngine`), the same
+/// harness as the honest 7702 test above.
+#[tokio::test]
+async fn test_floor_bound_7702_sender_pays_no_penalty() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+    const NUM_AUTHS: usize = 2;
+    // zero bytes are 1 EIP-7623 token each: the cheapest way to lift the floor
+    const CALLDATA_LEN: usize = 10_000;
+    // 10x the floor-bound spend below — exactly at the 10% penalty-free threshold
+    const TX_GAS_LIMIT: u64 = 1_210_000;
+    // the EIP-7623 floor: 21,000 + 10 gas per token, above the 111,000 standard cost
+    const EIP7623_FLOOR: u64 = 21_000 + 10 * CALLDATA_LEN as u64;
+    // revm rewrites spent to the floor and zeroes the refund, so used == floor
+    const EXPECTED_GAS_USED: u64 = 121_000;
+    // 7-wei min protocol base fee x 121,000 gas used: base-fee credit, zero penalty
+    const EXPECTED_GAS_REVENUE: u64 = 847_000;
+
+    // create genesis and the floor-bound set-code transaction
+    let genesis = test_genesis();
+    let mut tx_factory = TransactionFactory::new_random();
+    let sender = tx_factory.address();
+    let signed_tx = tx_factory.create_eip7702_with_authorizations(
+        genesis.config.chain_id,
+        TX_GAS_LIMIT,
+        MIN_PROTOCOL_BASE_FEE as u128,
+        NUM_AUTHS,
+        Bytes::from(vec![0u8; CALLDATA_LEN]),
+    );
+    let encoded_tx = signed_tx.encoded_2718();
+
+    let mut batch = Batch {
+        transactions: vec![encoded_tx],
+        epoch: 0,
+        beneficiary: Address::ZERO, // updated later
+        base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+        worker_id: 0,
+        received_at: None,
+    };
+
+    let all_batches = [batch.clone()];
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node
+    let gas_accumulator = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        Some(gas_accumulator.clone()),
+    )?;
+
+    // create committee
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    let batch_producer =
+        committee.authorities().get(2).expect("authority in committee").execution_address();
+
+    // set batch producer and execute
+    batch.beneficiary = batch_producer;
+    batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+    execute_test_batch(&mut batch);
+
+    // consensus output
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(authority_1);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    let batch_digest = batch.digest();
+    let batch_digests = VecDeque::from([batch_digest]);
+    let subdag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag.clone(),
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests.clone(),
+        vec![CertifiedBatch { address: batch_producer, batches: vec![batch] }],
+    );
+
+    // execution
+    let rewards_counter = gas_accumulator.rewards_counter();
+    rewards_counter.set_committee(committee.clone());
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let max_round = None;
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+
+    let broadcast_result = to_engine.send(consensus_output.clone()).await;
+    assert!(broadcast_result.is_ok());
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(5), rx).await??;
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // verify the block executed the floor-bound set-code transaction
+    let executed_blocks = reth_env.block_with_senders_range(1..=1)?;
+    assert_eq!(1, executed_blocks.len());
+    let block = &executed_blocks[0];
+    assert_eq!(
+        block.body().transactions.len(),
+        1,
+        "block must hold only the floor-bound 7702 transaction"
+    );
+
+    // 1. revm rewrote spent to the calldata floor and zeroed the refund, so the header's
+    //    post-refund gas IS the floor: 121,000 of a 1,210,000 limit, exactly 10% usage
+    assert_eq!(block.gas_used, EXPECTED_GAS_USED, "EIP-7623 floor-bound gas");
+    assert_eq!(EIP7623_FLOOR, EXPECTED_GAS_USED, "the floor is the entire spend");
+
+    // 2. the handler's clamp, fed the values it derives inside `reimburse_caller`: floor == spent
+    //    leaves nothing of the 50,000 authorization intrinsic paid on top of the floor, so nothing
+    //    is excused from the penalty basis
+    let auth_intrinsic = NUM_AUTHS as u64 * PER_EMPTY_ACCOUNT_COST;
+    assert_eq!(
+        effective_auth_intrinsic(auth_intrinsic, block.gas_used, EIP7623_FLOOR),
+        0,
+        "a floor-bound spend never paid the authorization intrinsic — nothing to excuse"
+    );
+
+    // 3. helper mirror of the handler's computation with that clamped intrinsic: the penalty is
+    //    priced on the raw (limit, spent) pair at exactly 10% usage — zero penalty, every unused
+    //    wei refunded
+    assert_eq!(
+        gas_penalty_and_refund(TX_GAS_LIMIT, block.gas_used, block.gas_used, 0),
+        (0, 1_089_000),
+        "floor-bound 7702 sender at the threshold must pay no penalty"
+    );
+    // the counterfactual the clamp exists to prevent: excusing the full intrinsic from a spend that
+    // never carried it manufactures a penalty out of gas the sender never paid
+    assert_eq!(
+        gas_penalty_and_refund(TX_GAS_LIMIT, block.gas_used, block.gas_used, auth_intrinsic),
+        (163_884, 925_116),
+        "unclamped intrinsic must be what the handler avoids"
+    );
+
+    // 4. governance revenue is base-fee revenue only: 7-wei min protocol base fee x 121,000 gas
+    //    used, with zero penalty component
+    let governance_safe_genesis_balance = chain
+        .genesis()
+        .alloc
+        .get(&GOVERNANCE_SAFE_ADDRESS)
+        .map(|acct| acct.balance)
+        .unwrap_or(U256::MAX);
+    let governance_safe = reth_env
+        .retrieve_account(&GOVERNANCE_SAFE_ADDRESS)?
+        .map(|acct| acct.balance)
+        .expect("governance safe has an account");
+    let actual_governance_revenue = governance_safe
+        .checked_sub(governance_safe_genesis_balance)
+        .expect("governance safe balance doesn't underflow");
+    assert_eq!(
+        actual_governance_revenue,
+        U256::from(EXPECTED_GAS_REVENUE),
+        "floor-bound 7702 governance revenue must be base-fee revenue only (zero penalty)"
+    );
+
+    // 5. the sender prepaid the full 1,210,000 reservation and was reimbursed everything but the
+    //    121,000 it actually used — the same 847,000 (value 0, priority fee 0)
+    let sender_genesis_balance = chain
+        .genesis()
+        .alloc
+        .get(&sender)
+        .map(|acct| acct.balance)
+        .expect("sender seeded in genesis");
+    let sender_balance = reth_env
+        .retrieve_account(&sender)?
+        .map(|acct| acct.balance)
+        .expect("sender has an account");
+    let sender_delta =
+        sender_genesis_balance.checked_sub(sender_balance).expect("sender balance decreased");
+    assert_eq!(
+        sender_delta,
+        U256::from(EXPECTED_GAS_REVENUE),
+        "floor-bound 7702 sender must pay base-fee gas only — no penalty confiscation"
+    );
+
+    // 6. the batch producer earned nothing: the transaction's priority fee is zero
+    let beneficiary_genesis_balance =
+        chain.genesis().alloc.get(&batch_producer).map(|acct| acct.balance).unwrap_or(U256::ZERO);
+    let beneficiary_balance =
+        reth_env.retrieve_account(&batch_producer)?.map(|acct| acct.balance).unwrap_or(U256::ZERO);
+    assert_eq!(
+        beneficiary_balance, beneficiary_genesis_balance,
+        "zero priority fee must leave the batch producer's balance untouched"
+    );
 
     Ok(())
 }

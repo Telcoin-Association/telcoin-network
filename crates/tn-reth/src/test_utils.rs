@@ -523,12 +523,22 @@ impl TransactionFactory {
     /// delegate and none earn the 12,500-gas refund, leaving pre- and post-refund
     /// gas equal and the caller's accounting exact. This mirrors the real attack,
     /// where the tuples never need to be valid.
+    ///
+    /// `input` is the transaction's calldata, the other half of the gas picture.
+    /// The EIP-7623 floor is priced from calldata alone — `21,000 + 10 gas per
+    /// token`, one token per zero byte and four per non-zero byte, with no
+    /// authorization term — so calldata is how a test drives a spend to that
+    /// floor: pass enough bytes and the floor exceeds the standard cost, and
+    /// revm rewrites `gas.spent()` to it. The mismatched-chain tuples keep the
+    /// refund at zero throughout, so post-refund gas lands on the floor exactly.
+    /// Pass `Bytes::new()` for the plain padded-list case.
     pub fn create_eip7702_with_authorizations(
         &mut self,
         chain_id: ChainId,
         gas_limit: u64,
         gas_price: u128,
         num_authorizations: usize,
+        input: Bytes,
     ) -> TransactionSigned {
         // authorizations on a different chain: still counted for intrinsic gas (and
         // eagerly recovered by alloy-evm), but `apply_auth_list` applies none, so
@@ -557,7 +567,7 @@ impl TransactionFactory {
             value: U256::ZERO,
             access_list: Default::default(),
             authorization_list,
-            input: Bytes::new(),
+            input,
         };
         let tx_signature_hash = tx.signature_hash();
 
