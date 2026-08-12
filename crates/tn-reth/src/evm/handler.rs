@@ -12,7 +12,9 @@
 //!   less than 10% of its gas limit (`calculate_gas_penalty`, issue #424). Batch gas cannot be
 //!   validated until after consensus, so wildly over-estimated limits could otherwise DoS batch
 //!   proposals for free; the penalty, priced at the effective gas price, is credited to the same
-//!   basefee address.
+//!   basefee address. The EIP-7702 authorization intrinsic — sourced from the cfg gas params, so it
+//!   is 0 before Prague and exactly what revm charged at Prague and later — is subtracted from both
+//!   penalty arguments, and the penalty is capped at unused gas as defense-in-depth.
 //!
 //! Invariant: both hooks return early when the transaction caller is `SYSTEM_ADDRESS`, so
 //! system calls (which run with zero gas price and zero base fee) never touch the beneficiary
@@ -24,7 +26,7 @@ use crate::{basefee_address, SYSTEM_ADDRESS};
 use reth_revm::{
     context::result::{EVMError, InvalidTransaction},
     context_interface::{
-        journaled_state::account::JournaledAccountTr, result::HaltReason, Block, ContextTr,
+        journaled_state::account::JournaledAccountTr, result::HaltReason, Block, Cfg, ContextTr,
         JournalTr, Transaction,
     },
     handler::{
@@ -119,22 +121,24 @@ where
         //
         // NOTE: uses pre-refund gas (gas_spent) so SSTORE refunds don't inflate the penalty
         //
-        // the EIP-7702 authorization intrinsic is excluded from the penalty basis: each tuple is
-        // charged a flat 25,000 gas from the tuple count alone (before any validity check), so a
-        // padded authorization list would otherwise let a sender buy gas.spent() past the 10%
-        // threshold and dodge the penalty without doing real work. the penalty is then capped at
-        // unused gas so the credit to the basefee address can never exceed what the sender
-        // prepaid (conservation: refund + penalty + gas_used == gas_limit)
+        // the EIP-7702 authorization intrinsic is subtracted from BOTH penalty arguments: each
+        // tuple is charged a flat per-empty-account intrinsic from the tuple count alone (before
+        // any validity check), so a padded authorization list would otherwise let a sender buy
+        // gas.spent() past the 10% threshold and dodge the penalty without doing real work —
+        // while subtracting from only the spent basis would over-penalize honest delegations.
+        // the intrinsic is sourced from the cfg gas params, so it is 0 before Prague and exactly
+        // what revm charged at Prague and later. the penalty is capped at unused gas as
+        // defense-in-depth so the credit to the basefee address can never exceed what the
+        // sender prepaid (conservation: refund + penalty + gas_used == gas_limit)
         //
         // see https://github.com/Telcoin-Association/telcoin-network/issues/424
-        let (penalty_gas, refund_amount) = gas_penalty_and_refund(
-            gas_limit,
-            gas_spent,
-            gas_used,
-            context.tx().authorization_list_len(),
-        );
+        let num_authorizations = context.tx().authorization_list_len() as u64;
+        let auth_intrinsic = num_authorizations
+            .saturating_mul(context.cfg().gas_params().tx_eip7702_per_empty_account_cost());
+        let (penalty_gas, refund_amount) =
+            gas_penalty_and_refund(gas_limit, gas_spent, gas_used, auth_intrinsic);
 
-        debug!(target: "engine", ?penalty_gas, ?refund_amount, "governance collects: {}", effective_gas_price.saturating_mul(u128::from(penalty_gas)));
+        debug!(target: "engine", ?gas_limit, ?gas_spent, ?gas_used, ?num_authorizations, ?auth_intrinsic, ?penalty_gas, ?refund_amount, "governance collects: {}", effective_gas_price.saturating_mul(u128::from(penalty_gas)));
 
         // return gas to caller (minus penalty)
         if refund_amount > 0 {

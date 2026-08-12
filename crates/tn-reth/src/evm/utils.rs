@@ -7,8 +7,12 @@
 //! confiscation of all unused gas for extreme over-estimates. Integer-only `u128` arithmetic
 //! (10^9 fixed-point precision) keeps results identical on every node — a consensus
 //! requirement, since the penalty changes account balances.
+//!
+//! [`gas_penalty_and_refund`] is the EIP-7702-aware wrapper the handler actually calls: it
+//! excludes the authorization-tuple intrinsic from the penalty basis — so padded authorization
+//! lists cannot buy their way past the threshold and honest delegations are not over-charged —
+//! and splits a transaction's unused gas into the penalty and the caller refund.
 
-use reth_revm::primitives::eip7702::PER_EMPTY_ACCOUNT_COST;
 use tracing::debug;
 
 /// Minimum gas limit threshold (10x minimum transaction cost)
@@ -94,55 +98,93 @@ pub fn calculate_gas_penalty(gas_limit: u64, gas_used: u64) -> u64 {
 
 /// Split a transaction's unused gas into the penalty credited to the basefee
 /// address and the refund returned to the caller, excluding EIP-7702
-/// authorization intrinsic gas from the penalty basis and capping the penalty at
-/// actually-unused gas.
+/// authorization intrinsic gas from the penalty basis.
 ///
-/// `gas_spent` is pre-refund (`gas.spent()`); `gas_used` is post-refund
-/// (`gas.spent_sub_refunded()`), matching `reimburse_caller`'s existing split.
+/// # Parameters
 ///
-/// # Why exclude the authorization intrinsic
+/// - `gas_limit`: the transaction's gas limit.
+/// - `gas_spent`: pre-refund gas, revm's `gas.spent()`.
+/// - `gas_used`: post-refund gas, revm's `gas.spent_sub_refunded()` — what the header records and
+///   the sender pays for.
+/// - `auth_intrinsic`: the wire authorization-tuple count multiplied by the spec's
+///   per-empty-account cost, supplied by the caller from revm's cfg gas params — so it is 0 before
+///   Prague and matches exactly what revm charged at Prague and later.
+///
+/// # Why the intrinsic comes off BOTH arguments
 ///
 /// The penalty asks "did you use enough of the gas you reserved?" and reads the
-/// answer off `gas.spent()`. EIP-7702 charges a flat 25,000-gas intrinsic per
-/// authorization tuple (`PER_EMPTY_ACCOUNT_COST`) from the tuple count alone,
+/// answer off `gas.spent()`. EIP-7702 charges a flat per-empty-account intrinsic
+/// (25,000 gas at Prague) per authorization tuple from the tuple count alone,
 /// before any validity check, so a sender can pad the authorization list with
 /// junk tuples to inflate `gas.spent()` past the 10% threshold and collapse the
 /// quadratic penalty on a batch-hogging gas limit — buying `gas.spent()` without
-/// doing any work. Subtracting the authorization intrinsic from the penalty basis
-/// removes that lever. Only the authorization intrinsic is excluded: calldata
-/// (16 gas/byte) fairly prices batch bytes and the base 21,000 is negligible, so
-/// legitimate low-execution transfers keep the pre-fix basis.
+/// doing any work. Subtracting the intrinsic removes that lever — but subtracting
+/// it from only the spent basis moved the penalty-free line to `gas_spent >=
+/// 0.10 * gas_limit + 25,000 * N`, silently confiscating the unrefunded
+/// 12,500-per-tuple portion of honest delegation work (revm refunds only
+/// `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` = 12,500 per applied tuple, only
+/// for authorities whose accounts already exist, and EIP-3529 caps the total
+/// refund at a fifth of spent gas). Subtracting from both arguments prices the
+/// penalty as if the authorization block did not exist: an honest exact-estimate
+/// delegation pays zero, while the unused-gas multiplier is unchanged —
+/// `(gas_limit - A) - (gas_spent - A) = gas_limit - gas_spent` — so the padded
+/// attacker (N = 120, 30M limit, 3,021,000 spent) still pays 26,560,959 of the
+/// previous 26,979,000, keeping 98.45% of the penalty.
+///
+/// Only the authorization intrinsic is excluded: calldata fairly prices batch
+/// bytes (16 gas per nonzero byte / 4 per zero byte under execution pricing, and
+/// 40 per nonzero byte / 10 per zero byte when the EIP-7623 floor binds) and the
+/// base 21,000 is negligible, so legitimate low-execution transfers keep the
+/// pre-fix basis.
+///
+/// # Consequences of the two-argument subtraction
+///
+/// - The small-transaction exemption widens from `gas_limit <= 210,000` to `gas_limit <= 210,000 +
+///   auth_intrinsic` — correct, because the authorization block is prepaid at full price.
+/// - A halted transaction consumes its entire limit, so `gas_spent - A` against `gas_limit - A` is
+///   a 100% usage ratio and the penalty is zero even with a large authorization list.
+/// - Residual tradeoff: when the EIP-7623 calldata floor binds, revm's spent value IS the floor,
+///   which carries no authorization intrinsic; subtracting `A` from it can produce a small penalty
+///   where the pre-fix code gave zero (pinned by `eip7623_floor_basis_can_pay_a_small_penalty`).
+///   Accepted: the floor case is rare and the penalty is tiny.
 ///
 /// # Why cap at unused gas
 ///
-/// Subtracting from the basis makes the penalty larger, and in the padded case it
-/// can exceed `unused_gas`. `reimburse_caller` credits the full penalty to the
-/// basefee address while flooring the caller refund at zero, so an uncapped
-/// penalty would pay out `gas_used + penalty > gas_limit` — more than the sender
-/// prepaid, minting value in consensus-critical code. Capping the penalty at
-/// `unused_gas` restores exact conservation (`refund + penalty + gas_used ==
-/// gas_limit`).
+/// The `.min(unused_gas)` cap is now structurally non-binding for every `gas_used <= gas_spent`
+/// input — the two-argument penalty is bounded by `(gas_limit - A) - (gas_spent - A) =
+/// gas_limit - gas_spent <= gas_limit - gas_used = unused_gas` — but it is kept as
+/// defense-in-depth: `reimburse_caller` credits the full penalty to the basefee address, so an
+/// uncapped penalty above unused gas would pay out more than the sender prepaid, minting value
+/// in consensus-critical code. The cap guarantees exact conservation (`refund + penalty +
+/// gas_used == gas_limit`).
 ///
-/// For `num_authorizations == 0` (every non-7702 transaction) `auth_intrinsic` is
-/// zero and `calculate_gas_penalty` is already bounded by `gas_limit - gas_spent
-/// <= gas_limit - gas_used = unused_gas`, so the cap never binds and this is
-/// identical to the prior inline math.
+/// For `auth_intrinsic == 0` (every non-7702 transaction) this reproduces the prior inline
+/// math byte-for-byte.
 pub(crate) fn gas_penalty_and_refund(
     gas_limit: u64,
     gas_spent: u64,
     gas_used: u64,
-    num_authorizations: usize,
+    auth_intrinsic: u64,
 ) -> (u64, u64) {
-    let auth_intrinsic = (num_authorizations as u64).saturating_mul(PER_EMPTY_ACCOUNT_COST);
     let unused_gas = gas_limit.saturating_sub(gas_used);
-    let penalty =
-        calculate_gas_penalty(gas_limit, gas_spent.saturating_sub(auth_intrinsic)).min(unused_gas);
+    let penalty = calculate_gas_penalty(
+        gas_limit.saturating_sub(auth_intrinsic),
+        gas_spent.saturating_sub(auth_intrinsic),
+    )
+    .min(unused_gas);
     (penalty, unused_gas.saturating_sub(penalty))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reth_revm::{
+        context::CfgEnv,
+        primitives::{
+            eip7702::{PER_AUTH_BASE_COST, PER_EMPTY_ACCOUNT_COST},
+            hardfork::SpecId,
+        },
+    };
     use tracing::debug;
 
     #[test]
@@ -249,31 +291,38 @@ mod tests {
         assert_eq!(penalty, 54_876, "Should have penalty above minimum threshold");
     }
 
-    /// A padded EIP-7702 authorization list pays a capped, near-maximal penalty.
+    /// A padded EIP-7702 authorization list pays a near-maximal penalty.
     ///
     /// 120 junk tuples inflate `gas_spent` to 3,021,000 (21,000 base + 120 ×
     /// 25,000 intrinsic) — 10.07% of a 30M limit, just over the 10% penalty-free
     /// threshold. `gas_penalty_and_refund` strips the 3,000,000 authorization
-    /// intrinsic from the basis, so the penalty is computed at 21,000 of real
-    /// work (0.07% usage → 29,560,762 uncapped) and then capped at the 26,979,000
-    /// of actually-unused gas. The batch-hogging reservation costs the whole
-    /// unused amount; nothing is refunded.
+    /// intrinsic from both arguments, so the penalty is priced as 21,000 of real
+    /// work against a 27M reservation — exactly the no-7702 penalty for the same
+    /// non-auth work: 26,560,959 of the 26,979,000 unused gas, keeping 98.45% of
+    /// the pre-fix 26,979,000 capped penalty. The batch-hogging reservation still
+    /// doesn't pay.
+    ///
+    /// Confirm-by-mutation: reverting to the numerator-only subtraction yields a
+    /// capped 26,979,000, and removing the subtraction entirely yields 0 — both
+    /// break the pinned pair below.
     #[test]
-    fn padded_7702_authorization_list_pays_a_capped_near_maximal_penalty() {
+    fn padded_7702_authorization_list_pays_a_near_maximal_penalty() {
         let gas_limit = 30_000_000;
         let gas_spent = 3_021_000; // 21,000 + 120 * 25,000
         let gas_used = gas_spent; // mismatched-chain tuples apply nothing, so no refund
-        let (penalty, refund) = gas_penalty_and_refund(gas_limit, gas_spent, gas_used, 120);
+        let (penalty, refund) = gas_penalty_and_refund(gas_limit, gas_spent, gas_used, 3_000_000);
 
-        // the cap binds: the uncapped penalty at 21,000 of real work exceeds unused gas, so
-        // without the cap the handler would credit more than the sender prepaid (minting value)
-        let uncapped = calculate_gas_penalty(gas_limit, 21_000);
-        assert_eq!(uncapped, 29_560_762);
-        assert!(uncapped > gas_limit - gas_spent, "uncapped penalty exceeds unused gas");
+        assert_eq!((penalty, refund), (26_560_959, 418_041), "near-maximal penalty");
 
-        assert_eq!(penalty, 26_979_000, "penalty capped at unused gas");
-        assert_eq!(refund, 0, "nothing left to refund");
-        assert_eq!(penalty + refund + gas_used, gas_limit, "gas is conserved");
+        // the two-argument basis is exactly the no-7702 penalty for the same non-auth work
+        assert_eq!(penalty, calculate_gas_penalty(27_000_000, 21_000));
+
+        // the cap is non-binding: the uncapped two-argument penalty is below unused gas
+        let uncapped = calculate_gas_penalty(27_000_000, 21_000);
+        assert!(uncapped < gas_limit - gas_used, "uncapped penalty stays below unused gas");
+
+        assert_eq!(penalty + refund, 26_979_000, "penalty + refund is all unused gas");
+        assert_eq!(penalty + refund, gas_limit - gas_used, "gas is conserved");
     }
 
     /// The same 3,021,000 spend with no authorization tuples earns no penalty:
@@ -293,7 +342,7 @@ mod tests {
         assert_eq!(penalty + refund + gas_used, gas_limit, "gas is conserved");
     }
 
-    /// For every non-7702 transaction (`num_authorizations == 0`) the helper is
+    /// For every non-7702 transaction (`auth_intrinsic == 0`) the helper is
     /// identical to the prior inline math — `calculate_gas_penalty(gas_limit,
     /// gas_spent)` with the refund as the remainder — and the cap never binds.
     /// Pins the "zero drift for existing traffic" guarantee across a spread of
@@ -322,5 +371,105 @@ mod tests {
             assert!(penalty <= unused, "cap never binds for non-7702");
             assert_eq!(penalty + refund + gas_used, gas_limit, "gas is conserved");
         }
+    }
+
+    /// An honest N=20 delegation at an exact gas estimate pays no penalty.
+    ///
+    /// `gas_limit = gas_spent = 521,000` (21,000 base + 20 × 25,000 intrinsic)
+    /// with all 20 tuples applied: revm's 12,500 × 20 = 250,000 refund is
+    /// EIP-3529-capped at `gas_spent / 5 = 104,200`, hence `gas_used = 416,800`.
+    /// Under the numerator-only subtraction this transaction paid a penalty
+    /// (21,000 of 521,000 is 4% usage); with the intrinsic off both arguments
+    /// the basis is 21,000 of 21,000 — zero penalty, full refund of unused gas.
+    #[test]
+    fn honest_exact_estimate_with_capped_refund_pays_no_penalty() {
+        let (penalty, refund) = gas_penalty_and_refund(521_000, 521_000, 416_800, 500_000);
+        assert_eq!((penalty, refund), (0, 104_200), "exact estimate pays no penalty");
+        assert_eq!(penalty + refund, 521_000 - 416_800, "gas is conserved");
+    }
+
+    /// An honest N=5 delegation at an exact gas estimate pays no penalty — the
+    /// unit mirror of the engine e2e's applied-delegation case.
+    ///
+    /// `gas_limit = gas_spent = 146,000` (21,000 base + 5 × 25,000 intrinsic);
+    /// the 12,500 × 5 = 62,500 refund is EIP-3529-capped at `146,000 / 5 =
+    /// 29,200`, hence `gas_used = 116,800`.
+    #[test]
+    fn honest_small_delegation_exact_estimate_pays_no_penalty() {
+        let (penalty, refund) = gas_penalty_and_refund(146_000, 146_000, 116_800, 125_000);
+        assert_eq!((penalty, refund), (0, 29_200), "exact estimate pays no penalty");
+        assert_eq!(penalty + refund, 146_000 - 116_800, "gas is conserved");
+    }
+
+    /// Applied authorizations with enough real work stay penalty-free:
+    /// `(gas_spent - A) / (gas_limit - A) = 100,000 / 950,000` is over the 10%
+    /// threshold, so all unused gas is refunded.
+    #[test]
+    fn applied_authorizations_above_threshold_pay_no_penalty() {
+        let (penalty, refund) = gas_penalty_and_refund(1_000_000, 150_000, 125_000, 50_000);
+        assert_eq!((penalty, refund), (0, 875_000), "usage over 10% on the reduced basis");
+        assert_eq!(penalty + refund, 1_000_000 - 125_000, "gas is conserved");
+    }
+
+    /// Applied authorizations with too little real work pay the quadratic
+    /// penalty on the non-auth basis: `(gas_spent - A) / (gas_limit - A) =
+    /// 71,000 / 1,000,000` is under the 10% threshold.
+    #[test]
+    fn applied_authorizations_below_threshold_pay_ratio_penalty() {
+        let (penalty, refund) = gas_penalty_and_refund(1_050_000, 121_000, 96_800, 50_000);
+        assert_eq!((penalty, refund), (78_128, 875_072), "quadratic penalty on non-auth work");
+        assert_eq!(penalty + refund, 953_200, "penalty + refund is all unused gas");
+        assert_eq!(penalty + refund, 1_050_000 - 96_800, "gas is conserved");
+    }
+
+    /// A halted transaction consumes its entire limit, so the reduced basis is
+    /// a 100% usage ratio (`gas_spent - A == gas_limit - A`) and there is no
+    /// penalty even with a large authorization list; the post-refund unused gas
+    /// is returned in full.
+    #[test]
+    fn halted_transaction_with_authorization_refund_pays_no_penalty() {
+        let (penalty, refund) = gas_penalty_and_refund(3_100_000, 3_100_000, 2_480_000, 3_000_000);
+        assert_eq!((penalty, refund), (0, 620_000), "halt spends the whole limit");
+        assert_eq!(penalty + refund, 3_100_000 - 2_480_000, "gas is conserved");
+    }
+
+    /// Documents the accepted EIP-7623 residual: when the calldata floor binds,
+    /// revm's spent value IS the floor, which carries no authorization
+    /// intrinsic — so subtracting `A` from it yields a small penalty where the
+    /// pre-fix numerator-only code gave zero. Accepted because the floor case
+    /// is rare and the penalty is tiny (10,021 of 3,779,000 unused gas here).
+    #[test]
+    fn eip7623_floor_basis_can_pay_a_small_penalty() {
+        let (penalty, refund) = gas_penalty_and_refund(4_200_000, 421_000, 421_000, 25_000);
+        assert_eq!((penalty, refund), (10_021, 3_768_979), "small penalty on the floor basis");
+        assert_eq!(penalty + refund, 4_200_000 - 421_000, "gas is conserved");
+    }
+
+    /// Pins the gas-table values the wrapper's documentation and the handler's
+    /// intrinsic sourcing rely on, in both directions:
+    ///
+    /// - `PER_EMPTY_ACCOUNT_COST` is the 25,000-gas per-tuple charge and `PER_EMPTY_ACCOUNT_COST -
+    ///   PER_AUTH_BASE_COST` is the 12,500-per-tuple refund the doc math quotes;
+    /// - revm's mainnet gas params serve exactly `PER_EMPTY_ACCOUNT_COST` at Prague and 0 before it
+    ///   — the pre-Prague guard the handler relies on when it multiplies the tuple count by this
+    ///   cfg value.
+    #[test]
+    fn per_empty_account_cost_matches_prague_gas_table() {
+        assert_eq!(PER_EMPTY_ACCOUNT_COST, 25_000, "per-tuple intrinsic charge");
+        assert_eq!(PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST, 12_500, "per-applied-tuple refund");
+
+        let prague = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
+        assert_eq!(
+            prague.gas_params.tx_eip7702_per_empty_account_cost(),
+            PER_EMPTY_ACCOUNT_COST,
+            "Prague gas params serve the spec's per-empty-account cost"
+        );
+
+        let cancun = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN);
+        assert_eq!(
+            cancun.gas_params.tx_eip7702_per_empty_account_cost(),
+            0,
+            "pre-Prague gas params serve 0, disabling the subtraction"
+        );
     }
 }

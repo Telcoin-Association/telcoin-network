@@ -2684,12 +2684,14 @@ async fn test_padded_7702_authorization_list_pays_capped_penalty() -> eyre::Resu
         "padding must push gas_used over the 10% penalty-free threshold (got {gas_used})"
     );
 
-    // mirror gas_penalty_and_refund with public APIs: the mismatched-chain tuples apply
-    // nothing, so there is no 7702 refund and pre-refund gas equals gas_used
+    // mirror gas_penalty_and_refund's two-argument auth-intrinsic subtraction with public
+    // APIs: the mismatched-chain tuples apply nothing, so there is no 7702 refund and
+    // pre-refund gas equals gas_used
     let auth_intrinsic = NUM_AUTHS as u64 * PER_EMPTY_ACCOUNT_COST;
     let unused_gas = GAS_LIMIT - gas_used;
     let expected_penalty =
-        calculate_gas_penalty(GAS_LIMIT, gas_used.saturating_sub(auth_intrinsic)).min(unused_gas);
+        calculate_gas_penalty(GAS_LIMIT - auth_intrinsic, gas_used.saturating_sub(auth_intrinsic))
+            .min(unused_gas);
     assert!(expected_penalty > 0, "fix must assess a nonzero penalty on the padded tx");
 
     // governance revenue = basefee portion of gas + penalty priced at the effective gas price
