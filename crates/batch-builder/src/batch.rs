@@ -98,7 +98,7 @@ pub fn build_batch<P: TxPool>(
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking eip4844 tx invalid");
                 blob_transactions.push(*tx.hash());
             } else {
-                best_txs.ignore_eip7702(&pool_tx);
+                best_txs.ignore_denylist_type(&pool_tx);
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking non-allowlisted tx type invalid");
                 unsupported_transactions.push(*tx.hash());
             }

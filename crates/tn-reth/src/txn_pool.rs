@@ -384,14 +384,15 @@ impl BestTxns {
         );
     }
 
-    /// Mark a non-allowlisted, non-4844 transaction type as invalid during batch
-    /// building.
+    /// Mark a denylisted transaction type — one outside the batch allowlist and not
+    /// EIP-4844 — as invalid during batch building.
     ///
-    /// Mirrors [`Self::ignore_eip4844`]: the nearest upstream error kind stands in for a
-    /// type the batch allowlist refuses. This is a default-deny path no decodable type
-    /// reaches today (EIP-7702 is allowlisted; EIP-4844 takes [`Self::ignore_eip4844`]),
-    /// kept for future transaction types.
-    pub fn ignore_eip7702(&mut self, pool_tx: &Arc<PoolTxn>) {
+    /// Mirrors [`Self::ignore_eip4844`]: upstream reth owns the pool error enum, so the
+    /// nearest upstream kind ([`Eip7702PoolTransactionError`]) stands in for a type the
+    /// batch allowlist refuses. This is a default-deny path no decodable type reaches
+    /// today (EIP-7702 is allowlisted; EIP-4844 takes [`Self::ignore_eip4844`]), kept
+    /// for future transaction types.
+    pub fn ignore_denylist_type(&mut self, pool_tx: &Arc<PoolTxn>) {
         self.inner.mark_invalid(
             pool_tx,
             &InvalidPoolTransactionError::Eip7702(
