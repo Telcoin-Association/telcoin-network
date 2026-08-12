@@ -446,8 +446,9 @@ impl RethEnv {
 /// 2. [`import_chain_scaffold`](Self::import_chain_scaffold) clears the genesis alloc from the
 ///    state tables and writes a header-only chain up to `B` (real hashes in the window, zero-hash
 ///    dummies below it), so the state import has a real `header(B)` to check its recomputed root
-///    against. It first records the restored-state floor marker (the window's first block), so
-///    every later env over this datadir refuses pinned state reads below the shipped window.
+///    against. It first records the restored-state floor marker (= `B`, the window's final block,
+///    the only block whose state the restore imports), so every later env over this datadir refuses
+///    pinned state reads below `B`.
 /// 3. [`import_state`](Self::import_state) streams the pack's accounts into reth's state tables one
 ///    account header and one bounded storage chunk at a time, recomputes the state root from
 ///    scratch, and hard-fails on any mismatch with `header(B).state_root`.
@@ -521,9 +522,9 @@ impl SnapshotRestorer {
     ///   consistent.
     /// - Writes `HeaderNumbers` (hash → number) for every window header so `BLOCKHASH` resolves by
     ///   hash, and sets every stage checkpoint to `B`.
-    /// - Writes the datadir's restored-state floor marker (= `window[0].number`) BEFORE any of the
-    ///   above commits, so pinned state reads below the shipped window are refused for the life of
-    ///   this datadir (`pinned_state_and_env` in `env/epoch.rs`).
+    /// - Writes the datadir's restored-state floor marker (= `B`, the window's final block) BEFORE
+    ///   any of the above commits, so pinned state reads below `B` are refused for the life of this
+    ///   datadir (`read_only_state_db` in `env/mod.rs`).
     ///
     /// Static files are committed BEFORE the database provider: the refuse-non-empty check in
     /// [`open`](Self::open) keys on the Headers static-file height, so committing static files
@@ -2430,6 +2431,38 @@ mod tests {
         let (epoch, _info) = restored.get_current_epoch_info_at_header(&closing)?;
         assert_eq!(epoch, 1, "the closing block must still read as the entered epoch");
 
+        // #1136: `read_contract_at_block` builds its state through `read_only_state_db` without
+        // passing `pinned_state_and_env`: the floor must refuse it all the same. Genesis
+        // resolves in this datadir, so before the chokepoint check this read returned Ok with
+        // every account "never written" instead of an error
+        use crate::error::EvmReadError;
+        let err = restored
+            .read_contract_at_block(
+                chain.sealed_genesis_header().hash(),
+                Address::from_slice(&[0xdd; 20]),
+                Bytes::default(),
+            )
+            .expect_err("a contract read pinned below the floor must be refused");
+        assert!(
+            matches!(&err, EvmReadError::Internal(_)),
+            "the floor refusal must be an internal node fault, not a revert: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("below this datadir's restored-state floor"),
+            "the contract-read refusal must name the restored floor, got: {err}"
+        );
+
+        // positive control for the same path: pinned AT the floor the read is admitted and
+        // reaches the EVM (a codeless address answers with empty output, not a refusal)
+        let output = restored
+            .read_contract_at_block(
+                closing.hash(),
+                Address::from_slice(&[0xdd; 20]),
+                Bytes::default(),
+            )
+            .expect("a contract read pinned at the floor must be admitted");
+        assert!(output.is_empty(), "a codeless address must return empty output");
+
         Ok(())
     }
 
@@ -2488,6 +2521,36 @@ mod tests {
         assert!(
             err.to_string().contains("below this datadir's restored-state floor"),
             "the window-interior refusal must come from the floor, got: {err}"
+        );
+
+        // #1136: the same window-interior pin through `read_contract_at_block`, which does not
+        // pass `pinned_state_and_env`: the chokepoint in `read_only_state_db` must refuse it too
+        use crate::error::EvmReadError;
+        let err = env
+            .read_contract_at_block(h3.hash(), Address::from_slice(&[0xdd; 20]), Bytes::default())
+            .expect_err("a contract read pinned inside the window but below B must be refused");
+        assert!(
+            matches!(&err, EvmReadError::Internal(_)),
+            "the floor refusal must be an internal node fault, not a revert: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("below this datadir's restored-state floor"),
+            "the contract-read refusal must come from the floor, got: {err}"
+        );
+
+        // admit-side control for the same path: a contract read pinned AT the floor (real hash
+        // `h5`) must not be the floor's refusal, whatever else this scaffold-only datadir does
+        // with the read
+        let at_floor_read = env.read_contract_at_block(
+            h5.hash(),
+            Address::from_slice(&[0xdd; 20]),
+            Bytes::default(),
+        );
+        assert!(
+            at_floor_read.as_ref().err().is_none_or(|e| !e
+                .to_string()
+                .contains("below this datadir's restored-state floor")),
+            "the floor must not refuse a contract read at the floor itself, got: {at_floor_read:?}"
         );
 
         // boundary control: AT the floor (= B) the guard admits the pin — this read then fails

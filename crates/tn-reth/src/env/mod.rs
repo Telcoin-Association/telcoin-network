@@ -16,7 +16,7 @@
 //!   registration) — see its docs.
 //! - Opening an env loads the datadir's restored-state floor marker when one exists (a datadir
 //!   bootstrapped from a snapshot); pinned state reads below the floor are refused — see
-//!   `pinned_state_and_env` in `env/epoch.rs`.
+//!   `RethEnv::read_only_state_db` in this module.
 
 use std::{
     path::{Path, PathBuf},
@@ -29,15 +29,16 @@ use reth_db_common::init::init_genesis;
 use reth_node_builder::NodeConfig;
 use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider},
-    ProviderFactory, ProviderResult, StateProviderBox, StateProviderFactory as _,
+    ProviderError, ProviderFactory, ProviderResult, StateProviderBox, StateProviderFactory as _,
 };
 use reth_revm::{database::StateProviderDatabase, State};
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
-use tn_types::{gas_accumulator::GasAccumulator, Address, TaskManager, TaskSpawner, B256};
+use tn_types::{gas_accumulator::GasAccumulator, Address, SealedHeader, TaskManager, TaskSpawner};
 use tracing::{debug, info};
 
 use crate::{
-    evm::TnEvmConfig, traits::TelcoinNode, RethConfig, RethDb, WorkerTxPool, BASEFEE_ADDRESS,
+    error::RestoredStateFloorError, evm::TnEvmConfig, traits::TelcoinNode, RethConfig, RethDb,
+    WorkerTxPool, BASEFEE_ADDRESS,
 };
 
 mod epoch;
@@ -81,9 +82,10 @@ struct RethEnvInner {
     /// Loaded once from the [`RESTORED_STATE_FLOOR_FILE`] marker at construction. The restore
     /// imports state ONLY at `B`: window headers below `B` carry real, resolvable hashes but no
     /// state and no history, and blocks below the window are zero-hash placeholders. So
-    /// `pinned_state_and_env` (`env/epoch.rs`) refuses every pin below the floor: reth's
-    /// checkpoint-less history walk would otherwise answer such reads `Ok(None)` per account,
-    /// silently reading every account as "never written".
+    /// `read_only_state_db` (the shared state constructor every pinned read goes through)
+    /// refuses every pin below the floor: reth's checkpoint-less history walk would otherwise
+    /// answer such reads `Ok(None)` per account, silently reading every account as "never
+    /// written".
     restored_state_floor: Option<u64>,
     /// TEST-ONLY: number of pending injected pre-commit persist faults.
     ///
@@ -355,18 +357,44 @@ impl RethEnv {
         &self.inner.evm_config
     }
 
-    /// Build the read-only database stack over the state at `block_hash`: state provider →
+    /// Build the read-only database stack over the state at `header`: state provider →
     /// [`StateProviderDatabase`] → [`State`] with bundle updates enabled.
     ///
-    /// This is the shared construction for every pinned, non-committing contract read. Callers
-    /// create their own EVM over the returned stack and keep their site-specific mapping of the
-    /// [`ProviderResult`] error (node-local provider faults classify differently per caller).
-    /// Block-building paths use a different, cached DB stack and must not switch to this one.
+    /// This is the shared construction for every pinned, non-committing contract read, and the
+    /// ONE enforcement point for the restored-state floor: a pin below the floor is refused
+    /// here, before any provider state is touched, as a [`RestoredStateFloorError`] carried in
+    /// [`ProviderError::Other`], so every consumer inherits the refusal instead of silently
+    /// reading every account as "never written" (the gap `read_contract_at_block` had, #1136).
+    /// Taking the full [`SealedHeader`] rather than a bare hash removes the number/hash
+    /// ambiguity of the hash-only signature: every production caller resolves the header from
+    /// the provider, so the compared number and the resolved hash come from one record. A
+    /// hand-built `SealedHeader` can still pair a number with a foreign hash (tests do), so the
+    /// floor guards against API misuse, not against forged headers.
+    ///
+    /// ARCHIVE-MODE ASSUMPTION: the `state_by_block_hash` call below stays deterministic only
+    /// because this node never constructs a pruner; with pruning enabled, reth's historical
+    /// provider can silently fall back to TIP state for a pinned read. Revisit every consumer
+    /// of this constructor before enabling pruning (the full note lives on
+    /// `pinned_state_and_env` in `env/epoch.rs`).
+    ///
+    /// Callers create their own EVM over the returned stack and keep their site-specific mapping
+    /// of the [`ProviderResult`] error (node-local provider faults classify differently per
+    /// caller). Block-building paths use a different, cached DB stack and must not switch to
+    /// this one.
     pub(crate) fn read_only_state_db(
         &self,
-        block_hash: B256,
+        header: &SealedHeader,
     ) -> ProviderResult<State<StateProviderDatabase<StateProviderBox>>> {
-        let state_provider = self.inner.blockchain_provider.state_by_block_hash(block_hash)?;
+        // refuse pins below the restored-state floor before touching the provider: below it the
+        // datadir holds headers but no state, and the read would resolve silently to "never
+        // written" values instead of failing
+        self.inner
+            .restored_state_floor
+            .filter(|floor| header.number < *floor)
+            .map_or(Ok(()), |floor| {
+                Err(ProviderError::other(RestoredStateFloorError::new(header.number, floor)))
+            })?;
+        let state_provider = self.inner.blockchain_provider.state_by_block_hash(header.hash())?;
         let state = StateProviderDatabase::new(state_provider);
         Ok(State::builder().with_database(state).with_bundle_update().build())
     }
