@@ -42,8 +42,8 @@ use tn_types::{
     forks::seed_signature_active,
     gas_accumulator::{next_base_fee_for_config, GasAccumulator},
     BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    EpochDigest, EpochRecord, Notifier, SealedHeader, TaskJoinError, TaskManager, TaskSpawner,
-    TnReceiver,
+    EpochDigest, EpochRecord, SealedHeader, ShutdownNotifier, TaskJoinError, TaskManager,
+    TaskSpawner, TnReceiver,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -891,7 +891,7 @@ where
 
     /// Finalize an epoch once its boundary output has been identified.
     ///
-    /// Begins shutting consensus down (when a [`Notifier`] is supplied) so it winds down in
+    /// Begins shutting consensus down (when a [`ShutdownNotifier`] is supplied) so it winds down in
     /// parallel while the engine finishes executing up to `target_hash`, then blocks until that
     /// execution is confirmed. On the live boundary path it then recomputes each worker's
     /// next-epoch base fee ([`adjust_base_fees`]); the restart replay-and-close and leftover-drain
@@ -907,7 +907,7 @@ where
     /// [`GasAccumulator`] so the next epoch starts from zero.
     async fn close_epoch(
         &self,
-        shutdown_consensus: Option<Notifier>,
+        shutdown_consensus: Option<ShutdownNotifier>,
         reth_env: &RethEnv,
         gas_accumulator: &GasAccumulator,
         target_hash: ConsensusHeaderDigest,

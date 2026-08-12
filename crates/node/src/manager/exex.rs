@@ -84,7 +84,7 @@ mod exex_isolation_tests {
     //! load-bearing and a failing one instead shuts the node down.
     use super::{run_critical_exex_future, run_isolated_exex_future};
     use std::time::Duration;
-    use tn_types::{Notifier, TaskError, TaskJoinError, TaskManager};
+    use tn_types::{ShutdownNotifier, TaskError, TaskJoinError, TaskManager};
 
     #[tokio::test]
     async fn isolated_exex_future_contains_panic_error_and_completion() {
@@ -142,7 +142,7 @@ mod exex_isolation_tests {
         // panicking/finished ExExes had shut the node down, `join` would have
         // returned with one of THEIR names instead of "node-alive".
         stop_tx.send(()).expect("sentinel still running");
-        match task_manager.join(Notifier::default()).await {
+        match task_manager.join(ShutdownNotifier::default()).await {
             Err(TaskJoinError::CriticalExitError(name, _)) => {
                 assert_eq!(name, "node-alive", "shutdown must originate from the critical task");
             }
@@ -180,7 +180,7 @@ mod exex_isolation_tests {
             }),
         );
 
-        match task_manager.join(Notifier::default()).await {
+        match task_manager.join(ShutdownNotifier::default()).await {
             Err(TaskJoinError::CriticalExitError(name, _)) => {
                 assert_eq!(name, "exex-critical", "shutdown must originate from the critical exex");
             }
