@@ -160,7 +160,11 @@ pub fn calculate_gas_penalty(gas_limit: u64, gas_used: u64) -> u64 {
 ///
 /// For `auth_intrinsic == 0` (every non-7702 transaction) this reproduces the prior inline
 /// math byte-for-byte.
-pub(crate) fn gas_penalty_and_refund(
+// `pub` for the test-gated re-exports in `evm` and the crate root; in builds where those
+// re-exports are compiled out (no `test-utils`, not `cfg(test)`) the item is crate-internal,
+// so silence `unreachable_pub` there instead of splitting the signature per cfg.
+#[cfg_attr(not(any(test, feature = "test-utils")), allow(unreachable_pub))]
+pub fn gas_penalty_and_refund(
     gas_limit: u64,
     gas_spent: u64,
     gas_used: u64,

@@ -140,6 +140,10 @@ pub use cli::{
 pub use env::*;
 #[cfg(feature = "faucet")]
 pub use evm::faucet_mint_role_slot;
+/// Test-gated re-export so integration and property tests exercise the real penalty/refund
+/// split the EVM handler applies to unused gas.
+#[cfg(any(test, feature = "test-utils"))]
+pub use evm::gas_penalty_and_refund;
 #[cfg(not(feature = "faucet"))]
 pub use evm::TIMELOCK_DURATION;
 pub use evm::{
