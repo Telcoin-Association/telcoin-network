@@ -42,8 +42,8 @@ mod code {
     pub(super) const RATE_LIMITED: i32 = -32006;
     /// An `eth_sendRawTransaction` payload could not be decoded as a transaction.
     pub(super) const INVALID_TRANSACTION: i32 = -32007;
-    /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob transaction).
+    /// An `eth_sendRawTransaction` payload decoded to a transaction type
+    /// outside the network's allowlist (legacy, EIP-2930, EIP-1559, EIP-7702).
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
     /// The request body could not be read. This is the spec-defined
     /// "Invalid Request" code, not a gateway-range code.
@@ -70,8 +70,8 @@ pub(crate) enum GatewayError {
     /// An `eth_sendRawTransaction` payload could not be decoded as a
     /// transaction (malformed hex or RLP).
     InvalidTransaction,
-    /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob transaction).
+    /// An `eth_sendRawTransaction` payload decoded to a transaction type
+    /// outside the network's allowlist (legacy, EIP-2930, EIP-1559, EIP-7702).
     UnsupportedTransactionType,
     /// The request body could not be read (e.g. the client aborted mid-body).
     UnreadableBody,
@@ -123,7 +123,8 @@ impl GatewayError {
             Self::RateLimited => "rate limit exceeded; slow down and retry",
             Self::InvalidTransaction => "raw transaction could not be decoded",
             Self::UnsupportedTransactionType => {
-                "unsupported transaction type: EIP-4844 blob transactions are not accepted"
+                "unsupported transaction type: only legacy, EIP-2930, EIP-1559, and EIP-7702 \
+                 transactions are accepted"
             }
             Self::UnreadableBody => "request body could not be read",
         }
