@@ -20,6 +20,7 @@ use tn_engine::{
 use tn_reth::{
     calculate_gas_penalty,
     error::TnRethError,
+    gas_penalty_and_refund,
     payload::{BuildArguments, TNPayload},
     recover_signed_transaction,
     system_calls::EpochState,
@@ -27,7 +28,7 @@ use tn_reth::{
         calculate_withdrawals_root, consensus_output_for_tests, create_committee_from_state,
         execute_payload_and_update_canonical_chain, seeded_genesis_from_random_batches,
         test_genesis_with_consensus_registry, TransactionFactory, BEACON_ROOTS_ADDRESS,
-        EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS,
+        EMPTY_REQUESTS_HASH, HISTORY_STORAGE_ADDRESS, PER_EMPTY_ACCOUNT_COST,
     },
     FixedBytes, ProviderError, RethChainSpec, RethEnv,
 };
@@ -2620,34 +2621,33 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
 
 /// End-to-end regression for the EIP-7702 gas-penalty bypass (issue #424 hardening).
 ///
-/// A padded EIP-7702 authorization list inflates `gas.spent()` past the 10%
-/// penalty-free threshold cheaply — 25,000 gas per junk tuple — which before the
-/// fix zeroed the over-reservation penalty on a batch-hogging gas limit. The fix
-/// excludes the authorization intrinsic from the penalty basis and caps the
-/// penalty at unused gas, so `reimburse_caller` confiscates the whole unused
-/// reservation instead of refunding it.
+/// A padded EIP-7702 authorization list inflates `gas.spent()` cheaply — 25,000
+/// gas per junk tuple, no validity required — which before the fix pushed
+/// reported usage over the 10% penalty-free threshold and zeroed the
+/// over-reservation penalty on a batch-hogging gas limit. Here 120
+/// mismatched-chain tuples inflate spent to 3,021,000 (10.07% of the 30M
+/// limit), just across the threshold, while the fix's two-argument subtraction
+/// prices the penalty as 21,000 of real work against a 27M reservation and caps
+/// it at unused gas: 26,560,959 of the pre-attack 26,979,000 penalty survives.
 ///
-/// Routed through `execute_payload_and_update_canonical_chain` rather than a
-/// batch: the transaction-type allowlist drops a 7702 transaction before it can
-/// reach execution, so a batch path would silently execute an empty block. This
-/// executes one padded 7702 transaction reserving the full 30M batch and asserts
-/// the governance-safe balance rose by `basefee * gas_used + penalty *
-/// effective_gas_price` — the capped penalty, applied in a real block.
+/// The test drives the executor directly through
+/// `execute_payload_and_update_canonical_chain` to pin the executor-level money
+/// flow for one padded 7702 transaction reserving the full 30M batch: the
+/// penalty/refund split, governance revenue, and sender debit are all pinned to
+/// literals.
 ///
-/// Confirm-by-mutation: reverting `gas_penalty_and_refund` to the old
-/// `calculate_gas_penalty(gas_limit, gas_spent)` makes the penalty 0 (10.07%
-/// usage is over the threshold), the caller keeps the full refund, and the
-/// governance-revenue assertion below fails.
+/// Confirm-by-mutation: subtracting the authorization intrinsic from only the
+/// spent numerator yields the capped 26,979,000; skipping the subtraction
+/// entirely yields 0 (10.07% usage is over the threshold and the caller keeps
+/// the full refund). Either mutation breaks the pins below.
 #[tokio::test]
-async fn test_padded_7702_authorization_list_pays_capped_penalty() -> eyre::Result<()> {
+async fn test_padded_7702_authorization_list_pays_near_maximal_penalty() -> eyre::Result<()> {
     let _guard = IT_TEST_GUARD.lock();
     let tmp_dir = TempDir::new().expect("temp dir");
 
     // reserve the full batch while doing almost no real work
     const GAS_LIMIT: u64 = 30_000_000;
     const NUM_AUTHS: usize = 120;
-    // revm's EIP-7702 per-tuple intrinsic at Prague (reth_revm eip7702::PER_EMPTY_ACCOUNT_COST)
-    const PER_EMPTY_ACCOUNT_COST: u64 = 25_000;
 
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let task_manager = TaskManager::new("Test Task Manager");
@@ -2657,6 +2657,7 @@ async fn test_padded_7702_authorization_list_pays_capped_penalty() -> eyre::Resu
     let basefee = MIN_PROTOCOL_BASE_FEE;
     let gas_price = basefee as u128;
     let mut tx_factory = TransactionFactory::new();
+    let sender = tx_factory.address();
     let padded_tx = tx_factory
         .create_eip7702_with_authorizations(
             chain.genesis().config.chain_id,
@@ -2670,6 +2671,10 @@ async fn test_padded_7702_authorization_list_pays_capped_penalty() -> eyre::Resu
         .retrieve_account(&GOVERNANCE_SAFE_ADDRESS)?
         .map(|acct| acct.balance)
         .unwrap_or(U256::ZERO);
+    let sender_genesis_balance = reth_env
+        .retrieve_account(&sender)?
+        .map(|acct| acct.balance)
+        .expect("sender pre-funded in test genesis");
 
     // execute a single block containing only the padded transaction
     let consensus_output = consensus_output_for_tests(2, 0, 1, false);
@@ -2684,15 +2689,17 @@ async fn test_padded_7702_authorization_list_pays_capped_penalty() -> eyre::Resu
         "padding must push gas_used over the 10% penalty-free threshold (got {gas_used})"
     );
 
-    // mirror gas_penalty_and_refund's two-argument auth-intrinsic subtraction with public
-    // APIs: the mismatched-chain tuples apply nothing, so there is no 7702 refund and
-    // pre-refund gas equals gas_used
+    // the real helper the handler calls, fed the wire-derived authorization
+    // intrinsic; the mismatched-chain tuples apply nothing, so there is no 7702
+    // refund and pre-refund gas equals gas_used
     let auth_intrinsic = NUM_AUTHS as u64 * PER_EMPTY_ACCOUNT_COST;
-    let unused_gas = GAS_LIMIT - gas_used;
-    let expected_penalty =
-        calculate_gas_penalty(GAS_LIMIT - auth_intrinsic, gas_used.saturating_sub(auth_intrinsic))
-            .min(unused_gas);
-    assert!(expected_penalty > 0, "fix must assess a nonzero penalty on the padded tx");
+    let (expected_penalty, expected_refund) =
+        gas_penalty_and_refund(GAS_LIMIT, gas_used, gas_used, auth_intrinsic);
+    assert_eq!(
+        (expected_penalty, expected_refund),
+        (26_560_959, 418_041),
+        "padded 7702 penalty/refund split changed (gas_used {gas_used})"
+    );
 
     // governance revenue = basefee portion of gas + penalty priced at the effective gas price
     let effective_gas_price = std::cmp::min(gas_price, basefee as u128);
@@ -2711,6 +2718,249 @@ async fn test_padded_7702_authorization_list_pays_capped_penalty() -> eyre::Resu
         expected_governance_revenue, actual_governance_revenue,
         "governance revenue must include the capped 7702 penalty"
     );
+    // hard pin: 7-wei min protocol base fee x (3,021,000 gas used + 26,560,959 penalty)
+    assert_eq!(
+        actual_governance_revenue,
+        U256::from(207_073_713u64),
+        "padded 7702 governance revenue changed"
+    );
+
+    // the sender prepaid the full 30M reservation and was reimbursed everything
+    // but gas used and the penalty (value is 0, priority fee is 0)
+    let sender_balance = reth_env
+        .retrieve_account(&sender)?
+        .map(|acct| acct.balance)
+        .expect("sender has an account");
+    let sender_delta =
+        sender_genesis_balance.checked_sub(sender_balance).expect("sender balance decreased");
+    assert_eq!(
+        sender_delta,
+        U256::from((gas_used + expected_penalty) as u128 * effective_gas_price),
+        "sender must pay exactly gas used plus the capped penalty"
+    );
+
+    Ok(())
+}
+
+/// End-to-end proof that an honest EIP-7702 sender pays no gas-limit penalty.
+///
+/// One set-code transaction carries 5 valid tuples: each matches the chain id,
+/// carries nonce 0 equal to its fresh authority's account nonce, and is signed
+/// by a distinct key, so revm applies all 5 — writing each authority's
+/// `0xef0100 || delegate` designator and bumping its nonce to 1. The
+/// authorities are pre-funded in genesis so their accounts exist, which is what
+/// makes revm count the per-applied-tuple 12,500-gas refund; EIP-3529 then caps
+/// the total refund at a fifth of spent gas, and the cap binds here:
+/// 5 x 12,500 = 62,500 clamps to 146,000 / 5 = 29,200, so the exact-estimate
+/// 146,000 limit executes to a post-refund gas_used of 116,800.
+///
+/// What this guards: the handler must see `gas_used < gas_spent` on the true
+/// axes — spent 146,000 (pre-refund) and used 116,800 (post-refund), with the
+/// 125,000 authorization intrinsic subtracted from both penalty arguments so
+/// the penalty is zero. Swapping spent/used or re-inflating the basis assesses
+/// a penalty and changes governance revenue, breaking the 817,600 pin below
+/// (7-wei base fee x 116,800: base-fee revenue only). The transaction rides the
+/// full batch path (`execute_test_batch` -> `ExecutorEngine`), which carries
+/// 7702 end-to-end now that the batch allowlist admits type 0x04.
+#[tokio::test]
+async fn test_honest_7702_sender_pays_no_penalty() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+    const NUM_AUTHS: usize = 5;
+    // exact estimate: 21,000 base + 5 x 25,000 authorization intrinsic
+    const TX_GAS_LIMIT: u64 = 146_000;
+    // post-refund gas: limit - min(5 x 12,500, limit / 5)
+    const EXPECTED_GAS_USED: u64 = 116_800;
+
+    // create genesis and the honest set-code transaction
+    let mut genesis = test_genesis();
+    let mut tx_factory = TransactionFactory::new_random();
+    let sender = tx_factory.address();
+    let (signed_tx, authorities) = tx_factory.create_eip7702_with_applied_authorizations(
+        genesis.config.chain_id,
+        None,
+        MIN_PROTOCOL_BASE_FEE as u128,
+        NUM_AUTHS,
+    );
+    assert_eq!(signed_tx.gas_limit(), TX_GAS_LIMIT, "factory's exact-estimate gas limit");
+    let encoded_tx = signed_tx.encoded_2718();
+
+    // pre-fund the authorities: revm counts the per-applied-tuple 12,500 refund
+    // only for authority accounts that already exist in the trie
+    genesis = genesis.extend_accounts(authorities.iter().map(|authority| {
+        (*authority, GenesisAccount { balance: U256::from(1_000_000), ..Default::default() })
+    }));
+
+    let mut batch = Batch {
+        transactions: vec![encoded_tx],
+        epoch: 0,
+        beneficiary: Address::ZERO, // updated later
+        base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+        worker_id: 0,
+        received_at: None,
+    };
+
+    let all_batches = [batch.clone()];
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node
+    let gas_accumulator = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        Some(gas_accumulator.clone()),
+    )?;
+
+    // create committee
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    let batch_producer =
+        committee.authorities().get(2).expect("authority in committee").execution_address();
+
+    // set batch producer and execute
+    batch.beneficiary = batch_producer;
+    batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+    execute_test_batch(&mut batch);
+
+    // consensus output
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(authority_1);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let reputation_scores = ReputationScores::default();
+    let previous_sub_dag = None;
+    let batch_digest = batch.digest();
+    let batch_digests = VecDeque::from([batch_digest]);
+    let subdag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        reputation_scores,
+        previous_sub_dag,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag.clone(),
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests.clone(),
+        vec![CertifiedBatch { address: batch_producer, batches: vec![batch] }],
+    );
+
+    // execution
+    let rewards_counter = gas_accumulator.rewards_counter();
+    rewards_counter.set_committee(committee.clone());
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let max_round = None;
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        max_round,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+
+    let broadcast_result = to_engine.send(consensus_output.clone()).await;
+    assert!(broadcast_result.is_ok());
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(5), rx).await??;
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // verify the block executed the set-code transaction
+    let executed_blocks = reth_env.block_with_senders_range(1..=1)?;
+    assert_eq!(1, executed_blocks.len());
+    let block = &executed_blocks[0];
+
+    // 1. post-refund header gas: 146,000 - min(5 x 12,500, 146,000 / 5)
+    assert_eq!(block.gas_used, EXPECTED_GAS_USED, "EIP-3529-capped post-refund gas");
+
+    // 2. helper mirror of the handler's computation: spent is the fully consumed pre-refund limit,
+    //    used is post-refund, and the authorization intrinsic is subtracted from both penalty
+    //    arguments — zero penalty, full refund
+    let auth_intrinsic = NUM_AUTHS as u64 * PER_EMPTY_ACCOUNT_COST;
+    assert_eq!(
+        gas_penalty_and_refund(TX_GAS_LIMIT, TX_GAS_LIMIT, block.gas_used, auth_intrinsic),
+        (0, 29_200),
+        "honest exact-estimate 7702 delegation must pay no penalty"
+    );
+
+    // 3. governance revenue is base-fee revenue only: 7-wei min protocol base fee x 116,800 gas
+    //    used, zero penalty
+    let governance_safe_genesis_balance = chain
+        .genesis()
+        .alloc
+        .get(&GOVERNANCE_SAFE_ADDRESS)
+        .map(|acct| acct.balance)
+        .unwrap_or(U256::MAX);
+    let governance_safe = reth_env
+        .retrieve_account(&GOVERNANCE_SAFE_ADDRESS)?
+        .map(|acct| acct.balance)
+        .expect("governance safe has an account");
+    let actual_governance_revenue = governance_safe
+        .checked_sub(governance_safe_genesis_balance)
+        .expect("governance safe balance doesn't underflow");
+    assert_eq!(
+        actual_governance_revenue,
+        U256::from(817_600u64),
+        "honest 7702 governance revenue must be base-fee revenue only (zero penalty)"
+    );
+
+    // 4. the sender paid gas only — the same 817,600 (value 0, priority fee 0)
+    let sender_genesis_balance = chain
+        .genesis()
+        .alloc
+        .get(&sender)
+        .map(|acct| acct.balance)
+        .expect("sender seeded in genesis");
+    let sender_balance = reth_env
+        .retrieve_account(&sender)?
+        .map(|acct| acct.balance)
+        .expect("sender has an account");
+    let sender_delta =
+        sender_genesis_balance.checked_sub(sender_balance).expect("sender balance decreased");
+    assert_eq!(
+        sender_delta,
+        U256::from(817_600u64),
+        "honest 7702 sender must pay base-fee gas only — no penalty confiscation"
+    );
+
+    // 5. every tuple applied: nonce bumped and the 0xef0100 || delegate designator written as the
+    //    authority's code
+    for authority in &authorities {
+        let account = reth_env.retrieve_account(authority)?.expect("authority account exists");
+        assert_eq!(account.nonce, 1, "applied authorization must bump the authority nonce");
+        let code = reth_env
+            .account_code(authority)?
+            .expect("applied authorization must set the authority's code");
+        assert_eq!(code.len(), 23, "delegation designator is 3-byte prefix + 20-byte delegate");
+        assert!(
+            code.starts_with(&[0xef, 0x01, 0x00]),
+            "authority code must be the EIP-7702 delegation designator"
+        );
+    }
 
     Ok(())
 }

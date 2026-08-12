@@ -88,6 +88,10 @@ pub use alloy::eips::{
     eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS, eip7685::EMPTY_REQUESTS_HASH,
 };
 pub use reth_primitives_traits::proofs::calculate_withdrawals_root;
+/// Flat 25,000-gas intrinsic revm charges per EIP-7702 authorization tuple at Prague
+/// (`cfg.gas_params().tx_eip7702_per_empty_account_cost()`), re-exported so tests derive
+/// authorization intrinsics from the source constant instead of hardcoding the value.
+pub use reth_revm::primitives::eip7702::PER_EMPTY_ACCOUNT_COST;
 
 /// Typedef for a complex type to make clippy happy (and be a bit more readable?).
 pub type TNEvmTestType = TNEvm<State<StateProviderDatabase<StateProviderBox>>>;
@@ -458,8 +462,8 @@ impl TransactionFactory {
     }
 
     /// Create a signed EIP-7702 set-code transaction carrying one authorization
-    /// signed by this factory's key, so the envelope is well-formed and its type
-    /// byte is the only reason a fork-blind validator could reject it.
+    /// signed by this factory's key — a well-formed single-authorization
+    /// set-code transaction the batch validator accepts.
     pub fn create_eip7702(
         &mut self,
         chain_id: ChainId,
@@ -513,11 +517,12 @@ impl TransactionFactory {
     /// gas-penalty bypass exploited: padding pushes reported usage over the 10%
     /// threshold, collapsing the quadratic penalty on an over-reserved gas limit.
     ///
-    /// The tuples carry a deliberately mismatched chain id, so revm skips each one
-    /// before signature recovery (revm-handler `apply_auth_list`): none delegate
-    /// and none earn the 12,500-gas refund, leaving pre- and post-refund gas equal
-    /// and the caller's accounting exact. This mirrors the real attack, where the
-    /// tuples never need to be valid.
+    /// The tuples carry a deliberately mismatched chain id. alloy-evm still
+    /// eagerly recovers every tuple's signer when constructing the `TxEnv`, but
+    /// revm's `apply_auth_list` skips application on the chain-id mismatch: none
+    /// delegate and none earn the 12,500-gas refund, leaving pre- and post-refund
+    /// gas equal and the caller's accounting exact. This mirrors the real attack,
+    /// where the tuples never need to be valid.
     pub fn create_eip7702_with_authorizations(
         &mut self,
         chain_id: ChainId,
@@ -525,8 +530,9 @@ impl TransactionFactory {
         gas_price: u128,
         num_authorizations: usize,
     ) -> TransactionSigned {
-        // authorizations on a different chain: still counted for intrinsic gas, but
-        // skipped before recovery so none apply and none earn a refund
+        // authorizations on a different chain: still counted for intrinsic gas (and
+        // eagerly recovered by alloy-evm), but `apply_auth_list` applies none, so
+        // none earn a refund
         let wrong_chain_id = U256::from(chain_id) + U256::from(1u64);
         let authorization_list = (0..num_authorizations)
             .map(|i| {
@@ -562,6 +568,74 @@ impl TransactionFactory {
         self.inc_nonce();
 
         TransactionSigned::new_unhashed(tx.into(), signature)
+    }
+
+    /// Create a signed EIP-7702 set-code transaction whose `num_authorizations`
+    /// tuples all APPLY: each tuple matches the transaction's chain id, carries
+    /// `nonce: 0` (fresh authorities), is signed by a distinct freshly generated
+    /// key, and delegates to a fixed non-zero address — a zero delegate would
+    /// clear the authority's code instead of writing the `0xef0100 || delegate`
+    /// designator. Distinct keys matter: every applied tuple increments its
+    /// authority's nonce, so same-key tuples would collapse to one application.
+    ///
+    /// Callers must pre-fund every returned authority so the account exists in
+    /// the trie — revm counts the per-applied-tuple 12,500-gas refund
+    /// (`PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST`) only for authorities that
+    /// already exist — and EIP-3529 caps the total refund at a fifth of spent
+    /// gas. `gas_limit: None` uses the exact intrinsic estimate
+    /// `21_000 + PER_EMPTY_ACCOUNT_COST * N`; with that limit and N applied
+    /// tuples, post-refund `gas_used` is `limit - min(12_500 * N, limit / 5)`.
+    ///
+    /// Returns the signed transaction and the authority addresses in tuple order.
+    pub fn create_eip7702_with_applied_authorizations(
+        &mut self,
+        chain_id: ChainId,
+        gas_limit: Option<u64>,
+        gas_price: u128,
+        num_authorizations: usize,
+    ) -> (TransactionSigned, Vec<Address>) {
+        let gas_limit =
+            gas_limit.unwrap_or(21_000 + PER_EMPTY_ACCOUNT_COST * num_authorizations as u64);
+
+        // non-zero delegate target for the 0xef0100 || delegate designator
+        let delegate = address!("000000000000000000000000000000000000de1e");
+
+        // one fresh key per tuple, each authorizing delegation from its own account
+        let mut authorities = Vec::with_capacity(num_authorizations);
+        let authorization_list = (0..num_authorizations)
+            .map(|_| {
+                let authority = TransactionFactory::new_random();
+                authorities.push(authority.address());
+                let authorization =
+                    Authorization { chain_id: U256::from(chain_id), address: delegate, nonce: 0 };
+                let auth_signature = authority.sign_hash(authorization.signature_hash());
+                authorization.into_signed(auth_signature)
+            })
+            .collect();
+
+        // set-code transaction calling a plain non-delegated address with empty
+        // input, so execution itself consumes no gas beyond the intrinsics
+        let tx = TxEip7702 {
+            chain_id,
+            nonce: self.nonce,
+            gas_limit,
+            max_fee_per_gas: gas_price,
+            max_priority_fee_per_gas: 0,
+            to: address!("a8cb082a5a689e0d594d7da1e2d72a3d63adc1bd"),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list,
+            input: Bytes::new(),
+        };
+        let tx_signature_hash = tx.signature_hash();
+
+        // construct transaction and sign
+        let signature = self.sign_hash(tx_signature_hash);
+
+        // increase nonce for next tx
+        self.inc_nonce();
+
+        (TransactionSigned::new_unhashed(tx.into(), signature), authorities)
     }
 
     /// Create and sign an EIP4844 transaction.
