@@ -22,6 +22,7 @@ use crate::{
         pack::{Pack, PackCompression, DATA_HEADER_BYTES},
     },
     consensus_pack::PACK_VERSION,
+    error_latch::latch_first_error,
 };
 
 enum PackMessage {
@@ -59,9 +60,15 @@ fn run_pack_loop(
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             PackMessage::Save(cert) => {
-                if let Err(e) = inner.save(&cert) {
-                    tx_error.send_replace(Some(e));
-                }
+                // First-error-wins: after a real write failure poisons the pack, each queued
+                // save fails with the poisoned-pack guard's `ReadOnly` error. A plain
+                // `send_replace` would overwrite the root cause with that follow-on error
+                // before any reader could observe it (#1148). The log keeps every failure
+                // visible, including the ones the latch does not keep.
+                inner.save(&cert).unwrap_or_else(|e| {
+                    error!(target: "certificate_pack", %e, "failed to save certificate");
+                    latch_first_error(&tx_error, e);
+                });
             }
             PackMessage::Get(digest, tx) => {
                 let _ = tx.send(inner.get(digest));
@@ -108,7 +115,7 @@ impl CertificatePack {
         let handle = std::thread::spawn(move || match Inner::open(path, false) {
             Ok(inner) => run_pack_loop(inner, rx, tx_error, epoch),
             Err(e) => {
-                tx_error.send_replace(Some(e));
+                latch_first_error(&tx_error, e);
                 clear_pack_loop(rx);
             }
         });
@@ -123,7 +130,7 @@ impl CertificatePack {
         let handle = std::thread::spawn(move || match Inner::open(path, true) {
             Ok(inner) => run_pack_loop(inner, rx, tx_error, epoch),
             Err(e) => {
-                tx_error.send_replace(Some(e));
+                latch_first_error(&tx_error, e);
                 clear_pack_loop(rx);
             }
         });
@@ -131,6 +138,11 @@ impl CertificatePack {
     }
 
     /// Return any delayed error from a previous background operation.
+    ///
+    /// The slot does not clear on read. When more than one background operation fails, the
+    /// slot keeps the first failure. In the poisoned-pack cascade (a write failure makes
+    /// every queued save fail with the read-only guard error) the first failure is the root
+    /// cause. Every failure, kept or not, is logged by the pack loop.
     pub fn get_error(&self) -> Result<(), PackError> {
         match &*self.error.borrow() {
             Some(e) => Err(e.clone()),
@@ -379,7 +391,9 @@ mod test {
     use tn_test_utils::CommitteeFixture;
     use tn_types::{Certificate, Hash, HeaderDigest};
 
-    use crate::{certificate_pack::CertificatePack, mem_db::MemDatabase};
+    use crate::{
+        archive::error::insert::AppendError, certificate_pack::CertificatePack, mem_db::MemDatabase,
+    };
 
     fn make_test_cert(fixture: &CommitteeFixture<MemDatabase>, index: usize) -> Certificate {
         let mut cert = Certificate::default();
@@ -435,5 +449,67 @@ mod test {
             let loaded = pack.get(digest).await.expect("should load cert read-only");
             assert_eq!(loaded.digest(), digest);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_saves_after_a_failed_write_keep_the_root_cause() {
+        // Regression test for #1148: a real write failure poisons the pack, so every save
+        // queued behind it fails on the poisoned-pack guard with `AppendError::ReadOnly`.
+        // Before the fix the loop latched last-write-wins: the follow-on "read only" error
+        // overwrote the root cause before any reader could observe it, and the latch then
+        // reported a read-only condition on a pack that was opened read-write, forever.
+        let temp_dir = TempDir::with_prefix("queued_saves_root_cause").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+
+        // Build the actor by hand so the test can arm the write-failure injector before the
+        // loop takes ownership of the pack.
+        let mut inner =
+            super::Inner::open(temp_dir.path().join("epoch-0"), false).expect("open pack inner");
+        inner.data.fail_next_append_for_test();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (tx_error, error) = tokio::sync::watch::channel(None);
+        let handle = std::thread::spawn(move || super::run_pack_loop(inner, rx, tx_error, 0));
+
+        // Two saves back to back with no reader between them. The first fails with the
+        // injected io write failure and poisons the pack; the second fails on the
+        // poisoned-pack guard. A single consumer draining a FIFO channel guarantees the
+        // order, so this is deterministic rather than a race.
+        tx.send(super::PackMessage::Save(make_test_cert(&fixture, 0)))
+            .await
+            .expect("queue first failing save");
+        tx.send(super::PackMessage::Save(make_test_cert(&fixture, 1)))
+            .await
+            .expect("queue second failing save");
+        // A round-trip through the actor proves both saves were processed.
+        let (tx_contains, rx_contains) = tokio::sync::oneshot::channel();
+        tx.send(super::PackMessage::Contains(HeaderDigest::default(), tx_contains))
+            .await
+            .expect("queue contains barrier");
+        let _ = rx_contains.await.expect("actor replied to the barrier");
+
+        let latched = error.borrow().clone().expect("a failed save latched an error");
+        assert!(
+            matches!(latched, super::PackError::Append(_)),
+            "latch holds the append failure, got: {latched:?}"
+        );
+        let text = latched.to_string();
+        assert!(
+            text.contains("injected write failure"),
+            "latch must keep the root cause, got: {text}"
+        );
+        assert!(
+            !text.contains("read only"),
+            "latch must not report the follow-on read-only error, got: {text}"
+        );
+        // Positive control for the negative assertion above: the follow-on guard error
+        // really renders as "read only" today, so a later Display reword cannot make that
+        // check pass vacuously without failing here.
+        assert_eq!(AppendError::ReadOnly.to_string(), "read only");
+
+        tx.send(super::PackMessage::Shutdown).await.expect("queue shutdown");
+        tokio::task::spawn_blocking(move || handle.join())
+            .await
+            .expect("spawn_blocking join")
+            .expect("actor thread exits cleanly");
     }
 }

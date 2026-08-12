@@ -90,6 +90,15 @@ where
         self.inner.append(value)
     }
 
+    /// Test-only failure injector: make the next append fail with
+    /// [`AppendError::WriteDataError`], the same classification a real io write failure gets.
+    /// The append path then marks the pack failed, which is the poisoned state the queued-save
+    /// regression tests start from.
+    #[cfg(test)]
+    pub(crate) fn fail_next_append_for_test(&mut self) {
+        self.inner.fail_next_append = true;
+    }
+
     /// Return the DB version.
     pub fn version(&self) -> u16 {
         self.inner.version()
@@ -165,6 +174,9 @@ where
     failed: bool,
     read_only: bool,
     uid_idx: u64, // Store for opening an iterator.
+    /// Test-only: when set, the next append fails as if the data write hit an io error.
+    #[cfg(test)]
+    fail_next_append: bool,
     _value: PhantomData<V>,
 }
 
@@ -202,6 +214,8 @@ where
             failed: false,
             read_only,
             uid_idx,
+            #[cfg(test)]
+            fail_next_append: false,
             _value: PhantomData,
         })
     }
@@ -233,9 +247,26 @@ where
         Ok(bytes)
     }
 
+    /// Test-only injection point: fail the append the way a real io write failure fails.
+    /// Armed by [`Pack::fail_next_append_for_test`]; disarms after one use.
+    #[cfg(test)]
+    fn injected_append_failure(&mut self) -> Result<(), AppendError> {
+        std::mem::take(&mut self.fail_next_append)
+            .then(|| AppendError::WriteDataError(io::Error::other("injected write failure")))
+            .map_or(Ok(()), Err)
+    }
+
+    /// Outside tests the injection point compiles to a no-op.
+    #[cfg(not(test))]
+    fn injected_append_failure(&mut self) -> Result<(), AppendError> {
+        Ok(())
+    }
+
     /// Do the actual insert so the public function can rollback easily on an error.
     fn append_inner(&mut self, value: &V) -> Result<u64, AppendError> {
         let record_pos = self.data_file.len();
+
+        self.injected_append_failure()?;
 
         write_value(
             value,
