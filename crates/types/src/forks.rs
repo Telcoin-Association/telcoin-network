@@ -147,11 +147,16 @@ pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
 /// (certificate vectors, sub-DAGs, pack records) decode correctly at any nesting depth, and
 /// historical digests are preserved end to end.
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch (at least
-/// current + 8, about 48h at 6h epochs) in a dedicated epoch-setting PR only after every
-/// validator and observer runs a gate-capable build. The full fork schedule is logged at
-/// startup so operators can diff it across the fleet; a compile-time constant that differs
-/// between binaries has no other in-protocol detection.
+/// Set to epoch 380 for the #1086 rollout (PR-2, adjusted from the initial 400).
+/// Adjustment-time snapshot: live adiri epoch 379 on 2026-08-12 (latest block 313478,
+/// nonce `>> 32` via rpc.adiri.tel), so 380 begins at the next epoch boundary. That is
+/// inside the plan's floor of current + 8: every adiri node must run this build before
+/// that boundary closes. No test or CI re-checks the margin: re-verify it against the
+/// live chain at merge time. If epoch 380 has already begun, raise the constant in the
+/// same PR: headers committed at or past the fork epoch in the legacy seven-field layout
+/// do not decode under this build. The full fork schedule is logged at startup so
+/// operators can diff it across the fleet; a compile-time constant that differs between
+/// binaries has no other in-protocol detection.
 ///
 /// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide
 /// first (safe indefinitely while dormant), then land the epoch-setting PR fleet-wide before
@@ -162,7 +167,7 @@ pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
 ///
 /// Non-adiri builds (mainnet) have no dormant period: the field is active from genesis and
 /// this constant does not exist there.
-pub const SEED_SIGNATURE_FORK_EPOCH: Epoch = u32::MAX;
+pub const SEED_SIGNATURE_FORK_EPOCH: Epoch = 380;
 
 /// Whether `Header`s of `epoch` carry the `seed_signature` field on the wire and the epoch
 /// seed chain drives the epoch-close committee shuffle (#1032).
@@ -194,17 +199,11 @@ pub fn seed_signature_active(epoch: Epoch) -> bool {
 /// This build's compile-time fork point, with no test override applied.
 ///
 /// Unchanged from [`SEED_SIGNATURE_FORK_EPOCH`]'s documented contract: adiri (testnet, which
-/// carries pre-fork history) stays dormant until the constant is lowered, and every other
-/// build (mainnet, which never carries the legacy layout) is active from genesis.
+/// carries pre-fork history) is dormant before the fork epoch and active from it, and every
+/// other build (mainnet, which never carries the legacy layout) is active from genesis.
 #[inline]
 const fn build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
-    #[expect(
-        clippy::absurd_extreme_comparisons,
-        reason = "SEED_SIGNATURE_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) is the \
-                  gate the future epoch-setting PR relies on, and this expectation flags itself \
-                  for removal once that PR lowers the constant"
-    )]
     {
         epoch >= SEED_SIGNATURE_FORK_EPOCH
     }
@@ -267,8 +266,9 @@ mod tests {
 
     /// Pin the seed-signature gate to the rollout contract this build actually implements.
     ///
-    /// #1032 was reviewed on the claim that the gate is dormant at [`SEED_SIGNATURE_FORK_EPOCH`]
-    /// (`u32::MAX`). That holds only under `adiri`. Every other build — including the default
+    /// #1032 was reviewed on the claim that the gate is dormant before
+    /// [`SEED_SIGNATURE_FORK_EPOCH`] (then the `u32::MAX` placeholder, now a concrete epoch).
+    /// That holds only under `adiri`. Every other build — including the default
     /// one that produces both the shipped node binary and the e2e binary — is active from
     /// genesis, so epoch 1 takes the post-fork certified-anchor path in production. Nothing
     /// asserted either half, so the "dormant everywhere" reading survived review; this states
@@ -288,17 +288,20 @@ mod tests {
         });
         #[cfg(feature = "adiri")]
         {
-            [0, 1, 2].into_iter().for_each(|epoch| {
+            [0, 1, 2, SEED_SIGNATURE_FORK_EPOCH - 1].into_iter().for_each(|epoch| {
                 assert!(
                     !build_fork_active(epoch),
-                    "adiri stays dormant until the epoch-setting PR lowers \
-                     SEED_SIGNATURE_FORK_EPOCH; epoch {epoch} must be pre-fork",
+                    "adiri stays dormant before SEED_SIGNATURE_FORK_EPOCH; epoch {epoch} must \
+                     be pre-fork",
                 );
             });
-            assert!(
-                build_fork_active(SEED_SIGNATURE_FORK_EPOCH),
-                "the gate must fire at the fork epoch itself (`>=`, not `>`)",
-            );
+            [SEED_SIGNATURE_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+                assert!(
+                    build_fork_active(epoch),
+                    "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
+                     {epoch} must be post-fork",
+                );
+            });
         }
     }
 
