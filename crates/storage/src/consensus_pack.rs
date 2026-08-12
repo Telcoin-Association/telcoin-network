@@ -2081,7 +2081,9 @@ pub(crate) mod test {
     /// Build a [`ConsensusOutput`] whose single leader header references `num_batches` unique
     /// batches, standing in for a deep sub-DAG that exceeds the old fixed reconstruction cap
     /// but stays within the committee-derived bound.
-    fn make_wide_test_output(
+    ///
+    /// Reused by `pack_bench` as the single output-width knob for the observation benchmark.
+    pub(crate) fn make_wide_test_output(
         committee: &Committee,
         chain: Arc<RethChainSpec>,
         number: u64,

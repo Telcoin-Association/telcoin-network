@@ -29,6 +29,9 @@ pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
 pub mod mem_db;
+/// On-demand observation benchmark for consensus pack files (see `pack_bench.rs`).
+#[cfg(test)]
+mod pack_bench;
 pub mod pack_validate;
 pub mod redb;
 
