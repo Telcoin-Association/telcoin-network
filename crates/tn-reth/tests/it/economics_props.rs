@@ -4,9 +4,11 @@
 //! - Gas penalty is always <= unused gas
 //! - Gas penalty is 0 when usage >= 10%
 //! - Gas penalty increases as usage decreases (monotonicity)
+//! - `gas_penalty_and_refund` conserves gas, matches the prior inline math when `auth_intrinsic` is
+//!   0, never penalizes exact estimates, and never needs its unused-gas cap
 
 use proptest::prelude::*;
-use tn_reth::calculate_gas_penalty;
+use tn_reth::{calculate_gas_penalty, gas_penalty_and_refund};
 
 /// Minimum gas limit threshold from the implementation
 const MIN_GAS_LIMIT_THRESHOLD: u64 = 210_000;
@@ -112,6 +114,111 @@ proptest! {
             penalty >= min_expected,
             "Near-zero usage should have high penalty: {} >= {} (unused={})",
             penalty, min_expected, unused_gas
+        );
+    }
+}
+
+// Properties of `gas_penalty_and_refund`, the EIP-7702-aware wrapper the EVM handler applies.
+// Ordered gas values are derived by construction (no `prop_assume`): `gas_limit / 1000 *
+// spent_pm <= gas_limit` for any per-mille `spent_pm <= 1000`, and likewise for `gas_used`
+// from `gas_spent`.
+proptest! {
+    /// The penalty and the caller refund must partition unused gas exactly,
+    /// and the penalty alone must never exceed it — for any authorization
+    /// intrinsic, so the split can never mint or destroy gas value.
+    #[test]
+    fn prop_penalty_refund_conserve_gas(
+        gas_limit in 0..=60_000_000u64,
+        spent_pm in 0..=1000u64,
+        used_pm in 0..=1000u64,
+        auth_intrinsic in 0..=6_000_000u64
+    ) {
+        let gas_spent = gas_limit / 1000 * spent_pm;
+        let gas_used = gas_spent / 1000 * used_pm;
+
+        let (penalty, refund) =
+            gas_penalty_and_refund(gas_limit, gas_spent, gas_used, auth_intrinsic);
+
+        prop_assert_eq!(
+            penalty + refund,
+            gas_limit - gas_used,
+            "penalty {} + refund {} must equal unused gas (limit={}, used={}, auth={})",
+            penalty, refund, gas_limit, gas_used, auth_intrinsic
+        );
+        prop_assert!(
+            penalty <= gas_limit - gas_used,
+            "penalty {} must not exceed unused gas {} (limit={}, used={}, auth={})",
+            penalty, gas_limit - gas_used, gas_limit, gas_used, auth_intrinsic
+        );
+    }
+
+    /// With `auth_intrinsic == 0` (every non-7702 transaction) the wrapper must
+    /// reproduce the prior inline math byte-for-byte: `calculate_gas_penalty`
+    /// capped at unused gas, with the refund as the remainder.
+    #[test]
+    fn prop_zero_auth_matches_prior_inline_math(
+        gas_limit in 0..=60_000_000u64,
+        spent_pm in 0..=1000u64,
+        used_pm in 0..=1000u64
+    ) {
+        let gas_spent = gas_limit / 1000 * spent_pm;
+        let gas_used = gas_spent / 1000 * used_pm;
+
+        // the prior inline math, computed with public APIs
+        let unused = gas_limit - gas_used;
+        let p = calculate_gas_penalty(gas_limit, gas_spent).min(unused);
+
+        prop_assert_eq!(
+            gas_penalty_and_refund(gas_limit, gas_spent, gas_used, 0),
+            (p, unused - p),
+            "zero auth intrinsic must match the prior math (limit={}, spent={}, used={})",
+            gas_limit, gas_spent, gas_used
+        );
+    }
+
+    /// A transaction that spends exactly its limit pays no penalty for ANY
+    /// authorization intrinsic — including intrinsics above the gas limit,
+    /// which exercise the saturating subtraction in both arguments.
+    #[test]
+    fn prop_exact_estimate_pays_no_penalty(
+        gas_limit in 0..=60_000_000u64,
+        used_pm in 0..=1000u64,
+        auth_intrinsic in 0..=60_000_000u64
+    ) {
+        let gas_spent = gas_limit;
+        let gas_used = gas_spent / 1000 * used_pm;
+
+        prop_assert_eq!(
+            gas_penalty_and_refund(gas_limit, gas_spent, gas_used, auth_intrinsic),
+            (0, gas_limit - gas_used),
+            "exact estimate must pay no penalty (limit={}, used={}, auth={})",
+            gas_limit, gas_used, auth_intrinsic
+        );
+    }
+
+    /// The wrapper's `.min(unused_gas)` cap is structurally non-binding: for
+    /// every `gas_used <= gas_spent <= gas_limit` the UNCAPPED two-argument
+    /// penalty is already bounded by unused gas, so the cap is pure
+    /// defense-in-depth.
+    #[test]
+    fn prop_cap_is_structurally_non_binding(
+        gas_limit in 0..=60_000_000u64,
+        spent_pm in 0..=1000u64,
+        used_pm in 0..=1000u64,
+        auth_intrinsic in 0..=60_000_000u64
+    ) {
+        let gas_spent = gas_limit / 1000 * spent_pm;
+        let gas_used = gas_spent / 1000 * used_pm;
+
+        let uncapped = calculate_gas_penalty(
+            gas_limit.saturating_sub(auth_intrinsic),
+            gas_spent.saturating_sub(auth_intrinsic),
+        );
+
+        prop_assert!(
+            uncapped <= gas_limit - gas_used,
+            "uncapped penalty {} must stay within unused gas {} (limit={}, spent={}, used={}, auth={})",
+            uncapped, gas_limit - gas_used, gas_limit, gas_spent, gas_used, auth_intrinsic
         );
     }
 }

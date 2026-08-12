@@ -12,7 +12,8 @@
 //! - `handler`: `TNEvmHandler`, post-execution overrides — the base fee is credited to the chain's
 //!   basefee address instead of burned, plus a quadratic penalty on grossly over-estimated gas
 //!   limits.
-//! - `utils`: the `calculate_gas_penalty` formula backing that penalty.
+//! - `utils`: the `calculate_gas_penalty` formula backing that penalty, plus
+//!   `gas_penalty_and_refund`, the EIP-7702-aware penalty/refund split the handler applies.
 //! - `context`: type aliases and builder plumbing for the revm `Context` TN executes against.
 //! - `block`: `TNBlockExecutor`/`TNBlockAssembler` — block-level execution, the epoch-closing
 //!   system calls (rewards, committee shuffle, `concludeEpoch`), and header assembly.
@@ -63,6 +64,10 @@ pub use tel_precompile::{
     revokeMintRoleCall, totalSupplyCall, TELCOIN_PRECOMPILE_ADDRESS,
 };
 pub use utils::calculate_gas_penalty;
+/// Test-gated exposure so integration and property tests exercise the real penalty/refund
+/// split the handler applies.
+#[cfg(any(test, feature = "test-utils"))]
+pub use utils::gas_penalty_and_refund;
 
 /// Gas budget for a single protocol system call.
 ///
