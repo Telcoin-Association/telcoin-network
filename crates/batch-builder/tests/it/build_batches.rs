@@ -558,3 +558,68 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
 
     Ok(())
 }
+
+/// Submit one valid EIP-7702 transaction to the real pool and assert the real
+/// batch builder packs it: type `0x04` is on the executable allowlist.
+#[tokio::test]
+async fn test_batch_builder_packs_eip7702() {
+    //
+    //=== Execution Layer
+    //
+    // adiri genesis with TxFactory funded
+    let genesis = test_genesis();
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let address = Address::from(U160::from(333));
+    let tmp_dir = TempDir::new().unwrap();
+    let task_manager = TaskManager::default();
+    let reth_env =
+        RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).unwrap();
+    let txpool = reth_env.init_txn_pool().unwrap();
+
+    let (to_worker, mut from_batch_builder) = tokio::sync::mpsc::channel(2);
+
+    // build execution block proposer
+    let batch_builder = BatchBuilder::new(
+        &reth_env,
+        txpool.clone(),
+        to_worker,
+        address,
+        Duration::from_secs(1),
+        task_manager.get_spawner(),
+        0,
+        MIN_PROTOCOL_BASE_FEE,
+        0,
+    )
+    .expect("batch builder");
+
+    let gas_price = reth_env.get_gas_price().unwrap();
+    let mut tx_factory = TransactionFactory::new();
+
+    // one valid eip7702 set-code transaction on the chain's real id
+    let transaction = tx_factory.create_eip7702(reth_env.chainspec().chain_id(), None, gas_price);
+    let added_result = tx_factory.submit_tx_to_pool(transaction.clone(), txpool.clone()).await;
+    assert_matches!(added_result, hash if &hash == transaction.hash());
+    assert_eq!(txpool.pool_size().pending, 1);
+
+    // spawn batch_builder once worker is ready
+    let _batch_builder = tokio::spawn(batch_builder.run());
+
+    //
+    //=== Test batch flow
+    //
+
+    // plenty of time for batch production
+    let duration = std::time::Duration::from_secs(5);
+
+    // receive next batch
+    let (batch, ack) = timeout(duration, from_batch_builder.recv())
+        .await
+        .expect("batch builder's sender didn't drop")
+        .expect("batch was built");
+
+    // send ack to mine the transaction
+    let _ = ack.send(Ok(()));
+
+    // the built batch contains exactly the eip7702 transaction
+    assert_eq!(batch.batch().transactions(), &[transaction.encoded_2718()]);
+}

@@ -306,7 +306,10 @@ pub enum BatchValidationError {
     #[error("Proposed batch contains blob transaction. Tx hash: {0}")]
     InvalidTx4844(BlockHash),
     /// The batch contains a transaction whose EIP-2718 type byte is outside the
-    /// executable allowlist (legacy, EIP-2930, EIP-1559).
+    /// executable allowlist (legacy, EIP-2930, EIP-1559, EIP-7702).
+    ///
+    /// Reachable only by a future decodable type outside the allowlist — no such
+    /// type exists today. EIP-4844 keeps its dedicated `InvalidTx4844` error.
     #[error("Proposed batch contains unsupported transaction type {tx_type}. Tx hash: {hash}")]
     UnsupportedTxType {
         /// The EIP-2718 type byte of the offending transaction.

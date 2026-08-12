@@ -204,7 +204,8 @@ fn classify_error(err: reqwest::Error) -> GatewayError {
 ///
 /// Returns `Some((error, id))` only when `body` is a single
 /// `eth_sendRawTransaction` call whose raw transaction cannot be decoded, or
-/// decodes to an EIP-4844 blob transaction (which the network does not accept).
+/// decodes to a type outside the executable allowlist — legacy, EIP-2930,
+/// EIP-1559, and EIP-7702 are accepted; an EIP-4844 blob transaction is not.
 /// Every other request — including batches, other methods, and any
 /// structurally-off submission — returns `None` and is forwarded unchanged.
 ///
@@ -300,6 +301,36 @@ mod tests {
         // blob-typed payload never reaches an upstream.
         let err = screen_err(&send_raw(r#"["0x03c0"]"#));
         assert!(err.is_some());
+    }
+
+    #[test]
+    fn eip7702_typed_payload_is_forwarded() {
+        use tn_types::{
+            Address, Authorization, Encodable2718, EthSignature, SignableTransaction, TxEip7702,
+            U256,
+        };
+
+        // A well-formed type-`0x04` (EIP-7702) set-code transaction is on the
+        // executable allowlist and must be forwarded. The screen is decode-only
+        // and never recovers signers, so dummy signatures suffice.
+        let dummy_signature = EthSignature::new(U256::from(1), U256::from(1), false);
+        let authorization =
+            Authorization { chain_id: U256::from(2017), address: Address::ZERO, nonce: 1 };
+        let tx = TxEip7702 {
+            chain_id: 2017,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 0,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list: vec![authorization.into_signed(dummy_signature)],
+            input: Default::default(),
+        };
+        let raw = tx.into_signed(dummy_signature).encoded_2718();
+        let raw_hex = format!("0x{}", tn_types::hex::encode(raw));
+        assert!(screen_err(&send_raw(&format!("[\"{raw_hex}\"]"))).is_none());
     }
 
     #[test]

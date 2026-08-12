@@ -52,12 +52,13 @@ pub use alloy::{
         proofs::calculate_transaction_root,
         transaction::TransactionMeta,
         BlockHeader, Header as ExecHeader, SignableTransaction, Transaction as TransactionTrait,
-        TxEip1559,
+        TxEip1559, TxEip7702,
     },
     eips::{
         eip1559::{ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE},
         eip2718::{Decodable2718, Encodable2718, Typed2718},
         eip4844::{env_settings::EnvKzgSettings, BlobAndProofV1, BlobTransactionSidecar},
+        eip7702::{Authorization, SignedAuthorization},
         BlockHashOrNumber, BlockNumHash,
     },
     genesis::{Genesis, GenesisAccount},
@@ -74,15 +75,61 @@ pub use alloy::{
 pub use libp2p::{multiaddr::Protocol, Multiaddr};
 
 /// Whether a transaction's EIP-2718 type is on the batch executable allowlist
-/// (legacy, EIP-2930, EIP-1559).
+/// (legacy, EIP-2930, EIP-1559, EIP-7702).
 ///
 /// One predicate shared by the batch validator, the batch builder, and the
 /// worker gateway so producers and validators can never disagree on the set.
 /// Deliberately fork-blind: uniform across chain configurations.
+///
+/// EIP-4844 stays excluded: batches carry raw transaction bytes with no
+/// transport for blob sidecars or KZG proofs, so a blob transaction could
+/// never be verified or executed from a batch.
+///
+/// # LOCKSTEP FLEET UPGRADE (EIP-7702)
+///
+/// Admitting type `0x04` activates the 7702-aware gas-penalty math in the EVM
+/// handler's `reimburse_caller` on live balances. A validator running an older
+/// binary — one without the two-argument authorization-intrinsic subtraction —
+/// computes a different post-execution balance for the same certified batch
+/// and forks state at the live edge. Chain history is clean (no 7702
+/// transaction has ever been certified), so there is no replay risk; the risk
+/// window is only a mixed-version fleet during rollout. Every validator must
+/// run a binary at or beyond this change before the first 7702 transaction is
+/// admitted.
 pub fn batch_allowlisted_tx_type<T: Typed2718>(tx: &T) -> bool {
-    tx.is_legacy() || tx.is_eip2930() || tx.is_eip1559()
+    tx.is_legacy() || tx.is_eip2930() || tx.is_eip1559() || tx.is_eip7702()
 }
 pub use reth_primitives::{
     Account, Block, BlockBody, EthPrimitives, NodePrimitives, PooledTransaction, Receipt,
     Recovered, RecoveredBlock, SealedBlock, SealedHeader, Transaction, TransactionSigned,
 };
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::*;
+
+    /// A bare EIP-2718 type byte: the allowlist consults nothing else.
+    struct TypeByte(u8);
+
+    impl Typed2718 for TypeByte {
+        fn ty(&self) -> u8 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn allowlist_admits_legacy_2930_1559_and_7702_only() {
+        for admitted in [0x00, 0x01, 0x02, 0x04] {
+            assert!(
+                batch_allowlisted_tx_type(&TypeByte(admitted)),
+                "type {admitted:#04x} must be admitted"
+            );
+        }
+        for rejected in [0x03, 0x05, 0x7e] {
+            assert!(
+                !batch_allowlisted_tx_type(&TypeByte(rejected)),
+                "type {rejected:#04x} must be rejected"
+            );
+        }
+    }
+}

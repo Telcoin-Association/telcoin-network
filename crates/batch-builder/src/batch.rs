@@ -86,9 +86,12 @@ pub fn build_batch<P: TxPool>(
         // NOTE: `ValidPoolTransaction::size()` is private
         let tx = pool_tx.to_consensus();
 
-        // ignore any transaction type outside the executable allowlist (EIP-4844
-        // blobs and EIP-7702 today): the batch validator rejects such batches, so
-        // packing one would cost this node a peer penalty on every vote request
+        // ignore any transaction type outside the executable allowlist (the
+        // predicate admits legacy, EIP-2930, EIP-1559, and EIP-7702): the batch
+        // validator rejects non-allowlisted batches, so packing one would cost
+        // this node a peer penalty on every vote request. The 4844 arm discards
+        // blob transactions; the else arm is default-deny for any future
+        // decodable type outside the allowlist (no such type exists today)
         if !tn_types::batch_allowlisted_tx_type(&tx) {
             if tx.is_eip4844() {
                 best_txs.ignore_eip4844(&pool_tx);

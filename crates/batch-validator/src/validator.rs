@@ -197,13 +197,14 @@ impl BatchValidator {
 
     /// Validate every transaction's EIP-2718 type is on the executable allowlist.
     ///
-    /// The protocol admits only legacy, EIP-2930, and EIP-1559 envelopes in batches,
-    /// uniformly across chain configurations; the batch builder and the worker gateway
-    /// enforce the same `batch_allowlisted_tx_type` predicate on the producing side.
-    /// EIP-4844 keeps its dedicated error for continuity with existing peer penalties;
-    /// any other decodable type (EIP-7702 today) maps to `UnsupportedTxType`. A type
-    /// byte outside the envelope's decodable set never reaches this check: it fails
-    /// transaction decode first and surfaces as `RecoverTransaction`.
+    /// The protocol admits legacy, EIP-2930, EIP-1559, and EIP-7702 envelopes in
+    /// batches, uniformly across chain configurations; the batch builder and the worker
+    /// gateway enforce the same `batch_allowlisted_tx_type` predicate on the producing
+    /// side. EIP-4844 keeps its dedicated error for continuity with existing peer
+    /// penalties; any other decodable type outside the allowlist (none exists today)
+    /// maps to `UnsupportedTxType`. A type byte outside the envelope's decodable set
+    /// never reaches this check: it fails transaction decode first and surfaces as
+    /// `RecoverTransaction`.
     fn validate_tx_type_allowlist(
         &self,
         transactions: &[TransactionSigned],
@@ -678,16 +679,19 @@ mod tests {
         );
     }
 
+    /// A well-formed EIP-7702 transaction passes batch validation: the type
+    /// allowlist admits `0x04`, and validation is structural (decode, signer
+    /// recovery, size/gas/base-fee) — authorization-tuple contents are an
+    /// execution concern, not a validation concern.
     #[tokio::test]
-    async fn test_invalid_tx_eip7702() {
+    async fn test_valid_tx_eip7702() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let TestTools { valid_batch, validator, .. } =
             test_tools(tmp_dir.path(), &task_manager).await;
         let (mut batch, _) = valid_batch.split();
 
-        // eip7702 set-code transaction carrying a signed authorization, so the
-        // only invalid thing about the envelope is its type byte
+        // eip7702 set-code transaction carrying a signed authorization
         let mut tx_factory = TransactionFactory::new_random();
         let signed_tx =
             tx_factory.create_eip7702(validator.reth_env.chainspec().chain_id(), None, 7);
@@ -695,10 +699,7 @@ mod tests {
         // test batch with eip7702 tx
         batch.transactions = vec![signed_tx.encoded_2718()];
 
-        assert_matches!(
-            validator.validate_batch(batch.clone().seal_slow()),
-            Err(BatchValidationError::UnsupportedTxType { tx_type: 4, hash: _ })
-        );
+        assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
     }
 
     #[tokio::test]
