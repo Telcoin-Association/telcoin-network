@@ -5,7 +5,7 @@
 
 use crate::{
     batch_fetcher::BatchFetcher,
-    metrics::WorkerMetrics,
+    metrics::{ForwardDropReason, WorkerMetrics},
     network::primary::PrimaryReceiverHandler,
     quorum_waiter::{QuorumWaiter, QuorumWaiterTrait},
     WorkerNetworkHandle,
@@ -247,6 +247,10 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             return Ok(());
         }
 
+        // Captured before the vec moves into the spawned task: both drop arms below lose the
+        // whole batch, and by then the length is no longer reachable (issue #1133).
+        let num_txns = transactions.len();
+        let metrics = self.metrics.clone();
         let network_handle = self.network_handle.clone();
         let forwarder = self.forwarder.clone();
         let committee_slots = self.committee_slots.clone();
@@ -261,6 +265,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                         "no committee validator has advertised a JSON-RPC endpoint; \
                          cannot forward accepted transactions"
                     );
+                    metrics
+                        .record_forward_dropped(ForwardDropReason::NoEndpointAdvertised, num_txns);
                 }
                 Err(err) => {
                     warn!(
@@ -268,6 +274,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                         ?err,
                         "failed to discover validator JSON-RPC endpoints for transaction forwarding"
                     );
+                    metrics.record_forward_dropped(ForwardDropReason::DiscoveryFailed, num_txns);
                 }
             }
             Ok(())

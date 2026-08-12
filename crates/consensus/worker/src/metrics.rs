@@ -8,6 +8,30 @@ use reth_metrics::{
 use std::time::Duration;
 use tn_types::WorkerId;
 
+/// Why the worker dropped a sealed batch's transactions instead of handing them to the
+/// transaction forwarder.
+///
+/// Both variants are whole-batch losses on the observer path (`disburse_txns`): the
+/// transactions were accepted by this node's RPC and never reached the forwarder, so the
+/// forwarder-side series (`tn_reth.forwarded_txns_*`) cannot see them (issue #1133).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ForwardDropReason {
+    /// No committee validator advertised a JSON-RPC endpoint to forward to.
+    NoEndpointAdvertised,
+    /// Discovering the committee's advertised endpoints failed outright.
+    DiscoveryFailed,
+}
+
+impl ForwardDropReason {
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NoEndpointAdvertised => "no_endpoint_advertised",
+            Self::DiscoveryFailed => "discovery_failed",
+        }
+    }
+}
+
 /// Derive-backed metric handles for the worker, labeled per `worker`.
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_worker")]
@@ -107,6 +131,24 @@ impl WorkerMetrics {
     pub(crate) fn record_batch_fetch_duration(&self, elapsed: Duration) {
         self.handles.batch_fetch_duration_seconds.record(elapsed);
     }
+
+    /// Record transactions dropped by the worker before they reached the transaction
+    /// forwarder, labeled by [`ForwardDropReason`].
+    ///
+    /// Modeled on [`Self::record_batches_fetched`]: a zero count records nothing, so a path
+    /// that never dropped creates no series. Every call site pairs with a `warn!` line; the
+    /// counter is what makes the loss visible on a dashboard, where an observer that drops
+    /// every transaction it accepts otherwise looks healthy (issue #1133).
+    pub(crate) fn record_forward_dropped(&self, reason: ForwardDropReason, count: usize) {
+        if count > 0 {
+            metrics::counter!(
+                "tn_worker.forwarded_txns_dropped_total",
+                "worker" => self.worker_id.to_string(),
+                "reason" => reason.label(),
+            )
+            .increment(u64::try_from(count).unwrap_or(u64::MAX));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -129,6 +171,8 @@ mod tests {
             metrics.record_batches_fetched("local", 3);
             metrics.record_batches_fetched("remote", 0); // no-op, no series
             metrics.record_batch_fetch_duration(Duration::from_millis(80));
+            metrics.record_forward_dropped(ForwardDropReason::NoEndpointAdvertised, 4);
+            metrics.record_forward_dropped(ForwardDropReason::DiscoveryFailed, 0); // no-op, no series
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -158,11 +202,28 @@ mod tests {
         find("tn_worker.batch_validation_failures_total");
         find("tn_worker.batch_fetch_duration_seconds");
 
+        let (key, _, _, value) = find("tn_worker.forwarded_txns_dropped_total");
+        assert!(matches!(value, DebugValue::Counter(4)));
+        assert!(key
+            .key()
+            .labels()
+            .any(|l| l.key() == "reason" && l.value() == "no_endpoint_advertised"));
+        assert!(key.key().labels().any(|l| l.key() == "worker" && l.value() == "0"));
+
         // the zero-count fetch must not create a series
         assert!(
             !snapshot.iter().any(|(key, ..)| key.key().name() == "tn_worker.batches_fetched_total"
                 && key.key().labels().any(|l| l.value() == "remote")),
             "zero-count fetch should not register a remote series"
+        );
+
+        // neither must the zero-count forward drop
+        assert!(
+            !snapshot.iter().any(|(key, ..)| {
+                key.key().name() == "tn_worker.forwarded_txns_dropped_total"
+                    && key.key().labels().any(|l| l.value() == "discovery_failed")
+            }),
+            "zero-count forward drop should not register a series"
         );
     }
 }

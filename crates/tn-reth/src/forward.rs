@@ -30,7 +30,10 @@
 //!
 //! [`submit_txn_if_mine`]: tn_types::BatchValidation::submit_txn_if_mine
 
-use crate::{metrics::ForwarderMetrics, recover_raw_transaction};
+use crate::{
+    metrics::{ForwardDropReason, ForwarderMetrics},
+    recover_raw_transaction,
+};
 use alloy::{
     providers::{Provider as _, RootProvider},
     transports::{RpcError, TransportErrorKind},
@@ -564,6 +567,24 @@ impl WorkerRpcForwarder {
                 }
             }
 
+            // The per-transaction losses, counted per batch rather than per event. A rejection
+            // is a considered verdict a validator saw; an unreached transaction exhausted its
+            // whole fallback chain. Both are transactions this node accepted and never
+            // delivered, so both subtract from the queued denominator - see
+            // [`ForwardDropReason`] for which of the two is alertable.
+            if rejected > 0 {
+                ForwarderMetrics::record_txns_dropped(
+                    ForwardDropReason::Rejected,
+                    u64::try_from(rejected).unwrap_or(u64::MAX),
+                );
+            }
+            if unreached > 0 {
+                ForwarderMetrics::record_txns_dropped(
+                    ForwardDropReason::Unreached,
+                    u64::try_from(unreached).unwrap_or(u64::MAX),
+                );
+            }
+
             // Everything the batch deadline cut off: whatever `map_while` stopped short of,
             // plus any transaction whose deadline-clamped budget expired mid-chain. Derived
             // from the individual outcome tallies rather than from a count of loop iterations
@@ -599,9 +620,21 @@ impl TxnForwarder for WorkerRpcForwarder {
     ) {
         let committee_size = committee_slots.len() as u64;
         let queued = transactions.len();
-        // Nothing to forward, or nowhere to forward it to: neither is a fault, so neither warns.
-        let discovered = (queued > 0 && committee_size > 0 && !validator_rpcs.is_empty())
-            .then(|| self.cached_providers(&validator_rpcs));
+        let queued_total = u64::try_from(queued).unwrap_or(u64::MAX);
+        if queued > 0 {
+            // The base series the drop and abandon counters read against: every transaction
+            // handed to the forwarder, counted before any admission decision.
+            ForwarderMetrics::record_txns_queued(queued_total);
+        }
+        // Nothing to forward, or nowhere to forward it to: neither is a fault, so neither
+        // warns - the worker warns and counts its own guard on the production path. But a
+        // batch with nowhere to go is still dropped, so it is counted (issue #1133).
+        let targets_known = committee_size > 0 && !validator_rpcs.is_empty();
+        if queued > 0 && !targets_known {
+            ForwarderMetrics::record_txns_dropped(ForwardDropReason::EmptyCommittee, queued_total);
+        }
+        let discovered =
+            (queued > 0 && targets_known).then(|| self.cached_providers(&validator_rpcs));
         // Endpoints were advertised but none of them resolved to a usable provider. That is a
         // fault, and the batch is dropped for it.
         let admissible = discovered.filter(|providers| {
@@ -610,6 +643,10 @@ impl TxnForwarder for WorkerRpcForwarder {
                 warn!(
                     target: "worker::forward",
                     "no usable validator RPC endpoints; dropping forwarded transactions"
+                );
+                ForwarderMetrics::record_txns_dropped(
+                    ForwardDropReason::NoUsableEndpoint,
+                    queued_total,
                 );
             }
             usable
@@ -632,6 +669,9 @@ impl TxnForwarder for WorkerRpcForwarder {
                         "forward capacity exhausted; dropping a sealed batch rather than queueing it"
                     );
                     ForwarderMetrics::record_batch_shed();
+                    // The transaction-level count beside the batch-level one, so shed batches
+                    // subtract from the queued denominator like every other drop.
+                    ForwarderMetrics::record_txns_dropped(ForwardDropReason::BatchShed, queued_total);
                 },
                 move |permit| {
                     self.spawn_forward(
@@ -761,11 +801,38 @@ mod tests {
         Ok(format!("http://{addr}"))
     }
 
+    /// One recorder capture. [`metrics_util::debugging::Snapshotter::snapshot`] drains the
+    /// accumulated values with it, so each test takes exactly one snapshot after its recorded
+    /// scope ends and every lookup below reads that capture; a second snapshot would read
+    /// zeros.
+    type Snapshot = Vec<(
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        DebugValue,
+    )>;
+
     /// Read one counter out of a recorder snapshot, `None` if the series is not registered.
-    fn counter(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> Option<u64> {
-        snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+    fn counter(snapshot: &Snapshot, name: &str) -> Option<u64> {
+        snapshot.iter().find_map(|(key, _, _, value)| {
             (key.key().name() == name).then_some(value).and_then(|value| match value {
-                DebugValue::Counter(count) => Some(count),
+                DebugValue::Counter(count) => Some(*count),
+                DebugValue::Gauge(_) | DebugValue::Histogram(_) => None,
+            })
+        })
+    }
+
+    /// The dropped-transactions counter for one `reason`, `None` if that series is absent.
+    ///
+    /// [`counter`] cannot serve here: every reason shares the metric name, so a name-only
+    /// lookup returns whichever series the snapshot happens to list first.
+    fn dropped_counter(snapshot: &Snapshot, reason: &str) -> Option<u64> {
+        snapshot.iter().find_map(|(key, _, _, value)| {
+            (key.key().name() == "tn_reth.forwarded_txns_dropped_total"
+                && key.key().labels().any(|l| l.key() == "reason" && l.value() == reason))
+            .then_some(value)
+            .and_then(|value| match value {
+                DebugValue::Counter(count) => Some(*count),
                 DebugValue::Gauge(_) | DebugValue::Histogram(_) => None,
             })
         })
@@ -878,11 +945,84 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             forwarder.forward_txns(vec![vec![0_u8; 32]], vec![test_key(1)], rpcs);
         });
+        let snapshot = snapshotter.snapshot().into_vec();
 
         // No permit was free, so none was taken, and the shed is visible as a counter rather
-        // than only as a log line.
+        // than only as a log line - at batch grain and, since #1133, at transaction grain
+        // against the queued denominator.
         assert_eq!(forwarder.forwards_in_flight.available_permits(), 0);
-        assert_eq!(counter(&snapshotter, "tn_reth.forwarded_batches_shed_total"), Some(1));
+        assert_eq!(counter(&snapshot, "tn_reth.forwarded_batches_shed_total"), Some(1));
+        assert_eq!(counter(&snapshot, "tn_reth.forwarded_txns_queued_total"), Some(1));
+        assert_eq!(dropped_counter(&snapshot, "batch_shed"), Some(1));
+        Ok(())
+    }
+
+    /// A batch that reaches the forwarder with an empty committee is dropped without a warn by
+    /// design; the reason-labeled counter is what keeps the loss visible (issue #1133).
+    #[test]
+    fn forward_txns_counts_a_batch_with_no_committee_as_dropped() -> eyre::Result<()> {
+        let rpcs = vec![(test_key(1), test_rpc("http://validator-one.example.com:8545")?)];
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // Built inside the recorder scope so `ForwarderMetrics::init` registers every series
+        // with this recorder; the zero assertions below read those registrations.
+        let forwarder = metrics::with_local_recorder(&recorder, || {
+            let forwarder = test_forwarder();
+            forwarder.forward_txns(vec![vec![0_u8; 32], vec![1_u8; 32]], vec![], rpcs);
+            forwarder
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        assert_eq!(counter(&snapshot, "tn_reth.forwarded_txns_queued_total"), Some(2));
+        assert_eq!(dropped_counter(&snapshot, "empty_committee"), Some(2));
+        assert_eq!(dropped_counter(&snapshot, "no_usable_endpoint"), Some(0));
+        // Dropped at the routing check: no forward task was ever spawned.
+        assert_eq!(forwarder.forwards_in_flight.available_permits(), MAX_CONCURRENT_FORWARDS);
+        Ok(())
+    }
+
+    /// A committee is present but nobody advertised an endpoint: the same routing dead end
+    /// as an empty committee, counted under the same reason.
+    #[test]
+    fn forward_txns_counts_a_batch_with_no_advertised_endpoint_as_dropped() -> eyre::Result<()> {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let forwarder = metrics::with_local_recorder(&recorder, || {
+            let forwarder = test_forwarder();
+            forwarder.forward_txns(vec![vec![0_u8; 32]], vec![test_key(1)], vec![]);
+            forwarder
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        assert_eq!(counter(&snapshot, "tn_reth.forwarded_txns_queued_total"), Some(1));
+        assert_eq!(dropped_counter(&snapshot, "empty_committee"), Some(1));
+        assert_eq!(dropped_counter(&snapshot, "no_usable_endpoint"), Some(0));
+        assert_eq!(forwarder.forwards_in_flight.available_permits(), MAX_CONCURRENT_FORWARDS);
+        Ok(())
+    }
+
+    /// Endpoints were advertised but the policy refused every one: the batch is dropped and
+    /// the drop is counted under its own reason, apart from the empty-committee no-op.
+    #[test]
+    fn forward_txns_counts_a_batch_with_no_usable_endpoint_as_dropped() -> eyre::Result<()> {
+        // The shipped default policy refuses the loopback advertisement, so the committee is
+        // present but no endpoint resolves to a provider.
+        let rpcs = vec![(test_key(1), test_rpc("http://127.0.0.1:8545")?)];
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let forwarder = metrics::with_local_recorder(&recorder, || {
+            let forwarder = test_forwarder();
+            forwarder.forward_txns(vec![vec![0_u8; 32]], vec![test_key(1)], rpcs);
+            forwarder
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        assert_eq!(counter(&snapshot, "tn_reth.forwarded_txns_queued_total"), Some(1));
+        assert_eq!(dropped_counter(&snapshot, "no_usable_endpoint"), Some(1));
+        assert_eq!(dropped_counter(&snapshot, "empty_committee"), Some(0));
+        assert_eq!(forwarder.forwards_in_flight.available_permits(), MAX_CONCURRENT_FORWARDS);
         Ok(())
     }
 
