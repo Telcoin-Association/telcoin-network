@@ -1000,7 +1000,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
 
         // calculate anticipated penalty for setting gas limit too high
         for tx in transactions {
-            let recovered = recover_signed_transaction(&tx).expect("tx valid");
+            let recovered = recover_signed_transaction(tx).expect("tx valid");
             let effective_gas_price = recovered.effective_gas_price(Some(batch.base_fee_per_gas));
             let expected_penalty = U256::from(
                 calculate_gas_penalty(recovered.gas_limit(), TOTAL_GAS_PER_TX) as u128
@@ -1045,7 +1045,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
 
         // calculate anticipated penalty for setting gas limit too high
         for tx in transactions {
-            let recovered = recover_signed_transaction(&tx).expect("tx valid");
+            let recovered = recover_signed_transaction(tx).expect("tx valid");
             let effective_gas_price = recovered.effective_gas_price(Some(batch.base_fee_per_gas));
             let expected_penalty = U256::from(
                 calculate_gas_penalty(recovered.gas_limit(), TOTAL_GAS_PER_TX) as u128
@@ -1109,8 +1109,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         reputation_scores,
         previous_sub_dag,
         tn_types::EpochSeedChainValue::genesis_placeholder(),
-    )
-    .into();
+    );
     let consensus_output_2 = ConsensusOutput::new(
         subdag_2,
         consensus_output_1.consensus_header_hash(),
@@ -1485,7 +1484,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
             // calculate anticipated penalty for setting gas limit too high
             for tx in transactions {
-                let recovered = recover_signed_transaction(&tx).expect("tx valid");
+                let recovered = recover_signed_transaction(tx).expect("tx valid");
                 let effective_gas_price =
                     recovered.effective_gas_price(Some(batch.base_fee_per_gas));
                 let expected_penalty = U256::from(
@@ -1534,7 +1533,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
             // calculate anticipated penalty for setting gas limit too high
             for tx in transactions {
-                let recovered = recover_signed_transaction(&tx).expect("tx valid");
+                let recovered = recover_signed_transaction(tx).expect("tx valid");
                 let effective_gas_price =
                     recovered.effective_gas_price(Some(batch.base_fee_per_gas));
                 let expected_penalty = U256::from(
@@ -2127,7 +2126,7 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
 
     // okay to clone these because they are only used to seed genesis, decode transactions, and
     // recover signers
-    let all_batches = vec![batch.clone()];
+    let all_batches = [batch.clone()];
 
     // use default genesis and seed accounts to execute batches
     let (genesis, txs_by_block, signers_by_block) =
@@ -2484,7 +2483,7 @@ async fn test_gas_refund_does_not_inflate_penalty() -> eyre::Result<()> {
         received_at: None,
     };
 
-    let all_batches = vec![batch.clone()];
+    let all_batches = [batch.clone()];
     let (genesis, _txs_by_block, _signers_by_block) =
         seeded_genesis_from_random_batches(genesis, all_batches.iter());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
