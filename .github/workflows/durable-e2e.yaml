@@ -31,6 +31,11 @@ on:
           - safe-no-sync
         default: durable
 
+# The job only reads the repository (checkout + build + test); the token gets no
+# write scopes (least privilege, CodeQL actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
 env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings -D unused_extern_crates"
