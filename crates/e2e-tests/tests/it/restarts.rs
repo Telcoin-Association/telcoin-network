@@ -541,7 +541,8 @@ fn test_restarts_observer() -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         client_urls[i].push_str(&format!(":{rpc_port}"));
         // The observer forwards accepted txns to the committee's advertised RPC
-        // endpoints; without this the forward has no targets and txns are dropped.
+        // endpoints; without this each seal is refused with NotValidator and the txns
+        // stay pending in the observer's pool until an endpoint is discoverable.
         advertise_worker_rpc(&temp_path, i, rpc_port)?;
         guard.push(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
     }
