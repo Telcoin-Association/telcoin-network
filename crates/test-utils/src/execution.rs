@@ -33,16 +33,16 @@ pub fn default_test_execution_node(
     )?;
 
     // create engine node
+    // Leak the manager: a dropped TaskManager latches its one-shot shutdown, which
+    // would cancel every task later spawned through the retained spawner.
+    let task_manager = Box::leak(Box::new(TaskManager::default()));
     let engine = if let Some(chain) = opt_chain {
         ExecutionNode::new(
             &builder,
-            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir, &TaskManager::default(), rewards)?,
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir, task_manager, rewards)?,
         )?
     } else {
-        ExecutionNode::new(
-            &builder,
-            RethEnv::new_for_test(tmp_dir, &TaskManager::default(), rewards)?,
-        )?
+        ExecutionNode::new(&builder, RethEnv::new_for_test(tmp_dir, task_manager, rewards)?)?
     };
 
     Ok(engine)

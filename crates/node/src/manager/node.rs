@@ -31,8 +31,9 @@ use tn_types::{
     deconstruct_nonce,
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
     BlsPublicKey, BootstrapServer, Committee, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, Notifier,
-    SealedHeader, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId, DEFAULT_WORKER_ID,
+    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, EngineUpdate, Epoch, SealedHeader,
+    ShutdownNotifier, TaskError, TaskManager, TaskSpawner, TimestampSec, WorkerId,
+    DEFAULT_WORKER_ID,
 };
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
@@ -92,8 +93,8 @@ pub(crate) struct EpochManager<P, DB> {
     worker_network_handle: Option<WorkerNetworkHandle>,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
-    /// The epoch manager's [Notifier] to shutdown all node processes.
-    node_shutdown: Notifier,
+    /// The epoch manager's [ShutdownNotifier] to shutdown all node processes.
+    node_shutdown: ShutdownNotifier,
     /// The timestamp to close the current epoch.
     ///
     /// The manager monitors leader timestamps for the epoch boundary.
@@ -577,7 +578,7 @@ where
         let _ = std::fs::create_dir_all(&epochs_db_path);
         let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?;
         // shutdown long-running node components
-        let node_shutdown = Notifier::new();
+        let node_shutdown = ShutdownNotifier::new();
 
         let reth_db = builder.reth_db.clone();
 

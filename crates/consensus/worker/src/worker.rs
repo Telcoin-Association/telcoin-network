@@ -239,48 +239,55 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     ///
     /// Replaces the previous gossip broadcast (issue #804): each transaction is forwarded to the
     /// JSON-RPC endpoint the owning validator advertised on its worker record, discovered over
-    /// kademlia. Forwarding is best-effort and runs on a background task so batch production is
-    /// never stalled by a slow or unreachable validator.
+    /// kademlia. Admission is decided here, synchronously, because the `Ok` this method returns
+    /// is what lets the batch builder evict these transactions from its pool as mined: a batch
+    /// that was never handed to a forward task must report [`BlockSealError::NotValidator`] so
+    /// the builder keeps its transactions pending and retries on a later build. Delivery stays
+    /// best-effort on a background task, so batch production is never stalled by a slow or
+    /// unreachable validator; discovery is a snapshot of already-fetched kademlia records, not
+    /// a blocking network round-trip.
     pub async fn disburse_txns(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
         let transactions = sealed_batch.batch.transactions;
         if transactions.is_empty() {
             return Ok(());
         }
 
-        // Captured before the vec moves into the spawned task: both drop arms below lose the
-        // whole batch, and by then the length is no longer reachable (issue #1133).
+        // Whole-batch count for the discovery dead ends below (issue #1133).
         let num_txns = transactions.len();
-        let metrics = self.metrics.clone();
-        let network_handle = self.network_handle.clone();
-        let forwarder = self.forwarder.clone();
-        let committee_slots = self.committee_slots.clone();
-        self.network_handle.get_task_spawner().spawn_task("disburse-txns", async move {
-            match network_handle.get_all_validator_rpcs().await {
-                Ok(validator_rpcs) if !validator_rpcs.is_empty() => {
-                    forwarder.forward_txns(transactions, committee_slots, validator_rpcs);
-                }
-                Ok(_) => {
+        let validator_rpcs = self
+            .network_handle
+            .get_all_validator_rpcs()
+            .await
+            .inspect_err(|err| {
+                warn!(
+                    target: "worker::batch_provider",
+                    ?err,
+                    "failed to discover validator JSON-RPC endpoints for transaction forwarding"
+                );
+                self.metrics.record_forward_dropped(ForwardDropReason::DiscoveryFailed, num_txns);
+            })
+            .inspect(|rpcs| {
+                // Only the discovery-succeeded-but-empty case earns this message; a
+                // discovery failure already warned above with the actual error.
+                if rpcs.is_empty() {
                     warn!(
                         target: "worker::batch_provider",
                         "no committee validator has advertised a JSON-RPC endpoint; \
                          cannot forward accepted transactions"
                     );
-                    metrics
+                    self.metrics
                         .record_forward_dropped(ForwardDropReason::NoEndpointAdvertised, num_txns);
                 }
-                Err(err) => {
-                    warn!(
-                        target: "worker::batch_provider",
-                        ?err,
-                        "failed to discover validator JSON-RPC endpoints for transaction forwarding"
-                    );
-                    metrics.record_forward_dropped(ForwardDropReason::DiscoveryFailed, num_txns);
-                }
-            }
-            Ok(())
-        });
+            })
+            .unwrap_or_default();
 
-        Ok(())
+        let admitted = !validator_rpcs.is_empty()
+            && self.forwarder.forward_txns(
+                transactions,
+                self.committee_slots.clone(),
+                validator_rpcs,
+            );
+        admitted.then_some(()).ok_or(BlockSealError::NotValidator)
     }
 
     /// Seal and broadcast the current batch.

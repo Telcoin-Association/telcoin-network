@@ -115,13 +115,17 @@ const FORWARDED_TXNS_ABANDONED: &str = "tn_reth.forwarded_txns_abandoned_total";
 const FORWARDED_TXNS_QUEUED: &str = "tn_reth.forwarded_txns_queued_total";
 const FORWARDED_TXNS_DROPPED: &str = "tn_reth.forwarded_txns_dropped_total";
 
-/// Why the forwarding pipeline gave up on transactions it had accepted.
+/// Why the forwarding pipeline gave up on a forward attempt it had accepted.
 ///
 /// The variants label `tn_reth.forwarded_txns_dropped_total`, one series per reason, all
 /// registered at zero by [`ForwarderMetrics::init`]. Together with
 /// `tn_reth.forwarded_txns_abandoned_total` they account for every queued transaction that was
 /// not delivered, so `queued - dropped - abandoned` is the number a dashboard can trust as
-/// delivered (issue #1133).
+/// delivered (issue #1133). The accounting is per attempt: the pre-admission reasons
+/// (`EmptyCommittee`, `NoUsableEndpoint`, `BatchShed`) refuse the batch so the caller keeps
+/// its transactions and requeues them on a later build (issue #1132), while `Rejected` and
+/// `Unreached` happen after admission, when the transactions are already evicted as mined,
+/// and are final losses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ForwardDropReason {
     /// The batch reached the forwarder with an empty committee or no advertised endpoint, so
@@ -131,7 +135,7 @@ pub(crate) enum ForwardDropReason {
     EmptyCommittee,
     /// Endpoints were advertised but none resolved to a usable provider - every one was
     /// refused by the [`crate::ForwardTargetPolicy`] or failed to parse. Alertable: the node
-    /// is accepting transactions it can never hand on.
+    /// cannot hand on the transactions it accepts while this condition lasts.
     NoUsableEndpoint,
     /// The whole batch was shed at admission because every forward permit was in flight. The
     /// transaction-level twin of `tn_reth.forwarded_batches_shed_total`, so shed batches also

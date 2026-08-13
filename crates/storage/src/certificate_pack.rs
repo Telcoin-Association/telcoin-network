@@ -35,6 +35,11 @@ enum PackMessage {
 
 /// Manages a pack file of [`Certificate`] data, indexed by certificate digest.
 /// Note, lack of Clone to make shutdown easier to manage.
+///
+/// Saves run on a background thread. A failed save latches into an error slot that
+/// [`get_error`](Self::get_error) reads without clearing. [`persist`](Self::persist) and
+/// [`shutdown`](Self::shutdown) are the durability barriers: a latched save failure reaches
+/// their return value, even when that save was still queued at the time of the call.
 #[derive(Debug)]
 pub struct CertificatePack {
     tx: Sender<PackMessage>,
@@ -70,7 +75,14 @@ fn run_pack_loop(
                 let _ = tx.send(inner.contains(digest));
             }
             PackMessage::Persist(tx) => {
-                let _ = tx.send(inner.persist());
+                // Fold a save that failed while this persist was queued into the reply.
+                // `persist()` samples the error slot before enqueueing, and saves are
+                // fire-and-forget, so a save that fails after that sample but before this arm
+                // would otherwise be acknowledged as a successful flush. The slot does not
+                // clear on read, so a plain read is enough here.
+                let pending = tx_error.borrow().clone();
+                let flushed = inner.persist();
+                let _ = tx.send(pending.map_or(flushed, Err));
             }
             PackMessage::Shutdown => {
                 let _ = inner.persist();
@@ -78,7 +90,13 @@ fn run_pack_loop(
                 break;
             }
             PackMessage::ShutdownAsync(tx) => {
-                let _ = tx.send(inner.persist());
+                // Same fold as `Persist`: `shutdown()` never samples the error slot, so this
+                // reply is the only place a save that failed earlier in the queue can surface.
+                // Without it the final flush of an epoch reports `Ok(())` for a pack that
+                // silently dropped a certificate.
+                let pending = tx_error.borrow().clone();
+                let flushed = inner.persist();
+                let _ = tx.send(pending.map_or(flushed, Err));
                 break;
             }
         }
@@ -185,6 +203,12 @@ impl CertificatePack {
     }
 
     /// Flush the pack file and index to disk.
+    ///
+    /// Returns `Err` if any background save queued before this call failed. An error that is
+    /// already latched when this is called short-circuits before the flush is enqueued (the
+    /// slot does not clear on read). A save still queued at that sample is processed before
+    /// the flush by the actor's single FIFO channel, and its failure is folded into the flush
+    /// reply.
     pub async fn persist(&self) -> Result<(), PackError> {
         self.get_error()?;
         let (tx, rx) = oneshot::channel();
@@ -197,6 +221,10 @@ impl CertificatePack {
 
     /// Consume and shutdown the pack if this is the last instance (if not the last instance then is
     /// no-op). This is safer than relying on Drop.
+    ///
+    /// Returns `Err` if the final flush fails or if any earlier background save failed: the
+    /// shutdown reply folds in the latched error slot, so a save failure from this epoch is
+    /// reported here even though this method never samples the slot itself.
     pub async fn shutdown(self) -> Result<(), PackError> {
         if Arc::strong_count(&self.handle) == 1 {
             let handle = self.handle.lock().take();
@@ -435,5 +463,64 @@ mod test {
             let loaded = pack.get(digest).await.expect("should load cert read-only");
             assert_eq!(loaded.digest(), digest);
         }
+    }
+
+    /// Open a pack read-write once so the files exist, then reopen it read-only. On the
+    /// read-only pack every background save fails deterministically (`AppendError::ReadOnly`),
+    /// which is the failure injector for the queued-save regression tests below.
+    async fn open_read_only_pack(temp_dir: &TempDir) -> CertificatePack {
+        let pack = CertificatePack::open(temp_dir.path(), 0);
+        pack.shutdown().await.expect("clean shutdown of the writable pack");
+        CertificatePack::open_static(temp_dir.path(), 0)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn persist_reports_a_save_that_failed_while_the_flush_was_queued() {
+        // Regression test for #1138: `persist()` samples the error slot before it enqueues, and
+        // saves are fire-and-forget, so a save that fails while the `Persist` message is still
+        // queued behind it must be folded into the persist reply. Otherwise the caller treats
+        // `Ok(())` as proof of durability for a certificate that never reached the pack.
+        let temp_dir = TempDir::with_prefix("persist_queued_save_error").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let pack = open_read_only_pack(&temp_dir).await;
+
+        // Queue a save the actor will reject and a persist behind it. Both go straight to the
+        // channel: the handle-side `get_error` sample sees an empty slot at this point, and the
+        // point of the test is the actor's ordering. A single consumer draining a FIFO channel
+        // guarantees the save fails before the persist is dequeued, so this is deterministic
+        // rather than a race.
+        let cert = make_test_cert(&fixture, 0);
+        pack.tx.send(super::PackMessage::Save(cert)).await.expect("queue failing save");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pack.tx.send(super::PackMessage::Persist(tx)).await.expect("queue persist");
+
+        let err = rx
+            .await
+            .expect("actor replied to the persist")
+            .expect_err("persist must report the save that failed while it was queued");
+        assert!(matches!(err, super::PackError::Append(_)), "unexpected error: {err:?}");
+
+        // This slot does not clear on read, so the failure stays visible to later callers too.
+        pack.get_error().expect_err("error stays latched after the persist reply");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_reports_a_save_that_failed_while_the_shutdown_was_queued() {
+        // Regression test for #1138, end-of-epoch path: `shutdown()` never samples the error
+        // slot, so the `ShutdownAsync` reply is the only place a queued save failure can
+        // surface. Before the fix this returned `Ok(())` for a pack that silently dropped a
+        // certificate.
+        let temp_dir = TempDir::with_prefix("shutdown_queued_save_error").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let pack = open_read_only_pack(&temp_dir).await;
+
+        let cert = make_test_cert(&fixture, 0);
+        pack.tx.send(super::PackMessage::Save(cert)).await.expect("queue failing save");
+
+        let err = pack
+            .shutdown()
+            .await
+            .expect_err("shutdown must report the save that failed while it was queued");
+        assert!(matches!(err, super::PackError::Append(_)), "unexpected error: {err:?}");
     }
 }

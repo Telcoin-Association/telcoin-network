@@ -462,7 +462,9 @@ pub(crate) fn start_validator_with_args(
 ///
 /// The genesis ceremony leaves `p2p_info.worker.rpc` unset, and a non-committee node
 /// forwards accepted transactions to whatever endpoints committee validators advertise
-/// (issue #804); with none advertised, observer-submitted transactions are dropped.
+/// (issue #804); with none advertised, each seal is refused with
+/// `BlockSealError::NotValidator` and the transactions stay pending in the node's own
+/// pool, retried roughly once per `max_batch_delay` until an endpoint is discoverable.
 /// Call this between the config ceremony and `start_validator`, passing the same
 /// `rpc_port` the validator will serve `--http` on; the node re-signs the record from
 /// its `node-info.yaml` at startup, so editing the file is sufficient.

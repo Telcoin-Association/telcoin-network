@@ -1,6 +1,6 @@
 //! Task manager interface to spawn tasks to the tokio runtime.
 
-use crate::Notifier;
+use crate::ShutdownNotifier;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use std::{
     fmt::{Debug, Display},
@@ -135,7 +135,7 @@ pub struct TaskManager {
     new_task_tx: mpsc::Sender<TaskHandle>,
     /// This is used to notify any spawned tasks to exit when task manager is dropped.
     /// Otherwise we will end up with orphaned tasks when epochs change.
-    local_shutdown: Notifier,
+    local_shutdown: ShutdownNotifier,
     /// How long to wait for joins to complete.  This will be used twice (so double it).
     join_wait_millis: u64,
 }
@@ -154,7 +154,7 @@ impl Drop for TaskManager {
 pub struct TaskSpawner {
     /// The channel to forward task handles to the parent [TaskManager].
     new_task_tx: mpsc::Sender<TaskHandle>,
-    local_shutdown: Notifier,
+    local_shutdown: ShutdownNotifier,
 }
 
 impl TaskSpawner {
@@ -198,7 +198,7 @@ impl TaskSpawner {
         });
         if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, critical))
         {
-            tracing::error!(target: "tn::tasks", "Task error sending joiner for {name}: {err}");
+            tracing::error!(target: "tn::tasks", "Failed to track spawned task {name}: {err}. The task is already spawned but untracked: it can never be joined or aborted, and only its shutdown notice can end it.");
         }
     }
 
@@ -301,14 +301,13 @@ impl TaskManager {
             name: name.to_string(),
             new_task_rx,
             new_task_tx,
-            local_shutdown: Notifier::default(),
+            local_shutdown: ShutdownNotifier::default(),
             join_wait_millis: 2000,
         }
     }
 
-    /// Sets the amount of time this task manager will wait on tasks/submanagers to complete.
-    /// Will be used twice in join, once for tasks and once for subtasks so max wait will
-    /// 2x this value (min).
+    /// Sets the amount of time this task manager will wait for its tasks to complete
+    /// during shutdown (the timeout for [`Self::wait_for_task_shutdown`]).
     pub fn set_join_wait(&mut self, millis: u64) {
         self.join_wait_millis = millis;
     }
@@ -362,7 +361,7 @@ impl TaskManager {
     ///
     /// The manager tracks critical and non-critical tasks. Critical tasks
     /// that stop force the process to shutdown.
-    pub async fn join(&mut self, shutdown: Notifier) -> Result<(), TaskJoinError> {
+    pub async fn join(&mut self, shutdown: ShutdownNotifier) -> Result<(), TaskJoinError> {
         self.join_internal(shutdown, false).await
     }
 
@@ -371,7 +370,10 @@ impl TaskManager {
     /// Note the manager is based on the assumption that all tasks added via spawn_task
     /// are critical and and one stopping is problem.
     /// Also will end if the user hits ctrl-c or sends a SIGTERM to the app.
-    pub async fn join_until_exit(&mut self, shutdown: Notifier) -> Result<(), TaskJoinError> {
+    pub async fn join_until_exit(
+        &mut self,
+        shutdown: ShutdownNotifier,
+    ) -> Result<(), TaskJoinError> {
         self.join_internal(shutdown, true).await
     }
 
@@ -382,7 +384,7 @@ impl TaskManager {
     /// are critical and and one stopping is problem.
     /// Also will end if the user hits ctrl-c or sends a SIGTERM to the app.
     /// This will not join the tasks but resolves as soon as shutdown is indicated.
-    pub async fn until_exit(&mut self, shutdown: Notifier) -> Result<(), TaskJoinError> {
+    pub async fn until_exit(&mut self, shutdown: ShutdownNotifier) -> Result<(), TaskJoinError> {
         self.until_exit_internal(shutdown, true).await
     }
 
@@ -391,7 +393,10 @@ impl TaskManager {
     /// Note the manager is based on the assumption that all tasks added via spawn_task
     /// are critical and and one stopping is problem.
     /// This will not join the tasks but resolves as soon as shutdown is indicated.
-    pub async fn until_task_ends(&mut self, shutdown: Notifier) -> Result<(), TaskJoinError> {
+    pub async fn until_task_ends(
+        &mut self,
+        shutdown: ShutdownNotifier,
+    ) -> Result<(), TaskJoinError> {
         self.until_exit_internal(shutdown, false).await
     }
 
@@ -409,7 +414,7 @@ impl TaskManager {
         }
     }
 
-    /// Abort all tasks including submanagers.
+    /// Abort all of this manager's tasks.
     ///
     /// This is used to close epoch-related tasks.
     pub fn abort_all_tasks(&mut self) {
@@ -430,7 +435,7 @@ impl TaskManager {
     /// Resolves when the task manager should exit.
     async fn until_exit_internal(
         &mut self,
-        shutdown: Notifier,
+        shutdown: ShutdownNotifier,
         do_exit: bool,
     ) -> Result<(), TaskJoinError> {
         let rx_shutdown = shutdown.subscribe();
@@ -538,7 +543,7 @@ impl TaskManager {
     /// Implements the join logic for the manager.
     async fn join_internal(
         &mut self,
-        shutdown: Notifier,
+        shutdown: ShutdownNotifier,
         do_exit: bool,
     ) -> Result<(), TaskJoinError> {
         let result = self.until_exit_internal(shutdown, do_exit).await;
@@ -637,7 +642,7 @@ mod test {
 
     use tokio::sync::mpsc::{self, Receiver, Sender};
 
-    use crate::{Notifier, TaskError, TaskJoinError, TaskManager};
+    use crate::{ShutdownNotifier, TaskError, TaskJoinError, TaskManager};
 
     struct Ping {
         ping_rx: Receiver<u32>,
@@ -807,7 +812,7 @@ mod test {
     async fn test_task_manager_join() {
         let mut task_manager = TaskManager::default();
         task_manager.spawn_critical_task("Crit 1", async move { Ok(()) });
-        match task_manager.join(Notifier::default()).await {
+        match task_manager.join(ShutdownNotifier::default()).await {
             Ok(_) => {}
             Err(TaskJoinError::CriticalExitOk(name)) => assert!(name.eq("Crit 1")),
             Err(TaskJoinError::CriticalJoinError(_name, _err)) => panic!("wrong error"),
@@ -820,7 +825,7 @@ mod test {
         });
         task_manager
             .spawn_critical_task("Crit 2", async move { Err(TaskError::from_message("BOOM!")) });
-        match task_manager.join(Notifier::default()).await {
+        match task_manager.join(ShutdownNotifier::default()).await {
             Ok(_) => {}
             Err(TaskJoinError::CriticalExitOk(_name)) => panic!("should not be OK"),
             Err(TaskJoinError::CriticalJoinError(_name, _err)) => panic!("wrong error"),

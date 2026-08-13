@@ -8,12 +8,14 @@ use reth_metrics::{
 use std::time::Duration;
 use tn_types::WorkerId;
 
-/// Why the worker dropped a sealed batch's transactions instead of handing them to the
+/// Why the worker refused a sealed batch's transactions instead of handing them to the
 /// transaction forwarder.
 ///
-/// Both variants are whole-batch losses on the observer path (`disburse_txns`): the
-/// transactions were accepted by this node's RPC and never reached the forwarder, so the
-/// forwarder-side series (`tn_reth.forwarded_txns_*`) cannot see them (issue #1133).
+/// Both variants refuse the whole batch on the observer path (`disburse_txns`): the
+/// transactions never reached the forwarder, so the forwarder-side series
+/// (`tn_reth.forwarded_txns_*`) cannot see them (issue #1133). A refusal is not a final
+/// loss: `disburse_txns` reports `BlockSealError::NotValidator`, so the batch builder
+/// keeps the transactions pending and retries them on a later build (issue #1132).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ForwardDropReason {
     /// No committee validator advertised a JSON-RPC endpoint to forward to.
