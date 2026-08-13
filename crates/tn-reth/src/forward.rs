@@ -92,15 +92,44 @@ const FORWARD_BATCH_BUDGET: Duration = Duration::from_secs(120);
 /// and a tighter cap would shed batches an unstressed node could have delivered.
 const MAX_CONCURRENT_FORWARDS: usize = 64;
 
-/// JSON-RPC error codes reth returns for a validator-local, transient condition (a full pool,
-/// `-32003`, or an internal/IO error, `-32603`) rather than a verdict on the transaction itself.
-/// The forward falls through to the next advertised validator on these, since another validator
-/// may still accept the transaction.
+/// JSON-RPC error codes reth reserves for conditions that are validator-local or indeterminate,
+/// never cleanly a verdict on the transaction: `-32003` is a full pool (`TxPoolOverflow`) plus
+/// reth's catch-all for invalid-transaction variants with no explicit code of their own (for
+/// example insufficient funds), and `-32603` is an internal/IO error. The forward falls through
+/// to the next advertised validator on these: retrying a deterministic verdict caught in the
+/// `-32003` mix costs at most one bounded pass over the committee, while stopping on a full pool
+/// would drop a transaction another validator may still accept.
 const TRANSIENT_RPC_CODES: [i64; 2] = [-32003, -32603];
 
 /// Substring of reth's `eth_sendRawTransaction` error message when the transaction is already in a
 /// validator's pool (`code -32000`). Treated as a successful delivery, not a failure to retry.
 const ALREADY_KNOWN_MESSAGE: &str = "already known";
+
+/// The JSON-RPC code reth answers with for both chain-wide verdicts and the node-local refusals
+/// in [`NODE_LOCAL_MESSAGES`] (`EthRpcErrorCode::InvalidInput`). The message carve-out is scoped
+/// to this code so a matching substring under any other code keeps its terminal meaning.
+const INVALID_INPUT_RPC_CODE: i64 = -32000;
+
+/// Substrings of reth `eth_sendRawTransaction` error messages (code `-32000`) that describe one
+/// validator's pool contents or one operator's admission config rather than a verdict on the
+/// transaction itself. Reth maps almost every pool refusal to `-32000`, the same code it uses
+/// for chain-wide verdicts, so the code axis cannot make this split; the message can. The
+/// forward tries the next advertised validator on these, since a validator with different pool
+/// contents or config may accept the same bytes.
+const NODE_LOCAL_MESSAGES: [&str; 4] = [
+    // `RpcPoolError::Underpriced`: priced below that operator's `--txpool.minimal-protocol-fee`.
+    "transaction underpriced",
+    // `RpcPoolError::ReplaceUnderpriced`: a same-nonce transaction already sits in that
+    // validator's pool and the fee bump is below its `--txpool.pricebump`. Subsumed by the
+    // entry above under `contains`, pinned separately so a reth rewording of one message
+    // cannot silently drop coverage of the other.
+    "replacement transaction underpriced",
+    // `RpcPoolError::ExceedsFeeCap`: the fee is above that node's `--rpc.txfeecap`.
+    "exceeds the configured cap",
+    // `RpcPoolError::AddressAlreadyReserved`: blob-vs-regular sender exclusivity against that
+    // validator's current pool contents.
+    "address already reserved",
+];
 
 /// Whether the forwarder may dial an advertised endpoint whose host is not a public internet
 /// address.
@@ -511,8 +540,9 @@ impl WorkerRpcForwarder {
                                 result = ForwardOutcome::Rejected(reason);
                                 break;
                             }
-                            // Endpoint-local problem (timeout, transport error, full pool): the
-                            // transaction's fate is unknown here, so try the next validator.
+                            // Endpoint-local problem (timeout, transport error, full pool, or a
+                            // node-local refusal): the transaction's fate is unknown here, so
+                            // try the next validator.
                             Disposition::TryNext(reason) => {
                                 debug!(
                                     target: "worker::forward",
@@ -683,10 +713,11 @@ enum Disposition {
     /// The validator accepted the transaction, or it was already in a validator's pool.
     Delivered,
     /// The validator returned a considered rejection of the transaction itself (bad nonce,
-    /// underpriced, invalid, wrong fork). No other validator will accept it either.
+    /// invalid, wrong fork). No other validator will accept it either.
     Rejected(String),
-    /// This endpoint gave no verdict (timeout, transport error, or a transient full pool); the
-    /// transaction may still be accepted by another validator.
+    /// This endpoint gave no verdict (timeout, transport error, a transient full pool, or a
+    /// refusal tied to this validator's own pool contents or admission config); the transaction
+    /// may still be accepted by another validator.
     TryNext(String),
 }
 
@@ -712,15 +743,22 @@ fn classify_error(err: RpcError<TransportErrorKind>) -> Disposition {
 
 /// Classify a server-side JSON-RPC rejection of a forwarded transaction.
 fn classify_server_error(code: i64, message: String) -> Disposition {
-    if TRANSIENT_RPC_CODES.contains(&code) {
+    let lowered = message.to_ascii_lowercase();
+    match () {
         // A full pool or an internal error is validator-local; another validator may accept it.
-        Disposition::TryNext(message)
-    } else if message.to_ascii_lowercase().contains(ALREADY_KNOWN_MESSAGE) {
+        () if TRANSIENT_RPC_CODES.contains(&code) => Disposition::TryNext(message),
         // Already in a validator's pool: the transaction is delivered.
-        Disposition::Delivered
-    } else {
+        () if lowered.contains(ALREADY_KNOWN_MESSAGE) => Disposition::Delivered,
+        // A refusal tied to this validator's own pool contents or admission config, not a
+        // verdict: the next validator may accept the same bytes. Scoped to `-32000` so the
+        // substrings cannot hijack a verdict that arrives under any other code.
+        () if code == INVALID_INPUT_RPC_CODE
+            && NODE_LOCAL_MESSAGES.iter().any(|needle| lowered.contains(needle)) =>
+        {
+            Disposition::TryNext(message)
+        }
         // Every validator shares consensus state, so a considered rejection repeats everywhere.
-        Disposition::Rejected(format!("code {code}: {message}"))
+        () => Disposition::Rejected(format!("code {code}: {message}")),
     }
 }
 
@@ -1148,6 +1186,40 @@ mod tests {
             Disposition::Rejected(_)
         ));
         Ok(())
+    }
+
+    /// Reth answers `-32000` for refusals that depend on one validator's pool contents or one
+    /// operator's admission config. These are not verdicts on the transaction: the forward tries
+    /// the next advertised validator instead of dropping the transaction as rejected.
+    #[test]
+    fn classify_server_error_tries_next_on_node_local_refusals() {
+        [
+            "transaction underpriced",
+            "replacement transaction underpriced",
+            "tx fee (2000000000000000000 wei) exceeds the configured cap (1000000000000000000 wei)",
+            "address already reserved",
+            // The scan is case-insensitive, matching the `already known` handling.
+            "Transaction Underpriced",
+        ]
+        .into_iter()
+        .for_each(|message| {
+            assert_eq!(
+                classify_server_error(-32000, message.to_string()),
+                Disposition::TryNext(message.to_string())
+            )
+        });
+        // An adjacent chain-wide verdict stays terminal: sharing words with a carve-out entry
+        // is not a match.
+        assert!(matches!(
+            classify_server_error(-32000, "gas required exceeds allowance (21000)".to_string()),
+            Disposition::Rejected(_)
+        ));
+        // The carve-out is scoped to code -32000: the same substring under another code (for
+        // example a revert reason echoed under reth's code 3) stays terminal.
+        assert!(matches!(
+            classify_server_error(3, "execution reverted: transaction underpriced".to_string()),
+            Disposition::Rejected(_)
+        ));
     }
 
     /// With no advertised endpoint, or with only endpoints the policy refuses, the batch is
