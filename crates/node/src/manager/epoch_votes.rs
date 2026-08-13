@@ -20,12 +20,19 @@ type VoteQueue = VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>
 /// Per-iteration wait for the next epoch vote in [`manage_epoch_votes`]'s collection loop.
 pub(crate) const EPOCH_VOTE_RECV_TIMEOUT: Duration = Duration::from_millis(2500);
 
-/// Timeout-count threshold in [`manage_epoch_votes`]: the loop gives up on a local vote quorum
-/// on the first wait that times out with the counter ABOVE this value. The counter increments
-/// once per timed-out wait, so up to `MAX_EPOCH_VOTE_TIMEOUTS + 2` full
-/// [`EPOCH_VOTE_RECV_TIMEOUT`] windows of ordinary vote-propagation lag elapse before the
-/// peer-recovery path is even entered.
+/// Timeout-count threshold in [`manage_epoch_votes`]: a vote round tolerates this many full
+/// [`EPOCH_VOTE_RECV_TIMEOUT`] windows of ordinary vote-propagation lag before it ends the
+/// round and enters the recovery-then-retry path (peer fetch, DB check, backoff, republish).
+/// Rounds repeat until a certificate exists, so this bounds one round, not the whole effort.
 pub(crate) const MAX_EPOCH_VOTE_TIMEOUTS: u32 = 24;
+
+/// Backoff before the first vote-round retry in [`manage_epoch_votes`]; doubles per round.
+pub(crate) const EPOCH_VOTE_ROUND_BACKOFF_START: Duration = Duration::from_secs(5);
+
+/// Cap on the doubling inter-round backoff in [`manage_epoch_votes`]: retries settle at one
+/// round per this interval (plus the round itself), keeping a long-parked fleet's gossip
+/// traffic to one republished vote per member per round.
+pub(crate) const EPOCH_VOTE_ROUND_BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// Number of peer-recovery attempts [`manage_epoch_votes`] makes (each one
 /// `request_epoch_cert` call) after failing to reach a local vote quorum.
@@ -63,7 +70,80 @@ async fn save_and_persist_with_logs(
     }
 }
 
+/// One peer-recovery pass: download a certified record for `epoch_rec.epoch` from peers.
+///
+/// Tries up to [`EPOCH_CERT_RECOVERY_ATTEMPTS`] `request_epoch_cert` calls, anchoring any
+/// downloaded record to the locally-trusted committee before storing it (see the comment at
+/// the validation site). Returns `true` once a validated `(record, certificate)` pair has been
+/// saved — including a verified record that differs from `epoch_rec` (the overwrite case).
+async fn try_fetch_certified_record(
+    epoch_rec: &EpochRecord,
+    primary_network: &PrimaryNetworkHandle,
+    consensus_chain: &ConsensusChain,
+) -> bool {
+    let epoch_hash = epoch_rec.digest();
+    let db = consensus_chain.epochs().clone();
+    for _ in 0..EPOCH_CERT_RECOVERY_ATTEMPTS {
+        match primary_network.request_epoch_cert(Some(epoch_rec.epoch), None).await {
+            Ok((new_epoch_rec, cert)) => {
+                // Anchor the downloaded record to the locally-trusted committee using the
+                // same routine the state-sync ingest path uses (see crates/state-sync
+                // epoch.rs). `verify_with_cert` alone only proves the record is
+                // self-consistent with its own embedded committee, so a peer could return an
+                // attacker-committee record self-signed by that committee; the anchor rejects
+                // it because its committee is not the one derived from prev.next_committee.
+                if db
+                    .validate_downloaded_record(epoch_rec.epoch, &new_epoch_rec, &cert)
+                    .await
+                    .is_valid()
+                {
+                    let new_epoch_hash = new_epoch_rec.digest();
+                    if new_epoch_hash != epoch_hash {
+                        warn!(
+                            target: "epoch-manager",
+                            "Over wrote expected epoch record {epoch_hash} with verified epoch record {new_epoch_hash}",
+                        );
+                    } else {
+                        info!(
+                            target: "epoch-manager",
+                            "retrieved cert for epoch {}/{new_epoch_hash} from a peer", epoch_rec.epoch
+                        );
+                    }
+                    save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
+                    return true;
+                } else {
+                    warn!(
+                        target: "epoch-manager",
+                        "rejected an unanchored epoch record for epoch {} received from a peer during recovery",
+                        epoch_rec.epoch,
+                    );
+                }
+            }
+            Err(err) => error!(
+                target: "epoch-manager",
+                "failed to retrieve epoch from a peer {epoch_hash}: {err}",
+            ),
+        }
+    }
+    false
+}
+
 /// Collect and manage votes for a specific epoch record.
+///
+/// Runs vote rounds until a certificate for the epoch exists: a round publishes this node's
+/// vote (when it is a record-committee member), collects peer votes, and aggregates on quorum.
+/// A round that exhausts [`MAX_EPOCH_VOTE_TIMEOUTS`] wait windows without quorum does NOT
+/// abandon the epoch — it runs one peer-recovery pass, checks the store for a certificate
+/// obtained from any other source, then backs off ([`EPOCH_VOTE_ROUND_BACKOFF_START`] doubling
+/// to [`EPOCH_VOTE_ROUND_BACKOFF_CAP`]), republishes its vote, and starts the next round with
+/// all accumulated signatures intact — votes arriving minutes apart still aggregate. A single
+/// bounded round certified nothing when a staggered fleet restart spread votes across more
+/// than one round's span, and a dead round made late votes unrecoverable (the collector drops
+/// votes for epochs whose queue entry has no live task).
+///
+/// Exits: quorum reached (aggregate and store), certificate found in the store, a validated
+/// record+cert fetched from a peer, quorum on a DIFFERENT record digest (equivocation path:
+/// fall through to peer recovery for the certified alternative), or vote channel closed.
 async fn manage_epoch_votes(
     epoch_rec: EpochRecord,
     key_config: KeyConfig,
@@ -103,6 +183,8 @@ async fn manage_epoch_votes(
     let mut reached_quorum = false;
     let mut timeout = EPOCH_VOTE_RECV_TIMEOUT;
     let mut timeouts = 0;
+    let mut round: u64 = 1;
+    let mut round_backoff = EPOCH_VOTE_ROUND_BACKOFF_START;
     let mut alt_recs: HashMap<EpochDigest, usize> = HashMap::default();
     let committee_size = epoch_rec.committee.len() as u64;
     let quorum = epoch_rec.super_quorum();
@@ -155,11 +237,53 @@ async fn manage_epoch_votes(
                         }
                     }
                     Err(_) => {
-                        // Timeout: have quorum or tried long enough
-                        if reached_quorum || timeouts > MAX_EPOCH_VOTE_TIMEOUTS {
+                        // Timeout with quorum: the post-quorum straggler window ended.
+                        if reached_quorum {
                             break;
                         }
                         timeouts += 1;
+                        if timeouts > MAX_EPOCH_VOTE_TIMEOUTS {
+                            // Round exhausted without quorum. Recover instead of abandoning the
+                            // epoch: a dead vote task makes late votes unrecoverable, and an
+                            // uncertified record blocks the fork-active entry into the next
+                            // epoch on every node.
+                            if try_fetch_certified_record(
+                                &epoch_rec,
+                                &primary_network,
+                                &consensus_chain,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                            // A certificate may have arrived from any other source while this
+                            // round ran (peer gossip quorum on another node's round, the
+                            // state-sync record collector, an alternative certified record).
+                            if let Some((_, Some(_cert))) = consensus_chain
+                                .epochs()
+                                .get_epoch_by_number(epoch_rec.epoch)
+                                .await
+                            {
+                                info!(
+                                    target: "epoch-manager",
+                                    "certificate for epoch {} obtained; ending vote rounds",
+                                    epoch_rec.epoch,
+                                );
+                                return;
+                            }
+                            warn!(
+                                target: "epoch-manager",
+                                "epoch vote round {round} for {}/{epoch_hash} ended without \
+                                 certificate; retrying in {round_backoff:?}",
+                                epoch_rec.epoch,
+                            );
+                            tokio::time::sleep(round_backoff).await;
+                            round_backoff =
+                                (round_backoff.saturating_mul(2)).min(EPOCH_VOTE_ROUND_BACKOFF_CAP);
+                            round += 1;
+                            // Fresh round: same accumulated signatures, reset window budget.
+                            timeouts = 0;
+                        }
                         // Republish our vote in case peers are also struggling
                         if let Some(vote) = my_vote {
                             let _ = primary_network.publish_epoch_vote(vote).await;
@@ -213,59 +337,14 @@ async fn manage_epoch_votes(
             }
         }
     } else {
+        // Reached only on the alternative-record quorum break (peers certified a different
+        // digest — recover their record) or a closed vote channel (shutdown/eviction). The
+        // no-quorum timeout path retries rounds inside the loop and never lands here.
         error!(
             target: "epoch-manager",
             "failed to reach quorum on epoch close for {epoch_hash} {epoch_rec:?}",
         );
-        let db = consensus_chain.epochs().clone();
-        let network = primary_network.clone();
-        // Try to recover by downloading the epoch record and cert from a peer
-        let mut got_epoch_record = false;
-        for _ in 0..EPOCH_CERT_RECOVERY_ATTEMPTS {
-            match network.request_epoch_cert(Some(epoch_rec.epoch), None).await {
-                Ok((new_epoch_rec, cert)) => {
-                    // Anchor the downloaded record to the locally-trusted committee using the
-                    // same routine the state-sync ingest path uses (see crates/state-sync
-                    // epoch.rs). `verify_with_cert` alone only proves the record is
-                    // self-consistent with its own embedded committee, so a peer could return an
-                    // attacker-committee record self-signed by that committee; the anchor rejects
-                    // it because its committee is not the one derived from prev.next_committee.
-                    if db
-                        .validate_downloaded_record(epoch_rec.epoch, &new_epoch_rec, &cert)
-                        .await
-                        .is_valid()
-                    {
-                        let new_epoch_hash = new_epoch_rec.digest();
-                        if new_epoch_hash != epoch_hash {
-                            warn!(
-                                target: "epoch-manager",
-                                "Over wrote expected epoch record {epoch_hash} with verified epoch record {new_epoch_hash}",
-                            );
-                            save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
-                        } else {
-                            info!(
-                                target: "epoch-manager",
-                                "retrieved cert for epoch {}/{new_epoch_hash} from a peer", epoch_rec.epoch
-                            );
-                            save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
-                        }
-                        got_epoch_record = true;
-                        break;
-                    } else {
-                        warn!(
-                            target: "epoch-manager",
-                            "rejected an unanchored epoch record for epoch {} received from a peer during recovery",
-                            epoch_rec.epoch,
-                        );
-                    }
-                }
-                Err(err) => error!(
-                    target: "epoch-manager",
-                    "failed to retrieve epoch from a peer {epoch_hash}: {err}",
-                ),
-            }
-        }
-        if !got_epoch_record {
+        if !try_fetch_certified_record(&epoch_rec, &primary_network, &consensus_chain).await {
             error!(
                 target: "epoch-manager",
                 "Failed to retrieve an epoch record for epoch {}",
@@ -391,6 +470,10 @@ pub(crate) fn spawn_epoch_vote_collector(
 mod epoch_vote_collector_tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng as _};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tempfile::TempDir;
     use tn_network_libp2p::types::{MessageId, NetworkCommand};
     use tn_primary::{
@@ -883,6 +966,199 @@ mod epoch_vote_collector_tests {
         assert!(cert.signed_authorities.contains(2));
 
         // Shutdown
+        node_shutdown.notify();
+    }
+
+    /// Votes that arrive only after the first full vote round has exhausted its windows must
+    /// still certify: the round retries with backoff instead of abandoning the epoch, and
+    /// signatures accumulated in earlier rounds survive into later ones. Paused time drives
+    /// the ~62s round plus backoff instantly. (The single-round give-up was the incident
+    /// shape: a staggered fleet restart spread votes across more than one round's span and
+    /// the dead round dropped them forever.)
+    #[tokio::test(start_paused = true)]
+    async fn test_late_votes_after_round_exhaustion_still_certify() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+
+        // Node is kp1; committee of 4 → super_quorum = 3
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir =
+            TempDir::with_prefix("test_late_votes_after_round_exhaustion_still_certify").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+
+        // Mock network: reply Ok to Publish; every other command's reply channel drops,
+        // so the round-end peer-recovery fetch fails fast (no serving peers — the parked
+        // fleet shape).
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = Notifier::new();
+
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.subscribe(),
+        );
+
+        // Arm the round with NO peer votes: it must exhaust round 1 (25 wait windows) and
+        // enter the retry path rather than giving up.
+        consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+
+        // Advance well past one full round (25 × 2.5s = 62.5s) plus the first 5s backoff.
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        assert!(
+            consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_none(),
+            "no cert may exist before peer votes arrive"
+        );
+
+        // Late votes land in a later round; with the accumulated self-signature they complete
+        // the 3-of-4 quorum.
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc2)).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
+
+        // Poll for the cert; paused time advances through the straggler window instantly.
+        let mut cert = None;
+        for _ in 0..600 {
+            if let Some(found) = consensus_chain.epochs().cert_by_digest(epoch_hash).await {
+                cert = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let cert = cert.expect("late votes must certify in a retry round");
+        assert_eq!(cert.epoch_hash, epoch_hash);
+        assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
+        assert_eq!(cert.signed_authorities.len(), 3, "self + two late votes");
+
+        node_shutdown.notify();
+    }
+
+    /// A certificate that appears in the store from another source (peer fetch by the
+    /// state-sync collector, an earlier round on another task) ends the vote rounds: the
+    /// round-exhaustion path checks the store and exits instead of retrying forever. Verified
+    /// by the publish count going quiet after round 1 while virtual time keeps advancing.
+    #[tokio::test(start_paused = true)]
+    async fn test_prestored_cert_ends_vote_rounds() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+
+        // Node is kp1; committee of 4 → super_quorum = 3
+        let key_config = KeyConfig::new_with_testing_key(kp1.copy());
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, *kp2.public(), *kp3.public(), *kp4.public()],
+            next_committee: vec![pk1, *kp2.public(), *kp3.public(), *kp4.public()],
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        // Build the genuine 3-of-4 certificate out-of-band and store it BEFORE arming the
+        // round — the "certificate arrived from any other source" shape.
+        let votes = [&kp1, &kp2, &kp3]
+            .map(|kp| epoch_rec.sign_vote(&KeyConfig::new_with_testing_key(kp.copy())));
+        let sigs: Vec<BlsSignature> = votes.iter().map(|v| v.signature).collect();
+        let aggregated = BlsAggregateSignature::aggregate(&sigs, true).expect("aggregate");
+        let mut signed_authorities = roaring::RoaringBitmap::new();
+        signed_authorities.insert_range(0..3);
+        let cert = EpochCertificate {
+            epoch_hash,
+            signature: aggregated.to_signature(),
+            signed_authorities,
+        };
+        assert!(epoch_rec.verify_with_cert(&cert), "test cert must verify");
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir = TempDir::with_prefix("test_prestored_cert_ends_vote_rounds").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+        consensus_chain.epochs().save(epoch_rec.clone(), cert).await.expect("save record + cert");
+
+        // Mock network counting Publish commands.
+        let publish_count = Arc::new(AtomicUsize::new(0));
+        let publish_count_clone = publish_count.clone();
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    publish_count_clone.fetch_add(1, Ordering::SeqCst);
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = Notifier::new();
+
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.subscribe(),
+        );
+
+        // Arm the round with no peer votes: round 1 exhausts, finds the stored cert, exits.
+        consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+
+        // Let round 1 fully elapse (62.5s + backoff margin) …
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        let after_round_one = publish_count.load(Ordering::SeqCst);
+        assert!(after_round_one >= 1, "own vote must have been published");
+
+        // … then confirm no further rounds publish anything over ten more virtual minutes.
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(
+            publish_count.load(Ordering::SeqCst),
+            after_round_one,
+            "vote rounds must end once a certificate exists in the store"
+        );
+
         node_shutdown.notify();
     }
 }

@@ -79,9 +79,13 @@ const CERTIFIED_ANCHOR_WAIT_MARGIN: Duration =
 /// this wait, so any budget below the producer's own ceiling
 /// ([`LOCAL_QUORUM_WORST`] of tolerated vote lag plus [`PEER_RECOVERY_WORST`] of peer
 /// recovery) can abort an honest node while the vote protocol is still within its designed
-/// bounds - and on non-adiri builds this is reachable from genesis. Fail-loud semantics are
-/// preserved: the wait stays finite, and on expiry the error still propagates out of
-/// `open_epoch_pack` / `run_epoch` / `run_epochs` and aborts the node instead of retrying.
+/// bounds - and on non-adiri builds this is reachable from genesis. One expiry is no longer
+/// fatal: while the miss stays retryable (record or certificate simply absent),
+/// [`EpochManager::certified_prior_epoch_anchor`] re-arms the vote round and waits another
+/// budget with a loud per-attempt warn, because without a container restart policy an exit
+/// converts a recoverable certification stall into a fleet-wide manual-restart outage.
+/// Non-retryable errors (storage failure, invalid stored certificate) still abort the node
+/// on the first attempt.
 const CERTIFIED_ANCHOR_WAIT: Duration = LOCAL_QUORUM_WORST
     .saturating_add(PEER_RECOVERY_WORST)
     .saturating_add(CERTIFIED_ANCHOR_WAIT_MARGIN);
@@ -736,16 +740,26 @@ where
     ///
     /// The certificate is aggregated asynchronously from epoch-vote gossip, so it may not be
     /// stored yet when the next epoch opens. The fast path accepts an already-verified
-    /// certificate with no extra waiting; otherwise this pre-dials committee peers (so the
-    /// node-lifetime epoch record collector, already nudged via `requested_missing_epoch` by
-    /// the caller, can actually fetch) and polls for up to [`CERTIFIED_ANCHOR_WAIT`] — the
-    /// vote protocol's own worst case (local-quorum lag plus full peer recovery) plus a
-    /// safety margin, all derived from the producer's named consts, because the vote
-    /// collector and this wait start from nearly the same instant and a shorter budget would
-    /// abort an honest node the vote protocol still considers on
-    /// schedule. A missing certificate after the wait, or a stored
-    /// certificate that fails verification, is a hard error — never a silent fallback to the
-    /// uncertified digest.
+    /// certificate with no extra waiting. Otherwise, before parking, the slow path arranges
+    /// everything a parked node needs for the certificate to actually be assemblable — none of
+    /// which the per-epoch phase-4 setup can provide, because that setup only runs after this
+    /// wait resolves:
+    ///
+    /// 1. pre-dials committee peers (so the node-lifetime collector tasks can fetch);
+    /// 2. subscribes to the epoch-vote gossip topic with a committee-restricted publisher set
+    ///    ([`Self::subscribe_epoch_vote_topic_pre_anchor`]) — the swarm rejects gossip on
+    ///    unsubscribed topics, so without this a parked node cannot receive votes at all;
+    /// 3. re-arms the vote round for the stored-but-uncertified record
+    ///    ([`Self::rearm_epoch_vote_round`]) — votes re-sign deterministically, so a restarted
+    ///    fleet re-assembles the exact certificate it failed to assemble before going down.
+    ///
+    /// Each wait attempt polls for [`CERTIFIED_ANCHOR_WAIT`] — the vote protocol's own worst
+    /// case (local-quorum lag plus full peer recovery) plus a safety margin, all derived from
+    /// the producer's named consts. A retryable miss (record or certificate simply not stored
+    /// yet) re-arms and waits again indefinitely, with a loud per-attempt warn — the primary
+    /// alerting line while a fleet is parked. A stored certificate that fails verification, or
+    /// a storage-layer failure, is a hard error on the first attempt — never a silent fallback
+    /// to the uncertified digest, and never retried (re-reading cannot repair either).
     ///
     /// Returns the certified [`EpochRecord`] itself rather than just its digest, because the
     /// caller seeds the chain from it too. An earlier revision returned the digest and the
@@ -775,10 +789,35 @@ where
                 current_epoch,
                 "previous epoch record not yet certified, waiting for its certificate"
             );
-            self.consensus_chain
-                .epochs()
-                .certified_record_by_epoch_with_timeout(previous_epoch, CERTIFIED_ANCHOR_WAIT)
-                .await
+            self.subscribe_epoch_vote_topic_pre_anchor(previous_epoch, committee).await?;
+            let mut attempt: u32 = 0;
+            loop {
+                attempt += 1;
+                self.rearm_epoch_vote_round(previous_epoch).await;
+                match self
+                    .consensus_chain
+                    .epochs()
+                    .certified_record_by_epoch_with_timeout(previous_epoch, CERTIFIED_ANCHOR_WAIT)
+                    .await
+                {
+                    Err(e) if e.is_retryable() => {
+                        // THE alerting line while a node is parked: repeated occurrences mean
+                        // the committee has not assembled a certificate quorum for a full
+                        // budget, and the node will keep waiting rather than exit.
+                        warn!(
+                            target: "epoch-manager",
+                            previous_epoch,
+                            current_epoch,
+                            "certified anchor wait attempt {attempt} for epoch {previous_epoch} \
+                             expired after {CERTIFIED_ANCHOR_WAIT:?}; node parked until \
+                             certificate quorum"
+                        );
+                        // Cheap between attempts: dials only when the node has zero peers.
+                        self.predial_committee_peers(committee, task_spawner).await?;
+                    }
+                    outcome => break outcome,
+                }
+            }
         } else {
             fast
         }
@@ -789,6 +828,72 @@ where
             )
         })?;
         Ok(certified)
+    }
+
+    /// Subscribe to the epoch-vote gossip topic before parking on the certified anchor.
+    ///
+    /// A parked node has not run the per-epoch phase-4 network setup, so it is not subscribed
+    /// to the vote topic and the swarm rejects incoming gossip on unsubscribed topics — on a
+    /// restarted fleet the certificate the park waits for could never assemble. The authorized
+    /// publisher set is the stored record's committee (the voters for `previous_epoch`) unioned
+    /// with the current committee, never an open subscribe; phase 4 later overwrites it with
+    /// the canonical previous/current/next-committee window (the swarm's documented
+    /// overwrite-on-resubscribe semantics), preserving the committee-restricted posture of
+    /// issues #898/#912. When the record itself is still missing, the current committee alone
+    /// authorizes — the collector fetch that supplies the record refreshes nothing here, but
+    /// every re-arm attempt passes through this state only until the record arrives.
+    async fn subscribe_epoch_vote_topic_pre_anchor(
+        &self,
+        previous_epoch: Epoch,
+        committee: &Committee,
+    ) -> eyre::Result<()> {
+        let network_handle = self
+            .primary_network_handle
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("primary network handle missing during anchor wait"))?;
+        let mut publishers: HashSet<BlsPublicKey> = committee.bls_keys().into_iter().collect();
+        if let Some(record) = self.consensus_chain.epochs().record_by_epoch(previous_epoch).await {
+            publishers.extend(record.committee.iter().copied());
+        }
+        let publisher_count = publishers.len();
+        let chain_id = self.builder.tn_config.genesis().config.chain_id;
+        network_handle
+            .inner_handle()
+            .subscribe_with_publishers(
+                tn_config::LibP2pConfig::epoch_vote_topic(chain_id),
+                publishers,
+            )
+            .await?;
+        info!(
+            target: "epoch-manager",
+            previous_epoch,
+            "pre-anchor subscribe to epoch vote topic with {publisher_count} authorized publishers"
+        );
+        Ok(())
+    }
+
+    /// Re-arm the epoch-vote round for a stored-but-uncertified previous record.
+    ///
+    /// The vote collector is armed only by `epoch_record_watch`, which is written at the three
+    /// epoch-close paths — a restarted node never fires it again, so without this hook no vote
+    /// is ever re-signed and a fleet holding records without certificates cannot self-heal.
+    /// Re-publishing the stored record is idempotent: votes re-sign deterministically (BLS over
+    /// the record's digest), the collector ignores the publish while a vote round for the epoch
+    /// is already live, and certificate writes are append-once. Gated on `previous_epoch > 0`
+    /// because the epoch-0 slot can hold the uncertifiable dummy record; epoch-0 certificates
+    /// come from peers via the collector fetch instead.
+    async fn rearm_epoch_vote_round(&self, previous_epoch: Epoch) {
+        if previous_epoch == 0 {
+            return;
+        }
+        if let Some(record) = self.consensus_chain.epochs().record_by_epoch(previous_epoch).await {
+            let epoch_hash = record.digest();
+            info!(
+                target: "epoch-manager",
+                "re-arming epoch vote round for uncertified epoch {previous_epoch} ({epoch_hash})"
+            );
+            self.consensus_bus.epoch_record_watch().send_replace(Some(record));
+        }
     }
 
     /// Forward one consensus output to the engine and record progress.
