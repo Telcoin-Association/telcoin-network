@@ -4,6 +4,7 @@ use super::*;
 use crate::consensus::LeaderSwapTable;
 use indexmap::IndexMap;
 use std::collections::BTreeSet;
+use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{error::HeaderError, now, HeaderBuilder, B256, MAX_HEADER_NUM_OF_BATCHES};
@@ -224,9 +225,22 @@ async fn test_equivocation_protection_after_restart() {
     let cb = ConsensusBus::new();
     let mut rx_headers = cb.subscribe_headers();
     let task_manager = TaskManager::default();
+    // Build a fresh config for the restart, as production does per epoch: the
+    // old config's one-shot shutdown is latched, so a proposer subscribing to
+    // it would exit immediately. Node storage is shared so the equivocation
+    // guard still sees the first proposal.
+    let config = primary.consensus_config();
+    let restarted_config = ConsensusConfig::new_with_committee_for_test(
+        config.config().clone(),
+        config.node_storage().clone(),
+        config.key_config().clone(),
+        committee.clone(),
+        NetworkConfig::default(),
+    )
+    .unwrap();
     let proposer = Proposer::new(
-        primary.consensus_config(),
-        primary.consensus_config().authority_id().expect("authority"),
+        restarted_config.clone(),
+        restarted_config.authority_id().expect("authority"),
         cb.clone(),
         LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
         task_manager.get_spawner(),
