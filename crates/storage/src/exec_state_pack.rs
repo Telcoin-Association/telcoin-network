@@ -68,9 +68,17 @@ const DATA_NAME: &str = "state_data";
 /// working-set ceiling such an exporter must hold in memory is stated in one place.
 pub const STORAGE_CHUNK_SLOTS: usize = 64 * 1024;
 
+/// Depth of the EVM `BLOCKHASH` lookback window: the opcode resolves the 256 most recent block
+/// hashes. The export side embeds this many real ancestor headers below the snapshot header
+/// (`gather_headers` in `tn-node`), and the restore side refuses a pack (and a scaffold window,
+/// `SnapshotRestorer::import_chain_scaffold` in `tn-reth`) that does not cover this lookback
+/// below its tip. One shared constant keeps the export bound and the restore floor from drifting
+/// apart (issue #1174).
+pub const BLOCKHASH_ANCESTORS: u64 = 256;
+
 /// Upper bound on the header count a pack may declare, enforced before any allocation sized by the
 /// untrusted `header_count`. A genuine pack carries the snapshot header plus at most
-/// `BLOCKHASH_ANCESTORS` (256) ancestors — 257 in all — so this generous cap never rejects a
+/// [`BLOCKHASH_ANCESTORS`] (256) ancestors (257 in all), so this generous cap never rejects a
 /// legitimate pack, while bounding the eager `Vec::with_capacity` in [`ExecStatePackReader::open`]
 /// against a crafted/corrupt count (which would otherwise request a multi-TB allocation before any
 /// per-record CRC/size guard runs).
@@ -88,7 +96,9 @@ pub struct ExecStateMeta {
     pub block_number: u64,
     /// Block hash of the snapshot (the first / canonical header).
     pub block_hash: B256,
-    /// Number of header records that immediately follow (>= 1).
+    /// Number of header records that immediately follow (>= 1). [`ExecStatePackReader::open`]
+    /// also holds it to the `BLOCKHASH` lookback floor: at least
+    /// `min(block_number, BLOCKHASH_ANCESTORS)` headers.
     pub header_count: u32,
 }
 
@@ -384,8 +394,9 @@ pub struct ExecStatePackReader {
 impl ExecStatePackReader {
     /// Open the pack in directory `path` read-only and read its meta + headers.
     ///
-    /// Errors if the first record is not the meta, the schema version is unexpected, or
-    /// the declared headers are missing/short.
+    /// Errors if the first record is not the meta, the schema version is unexpected, the
+    /// declared headers are missing/short, or the declared header count does not cover the
+    /// `BLOCKHASH` lookback floor for the pack's tip block (see [`BLOCKHASH_ANCESTORS`]).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ExecStatePackError> {
         let base = path.as_ref();
         let data: Pack<ExecStateRecord> = Pack::open(
@@ -416,6 +427,19 @@ impl ExecStatePackReader {
                 max: MAX_HEADER_COUNT,
             });
         }
+        // Defense-in-depth floor (issue #1174): a genuine pack covers the full `BLOCKHASH`
+        // lookback below its tip (or reaches block 1), so a shorter pack is truncated or
+        // corrupt. Refusing it here keeps the restore path from ever scaffolding zero-hash
+        // ancestors inside the lookback; `import_chain_scaffold` re-checks the same floor on
+        // the assembled window.
+        let floor = meta.block_number.min(BLOCKHASH_ANCESTORS);
+        (u64::from(meta.header_count) >= floor).then_some(()).ok_or(
+            ExecStatePackError::InsufficientHeaders {
+                declared: meta.header_count,
+                floor,
+                block: meta.block_number,
+            },
+        )?;
 
         let mut headers = Vec::with_capacity(meta.header_count as usize);
         for _ in 0..meta.header_count {
@@ -554,7 +578,8 @@ impl ExecStatePackReader {
     /// Run a full structural / self-consistency pass over the pack at `path`.
     ///
     /// This opens its own reader (it does not disturb any reader you are streaming
-    /// from) and checks: meta first + version, `header_count >= 1`, snapshot header's
+    /// from) and checks: meta first + version, `header_count >= 1` plus the `BLOCKHASH`
+    /// lookback floor (see [`BLOCKHASH_ANCESTORS`]), snapshot header's
     /// `state_root`/number/hash agree with the meta, a trailing footer is present, and
     /// its declared `account_count` matches the records actually read. Per-record CRC32
     /// is enforced by the container during the walk.
@@ -648,6 +673,18 @@ pub enum ExecStatePackError {
         /// Maximum accepted count ([`MAX_HEADER_COUNT`]).
         max: u32,
     },
+    /// The pack declares fewer headers than the `BLOCKHASH` lookback floor for its tip block. A
+    /// genuine pack covers the full lookback (or reaches block 1); a shorter pack is truncated
+    /// or corrupt, and restoring from it would scaffold zero-hash ancestors inside the lookback
+    /// of the first post-restore block.
+    InsufficientHeaders {
+        /// Header count declared by the pack meta.
+        declared: u32,
+        /// Minimum accepted count: `min(block, BLOCKHASH_ANCESTORS)`.
+        floor: u64,
+        /// The pack's tip block number ([`ExecStateMeta::block_number`]).
+        block: u64,
+    },
     /// The snapshot header's `state_root` does not match the meta's `state_root`.
     StateRootMismatch,
     /// The snapshot header's number/hash do not match the meta.
@@ -680,6 +717,13 @@ impl fmt::Display for ExecStatePackError {
             Self::MissingHeaders => write!(f, "pack is missing one or more declared headers"),
             Self::TooManyHeaders { declared, max } => {
                 write!(f, "pack declares {declared} headers, exceeding the maximum of {max}")
+            }
+            Self::InsufficientHeaders { declared, floor, block } => {
+                write!(
+                    f,
+                    "pack declares {declared} headers for tip block {block}, below the \
+                     BLOCKHASH lookback floor of {floor}"
+                )
             }
             Self::StateRootMismatch => {
                 write!(f, "snapshot header state_root does not match meta state_root")
@@ -758,10 +802,12 @@ mod test {
     fn round_trip_and_verify() {
         let dir = TempDir::with_prefix("exec_state_pack").expect("temp dir");
         let root = B256::from([7u8; 32]);
+        // tip block 3 with all 3 headers down to block 1, so the pack covers the whole chain
+        // below its tip and satisfies `open`'s BLOCKHASH lookback floor
         let headers = vec![
-            header(100, root),
-            header(99, B256::from([9u8; 32])),
-            header(98, B256::from([8u8; 32])),
+            header(3, root),
+            header(2, B256::from([9u8; 32])),
+            header(1, B256::from([8u8; 32])),
         ];
 
         // Write: meta + 3 headers + 100 varied accounts + footer.
@@ -789,7 +835,7 @@ mod test {
         // Read back: meta + headers round-trip, accounts stream byte-equal.
         let mut reader = ExecStatePackReader::open(dir.path()).expect("open reader");
         assert_eq!(reader.meta().state_root, root);
-        assert_eq!(reader.meta().block_number, 100);
+        assert_eq!(reader.meta().block_number, 3);
         assert_eq!(reader.meta().header_count, 3);
         assert_eq!(reader.headers().len(), 3);
         assert_eq!(reader.snapshot_header().state_root, root);
@@ -884,7 +930,7 @@ mod test {
         let root1 = B256::from([1u8; 32]);
         let acct_a = account(0xAA, 1, false);
         let mut w1 =
-            ExecStatePackWriter::create(dir.path(), root1, &[header(10, root1)]).expect("create 1");
+            ExecStatePackWriter::create(dir.path(), root1, &[header(1, root1)]).expect("create 1");
         w1.append_account(&acct_a).expect("append A");
         w1.finish().expect("finish 1");
 
@@ -892,7 +938,7 @@ mod test {
         let root2 = B256::from([2u8; 32]);
         let acct_b = account(0xBB, 1, false);
         let mut w2 =
-            ExecStatePackWriter::create(dir.path(), root2, &[header(20, root2)]).expect("create 2");
+            ExecStatePackWriter::create(dir.path(), root2, &[header(1, root2)]).expect("create 2");
         w2.append_account(&acct_b).expect("append B");
         w2.finish().expect("finish 2");
 
@@ -914,12 +960,12 @@ mod test {
         // Meta claims root A, but the snapshot header carries root B.
         let meta = ExecStateMeta {
             state_root: B256::from([1u8; 32]),
-            block_number: 5,
+            block_number: 1,
             block_hash: B256::ZERO,
             header_count: 1,
         };
         pack.append(&ExecStateRecord::Meta(meta)).unwrap();
-        pack.append(&ExecStateRecord::Header(encode_header(&header(5, B256::from([2u8; 32])))))
+        pack.append(&ExecStateRecord::Header(encode_header(&header(1, B256::from([2u8; 32])))))
             .unwrap();
         pack.append(&ExecStateRecord::End(ExecStateStats::default())).unwrap();
         pack.commit().unwrap();
@@ -933,11 +979,11 @@ mod test {
     fn verify_detects_missing_footer() {
         let dir = TempDir::with_prefix("exec_state_pack_mf").expect("temp dir");
         let root = B256::from([3u8; 32]);
-        let snapshot = header(7, root);
+        let snapshot = header(1, root);
         let mut pack = open_raw(dir.path());
         let meta = ExecStateMeta {
             state_root: root,
-            block_number: 7,
+            block_number: 1,
             block_hash: snapshot.hash_slow(),
             header_count: 1,
         };
@@ -1012,6 +1058,59 @@ mod test {
         assert!(
             matches!(err, ExecStatePackError::TooManyHeaders { declared, .. } if declared == u32::MAX)
         );
+    }
+
+    #[test]
+    fn open_rejects_header_count_below_blockhash_floor() {
+        // Boundary pair around the `BLOCKHASH` lookback floor (issue #1174) for a tip deep
+        // enough that the full 256-header floor applies: a pack one header short of the floor
+        // must be refused, and a pack exactly at the floor must open, proving the refusal is
+        // specific rather than a blanket reject.
+        let block = 300u64;
+        let root = B256::from([4u8; 32]);
+        let snapshot = header(block, root);
+
+        let build = |header_count: u32| {
+            let dir = TempDir::with_prefix("exec_state_pack_floor").expect("temp dir");
+            let mut pack = open_raw(dir.path());
+            let meta = ExecStateMeta {
+                state_root: root,
+                block_number: block,
+                block_hash: snapshot.hash_slow(),
+                header_count,
+            };
+            pack.append(&ExecStateRecord::Meta(meta)).expect("append meta");
+            // snapshot header first, then ancestors newest-first (the exporter's shape)
+            ((block + 1 - u64::from(header_count))..=block)
+                .rev()
+                .try_for_each(|number| {
+                    pack.append(&ExecStateRecord::Header(encode_header(&header(number, root))))
+                        .map(|_| ())
+                })
+                .expect("append headers");
+            pack.append(&ExecStateRecord::End(ExecStateStats::default())).expect("append end");
+            pack.commit().expect("commit");
+            drop(pack);
+            dir
+        };
+
+        // 255 headers for tip 300 is one short of the floor (min(300, 256) = 256)
+        let short = build(255);
+        let err = ExecStatePackReader::open(short.path())
+            .expect_err("a pack short of the BLOCKHASH lookback floor must be refused");
+        assert!(
+            matches!(
+                err,
+                ExecStatePackError::InsufficientHeaders { declared: 255, floor: 256, block: 300 }
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        // exactly the floor opens, and the declared headers round-trip
+        let at_floor = build(256);
+        let reader = ExecStatePackReader::open(at_floor.path()).expect("at-floor pack must open");
+        assert_eq!(reader.meta().header_count, 256);
+        assert_eq!(reader.headers().len(), 256);
     }
 
     #[test]
