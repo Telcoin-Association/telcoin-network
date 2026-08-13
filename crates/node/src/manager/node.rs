@@ -101,15 +101,16 @@ pub(crate) struct EpochManager<P, DB> {
     /// If the timestamp of the leader is >= the epoch_boundary then the
     /// manager closes the epoch after the engine executes all data.
     epoch_boundary: TimestampSec,
-    /// Whether the long-running p2p networks have completed their one-time, per-process setup
-    /// (start listening, register bootstrap peers).
+    /// Whether the first `create_consensus` has completed for this process.
     ///
-    /// This setup normally runs on the `Initial` epoch, but the `Initial` iteration can return
-    /// early from [`EpochManager::replay_missed_consensus`] - when a restart must replay-and-close
-    /// an epoch boundary - *before* `create_consensus` runs the setup. In that case the setup runs
-    /// on the first following `NewEpoch` iteration instead. Gating on this flag, rather than on
-    /// [`RunEpochMode::Initial`], guarantees the networks are set up exactly once even on that
-    /// restart path (mirrors the `are_workers_initialized` guard used for worker components).
+    /// Listener binds and bootstrap-peer registration run unconditionally at process start in
+    /// `spawn_node_networks`, so the only remaining consumer of this flag is the worker
+    /// engine-components gate in `spawn_worker_node_components`. That first run normally happens
+    /// on the `Initial` epoch, but the `Initial` iteration can return early from
+    /// [`EpochManager::replay_missed_consensus`] - when a restart must replay-and-close an epoch
+    /// boundary - *before* `create_consensus` runs. Gating on this flag, rather than on
+    /// [`RunEpochMode::Initial`], keeps the first-run signal accurate on that restart path
+    /// (mirrors the `are_workers_initialized` guard used for worker components).
     ///
     /// Committee slots are NOT gated on this flag. They are set every epoch from authoritative
     /// state via `update_committees`.
@@ -997,6 +998,25 @@ where
             )
         });
 
+        // Register bootstrap peers and bind the listener now, at process start, rather than in
+        // the first epoch's phase-4 network setup: a restarted node can park for the previous
+        // epoch's certificate (`certified_prior_epoch_anchor`) before any epoch-scoped setup
+        // runs, and a parked node must still accept inbound connections so the committee can
+        // exchange votes and records. Bootstrap peers are registered before the listener binds
+        // so `known_peers` is populated before any inbound traffic resolves against it.
+        primary_network_handle
+            .add_bootstrap_peers(
+                self.bootstrap_servers.iter().map(|(k, v)| (*k, v.primary.clone())).collect(),
+            )
+            .await?;
+        let primary_address = Self::parse_listener_address_for_swarm(
+            "PRIMARY_LISTENER_MULTIADDR",
+            self.builder.tn_config.node_info.p2p_info.primary.network_key.clone(),
+            self.builder.tn_config.node_info.primary_network_address().clone(),
+        )?;
+        primary_network_handle.start_listening(primary_address.clone()).await?;
+        info!(target: "epoch-manager", "primary listener bound at process start {primary_address}");
+
         // primary network handle
         self.primary_network_handle =
             Some(PrimaryNetworkHandle::new(primary_network_handle, network_config.chain_id()));
@@ -1037,6 +1057,22 @@ where
                 }
             )
         });
+
+        // Same one-time bootstrap + listener bring-up as the primary above. The worker listener
+        // deliberately keeps the primary network key in its `/p2p/` component, matching the
+        // per-epoch bind this replaces.
+        worker_network_handle
+            .add_bootstrap_peers(
+                self.bootstrap_servers.iter().map(|(k, v)| (*k, v.worker.clone())).collect(),
+            )
+            .await?;
+        let worker_address = Self::parse_listener_address_for_swarm(
+            "WORKER_LISTENER_MULTIADDR",
+            self.builder.tn_config.node_info.p2p_info.primary.network_key.clone(),
+            self.builder.tn_config.node_info.worker_network_address().clone(),
+        )?;
+        worker_network_handle.start_listening(worker_address.clone()).await?;
+        info!(target: "epoch-manager", "worker listener bound at process start {worker_address}");
 
         // set temporary task spawner - this is updated with each epoch
         self.worker_network_handle = Some(WorkerNetworkHandle::new(

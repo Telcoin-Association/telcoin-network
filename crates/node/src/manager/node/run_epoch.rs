@@ -153,9 +153,10 @@ where
     /// 4. Subscribe to consensus output, configure consensus, and create the primary/worker
     ///    components. The previous and next committees' keys are resolved first in ONE batched read
     ///    pinned to the epoch-start header and threaded into both steps as parameters. The one-time
-    ///    per-process network setup is gated on `network_first_init`, which is driven by
-    ///    `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the replay-and-close
-    ///    return above can defer setup to a following iteration without skipping it.
+    ///    engine worker-component initialization is gated on `network_first_init`, which is driven
+    ///    by `self.network_initialized` (not by [`RunEpochMode::Initial`]) so the replay-and-close
+    ///    return above can defer it to a following iteration without skipping it. (Listeners and
+    ///    bootstrap peers are bound earlier, at process start, in `spawn_node_networks`.)
     /// 5. Start the primary (if this node is an active CVV), the subscriber, the worker batch
     ///    builder, and the engine batch builder; reattach any orphaned batches.
     /// 6. `tokio::select!` over three exits: node shutdown, the epoch boundary
@@ -369,14 +370,14 @@ where
             .configure_consensus(network_config, committee, next_committee_keys, prior_epoch_record)
             .await?;
 
-        // The networks need their one-time, per-process setup (start listening, register bootstrap
-        // peers) on the first iteration that actually reaches `create_consensus`. This is usually
-        // the `Initial` epoch, but the replay above can return early before
-        // `create_consensus` on a restart that replays-and-closes an epoch boundary, so the first
-        // real setup then happens on a following `NewEpoch` iteration. Drive the decision off
-        // whether the network has actually been set up yet (not off `RunEpochMode::Initial`) so the
-        // setup is never skipped on that restart path. (Committee slots are set every epoch
-        // regardless via `update_committees`.)
+        // The engine's worker components need their one-time initialization on the first
+        // iteration that actually reaches `create_consensus`. This is usually the `Initial`
+        // epoch, but the replay above can return early before `create_consensus` on a restart
+        // that replays-and-closes an epoch boundary, so the first real run then happens on a
+        // following `NewEpoch` iteration. Drive the decision off whether that first run has
+        // actually completed (not off `RunEpochMode::Initial`) so it is never skipped on that
+        // restart path. (Listeners and bootstrap peers are bound at process start in
+        // `spawn_node_networks`; committee slots are set every epoch via `update_committees`.)
         let network_first_init = epoch_mode.initial_epoch() || !self.network_initialized;
 
         // create primary and worker nodes
