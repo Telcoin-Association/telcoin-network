@@ -10,7 +10,8 @@ use tn_reth::{
     SenderIdentifiers, TxPool,
 };
 use tn_types::{
-    Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash, MIN_PROTOCOL_BASE_FEE,
+    Address, Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 
 /// Attempt to update batch with accurate header information.
@@ -29,9 +30,12 @@ pub fn execute_test_batch(test_batch: &mut Batch) {
 
 /// A test pool that ensures every transaction is in the pending pool
 #[derive(Default, Clone, Debug)]
-struct TestPool {
+pub(crate) struct TestPool {
     transactions: Vec<Arc<PoolTxn>>,
     by_id: BTreeMap<PoolTxnId, Arc<PoolTxn>>,
+    /// Per-sender balances returned by [`TxPool::get_account_balance`]. A sender that is absent
+    /// here reports [`U256::MAX`], preserving the behavior of tests that do not exercise balance.
+    balances: BTreeMap<Address, U256>,
 }
 
 impl TxPool for TestPool {
@@ -51,11 +55,28 @@ impl TxPool for TestPool {
         self.transactions.retain(|tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
         self.by_id.retain(|_, tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
     }
+    fn get_account_balance(&self, address: Address) -> U256 {
+        self.balances.get(&address).copied().unwrap_or(U256::MAX)
+    }
 }
 
 impl TestPool {
+    /// Override the balance [`TxPool::get_account_balance`] reports for `address`.
+    #[cfg(test)]
+    pub(crate) fn with_balance(mut self, address: Address, balance: U256) -> Self {
+        self.balances.insert(address, balance);
+        self
+    }
+
+    /// Sum of the pool transactions' costs, used by tests to compute the expected optimistic
+    /// balance debit.
+    #[cfg(test)]
+    pub(crate) fn total_cost(&self) -> U256 {
+        self.transactions.iter().fold(U256::ZERO, |acc, tx| acc.saturating_add(*tx.cost()))
+    }
+
     /// Create a new instance of Self.
-    fn new(txs: &[Vec<u8>]) -> Self {
+    pub(crate) fn new(txs: &[Vec<u8>]) -> Self {
         let mut sender_ids = SenderIdentifiers::default();
         let mut by_id = Vec::with_capacity(txs.len());
         let transactions = txs
@@ -78,7 +99,7 @@ impl TestPool {
                 valid_tx
             })
             .collect();
-        Self { transactions, by_id: by_id.into_iter().collect() }
+        Self { transactions, by_id: by_id.into_iter().collect(), balances: BTreeMap::new() }
     }
 
     fn best_transactions_int(&self) -> Box<dyn BestTransactions<Item = Arc<PoolTxn>>> {

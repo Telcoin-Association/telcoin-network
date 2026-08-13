@@ -32,8 +32,8 @@ use reth_chainspec::ChainSpec;
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
-    providers::BlockchainProvider, CanonStateNotification, CanonStateSubscriptions as _, Chain,
-    ChangedAccount,
+    providers::BlockchainProvider, AccountReader as _, CanonStateNotification,
+    CanonStateSubscriptions as _, Chain, ChangedAccount,
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
@@ -48,7 +48,7 @@ use reth_transaction_pool::{
 use std::{sync::Arc, time::Instant};
 use tn_types::{
     Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned,
-    TxHash, MIN_PROTOCOL_BASE_FEE,
+    TxHash, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -83,12 +83,24 @@ pub trait TxPool {
     /// Remove transactions whose EIP-2718 type is outside the executable allowlist from the
     /// pool, along with their descendants.
     fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>);
+    /// Return the canonical balance of `address` as of the latest committed block.
+    ///
+    /// Used to build the optimistic per-sender balance in a post-mining pool update. A missing
+    /// account (or a read error) yields [`U256::ZERO`], which is the conservative choice: it can
+    /// only keep a sender's remaining transactions parked, never promote an unfunded one, and the
+    /// engine's authoritative canonical update corrects it within the same consensus round.
+    fn get_account_balance(&self, address: Address) -> U256;
 }
 
 /// A telcoin network transaction pool.
+///
+/// The second field is a handle to the blockchain provider, retained so the pool can read a
+/// sender's canonical balance when constructing optimistic pool updates after mining a batch
+/// (see [`TxPool::get_account_balance`]).
 #[derive(Clone, Debug)]
 pub struct WorkerTxPool(
     EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>,
+    BlockchainProvider<TelcoinNode>,
 );
 
 impl From<WorkerTxPool>
@@ -147,7 +159,7 @@ impl WorkerTxPool {
         */
 
         let mut state_stream = blockchain_provider.canonical_state_stream();
-        let this = Self(transaction_pool);
+        let this = Self(transaction_pool, blockchain_provider.clone());
         let txn_pool_clone = this.clone();
         // Update the txn pool as the canonical tip changes.
         task_spawner.spawn_critical_task("canonical txn pool", async move {
@@ -338,6 +350,15 @@ impl TxPool for WorkerTxPool {
 
     fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>) {
         self.0.remove_transactions_and_descendants(txs);
+    }
+
+    fn get_account_balance(&self, address: Address) -> U256 {
+        self.1
+            .basic_account(&address)
+            .ok()
+            .flatten()
+            .map(|account| account.balance)
+            .unwrap_or(U256::ZERO)
     }
 }
 
