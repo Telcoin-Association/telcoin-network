@@ -1,6 +1,6 @@
 //! Prometheus metrics for the reth execution environment.
 //!
-//! Four counter series are exported under the `tn_reth` scope, in two unrelated groups.
+//! The counter series are exported under the `tn_reth` scope, in two unrelated groups.
 //!
 //! Block building. Two series count transactions that `build_block_from_batch_payload`
 //! declines to include in a block: `tn_reth.unrecoverable_txs_dropped_total` (alertable - a
@@ -8,8 +8,11 @@
 //! `tn_reth.invalid_txs_skipped_total` (expected - duplicates/invalid transactions across
 //! independently-batching workers). See [`RethEnvMetrics`] for per-series semantics.
 //!
-//! Observer transaction forwarding. Two series count work the forwarder
-//! ([`crate::WorkerRpcForwarder`]) sheds to stay within its own bounds:
+//! Observer transaction forwarding. A base series counts every transaction handed to the
+//! forwarder ([`crate::WorkerRpcForwarder`]): `tn_reth.forwarded_txns_queued_total`. Read
+//! against it, `tn_reth.forwarded_txns_dropped_total` (labeled by `reason`, see
+//! [`ForwardDropReason`]) counts the transactions the pipeline gave up on, and two series count
+//! work the forwarder sheds to stay within its own bounds:
 //! `tn_reth.forwarded_batches_shed_total` and `tn_reth.forwarded_txns_abandoned_total`. See
 //! [`ForwarderMetrics`] for per-series semantics.
 //!
@@ -109,14 +112,80 @@ pub(crate) struct RethEnvMetrics {
 /// registration in [`ForwarderMetrics::init`] and the increments below cannot drift apart.
 const FORWARDED_BATCHES_SHED: &str = "tn_reth.forwarded_batches_shed_total";
 const FORWARDED_TXNS_ABANDONED: &str = "tn_reth.forwarded_txns_abandoned_total";
+const FORWARDED_TXNS_QUEUED: &str = "tn_reth.forwarded_txns_queued_total";
+const FORWARDED_TXNS_DROPPED: &str = "tn_reth.forwarded_txns_dropped_total";
+
+/// Why the forwarding pipeline gave up on a forward attempt it had accepted.
+///
+/// The variants label `tn_reth.forwarded_txns_dropped_total`, one series per reason, all
+/// registered at zero by [`ForwarderMetrics::init`]. Together with
+/// `tn_reth.forwarded_txns_abandoned_total` they account for every queued transaction that was
+/// not delivered, so `queued - dropped - abandoned` is the number a dashboard can trust as
+/// delivered (issue #1133). The accounting is per attempt: the pre-admission reasons
+/// (`EmptyCommittee`, `NoUsableEndpoint`, `BatchShed`) refuse the batch so the caller keeps
+/// its transactions and requeues them on a later build (issue #1132), while `Rejected` and
+/// `Unreached` happen after admission, when the transactions are already evicted as mined,
+/// and are final losses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardDropReason {
+    /// The batch reached the forwarder with an empty committee or no advertised endpoint, so
+    /// there was nowhere to route to. A silent no-op before it was counted; on the production
+    /// path the worker guards this case first and counts it under its own scope
+    /// (`tn_worker.forwarded_txns_dropped_total`).
+    EmptyCommittee,
+    /// Endpoints were advertised but none resolved to a usable provider - every one was
+    /// refused by the [`crate::ForwardTargetPolicy`] or failed to parse. Alertable: the node
+    /// cannot hand on the transactions it accepts while this condition lasts.
+    NoUsableEndpoint,
+    /// The whole batch was shed at admission because every forward permit was in flight. The
+    /// transaction-level twin of `tn_reth.forwarded_batches_shed_total`, so shed batches also
+    /// subtract from the queued denominator.
+    BatchShed,
+    /// A validator's RPC returned a considered rejection (bad nonce, underpriced, invalid).
+    /// Not alertable on its own: the rejection would repeat at every validator, the same way
+    /// `tn_reth.invalid_txs_skipped_total` is expected traffic at execution.
+    Rejected,
+    /// The whole fallback chain was tried inside the transaction's budget and no validator
+    /// accepted the connection or answered in time. Alertable on a sustained rate: the
+    /// committee is unreachable from this node while it keeps accepting transactions.
+    Unreached,
+}
+
+impl ForwardDropReason {
+    /// Every variant, for zero-registration in [`ForwarderMetrics::init`].
+    ///
+    /// Hand-maintained: the exhaustive match in [`Self::label`] is the compile-time tripwire
+    /// a new variant hits, and this list must be extended in the same edit - a variant
+    /// missing here skips zero-registration silently, and the register-at-zero test cannot
+    /// notice because it iterates this same list.
+    const ALL: [Self; 5] = [
+        Self::EmptyCommittee,
+        Self::NoUsableEndpoint,
+        Self::BatchShed,
+        Self::Rejected,
+        Self::Unreached,
+    ];
+
+    /// The `reason` label value this variant records under.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::EmptyCommittee => "empty_committee",
+            Self::NoUsableEndpoint => "no_usable_endpoint",
+            Self::BatchShed => "batch_shed",
+            Self::Rejected => "rejected",
+            Self::Unreached => "unreached",
+        }
+    }
+}
 
 /// Metrics for the observer transaction forwarder ([`crate::WorkerRpcForwarder`]).
 ///
-/// Both series count forwarding work the node deliberately gives up on to keep its own
-/// resource use bounded. Forwarding is best-effort, so shedding is a correct outcome rather
+/// The shed, abandoned, and dropped series count forwarding work the node deliberately gives
+/// up on to keep its own resource use bounded; the queued series is the intake denominator
+/// they read against. Forwarding is best-effort, so shedding is a correct outcome rather
 /// than an error - but it is an *absorbed* failure, invisible until it is not, which is
 /// exactly the category that needs to show up somewhere other than a `warn!` line. Transactions
-/// counted here were accepted by this node's RPC and never handed to a validator.
+/// counted as lost here were accepted by this node's RPC and never handed to a validator.
 ///
 /// Associated functions rather than instance handles, matching the epoch manager's
 /// `record_provider_fault_retry`: the emission sites are inside a spawned task that holds no
@@ -125,7 +194,8 @@ const FORWARDED_TXNS_ABANDONED: &str = "tn_reth.forwarded_txns_abandoned_total";
 pub(crate) struct ForwarderMetrics;
 
 impl ForwarderMetrics {
-    /// Register both forwarder counters with the current recorder without recording an event.
+    /// Register every forwarder series (shed, abandoned, queued, and one dropped series per
+    /// [`ForwardDropReason`]) with the current recorder without recording an event.
     ///
     /// Called from `WorkerRpcForwarder::new`, which runs at epoch start, long after the CLI
     /// installs the global recorder. The reason to register eagerly is the same one [`init`]
@@ -136,6 +206,10 @@ impl ForwarderMetrics {
     pub(crate) fn init() {
         metrics::counter!(FORWARDED_BATCHES_SHED).increment(0);
         metrics::counter!(FORWARDED_TXNS_ABANDONED).increment(0);
+        metrics::counter!(FORWARDED_TXNS_QUEUED).increment(0);
+        ForwardDropReason::ALL.iter().for_each(|reason| {
+            metrics::counter!(FORWARDED_TXNS_DROPPED, "reason" => reason.label()).increment(0);
+        });
     }
 
     /// Count one sealed batch dropped without being forwarded because every forward permit was
@@ -155,6 +229,23 @@ impl ForwarderMetrics {
     /// could not be walked inside its budget.
     pub(crate) fn record_txns_abandoned(count: u64) {
         metrics::counter!(FORWARDED_TXNS_ABANDONED).increment(count);
+    }
+
+    /// Count transactions handed to the forwarder, before any admission decision.
+    ///
+    /// The denominator the drop and abandon counters read against: without it a dashboard can
+    /// see what was lost but not what fraction of the intake that loss is.
+    pub(crate) fn record_txns_queued(count: u64) {
+        metrics::counter!(FORWARDED_TXNS_QUEUED).increment(count);
+    }
+
+    /// Count transactions the forwarding pipeline gave up on, labeled by [`ForwardDropReason`].
+    ///
+    /// Every call site pairs with a `warn!` (or a documented silent no-op), so the counter is
+    /// the dashboard-visible half of a loss the logs already describe: transactions counted
+    /// here were accepted by this node's RPC and never delivered to a validator.
+    pub(crate) fn record_txns_dropped(reason: ForwardDropReason, count: u64) {
+        metrics::counter!(FORWARDED_TXNS_DROPPED, "reason" => reason.label()).increment(count);
     }
 }
 
@@ -408,6 +499,52 @@ mod tests {
         assert!(matches!(series(&snapshot, FORWARDED_TXNS_ABANDONED), DebugValue::Counter(7)));
     }
 
+    /// [`ForwarderMetrics::init`] must register the queued base series and one dropped series
+    /// per [`ForwardDropReason`] at zero, and a recorded drop must move only its own reason's
+    /// series.
+    ///
+    /// The per-reason zero registrations carry the same weight as the unlabeled ones: a reason
+    /// that only appears once it fires cannot be told apart from a mistyped label value, and
+    /// its first `rate()` step is lost.
+    #[test]
+    fn test_forward_drop_reasons_register_at_zero_and_count_separately() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::with_local_recorder(&recorder, || {
+            ForwarderMetrics::init();
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(matches!(series(&snapshot, FORWARDED_TXNS_QUEUED), DebugValue::Counter(0)));
+        ForwardDropReason::ALL.into_iter().for_each(|reason| {
+            assert!(
+                matches!(reason_series(&snapshot, reason.label()), DebugValue::Counter(0)),
+                "reason {} must be registered at zero by init",
+                reason.label()
+            );
+        });
+
+        metrics::with_local_recorder(&recorder, || {
+            ForwarderMetrics::record_txns_queued(9);
+            ForwarderMetrics::record_txns_dropped(ForwardDropReason::BatchShed, 3);
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert!(matches!(series(&snapshot, FORWARDED_TXNS_QUEUED), DebugValue::Counter(9)));
+        assert!(matches!(reason_series(&snapshot, "batch_shed"), DebugValue::Counter(3)));
+        ForwardDropReason::ALL
+            .into_iter()
+            .filter(|reason| *reason != ForwardDropReason::BatchShed)
+            .for_each(|reason| {
+                assert!(
+                    matches!(reason_series(&snapshot, reason.label()), DebugValue::Counter(0)),
+                    "a batch_shed drop must not move the {} series",
+                    reason.label()
+                );
+            });
+    }
+
     /// One series of a [`DebuggingRecorder`] snapshot, looked up by metric name.
     ///
     /// A free function rather than the closures the two tests above use, because this one is
@@ -428,6 +565,29 @@ mod tests {
             .find(|(key, ..)| key.key().name() == name)
             .map(|(.., value)| value)
             .unwrap_or_else(|| panic!("metric {name} not registered without an event"))
+    }
+
+    /// The dropped-transactions series for one `reason` label value.
+    ///
+    /// [`series`] cannot serve here: all reasons share the metric name, so a name-only lookup
+    /// returns whichever series the snapshot happens to list first.
+    fn reason_series<'a>(
+        snapshot: &'a [(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        reason: &str,
+    ) -> &'a DebugValue {
+        snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == FORWARDED_TXNS_DROPPED
+                    && key.key().labels().any(|l| l.key() == "reason" && l.value() == reason)
+            })
+            .map(|(.., value)| value)
+            .unwrap_or_else(|| panic!("dropped series for reason {reason} not registered"))
     }
 
     /// Read one gauge out of a snapshot, selecting by `call` label when one is given.
