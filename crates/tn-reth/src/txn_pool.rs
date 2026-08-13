@@ -16,7 +16,7 @@
 //!   distribution happens via the worker batch protocol, and observer nodes forward RPC submissions
 //!   to committee validators over JSON-RPC (see `forward.rs`) — never via devp2p gossip.
 //! - The per-sender slot default is 256 (`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER` in `src/cli.rs`,
-//!   seeded process-wide by `init_txpool_defaults`) instead of reth's 16.
+//!   seeded process-wide by `init_reth_defaults`) instead of reth's 16.
 //! - Blob (EIP-4844) transactions are unsupported in batches: the batch builder strips them via
 //!   [`TxPool::remove_eip4844_txs`] (removes descendants and deletes sidecars from the blob store),
 //!   and every canonical pool update — `process_canon_state_update` here and the batch builder's
