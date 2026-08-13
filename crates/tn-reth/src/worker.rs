@@ -100,6 +100,19 @@ impl WorkerNetwork {
         Self { chain_spec: chain_spec.reth_chain_spec(), peer_count, version }
     }
 
+    /// Create a test instance that does not track peers.
+    ///
+    /// The peer count stays zero. Tests that build an RPC server use this so they
+    /// do not need a live worker network handle.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_test(chain_spec: ChainSpec) -> Self {
+        Self {
+            chain_spec: chain_spec.reth_chain_spec(),
+            peer_count: Arc::new(RwLock::new(0)),
+            version: "test",
+        }
+    }
+
     /// Spawn a new task to keep up with peer counts.
     /// Use this when the epoch rolls over and the worker_network gets a new task manager.
     pub fn respawn_peer_count(&self, worker_network: WorkerNetworkHandle) {

@@ -14,7 +14,12 @@
 //!   `trace_filter`/log filters have block-scan windows, and `eth_getProof` is bounded by a permit
 //!   count and a historical proof window.
 //! - Spend: transactions submitted through this RPC are refused above a fee cap (`--rpc.txfeecap`,
-//!   default 1.0 in native-token units; 0 disables the cap).
+//!   default 1.0 in native-token units; 0 disables the cap). The RPC boundary checks raw
+//!   submissions (`crate::rpc_fee_cap`); the pool validator checks transactions it treats as local,
+//!   such as `--txpool.locals` senders (`--txpool.nolocals` empties that class, which leaves only
+//!   the RPC-boundary check). Committee validators should run a uniform cap: the transaction
+//!   forwarder (`crate::forward`) treats one validator's fee-cap refusal as final for that
+//!   transaction.
 //!
 //! The HTTP and WS servers are off by default and bind to localhost when enabled; the IPC
 //! server is on unless `--ipcdisable` is passed.

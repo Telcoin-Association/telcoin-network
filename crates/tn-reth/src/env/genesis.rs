@@ -90,6 +90,27 @@ impl RethEnv {
         task_manager: &TaskManager,
         rewards: Option<GasAccumulator>,
     ) -> eyre::Result<Self> {
+        Self::new_for_temp_chain_with_rpc_args(
+            chain,
+            db_path,
+            task_manager,
+            rewards,
+            reth::args::RpcServerArgs::default(),
+        )
+    }
+
+    /// Create a new temp RethEnv with explicit RPC server args.
+    ///
+    /// Test seam: temp-chain envs otherwise run on `NodeConfig::default()`. Tests that
+    /// exercise flag-driven RPC behavior (for example `--rpc.txfeecap`) inject the
+    /// parsed args here. Production nodes receive their args through `RethConfig`.
+    pub(crate) fn new_for_temp_chain_with_rpc_args<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        rewards: Option<GasAccumulator>,
+        rpc: reth::args::RpcServerArgs,
+    ) -> eyre::Result<Self> {
         /// MDBX map-size ceiling for throwaway temp-chain envs. reth defaults to 8 TB per
         /// environment; `cargo test` runs a test binary as threads in ONE process, so N
         /// concurrent 8 TB virtual reservations exhaust the address space and MDBX aborts
@@ -121,6 +142,7 @@ impl RethEnv {
                 growth_step: Some(TEMP_CHAIN_DB_GROWTH_STEP),
                 ..Default::default()
             },
+            rpc,
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config);
