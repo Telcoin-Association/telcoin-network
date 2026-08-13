@@ -62,6 +62,10 @@ pub trait PackFileIo: Read + Write + Seek + Send + Sync + Debug {
     fn path(&self) -> &Path;
     /// Rename the underlying file.
     fn rename(&mut self, path: &Path) -> Result<(), RenameError>;
+    /// If the underlying Io suports it (mmap) return the slice from offset of len bytes.
+    /// None if outside the file range or unsupported (should fall back on normal Read trait in that
+    /// case).
+    fn slice(&self, offset: u64, len: usize) -> Option<&[u8]>;
 }
 
 impl PackFileIo for DataFile {
@@ -85,6 +89,9 @@ impl PackFileIo for DataFile {
     }
     fn rename(&mut self, path: &Path) -> Result<(), RenameError> {
         DataFile::rename(self, path)
+    }
+    fn slice(&self, _offset: u64, _len: usize) -> Option<&[u8]> {
+        None
     }
 }
 
@@ -110,12 +117,15 @@ impl PackFileIo for MmapDataFile {
     fn rename(&mut self, path: &Path) -> Result<(), RenameError> {
         MmapDataFile::rename(self, path)
     }
+    fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        MmapDataFile::slice(self, offset, len)
+    }
 }
 
 /// Raw [`File`] as a `PackFileIo`, for the **non-mmap** digest index (whose hash buckets are
 /// overwritten in place — random-write semantics we deliberately keep out of the append-only
-/// `DataFile`). The digest index only uses `Read`/`Write`/`Seek`/`sync_all`; `path`/`rename` are not
-/// meaningful for a bare `File` (it tracks no path) and are never called on the digest files.
+/// `DataFile`). The digest index only uses `Read`/`Write`/`Seek`/`sync_all`; `path`/`rename` are
+/// not meaningful for a bare `File` (it tracks no path) and are never called on the digest files.
 impl PackFileIo for File {
     fn len(&self) -> u64 {
         File::metadata(self).map(|m| m.len()).unwrap_or(0)
@@ -140,6 +150,9 @@ impl PackFileIo for File {
             io::ErrorKind::Unsupported,
             "rename is not supported for the raw File backend",
         )))
+    }
+    fn slice(&self, _offset: u64, _len: usize) -> Option<&[u8]> {
+        None
     }
 }
 
@@ -610,42 +623,89 @@ where
         Ok(header)
     }
 
+    fn record_size_bytes<'a>(
+        &'a mut self,
+        position: u64,
+        crc32_hasher: &mut crc32fast::Hasher,
+    ) -> Result<(usize, &'a [u8]), FetchError> {
+        if let Some(bytes) = self.data_file.slice(position, 4) {
+            let mut val_size_buf = [0_u8; 4];
+            val_size_buf.copy_from_slice(&bytes[0..4]);
+            crc32_hasher.update(&val_size_buf);
+            let val_size = u32::from_le_bytes(val_size_buf);
+            if val_size > MAX_RECORD_SIZE {
+                return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+            }
+            if let Some(bytes) = self.data_file.slice(position + 4, val_size as usize + 4) {
+                Ok((val_size as usize, bytes))
+            } else {
+                Err(FetchError::IO(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Unable to read the full record and CRC",
+                )))
+            }
+        } else {
+            self.data_file.seek(SeekFrom::Start(position))?;
+            let mut val_size_buf = [0_u8; 4];
+            self.data_file.read_exact(&mut val_size_buf)?;
+            crc32_hasher.update(&val_size_buf);
+            let val_size = u32::from_le_bytes(val_size_buf);
+            if val_size > MAX_RECORD_SIZE {
+                return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+            }
+            self.value_buffer.resize(val_size as usize + 4, 0);
+            self.data_file.read_exact(&mut self.value_buffer[..])?;
+            Ok((val_size as usize, &self.value_buffer[..]))
+        }
+    }
+
     /// Read the record at position.
     /// Returns the (key, value) tuple
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
     fn read_record(&mut self, position: u64) -> Result<V, FetchError> {
-        self.data_file.seek(SeekFrom::Start(position))?;
+        // The record `bytes` (in `read_record_into`) borrow `self` on the zero-copy path, so the
+        // reusable decompression buffer cannot be borrowed from `self` during the decode. Move it
+        // out and back; `mem::take` preserves its capacity, so there is still no per-read
+        // allocation.
+        let mut compression_buffer = std::mem::take(&mut self.compression_buffer);
+        let result = self.read_record_into(position, &mut compression_buffer);
+        self.compression_buffer = compression_buffer;
+        result
+    }
+
+    /// Body of [`Self::read_record`], with the reusable decompression buffer passed in (see the
+    /// note there) so the record `bytes` can be decoded/decompressed straight from where they
+    /// were read (the mmap map for the zero-copy path) without a borrow conflict.
+    fn read_record_into(
+        &mut self,
+        position: u64,
+        compression_buffer: &mut Vec<u8>,
+    ) -> Result<V, FetchError> {
         let mut crc32_hasher = crc32fast::Hasher::new();
-        let mut val_size_buf = [0_u8; 4];
-        self.data_file.read_exact(&mut val_size_buf)?;
-        crc32_hasher.update(&val_size_buf);
-        let val_size = u32::from_le_bytes(val_size_buf);
-        if val_size > MAX_RECORD_SIZE {
-            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
-        }
-        self.value_buffer.resize(val_size as usize, 0);
-        self.data_file.read_exact(&mut self.value_buffer[..])?;
-        crc32_hasher.update(&self.value_buffer);
+        let compression = self.header.compression;
+        let (val_size, bytes) = self.record_size_bytes(position, &mut crc32_hasher)?;
+        crc32_hasher.update(&bytes[0..val_size]);
         let calc_crc32 = crc32_hasher.finalize();
         let mut buf_u32 = [0_u8; 4];
-        self.data_file.read_exact(&mut buf_u32)?;
+        buf_u32.copy_from_slice(&bytes[val_size..val_size + 4]);
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let buffer = match self.header.compression {
-            PackCompression::None => &self.value_buffer,
+        let buffer: &[u8] = match compression {
+            // The value bytes only — `bytes` is `[value | crc]`, so drop the trailing 4-byte CRC.
+            PackCompression::None => &bytes[0..val_size],
             PackCompression::ZStd => {
-                let mut decoder = zstd::stream::read::Decoder::new(&self.value_buffer[..])?;
+                let mut decoder = zstd::stream::read::Decoder::new(&bytes[0..val_size])?;
                 decoder.window_log_max(24)?;
-                self.compression_buffer.clear();
+                compression_buffer.clear();
                 // +1 lets us detect overflow vs. natural EOF
                 let mut limited = decoder.take(MAX_RECORD_SIZE as u64 + 1);
-                limited.read_to_end(&mut self.compression_buffer)?;
-                if self.compression_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
+                limited.read_to_end(compression_buffer)?;
+                if compression_buffer.len() as u64 > MAX_RECORD_SIZE as u64 {
                     return Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE));
                 }
-                &self.compression_buffer
+                &compression_buffer[..]
             }
         };
         let val =
@@ -656,26 +716,17 @@ where
     /// Read the record size (with crc32) at position.
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
     fn record_size(&mut self, position: u64) -> Result<u32, FetchError> {
-        self.data_file.seek(SeekFrom::Start(position))?;
         let mut crc32_hasher = crc32fast::Hasher::new();
-        let mut val_size_buf = [0_u8; 4];
-        self.data_file.read_exact(&mut val_size_buf)?;
-        crc32_hasher.update(&val_size_buf);
-        let val_size = u32::from_le_bytes(val_size_buf);
-        if val_size > MAX_RECORD_SIZE {
-            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
-        }
-        self.value_buffer.resize(val_size as usize, 0);
-        self.data_file.read_exact(&mut self.value_buffer[..])?;
-        crc32_hasher.update(&self.value_buffer);
+        let (val_size, bytes) = self.record_size_bytes(position, &mut crc32_hasher)?;
+        crc32_hasher.update(&bytes[0..val_size]);
         let calc_crc32 = crc32_hasher.finalize();
         let mut buf_u32 = [0_u8; 4];
-        self.data_file.read_exact(&mut buf_u32)?;
+        buf_u32.copy_from_slice(&bytes[val_size..val_size + 4]);
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        Ok(val_size + 8)
+        Ok(val_size as u32 + 8)
     }
 
     /// Close and destroy the Pack (remove it's file).

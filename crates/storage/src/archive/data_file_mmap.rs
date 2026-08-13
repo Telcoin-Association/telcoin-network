@@ -64,13 +64,13 @@ pub enum GrowMode {
 /// Where [`MmapDataFile::write`] places bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WriteMode {
-    /// Writes always go to the logical `end` (append log). The default — used by the pack data file
-    /// and the position index.
+    /// Writes always go to the logical `end` (append log). The default — used by the pack data
+    /// file and the position index.
     #[default]
     Append,
-    /// Writes go to the current seek position (overwrite), extending the high-water `end` only when
-    /// they pass it. Used by the digest index (fixed-layout hash buckets overwritten in place, plus
-    /// its append-only overflow log driven by explicit `seek(End)`).
+    /// Writes go to the current seek position (overwrite), extending the high-water `end` only
+    /// when they pass it. Used by the digest index (fixed-layout hash buckets overwritten in
+    /// place, plus its append-only overflow log driven by explicit `seek(End)`).
     Random,
 }
 
@@ -211,11 +211,11 @@ impl MmapDataFile {
     /// block for zero-copy record reads (no `memcpy`, no allocation).
     ///
     /// Returns `None` if the range falls outside the logical data `[0, len())` (so the transient
-    /// capacity padding past `end` is never exposed) or the file is currently unmapped. The returned
-    /// slice borrows `&self`, so no concurrent write/remap (which needs `&mut self`) can invalidate
-    /// it while it is held. A caller that does not know a record's length up front reads the size
-    /// prefix with one `slice` call and the value with another; passing `len = self.len() - offset`
-    /// gives an offset-to-end view.
+    /// capacity padding past `end` is never exposed) or the file is currently unmapped. The
+    /// returned slice borrows `&self`, so no concurrent write/remap (which needs `&mut self`)
+    /// can invalidate it while it is held. A caller that does not know a record's length up
+    /// front reads the size prefix with one `slice` call and the value with another; passing
+    /// `len = self.len() - offset` gives an offset-to-end view.
     pub fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         let range_end = offset.checked_add(len as u64)?;
         if range_end > self.end {
@@ -452,8 +452,8 @@ impl Seek for MmapDataFile {
 
 impl Write for MmapDataFile {
     /// Place `buf` per the configured [`WriteMode`]: at the logical end ([`WriteMode::Append`],
-    /// ignoring the seek position) or at the current seek position ([`WriteMode::Random`], extending
-    /// the high-water `end` when it passes it), growing the mapping if required.
+    /// ignoring the seek position) or at the current seek position ([`WriteMode::Random`],
+    /// extending the high-water `end` when it passes it), growing the mapping if required.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.read_only {
             return Err(io::Error::new(
@@ -835,13 +835,12 @@ mod tests {
     fn segment_mode_unsupported_on_rollover() {
         let tmp = TempDir::with_prefix("mmap_df_segment").expect("temp dir");
         let path = tmp.path().join("data");
-        let opts =
-            MmapFileOptions {
-                initial_size: 128,
-                max_map_size: 128,
-                grow_mode: GrowMode::Segment,
-                write_mode: WriteMode::Append,
-            };
+        let opts = MmapFileOptions {
+            initial_size: 128,
+            max_map_size: 128,
+            grow_mode: GrowMode::Segment,
+            write_mode: WriteMode::Append,
+        };
         let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
         // Fits within the first mapping (<= max_map_size).
         df.write_all(&pattern(100)).expect("first write fits");

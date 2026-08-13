@@ -81,10 +81,7 @@ impl OdxHeader {
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    fn load_header(
-        source: &mut dyn PackFileIo,
-        read_only: bool,
-    ) -> Result<Self, LoadHeaderError> {
+    fn load_header(source: &mut dyn PackFileIo, read_only: bool) -> Result<Self, LoadHeaderError> {
         let header_size = MIN_HEADER_SIZE;
         source.rewind()?;
         let mut buffer = vec![0_u8; header_size];
