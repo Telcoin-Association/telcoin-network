@@ -152,6 +152,14 @@ test-restarts: build-e2e-bin
 test-e2e: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
 
+# run the epoch-boundary e2e group with the seed-signature fork ACTIVE from epoch 1 (#1032).
+# The default lanes above run the fork DORMANT, so they never exercise the fork-active close
+# (epoch-record vote quorum + certification) or the certified-anchor entry path — the paths
+# that deadlocked adiri at epoch 383. Fork epoch 1 (not 0) also covers the pre-fork -> fork
+# first boundary crossing.
+test-e2e-fork-active: build-e2e-bin
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=1 cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
 	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast ;

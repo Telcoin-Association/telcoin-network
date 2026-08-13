@@ -6,6 +6,7 @@
 mod basefee;
 mod common;
 mod eject;
+mod epoch_cert_recovery;
 mod epochs;
 #[cfg(feature = "faucet")]
 mod faucet;

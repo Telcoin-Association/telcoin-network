@@ -300,6 +300,18 @@ async fn manage_epoch_votes(
             target: "epoch-manager",
             "reached quorum on epoch close for {}/{epoch_hash}", epoch_rec.epoch
         );
+        // e2e-only hook (compiled out of production builds): drop the assembled certificate so
+        // the harness can manufacture the records-without-certificates fleet state a
+        // whole-committee crash at an epoch close leaves behind.
+        if tn_types::test_suppress_epoch_certs() {
+            warn!(
+                target: "epoch-manager",
+                "TEST HOOK: TN_TEST_SUPPRESS_EPOCH_CERTS active - discarding quorum certificate \
+                 for epoch {}",
+                epoch_rec.epoch,
+            );
+            return;
+        }
         match BlsAggregateSignature::aggregate(&sigs[..], true) {
             Ok(aggregated_signature) => {
                 let signature: BlsSignature = aggregated_signature.to_signature();

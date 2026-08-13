@@ -45,6 +45,33 @@ pub use worker::*;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
+/// Test-only hook: suppress storing epoch certificates assembled from local vote quorums,
+/// read once from `TN_TEST_SUPPRESS_EPOCH_CERTS` (`1` to suppress).
+///
+/// Lets an e2e harness manufacture the halted-fleet state where every node holds an epoch
+/// record but no certificate exists anywhere — the state a whole-committee crash between an
+/// epoch close and certification leaves behind — so recovery paths can be exercised against
+/// real node processes. An environment variable rather than a process-global setter for the
+/// same reason as [`forks::seed_signature_fork_epoch_override`]: e2e tests drive real spawned
+/// node binaries that share no memory with the harness.
+///
+/// Compiled out entirely without `test-utils`, so a production binary always stores the
+/// certificates it assembles and cannot be repointed at runtime by its environment.
+#[cfg(feature = "test-utils")]
+pub fn test_suppress_epoch_certs() -> bool {
+    static SUPPRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPRESS.get_or_init(|| {
+        std::env::var("TN_TEST_SUPPRESS_EPOCH_CERTS").is_ok_and(|raw| raw.trim() == "1")
+    })
+}
+
+/// Production builds never suppress certificate storage; see the `test-utils` variant.
+#[cfg(not(feature = "test-utils"))]
+#[inline]
+pub const fn test_suppress_epoch_certs() -> bool {
+    false
+}
+
 // re-exports for easier maintainability
 pub use alloy::{
     consensus::{

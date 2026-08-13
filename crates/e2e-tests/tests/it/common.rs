@@ -416,7 +416,7 @@ pub(crate) fn start_validator(
     test: &str,
     run: u32,
 ) -> Child {
-    start_validator_with_args(instance, bin, base_dir, rpc_port, test, run, &[])
+    start_validator_with_args_and_envs(instance, bin, base_dir, rpc_port, test, run, &[], &[])
 }
 
 /// Start a validator node process with additional CLI arguments (e.g. `--metrics`).
@@ -428,6 +428,56 @@ pub(crate) fn start_validator_with_args(
     test: &str,
     run: u32,
     extra_args: &[&str],
+) -> Child {
+    start_validator_with_args_and_envs(
+        instance,
+        bin,
+        base_dir,
+        rpc_port,
+        test,
+        run,
+        extra_args,
+        &[],
+    )
+}
+
+/// Start a validator node process with additional environment variables on the child (e.g.
+/// `TN_SEED_SIGNATURE_FORK_EPOCH` / `TN_TEST_SUPPRESS_EPOCH_CERTS`).
+///
+/// Extra envs are applied after [`TestBinary::command`]'s harness pins, so a test states the
+/// value it means for its children instead of inheriting whichever one the lane exports.
+pub(crate) fn start_validator_with_envs(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_envs: &[(&str, &str)],
+) -> Child {
+    start_validator_with_args_and_envs(
+        instance,
+        bin,
+        base_dir,
+        rpc_port,
+        test,
+        run,
+        &[],
+        extra_envs,
+    )
+}
+
+/// Shared spawn body for the `start_validator*` variants.
+#[allow(clippy::too_many_arguments)]
+fn start_validator_with_args_and_envs(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
+    extra_envs: &[(&str, &str)],
 ) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
@@ -452,6 +502,11 @@ pub(crate) fn start_validator_with_args(
         .arg(format!("{test}-node{instance}"));
 
     command.args(extra_args);
+    // Applied last: a later `env()` on the same key overrides the harness-pinned value from
+    // `TestBinary::command`.
+    for (key, value) in extra_envs {
+        command.env(key, value);
+    }
 
     setup_log_dir(&mut command, instance, test, run);
 
@@ -490,6 +545,20 @@ pub(crate) fn start_observer(
     test: &str,
     run: u32,
 ) -> Child {
+    start_observer_with_envs(instance, bin, base_dir, rpc_port, test, run, &[])
+}
+
+/// Start an observer node process with additional environment variables on the child (see
+/// [`start_validator_with_envs`] for the override semantics).
+pub(crate) fn start_observer_with_envs(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_envs: &[(&str, &str)],
+) -> Child {
     let data_dir = base_dir.join("observer");
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
@@ -511,6 +580,12 @@ pub(crate) fn start_observer(
         .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
+
+    // Applied last: a later `env()` on the same key overrides the harness-pinned value from
+    // `TestBinary::command`.
+    for (key, value) in extra_envs {
+        command.env(key, value);
+    }
 
     setup_log_dir(&mut command, instance, test, run);
 

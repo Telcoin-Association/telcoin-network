@@ -128,6 +128,14 @@ cargo build --profile e2e --bin telcoin-network --features tn-storage/test-utils
 TN_BIN_PATH="$E2E_TARGET_ROOT/e2e/telcoin-network" \
     cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features
 
+# Second lane: the epoch-boundary group with the seed-signature fork ACTIVE from epoch 1
+# (#1032). The default lane above runs the fork dormant, so it never exercises the
+# fork-active epoch close (record vote quorum + certification) or the certified-anchor
+# entry path — the paths that deadlocked adiri at the epoch-383 close.
+TN_BIN_PATH="$E2E_TARGET_ROOT/e2e/telcoin-network" \
+    TN_SEED_SIGNATURE_FORK_EPOCH=1 \
+    cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch
+
 echo "all checks passed - submitting attestation on-chain..."
 
 #
