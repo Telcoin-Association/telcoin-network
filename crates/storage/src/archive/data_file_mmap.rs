@@ -207,6 +207,30 @@ impl MmapDataFile {
         self.end == 0
     }
 
+    /// Borrow the mapped bytes `[offset, offset + len)` directly, without copying — the building
+    /// block for zero-copy record reads (no `memcpy`, no allocation).
+    ///
+    /// Returns `None` if the range falls outside the logical data `[0, len())` (so the transient
+    /// capacity padding past `end` is never exposed) or the file is currently unmapped. The returned
+    /// slice borrows `&self`, so no concurrent write/remap (which needs `&mut self`) can invalidate
+    /// it while it is held. A caller that does not know a record's length up front reads the size
+    /// prefix with one `slice` call and the value with another; passing `len = self.len() - offset`
+    /// gives an offset-to-end view.
+    pub fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let range_end = offset.checked_add(len as u64)?;
+        if range_end > self.end {
+            return None;
+        }
+        let start = offset as usize;
+        match &self.backing {
+            Backing::Rw(map) => Some(&map[start..start + len]),
+            Backing::Ro(map) => Some(&map[start..start + len]),
+            // Only a zero-length borrow (necessarily at offset 0) is valid with no mapping.
+            Backing::Empty if len == 0 => Some(&[]),
+            Backing::Empty => None,
+        }
+    }
+
     /// Next capacity that holds `needed` bytes: double until a step would exceed `max_map_size`,
     /// then advance in `max_map_size` increments. Floors the first allocation at `initial_size`.
     fn next_capacity(&self, needed: u64) -> u64 {
@@ -575,6 +599,36 @@ mod tests {
         let mut all = vec![0u8; 350];
         df.read_exact(&mut all).expect("read all after reopen");
         assert_eq!(all, expected);
+    }
+
+    /// The zero-copy slice accessor: borrowed windows equal the written bytes; out-of-bounds or
+    /// into-the-padding ranges return `None`.
+    #[test]
+    fn slice_borrows_mapped_bytes() {
+        let tmp = TempDir::with_prefix("mmap_df_slice").expect("temp dir");
+        let path = tmp.path().join("data");
+        let data = pattern(300); // crosses the tiny initial_size/max_map_size growth boundary
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&data).expect("write");
+            // Borrowed windows match the written bytes (no copy).
+            assert_eq!(df.slice(0, 300).expect("full"), &data[..]);
+            assert_eq!(df.slice(100, 50).expect("mid"), &data[100..150]);
+            assert!(df.slice(300, 0).expect("zero-len at end").is_empty());
+            // Out of bounds (past the logical end / into padding) and overflow return None.
+            assert!(df.slice(300, 1).is_none(), "one past end");
+            assert!(df.slice(280, 40).is_none(), "window overruns end");
+            assert!(df.slice(u64::MAX, 1).is_none(), "offset+len overflow");
+        }
+        // Same slices from a read-only reopen (exact length after clean close).
+        let df = MmapDataFile::open(&path, true).expect("reopen ro");
+        assert_eq!(df.len(), 300);
+        assert_eq!(df.slice(0, 300).expect("ro full"), &data[..]);
+        assert_eq!(df.slice(250, 50).expect("ro tail"), &data[250..300]);
+        // A never-written (empty) file exposes only a zero-length borrow.
+        let empty = MmapDataFile::open(tmp.path().join("empty"), false).expect("open empty");
+        assert!(empty.slice(0, 0).expect("empty zero-len").is_empty());
+        assert!(empty.slice(0, 1).is_none());
     }
 
     #[test]
