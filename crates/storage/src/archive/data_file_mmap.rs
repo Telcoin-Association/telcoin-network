@@ -3,42 +3,43 @@
 //!
 //! Where `DataFile` uses buffered `read`/`write` syscalls, this maps the file into memory and does
 //! reads/writes as `memcpy` against the mapping, so no per-IO syscall and no read/write buffers are
-//! needed. It is a **drop-in** for `DataFile` (same public surface + trait impls) plus mmap-specific
-//! open options, but is intentionally standalone (not wired into `pack.rs`) so it can be validated in
-//! isolation and swapped in deliberately.
+//! needed. It is a **drop-in** for `DataFile` (same public surface + trait impls) plus
+//! mmap-specific open options, but is intentionally standalone (not wired into `pack.rs`) so it can
+//! be validated in isolation and swapped in deliberately.
 //!
 //! ## Growth
 //!
 //! mmap cannot write past end-of-file, so the physical file must be sized *ahead* of the data. A
-//! fresh file is left 0-length until the first write; then it is grown to [`MmapFileOptions::initial_size`]
-//! and thereafter geometrically (doubling, each step capped at [`MmapFileOptions::max_map_size`]).
-//! When a single mapping reaches `max_map_size`, [`GrowMode::Reopen`] (the default) keeps one file and
-//! remaps it larger (absolute byte offsets are preserved); [`GrowMode::Segment`] is reserved for a
-//! future multi-file layout and currently errors on rollover.
+//! fresh file is left 0-length until the first write; then it is grown to
+//! [`MmapFileOptions::initial_size`] and thereafter geometrically (doubling, each step capped at
+//! [`MmapFileOptions::max_map_size`]). When a single mapping reaches `max_map_size`,
+//! [`GrowMode::Reopen`] (the default) keeps one file and remaps it larger (absolute byte offsets
+//! are preserved); [`GrowMode::Segment`] is reserved for a future multi-file layout and currently
+//! errors on rollover.
 //!
 //! ## Transient padding, exact on exposure
 //!
 //! Because the file is sized ahead of the data, the physical file is padded to `capacity >= end`
 //! while actively appending (`end` is the logical data length). The physical file is reconciled to
 //! **exactly `end`** at every point an external consumer can observe it — [`Self::try_clone`] (for
-//! `PackIter`/`raw_iter`, which read to EOF) and `Drop` (clean close) both truncate to `end` — while
-//! our own reads are bounded by `end` and never see the padding. After a crash the file may be left
-//! padded; the pack's CRC + `trunc_and_heal` path truncates it back exactly as it does for the
-//! buffered `DataFile`.
+//! `PackIter`/`raw_iter`, which read to EOF) and `Drop` (clean close) both truncate to `end` —
+//! while our own reads are bounded by `end` and never see the padding. After a crash the file may
+//! be left padded; the pack's CRC + `trunc_and_heal` path truncates it back exactly as it does for
+//! the buffered `DataFile`.
 //!
 //! ## Durability
 //!
-//! The default barrier [`Self::sync_all`] is `msync` (flush dirty pages to the backing store) — this
-//! is sufficient for data written within an already-fsync'd file size, and each size extension is
-//! fsync'd when it happens (in the grow path). [`Self::sync_disk`] is the full, slower `msync` +
+//! The default barrier [`Self::sync_all`] is `msync` (flush dirty pages to the backing store) —
+//! this is sufficient for data written within an already-fsync'd file size, and each size extension
+//! is fsync'd when it happens (in the grow path). [`Self::sync_disk`] is the full, slower `msync` +
 //! `fsync`, which additionally persists the file's size/metadata. (On macOS `fsync` is not a full
 //! power-loss barrier — that needs `F_FULLFSYNC`; the real win of the msync default is on Linux.)
 
 use std::{
-    cell::Cell,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use memmap2::{Mmap, MmapMut};
@@ -55,8 +56,8 @@ pub const DEFAULT_MAX_MAP_SIZE: u64 = 128 << 20;
 pub enum GrowMode {
     /// Keep one file and remap it larger; absolute byte offsets are preserved. Fully supported.
     Reopen,
-    /// Roll over into a new segment file. Reserved for a future multi-file layout; currently errors
-    /// on rollover.
+    /// Roll over into a new segment file. Reserved for a future multi-file layout; currently
+    /// errors on rollover.
     Segment,
 }
 
@@ -65,8 +66,8 @@ pub enum GrowMode {
 pub struct MmapFileOptions {
     /// Bytes the file is first grown to on the first write; growth is geometric from here.
     pub initial_size: u64,
-    /// Cap on a single growth step: growth doubles until a step would exceed this, then advances in
-    /// `max_map_size` increments. Also the rollover threshold for [`GrowMode::Segment`].
+    /// Cap on a single growth step: growth doubles until a step would exceed this, then advances
+    /// in `max_map_size` increments. Also the rollover threshold for [`GrowMode::Segment`].
     pub max_map_size: u64,
     /// Behaviour when a mapping reaches `max_map_size`.
     pub grow_mode: GrowMode,
@@ -108,8 +109,10 @@ pub struct MmapDataFile {
     seek_pos: u64,
     read_only: bool,
     remove_on_drop: bool,
-    /// Set by [`Self::try_clone`] after it truncates the file to `end`; the next write re-maps first.
-    remap_needed: Cell<bool>,
+    /// Set by [`Self::try_clone`] after it truncates the file to `end`; the next write re-maps
+    /// first. `AtomicBool` (not `Cell`) so the file stays `Sync`, letting a pack hold it
+    /// behind a `Send + Sync` trait object.
+    remap_needed: AtomicBool,
     opts: MmapFileOptions,
 }
 
@@ -163,7 +166,7 @@ impl MmapDataFile {
             seek_pos: 0,
             read_only,
             remove_on_drop: false,
-            remap_needed: Cell::new(false),
+            remap_needed: AtomicBool::new(false),
             opts,
         })
     }
@@ -192,11 +195,8 @@ impl MmapDataFile {
     /// then advance in `max_map_size` increments. Floors the first allocation at `initial_size`.
     fn next_capacity(&self, needed: u64) -> u64 {
         let max_step = self.opts.max_map_size.max(1);
-        let mut cap = if self.capacity == 0 {
-            self.opts.initial_size.max(1)
-        } else {
-            self.capacity
-        };
+        let mut cap =
+            if self.capacity == 0 { self.opts.initial_size.max(1) } else { self.capacity };
         while cap < needed {
             // Grow by min(cap, max_step): geometric early, linear once a step hits the cap.
             cap = cap.saturating_mul(2).min(cap.saturating_add(max_step));
@@ -230,12 +230,13 @@ impl MmapDataFile {
 
     /// Ensure a writable mapping large enough for `[0, needed)`, growing (reopen-larger) if needed.
     fn ensure_capacity(&mut self, needed: u64) -> io::Result<()> {
-        if self.remap_needed.get() {
+        if self.remap_needed.load(Ordering::Relaxed) {
             // `try_clone` truncated the physical file to `end` and left a stale over-length map;
             // reflect the real physical size so the growth math is correct, then force a fresh map
-            // below (writes always append, so `needed > end == capacity` and we take the grow path).
+            // below (writes always append, so `needed > end == capacity` and we take the grow
+            // path).
             self.capacity = self.end;
-            self.remap_needed.set(false);
+            self.remap_needed.store(false, Ordering::Relaxed);
         }
         if needed <= self.capacity {
             return Ok(());
@@ -261,7 +262,7 @@ impl MmapDataFile {
         }
         self.remap(len)?;
         self.end = len;
-        self.remap_needed.set(false);
+        self.remap_needed.store(false, Ordering::Relaxed);
         if self.seek_pos > len {
             self.seek_pos = len;
         }
@@ -280,10 +281,11 @@ impl MmapDataFile {
                 }
             }
             // Truncate away the capacity padding. `File::set_len` takes `&self`; the existing map
-            // still spans the old capacity but `[end, capacity)` is never touched (reads are bounded
-            // by `end`), and the next write re-maps first (see `remap_needed` / `ensure_capacity`).
+            // still spans the old capacity but `[end, capacity)` is never touched (reads are
+            // bounded by `end`), and the next write re-maps first (see `remap_needed` /
+            // `ensure_capacity`).
             self.file.set_len(self.end)?;
-            self.remap_needed.set(true);
+            self.remap_needed.store(true, Ordering::Relaxed);
         }
         self.file.try_clone()
     }
@@ -300,8 +302,8 @@ impl MmapDataFile {
         Ok(())
     }
 
-    /// Full, slow disk sync: `msync` then `fsync`, additionally persisting the file's size/metadata.
-    /// See the module docs for the macOS `F_FULLFSYNC` caveat.
+    /// Full, slow disk sync: `msync` then `fsync`, additionally persisting the file's
+    /// size/metadata. See the module docs for the macOS `F_FULLFSYNC` caveat.
     pub fn sync_disk(&self) -> io::Result<()> {
         if self.read_only {
             return Ok(());
@@ -315,8 +317,9 @@ impl MmapDataFile {
     }
 
     /// Refresh the logical end for a read-only handle so it observes a writer's appends, re-mapping
-    /// if the file grew. Intended for following a cleanly-closed writer; a writer that is mid-append
-    /// may have the file padded beyond its logical data, so pair with index-bounded reads.
+    /// if the file grew. Intended for following a cleanly-closed writer; a writer that is
+    /// mid-append may have the file padded beyond its logical data, so pair with index-bounded
+    /// reads.
     pub fn refresh_data_file_end(&mut self) -> io::Result<()> {
         let disk_len = self.file.metadata()?.len();
         if disk_len == self.capacity {
@@ -344,7 +347,8 @@ impl MmapDataFile {
     }
 
     /// Rename the underlying file, fsync'ing affected directories so the rename is durable. The
-    /// active mapping is backed by the open handle, not the path, so it stays valid across the move.
+    /// active mapping is backed by the open handle, not the path, so it stays valid across the
+    /// move.
     pub fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
         let path = path.as_ref();
         if self.path == path {
@@ -596,7 +600,7 @@ mod tests {
             let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
             df.write_all(&data).expect("write");
         } // clean close: truncates padding + fsync
-        // No padding after a clean close.
+          // No padding after a clean close.
         assert_eq!(std::fs::metadata(&path).expect("meta").len(), 250);
         // Reopen read-write and read back.
         {
@@ -623,8 +627,8 @@ mod tests {
         let data = pattern(200);
         let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
         df.write_all(&data).expect("write");
-        // A raw clone read to EOF must yield exactly the written bytes (the PackIter/raw_iter path):
-        // no trailing zero padding.
+        // A raw clone read to EOF must yield exactly the written bytes (the PackIter/raw_iter
+        // path): no trailing zero padding.
         let mut clone = df.try_clone().expect("clone");
         clone.seek(SeekFrom::Start(0)).expect("seek clone");
         let mut all = Vec::new();
@@ -704,7 +708,8 @@ mod tests {
         let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
         // Fits within the first mapping (<= max_map_size).
         df.write_all(&pattern(100)).expect("first write fits");
-        // Next append would require growing past max_map_size -> segment rollover, not yet supported.
+        // Next append would require growing past max_map_size -> segment rollover, not yet
+        // supported.
         let err = df.write_all(&pattern(100)).expect_err("rollover must error");
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
@@ -723,7 +728,8 @@ mod tests {
         let mut buf = vec![0u8; 300];
         df.read_exact(&mut buf).expect("read");
         assert_eq!(buf, data);
-        // The physical file is at least the logical length (padding may make it larger until close).
+        // The physical file is at least the logical length (padding may make it larger until
+        // close).
         assert!(std::fs::metadata(&path).expect("meta").len() >= 300);
     }
 }

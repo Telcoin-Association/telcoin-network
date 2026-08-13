@@ -37,7 +37,7 @@ use crate::archive::{
     error::{fetch::FetchError, load_header::LoadHeaderError, open::OpenError},
     fxhasher::FxHasher,
     index::Index as _,
-    pack::{write_value, DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
+    pack::{write_value, DataHeader, FileBackend, Pack, PackCompression, DATA_HEADER_BYTES},
     pack_iter::AsyncPackIter,
     position_index::index::{PosIndexValue, PositionIndex},
 };
@@ -209,7 +209,23 @@ impl ConsensusPack {
         previous_epoch: EpochRecord,
         committee: Committee,
     ) -> Result<ConsensusPack, PackError> {
-        Self::open_append_inner(path, previous_epoch, committee, PACK_VERSION)
+        Self::open_append_inner(
+            path,
+            previous_epoch,
+            committee,
+            PACK_VERSION,
+            FileBackend::default(),
+        )
+    }
+
+    /// Like [`Self::open_append`] but selecting the on-disk file `backend` (buffered vs mmap).
+    pub fn open_append_with_backend<P: Into<PathBuf>>(
+        path: P,
+        previous_epoch: EpochRecord,
+        committee: Committee,
+        backend: FileBackend,
+    ) -> Result<ConsensusPack, PackError> {
+        Self::open_append_inner(path, previous_epoch, committee, PACK_VERSION, backend)
     }
 
     /// Test-only: open an append pack forcing a specific on-disk data version so tests can
@@ -221,7 +237,7 @@ impl ConsensusPack {
         committee: Committee,
         version: u16,
     ) -> Result<ConsensusPack, PackError> {
-        Self::open_append_inner(path, previous_epoch, committee, version)
+        Self::open_append_inner(path, previous_epoch, committee, version, FileBackend::default())
     }
 
     /// Shared body for [`Self::open_append`] stamping the given on-disk data `version`.
@@ -230,11 +246,13 @@ impl ConsensusPack {
         previous_epoch: EpochRecord,
         committee: Committee,
         version: u16,
+        backend: FileBackend,
     ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let epoch = committee.epoch();
-        let inner = Inner::open_append(path.clone(), &previous_epoch, committee.clone(), version)?;
+        let inner =
+            Inner::open_append(path.clone(), &previous_epoch, committee.clone(), version, backend)?;
         let version = inner.version();
         let compression = inner.data.header().compression();
         let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
@@ -253,7 +271,7 @@ impl ConsensusPack {
     pub fn open_append_exists<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let inner = Inner::open_append_exists(path.clone(), epoch)?;
+        let inner = Inner::open_append_exists(path.clone(), epoch, FileBackend::default())?;
         let version = inner.version();
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
@@ -271,9 +289,18 @@ impl ConsensusPack {
 
     /// Open up the static files for previous epoch.  These will be read only.
     pub fn open_static<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
+        Self::open_static_with_backend(path, epoch, FileBackend::default())
+    }
+
+    /// Like [`Self::open_static`] but selecting the on-disk file `backend` (buffered vs mmap).
+    pub fn open_static_with_backend<P: Into<PathBuf>>(
+        path: P,
+        epoch: Epoch,
+        backend: FileBackend,
+    ) -> Result<Self, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let inner = Inner::open_static(path.clone(), epoch)?;
+        let inner = Inner::open_static(path.clone(), epoch, backend)?;
         let version = inner.version();
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
@@ -298,6 +325,29 @@ impl ConsensusPack {
         final_consensus_number: u64,
         timeout: Duration,
     ) -> Result<ConsensusPack, PackError> {
+        Self::stream_import_with_backend(
+            path,
+            stream,
+            epoch,
+            previous_epoch,
+            final_consensus_number,
+            timeout,
+            FileBackend::default(),
+        )
+        .await
+    }
+
+    /// Like [`Self::stream_import`] but selecting the on-disk file `backend` (buffered vs mmap).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_import_with_backend<P: Into<PathBuf>, R: AsyncRead + Unpin>(
+        path: P,
+        stream: R,
+        epoch: Epoch,
+        previous_epoch: &EpochRecord,
+        final_consensus_number: u64,
+        timeout: Duration,
+        backend: FileBackend,
+    ) -> Result<ConsensusPack, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let inner = Inner::stream_import(
@@ -307,6 +357,7 @@ impl ConsensusPack {
             previous_epoch,
             final_consensus_number,
             timeout,
+            backend,
         )
         .await?;
         let version = inner.version();
@@ -737,11 +788,17 @@ impl Inner {
         dir: P,
         data_header: &DataHeader,
         read_only: bool,
+        backend: FileBackend,
     ) -> Result<PositionIndex<T>, PackError> {
         let base_dir = dir.as_ref().join(Self::CONSENSUS_POS_NAME);
-        let consensus_pos_idx =
-            PositionIndex::open_pdx_file(&base_dir, data_header, "index_pos.pdx", read_only)
-                .map_err(OpenError::IndexFileOpen)?;
+        let consensus_pos_idx = PositionIndex::open_pdx_file_with_backend(
+            &base_dir,
+            data_header,
+            "index_pos.pdx",
+            read_only,
+            backend,
+        )
+        .map_err(OpenError::IndexFileOpen)?;
         Ok(consensus_pos_idx)
     }
 
@@ -752,14 +809,21 @@ impl Inner {
         previous_epoch: &EpochRecord,
         committee: Committee,
         version: u16,
+        backend: FileBackend,
     ) -> Result<Self, PackError> {
         let epoch = committee.epoch();
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = create_dir_synced(&base_dir);
         let pack_file = base_dir.join(Self::DATA_NAME);
         let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
-        let mut data: Pack<PackRecord> =
-            Pack::open(&pack_file, epoch as u64, false, PackCompression::ZStd, version)?;
+        let mut data: Pack<PackRecord> = Pack::open_with_backend(
+            &pack_file,
+            epoch as u64,
+            false,
+            PackCompression::ZStd,
+            version,
+            backend,
+        )?;
         let start_consensus_number =
             if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
         let epoch_meta = EpochMeta {
@@ -782,7 +846,7 @@ impl Inner {
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
         }
-        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
+        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -816,21 +880,26 @@ impl Inner {
     }
 
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
-    fn open_append_exists<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
+    fn open_append_exists<P: AsRef<Path>>(
+        path: P,
+        epoch: Epoch,
+        backend: FileBackend,
+    ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
 
-        let mut data = Pack::<PackRecord>::open(
+        let mut data = Pack::<PackRecord>::open_with_backend(
             base_dir.join(Self::DATA_NAME),
             epoch as u64,
             false,
             PackCompression::ZStd,
             PACK_VERSION,
+            backend,
         )?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
             .into_epoch()?;
-        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
+        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -859,21 +928,26 @@ impl Inner {
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
-    fn open_static<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
+    fn open_static<P: AsRef<Path>>(
+        path: P,
+        epoch: Epoch,
+        backend: FileBackend,
+    ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
 
-        let mut data = Pack::<PackRecord>::open(
+        let mut data = Pack::<PackRecord>::open_with_backend(
             base_dir.join(Self::DATA_NAME),
             epoch as u64,
             true,
             PackCompression::ZStd,
             PACK_VERSION,
+            backend,
         )?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
             .into_epoch()?;
-        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), true)?;
+        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), true, backend)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -911,18 +985,20 @@ impl Inner {
         previous_epoch: &EpochRecord,
         final_consensus_number: u64,
         timeout: Duration,
+        backend: FileBackend,
     ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = create_dir_synced(&base_dir);
         let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
-        let mut data = Pack::open(
+        let mut data = Pack::open_with_backend(
             base_dir.join(Self::DATA_NAME),
             epoch as u64,
             false,
             PackCompression::ZStd,
             PACK_VERSION,
+            backend,
         )?;
         let epoch_meta = if let Some(meta) = next_output_record(&mut stream_iter, timeout).await? {
             meta.into_epoch()?
@@ -932,7 +1008,7 @@ impl Inner {
         verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
         data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
             .map_err(|e| PackError::Append(e.to_string()))?;
-        let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
+        let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -2326,6 +2402,57 @@ pub(crate) mod test {
         })
         .await
         .unwrap_or_else(|_| panic!("timed out after 10s waiting for {msg}"));
+    }
+
+    /// Exercise the full `ConsensusPack` lifecycle (append, read-back, persist, reopen-static) on
+    /// the memory-mapped file backend, so the mmap wiring for the data file + position index is
+    /// covered by the default suite (the side-by-side timing lives in the `#[ignore]`d
+    /// `pack_file_bench`).
+    #[tokio::test]
+    async fn test_consensus_pack_mmap_backend() {
+        use crate::archive::pack::FileBackend;
+        let temp_dir = TempDir::with_prefix("test_consensus_pack_mmap").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let pack = ConsensusPack::open_append_with_backend(
+            temp_dir.path(),
+            previous_epoch,
+            committee.clone(),
+            FileBackend::Mmap,
+        )
+        .expect("open mmap pack");
+
+        let num_outputs = 50u64;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for number in 1..=num_outputs {
+            let output =
+                make_test_output(&committee, (number as usize) % 4, chain.clone(), number, parent);
+            parent = output.consensus_header_hash();
+            outputs.push(output.clone());
+            pack.save_consensus_output(output).await.expect("save");
+        }
+        for (i, output) in outputs.iter().enumerate() {
+            let db = pack.get_consensus_output(i as u64 + 1).await.expect("read back");
+            compare_outputs(&db, output);
+        }
+        pack.persist().await.expect("persist");
+        drop(pack);
+
+        // Reopen the finished pack read-only on the mmap backend and re-verify every output.
+        let pack = ConsensusPack::open_static_with_backend(temp_dir.path(), 0, FileBackend::Mmap)
+            .expect("open static mmap");
+        for (i, output) in outputs.iter().enumerate() {
+            let db = pack.get_consensus_output(i as u64 + 1).await.expect("read back static");
+            compare_outputs(&db, output);
+        }
     }
 
     #[tokio::test]

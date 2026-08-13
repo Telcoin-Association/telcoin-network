@@ -9,12 +9,12 @@ use std::{
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::{fsync_directory, DataFile},
+    data_file::fsync_directory,
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
     index::Index,
-    pack::DataHeader,
+    pack::{DataHeader, FileBackend, PackFileIo},
 };
 
 /// Size of a header.
@@ -45,7 +45,7 @@ impl PdxHeader {
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    fn load_header(hdx_file: &mut DataFile) -> Result<Self, LoadHeaderError> {
+    fn load_header(hdx_file: &mut dyn PackFileIo) -> Result<Self, LoadHeaderError> {
         hdx_file.rewind()?;
         let mut buffer = [0_u8; PDX_HEADER_SIZE];
         let mut buf16 = [0_u8; 2];
@@ -75,7 +75,7 @@ impl PdxHeader {
     }
 
     /// Write this header to sync at current seek position.
-    fn write_header(&mut self, hdx_file: &mut DataFile) -> Result<(), io::Error> {
+    fn write_header(&mut self, hdx_file: &mut dyn PackFileIo) -> Result<(), io::Error> {
         hdx_file.rewind()?;
         let mut buffer = [0_u8; PDX_HEADER_SIZE];
         let mut pos = 0;
@@ -111,7 +111,7 @@ impl PdxHeader {
 #[derive(Debug)]
 pub struct PositionIndex<T> {
     _header: PdxHeader,
-    pdx_file: DataFile,
+    pdx_file: Box<dyn PackFileIo>,
     _index_dir: PathBuf,
     _phantom: PhantomData<T>,
 }
@@ -123,12 +123,29 @@ impl<T: PosIndexValue> PositionIndex<T> {
         dir.join(file_name).exists()
     }
 
-    /// Open a PDX index file and return the open index.
+    /// Open a PDX index file on the default (buffered) backend and return the open index.
     pub fn open_pdx_file<P: AsRef<Path>>(
         dir: P,
         data_header: &DataHeader,
         file_name: &str,
         read_only: bool,
+    ) -> Result<PositionIndex<T>, LoadHeaderError> {
+        Self::open_pdx_file_with_backend(
+            dir,
+            data_header,
+            file_name,
+            read_only,
+            FileBackend::default(),
+        )
+    }
+
+    /// Open a PDX index file on the chosen file `backend` and return the open index.
+    pub fn open_pdx_file_with_backend<P: AsRef<Path>>(
+        dir: P,
+        data_header: &DataHeader,
+        file_name: &str,
+        read_only: bool,
+        backend: FileBackend,
     ) -> Result<PositionIndex<T>, LoadHeaderError> {
         // Values are encoded/decoded through a fixed VALUE_MAX_BYTES stack buffer; a larger
         // stride would panic on the slice operations in save/load.
@@ -144,7 +161,7 @@ impl<T: PosIndexValue> PositionIndex<T> {
                 let _ = fsync_directory(parent);
             }
         }
-        let mut pdx_file = DataFile::open(dir.join(file_name), read_only)?;
+        let mut pdx_file = backend.open_boxed(dir.join(file_name), read_only)?;
 
         let was_empty = pdx_file.is_empty();
         let header = if was_empty {
@@ -152,13 +169,13 @@ impl<T: PosIndexValue> PositionIndex<T> {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
             let mut header = PdxHeader::from_data_header(data_header);
-            header.write_header(&mut pdx_file)?;
+            header.write_header(&mut *pdx_file)?;
             // index.pdx was just created and its header written; fsync the directory so the entry
             // is durable.
             let _ = fsync_directory(dir);
             header
         } else {
-            let header = PdxHeader::load_header(&mut pdx_file)?;
+            let header = PdxHeader::load_header(&mut *pdx_file)?;
             // Basic validation of the pdx header.
             if header.version() != data_header.version() {
                 return Err(LoadHeaderError::InvalidIndexVersion);

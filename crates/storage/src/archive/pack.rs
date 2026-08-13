@@ -14,7 +14,7 @@ use crate::archive::{
     pack_iter::{PackIter, MAX_RECORD_SIZE},
 };
 
-use super::{crc::add_crc32, data_file::DataFile};
+use super::{crc::add_crc32, data_file::DataFile, data_file_mmap::MmapDataFile};
 use std::{
     fmt::Debug,
     fs::{self, File},
@@ -23,6 +23,105 @@ use std::{
     marker::PhantomData,
     path::Path,
 };
+
+/// Selectable on-disk file backend for a [`Pack`]'s append-only data (and position-index) file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FileBackend {
+    /// Buffered syscall IO ([`DataFile`]); durability barrier is `fsync`.
+    #[default]
+    Buffered,
+    /// Memory-mapped IO ([`MmapDataFile`]); default durability barrier is `msync`.
+    Mmap,
+}
+
+/// The append-only file operations a [`Pack`] (and the position index) need, abstracted over the
+/// buffered ([`DataFile`]) and memory-mapped ([`MmapDataFile`]) backends. Both concrete types
+/// already provide every method; this trait just lets a pack hold either behind a `Box<dyn
+/// PackFileIo>` without changing `Pack`'s type. Methods forward via UFCS to the inherent
+/// implementations.
+pub trait PackFileIo: Read + Write + Seek + Send + Sync + Debug {
+    /// Logical length (bytes of real data) — also the append position.
+    fn len(&self) -> u64;
+    /// True if the file has no data.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Bytes of real data on disk.
+    fn data_file_end(&self) -> u64;
+    /// Truncate or extend the file to `len`.
+    fn set_len(&mut self, len: u64) -> io::Result<()>;
+    /// Clone the underlying file handle; reads the exact logical bytes to EOF.
+    fn try_clone(&self) -> io::Result<File>;
+    /// Durability barrier (`fsync` for buffered, `msync` for mmap).
+    fn sync_all(&self) -> io::Result<()>;
+    /// Path to the file.
+    fn path(&self) -> &Path;
+    /// Rename the underlying file.
+    fn rename(&mut self, path: &Path) -> Result<(), RenameError>;
+}
+
+impl PackFileIo for DataFile {
+    fn len(&self) -> u64 {
+        DataFile::len(self)
+    }
+    fn data_file_end(&self) -> u64 {
+        DataFile::data_file_end(self)
+    }
+    fn set_len(&mut self, len: u64) -> io::Result<()> {
+        DataFile::set_len(self, len)
+    }
+    fn try_clone(&self) -> io::Result<File> {
+        DataFile::try_clone(self)
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        DataFile::sync_all(self)
+    }
+    fn path(&self) -> &Path {
+        DataFile::path(self)
+    }
+    fn rename(&mut self, path: &Path) -> Result<(), RenameError> {
+        DataFile::rename(self, path)
+    }
+}
+
+impl PackFileIo for MmapDataFile {
+    fn len(&self) -> u64 {
+        MmapDataFile::len(self)
+    }
+    fn data_file_end(&self) -> u64 {
+        MmapDataFile::data_file_end(self)
+    }
+    fn set_len(&mut self, len: u64) -> io::Result<()> {
+        MmapDataFile::set_len(self, len)
+    }
+    fn try_clone(&self) -> io::Result<File> {
+        MmapDataFile::try_clone(self)
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        MmapDataFile::sync_all(self)
+    }
+    fn path(&self) -> &Path {
+        MmapDataFile::path(self)
+    }
+    fn rename(&mut self, path: &Path) -> Result<(), RenameError> {
+        MmapDataFile::rename(self, path)
+    }
+}
+
+impl FileBackend {
+    /// Open `path` on this backend, boxed as a [`PackFileIo`]. Shared by the pack data file and the
+    /// position index.
+    pub fn open_boxed<P: AsRef<Path>>(
+        self,
+        path: P,
+        read_only: bool,
+    ) -> io::Result<Box<dyn PackFileIo>> {
+        match self {
+            FileBackend::Buffered => Ok(Box::new(DataFile::open(path, read_only)?)),
+            FileBackend::Mmap => Ok(Box::new(MmapDataFile::open(path, read_only)?)),
+        }
+    }
+}
 
 /// An instance of a DB.
 /// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
@@ -38,7 +137,7 @@ impl<V> Pack<V>
 where
     V: Debug + Serialize + DeserializeOwned,
 {
-    /// Open a new or reopen an existing database.
+    /// Open a new or reopen an existing database on the default (buffered) file backend.
     pub fn open<P: AsRef<Path>>(
         path: P,
         uid_idx: u64,
@@ -46,7 +145,28 @@ where
         compression: PackCompression,
         version: u16,
     ) -> Result<Self, OpenError> {
-        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression, version)? })
+        Self::open_with_backend(
+            path,
+            uid_idx,
+            read_only,
+            compression,
+            version,
+            FileBackend::default(),
+        )
+    }
+
+    /// Open a new or reopen an existing database on the chosen file `backend`.
+    pub fn open_with_backend<P: AsRef<Path>>(
+        path: P,
+        uid_idx: u64,
+        read_only: bool,
+        compression: PackCompression,
+        version: u16,
+        backend: FileBackend,
+    ) -> Result<Self, OpenError> {
+        Ok(Self {
+            inner: PackInner::open(path, uid_idx, read_only, compression, version, backend)?,
+        })
     }
 
     /// Length of the Pack file.
@@ -170,7 +290,7 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     header: DataHeader,
-    data_file: DataFile,
+    data_file: Box<dyn PackFileIo>,
     value_buffer: Vec<u8>,
     /// Used as a second buffer for compress and decompress operations on records.
     compression_buffer: Vec<u8>,
@@ -201,16 +321,17 @@ impl<V> PackInner<V>
 where
     V: Debug + Serialize + DeserializeOwned,
 {
-    /// Open a new or reopen an existing database.
+    /// Open a new or reopen an existing database on the chosen file `backend`.
     fn open<P: AsRef<Path>>(
         path: P,
         uid_idx: u64,
         read_only: bool,
         compression: PackCompression,
         version: u16,
+        backend: FileBackend,
     ) -> Result<Self, OpenError> {
         let (data_file, header) =
-            Self::open_data_file(path, uid_idx, read_only, compression, version)
+            Self::open_data_file(path, uid_idx, read_only, compression, version, backend)
                 .map_err(OpenError::DataFileOpen)?;
         Ok(Self {
             header,
@@ -278,7 +399,7 @@ where
 
         write_value(
             value,
-            &mut self.data_file,
+            &mut *self.data_file,
             &mut self.value_buffer,
             &mut self.compression_buffer,
             self.header.compression,
@@ -374,16 +495,39 @@ where
         ro: bool,
         compression: PackCompression,
         version: u16,
-    ) -> Result<(DataFile, DataHeader), LoadHeaderError> {
-        let mut data_file = DataFile::open(path, ro)?;
-        let file_end = data_file.data_file_end();
+        backend: FileBackend,
+    ) -> Result<(Box<dyn PackFileIo>, DataHeader), LoadHeaderError> {
+        // Open the concrete file and initialize its header before boxing, so `DataHeader`'s generic
+        // `Read/Write + Seek` IO runs on a sized type and needs no change.
+        match backend {
+            FileBackend::Buffered => {
+                let mut data_file = DataFile::open(path, ro)?;
+                let header = Self::init_header(&mut data_file, uid_idx, compression, version)?;
+                Ok((Box::new(data_file), header))
+            }
+            FileBackend::Mmap => {
+                let mut data_file = MmapDataFile::open(path, ro)?;
+                let header = Self::init_header(&mut data_file, uid_idx, compression, version)?;
+                Ok((Box::new(data_file), header))
+            }
+        }
+    }
 
+    /// Write a fresh [`DataHeader`] to an empty file, or load and validate an existing one, then
+    /// flush. Runs on the concrete file `F` (before it is boxed as `dyn PackFileIo`).
+    fn init_header<F: PackFileIo>(
+        data_file: &mut F,
+        uid_idx: u64,
+        compression: PackCompression,
+        version: u16,
+    ) -> Result<DataHeader, LoadHeaderError> {
+        let file_end = data_file.data_file_end();
         let header = if file_end == 0 {
             let header = DataHeader::new(uid_idx, compression, version);
-            header.write_header(&mut data_file)?;
+            header.write_header(data_file)?;
             header
         } else {
-            let header = DataHeader::load_header(&mut data_file, uid_idx)?;
+            let header = DataHeader::load_header(data_file, uid_idx)?;
             if header.version() > version {
                 // Do not allow a newer version than we request but allow an older.
                 return Err(LoadHeaderError::InvalidVersion);
@@ -394,7 +538,7 @@ where
             header
         };
         data_file.flush()?;
-        Ok((data_file, header))
+        Ok(header)
     }
 
     /// Read the record at position.
@@ -475,7 +619,7 @@ where
 
     /// Rename the pack file to name.
     fn rename<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RenameError> {
-        self.data_file.rename(path)
+        self.data_file.rename(path.as_ref())
     }
 
     /// Truncate the pack file.  Use this get back to known good state.
