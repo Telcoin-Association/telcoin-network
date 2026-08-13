@@ -116,10 +116,41 @@ fn default_page_size() -> usize {
 /// The MDBX sync mode compiled into `test` and `test-utils` builds. `SafeNoSync` removes the
 /// hot-path `fsync` while still surviving a process kill+restart (see [`MdbxDatabase::open`]);
 /// it must never be `UtterlyNoSync`, which risks whole-DB corruption on an OS/power crash. This
-/// is the single source of truth `open` applies, so a test can pin it exactly. Production builds
-/// enable neither cfg and this const does not exist for them (the env stays `Durable`).
+/// is the default `open` applies when [`TN_TEST_MDBX_SYNC_ENV`] is unset, so a test can pin it
+/// exactly. Production builds enable neither cfg and this const does not exist for them (the
+/// env stays `Durable`).
 #[cfg(any(test, feature = "test-utils"))]
 const BUILD_SYNC_MODE: reth_libmdbx::SyncMode = reth_libmdbx::SyncMode::SafeNoSync;
+
+/// The environment variable a `test`/`test-utils` build reads at `open` to override
+/// [`BUILD_SYNC_MODE`] with no rebuild (#1149). `durable` restores the production per-commit
+/// fsync regime; `safe-no-sync` selects the compiled default explicitly. Any other value is a
+/// hard error from [`MdbxDatabase::open`]: a silent fallback could green-run a "Durable" e2e
+/// lane that never ran `Durable`. Production builds compile the read out with the rest of the
+/// cfg block.
+#[cfg(any(test, feature = "test-utils"))]
+const TN_TEST_MDBX_SYNC_ENV: &str = "TN_TEST_MDBX_SYNC";
+
+/// Resolves the sync mode a `test`/`test-utils` build opens the environment with: the parsed
+/// [`TN_TEST_MDBX_SYNC_ENV`] value when the variable is set, otherwise [`BUILD_SYNC_MODE`]. A
+/// set-but-invalid value (not UTF-8, or a spelling `SyncMode::from_str` rejects) is an error,
+/// never a fallback. Every spelling the parser accepts maps to `Durable` or `SafeNoSync`, so
+/// no environment value can reach `UtterlyNoSync`.
+#[cfg(any(test, feature = "test-utils"))]
+fn resolve_sync_mode(raw: Option<std::ffi::OsString>) -> eyre::Result<reth_libmdbx::SyncMode> {
+    raw.map(|value| {
+        value
+            .into_string()
+            .map_err(|value| eyre::eyre!("{TN_TEST_MDBX_SYNC_ENV} is not valid UTF-8: {value:?}"))
+            .and_then(|value| {
+                value
+                    .parse::<reth_libmdbx::SyncMode>()
+                    .map_err(|err| eyre::eyre!("invalid {TN_TEST_MDBX_SYNC_ENV} value: {err}"))
+            })
+    })
+    .transpose()
+    .map(|parsed| parsed.unwrap_or(BUILD_SYNC_MODE))
+}
 
 impl MdbxDatabase {
     /// Creates a new database at the specified path if it doesn't exist. Does NOT create tables.
@@ -165,11 +196,19 @@ impl MdbxDatabase {
         // separate processes built with `--features tn-storage/test-utils`, where `cfg(test)`
         // is not live, so no CLI plumbing is required to select the mode. Production builds
         // enable neither cfg, so this block is compiled out and the default `Durable` stands.
+        //
+        // #1149: `TN_TEST_MDBX_SYNC` overrides the compiled default at `open`. `durable`
+        // restores the production per-commit fsync regime for the scheduled Durable e2e lane
+        // (and for A/B timing runs like #1142's) with no rebuild; an invalid value fails
+        // `open` outright. The e2e nodes inherit the variable through `std::process::Command`
+        // (the harness never clears the child env), so a CI-level export reaches every
+        // spawned node.
         #[cfg(any(test, feature = "test-utils"))]
         {
             use reth_libmdbx::{EnvironmentFlags, Mode};
+            let sync_mode = resolve_sync_mode(std::env::var_os(TN_TEST_MDBX_SYNC_ENV))?;
             builder.set_flags(EnvironmentFlags {
-                mode: Mode::ReadWrite { sync_mode: BUILD_SYNC_MODE },
+                mode: Mode::ReadWrite { sync_mode },
                 ..Default::default()
             });
         }
@@ -469,27 +508,55 @@ mod test {
         db_simp_bench(db, "MDBX");
     }
 
-    /// #917: under the `test`/`test-utils` cfg the env must open in `SafeNoSync` (no hot-path
-    /// `fsync`) -- specifically not `Durable` (would keep the fsync) and, critically, not
-    /// `UtterlyNoSync` (risks whole-DB corruption on an OS/power crash). The e2e restart suite
-    /// cannot tell the two no-sync modes apart, so this const-assert is the real guard.
+    /// The harness-visible name of a test in this module: the module path minus the leading
+    /// crate-name segment, as libtest prints (and `--exact` matches) it.
+    fn child_test_name(fn_name: &str) -> String {
+        module_path!()
+            .split_once("::")
+            .map_or_else(|| fn_name.to_string(), |(_, module)| format!("{module}::{fn_name}"))
+    }
+
+    /// Runs one `#[ignore]` child test of THIS binary in a fresh process, with
+    /// `TN_TEST_MDBX_SYNC` set to `value` or explicitly removed (`None`). Env mutation in a
+    /// child process cannot race sibling tests in this one. The child's harness output must
+    /// report exactly one passed test: a drifted name would match nothing and still exit 0,
+    /// so exit status alone would be a vacuous pass.
+    fn run_child_test(fn_name: &str, value: Option<&str>) {
+        let exe = std::env::current_exe().expect("test binary path");
+        let name = child_test_name(fn_name);
+        let mut command = std::process::Command::new(exe);
+        command.args(["--exact", name.as_str(), "--ignored"]);
+        // The variable is never inherited: it is removed outright, then set only when this
+        // regime supplies a value, so ambient state cannot leak into any child.
+        command.env_remove(super::TN_TEST_MDBX_SYNC_ENV);
+        value.into_iter().for_each(|value| {
+            command.env(super::TN_TEST_MDBX_SYNC_ENV, value);
+        });
+        let output = command.output().expect("spawn child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child test {name} did not pass exactly once; status {:?}, stdout:\n{stdout}",
+            output.status
+        );
+    }
+
+    /// Child of [`test_open_uses_safe_no_sync_under_test_cfg`], spawned with
+    /// `TN_TEST_MDBX_SYNC` removed from its env: the compiled default must reach MDBX, so the
+    /// opened env reports a non-`Durable` mode (no hot-path fsync). NOTE: MDBX defines
+    /// `MDBX_UTTERLY_NOSYNC = MDBX_SAFE_NOSYNC | <extra bit>`, and reth-libmdbx's `mode()`
+    /// tests the UtterlyNoSync mask before the SafeNoSync one, so it reports `UtterlyNoSync`
+    /// for a genuine `SafeNoSync` env. We therefore assert only "not Durable / not read-only"
+    /// from the readback; the exact-mode guarantee is pinned by the parent's const assert. Do
+    /// not "fix" this into `assert_eq!(mode, ..SafeNoSync)` -- it cannot pass by construction.
     #[test]
-    fn test_open_uses_safe_no_sync_under_test_cfg() {
-        use super::BUILD_SYNC_MODE;
+    #[ignore = "spawned by test_open_uses_safe_no_sync_under_test_cfg with a controlled env"]
+    fn child_open_default_safe_no_sync() {
         use reth_libmdbx::{Mode, SyncMode};
-
-        // Pin the exact compiled mode. `SyncMode` is `PartialEq`, so this catches a drift to
-        // `Durable` (fsync back on) or to `UtterlyNoSync` (recovery broken) -- the latter is the
-        // one the readback below cannot see, so this assert is what guards the hard constraint.
-        assert_eq!(BUILD_SYNC_MODE, SyncMode::SafeNoSync);
-
-        // And prove the flag actually reached MDBX: the opened env reports a non-`Durable` mode,
-        // so the hot-path fsync is genuinely gone. NOTE: MDBX defines
-        // `MDBX_UTTERLY_NOSYNC = MDBX_SAFE_NOSYNC | <extra bit>`, and reth-libmdbx's `mode()`
-        // tests the UtterlyNoSync mask before the SafeNoSync one, so it reports `UtterlyNoSync`
-        // for a genuine `SafeNoSync` env. We therefore assert only "not Durable / not read-only"
-        // from the readback; the exact-mode guarantee is pinned by the const assert above. Do not
-        // "fix" this into `assert_eq!(mode, ..SafeNoSync)` -- it cannot pass by construction.
+        assert!(
+            std::env::var_os(super::TN_TEST_MDBX_SYNC_ENV).is_none(),
+            "this child expects TN_TEST_MDBX_SYNC absent from its env"
+        );
         let temp_dir = tempdir().expect("failed to create temp dir");
         let db = open_db(temp_dir.path());
         let mode = db.inner.info().expect("read env info").mode();
@@ -497,5 +564,103 @@ mod test {
             matches!(mode, Mode::ReadWrite { sync_mode } if sync_mode != SyncMode::Durable),
             "test-build MDBX env must not be Durable (hot-path fsync must be off), got {mode:?}"
         );
+    }
+
+    /// Child of [`test_open_uses_safe_no_sync_under_test_cfg`], spawned with
+    /// `TN_TEST_MDBX_SYNC=durable`: the override must force `Durable` at `open`. `Durable`
+    /// sets no no-sync bits, so the mask caveat on the default child does not apply and the
+    /// read-back is exact.
+    #[test]
+    #[ignore = "spawned by test_open_uses_safe_no_sync_under_test_cfg with a controlled env"]
+    fn child_open_durable_override() {
+        use reth_libmdbx::{Mode, SyncMode};
+        assert_eq!(
+            std::env::var_os(super::TN_TEST_MDBX_SYNC_ENV).as_deref(),
+            Some(std::ffi::OsStr::new("durable")),
+            "this child expects TN_TEST_MDBX_SYNC=durable in its env"
+        );
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_db(temp_dir.path());
+        let mode = db.inner.info().expect("read env info").mode();
+        assert!(
+            matches!(mode, Mode::ReadWrite { sync_mode: SyncMode::Durable }),
+            "TN_TEST_MDBX_SYNC=durable must open the env Durable, got {mode:?}"
+        );
+    }
+
+    /// Child of [`test_open_uses_safe_no_sync_under_test_cfg`], spawned with an invalid
+    /// `TN_TEST_MDBX_SYNC`: `open` must fail outright, and the error must name the variable
+    /// so the failure is attributable to the resolver rather than the environment setup. A
+    /// silent fallback here could green-run a "Durable" e2e lane that never ran Durable.
+    #[test]
+    #[ignore = "spawned by test_open_uses_safe_no_sync_under_test_cfg with a controlled env"]
+    fn child_open_invalid_value_errors() {
+        assert!(
+            std::env::var_os(super::TN_TEST_MDBX_SYNC_ENV).is_some(),
+            "this child expects an invalid TN_TEST_MDBX_SYNC in its env"
+        );
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let result = MdbxDatabase::open(temp_dir.path(), 4, 16 * MEGABYTE, 8 * MEGABYTE);
+        let error = result.err().map(|error| error.to_string()).unwrap_or_default();
+        assert!(
+            error.contains(super::TN_TEST_MDBX_SYNC_ENV),
+            "an invalid TN_TEST_MDBX_SYNC must be a hard error naming the variable, got: \
+             {error:?}"
+        );
+    }
+
+    /// #917/#1149: under the `test`/`test-utils` cfg the env must open in `SafeNoSync` (no
+    /// hot-path `fsync`) -- specifically not `Durable` (would keep the fsync) and, critically,
+    /// not `UtterlyNoSync` (risks whole-DB corruption on an OS/power crash) -- unless
+    /// `TN_TEST_MDBX_SYNC` overrides the mode at runtime: `durable` restores the production
+    /// fsync regime with no rebuild, and an invalid value is a hard error from `open`, never a
+    /// fallback. The e2e restart suite cannot tell the two no-sync modes apart, so the
+    /// const-assert is the real guard for the compiled default.
+    ///
+    /// Each live read-back runs in a CHILD process of this binary (`--exact` plus a controlled
+    /// child env), so no phase ever mutates this process's environment: sibling tests opening
+    /// databases on other threads (plain `cargo test`) can never observe a half-set variable,
+    /// a panicking phase cannot leak a poisoned value (it dies with its child process), and
+    /// the spawn path exercises the same env inheritance the Durable e2e lane relies on.
+    #[test]
+    fn test_open_uses_safe_no_sync_under_test_cfg() {
+        use super::{resolve_sync_mode, BUILD_SYNC_MODE, TN_TEST_MDBX_SYNC_ENV};
+        use reth_libmdbx::SyncMode;
+
+        // Pin the exact compiled mode. `SyncMode` is `PartialEq`, so this catches a drift to
+        // `Durable` (fsync back on) or to `UtterlyNoSync` (recovery broken) -- the latter is the
+        // one the readback below cannot see, so this assert is what guards the hard constraint.
+        assert_eq!(BUILD_SYNC_MODE, SyncMode::SafeNoSync);
+
+        // Pin the documented variable NAME too: the CI lane and the docs reference the
+        // literal, so a drift of the const away from it must fail here.
+        assert_eq!(TN_TEST_MDBX_SYNC_ENV, "TN_TEST_MDBX_SYNC");
+
+        // The resolver, exercised pure (no process-env mutation): unset keeps the compiled
+        // default; `durable` and `safe-no-sync` parse to their modes; garbage, the empty
+        // string, and a non-UTF-8 value are hard errors. `UtterlyNoSync` has no accepted
+        // spelling at all, so no environment value can reach it.
+        assert_eq!(resolve_sync_mode(None).expect("unset env resolves"), BUILD_SYNC_MODE);
+        assert_eq!(
+            resolve_sync_mode(Some("durable".into())).expect("durable resolves"),
+            SyncMode::Durable
+        );
+        assert_eq!(
+            resolve_sync_mode(Some("safe-no-sync".into())).expect("safe-no-sync resolves"),
+            SyncMode::SafeNoSync
+        );
+        assert!(resolve_sync_mode(Some("utterly-no-sync".into())).is_err());
+        assert!(resolve_sync_mode(Some("".into())).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let non_utf8 = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+            assert!(resolve_sync_mode(Some(non_utf8)).is_err());
+        }
+
+        // Live read-backs against a real opened environment, one child process per regime.
+        run_child_test("child_open_default_safe_no_sync", None);
+        run_child_test("child_open_durable_override", Some("durable"));
+        run_child_test("child_open_invalid_value_errors", Some("utterly-no-sync"));
     }
 }

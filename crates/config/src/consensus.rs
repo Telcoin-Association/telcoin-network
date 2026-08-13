@@ -9,7 +9,7 @@ use std::{
 use tn_network_types::local::LocalNetwork;
 use tn_types::{
     Authority, AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Epoch,
-    EpochDigest, Hash as _, HeaderDigest, Multiaddr, NetworkPublicKey, Notifier,
+    EpochDigest, Hash as _, HeaderDigest, Multiaddr, NetworkPublicKey, ShutdownNotifier,
 };
 use tracing::info;
 
@@ -43,7 +43,7 @@ struct ConsensusConfigInner<DB> {
 #[derive(Debug, Clone)]
 pub struct ConsensusConfig<DB> {
     inner: Arc<ConsensusConfigInner<DB>>,
-    shutdown: Notifier,
+    shutdown: ShutdownNotifier,
 }
 
 impl<DB> ConsensusConfig<DB>
@@ -194,7 +194,7 @@ where
         let primary_public_key = key_config.primary_public_key();
         let authority = committee.authority_by_key(&primary_public_key);
 
-        let shutdown = Notifier::new();
+        let shutdown = ShutdownNotifier::new();
         let genesis = Certificate::genesis(&committee)
             .into_iter()
             .map(|cert| (cert.digest(), cert))
@@ -221,7 +221,7 @@ where
     ///
     /// The shutdown notifier can be used to either subscribe to shutdown events
     /// or trigger shutdown across consensus components.
-    pub fn shutdown(&self) -> &Notifier {
+    pub fn shutdown(&self) -> &ShutdownNotifier {
         &self.shutdown
     }
 
