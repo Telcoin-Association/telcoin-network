@@ -147,12 +147,12 @@ pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
 /// (certificate vectors, sub-DAGs, pack records) decode correctly at any nesting depth, and
 /// historical digests are preserved end to end.
 ///
-/// Set to epoch 380 for the #1086 rollout (PR-2, adjusted from the initial 400).
+/// Set to epoch 383 for the #1086 rollout (PR-2, adjusted from the initial 400).
 /// Adjustment-time snapshot: live adiri epoch 379 on 2026-08-12 (latest block 313478,
-/// nonce `>> 32` via rpc.adiri.tel), so 380 begins at the next epoch boundary. That is
+/// nonce `>> 32` via rpc.adiri.tel), so 383 begins at the next epoch boundary. That is
 /// inside the plan's floor of current + 8: every adiri node must run this build before
 /// that boundary closes. No test or CI re-checks the margin: re-verify it against the
-/// live chain at merge time. If epoch 380 has already begun, raise the constant in the
+/// live chain at merge time. If epoch 383 has already begun, raise the constant in the
 /// same PR: headers committed at or past the fork epoch in the legacy seven-field layout
 /// do not decode under this build. The full fork schedule is logged at startup so
 /// operators can diff it across the fleet; a compile-time constant that differs between
@@ -167,7 +167,7 @@ pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
 ///
 /// Non-adiri builds (mainnet) have no dormant period: the field is active from genesis and
 /// this constant does not exist there.
-pub const SEED_SIGNATURE_FORK_EPOCH: Epoch = 380;
+pub const SEED_SIGNATURE_FORK_EPOCH: Epoch = 383;
 
 /// Whether `Header`s of `epoch` carry the `seed_signature` field on the wire and the epoch
 /// seed chain drives the epoch-close committee shuffle (#1032).

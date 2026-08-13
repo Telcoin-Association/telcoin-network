@@ -229,7 +229,7 @@ impl Default for RpcServerArgs {
             ws_allowed_origins: None,
             ws_api: None,
             ipcdisable: false,
-            ipcpath: constants::DEFAULT_IPC_ENDPOINT.to_string(),
+            ipcpath: DEFAULT_IPC_ENDPOINT.to_string(),
             rpc_jwtsecret: None,
             rpc_max_request_size: RPC_DEFAULT_MAX_REQUEST_SIZE_MB.into(),
             rpc_max_response_size: RPC_DEFAULT_MAX_RESPONSE_SIZE_MB.into(),
@@ -314,5 +314,28 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
         let values = RethRpcModule::all_variant_names().iter().map(PossibleValue::new);
         Some(Box::new(values))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::RethCommand;
+    use clap::Parser;
+
+    /// The manual `Default` impl and the clap CLI default must agree on TN's own
+    /// IPC endpoint, not reth's `/tmp/reth.ipc`.
+    #[test]
+    fn default_ipcpath_matches_cli_default() {
+        assert_eq!(RpcServerArgs::default().ipcpath, DEFAULT_IPC_ENDPOINT);
+    }
+
+    /// The mirror-image regression: a bare CLI parse must agree with the manual `Default`
+    /// impl on `ipcpath`, so the clap default cannot drift back to reth's constant either.
+    #[test]
+    fn cli_default_ipcpath_matches_default_impl() -> eyre::Result<()> {
+        let parsed = RethCommand::try_parse_from(["tn-reth"])?;
+        assert_eq!(parsed.rpc.ipcpath, RpcServerArgs::default().ipcpath);
+        Ok(())
     }
 }

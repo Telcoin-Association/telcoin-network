@@ -643,7 +643,7 @@ mod test {
     }
 
     /// An epoch with the V1 (eight-field) wire layout under the running cfg: `u32::MAX` under
-    /// `adiri` (far past the concrete fork epoch, `SEED_SIGNATURE_FORK_EPOCH` = 380, so
+    /// `adiri` (far past the concrete fork epoch, `SEED_SIGNATURE_FORK_EPOCH` = 383, so
     /// fork-active), epoch zero elsewhere (non-adiri is V1 from genesis).
     fn v1_epoch() -> Epoch {
         if cfg!(feature = "adiri") {
@@ -698,7 +698,7 @@ mod test {
     }
 
     /// Epoch of the frozen V1 golden vector: `u32::MAX` is fork-active under BOTH cfgs
-    /// (`adiri` activates at the concrete `SEED_SIGNATURE_FORK_EPOCH` (380), far below
+    /// (`adiri` activates at the concrete `SEED_SIGNATURE_FORK_EPOCH` (383), far below
     /// `u32::MAX`; non-adiri everywhere), so one hex constant pins the V1 wire bytes for
     /// every build.
     const GOLDEN_V1_EPOCH: Epoch = u32::MAX;
