@@ -160,6 +160,10 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
 
                 let runtime = Builder::new_multi_thread()
                     .thread_name("telcoin-network")
+                    // 8 MiB workers instead of tokio's 2 MiB default: consensus futures can
+                    // poll deeply nested state machines, and a worker stack overflow aborts
+                    // the whole process.
+                    .thread_stack_size(8 << 20)
                     .enable_io()
                     .enable_time()
                     .build()?;

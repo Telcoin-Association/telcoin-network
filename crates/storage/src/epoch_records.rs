@@ -12,7 +12,6 @@ use std::{
     hash::BuildHasherDefault,
     io,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::Arc,
     thread::JoinHandle,
     time::Duration,
@@ -42,8 +41,9 @@ use crate::{
 /// Current version of the epoch pack file.
 const EPOCH_PACK_VERSION: u16 = 0;
 
-/// Interval between lookups in the bounded waits [`EpochRecordDb::record_by_epoch_with_timeout`]
-/// and [`EpochRecordDb::cert_by_digest_with_timeout`].
+/// Interval between lookups in the bounded waits [`EpochRecordDb::record_by_epoch_with_timeout`],
+/// [`EpochRecordDb::cert_by_digest_with_timeout`], and
+/// [`EpochRecordDb::certified_record_by_epoch_with_timeout`].
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 enum EpochDbMessage {
@@ -659,7 +659,7 @@ impl EpochRecordDb {
     }
 
     /// Like [`Self::certified_record_by_epoch`], but waits up to `timeout` for the record and
-    /// its certificate to arrive, polling every 200ms (matching
+    /// its certificate to arrive, polling every [`POLL_INTERVAL`] (matching
     /// [`Self::record_by_epoch_with_timeout`]).
     ///
     /// Only the retryable outcomes are waited on (see [`CertifiedRecordError::is_retryable`]):
@@ -668,36 +668,28 @@ impl EpochRecordDb {
     /// append-once per digest, so re-reading can never observe a repaired one. A storage-level
     /// failure ([`CertifiedRecordError::Storage`]) likewise fails immediately: re-reading
     /// corrupt bytes for the full timeout would only relabel corruption as "missing".
+    ///
+    /// Always performs at least one check; the deadline is tested after each check and before
+    /// each sleep, so the wait ends with a lookup at (or just past) the deadline and the final
+    /// (non-retryable or timed-out) error is returned intact. The loop must stay iterative:
+    /// callers park on this wait for minutes at a time, and async recursion here retains one
+    /// poll frame per interval without unwinding, which overflows a worker stack well before
+    /// long deadlines expire.
     pub async fn certified_record_by_epoch_with_timeout(
         &self,
         epoch: Epoch,
         timeout: Duration,
     ) -> Result<EpochRecord, CertifiedRecordError> {
         let deadline = tokio::time::Instant::now() + timeout;
-        self.certified_record_poll(epoch, deadline).await
-    }
-
-    /// Recursive polling body of [`Self::certified_record_by_epoch_with_timeout`].
-    ///
-    /// Boxed because async recursion needs an indirected future type. Always performs at least
-    /// one check, then recurses only while the failure is retryable and `deadline` has not
-    /// passed; the final (non-retryable or timed-out) error is returned to the caller intact.
-    fn certified_record_poll(
-        &self,
-        epoch: Epoch,
-        deadline: tokio::time::Instant,
-    ) -> Pin<Box<dyn Future<Output = Result<EpochRecord, CertifiedRecordError>> + Send + '_>> {
-        Box::pin(async move {
+        loop {
             let outcome = self.certified_record_by_epoch(epoch).await;
             let retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
                 && tokio::time::Instant::now() < deadline;
-            if retry {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                self.certified_record_poll(epoch, deadline).await
-            } else {
-                outcome
+            if !retry {
+                return outcome;
             }
-        })
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     /// Retrieve an [`EpochRecord`] by its digest.
@@ -3242,5 +3234,42 @@ mod test {
             "wronglast",
         )
         .await;
+    }
+
+    /// The certified-record wait must poll with constant stack depth: callers park on it for
+    /// minutes (hundreds of [`POLL_INTERVAL`] lookups), so the whole wait runs here on a
+    /// deliberately tiny 128 KiB thread with paused time. A recursive polling body retains one
+    /// poll frame per interval without unwinding and dies within a few dozen intervals at this
+    /// stack size; the iterative wait must complete all ~1500 simulated intervals and report
+    /// the timed-out miss intact.
+    #[test]
+    fn certified_wait_polls_with_constant_stack() {
+        let waiter = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .start_paused(true)
+                    .build()
+                    .expect("current-thread runtime");
+                runtime.block_on(async {
+                    let dir = TempDir::new().expect("tempdir");
+                    let db = EpochRecordDb::open(dir.path()).expect("open epoch db");
+                    // Nothing is ever stored for epoch 7, so every poll yields the retryable
+                    // MissingRecord until the deadline; paused time auto-advances each sleep.
+                    let res = db
+                        .certified_record_by_epoch_with_timeout(
+                            7,
+                            std::time::Duration::from_secs(300),
+                        )
+                        .await;
+                    assert!(
+                        matches!(res, Err(CertifiedRecordError::MissingRecord(7))),
+                        "expected timed-out MissingRecord, got {res:?}"
+                    );
+                });
+            })
+            .expect("spawn small-stack thread");
+        waiter.join().expect("certified wait must not overflow a 128 KiB stack");
     }
 }
