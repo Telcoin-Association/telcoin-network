@@ -24,7 +24,10 @@ use state_sync::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_recen
 use std::{collections::BTreeMap, future::ready, sync::Arc};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, TelcoinDirs};
 use tn_network_libp2p::{types::NetworkEvent, ConsensusNetwork};
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, NodeMode, QueChannel};
+use tn_primary::{
+    network::{spawn_epoch_vote_ingress, PrimaryEventRouter, PrimaryNetworkHandle},
+    ConsensusBusApp, NodeMode, QueChannel,
+};
 use tn_reth::{system_calls::EpochState, RethDb, RethEnv};
 use tn_storage::{consensus::ConsensusChain, open_db, DatabaseType};
 use tn_types::{
@@ -723,7 +726,8 @@ where
         // network builder, the gossip handles, and the gossip-validation handlers.
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
-        self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
+        let event_router =
+            self.spawn_node_networks(node_task_spawner, &network_config, epoch).await?;
         let primary_network_handle =
             self.primary_network_handle.as_ref().expect("primary network").clone();
         // `epoch_vote_topic` and `consensus_output_topic` are committee-only publish topics, so
@@ -750,6 +754,18 @@ where
             self.key_config.clone(),
             primary_network_handle.clone(),
             node_task_manager.get_spawner(),
+            self.node_shutdown.subscribe(),
+        );
+
+        // Node-lifetime consumer for the router's diverted epoch-vote gossip: verifies votes and
+        // feeds the collector above. Outliving every epoch (and running while the node parks on
+        // a previous epoch's certificate) is the point — the epoch-scoped PrimaryNetwork is torn
+        // down at each boundary right when peers' votes for the closing epoch arrive.
+        spawn_epoch_vote_ingress(
+            &event_router,
+            self.consensus_chain.clone(),
+            self.consensus_bus.clone(),
+            &node_task_manager.get_spawner(),
             self.node_shutdown.subscribe(),
         );
 
@@ -952,12 +968,18 @@ where
     /// Each swarm runs as a critical task until node shutdown. The resulting network handles are
     /// stored on the manager for use by every epoch; the worker handle is seeded with the starting
     /// `epoch` and its task spawner is refreshed on each epoch transition.
+    ///
+    /// The primary swarm's event sink is a [`PrimaryEventRouter`] wrapping the bus's
+    /// `primary_network_events`: epoch-vote gossip diverts to the node-lifetime ingress task
+    /// (spawned by the caller via [`spawn_epoch_vote_ingress`]), everything else passes through
+    /// to the epoch-scoped `PrimaryNetwork` unchanged. The router is returned so the caller can
+    /// attach that ingress.
     async fn spawn_node_networks(
         &mut self,
         node_task_spawner: TaskSpawner,
         network_config: &NetworkConfig,
         epoch: Epoch,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<PrimaryEventRouter> {
         // Reject an invalid peer-score config before it is installed into the process-global,
         // first-write-wins `GLOBAL_SCORE_CONFIG` by the `PeerManager` built below
         // (`init_peer_score_config`). This is the boot-path install funnel, so validating here
@@ -973,10 +995,17 @@ where
         //=== PRIMARY
         //
 
+        // Route the primary swarm's events: epoch-vote gossip to the node-lifetime ingress,
+        // everything else through to `primary_network_events` bit-identically.
+        let event_router = PrimaryEventRouter::new(
+            self.consensus_bus.primary_network_events_cloned(),
+            network_config.chain_id(),
+        );
+
         // create long-running network task for primary
         let primary_network = ConsensusNetwork::new_for_primary(
             network_config,
-            self.consensus_bus.primary_network_events_cloned(),
+            event_router.clone(),
             self.key_config.clone(),
             self.consensus_db.clone(),
             node_task_spawner.clone(),
@@ -1082,7 +1111,7 @@ where
             network_config.chain_id(),
         ));
 
-        Ok(())
+        Ok(event_router)
     }
 
     /// Loop, starting a new epoch on each iteration until shutdown.

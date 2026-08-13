@@ -40,6 +40,8 @@ use tracing::{debug, info, warn};
 pub mod handler;
 mod message;
 mod sync_codec;
+mod vote_ingress;
+pub use vote_ingress::{spawn_epoch_vote_ingress, PrimaryEventRouter};
 
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]

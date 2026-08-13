@@ -72,10 +72,6 @@ struct ConsensusCertTally {
     signers: HashSet<BlsPublicKey>,
 }
 
-/// Dedup key for an epoch vote at ingress: `(author, epoch, epoch-record hash)`. See the
-/// `epoch_votes_seen` field and issue #898.
-type EpochVoteKey = (BlsPublicKey, Epoch, EpochDigest);
-
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
 pub(crate) struct RequestHandler<DB> {
@@ -99,15 +95,10 @@ pub(crate) struct RequestHandler<DB> {
     consensus_certs: Arc<Mutex<HashMap<ConsensusResultDigest, ConsensusCertTally>>>,
     /// Deduplicate epoch votes at ingress, keyed on `(author, epoch, epoch-record hash)`.
     ///
-    /// The value is a monotonic recency sequence used to evict the least-recently-seen entry
-    /// once the map reaches [`MAX_EPOCH_VOTES`](super::MAX_EPOCH_VOTES), bounding memory
-    /// against a vote flood. A key is inserted only after its signature verifies, so this gate
-    /// skips repeated verifies of an already-accepted vote without letting a bad-signature vote
-    /// poison the slot of the real author. The `epoch` field is part of the key even though it is
-    /// not covered by the vote signature: this ensures a replay that tampers with `vote.epoch`
-    /// lands on a different key and cannot evict/pre-empt the real vote's slot. See the
-    /// `PrimaryGossip::EpochVote` handler and issue #898.
-    epoch_votes_seen: Arc<Mutex<HashMap<EpochVoteKey, u64>>>,
+    /// The bounded LRU semantics live in [`EpochVotesSeen`](super::vote_ingress); this instance
+    /// backs the handler's vestigial `PrimaryGossip::EpochVote` arm, which is retained as
+    /// defense-in-depth behind the node-lifetime vote ingress. See issue #898.
+    epoch_votes_seen: Arc<super::vote_ingress::EpochVotesSeen>,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
 }
@@ -256,35 +247,17 @@ where
     }
 
     /// True if a vote for this `(author, epoch, epoch-record)` has already been verified and
-    /// forwarded.
-    ///
-    /// Cheap read used as a pre-verify gate: an accepted vote is re-gossiped by its author on a
-    /// timer and duplicated by the gossip mesh, so this caps repeated BLS verifies of the same
-    /// valid vote. See [`RequestHandler::record_epoch_vote`] and issue #898.
+    /// forwarded. Delegates to the shared [`EpochVotesSeen`](super::vote_ingress) gate; see
+    /// [`RequestHandler::record_epoch_vote`] and issue #898.
     fn epoch_vote_seen(&self, author: BlsPublicKey, epoch: Epoch, epoch_hash: EpochDigest) -> bool {
-        self.epoch_votes_seen.lock().contains_key(&(author, epoch, epoch_hash))
+        self.epoch_votes_seen.contains(author, epoch, epoch_hash)
     }
 
     /// Record a verified `(author, epoch, epoch-record)` vote so later replays are dropped before
-    /// the signature check.
-    ///
-    /// Callers MUST invoke this only after [`EpochVote::check_signature`] succeeds: recording a
-    /// bad-signature vote would let a Byzantine committee publisher poison the slot of the real
-    /// author and suppress their vote. Eviction is least-recently-seen once the map reaches
-    /// [`MAX_EPOCH_VOTES`](super::MAX_EPOCH_VOTES), so a flood of distinct keys cannot grow it
-    /// without bound; a false negative after eviction only costs one extra verify (the collector
-    /// dedups per signer downstream), never a dropped honest vote.
+    /// the signature check. Callers MUST invoke this only after [`EpochVote::check_signature`]
+    /// succeeds; see [`EpochVotesSeen::record`](super::vote_ingress) for the LRU bounds.
     fn record_epoch_vote(&self, author: BlsPublicKey, epoch: Epoch, epoch_hash: EpochDigest) {
-        let key = (author, epoch, epoch_hash);
-        let mut guard = self.epoch_votes_seen.lock();
-        let next_seq = guard.values().copied().max().unwrap_or(0) + 1;
-        if guard.len() >= super::MAX_EPOCH_VOTES && !guard.contains_key(&key) {
-            let evict = guard.iter().min_by_key(|entry| *entry.1).map(|entry| *entry.0);
-            if let Some(evict) = evict {
-                guard.remove(&evict);
-            }
-        }
-        guard.insert(key, next_seq);
+        self.epoch_votes_seen.record(author, epoch, epoch_hash)
     }
 
     /// Process gossip from the committee.
@@ -495,6 +468,11 @@ where
                 }
             }
             PrimaryGossip::EpochVote(vote) => {
+                // VESTIGIAL, kept as defense-in-depth: epoch-vote gossip is diverted to the
+                // node-lifetime ingress task by `PrimaryEventRouter` (see `vote_ingress`) before
+                // it can reach `primary_network_events`, so this arm only runs if that routing is
+                // ever bypassed. It must stay behavior-identical to the ingress gates.
+                //
                 // Uniform gate ordering (issue #898): run the cheap, attacker-independent checks
                 // before the expensive BLS verify so unauthorized or duplicate votes are dropped
                 // without consuming verification resources.
