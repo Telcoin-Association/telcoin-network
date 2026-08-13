@@ -1,0 +1,97 @@
+# Scheduled Durable-mode e2e lane (#1149, follow-up to #982 / #917).
+#
+# PR CI runs the e2e suites with the test-build MDBX default (`SafeNoSync`, no hot-path
+# fsync; see crates/storage/src/mdbx/database.rs). That removed the Durable timing regime
+# -- where the externalization barriers (`persist().await` before a certificate, header,
+# or vote goes on the wire) wait on a real per-commit flush that races the proposer
+# timers -- from every test run. This lane restores that regime on a schedule by
+# exporting TN_TEST_MDBX_SYNC=durable, which every spawned node process inherits, at
+# zero wall-clock cost to PR CI. An invalid value fails MdbxDatabase::open outright, so
+# a typo here cannot green-run the wrong sync regime.
+#
+# The timings of the two suite steps, compared against a `safe-no-sync` dispatch run on
+# the same runner class, give the #917 acceptance measurement (Durable-vs-SafeNoSync
+# wall clock on a CI disk): post the first numbers on #1149. The untimed build step ahead
+# of them absorbs every compile (node binary and all test binaries) plus the cache state,
+# so the timed steps measure test execution only and the A/B pair stays comparable even
+# when one side runs cold.
+name: Durable e2e
+
+on:
+  schedule:
+    # Nightly at 08:17 UTC, off the top of the hour to dodge the scheduled-load spike.
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+    inputs:
+      sync_mode:
+        description: "TN_TEST_MDBX_SYNC value for the spawned nodes"
+        type: choice
+        options:
+          - durable
+          - safe-no-sync
+        default: durable
+
+# The job only reads the repository (checkout + build + test); the token gets no
+# write scopes (least privilege, CodeQL actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings -D unused_extern_crates"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  durable-e2e:
+    runs-on: ubuntu-latest
+    # Covers a cold cache: full workspace test-binary build plus both e2e suites run
+    # serialized (nextest pins the e2e group to max-threads 1) in the slower Durable regime.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          shared-key: durable-e2e-cache
+          cache-on-failure: "true"
+
+      # Untimed: absorbs the node-binary build and every workspace test-binary compile, and
+      # validates the committed lockfile (`fetch --locked` fails on drift, matching the
+      # `--locked` discipline of pr.yaml), so the timed suite steps below are compile-free.
+      # TN_TEST_MDBX_SYNC is scoped to the suite steps, not exported job-wide: a build needs
+      # no override, and a future "variable must be unset" test (the
+      # TN_SEED_SIGNATURE_FORK_EPOCH pattern in the Makefile) must not inherit it.
+      - name: Build node binary and test binaries (untimed)
+        run: |
+          cargo fetch --locked
+          make build-e2e-bin
+          cargo nextest run --no-run --locked --workspace
+
+      - name: Run restart e2e tests
+        env:
+          # Scheduled runs get `durable`; a manual dispatch may select either side of the A/B.
+          TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
+        run: make test-restarts
+
+      - name: Run epoch e2e tests
+        env:
+          TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
+        run: make test-epochs
+
+      - name: Assert lockfile unchanged
+        run: git diff --exit-code -- Cargo.lock

@@ -148,6 +148,12 @@ TN_SEED_SIGNATURE_FORK_EPOCH ?= 4294967295
 test-restarts: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
+# run epoch integration tests (same filter as the public-tests epoch line). The scheduled
+# Durable e2e lane (#1149) runs this and test-restarts with TN_TEST_MDBX_SYNC=durable
+# exported so every spawned node opens MDBX in Durable.
+test-epochs: build-e2e-bin
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+
 # run e2e tests
 test-e2e: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
