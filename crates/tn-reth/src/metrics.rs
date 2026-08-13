@@ -109,14 +109,19 @@ pub(crate) struct RethEnvMetrics {
 /// registration in [`ForwarderMetrics::init`] and the increments below cannot drift apart.
 const FORWARDED_BATCHES_SHED: &str = "tn_reth.forwarded_batches_shed_total";
 const FORWARDED_TXNS_ABANDONED: &str = "tn_reth.forwarded_txns_abandoned_total";
+const FORWARDED_REJECTIONS_OVERRIDDEN: &str = "tn_reth.forwarded_rejections_overridden_total";
 
 /// Metrics for the observer transaction forwarder ([`crate::WorkerRpcForwarder`]).
 ///
-/// Both series count forwarding work the node deliberately gives up on to keep its own
-/// resource use bounded. Forwarding is best-effort, so shedding is a correct outcome rather
-/// than an error - but it is an *absorbed* failure, invisible until it is not, which is
-/// exactly the category that needs to show up somewhere other than a `warn!` line. Transactions
-/// counted here were accepted by this node's RPC and never handed to a validator.
+/// The shed and abandoned series count forwarding work the node deliberately gives up on to
+/// keep its own resource use bounded. Forwarding is best-effort, so shedding is a correct
+/// outcome rather than an error - but it is an *absorbed* failure, invisible until it is not,
+/// which is exactly the category that needs to show up somewhere other than a `warn!` line.
+/// Transactions counted there were accepted by this node's RPC and never handed to a validator.
+///
+/// The overridden series is different in kind: it counts validator verdicts that contradicted
+/// each other on one transaction, which is an integrity signal about the committee rather than
+/// a resource decision by this node (issue #1167).
 ///
 /// Associated functions rather than instance handles, matching the epoch manager's
 /// `record_provider_fault_retry`: the emission sites are inside a spawned task that holds no
@@ -136,6 +141,7 @@ impl ForwarderMetrics {
     pub(crate) fn init() {
         metrics::counter!(FORWARDED_BATCHES_SHED).increment(0);
         metrics::counter!(FORWARDED_TXNS_ABANDONED).increment(0);
+        metrics::counter!(FORWARDED_REJECTIONS_OVERRIDDEN).increment(0);
     }
 
     /// Count one sealed batch dropped without being forwarded because every forward permit was
@@ -155,6 +161,19 @@ impl ForwarderMetrics {
     /// could not be walked inside its budget.
     pub(crate) fn record_txns_abandoned(count: u64) {
         metrics::counter!(FORWARDED_TXNS_ABANDONED).increment(count);
+    }
+
+    /// Count one considered rejection that a later validator contradicted by accepting the
+    /// same transaction (issue #1167).
+    ///
+    /// Alertable on a sustained rate. Honest validators share consensus state, so their
+    /// verdicts on one transaction should agree; a rejection followed by an acceptance means
+    /// the rejecting validator answered from divergent state or lied. A rare blip can be an
+    /// honest race (the sender's account state moved between the two calls); a sustained rate,
+    /// or any rate whose `rejected_by` log lines point at one validator, is a byzantine
+    /// signal.
+    pub(crate) fn record_rejection_overridden() {
+        metrics::counter!(FORWARDED_REJECTIONS_OVERRIDDEN).increment(1);
     }
 }
 
