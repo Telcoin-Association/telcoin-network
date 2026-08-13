@@ -196,6 +196,7 @@ tn-test-utils-committee = { path = "./crates/test-utils-committee" }
 
 # misc
 match_opt = "0.1.2"
+memmap2 = "0.9"
 serde = { version = "^1.0", features = ["derive", "rc"] }
 serde_repr = "0.1"
 rand = "0.9"
