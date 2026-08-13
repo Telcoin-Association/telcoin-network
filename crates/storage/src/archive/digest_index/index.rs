@@ -15,11 +15,11 @@ use crate::archive::{
     },
     fxhasher::{FxHashMap, FxHasher},
     index::Index,
-    pack::{DataHeader, DATA_HEADER_BYTES},
+    pack::{DataHeader, FileBackend, PackFileIo, DATA_HEADER_BYTES},
 };
 use std::{
     collections::{BTreeSet, VecDeque},
-    fs::{self, File, OpenOptions},
+    fs,
     hash::{BuildHasher, BuildHasherDefault},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -73,7 +73,7 @@ impl HdxHeader {
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    fn load_header(hdx_file: &mut File) -> Result<Self, LoadHeaderError> {
+    fn load_header(hdx_file: &mut dyn PackFileIo) -> Result<Self, LoadHeaderError> {
         hdx_file.rewind()?;
         let mut buffer = [0_u8; HEADER_SIZE];
         let mut buf16 = [0_u8; 2];
@@ -140,7 +140,7 @@ impl HdxHeader {
     }
 
     /// Write this header to sync at current seek position.
-    fn write_header(&mut self, hdx_file: &mut File) -> Result<(), io::Error> {
+    fn write_header(&mut self, hdx_file: &mut dyn PackFileIo) -> Result<(), io::Error> {
         hdx_file.rewind()?;
         let header_size = self.header_size();
         let mut buffer = vec![0_u8; header_size];
@@ -249,9 +249,9 @@ pub struct HdxIndex<
     /// Maintain a fifo of cached buckets.  This is a simple way to make sure the cache is not the
     /// entire set of buckets (bounded by disk space).
     bucket_cache_fifo: VecDeque<u64>,
-    hdx_file: File,
+    hdx_file: Box<dyn PackFileIo>,
     // Note, if odx_file is ever replaced in HdxIndex then see bucket_iter for undefined behaviour.
-    pub(crate) odx_file: File,
+    pub(crate) odx_file: Box<dyn PackFileIo>,
     capacity: u64,
     hasher_builder: S,
     read_only: bool,
@@ -285,6 +285,24 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         hasher_builder: S,
         read_only: bool,
     ) -> Result<HdxIndex<KSIZE, S>, LoadHeaderError> {
+        Self::open_hdx_file_with_backend(
+            dir,
+            data_header,
+            hasher_builder,
+            read_only,
+            FileBackend::default(),
+        )
+    }
+
+    /// Like [`Self::open_hdx_file`] but selecting the on-disk file `backend`: buffered raw [`File`]
+    /// (random-overwrite) or a random-write memory-mapped file.
+    pub fn open_hdx_file_with_backend<P: AsRef<Path>>(
+        dir: P,
+        data_header: &DataHeader,
+        hasher_builder: S,
+        read_only: bool,
+        backend: FileBackend,
+    ) -> Result<HdxIndex<KSIZE, S>, LoadHeaderError> {
         let dir = dir.as_ref();
         let dir_created = fs::create_dir(dir).is_ok();
         if dir_created {
@@ -293,16 +311,8 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 let _ = fsync_directory(parent);
             }
         }
-        let mut hdx_file = if read_only {
-            OpenOptions::new().read(true).write(false).open(dir.join("index.hdx"))?
-        } else {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(dir.join("index.hdx"))?
-        };
+        // hdx does random-offset overwrites (not append), so `append = false`.
+        let mut hdx_file = backend.open_boxed_random(dir.join("index.hdx"), read_only, false)?;
         let file_end = hdx_file.seek(SeekFrom::End(0))?;
 
         let (header, bloom) = if file_end == 0 {
@@ -312,7 +322,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let salt = hasher_builder.hash_one(data_header.uid());
             let pepper = hasher_builder.hash_one(salt);
             let mut header = HdxHeader::from_data_header::<KSIZE, S>(data_header, salt, pepper);
-            header.write_header(&mut hdx_file)?;
+            header.write_header(&mut *hdx_file)?;
             let bloom = Bloom::new();
             hdx_file.write_all(bloom.data())?;
             let bucket_size = header.bucket_size() as usize;
@@ -333,7 +343,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let _ = fsync_directory(dir);
             (header, bloom)
         } else {
-            let header = HdxHeader::load_header(&mut hdx_file)?;
+            let header = HdxHeader::load_header(&mut *hdx_file)?;
             // Basic validation of the odx header.
             if header.version() != data_header.version() {
                 return Err(LoadHeaderError::InvalidIndexVersion);
@@ -371,6 +381,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             header.appnum(),
             dir.join("index.odx"),
             read_only,
+            backend,
         )?;
         // Don't want buckets and modulus to be the same, so +1
         let modulus = (header.buckets + 1).next_power_of_two();
@@ -447,7 +458,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
 
     /// Write the indexes header and bloom filter to disk.
     fn write_header(&mut self) -> Result<(), io::Error> {
-        self.header.write_header(&mut self.hdx_file)?;
+        self.header.write_header(&mut *self.hdx_file)?;
         self.hdx_file.seek(SeekFrom::Start(self.header.header_size() as u64))?;
         self.hdx_file.write_all(self.bloom.data())?;
         Ok(())
@@ -859,6 +870,61 @@ mod tests {
             let hash = B256::from_slice(hasher.finalize().as_bytes());
             assert!(idx.test_bloom_contains(hash));
             assert_eq!(idx.load(hash).expect("load idx"), i);
+        }
+    }
+
+    /// The same lifecycle on the memory-mapped **random-write** backend: fill (forcing bucket
+    /// splits, i.e. random-offset overwrites + file growth), look up, reopen for append and add
+    /// more, then reopen read-only and re-verify every key. Exercises the mmap hdx (overwrite) and
+    /// odx (append) paths.
+    #[test]
+    fn test_archive_hdx_index_mmap_backend() {
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_mmap").expect("temp dir");
+        let tmp_path = tmp_dir.path();
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        let key = |i: u64| {
+            let mut hasher = DefaultHashFunction::new();
+            hasher.update(&format!("idx-{i}").into_bytes());
+            B256::from_slice(hasher.finalize().as_bytes())
+        };
+        // Enough to blow past the 1000 initial buckets (× 32 elements) and force splits.
+        const N: u64 = 50_000;
+        const MORE: u64 = N + 1_000;
+        let open = |read_only: bool| -> HdxIndex {
+            HdxIndex::open_hdx_file_with_backend(
+                tmp_path.join("index.hdx"),
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                read_only,
+                FileBackend::Mmap,
+            )
+            .expect("hdx mmap")
+        };
+
+        {
+            let mut idx = open(false);
+            for i in 0..N {
+                idx.save(key(i), i).unwrap_or_else(|e| panic!("save {i}: {e}"));
+            }
+            for i in 0..N {
+                assert_eq!(idx.load(key(i)).unwrap_or_else(|e| panic!("load {i}: {e}")), i);
+            }
+        }
+        // Reopen for append on the mmap backend, add more, verify old + new, sync.
+        {
+            let mut idx = open(false);
+            for i in N..MORE {
+                idx.save(key(i), i).expect("save more");
+            }
+            for i in 0..MORE {
+                assert_eq!(idx.load(key(i)).expect("load"), i);
+            }
+            idx.sync().expect("sync");
+        }
+        // Reopen read-only on the mmap backend and re-verify everything.
+        let mut idx = open(true);
+        for i in 0..MORE {
+            assert_eq!(idx.load(key(i)).expect("load ro"), i);
         }
     }
 

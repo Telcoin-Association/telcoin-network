@@ -14,7 +14,11 @@ use crate::archive::{
     pack_iter::{PackIter, MAX_RECORD_SIZE},
 };
 
-use super::{crc::add_crc32, data_file::DataFile, data_file_mmap::MmapDataFile};
+use super::{
+    crc::add_crc32,
+    data_file::DataFile,
+    data_file_mmap::{MmapDataFile, MmapFileOptions, WriteMode},
+};
 use std::{
     fmt::Debug,
     fs::{self, File},
@@ -108,9 +112,40 @@ impl PackFileIo for MmapDataFile {
     }
 }
 
+/// Raw [`File`] as a `PackFileIo`, for the **non-mmap** digest index (whose hash buckets are
+/// overwritten in place — random-write semantics we deliberately keep out of the append-only
+/// `DataFile`). The digest index only uses `Read`/`Write`/`Seek`/`sync_all`; `path`/`rename` are not
+/// meaningful for a bare `File` (it tracks no path) and are never called on the digest files.
+impl PackFileIo for File {
+    fn len(&self) -> u64 {
+        File::metadata(self).map(|m| m.len()).unwrap_or(0)
+    }
+    fn data_file_end(&self) -> u64 {
+        File::metadata(self).map(|m| m.len()).unwrap_or(0)
+    }
+    fn set_len(&mut self, len: u64) -> io::Result<()> {
+        File::set_len(self, len)
+    }
+    fn try_clone(&self) -> io::Result<File> {
+        File::try_clone(self)
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        File::sync_all(self)
+    }
+    fn path(&self) -> &Path {
+        Path::new("")
+    }
+    fn rename(&mut self, _path: &Path) -> Result<(), RenameError> {
+        Err(RenameError::RenameIO(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "rename is not supported for the raw File backend",
+        )))
+    }
+}
+
 impl FileBackend {
     /// Open `path` on this backend, boxed as a [`PackFileIo`]. Shared by the pack data file and the
-    /// position index.
+    /// position index (append-only).
     pub fn open_boxed<P: AsRef<Path>>(
         self,
         path: P,
@@ -119,6 +154,40 @@ impl FileBackend {
         match self {
             FileBackend::Buffered => Ok(Box::new(DataFile::open(path, read_only)?)),
             FileBackend::Mmap => Ok(Box::new(MmapDataFile::open(path, read_only)?)),
+        }
+    }
+
+    /// Open `path` for **random-access overwrite** IO, boxed as a [`PackFileIo`] — for the digest
+    /// index. `Buffered` uses a raw [`File`]; `Mmap` uses a random-write [`MmapDataFile`]. `append`
+    /// picks the raw-`File` open mode for the buffered case (hdx: random-overwrite; odx: append);
+    /// the mmap case drives its position explicitly via `seek`, so `append` is ignored there.
+    pub fn open_boxed_random<P: AsRef<Path>>(
+        self,
+        path: P,
+        read_only: bool,
+        append: bool,
+    ) -> io::Result<Box<dyn PackFileIo>> {
+        match self {
+            FileBackend::Buffered => {
+                let path = path.as_ref();
+                let file = if read_only {
+                    fs::OpenOptions::new().read(true).write(false).open(path)?
+                } else if append {
+                    fs::OpenOptions::new().read(true).append(true).create(true).open(path)?
+                } else {
+                    fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(path)?
+                };
+                Ok(Box::new(file))
+            }
+            FileBackend::Mmap => {
+                let opts = MmapFileOptions { write_mode: WriteMode::Random, ..Default::default() };
+                Ok(Box::new(MmapDataFile::open_with(path, read_only, opts)?))
+            }
         }
     }
 }

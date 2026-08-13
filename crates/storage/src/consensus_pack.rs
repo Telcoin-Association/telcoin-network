@@ -848,19 +848,21 @@ impl Inner {
         }
         let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut consensus_digests = HdxIndex::open_hdx_file(
+        let mut consensus_digests = HdxIndex::open_hdx_file_with_backend(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
             data.header(),
             builder,
             false,
+            backend,
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut batch_digests = HdxIndex::open_hdx_file(
+        let mut batch_digests = HdxIndex::open_hdx_file_with_backend(
             base_dir.join(Self::BATCH_HASH_NAME),
             data.header(),
             builder,
             false,
+            backend,
         )
         .map_err(OpenError::IndexFileOpen)?;
         if !have_pack {
@@ -901,19 +903,21 @@ impl Inner {
             .into_epoch()?;
         let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut consensus_digests = HdxIndex::open_hdx_file(
+        let mut consensus_digests = HdxIndex::open_hdx_file_with_backend(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
             data.header(),
             builder,
             false,
+            backend,
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut batch_digests = HdxIndex::open_hdx_file(
+        let mut batch_digests = HdxIndex::open_hdx_file_with_backend(
             base_dir.join(Self::BATCH_HASH_NAME),
             data.header(),
             builder,
             false,
+            backend,
         )
         .map_err(OpenError::IndexFileOpen)?;
 
@@ -949,19 +953,21 @@ impl Inner {
             .into_epoch()?;
         let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), true, backend)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let consensus_digests = HdxIndex::open_hdx_file(
+        let consensus_digests = HdxIndex::open_hdx_file_with_backend(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
             data.header(),
             builder,
             true,
+            backend,
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let batch_digests = HdxIndex::open_hdx_file(
+        let batch_digests = HdxIndex::open_hdx_file_with_backend(
             base_dir.join(Self::BATCH_HASH_NAME),
             data.header(),
             builder,
             true,
+            backend,
         )
         .map_err(OpenError::IndexFileOpen)?;
 
@@ -1010,19 +1016,21 @@ impl Inner {
             .map_err(|e| PackError::Append(e.to_string()))?;
         let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let consensus_digests = HdxIndex::open_hdx_file(
+        let consensus_digests = HdxIndex::open_hdx_file_with_backend(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
             data.header(),
             builder,
             false,
+            backend,
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let batch_digests = HdxIndex::open_hdx_file(
+        let batch_digests = HdxIndex::open_hdx_file_with_backend(
             base_dir.join(Self::BATCH_HASH_NAME),
             data.header(),
             builder,
             false,
+            backend,
         )
         .map_err(OpenError::IndexFileOpen)?;
         let mut parent_digest_expectation = if epoch == 0 {
@@ -2443,15 +2451,36 @@ pub(crate) mod test {
             let db = pack.get_consensus_output(i as u64 + 1).await.expect("read back");
             compare_outputs(&db, output);
         }
+        // Exercise the mmap digest index (hdx + odx overflow): every header and batch digest must
+        // resolve through the hash index.
+        for output in &outputs {
+            assert!(
+                pack.contains_consensus_header(output.consensus_header_hash()).await,
+                "header digest must be found in the mmap hdx",
+            );
+            for batch_digest in output.batch_digests() {
+                assert!(
+                    pack.contains_batch(*batch_digest).await,
+                    "batch digest must be found in the mmap hdx",
+                );
+            }
+        }
         pack.persist().await.expect("persist");
         drop(pack);
 
-        // Reopen the finished pack read-only on the mmap backend and re-verify every output.
+        // Reopen the finished pack read-only on the mmap backend and re-verify every output and a
+        // digest lookup (the reopened mmap hdx/odx).
         let pack = ConsensusPack::open_static_with_backend(temp_dir.path(), 0, FileBackend::Mmap)
             .expect("open static mmap");
         for (i, output) in outputs.iter().enumerate() {
             let db = pack.get_consensus_output(i as u64 + 1).await.expect("read back static");
             compare_outputs(&db, output);
+        }
+        for output in &outputs {
+            assert!(
+                pack.contains_consensus_header(output.consensus_header_hash()).await,
+                "header digest must be found after mmap reopen",
+            );
         }
     }
 

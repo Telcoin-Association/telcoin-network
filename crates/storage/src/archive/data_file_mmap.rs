@@ -61,7 +61,20 @@ pub enum GrowMode {
     Segment,
 }
 
-/// Options controlling the mmap-backed file's allocation and growth.
+/// Where [`MmapDataFile::write`] places bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteMode {
+    /// Writes always go to the logical `end` (append log). The default — used by the pack data file
+    /// and the position index.
+    #[default]
+    Append,
+    /// Writes go to the current seek position (overwrite), extending the high-water `end` only when
+    /// they pass it. Used by the digest index (fixed-layout hash buckets overwritten in place, plus
+    /// its append-only overflow log driven by explicit `seek(End)`).
+    Random,
+}
+
+/// Options controlling the mmap-backed file's allocation, growth, and write placement.
 #[derive(Debug, Clone, Copy)]
 pub struct MmapFileOptions {
     /// Bytes the file is first grown to on the first write; growth is geometric from here.
@@ -71,6 +84,8 @@ pub struct MmapFileOptions {
     pub max_map_size: u64,
     /// Behaviour when a mapping reaches `max_map_size`.
     pub grow_mode: GrowMode,
+    /// Append vs random-overwrite write placement (see [`WriteMode`]).
+    pub write_mode: WriteMode,
 }
 
 impl Default for MmapFileOptions {
@@ -79,6 +94,7 @@ impl Default for MmapFileOptions {
             initial_size: DEFAULT_INITIAL_SIZE,
             max_map_size: DEFAULT_MAX_MAP_SIZE,
             grow_mode: GrowMode::Reopen,
+            write_mode: WriteMode::Append,
         }
     }
 }
@@ -411,8 +427,9 @@ impl Seek for MmapDataFile {
 }
 
 impl Write for MmapDataFile {
-    /// Append `buf` at the logical end (writes always append, regardless of seek position), growing
-    /// the mapping if required.
+    /// Place `buf` per the configured [`WriteMode`]: at the logical end ([`WriteMode::Append`],
+    /// ignoring the seek position) or at the current seek position ([`WriteMode::Random`], extending
+    /// the high-water `end` when it passes it), growing the mapping if required.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.read_only {
             return Err(io::Error::new(
@@ -424,13 +441,23 @@ impl Write for MmapDataFile {
             return Ok(0);
         }
         let n = buf.len() as u64;
-        self.ensure_capacity(self.end + n)?;
-        let start = self.end as usize;
+        let start = match self.opts.write_mode {
+            WriteMode::Append => self.end,
+            WriteMode::Random => self.seek_pos,
+        };
+        self.ensure_capacity(start + n)?;
+        let start_us = start as usize;
         match &mut self.backing {
-            Backing::Rw(map) => map[start..start + buf.len()].copy_from_slice(buf),
+            Backing::Rw(map) => map[start_us..start_us + buf.len()].copy_from_slice(buf),
             _ => return Err(io::Error::other("no writable mapping")),
         }
-        self.end += n;
+        match self.opts.write_mode {
+            WriteMode::Append => self.end += n,
+            WriteMode::Random => {
+                self.seek_pos += n;
+                self.end = self.end.max(self.seek_pos);
+            }
+        }
         Ok(buf.len())
     }
 
@@ -496,7 +523,58 @@ mod tests {
     }
 
     fn tiny_opts() -> MmapFileOptions {
-        MmapFileOptions { initial_size: 64, max_map_size: 128, grow_mode: GrowMode::Reopen }
+        MmapFileOptions {
+            initial_size: 64,
+            max_map_size: 128,
+            grow_mode: GrowMode::Reopen,
+            write_mode: WriteMode::Append,
+        }
+    }
+
+    fn random_opts() -> MmapFileOptions {
+        MmapFileOptions {
+            initial_size: 64,
+            max_map_size: 128,
+            grow_mode: GrowMode::Reopen,
+            write_mode: WriteMode::Random,
+        }
+    }
+
+    /// The digest-index write pattern: sequential fill, in-place overwrite, and extend-at-end.
+    #[test]
+    fn random_write_overwrites_and_extends() {
+        let tmp = TempDir::with_prefix("mmap_df_random_write").expect("temp dir");
+        let path = tmp.path().join("data");
+        let expected = {
+            let mut e = pattern(300);
+            e[100..116].fill(0xAA);
+            e.extend_from_slice(&pattern(50));
+            e
+        };
+        {
+            let mut df = MmapDataFile::open_with(&path, false, random_opts()).expect("open");
+            // Sequential fill (crosses the tiny initial_size/max_map_size to exercise growth).
+            df.write_all(&pattern(300)).expect("initial write");
+            assert_eq!(df.len(), 300);
+            // In-place overwrite in the middle — no length change.
+            df.seek(SeekFrom::Start(100)).expect("seek");
+            df.write_all(&[0xAA; 16]).expect("overwrite");
+            assert_eq!(df.len(), 300, "overwrite within bounds keeps length");
+            // Extend past end from an explicit seek(End) (the odx append pattern).
+            df.seek(SeekFrom::End(0)).expect("seek end");
+            df.write_all(&pattern(50)).expect("append via seek(End)");
+            assert_eq!(df.len(), 350);
+            df.seek(SeekFrom::Start(0)).expect("seek");
+            let mut all = vec![0u8; 350];
+            df.read_exact(&mut all).expect("read all");
+            assert_eq!(all, expected);
+        }
+        // Clean close truncates to the high-water length; reopen and re-verify.
+        let mut df = MmapDataFile::open(&path, true).expect("reopen ro");
+        assert_eq!(df.len(), 350);
+        let mut all = vec![0u8; 350];
+        df.read_exact(&mut all).expect("read all after reopen");
+        assert_eq!(all, expected);
     }
 
     #[test]
@@ -704,7 +782,12 @@ mod tests {
         let tmp = TempDir::with_prefix("mmap_df_segment").expect("temp dir");
         let path = tmp.path().join("data");
         let opts =
-            MmapFileOptions { initial_size: 128, max_map_size: 128, grow_mode: GrowMode::Segment };
+            MmapFileOptions {
+                initial_size: 128,
+                max_map_size: 128,
+                grow_mode: GrowMode::Segment,
+                write_mode: WriteMode::Append,
+            };
         let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
         // Fits within the first mapping (<= max_map_size).
         df.write_all(&pattern(100)).expect("first write fits");

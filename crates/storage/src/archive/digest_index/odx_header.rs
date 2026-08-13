@@ -4,10 +4,10 @@ use crate::archive::{
     crc::{add_crc32, check_crc},
     data_file::fsync_directory,
     error::load_header::LoadHeaderError,
+    pack::{FileBackend, PackFileIo},
 };
 use std::{
-    fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom},
     path::Path,
 };
 
@@ -36,13 +36,11 @@ impl OdxHeader {
         appnum: u32,
         path: P,
         read_only: bool,
-    ) -> Result<(File, OdxHeader), LoadHeaderError> {
+        backend: FileBackend,
+    ) -> Result<(Box<dyn PackFileIo>, OdxHeader), LoadHeaderError> {
         let path = path.as_ref();
-        let mut file = if read_only {
-            OpenOptions::new().read(true).write(false).open(path)?
-        } else {
-            OpenOptions::new().read(true).append(true).create(true).open(path)?
-        };
+        // odx is an append-only overflow log (`append = true`); writes go to EOF via explicit seek.
+        let mut file = backend.open_boxed_random(path, read_only, true)?;
         let file_end = file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
@@ -50,7 +48,7 @@ impl OdxHeader {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
             let header = OdxHeader::new(version, uid, appnum, read_only);
-            header.write_header(&mut file)?;
+            header.write_header(&mut *file)?;
             // New odx file was just created and its header written; fsync the parent so the entry
             // is durable.
             if let Some(parent) = path.parent() {
@@ -58,7 +56,7 @@ impl OdxHeader {
             }
             header
         } else {
-            let header = OdxHeader::load_header(&mut file, read_only)?;
+            let header = OdxHeader::load_header(&mut *file, read_only)?;
             // Basic validation of the odx header.
             if header.version() != version {
                 return Err(LoadHeaderError::InvalidIndexVersion);
@@ -83,8 +81,8 @@ impl OdxHeader {
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    fn load_header<R: Read + Seek>(
-        source: &mut R,
+    fn load_header(
+        source: &mut dyn PackFileIo,
         read_only: bool,
     ) -> Result<Self, LoadHeaderError> {
         let header_size = MIN_HEADER_SIZE;
@@ -117,7 +115,7 @@ impl OdxHeader {
     }
 
     /// Write this header to sync at current seek position.
-    fn write_header<R: Write + Seek>(&self, sync: &mut R) -> Result<(), LoadHeaderError> {
+    fn write_header(&self, sync: &mut dyn PackFileIo) -> Result<(), LoadHeaderError> {
         if self.read_only {
             return Err(LoadHeaderError::ReadOnly);
         }

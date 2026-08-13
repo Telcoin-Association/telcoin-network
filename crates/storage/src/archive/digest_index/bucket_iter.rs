@@ -2,12 +2,8 @@
 //! buckets to accessed without worrying about underlying structure or files.
 //! NOTE: This is ONLY appropriate for use by the index.
 
-use crate::archive::{crc::check_crc, digest_index::index::HdxIndex};
-use std::{
-    fs::File,
-    hash::BuildHasher,
-    io::{Read, Seek, SeekFrom},
-};
+use crate::archive::{crc::check_crc, digest_index::index::HdxIndex, pack::PackFileIo};
+use std::{hash::BuildHasher, io::SeekFrom};
 
 /// Iterates over the (hash, record_position) values contained in a bucket.
 /// It abstracts away whether overflow buckets are in use as well.
@@ -100,7 +96,7 @@ impl<'bucket> BucketIter<'bucket> {
     /// Load the next overflow bucket when needed.
     fn reset_next_overflow<const KSIZE: usize, S: BuildHasher + Default>(
         &mut self,
-        odx_file: &mut File,
+        odx_file: &mut dyn PackFileIo,
     ) -> Option<()> {
         // Make sure the overflow buffer is the correct size and zeroed when extended.
         self.overflow_buffer.resize(HdxIndex::<KSIZE, S>::BUCKET_SIZE, 0);
@@ -149,7 +145,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         loop {
             if iter.elements == 0 {
                 if iter.overflow_pos > 0 {
-                    iter.reset_next_overflow::<KSIZE, S>(&mut self.odx_file)?;
+                    iter.reset_next_overflow::<KSIZE, S>(&mut *self.odx_file)?;
                     continue;
                 }
                 return None;
@@ -161,7 +157,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 return Some((rec_hash, rec_pos));
             } else if iter.overflow_pos > 0 {
                 // We have an overflow bucket to search as well.
-                iter.reset_next_overflow::<KSIZE, S>(&mut self.odx_file)?;
+                iter.reset_next_overflow::<KSIZE, S>(&mut *self.odx_file)?;
             } else {
                 return None;
             }

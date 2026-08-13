@@ -22,8 +22,9 @@
 //! width; every row is the same production pattern, so you can read off both the backend delta and
 //! how each pattern scales with output size. Each column writes [`NUM_OUTPUTS`] chained outputs
 //! built with [`make_wide_test_output`], whose batches are genuinely distinct across outputs
-//! (random transactions), matching production where each output commits its own batches. Only the
-//! data file and position index switch backend; the digest index stays buffered+`fsync` in both.
+//! (random transactions), matching production where each output commits its own batches. All of the
+//! pack's files switch backend (data file + position index + digest index), so the mmap column is a
+//! fully-`msync` pack (the buffered digest index is a raw random-access `File`).
 //!
 //! The rows, grouped, capture the real call sites traced through `consensus_pack.rs` /
 //! `consensus.rs` / `state-sync/src/lib.rs`:
@@ -418,7 +419,7 @@ impl Report {
         let cell_w = 14usize;
 
         println!("\n=== consensus pack-file benchmark: buffered (fsync) vs mmap (msync) (ms) ===");
-        println!("legend: columns are {{backend}} x{{batches/output}}; mmap swaps the data file + position index to msync (digest index still fsync in both); save_durable adds a persist() barrier per output; test batches carry 1 tx each (representative, not production-sized).");
+        println!("legend: columns are {{backend}} x{{batches/output}}; the mmap column swaps ALL of the pack's files (data + position index + digest index) to msync (buffered digest index is a raw random-access File); save_durable adds a persist() barrier per output; test batches carry 1 tx each (representative, not production-sized).");
 
         // header
         print!("{:<label_w$}", "benchmark", label_w = label_w);
