@@ -688,15 +688,15 @@ impl EpochRecordDb {
         deadline: tokio::time::Instant,
     ) -> Pin<Box<dyn Future<Output = Result<EpochRecord, CertifiedRecordError>> + Send + '_>> {
         Box::pin(async move {
-            let outcome = self.certified_record_by_epoch(epoch).await;
-            let retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
+            let mut outcome = self.certified_record_by_epoch(epoch).await;
+            let mut retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
                 && tokio::time::Instant::now() < deadline;
-            if retry {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                self.certified_record_poll(epoch, deadline).await
-            } else {
-                outcome
+            while retry {
+                outcome = self.certified_record_by_epoch(epoch).await;
+                retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
+                    && tokio::time::Instant::now() < deadline;
             }
+            outcome
         })
     }
 

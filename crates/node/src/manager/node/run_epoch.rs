@@ -764,9 +764,12 @@ where
         task_spawner: &TaskSpawner,
     ) -> eyre::Result<EpochRecord> {
         let current_epoch = committee.epoch();
-        let fast = self.consensus_chain.epochs().certified_record_by_epoch(previous_epoch).await;
-        let needs_wait = fast.as_ref().err().is_some_and(|e| e.is_retryable());
-        let certified = if needs_wait {
+        // Typically we will have the EpochRecord in our DB.  We should have generated at the end of the last epoch and
+        // saved it.  Unless we have forked it will be correct so no need to wait for it to be certified.
+        let fast = self.consensus_chain.epochs().record_by_epoch(previous_epoch).await;
+        let certified = if let Some(fast) = fast {
+            fast
+        } else {
             self.predial_committee_peers(committee, task_spawner).await?;
             warn!(
                 target: "epoch-manager",
@@ -778,15 +781,13 @@ where
                 .epochs()
                 .certified_record_by_epoch_with_timeout(previous_epoch, CERTIFIED_ANCHOR_WAIT)
                 .await
-        } else {
-            fast
-        }
-        .map_err(|e| {
-            eyre::eyre!(
-                "refusing to anchor epoch {current_epoch} seed messages on an uncertified epoch \
-                 record for epoch {previous_epoch}: {e}"
-            )
-        })?;
+                .map_err(|e| {
+                    eyre::eyre!(
+                        "refusing to anchor epoch {current_epoch} seed messages on an uncertified epoch \
+                         record for epoch {previous_epoch}: {e}"
+                    )
+                })?
+        };
         Ok(certified)
     }
 
