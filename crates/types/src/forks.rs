@@ -274,6 +274,12 @@ pub const STRICT_COMMIT_TIMESTAMP_FORK_EPOCH: Epoch = u32::MAX;
 #[inline]
 pub fn strict_commit_timestamp_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
+    #[expect(
+        clippy::absurd_extreme_comparisons,
+        reason = "STRICT_COMMIT_TIMESTAMP_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not \
+                  `==`) is the gate the future epoch-setting PR relies on, and this expectation \
+                  flags itself for removal once that PR lowers the constant"
+    )]
     {
         epoch >= STRICT_COMMIT_TIMESTAMP_FORK_EPOCH
     }
