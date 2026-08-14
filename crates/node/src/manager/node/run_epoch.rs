@@ -51,11 +51,11 @@ use tracing::{debug, error, info, warn};
 /// Name of the per-epoch [`TaskManager`], created fresh and torn down each epoch.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
 
-/// Worst-case wall clock the epoch-vote collector (`manage_epoch_votes`) spends on ordinary
-/// vote-propagation lag before giving up on a local quorum: `MAX_EPOCH_VOTE_TIMEOUTS + 2` full
-/// [`EPOCH_VOTE_RECV_TIMEOUT`] windows (the counter increments once per timed-out wait, and
-/// the loop only breaks on the first wait that times out with the counter above the
-/// threshold).
+/// Worst-case wall clock one of the epoch-vote collector's rounds (`manage_epoch_votes`)
+/// spends on ordinary vote-propagation lag before entering its recovery-then-retry path. A
+/// round is `MAX_EPOCH_VOTE_TIMEOUTS + 1` full [`EPOCH_VOTE_RECV_TIMEOUT`] windows (the
+/// counter increments before the threshold test); the extra window kept here is deliberate
+/// slack, and rounds now repeat, so this models one round rather than a protocol ceiling.
 const LOCAL_QUORUM_WORST: Duration =
     EPOCH_VOTE_RECV_TIMEOUT.saturating_mul(MAX_EPOCH_VOTE_TIMEOUTS + 2);
 
@@ -683,7 +683,7 @@ where
         Ok(prior_epoch_record)
     }
 
-    /// Pre-dial the committee's primary peers when this node currently has no connections.
+    /// Pre-dial the committee's primary peers before parking inside `open_epoch_pack`.
     ///
     /// `open_epoch_pack` can block waiting on data (the previous epoch record, or its
     /// certificate) that only a peer can supply, but per-epoch peer connections are normally
@@ -691,6 +691,16 @@ where
     /// returns. Without this pre-dial such a wait deadlocks on a freshly-restarted node with
     /// zero connections and can only time out; with it, the node-lifetime collector tasks can
     /// fetch from peers while the wait is in progress.
+    ///
+    /// The dial is unconditional, NOT gated on `connected_peers_count() == 0`: the listener
+    /// binds at process start, so by the time a restarted node parks it commonly already has
+    /// inbound connections from non-committee peers (observers poll continuously), and those
+    /// must not suppress the committee dials the park depends on. `prepare_committee_dial`
+    /// also marks the members as validators so the peer manager's pruning protects them while
+    /// the committee slots are still empty (phase 4 has not run). Already-connected or
+    /// already-dialing peers resolve immediately inside `dial_peer_bls`, so repeats are cheap
+    /// — but each call spawns one retrying dial task per member, so callers that wait in a
+    /// loop must call this once and re-dial with [`Self::redial_committee_once`] instead.
     async fn predial_committee_peers(
         &self,
         committee: &Committee,
@@ -700,19 +710,72 @@ where
             .primary_network_handle
             .as_ref()
             .ok_or_else(|| eyre::eyre!("primary network handle missing during epoch open"))?;
-        if primary_network_handle.connected_peers_count().await.unwrap_or_default() == 0 {
-            let committee_keys: HashSet<BlsPublicKey> = committee.bls_keys().into_iter().collect();
-            let _ =
-                primary_network_handle.inner_handle().prepare_committee_dial(committee_keys).await;
-            committee.bls_keys().into_iter().for_each(|bls_key| {
-                self.dial_peer_bls(
-                    primary_network_handle.inner_handle().clone(),
-                    bls_key,
-                    task_spawner.clone(),
-                );
-            });
-        }
+        let committee_keys: HashSet<BlsPublicKey> = committee.bls_keys().into_iter().collect();
+        let _ = primary_network_handle.inner_handle().prepare_committee_dial(committee_keys).await;
+        committee.bls_keys().into_iter().for_each(|bls_key| {
+            self.dial_peer_bls(
+                primary_network_handle.inner_handle().clone(),
+                bls_key,
+                task_spawner.clone(),
+            );
+        });
         Ok(())
+    }
+
+    /// One best-effort dial per committee peer, with no retry task.
+    ///
+    /// The certified-anchor retry loop needs to keep reattempting committee connections (a
+    /// peer may have restarted since the initial pre-dial), but spawning
+    /// [`Self::dial_peer_bls`]'s retrying task on every attempt would accumulate one
+    /// never-exiting task per member per attempt while the fleet is isolated. The loop is
+    /// itself the retry mechanism, so each attempt issues exactly one dial per peer and
+    /// ignores the outcome: already-connected, already-dialing, and unreachable all resolve
+    /// on a later attempt or via an inbound connection.
+    async fn redial_committee_once(&self, committee: &Committee) {
+        let Some(primary_network_handle) = self.primary_network_handle.as_ref() else {
+            return;
+        };
+        let own_key = self.key_config.primary_public_key();
+        for bls_key in committee.bls_keys() {
+            if bls_key == own_key {
+                continue;
+            }
+            let _ = primary_network_handle.inner_handle().dial_by_bls(bls_key).await;
+        }
+    }
+
+    /// Discard everything queued on `primary_network_events` while the node is parked.
+    ///
+    /// The listener binds at process start, so a parked node accepts inbound traffic, but the
+    /// epoch-scoped `PrimaryNetwork` that consumes this channel is only spawned in phase 4 —
+    /// after the park resolves. Left alone over an unbounded park, the queue fills with
+    /// events the node cannot answer anyway (it has no epoch config yet), pinning the
+    /// resources some variants carry (response channels, inbound stream handles) and, once
+    /// the channel saturates, turning every further inbound event into an error-level
+    /// "failed to forward" log that buries the park's own alerting warn. Draining once per
+    /// anchor attempt keeps occupancy bounded to one attempt-window of arrivals; dropped
+    /// requests surface to peers as ordinary timeouts and are retried on their own cadence.
+    ///
+    /// Subscribe/drop safety: `primary_network_events` is strictly single-consumer and
+    /// `subscribe` panics while a subscription is live. This drain runs on the same task and
+    /// call path that later performs phase 4's subscribe, strictly before it, and the
+    /// receiver is dropped (restoring the slot) before this function returns — the two
+    /// subscriptions can never coexist.
+    async fn drain_parked_primary_events(&self) {
+        let mut drained: usize = 0;
+        {
+            let mut receiver = self.consensus_bus.subscribe_primary_network_events();
+            while receiver.try_recv().is_ok() {
+                drained += 1;
+            }
+        }
+        if drained > 0 {
+            debug!(
+                target: "epoch-manager",
+                drained,
+                "discarded inbound primary network events queued while parked"
+            );
+        }
     }
 
     /// Resolve the epoch-close seed anchor for a seed-signature-active epoch, refusing to
@@ -733,8 +796,11 @@ where
     /// committee authors are exempt from bans. Requiring a super-quorum certificate — via
     /// [`EpochRecordDb::certified_record_by_epoch`](tn_storage::epoch_records::EpochRecordDb),
     /// which reuses the exact verification the vote-quorum and peer-recovery paths run before
-    /// storing a certificate — turns that silent network-wide degradation into a loud,
-    /// restartable error on this node only.
+    /// storing a certificate — quarantines that silent network-wide degradation on this node
+    /// only: it parks loudly (one alertable warn per wait attempt) and keeps retrying, while
+    /// its divergent digest never signs a seed message. A genuinely divergent node cannot
+    /// self-heal by waiting; the state-sync collector replacing its record with the certified
+    /// one, or operator intervention keyed on the repeated warn, is the way out.
     ///
     /// # Waiting and failure
     ///
@@ -789,10 +855,13 @@ where
                 current_epoch,
                 "previous epoch record not yet certified, waiting for its certificate"
             );
-            self.subscribe_epoch_vote_topic_pre_anchor(previous_epoch, committee).await?;
             let mut attempt: u32 = 0;
             loop {
                 attempt += 1;
+                // Inside the loop so the authorized-publisher set is recomputed once the
+                // record (and with it the previous committee) arrives from the collector;
+                // re-subscribing is an idempotent allowlist overwrite.
+                self.subscribe_epoch_vote_topic_pre_anchor(previous_epoch, committee).await?;
                 self.rearm_epoch_vote_round(previous_epoch).await;
                 match self
                     .consensus_chain
@@ -812,8 +881,10 @@ where
                              expired after {CERTIFIED_ANCHOR_WAIT:?}; node parked until \
                              certificate quorum"
                         );
-                        // Cheap between attempts: dials only when the node has zero peers.
-                        self.predial_committee_peers(committee, task_spawner).await?;
+                        // One best-effort dial per peer per attempt (no retry-task spawns),
+                        // then shed the inbound backlog nothing can answer while parked.
+                        self.redial_committee_once(committee).await;
+                        self.drain_parked_primary_events().await;
                     }
                     outcome => break outcome,
                 }
@@ -835,13 +906,17 @@ where
     /// A parked node has not run the per-epoch phase-4 network setup, so it is not subscribed
     /// to the vote topic and the swarm rejects incoming gossip on unsubscribed topics — on a
     /// restarted fleet the certificate the park waits for could never assemble. The authorized
-    /// publisher set is the stored record's committee (the voters for `previous_epoch`) unioned
-    /// with the current committee, never an open subscribe; phase 4 later overwrites it with
-    /// the canonical previous/current/next-committee window (the swarm's documented
-    /// overwrite-on-resubscribe semantics), preserving the committee-restricted posture of
-    /// issues #898/#912. When the record itself is still missing, the current committee alone
-    /// authorizes — the collector fetch that supplies the record refreshes nothing here, but
-    /// every re-arm attempt passes through this state only until the record arrives.
+    /// publisher set is the stored record's committee and `next_committee` (the voters for
+    /// `previous_epoch` and the members rotating in) unioned with the current committee, never
+    /// an open subscribe; phase 4 later overwrites it with the canonical
+    /// previous/current/next-committee window (the swarm's documented overwrite-on-resubscribe
+    /// semantics), preserving the committee-restricted posture of issues #898/#912.
+    ///
+    /// Called once per anchor attempt, INSIDE the retry loop: when the record itself is still
+    /// missing, the first subscribe authorizes the current committee alone, and the
+    /// per-attempt re-subscribe widens the set as soon as the collector supplies the record —
+    /// an unauthorized publisher takes a Fatal penalty at the swarm, so a permanently stale
+    /// allowlist could ban an honest previous-committee voter across a rotation boundary.
     async fn subscribe_epoch_vote_topic_pre_anchor(
         &self,
         previous_epoch: Epoch,
@@ -854,6 +929,7 @@ where
         let mut publishers: HashSet<BlsPublicKey> = committee.bls_keys().into_iter().collect();
         if let Some(record) = self.consensus_chain.epochs().record_by_epoch(previous_epoch).await {
             publishers.extend(record.committee.iter().copied());
+            publishers.extend(record.next_committee.iter().copied());
         }
         let publisher_count = publishers.len();
         let chain_id = self.builder.tn_config.genesis().config.chain_id;
@@ -879,9 +955,10 @@ where
     /// is ever re-signed and a fleet holding records without certificates cannot self-heal.
     /// Re-publishing the stored record is idempotent: votes re-sign deterministically (BLS over
     /// the record's digest), the collector ignores the publish while a vote round for the epoch
-    /// is already live, and certificate writes are append-once. Gated on `previous_epoch > 0`
-    /// because the epoch-0 slot can hold the uncertifiable dummy record; epoch-0 certificates
-    /// come from peers via the collector fetch instead.
+    /// is LIVE and re-creates the round when a previous one exited without a certificate (see
+    /// `get_new_vote_channel`'s closed-sender check), and certificate writes are append-once.
+    /// Gated on `previous_epoch > 0` because the epoch-0 slot can hold the uncertifiable dummy
+    /// record; epoch-0 certificates come from peers via the collector fetch instead.
     async fn rearm_epoch_vote_round(&self, previous_epoch: Epoch) {
         if previous_epoch == 0 {
             return;

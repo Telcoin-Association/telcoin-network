@@ -265,10 +265,11 @@ fn wait_for_registry_epoch_at_least(
 ///    every node serves certified record 0 and NO node serves a record-1 certificate.
 /// 3. KILL: SIGKILL the whole committee at once, mid-park.
 /// 4. RECOVERY (run 3): restart validators 0-2 (and a fresh observer) WITHOUT the hook. Each must
-///    re-park, subscribe to the vote topic pre-anchor, re-arm the record-1 vote round, and
-///    re-assemble the certificate from deterministic re-votes (super_quorum of 4 = 3, so the three
-///    restarted nodes are exactly quorum). Validator 3 restarts ~60s late and must instead fetch
-///    the already-assembled certificate from its recovered peers.
+///    re-park, subscribe to the vote topic pre-anchor, and re-arm the record-1 vote round; the
+///    certificate is re-assembled from deterministic re-votes (super_quorum of 4 = 3, so the three
+///    restarted nodes are exactly quorum), with each node either aggregating it locally or fetching
+///    it from the first node to do so. Validator 3 restarts ~60s late and must recover via the
+///    late-joiner fetch path against its already-recovered peers.
 /// 5. PROOF OF LIFE: blocks advance on all 4 validators, the first fully fork-active close (epoch
 ///    2) certifies live, the registry advances to epoch 3+, and the observer follows past the
 ///    parked height.
@@ -460,17 +461,32 @@ fn test_epoch_cert_recovery() -> eyre::Result<()> {
         wait_for_log(&log, &[REARM_EPOCH_1], repark_deadline, "recovery vote-round re-arm")?;
     }
 
-    // (b) The three restarted nodes re-assemble the record-1 certificate from deterministic
-    // re-votes: super_quorum(4) = 3, so all three must aggregate a quorum locally.
-    let early_logs: Vec<String> = (0..3).map(|i| run_log(i, 3)).collect();
+    // (b) The record-1 certificate is re-assembled from deterministic re-votes:
+    // super_quorum(4) = 3, so the three restarted nodes are exactly quorum. Which node
+    // aggregates first is a race — the winner unparks and starts serving, so the others may
+    // obtain the certificate by peer fetch (or a vote round observing its arrival) before
+    // their own rounds aggregate. All are healthy recovery; require each node to OBTAIN the
+    // certificate by any path, and at least one participant (the observer's collector also
+    // aggregates received votes) to have actually aggregated a quorum, which the
+    // certificate's existence implies but the log makes explicit.
+    for i in 0..3 {
+        wait_for_log(
+            &run_log(i, 3),
+            &[QUORUM_EPOCH_1, RETRIEVED_CERT_1, OBTAINED_CERT_1],
+            Duration::from_secs(240),
+            "recovery certificate obtained",
+        )?;
+    }
+    let aggregator_logs: Vec<String> =
+        (0..3).map(|i| run_log(i, 3)).chain(std::iter::once(run_log(4, 3))).collect();
     wait_for_log_quorum(
-        &early_logs,
+        &aggregator_logs,
         QUORUM_EPOCH_1,
-        3,
-        Duration::from_secs(120),
-        "recovery re-vote quorum",
+        1,
+        Duration::from_secs(30),
+        "recovery re-vote aggregation",
     )?;
-    info!(target: "epoch-cert-recovery", "recovery quorum reached on nodes 0-2; holding node 3 back");
+    info!(target: "epoch-cert-recovery", "record-1 certificate recovered on nodes 0-2; holding node 3 back");
 
     // Validator 3 restarts late — the ONE deliberate plain sleep in this test. The re-vote
     // exchange above has already completed, so node 3 must recover via the late-joiner path.

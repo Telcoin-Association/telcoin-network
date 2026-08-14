@@ -24,7 +24,12 @@
 //! epoch's own record, else the previous record's `next_committee`), so the ingress needs no
 //! epoch-scoped `ConsensusConfig` and keeps working while the node is parked between epochs. A
 //! vote whose committee cannot be resolved yet is dropped without penalty: its author republishes
-//! on a timer, and the vote is accepted once the record is stored.
+//! on a timer, and the vote is accepted once the record is stored. Two narrowings versus the
+//! handler's live-config resolution are accepted as self-healing: a vote for the CURRENT epoch
+//! received before this node stores any record for it resolves through the previous record's
+//! `next_committee`, and an epoch-0 vote arriving before record 0 is stored has no fallback at
+//! all — both recover on the author's next republish. Events are processed serially; honest
+//! vote traffic is a few small messages per window, and ordering keeps the dedup gate simple.
 
 use std::collections::HashMap;
 
@@ -189,10 +194,20 @@ pub fn spawn_epoch_vote_ingress(
 /// Verify one diverted event and forward the vote to the collector.
 ///
 /// Mirrors the gate ordering of the handler's `PrimaryGossip::EpochVote` arm (issue #898): the
-/// cheap, attacker-independent checks run before the expensive BLS verify. Failures are dropped
-/// at `debug!` without peer penalties — a vote reaching this task already passed the swarm's
-/// authorized-publisher check for the committee-restricted epoch-vote topic, so penalty
-/// attribution adds nothing here.
+/// cheap, attacker-independent checks run before the expensive BLS verify.
+///
+/// Failures are dropped at `debug!` with NO peer penalty — a deliberate trade, not an
+/// omission. The handler arm this supersedes escalated a bad signature to a Fatal penalty
+/// that the gossip path charged to the RELAYING peer, not the author — the exact
+/// misattribution class of GHSA-j2g4-553f-875r, capable of banning an honest committee
+/// relayer over a third party's forgery — so carrying it forward would reintroduce a known
+/// bug. What bounds abuse instead: the epoch-vote topic's publisher allowlist restricts
+/// authors to the committee window (the swarm Fatal-bans unauthorized authors before this
+/// task ever sees the message), and the dedup gate caps repeat verifies of any accepted vote.
+/// Residual exposure: an authorized (committee) publisher can force one BLS verify per forged
+/// message on this serial task with no reputational cost. Accepted here because the flooder
+/// must already hold a committee identity; an author-attributed penalty (charge
+/// `payload.author`, never the relayer) plus drop metering is the designed follow-up.
 async fn ingest_epoch_vote_event(
     event: NetworkEvent<Req, Res>,
     consensus_chain: &ConsensusChain,

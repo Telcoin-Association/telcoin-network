@@ -30,8 +30,12 @@ pub(crate) const MAX_EPOCH_VOTE_TIMEOUTS: u32 = 24;
 pub(crate) const EPOCH_VOTE_ROUND_BACKOFF_START: Duration = Duration::from_secs(5);
 
 /// Cap on the doubling inter-round backoff in [`manage_epoch_votes`]: retries settle at one
-/// round per this interval (plus the round itself), keeping a long-parked fleet's gossip
-/// traffic to one republished vote per member per round.
+/// round per this interval plus the round itself. The backoff bounds the round-end recovery
+/// work (the peer-fetch pass and store check run once per round); the vote republish keeps
+/// its per-window cadence ([`EPOCH_VOTE_RECV_TIMEOUT`]) inside every round — deliberately, so
+/// a fleet whose peers come up staggered still hears votes promptly — which puts a
+/// long-parked member's steady-state gossip at roughly one small vote message per window,
+/// pausing only during the backoff sleeps.
 pub(crate) const EPOCH_VOTE_ROUND_BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// Number of peer-recovery attempts [`manage_epoch_votes`] makes (each one
@@ -366,10 +370,26 @@ async fn manage_epoch_votes(
     }
 }
 
-/// Direct a newly received vote to it's task.
+/// Return the vote receiver for `epoch` when a (new) vote round should be spawned.
+///
+/// `None` means a round for the epoch is already LIVE and the caller must not spawn another.
+/// Liveness is tested, not assumed: a queue entry whose receiver was taken by a round that has
+/// since exited (its receiver dropped, so the stored sender reports closed) is re-created with
+/// a fresh channel rather than treated as live. Without that check, a round that ends without
+/// storing a certificate — the alternative-record quorum exit, or a certificate save that
+/// fails — would leave a dead entry that turns every later re-arm for the epoch
+/// (`rearm_epoch_vote_round`) into a silent no-op, exactly the un-re-armable state the re-arm
+/// hook exists to eliminate.
 fn get_new_vote_channel(epoch: Epoch, vote_queues: &mut VoteQueue) -> Option<Receiver<EpochVote>> {
     for q in vote_queues.iter_mut() {
         if q.0 == epoch {
+            if q.2.is_none() && q.1.is_closed() {
+                // The previous round for this epoch already ran and exited; give the re-arm a
+                // fresh round instead of ignoring it forever.
+                let (epoch_vote_tx, epoch_vote_rx) = mpsc::channel(10_000);
+                q.1 = epoch_vote_tx;
+                return Some(epoch_vote_rx);
+            }
             return q.2.take();
         }
     }
@@ -1170,6 +1190,109 @@ mod epoch_vote_collector_tests {
             after_round_one,
             "vote rounds must end once a certificate exists in the store"
         );
+
+        node_shutdown.notify();
+    }
+
+    /// A vote round that exits WITHOUT a certificate (here: quorum on an alternative record
+    /// digest, whose peer-recovery fetch then fails) must not permanently disarm the epoch:
+    /// a later re-arm (`epoch_record_watch` firing again for the same epoch) must spawn a
+    /// fresh round that can still certify. Guards the closed-sender re-creation in
+    /// `get_new_vote_channel` — without it the dead queue entry swallows every re-arm and the
+    /// anchor park can never resolve through votes.
+    #[tokio::test]
+    async fn test_rearm_after_dead_round_spawns_fresh_round() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let committee = vec![pk1, *kp2.public(), *kp3.public(), *kp4.public()];
+
+        // Node is kp1; committee of 4 → super_quorum = 3.
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: committee.clone(),
+            next_committee: committee.clone(),
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+        // Same epoch and committee, different next_committee → different digest.
+        let alt_epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: committee.clone(),
+            next_committee: committee.iter().rev().copied().collect(),
+            ..Default::default()
+        };
+        assert_ne!(alt_epoch_rec.digest(), epoch_hash);
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("test_rearm_after_dead_round").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+
+        // Mock network: Publish succeeds; every other command's reply drops, so the dead
+        // round's peer-recovery fetch fails fast (nobody holds a certificate).
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = Notifier::new();
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.subscribe(),
+        );
+
+        // Round 1: three buffered alt-record votes reach the alternative-digest quorum, the
+        // round breaks without a certificate, its recovery fetch fails, and the task exits.
+        for kp in [&kp2, &kp3, &kp4] {
+            let kc = KeyConfig::new_with_testing_key(kp.copy());
+            consensus_bus.app().new_epoch_votes().send(alt_epoch_rec.sign_vote(&kc)).await.unwrap();
+        }
+        consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_none(),
+            "alt-quorum round must not certify the correct record"
+        );
+
+        // Re-arm the SAME epoch and feed correct votes into the fresh round. Retried because
+        // the re-arm only takes effect once the dead round's exit is observable (its sender
+        // reports closed); each pass is idempotent.
+        let kc2 = KeyConfig::new_with_testing_key(kp2.copy());
+        let kc3 = KeyConfig::new_with_testing_key(kp3.copy());
+        let mut cert = None;
+        for _ in 0..20 {
+            consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc2)).await.unwrap();
+            consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            if let Some(found) = consensus_chain.epochs().cert_by_digest(epoch_hash).await {
+                cert = Some(found);
+                break;
+            }
+        }
+        let cert = cert.expect("re-arm after a dead round must spawn a fresh certifying round");
+        assert_eq!(cert.epoch_hash, epoch_hash);
+        assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
 
         node_shutdown.notify();
     }
