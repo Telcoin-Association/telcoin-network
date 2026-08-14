@@ -78,7 +78,10 @@ const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("1
 /// address data admitted per record before it can accumulate on the peer entry
 /// (GHSA-29v6-gvv5-45gx). This is defence in depth for the per-peer set cap
 /// `MAX_MULTIADDRS_PER_PEER`; that set cap is what bounds accumulation across repeated records.
-const MAX_ADVERTISED_MULTIADDRS: usize = 16;
+///
+/// The same cap bounds the address list of a kad provider record before it is written to the
+/// consensus database (`KadStore::add_provider`, issue #1185).
+pub(crate) const MAX_ADVERTISED_MULTIADDRS: usize = 16;
 
 /// Maximum number of concurrent established connections a single peer may hold, across both
 /// directions (inbound and outbound).
