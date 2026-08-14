@@ -94,9 +94,16 @@ fn test_monotonically_incremented_commit_timestamps() {
         tn_types::EpochSeedChainValue::genesis_placeholder(),
     );
 
-    // THEN the latest sub dag should have the highest committed timestamp - basically the
-    // same as the previous commit round
-    assert_eq!(sub_dag_round_4.commit_timestamp(), sub_dag_round_2.commit_timestamp());
+    // THEN the commit timestamp never decreases. While the strict fork is dormant (adiri
+    // builds pre-fork) the value clamps to the previous commit's timestamp. Once the fork is
+    // active (non-adiri builds are active from genesis) the floor is `previous + 1`, so every
+    // commit in an epoch records a unique timestamp (#1191).
+    let expected = if tn_types::forks::strict_commit_timestamp_active(0) {
+        sub_dag_round_2.commit_timestamp() + 1
+    } else {
+        sub_dag_round_2.commit_timestamp()
+    };
+    assert_eq!(sub_dag_round_4.commit_timestamp(), expected);
 }
 
 #[test]
