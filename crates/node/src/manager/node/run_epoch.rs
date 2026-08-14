@@ -35,7 +35,7 @@ use std::{
 };
 use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
-use tn_primary::ConsensusBus;
+use tn_primary::{network::EpochVotePump, ConsensusBus};
 use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
@@ -746,6 +746,18 @@ where
     /// certificate that fails verification, is a hard error — never a silent fallback to the
     /// uncertified digest.
     ///
+    /// # Vote delivery during the wait
+    ///
+    /// The certificate is aggregated from epoch-vote gossip, but the per-epoch network task
+    /// that forwards that gossip to the vote collector only spawns after this wait returns
+    /// (`create_consensus`). An [`EpochVotePump`] therefore forwards epoch votes off
+    /// `primary_network_events` for the duration of the wait and buffers everything else.
+    /// Without it the wait can only be satisfied by a peer that already holds the
+    /// certificate; on a fleet-wide restart at the boundary no such peer exists, votes sit
+    /// undelivered, and every node blocks here forever (#1187). The pump is stopped - and
+    /// its subscription released for the real consumer - on both the success and the error
+    /// path before this function returns.
+    ///
     /// Returns the certified [`EpochRecord`] itself rather than just its digest, because the
     /// caller seeds the chain from it too. An earlier revision returned the digest and the
     /// caller cross-checked it against the record it had already resolved; that check aborted
@@ -774,10 +786,18 @@ where
                 current_epoch,
                 "previous epoch record not yet certified, waiting for its certificate"
             );
-            self.consensus_chain
+            // Deliver epoch-vote gossip while the wait blocks (see the doc section
+            // "Vote delivery during the wait"). `stop_and_replay` must run on both the
+            // Ok and the Err path so the `primary_network_events` subscription is
+            // released before `create_consensus` spawns the real consumer.
+            let vote_pump = EpochVotePump::spawn(&self.consensus_bus);
+            let waited = self
+                .consensus_chain
                 .epochs()
                 .certified_record_by_epoch_with_timeout(previous_epoch, CERTIFIED_ANCHOR_WAIT)
-                .await
+                .await;
+            vote_pump.stop_and_replay().await;
+            waited
         } else {
             fast
         }

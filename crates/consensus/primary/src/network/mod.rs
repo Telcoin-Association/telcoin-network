@@ -18,8 +18,8 @@ use tn_network_libp2p::{
     error::NetworkError,
     read_frame,
     types::{
-        IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
-        NetworkResult,
+        GossipPayload, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle,
+        NetworkResponseMessage, NetworkResult,
     },
     write_frame, DenyReason, GossipMessage, Penalty, PrimarySyncRequest, ResponseChannel, Stream,
     StreamError, SyncFrame, SyncFrameError,
@@ -31,12 +31,12 @@ use tn_storage::{
     PayloadStore,
 };
 use tn_types::{
-    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest, ConsensusOutput,
-    ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
-    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote,
+    encode, try_decode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest,
+    ConsensusOutput, ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord,
+    EpochVote, Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 pub mod handler;
 mod message;
 mod sync_codec;
@@ -1611,4 +1611,171 @@ pub enum RequestVoteResult {
     /// If the peer was unable to verify parents for a proposed header, they respond requesting
     /// the missing certificate by digest.
     MissingParents(Vec<HeaderDigest>),
+}
+
+/// Buffered non-vote network events an [`EpochVotePump`] preserves for the next subscriber.
+type BufferedPrimaryEvents = Vec<NetworkEvent<Req, Res>>;
+
+/// Scoped forwarder that keeps epoch-vote gossip flowing while the per-epoch network task is
+/// down.
+///
+/// The only production path that moves a peer's [`EpochVote`] gossip from the node-lifetime
+/// `primary_network_events` channel into the vote collector is the per-epoch
+/// [`PrimaryNetwork`] event task, which spawns only after the epoch is open. The epoch open
+/// itself can block waiting for the prior epoch's certificate, and that certificate can only
+/// be aggregated from the very votes sitting undelivered on the channel, so a fleet-wide
+/// restart at an epoch boundary deadlocks: every node waits for a certificate no node can
+/// assemble (#1187). The pump closes that window. It holds the channel subscription for the
+/// duration of a bounded wait, forwards each decoded, signature-checked epoch vote into
+/// `new_epoch_votes` (the same send the gossip handler performs at the end of its epoch-vote
+/// arm), buffers every other event, and on [`Self::stop_and_replay`] releases the
+/// subscription and re-queues the buffered events for the real consumer.
+///
+/// # Certification safety
+///
+/// The pump skips the handler's topic, committee-membership, and duplicate checks, but keeps
+/// the per-vote signature check ([`EpochVote::check_signature`]) that the vote collector's
+/// aggregation loop documents as its precondition. Even without the skipped checks a
+/// forwarded vote cannot mint a bad certificate: the collector only aggregates votes whose
+/// `epoch_hash` matches its record and whose signer is in that record's committee, it dedups
+/// per authority, and it verifies the assembled certificate against a super quorum
+/// ([`EpochRecord::verify_with_cert`]) before anything is stored.
+///
+/// # Subscription contract
+///
+/// `primary_network_events` allows exactly one live receiver: the per-epoch consumer takes it
+/// when the primary network spawns, and a second live subscribe panics. Callers must
+/// therefore await [`Self::stop_and_replay`] (which joins the pump task strictly after its
+/// receiver has dropped and returned the subscription slot) before the per-epoch network is
+/// spawned, on every exit path.
+pub struct EpochVotePump {
+    /// Signals the pump task to stop draining and yield its buffer.
+    stop: oneshot::Sender<()>,
+    /// Resolves with the buffered non-vote events after the pump task has released the
+    /// `primary_network_events` subscription.
+    task: tokio::task::JoinHandle<BufferedPrimaryEvents>,
+    /// Bus used to re-queue the buffered events once the subscription is released.
+    consensus_bus: ConsensusBusApp,
+}
+
+impl std::fmt::Debug for EpochVotePump {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpochVotePump").field("finished", &self.task.is_finished()).finish()
+    }
+}
+
+impl EpochVotePump {
+    /// Take the `primary_network_events` subscription and spawn the pump task.
+    ///
+    /// The subscription is taken synchronously, before the task spawns, per the `QueChannel`
+    /// contract. This is a raw `tokio::spawn` because the pump must hand its buffer back
+    /// through a join handle and [`TaskSpawner`] returns none; the task is bounded by the
+    /// stop signal (or the channel closing), so nothing outlives
+    /// [`Self::stop_and_replay`].
+    pub fn spawn(consensus_bus: &ConsensusBusApp) -> Self {
+        let events = consensus_bus.subscribe_primary_network_events();
+        let (stop, stop_rx) = oneshot::channel();
+        let bus = consensus_bus.clone();
+        let task = tokio::spawn(async move {
+            let event_stream = futures::stream::unfold(events, |mut receiver| async move {
+                receiver.recv().await.map(|event| (event, receiver))
+            });
+            let (_, buffered) = event_stream
+                .take_until(stop_rx)
+                .fold((bus, Vec::new()), |(bus, mut buffered), event| async move {
+                    Self::pump_event(&bus, event, &mut buffered).await;
+                    (bus, buffered)
+                })
+                .await;
+            // The fold above consumed the stream, so the receiver (and with it the
+            // subscription slot) is released before this task yields its buffer - the
+            // ordering `stop_and_replay`'s join relies on.
+            buffered
+        });
+        Self { stop, task, consensus_bus: consensus_bus.clone() }
+    }
+
+    /// Route one drained network event: forward a signature-checked epoch vote to the vote
+    /// collector, buffer everything else for replay.
+    async fn pump_event(
+        bus: &ConsensusBusApp,
+        event: NetworkEvent<Req, Res>,
+        buffered: &mut BufferedPrimaryEvents,
+    ) {
+        match event {
+            NetworkEvent::Gossip(payload) => {
+                let vote = Self::verified_epoch_vote(&payload);
+                if let Some(vote) = vote {
+                    // Fire-and-forget, mirroring the handler's forward; the send is only
+                    // dropped when no collector is subscribed.
+                    let _ = bus.new_epoch_votes().send(vote).await;
+                } else {
+                    // Non-vote gossip, and any payload the pump must not consume, is
+                    // preserved for the real consumer, which also owns penalty
+                    // attribution for malformed payloads.
+                    buffered.push(NetworkEvent::Gossip(payload));
+                }
+            }
+            event @ (NetworkEvent::Request { .. }
+            | NetworkEvent::Error(..)
+            | NetworkEvent::InboundStream { .. }) => buffered.push(event),
+        }
+    }
+
+    /// Decode an epoch vote from a gossip payload and verify its signature.
+    ///
+    /// Returns `None` for every payload the pump must not consume: non-vote gossip, bytes
+    /// that fail to decode, and votes whose signature does not verify (replaying the raw
+    /// event lets the real handler attribute the penalty instead).
+    fn verified_epoch_vote(payload: &GossipPayload) -> Option<EpochVote> {
+        try_decode::<PrimaryGossip>(&payload.message.data)
+            .ok()
+            .and_then(|gossip| match gossip {
+                PrimaryGossip::EpochVote(vote) => Some(*vote),
+                PrimaryGossip::Certificate(_) | PrimaryGossip::Consensus(_) => None,
+            })
+            .filter(EpochVote::check_signature)
+    }
+
+    /// Stop the pump, wait for it to release the `primary_network_events` subscription, and
+    /// re-queue the buffered non-vote events for the next subscriber.
+    ///
+    /// The join happens on the caller's critical path: it is what guarantees the
+    /// subscription slot is free before the per-epoch network subscribes. The replay
+    /// itself is detached onto its own task and NOT awaited, because the channel is
+    /// bounded and continuously fed by the node-lifetime swarm task while the only future
+    /// drainer (the per-epoch network task) cannot spawn until this method's caller
+    /// returns; awaiting a backpressuring send here could therefore suspend forever, a
+    /// self-inflicted deadlock. The detached sends always complete instead: the next
+    /// consumer drains the channel independently, and if the process exits first the task
+    /// dies with it, losing only events a dead process could not have handled anyway.
+    /// Replayed events may interleave with newer traffic that arrives after the slot is
+    /// released - a reordering the network layer tolerates (gossip is unordered and
+    /// requests carry their own deadlines).
+    pub async fn stop_and_replay(self) {
+        let Self { stop, task, consensus_bus } = self;
+        // An Err here only means the pump already stopped on its own (channel closed); the
+        // join below is the actual synchronization point either way.
+        let _ = stop.send(());
+        let buffered = task.await.unwrap_or_else(|e| {
+            error!(
+                target: "primary::network",
+                ?e,
+                "epoch vote pump task failed; its buffered events are lost"
+            );
+            Vec::new()
+        });
+        if !buffered.is_empty() {
+            // Detached on purpose; see the doc comment for why awaiting this here could
+            // deadlock against the bounded channel.
+            tokio::spawn(async move {
+                let bus = &consensus_bus;
+                futures::stream::iter(buffered)
+                    .for_each(|event| async move {
+                        let _ = bus.primary_network_events().send(event).await;
+                    })
+                    .await;
+            });
+        }
+    }
 }

@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use tn_config::KeyConfig;
+use tn_config::{KeyConfig, LibP2pConfig};
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
 use tn_storage::{consensus::ConsensusChain, epoch_records::EpochRecordDb};
 use tn_types::{
@@ -13,7 +13,7 @@ use tn_types::{
     EpochRecord, EpochVote, Noticer, TaskSpawner, TnReceiver as _,
 };
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 type VoteQueue = VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>)>;
 
@@ -385,6 +385,98 @@ pub(crate) fn spawn_epoch_vote_collector(
             }
         }
     });
+}
+
+/// Resume the epoch-close vote protocol for a persisted-but-uncertified latest epoch record.
+///
+/// A node that crashes (or is restarted) between persisting the epoch record at close -
+/// `write_epoch_record` flushes it durably before publishing - and storing its certificate
+/// comes back up with the record on disk but no certificate, and nothing on the restart path
+/// re-publishes the node's vote or re-fires `epoch_record_watch`. The vote collector then
+/// never aggregates, and the next epoch open blocks in `certified_prior_epoch_anchor` waiting
+/// for a certificate no restarted node is helping to form (#1187). Re-firing the watch with
+/// the persisted record replays the exact close-path handoff at the end of
+/// `write_epoch_record`: the node-lifetime collector spawned by
+/// [`spawn_epoch_vote_collector`] observes it, re-signs the same persisted bytes (the vote is
+/// a pure function of the record and the loaded key), publishes the vote, and drives the
+/// usual aggregation, certificate write, and peer-recovery machinery.
+///
+/// The persisted record is used verbatim and never rebuilt: `build_epoch_record` takes a live
+/// watch value as its `final_state` input, so a restarted process is not guaranteed to
+/// reproduce the digest, and a silently divergent digest would never aggregate with peer
+/// votes.
+///
+/// Gated on `record.epoch < current_epoch` (the epoch read from the canonical tip) so a
+/// record for an epoch still in progress is never voted on. In particular the epoch-0 dummy
+/// record - persisted uncertified at genesis while epoch 0 runs - must not reach the
+/// collector: certifying the dummy would permanently block the real epoch-0 record behind the
+/// certificate short-circuit in `write_epoch_record` and break sync.
+///
+/// # Gossip subscription
+///
+/// On a fresh restart the epoch-vote topic is not subscribed: the only per-epoch subscribe
+/// runs in `spawn_primary_network_for_epoch`, which a deadlocked epoch open never reaches.
+/// That is fatal on both legs - gossipsub fans a publish out only to peers that announced
+/// the subscription, and `verify_gossip` rejects inbound messages on a topic with no
+/// `authorized_publishers` entry. So before firing the watch this subscribes the topic
+/// itself, deriving the publisher window from the persisted record: `committee` (the
+/// outgoing voters) plus `next_committee`, the previous/current half of the wider
+/// previous/current/next window `boundary_publishers` uses at epoch start (the entering
+/// epoch's own next committee is not derivable from this record and is not needed to accept
+/// the resumed epoch's votes). The later per-epoch subscribe is safe to run on top: the
+/// swarm's `Subscribe` handler replaces the topic's publisher set outright, and a repeated
+/// gossipsub subscribe is an idempotent no-op.
+pub(crate) async fn resume_epoch_certification(
+    consensus_chain: &ConsensusChain,
+    consensus_bus: &ConsensusBusApp,
+    primary_network: &PrimaryNetworkHandle,
+    chain_id: u64,
+    current_epoch: Epoch,
+) {
+    let pending_epoch = consensus_chain
+        .epochs()
+        .latest_record()
+        .await
+        .filter(|record| record.epoch < current_epoch)
+        .map(|record| record.epoch);
+    if let Some(epoch) = pending_epoch {
+        if let Some((record, cert)) = consensus_chain.epochs().get_epoch_by_number(epoch).await {
+            if cert.is_some() {
+                debug!(
+                    target: "epoch-manager",
+                    epoch,
+                    "latest persisted epoch record is already certified; nothing to resume"
+                );
+            } else {
+                // Subscribe the epoch-vote topic before the collector starts publishing;
+                // see the doc section "Gossip subscription". A failure is logged rather
+                // than fatal: the collector's peer-recovery path can still fetch the
+                // certificate, and the next restart retries the subscribe.
+                let publishers: HashSet<BlsPublicKey> =
+                    record.committee.iter().chain(record.next_committee.iter()).copied().collect();
+                if let Err(e) = primary_network
+                    .inner_handle()
+                    .subscribe_with_publishers(LibP2pConfig::epoch_vote_topic(chain_id), publishers)
+                    .await
+                {
+                    warn!(
+                        target: "epoch-manager",
+                        ?e,
+                        epoch,
+                        "failed to subscribe the epoch vote topic for recovery; resuming anyway"
+                    );
+                }
+                let epoch_hash = record.digest();
+                info!(
+                    target: "epoch-manager",
+                    epoch,
+                    %epoch_hash,
+                    "resuming epoch-close vote protocol for persisted uncertified epoch record"
+                );
+                consensus_bus.epoch_record_watch().send_replace(Some(record));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -884,5 +976,195 @@ mod epoch_vote_collector_tests {
 
         // Shutdown
         node_shutdown.notify();
+    }
+
+    /// Build a consensus chain holding a saved epoch-0 record plus a saved-but-uncertified
+    /// epoch-1 record (the crash-window shape: record persisted, certificate absent),
+    /// returning the chain, the epoch-1 record, and the key configs behind its committee.
+    /// The `TempDir` is returned so it outlives the chain.
+    async fn uncertified_epoch1_fixture(
+        prefix: &str,
+    ) -> (ConsensusChain, EpochRecord, Vec<KeyConfig>, TempDir) {
+        let mut rng = StdRng::from_os_rng();
+        let key_configs: Vec<KeyConfig> = (0..4)
+            .map(|_| KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rng)))
+            .collect();
+        let committee_keys: Vec<BlsPublicKey> =
+            key_configs.iter().map(|kc| kc.primary_public_key()).collect();
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir = TempDir::with_prefix(prefix).unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).await.unwrap();
+
+        // `save_record` enforces in-order epochs, so store epoch 0 first and chain the
+        // epoch-1 record off its digest.
+        let epoch0_rec = EpochRecord {
+            epoch: 0,
+            committee: committee_keys.clone(),
+            next_committee: committee_keys.clone(),
+            ..Default::default()
+        };
+        consensus_chain.epochs().save_record(epoch0_rec.clone()).await.unwrap();
+        let epoch_rec = EpochRecord {
+            epoch: 1,
+            committee: committee_keys.clone(),
+            next_committee: committee_keys,
+            parent_hash: epoch0_rec.digest(),
+            ..Default::default()
+        };
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+
+        (consensus_chain, epoch_rec, key_configs, temp_dir)
+    }
+
+    /// Mock network handle whose command drain replies Ok to a single Subscribe command, so
+    /// a resume that subscribes (correctly or not) never hangs a test.
+    fn subscribe_replying_network() -> PrimaryNetworkHandle {
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        tokio::spawn(async move {
+            if let Some(NetworkCommand::Subscribe { reply, .. }) = net_rx.recv().await {
+                let _ = reply.send(Ok(true));
+            }
+        });
+        PrimaryNetworkHandle::new_for_test(net_tx)
+    }
+
+    /// Restart with the latest record persisted but uncertified (the #1187 crash window):
+    /// the resume must subscribe the epoch-vote topic with the record-derived publisher
+    /// window, then re-fire `epoch_record_watch` with the persisted record so the
+    /// node-lifetime collector re-enters the vote protocol.
+    #[tokio::test]
+    async fn test_resume_fires_watch_for_uncertified_latest_record() {
+        let (consensus_chain, epoch_rec, _key_configs, _temp_dir) =
+            uncertified_epoch1_fixture("test_resume_fires_watch").await;
+        let consensus_bus = ConsensusBus::new();
+
+        // Capture the Subscribe command the resume must issue before the watch fires.
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Some(NetworkCommand::Subscribe { topic, publishers, reply }) =
+                net_rx.recv().await
+            {
+                let _ = reply.send(Ok(true));
+                let _ = seen_tx.send((topic, publishers));
+            }
+        });
+
+        resume_epoch_certification(&consensus_chain, consensus_bus.app(), &primary_network, 0, 2)
+            .await;
+
+        let resumed = consensus_bus.app().epoch_record_watch().borrow().clone();
+        assert_eq!(
+            resumed,
+            Some(epoch_rec),
+            "resume must publish the persisted record on the watch"
+        );
+        let (topic, publishers) = tokio::time::timeout(Duration::from_secs(5), seen_rx)
+            .await
+            .expect("resume must subscribe before the timeout")
+            .expect("subscribe command captured");
+        assert_eq!(topic, LibP2pConfig::epoch_vote_topic(0));
+        assert_eq!(
+            publishers.map(|p| p.len()),
+            Some(4),
+            "publisher window must be the record's committee plus next_committee"
+        );
+    }
+
+    /// Restart with the latest record already certified: the resume must do nothing, so the
+    /// collector never re-runs a finished vote protocol.
+    #[tokio::test]
+    async fn test_resume_skips_certified_latest_record() {
+        let (consensus_chain, epoch_rec, key_configs, _temp_dir) =
+            uncertified_epoch1_fixture("test_resume_skips_certified").await;
+        let epoch_hash = epoch_rec.digest();
+
+        // Store a genuine 3-of-4 certificate for the record.
+        let sigs: Vec<BlsSignature> =
+            key_configs.iter().take(3).map(|kc| epoch_rec.sign_vote(kc).signature).collect();
+        let aggregate = BlsAggregateSignature::aggregate(&sigs[..], true).unwrap();
+        let signed_authorities: roaring::RoaringBitmap = (0u32..3).collect();
+        let cert = EpochCertificate {
+            epoch_hash,
+            signature: aggregate.to_signature(),
+            signed_authorities,
+        };
+        assert!(epoch_rec.verify_with_cert(&cert), "fixture cert must verify");
+        consensus_chain.epochs().save_certificate(epoch_hash, cert).await.unwrap();
+
+        let consensus_bus = ConsensusBus::new();
+        let primary_network = subscribe_replying_network();
+        resume_epoch_certification(&consensus_chain, consensus_bus.app(), &primary_network, 0, 2)
+            .await;
+
+        assert!(
+            consensus_bus.app().epoch_record_watch().borrow().is_none(),
+            "a certified record must not re-enter the vote protocol"
+        );
+    }
+
+    /// A latest record from an epoch at or past the current one must never resume: the gate
+    /// is strictly `record.epoch < current_epoch`, not merely inequality.
+    #[tokio::test]
+    async fn test_resume_skips_record_from_a_future_epoch() {
+        let (consensus_chain, _epoch_rec, _key_configs, _temp_dir) =
+            uncertified_epoch1_fixture("test_resume_skips_future_epoch").await;
+        let consensus_bus = ConsensusBus::new();
+        let primary_network = subscribe_replying_network();
+
+        // Latest stored record is epoch 1; the node believes it is still in epoch 0.
+        resume_epoch_certification(&consensus_chain, consensus_bus.app(), &primary_network, 0, 0)
+            .await;
+
+        assert!(
+            consensus_bus.app().epoch_record_watch().borrow().is_none(),
+            "a record from an epoch past the current one must not resume"
+        );
+    }
+
+    /// Fresh genesis: with no stored record the resume is a no-op, and once the in-memory
+    /// epoch-0 dummy is registered (mirroring `open_epoch_pack`) the resume must still skip
+    /// it - certifying the dummy would permanently block the real epoch-0 record behind
+    /// `write_epoch_record`'s certificate short-circuit.
+    #[tokio::test]
+    async fn test_resume_skips_in_progress_epoch_dummy() {
+        let mut rng = StdRng::from_os_rng();
+        let keypair = BlsKeypair::generate(&mut rng);
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir = TempDir::with_prefix("test_resume_skips_dummy").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee).await.unwrap();
+        let consensus_bus = ConsensusBus::new();
+        let primary_network = subscribe_replying_network();
+
+        // Empty store: nothing to resume.
+        resume_epoch_certification(&consensus_chain, consensus_bus.app(), &primary_network, 0, 1)
+            .await;
+        assert!(
+            consensus_bus.app().epoch_record_watch().borrow().is_none(),
+            "an empty record store must not fire the watch"
+        );
+
+        // The epoch-0 dummy (epoch still in progress) must never be voted on.
+        let dummy = EpochRecord {
+            epoch: 0,
+            committee: vec![*keypair.public()],
+            next_committee: vec![*keypair.public()],
+            ..Default::default()
+        };
+        consensus_chain.epochs().save_dummy_epoch0(dummy).await.unwrap();
+        resume_epoch_certification(&consensus_chain, consensus_bus.app(), &primary_network, 0, 0)
+            .await;
+        assert!(
+            consensus_bus.app().epoch_record_watch().borrow().is_none(),
+            "the in-progress epoch's dummy record must never be voted on"
+        );
     }
 }
