@@ -17,15 +17,7 @@
 //! [`ReplayResult`] types that thread control flow through the loop.
 
 use crate::{
-    engine::ExecutionNode,
-    manager::{
-        epoch_votes::{
-            EPOCH_CERT_RECOVERY_ATTEMPTS, EPOCH_CERT_RECOVERY_PEERS_PER_ATTEMPT,
-            EPOCH_CERT_RECOVERY_REQUEST_TIMEOUT, EPOCH_VOTE_RECV_TIMEOUT, MAX_EPOCH_VOTE_TIMEOUTS,
-        },
-        EpochManager,
-    },
-    metrics::EpochMetrics,
+    engine::ExecutionNode, manager::EpochManager, metrics::EpochMetrics,
     worker::worker_task_manager_name,
 };
 use std::{
@@ -39,52 +31,16 @@ use tn_primary::ConsensusBus;
 use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
 use tn_types::{
-    forks::seed_signature_active,
     gas_accumulator::{next_base_fee_for_config, GasAccumulator},
-    BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
+    BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase,
     EpochDigest, EpochRecord, SealedHeader, ShutdownNotifier, TaskJoinError, TaskManager,
-    TaskSpawner, TnReceiver,
+    TnReceiver,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// Name of the per-epoch [`TaskManager`], created fresh and torn down each epoch.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
-
-/// Worst-case wall clock the epoch-vote collector (`manage_epoch_votes`) spends on ordinary
-/// vote-propagation lag before giving up on a local quorum: `MAX_EPOCH_VOTE_TIMEOUTS + 2` full
-/// [`EPOCH_VOTE_RECV_TIMEOUT`] windows (the counter increments once per timed-out wait, and
-/// the loop only breaks on the first wait that times out with the counter above the
-/// threshold).
-const LOCAL_QUORUM_WORST: Duration =
-    EPOCH_VOTE_RECV_TIMEOUT.saturating_mul(MAX_EPOCH_VOTE_TIMEOUTS + 2);
-
-/// Worst-case wall clock of the vote collector's full peer-recovery path after a failed local
-/// quorum: every attempt exhausts every peer try at the full per-request timeout.
-const PEER_RECOVERY_WORST: Duration = EPOCH_CERT_RECOVERY_REQUEST_TIMEOUT
-    .saturating_mul(EPOCH_CERT_RECOVERY_ATTEMPTS * EPOCH_CERT_RECOVERY_PEERS_PER_ATTEMPT);
-
-/// Safety margin on top of the producer's ceiling: one additional full peer-recovery attempt,
-/// derived from the same named consts rather than a fresh literal, absorbing scheduling and
-/// network jitter around the modeled worst case.
-const CERTIFIED_ANCHOR_WAIT_MARGIN: Duration =
-    EPOCH_CERT_RECOVERY_REQUEST_TIMEOUT.saturating_mul(EPOCH_CERT_RECOVERY_PEERS_PER_ATTEMPT);
-
-/// Budget for the certified prior-epoch anchor wait
-/// ([`EpochManager::certified_prior_epoch_anchor`]), derived from the vote protocol's own
-/// designed-for worst case instead of guessed.
-///
-/// The two clocks race from nearly the same starting point: `write_epoch_record` fires the
-/// watch that spawns the vote collector inside the same `run_epoch` call that next enters
-/// this wait, so any budget below the producer's own ceiling
-/// ([`LOCAL_QUORUM_WORST`] of tolerated vote lag plus [`PEER_RECOVERY_WORST`] of peer
-/// recovery) can abort an honest node while the vote protocol is still within its designed
-/// bounds - and on non-adiri builds this is reachable from genesis. Fail-loud semantics are
-/// preserved: the wait stays finite, and on expiry the error still propagates out of
-/// `open_epoch_pack` / `run_epoch` / `run_epochs` and aborts the node instead of retrying.
-const CERTIFIED_ANCHOR_WAIT: Duration = LOCAL_QUORUM_WORST
-    .saturating_add(PEER_RECOVERY_WORST)
-    .saturating_add(CERTIFIED_ANCHOR_WAIT_MARGIN);
 
 /// Why `run_epoch` is being entered, and on exit what kind of transition just happened.
 ///
@@ -285,8 +241,7 @@ where
         // Do not wait long for tasks to exit, just drop them and move on to next epoch.
         epoch_task_manager.set_join_wait(200);
 
-        let prior_epoch_record =
-            self.open_epoch_pack(committee.clone(), epoch_task_manager.get_spawner()).await?;
+        let prior_epoch_record = self.open_epoch_pack(committee.clone()).await?;
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
             // to the engine and is executed.  Otherwise we could miss consensus execution.
@@ -565,230 +520,73 @@ where
 
     /// Open (or reuse, if already open) the epoch pack files for the current epoch.
     ///
-    /// Seeds the consensus chain for the new epoch, which requires the previous epoch's
-    /// [`EpochRecord`]. Resolving that record is the awkward part: it may already be in the DB, it
-    /// may be the synthetic epoch-0 filler, or it may be missing because a restart is catching up
-    /// across multiple boundaries faster than the epoch record collector can fetch records. In the
-    /// missing case this nudges `requested_missing_epoch` (only ever upward, never clobbering a
-    /// higher value already set by the gossip handler), pre-dials committee peers so the collector
-    /// has connections — without that pre-dial this blocks waiting for a record while the very task
-    /// that would supply it has not started — then waits up to 30s, erroring if it still does not
-    /// arrive.
+    /// Seeds the consensus chain for the new epoch from the previous epoch's [`EpochRecord`] and
+    /// returns that record's digest ([`EpochDigest::default`] for epoch 0, which has no prior
+    /// record) so the caller can seed the per-epoch
+    /// [`ConsensusConfig`](tn_config::ConsensusConfig) with the anchor for the epoch-close
+    /// committee-shuffle seed message.
     ///
-    /// Returns the digest of the previous epoch's [`EpochRecord`] ([`EpochDigest::default`] for
-    /// epoch 0, which has no prior record), so the caller can seed the per-epoch
-    /// [`ConsensusConfig`](tn_config::ConsensusConfig) with the canonical anchor for the
-    /// epoch-close committee-shuffle seed message. For seed-signature-active epochs the digest
-    /// is only released once the record's certificate has been verified (see
-    /// [`Self::certified_prior_epoch_anchor`]); an uncertified digest is never captured.
-    async fn open_epoch_pack(
-        &mut self,
-        committee: Committee,
-        task_spawner: TaskSpawner,
-    ) -> eyre::Result<EpochDigest> {
+    /// The previous epoch's record is always present here in a valid node state: every node seals
+    /// and durably persists each epoch's record at that epoch's close before advancing
+    /// (`write_epoch_record`), an imported node receives a contiguous, certificate-verified record
+    /// chain from genesis, and state sync never runs execution past the current epoch
+    /// (`handle_sync_output`), so every boundary is crossed through `write_epoch_record`. A missing
+    /// record therefore means a corrupted or incomplete datadir and is a hard error, not a
+    /// peer-fetch. The record is computed deterministically from the pinned closing block, so it
+    /// needs no certificate to be trusted as the seed anchor.
+    async fn open_epoch_pack(&mut self, committee: Committee) -> eyre::Result<EpochDigest> {
         let current_epoch = committee.epoch();
         let previous_epoch = current_epoch.saturating_sub(1);
-        let previous_epoch_rec =
-            self.consensus_chain.epochs().record_by_epoch(previous_epoch).await;
-        let previous_epoch_rec = if let Some(rec) = previous_epoch_rec {
-            // Even when the record is found, proactively trigger the epoch record
-            // collector so it backfills any epoch certs that are missing (e.g. when
-            // quorum failed AND the peer-fetch in manage_epoch_votes also failed because
-            // the network channels had already closed after epoch shutdown).
-            // Never decrease requested_missing_epoch: if the gossip handler already set it
-            // to a higher epoch (e.g. 3 while we are opening epoch 3 with previous_epoch=2),
-            // keep the higher value so the collector retries that epoch too.
-            let current = *self.consensus_bus.requested_missing_epoch().borrow();
-            self.consensus_bus.requested_missing_epoch().send_replace(current.max(previous_epoch));
-            rec
-        } else if current_epoch == 0 {
+
+        // Nudge the epoch-record collector to backfill missing epoch *certificates* only.
+        // Self-closed records are stored uncertified; their certs arrive later from epoch-vote
+        // gossip or peer recovery. This is purely cert availability - it does not gate record
+        // presence below. Never decrease it: the gossip handler may already have requested a
+        // higher epoch (e.g. 3 while we are opening epoch 3 with previous_epoch=2).
+        let requested = *self.consensus_bus.requested_missing_epoch().borrow();
+        self.consensus_bus.requested_missing_epoch().send_replace(requested.max(previous_epoch));
+
+        let previous_epoch_rec = if current_epoch == 0 {
+            // Genesis: no prior record to seal. Seed the chain from a filler carrying the genesis
+            // committee (identical to the `save_dummy_epoch0` record); the anchor below is the
+            // default digest. Gated on `current_epoch == 0`: by epoch 1 the real epoch-0 record has
+            // been sealed and persisted, so that boundary resolves it through the branch below
+            // rather than this filler.
             EpochRecord {
-                // Genuine genesis (current epoch 0, so there is no prior record to seal). Gated on
-                // `current_epoch == 0`, not `previous_epoch == 0`: at the epoch-0 -> epoch-1
-                // boundary `previous_epoch` is also 0, but a real epoch-0 record exists (or is
-                // syncing), and this filler's digest differs from that real record's digest. Using
-                // the filler at epoch 1 would feed a divergent `prior_epoch_record` into the
-                // epoch-close seed message, so nodes with the real record and nodes with the filler
-                // would sign/verify different seeds (#1032 canonicality). Epoch 1 therefore falls
-                // through to the wait-or-error path below, exactly like epoch >= 2.
                 epoch: 0,
                 committee: committee.bls_keys().iter().copied().collect(),
                 next_committee: committee.bls_keys().iter().copied().collect(),
                 ..Default::default()
             }
         } else {
-            // The previous epoch record is missing. This can happen when a node restarts while
-            // catching up across multiple epoch boundaries - state sync feeds epoch-boundary
-            // consensus to the engine faster than the epoch record collector fetches the records
-            // from peers. Trigger the collector and wait up to 30 seconds for the record.
-            // Never decrease requested_missing_epoch (same reasoning as the found-record branch).
-            let current = *self.consensus_bus.requested_missing_epoch().borrow();
-            self.consensus_bus.requested_missing_epoch().send_replace(current.max(previous_epoch));
-            warn!(target: "epoch-manager", previous_epoch, current_epoch, "missing previous epoch record, waiting for epoch record collector");
-
-            // Pre-dial committee peers before blocking so the epoch record collector can connect.
-            // Without this we deadlock: open_epoch_pack blocks here waiting for the record, but
-            // peer connections are only established in spawn_primary_network_for_epoch which runs
-            // after open_epoch_pack returns.
-            self.predial_committee_peers(&committee, &task_spawner).await?;
-
-            if let Some(rec) = self
-                .consensus_chain
-                .epochs()
-                .record_by_epoch_with_timeout(previous_epoch, Duration::from_secs(30))
-                .await
-            {
-                rec
-            } else {
-                return Err(eyre::eyre!(
-                    "Missing previous epoch record for epoch {previous_epoch} after waiting"
-                ));
-            }
+            // Invariant: every node seals and durably persists epoch N-1's record at that epoch's
+            // close before advancing (`write_epoch_record`), and an imported node receives a
+            // contiguous, certificate-verified record chain from genesis. State sync never runs
+            // execution past the current epoch (`handle_sync_output` no-ops output beyond it), so a
+            // node crosses every boundary through `write_epoch_record`. A missing record here is
+            // therefore a corrupted or incomplete datadir, not a recoverable sync gap - fail loudly
+            // rather than waiting on a peer that cannot supply what a valid node already has.
+            self.consensus_chain.epochs().record_by_epoch(previous_epoch).await.ok_or_else(
+                || {
+                    eyre::eyre!(
+                    "previous epoch record for epoch {previous_epoch} is missing while opening \
+                     epoch {current_epoch}: corrupted or incomplete datadir (do NOT delete \
+                     chain-data - investigate)"
+                )
+                },
+            )?
         };
-        // Anchor the epoch-close seed message: the digest of the record sealed for epoch N-1.
-        // Epoch 0 has no prior record, so it uses the default digest (matching the epoch-0
-        // filler convention above). The resolved record (found, filler, or fetched) is
-        // canonical chain state, so every node derives the same digest. For epochs where the
-        // seed-signature fork is active the anchor must additionally be backed by a verified
-        // certificate, so it is taken from `certified_prior_epoch_anchor` rather than from the
-        // record resolved above; pre-fork epochs never sign or verify epoch-close seed messages
-        // (proposer signing is fork-gated), so they keep the legacy uncertified capture and the
-        // certification error path can never fire for them.
-        let (prior_epoch_record, previous_epoch_rec) = if current_epoch == 0 {
-            (EpochDigest::default(), previous_epoch_rec)
-        } else if seed_signature_active(current_epoch) {
-            // The certified record REPLACES the one resolved above, for both the seed anchor and
-            // chain seeding. The resolved read can legitimately be the uncertified epoch-0 dummy
-            // (`save_dummy_epoch0`, which the epoch-record store returns for epoch 0 while its
-            // index is still empty), and that dummy's `..Default::default()` digest differs from
-            // the real epoch-0 record's. Keeping the resolved value and merely cross-checking
-            // digests would read that legitimate case as a divergence and abort, so a node that
-            // opened epoch 1 before epoch 0's record was persisted could never start. Taking the
-            // certified record is strictly stronger than the cross-check it replaces: the anchor
-            // and the chain are seeded from the same certificate-backed bytes by construction,
-            // rather than from two reads that are only assumed to agree.
-            let certified = self
-                .certified_prior_epoch_anchor(&committee, previous_epoch, &task_spawner)
-                .await?;
-            (certified.digest(), certified)
-        } else {
-            (previous_epoch_rec.digest(), previous_epoch_rec)
-        };
+
+        // Anchor the epoch-close seed message on the digest of the record sealed for epoch N-1
+        // (the default digest for epoch 0, which has no prior record). The record is computed
+        // deterministically from the pinned closing block, so every honest node derives the same
+        // digest and no certificate is needed to trust it here: a divergent record implies a fork,
+        // which a certificate could not repair. Proposer signing/verification of the seed message
+        // stays fork-gated elsewhere; only the "anchor must be certified" coupling is dropped.
+        let prior_epoch_record =
+            if current_epoch == 0 { EpochDigest::default() } else { previous_epoch_rec.digest() };
         self.consensus_chain.new_epoch(previous_epoch_rec, committee).await?;
         Ok(prior_epoch_record)
-    }
-
-    /// Pre-dial the committee's primary peers when this node currently has no connections.
-    ///
-    /// `open_epoch_pack` can block waiting on data (the previous epoch record, or its
-    /// certificate) that only a peer can supply, but per-epoch peer connections are normally
-    /// established in `spawn_primary_network_for_epoch`, which runs after `open_epoch_pack`
-    /// returns. Without this pre-dial such a wait deadlocks on a freshly-restarted node with
-    /// zero connections and can only time out; with it, the node-lifetime collector tasks can
-    /// fetch from peers while the wait is in progress.
-    async fn predial_committee_peers(
-        &self,
-        committee: &Committee,
-        task_spawner: &TaskSpawner,
-    ) -> eyre::Result<()> {
-        let primary_network_handle = self
-            .primary_network_handle
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("primary network handle missing during epoch open"))?;
-        if primary_network_handle.connected_peers_count().await.unwrap_or_default() == 0 {
-            let committee_keys: HashSet<BlsPublicKey> = committee.bls_keys().into_iter().collect();
-            let _ =
-                primary_network_handle.inner_handle().prepare_committee_dial(committee_keys).await;
-            committee.bls_keys().into_iter().for_each(|bls_key| {
-                self.dial_peer_bls(
-                    primary_network_handle.inner_handle().clone(),
-                    bls_key,
-                    task_spawner.clone(),
-                );
-            });
-        }
-        Ok(())
-    }
-
-    /// Resolve the epoch-close seed anchor for a seed-signature-active epoch, refusing to
-    /// return a digest that is not backed by a verified
-    /// [`EpochCertificate`](tn_types::EpochCertificate).
-    ///
-    /// # Threat model: why certification is required
-    ///
-    /// The proposer signs `EpochSeedMessage (epoch, round, prior_epoch_record)` against this
-    /// digest and every vote handler verifies incoming headers against its own copy; both read
-    /// it from the per-epoch `ConsensusConfig`, where it is captured exactly once — here, at
-    /// epoch start. The record store is first-write-wins, so a node holding a record the
-    /// previous committee never certified (e.g. built locally at an epoch close whose vote
-    /// quorum failed, then never replaced) would otherwise anchor on a digest no honest peer
-    /// shares: with n = 5 and quorum 4, one divergent node votes for nobody and is certified
-    /// by nobody (zero fault tolerance for the whole epoch), two divergent nodes stall the
-    /// epoch outright, and nothing self-heals because the capture is never re-read and
-    /// committee authors are exempt from bans. Requiring a super-quorum certificate — via
-    /// [`EpochRecordDb::certified_record_by_epoch`](tn_storage::epoch_records::EpochRecordDb),
-    /// which reuses the exact verification the vote-quorum and peer-recovery paths run before
-    /// storing a certificate — turns that silent network-wide degradation into a loud,
-    /// restartable error on this node only.
-    ///
-    /// # Waiting and failure
-    ///
-    /// The certificate is aggregated asynchronously from epoch-vote gossip, so it may not be
-    /// stored yet when the next epoch opens. The fast path accepts an already-verified
-    /// certificate with no extra waiting; otherwise this pre-dials committee peers (so the
-    /// node-lifetime epoch record collector, already nudged via `requested_missing_epoch` by
-    /// the caller, can actually fetch) and polls for up to [`CERTIFIED_ANCHOR_WAIT`] — the
-    /// vote protocol's own worst case (local-quorum lag plus full peer recovery) plus a
-    /// safety margin, all derived from the producer's named consts, because the vote
-    /// collector and this wait start from nearly the same instant and a shorter budget would
-    /// abort an honest node the vote protocol still considers on
-    /// schedule. A missing certificate after the wait, or a stored
-    /// certificate that fails verification, is a hard error — never a silent fallback to the
-    /// uncertified digest.
-    ///
-    /// Returns the certified [`EpochRecord`] itself rather than just its digest, because the
-    /// caller seeds the chain from it too. An earlier revision returned the digest and the
-    /// caller cross-checked it against the record it had already resolved; that check aborted
-    /// the node whenever the resolved read was the uncertified epoch-0 dummy, which is a
-    /// legitimate state (see the caller's comment in [`Self::open_epoch_pack`]).
-    ///
-    /// # Fork interaction
-    ///
-    /// Callers gate this on `seed_signature_active(current_epoch)`: pre-fork epochs neither
-    /// sign nor verify seed messages, so they never require (nor wait for) a certificate and
-    /// this error path cannot fire for them.
-    async fn certified_prior_epoch_anchor(
-        &self,
-        committee: &Committee,
-        previous_epoch: Epoch,
-        task_spawner: &TaskSpawner,
-    ) -> eyre::Result<EpochRecord> {
-        let current_epoch = committee.epoch();
-        // Typically we will have the EpochRecord in our DB.  We should have generated at the end of the last epoch and
-        // saved it.  Unless we have forked it will be correct so no need to wait for it to be certified.
-        let fast = self.consensus_chain.epochs().record_by_epoch(previous_epoch).await;
-        let certified = if let Some(fast) = fast {
-            fast
-        } else {
-            self.predial_committee_peers(committee, task_spawner).await?;
-            warn!(
-                target: "epoch-manager",
-                previous_epoch,
-                current_epoch,
-                "previous epoch record not yet certified, waiting for its certificate"
-            );
-            self.consensus_chain
-                .epochs()
-                .certified_record_by_epoch_with_timeout(previous_epoch, CERTIFIED_ANCHOR_WAIT)
-                .await
-                .map_err(|e| {
-                    eyre::eyre!(
-                        "refusing to anchor epoch {current_epoch} seed messages on an uncertified epoch \
-                         record for epoch {previous_epoch}: {e}"
-                    )
-                })?
-        };
-        Ok(certified)
     }
 
     /// Forward one consensus output to the engine and record progress.
@@ -1223,33 +1021,6 @@ mod tests {
         WorkerId, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
-    /// Pin the anchor-wait derivation to the producer's own ceiling: recompute the vote
-    /// protocol's worst case from the same named consts and require the budget to strictly
-    /// exceed it, so no future edit can silently shrink the wait back below the window the
-    /// vote collector is designed to use (the regression that hard-killed honest nodes at
-    /// the fork boundary).
-    #[test]
-    fn certified_anchor_wait_covers_the_vote_protocol_worst_case() {
-        // Local-quorum worst case: the collector waits out `MAX + 2` full recv windows
-        // before giving up on a local quorum (counter checked before increment, and the
-        // breaking check itself only fires after one more full window).
-        let local_quorum = EPOCH_VOTE_RECV_TIMEOUT * (MAX_EPOCH_VOTE_TIMEOUTS + 2);
-        // Peer-recovery worst case: every attempt exhausts every peer try at the full
-        // request timeout.
-        let peer_recovery = EPOCH_CERT_RECOVERY_REQUEST_TIMEOUT
-            * (EPOCH_CERT_RECOVERY_ATTEMPTS * EPOCH_CERT_RECOVERY_PEERS_PER_ATTEMPT);
-        assert!(
-            CERTIFIED_ANCHOR_WAIT > local_quorum,
-            "anchor wait ({CERTIFIED_ANCHOR_WAIT:?}) must strictly exceed the local-quorum \
-             worst case ({local_quorum:?})"
-        );
-        assert!(
-            CERTIFIED_ANCHOR_WAIT > local_quorum + peer_recovery,
-            "anchor wait ({CERTIFIED_ANCHOR_WAIT:?}) must strictly exceed the full vote \
-             protocol ceiling ({:?})",
-            local_quorum + peer_recovery,
-        );
-    }
     #[tokio::test(start_paused = true)]
     async fn retry_provider_faults_halts_after_exhausting_attempts() {
         // Retry-then-halt: a persistent node-local provider fault is retried exactly

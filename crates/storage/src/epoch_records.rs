@@ -554,19 +554,6 @@ impl EpochRecordDb {
         }
     }
 
-    /// Retrieve an [`EpochRecord`] by epoch number.
-    /// This version will wait up to timeout time for the record to show up if not available.
-    ///
-    /// The wait ends with a lookup at the deadline, so a record saved during the last poll
-    /// interval is still returned (see `poll_until_deadline`).
-    pub async fn record_by_epoch_with_timeout(
-        &self,
-        epoch: Epoch,
-        timeout: Duration,
-    ) -> Option<EpochRecord> {
-        Self::poll_until_deadline(timeout, || self.record_by_epoch(epoch)).await
-    }
-
     /// Retrieve the [`EpochRecord`] for `epoch` only when a stored [`EpochCertificate`]
     /// cryptographically verifies against it.
     ///
@@ -2812,33 +2799,6 @@ mod test {
         saver.await.expect("saver task");
         let got = got.expect("a cert saved before the deadline must be returned");
         assert_eq!(got.epoch_hash, cert.epoch_hash);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn record_by_epoch_with_timeout_sees_record_saved_in_final_poll_interval() {
-        // Same property on the record wait, which restart catch-up depends on: a record that lands
-        // in the last poll interval before the deadline is returned rather than turned into the
-        // error that ends the node. See the sibling cert test for why virtual time is exact here.
-        let temp_dir = TempDir::with_prefix("record_timeout_final_interval").expect("temp dir");
-        let mut rng = StdRng::from_os_rng();
-        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
-
-        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
-        let (record, _cert) = make_test_pair(0, &signers, EpochDigest::default());
-
-        let saver = {
-            let db = db.clone();
-            let record = record.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-                db.save_record(record).await.expect("save record");
-            })
-        };
-
-        let got = db.record_by_epoch_with_timeout(0, std::time::Duration::from_secs(1)).await;
-        saver.await.expect("saver task");
-        let got = got.expect("a record saved before the deadline must be returned");
-        assert_eq!(got.digest(), record.digest());
     }
 
     #[tokio::test(start_paused = true)]

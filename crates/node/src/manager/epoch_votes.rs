@@ -31,16 +31,6 @@ pub(crate) const MAX_EPOCH_VOTE_TIMEOUTS: u32 = 24;
 /// `request_epoch_cert` call) after failing to reach a local vote quorum.
 pub(crate) const EPOCH_CERT_RECOVERY_ATTEMPTS: u32 = 5;
 
-/// Peers tried per recovery attempt: mirrors the `0..3` peer-rotation loop inside
-/// `PrimaryNetworkHandle::request_epoch_cert` (`tn_primary::network`), which this module has
-/// no handle on but whose worst case budget consumers must account for.
-pub(crate) const EPOCH_CERT_RECOVERY_PEERS_PER_ATTEMPT: u32 = 3;
-
-/// Upper bound on one peer request during recovery: the libp2p request-response timeout. The
-/// swarm is built with `request_response::Config::default()` (10s) and `tn-network-libp2p`
-/// never overrides it, so each `request_epoch_cert` peer try is bounded by this.
-pub(crate) const EPOCH_CERT_RECOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Both save and persist an epoch record and cert with logging.
 async fn save_and_persist_with_logs(
     db: &EpochRecordDb,
