@@ -36,14 +36,18 @@ pub enum TestBinary {
 impl TestBinary {
     /// Build a [`std::process::Command`] that runs this binary.
     ///
-    /// Pins `TN_SEED_SIGNATURE_FORK_EPOCH` on the child so every spawned node runs the fork
-    /// point the harness states rather than the build default (non-adiri builds are otherwise
-    /// active from genesis). With nothing in the harness environment the pin is `u32::MAX`:
-    /// fork dormant, wire-identical to pre-fork mainnet. A harness-level value is forwarded
-    /// verbatim so a fork-active lane can export `TN_SEED_SIGNATURE_FORK_EPOCH=0`, and a
-    /// single test can still override the pin with its own later `env()` call. Only binaries
-    /// built with `tn-types/test-utils` (pulled in via `tn-storage/test-utils`, see
-    /// `make build-e2e-bin`) consult the variable; production binaries ignore it.
+    /// Pins `TN_SEED_SIGNATURE_FORK_EPOCH` and `TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH` on the
+    /// child so every spawned node runs the fork points the harness states rather than the
+    /// build default (non-adiri builds are otherwise active from genesis). With nothing in the
+    /// harness environment each pin is `u32::MAX`: fork dormant, wire-identical to pre-fork
+    /// mainnet. The strict-commit-timestamp pin matters here because e2e networks run
+    /// sub-second header delays, where the strict `previous + 1` floor advances chain time
+    /// faster than wall clock and breaks the harness's host-clock-vs-block-timestamp phase
+    /// math (`wait_for_mid_epoch`). A harness-level value is forwarded verbatim so a
+    /// fork-active lane can export either variable as `0`, and a single test can still
+    /// override a pin with its own later `env()` call. Only binaries built with
+    /// `tn-types/test-utils` (pulled in via `tn-storage/test-utils`, see `make build-e2e-bin`)
+    /// consult the variables; production binaries ignore them.
     pub fn command(&self) -> std::process::Command {
         let mut command = match self {
             TestBinary::Prebuilt(path) => std::process::Command::new(path),
@@ -52,6 +56,9 @@ impl TestBinary {
         let fork_epoch =
             std::env::var("TN_SEED_SIGNATURE_FORK_EPOCH").unwrap_or_else(|_| u32::MAX.to_string());
         command.env("TN_SEED_SIGNATURE_FORK_EPOCH", fork_epoch);
+        let strict_fork_epoch = std::env::var("TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH")
+            .unwrap_or_else(|_| u32::MAX.to_string());
+        command.env("TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH", strict_fork_epoch);
         command
     }
 }

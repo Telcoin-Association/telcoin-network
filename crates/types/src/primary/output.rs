@@ -383,11 +383,16 @@ impl Default for CommittedSubDag {
 /// (#1191). Post-fork (`strict` true, see [`crate::forks::strict_commit_timestamp_active`])
 /// the floor moves to `previous + 1`: consecutive commits never tie, so every commit of an
 /// epoch keys a unique buffer slot. The recorded time may then run ahead of wall clock while
-/// commits arrive faster than one per second; the drift is bounded by the longest
-/// faster-than-one-per-second commit run and shrinks again whenever a real second passes with
-/// no commit, every downstream consumer reads this same chain (block timestamps,
-/// epoch-boundary checks), and no consumer re-validates it against local wall clock, so the
-/// drift is self-consistent.
+/// commits arrive faster than one per second; the drift shrinks only when a real second
+/// passes with no commit, so a sustained sub-second commit cadence (where second-granularity
+/// `created_at` values tie on nearly every commit) advances chain time faster than wall time
+/// for as long as it lasts. Production cadences hold a 1 s minimum header delay with one
+/// leader per two rounds and do not sustain that regime; the e2e harness, which does
+/// (250-500 ms header delays), pins the fork dormant via
+/// `TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH` (see
+/// [`crate::forks::strict_commit_timestamp_active`]). Every downstream consumer reads this
+/// same chain (block timestamps, epoch-boundary checks), and no consumer re-validates it
+/// against local wall clock, so the drift is self-consistent.
 ///
 /// A commit with no previous sub-dag has no floor in either arm and records the leader
 /// timestamp as-is. That makes the strict guarantee intra-epoch only: the first commit of an

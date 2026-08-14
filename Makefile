@@ -144,19 +144,29 @@ E2E_BIN := $(E2E_TARGET_ROOT)/e2e/telcoin-network
 # seed_signature_override_is_inert_when_unset requires a process WITHOUT the variable.
 TN_SEED_SIGNATURE_FORK_EPOCH ?= 4294967295
 
+# Strict-commit-timestamp fork epoch for the e2e lanes (#1191), same shape as the
+# seed-signature pin above: u32::MAX = fork DORMANT. The e2e harness itself defaults the
+# spawned nodes to dormant (TestBinary::command), because sub-second e2e header delays make
+# the strict floor advance chain time faster than wall clock; this variable exists so a
+# fork-active lane can override that default. Only test-utils builds consult it
+# (tn_types::forks::strict_commit_timestamp_fork_epoch_override). Same caveat as above:
+# never set it on a bare --workspace run (strict_commit_timestamp_override_is_inert_when_unset
+# requires a process WITHOUT the variable).
+TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH ?= 4294967295
+
 # run restart integration tests
 test-restarts: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH=$(TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # run epoch integration tests (same filter as the public-tests epoch line). The scheduled
 # Durable e2e lane (#1149) runs this and test-restarts with TN_TEST_MDBX_SYNC=durable
 # exported so every spawned node opens MDBX in Durable.
 test-epochs: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH=$(TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
 
 # run e2e tests
 test-e2e: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH=$(TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
@@ -232,8 +242,8 @@ revert-submodule:
 # workspace tests that don't require faucet credentials
 public-tests: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" cargo nextest run --workspace --exclude tn-faucet --no-fail-fast ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH=$(TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH=$(TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # local checks to ensure PR is ready
 pr:

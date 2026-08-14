@@ -267,12 +267,31 @@ pub const STRICT_COMMIT_TIMESTAMP_FORK_EPOCH: Epoch = u32::MAX;
 /// it must follow the value being derived, not the node deriving it.
 ///
 /// Adiri builds activate at [`STRICT_COMMIT_TIMESTAMP_FORK_EPOCH`]; all other builds are
-/// active from genesis. This gate deliberately has no `TN_*` environment override: exactly
-/// one production site consumes it (`CommittedSubDag::new`), and the formula behind it is a
-/// pure function with direct unit tests on both arms, so tests pin behavior without
-/// process-global state.
+/// active from genesis. Under `test-utils`, an explicit
+/// `TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH` override takes precedence over both (see
+/// [`strict_commit_timestamp_fork_epoch_override`]), so a test states the fork point it
+/// means rather than inheriting whichever one its feature set happens to select.
 #[inline]
 pub fn strict_commit_timestamp_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "test-utils")]
+    {
+        strict_commit_timestamp_fork_epoch_override()
+            .map_or_else(|| build_strict_commit_timestamp_active(epoch), |fork| epoch >= fork)
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        build_strict_commit_timestamp_active(epoch)
+    }
+}
+
+/// This build's compile-time strict-commit-timestamp fork point, with no test override
+/// applied.
+///
+/// Unchanged from [`STRICT_COMMIT_TIMESTAMP_FORK_EPOCH`]'s documented contract: adiri
+/// (testnet, which carries pre-fork history) is dormant before the fork epoch and active
+/// from it, and every other build (mainnet) is active from genesis.
+#[inline]
+const fn build_strict_commit_timestamp_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
     #[expect(
         clippy::absurd_extreme_comparisons,
@@ -288,6 +307,33 @@ pub fn strict_commit_timestamp_active(epoch: Epoch) -> bool {
         let _ = epoch;
         true
     }
+}
+
+/// Test-only override of the effective strict-commit-timestamp fork epoch, read once from
+/// `TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH` (`4294967295` for "never fires", `0` for "active
+/// from genesis").
+///
+/// An environment variable for the same process-boundary reason as
+/// [`seed_signature_fork_epoch_override`]: e2e tests drive real node processes spawned via
+/// `TN_BIN_PATH`, which share no memory with the harness. The e2e harness pins this fork
+/// dormant on every spawned node: its networks run sub-second header delays (250-500 ms), so
+/// commits arrive faster than one per wall-clock second, the second-granularity `created_at`
+/// ties on nearly every commit, and the strict `previous + 1` floor would advance chain time
+/// roughly twice as fast as wall time, breaking every harness comparison of host clock
+/// against block timestamps. Production cadences (a 1 s minimum header delay and one leader
+/// per two rounds) do not produce that regime.
+///
+/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
+/// behavior and cannot be repointed at runtime by its environment. An unparseable value is
+/// ignored rather than defaulted, leaving the build's own fork point in force.
+#[cfg(feature = "test-utils")]
+pub fn strict_commit_timestamp_fork_epoch_override() -> Option<Epoch> {
+    static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+    })
 }
 
 #[cfg(test)]
@@ -387,12 +433,15 @@ mod tests {
     /// (#1191): dormant on adiri at every real epoch until a follow-up PR sets the concrete
     /// fork epoch, active from genesis on every other build (which is the build that produces
     /// both the shipped node binary and the e2e binary).
+    ///
+    /// Asserts against [`build_strict_commit_timestamp_active`], the override-free decision,
+    /// so the result does not depend on whether `test-utils` was unified into this build.
     #[test]
     fn strict_commit_timestamp_gate_matches_this_builds_rollout_contract() {
         #[cfg(not(feature = "adiri"))]
         [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
             assert!(
-                strict_commit_timestamp_active(epoch),
+                build_strict_commit_timestamp_active(epoch),
                 "non-adiri builds run the strict formula from genesis; epoch {epoch} must be \
                  active",
             );
@@ -401,16 +450,38 @@ mod tests {
         {
             [0, 1, 2, STRICT_COMMIT_TIMESTAMP_FORK_EPOCH - 1].into_iter().for_each(|epoch| {
                 assert!(
-                    !strict_commit_timestamp_active(epoch),
+                    !build_strict_commit_timestamp_active(epoch),
                     "adiri stays dormant before STRICT_COMMIT_TIMESTAMP_FORK_EPOCH; epoch \
                      {epoch} must be pre-fork",
                 );
             });
             assert!(
-                strict_commit_timestamp_active(STRICT_COMMIT_TIMESTAMP_FORK_EPOCH),
+                build_strict_commit_timestamp_active(STRICT_COMMIT_TIMESTAMP_FORK_EPOCH),
                 "the gate must fire from the fork epoch onward (`>=`, not `>`)",
             );
         }
+    }
+
+    /// With no `TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH` in the environment, the test override
+    /// must be completely inert: the gate answers exactly as the compile-time contract does.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn strict_commit_timestamp_override_is_inert_when_unset() {
+        // The override latches in a process-wide `OnceLock`, so a harness launched WITH the
+        // variable set cannot observe the unset behaviour. Fail loudly rather than assert a
+        // property this process cannot hold; a silent skip here would read as a pass.
+        assert!(
+            strict_commit_timestamp_fork_epoch_override().is_none(),
+            "this test requires a process without TN_STRICT_COMMIT_TIMESTAMP_FORK_EPOCH set; \
+             the override is OnceLock-latched, so run the unset case in its own process",
+        );
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert_eq!(
+                strict_commit_timestamp_active(epoch),
+                build_strict_commit_timestamp_active(epoch),
+                "an unset override must not shift the gate at epoch {epoch}",
+            );
+        });
     }
 
     /// Pin [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`] to the worker-configs code committed in
