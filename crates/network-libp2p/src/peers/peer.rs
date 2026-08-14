@@ -24,6 +24,10 @@ use tracing::{error, warn};
 /// over it (`known_ip_addresses`) bounded (GHSA-29v6-gvv5-45gx). A legitimate node advertises a
 /// single address, so the cap is never reached in normal operation, and address refresh and key
 /// rotation stay well within it.
+///
+/// The discovery path reuses this value as the per-entry ceiling in `eligible_for_discovery`:
+/// a PeerExchange entry with more addresses than this set can hold cannot come from an honest
+/// peer's store, so it is rejected before it reaches `discovery_peers` (issue #1183).
 pub(crate) const MAX_MULTIADDRS_PER_PEER: usize = 32;
 
 /// Information about a given connected peer.
