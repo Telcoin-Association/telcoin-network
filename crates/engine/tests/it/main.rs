@@ -3531,3 +3531,186 @@ async fn test_uneven_batches_and_digests_tolerated_on_early_adiri_epoch() -> eyr
 
     Ok(())
 }
+
+/// Two consecutive outputs whose leaders share one wall-clock second keep BOTH
+/// `ConsensusHeader` digests retrievable from the repurposed EIP-4788 beacon-roots ring
+/// buffer (#1191).
+///
+/// Both leaders carry the same `created_at`, so before the strict-commit-timestamp fork the
+/// two outputs recorded identical `commit_timestamp`s and the second output's pre-block
+/// system call silently overwrote the first output's digest (both writes keyed
+/// `timestamp % 8191`). Under the strict arm - active from genesis in this default-feature
+/// build - the second output commits at `previous + 1` and the pair keys two distinct slots.
+///
+/// The per-block `assert_eip4788` checks in the other tests read each block's OWN historical
+/// state, where the overwritten digest was still visible, so they could never catch the
+/// collision. This test asserts from the FINAL canonical state instead, which is where the
+/// overwrite used to land.
+///
+/// Adiri builds keep the legacy tie while `STRICT_COMMIT_TIMESTAMP_FORK_EPOCH` is dormant,
+/// so the non-collision property this test pins simply does not hold there yet.
+#[cfg(not(feature = "adiri"))]
+#[tokio::test]
+async fn test_same_second_outputs_keep_both_beacon_roots_digests() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+    // create batches for consensus output
+    let chain = test_chain_spec_arc();
+    let mut batches_1 = tn_reth::test_utils::batches(chain.clone(), 1);
+    let mut batches_2 = tn_reth::test_utils::batches(chain, 1);
+
+    // seed genesis with the batch signers
+    let genesis = test_genesis_with_consensus_registry(4);
+    let all_batches = [batches_1.clone(), batches_2.clone()].concat();
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 = committee.authorities().first().expect("first in committee").id();
+    let authority_2 = committee.authorities().last().expect("last in committee").id();
+    let batch_producer =
+        committee.authorities().get(2).expect("third in committee").execution_address();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    // execute batches so headers carry valid data
+    batches_1.iter_mut().chain(batches_2.iter_mut()).for_each(|batch| {
+        batch.beneficiary = batch_producer;
+        batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+        execute_test_batch(batch);
+    });
+
+    //=== Consensus: two chained outputs whose leaders tie on one second
+    //
+    // A fixed, deterministic second keeps the ring-buffer slots non-trivial: slot values must
+    // differ from the empty-storage default, and TIED_SECOND % 8191 (= 7096) does not wrap,
+    // so the pair's slots are adjacent.
+    const TIED_SECOND: u64 = 1_700_000_000;
+    let mut leader_1 = Certificate::default();
+    leader_1.update_header_author_for_test(authority_1);
+    leader_1.update_header_round_for_test(1);
+    leader_1.update_header_created_at_for_test(TIED_SECOND);
+    let batch_digests_1: VecDeque<BlockHash> = batches_1.iter().map(|b| b.digest()).collect();
+    let subdag_1 = CommittedSubDag::new(
+        vec![leader_1.clone()],
+        leader_1,
+        1,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output_1 = ConsensusOutput::new(
+        subdag_1.clone(),
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests_1,
+        vec![CertifiedBatch { address: batch_producer, batches: batches_1 }],
+    );
+
+    let mut leader_2 = Certificate::default();
+    leader_2.update_header_author_for_test(authority_2);
+    leader_2.update_header_round_for_test(2);
+    leader_2.update_header_created_at_for_test(TIED_SECOND);
+    let batch_digests_2: VecDeque<BlockHash> = batches_2.iter().map(|b| b.digest()).collect();
+    let subdag_2 = CommittedSubDag::new(
+        vec![leader_2.clone()],
+        leader_2,
+        2,
+        ReputationScores::default(),
+        Some(subdag_1.clone()),
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let ts_1 = subdag_1.commit_timestamp();
+    let ts_2 = subdag_2.commit_timestamp();
+    assert_eq!(ts_1, TIED_SECOND, "first commit records the leader second as-is");
+    assert_eq!(ts_2, ts_1 + 1, "tied leaders must commit at distinct consecutive seconds");
+    let consensus_output_2 = ConsensusOutput::new(
+        subdag_2,
+        consensus_output_1.consensus_header_hash(),
+        1,
+        false,
+        batch_digests_2,
+        vec![CertifiedBatch { address: batch_producer, batches: batches_2 }],
+    );
+    let digest_1: B256 = consensus_output_1.consensus_header_hash().into();
+    let digest_2: B256 = consensus_output_2.consensus_header_hash().into();
+
+    //=== Execution
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let mut engine = ExecutorEngine::new(
+        reth_env.clone(),
+        None, // max_round
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+
+    // queue the first output, send the second, then close the channel so the engine
+    // executes both and shuts down
+    engine.push_back_queued_for_test(consensus_output_1.clone());
+    let broadcast_result = to_engine.send(consensus_output_2.clone()).await;
+    assert!(broadcast_result.is_ok());
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+    let engine_task = timeout(Duration::from_secs(15), rx).await??;
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    // both single-batch outputs executed
+    assert_eq!(reth_env.last_block_number()?, 2, "one block per output");
+    let last_output = execution_node.last_executed_output().await?;
+    assert_eq!(last_output, consensus_output_2.consensus_header_hash());
+
+    // the collision surface: read BOTH outputs' ring-buffer slots from the FINAL state
+    let state_provider = reth_env.state_by_block_hash(reth_env.canonical_tip().hash())?;
+    let ts_slot_1 = U256::from(ts_1 % HISTORY_BUFFER_LENGTH);
+    let root_slot_1 = ts_slot_1 + U256::from(HISTORY_BUFFER_LENGTH);
+    let ts_slot_2 = U256::from(ts_2 % HISTORY_BUFFER_LENGTH);
+    let root_slot_2 = ts_slot_2 + U256::from(HISTORY_BUFFER_LENGTH);
+    assert_eq!(
+        state_provider.storage(BEACON_ROOTS_ADDRESS, ts_slot_1.into())?.unwrap_or_default(),
+        U256::from(ts_1),
+        "first output's timestamp slot must survive the second output"
+    );
+    assert_eq!(
+        state_provider.storage(BEACON_ROOTS_ADDRESS, root_slot_1.into())?.unwrap_or_default(),
+        U256::from_be_bytes(digest_1.0),
+        "first output's consensus digest must survive the second output (pre-#1191 this \
+         slot held the second output's digest)"
+    );
+    assert_eq!(
+        state_provider.storage(BEACON_ROOTS_ADDRESS, ts_slot_2.into())?.unwrap_or_default(),
+        U256::from(ts_2),
+        "second output's timestamp slot must be written"
+    );
+    assert_eq!(
+        state_provider.storage(BEACON_ROOTS_ADDRESS, root_slot_2.into())?.unwrap_or_default(),
+        U256::from_be_bytes(digest_2.0),
+        "second output's consensus digest must be written"
+    );
+
+    Ok(())
+}

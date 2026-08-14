@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
@@ -375,6 +375,45 @@ impl Default for CommittedSubDag {
     }
 }
 
+/// Resolve the `commit_timestamp` a new [`CommittedSubDag`] records.
+///
+/// Pre-fork (`strict` false) this is the legacy clamp `max(previous, leader_created_at)`,
+/// byte-identical to the historical chain: two consecutive commits may share one wall-clock
+/// second, and a tied pair collides in the repurposed EIP-4788 beacon-roots ring buffer
+/// (#1191). Post-fork (`strict` true, see [`crate::forks::strict_commit_timestamp_active`])
+/// the floor moves to `previous + 1`: consecutive commits never tie, so every commit of an
+/// epoch keys a unique buffer slot. The recorded time may then run ahead of wall clock while
+/// commits arrive faster than one per second; the drift is bounded by the longest
+/// faster-than-one-per-second commit run and shrinks again whenever a real second passes with
+/// no commit, every downstream consumer reads this same chain (block timestamps,
+/// epoch-boundary checks), and no consumer re-validates it against local wall clock, so the
+/// drift is self-consistent.
+///
+/// A commit with no previous sub-dag has no floor in either arm and records the leader
+/// timestamp as-is. That makes the strict guarantee intra-epoch only: the first commit of an
+/// epoch starts from an empty per-epoch pack (`previous` is `None`), so it can still tie the
+/// prior epoch's closing commit — a documented residual of #1191, not covered by this fork.
+/// The `+ 1` saturates at `u64::MAX`, where strictness degrades to the legacy tie rather than
+/// wrapping; that ceiling is unreachable for wall-clock seconds.
+///
+/// `previous` is the previous sub-dag's raw stored `commit_timestamp`, not the
+/// [`CommittedSubDag::commit_timestamp`] accessor: the pre-fork arm must reproduce the
+/// historical clamp byte-for-byte, and the accessor's zero-means-uninitialized fallback
+/// cannot apply in the strict arm, because the previous sub-dag always belongs to the same
+/// (post-fork) epoch and every sub-dag derived under this code records a nonzero timestamp.
+fn resolved_commit_timestamp(
+    strict: bool,
+    previous: Option<TimestampSec>,
+    leader_created_at: TimestampSec,
+) -> TimestampSec {
+    let floor = if strict {
+        previous.map(|ts| ts.saturating_add(1)).unwrap_or_default()
+    } else {
+        previous.unwrap_or_default()
+    };
+    floor.max(leader_created_at)
+}
+
 impl CommittedSubDag {
     /// Create a new CommittedSubDag.
     /// Note that leader MUST be the first element or certificates or this will panic.
@@ -394,13 +433,22 @@ impl CommittedSubDag {
     ) -> Self {
         // Narwhal enforces some invariants on the header.created_at, so we can use it as a
         // timestamp.
-        let previous_sub_dag_ts =
-            previous_sub_dag.map(|s| s.inner.commit_timestamp).unwrap_or_default();
-        let commit_timestamp = previous_sub_dag_ts.max(*leader.header().created_at());
+        let previous_sub_dag_ts = previous_sub_dag.map(|s| s.inner.commit_timestamp);
+        let commit_timestamp = resolved_commit_timestamp(
+            crate::forks::strict_commit_timestamp_active(leader.epoch()),
+            previous_sub_dag_ts,
+            *leader.header().created_at(),
+        );
 
-        if previous_sub_dag_ts > *leader.header().created_at() {
-            warn!(sub_dag_index = ?sub_dag_index, "Leader timestamp {} is older than previously committed sub dag timestamp {}. Auto-correcting to max {}.",
-                leader.header().created_at(), previous_sub_dag_ts, commit_timestamp);
+        if previous_sub_dag_ts.unwrap_or_default() > *leader.header().created_at() {
+            warn!(sub_dag_index = ?sub_dag_index, "Leader timestamp {} is older than previously committed sub dag timestamp {}. Auto-correcting to {}.",
+                leader.header().created_at(), previous_sub_dag_ts.unwrap_or_default(), commit_timestamp);
+        } else if commit_timestamp != *leader.header().created_at() {
+            // Only the strict arm reaches this branch: a tie with the previous commit was
+            // bumped one second past the leader-reported time (#1191). Ties are routine while
+            // commits arrive faster than one per second, so this is debug, not warn.
+            debug!(sub_dag_index = ?sub_dag_index, "Tied leader timestamp {} bumped to {} to keep commit timestamps strictly increasing.",
+                leader.header().created_at(), commit_timestamp);
         }
         // Make sure the leader is the LAST certificate.
         //
@@ -577,3 +625,90 @@ crate::crypto::digest_newtype! {
 }
 
 // See test_utils output_tests.rs for this modules tests.
+//
+// The tests below are the deliberate exception: `resolved_commit_timestamp` is private, so its
+// arms are only reachable from inside the crate, and the fork-arm split must run under BOTH CI
+// lanes (default features and `adiri`), which build tn-types but not the integration-test
+// crates.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The legacy arm is byte-identical to the historical clamp `max(previous, created_at)`:
+    /// ties and decreases both collapse onto the previous timestamp, which is the pre-fork
+    /// wire behavior every already-committed sub-dag digest depends on.
+    #[test]
+    fn legacy_commit_timestamp_matches_history() {
+        // No previous sub-dag: the leader timestamp is recorded as-is, including zero.
+        assert_eq!(resolved_commit_timestamp(false, None, 0), 0);
+        assert_eq!(resolved_commit_timestamp(false, None, 7), 7);
+        // Advancing leader wins.
+        assert_eq!(resolved_commit_timestamp(false, Some(10), 11), 11);
+        // Tie collapses onto the shared second (the #1191 collision case).
+        assert_eq!(resolved_commit_timestamp(false, Some(10), 10), 10);
+        // Decrease clamps to the previous timestamp, again a tie.
+        assert_eq!(resolved_commit_timestamp(false, Some(10), 9), 10);
+    }
+
+    /// The strict arm floors at `previous + 1`: no chained pair of commits can share a
+    /// timestamp, so no two commits of an epoch key the same EIP-4788 ring-buffer slot
+    /// (#1191).
+    #[test]
+    fn strict_commit_timestamp_never_ties_previous() {
+        // No previous sub-dag: unchanged from the legacy arm, including zero.
+        assert_eq!(resolved_commit_timestamp(true, None, 0), 0);
+        assert_eq!(resolved_commit_timestamp(true, None, 7), 7);
+        // Advancing leader wins exactly as before.
+        assert_eq!(resolved_commit_timestamp(true, Some(10), 11), 11);
+        // Tie bumps past the shared second instead of colliding.
+        assert_eq!(resolved_commit_timestamp(true, Some(10), 10), 11);
+        // Decrease also lands strictly past the previous commit.
+        assert_eq!(resolved_commit_timestamp(true, Some(10), 9), 11);
+        // The floor saturates at the ceiling instead of wrapping.
+        assert_eq!(resolved_commit_timestamp(true, Some(u64::MAX), 0), u64::MAX);
+    }
+
+    /// `CommittedSubDag::new` wires the gate for this build: default-feature builds are
+    /// strict from genesis, adiri builds stay on the legacy clamp while
+    /// [`crate::forks::STRICT_COMMIT_TIMESTAMP_FORK_EPOCH`] is dormant. Both leaders carry
+    /// epoch 0 and one shared NONZERO `created_at`, so the chained pair is a genuine tie and
+    /// the first commit's recorded value is observable (a zero would also satisfy the
+    /// accessor's uninitialized fallback, making the assertion vacuous).
+    #[test]
+    fn new_applies_this_builds_fork_arm_to_tied_leaders() {
+        const TIED_SECOND: TimestampSec = 7;
+        let mut leader = Certificate::default();
+        leader.update_header_created_at_for_test(TIED_SECOND);
+        let first = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader.clone(),
+            0,
+            ReputationScores::default(),
+            None,
+            EpochSeedChainValue::genesis_placeholder(),
+        );
+        let second = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            Some(first.clone()),
+            EpochSeedChainValue::genesis_placeholder(),
+        );
+        assert_eq!(
+            first.inner.commit_timestamp, TIED_SECOND,
+            "the first commit must record the leader second as-is",
+        );
+        #[cfg(not(feature = "adiri"))]
+        assert_eq!(
+            second.inner.commit_timestamp,
+            TIED_SECOND + 1,
+            "default-feature builds must bump a tied pair past the shared second",
+        );
+        #[cfg(feature = "adiri")]
+        assert_eq!(
+            second.inner.commit_timestamp, TIED_SECOND,
+            "adiri must keep the legacy tie while the fork is dormant",
+        );
+    }
+}

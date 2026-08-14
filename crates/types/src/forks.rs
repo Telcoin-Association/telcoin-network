@@ -234,6 +234,56 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
     })
 }
 
+#[cfg(feature = "adiri")]
+/// First epoch whose commits derive a strictly increasing `commit_timestamp` (#1191).
+///
+/// Pre-fork epochs keep the legacy clamp `max(previous, leader.created_at())`, which lets two
+/// consecutive commits of an epoch share one wall-clock second. Tied commits collide in the
+/// repurposed EIP-4788 beacon-roots ring buffer: the pre-block system call keys the buffer by
+/// `timestamp % 8191`, so the second commit of a tied pair silently overwrites the first
+/// commit's `ConsensusHeader` digest and the standard in-EVM proof path (`get(T)`) loses that
+/// digest permanently. From this epoch onward the floor moves to `previous + 1`
+/// ([`crate::CommittedSubDag::new`]), so every commit of an epoch records a unique timestamp
+/// and keeps a retrievable buffer slot. The guarantee is intra-epoch: the first commit of an
+/// epoch has no previous sub-dag (the per-epoch pack starts empty), so a tie with the prior
+/// epoch's closing commit stays possible across the boundary (#1191 residual).
+///
+/// The formula is consensus-critical: `commit_timestamp` is hashed into the sub-dag digest
+/// (`CommittedSubDag::digest`), so a mixed fleet would fork on the first tied pair. `u32::MAX`
+/// keeps the gate dormant. The rollout is the standard two-phase sequence documented on
+/// [`SEED_SIGNATURE_FORK_EPOCH`]: deploy this build fleet-wide first (safe indefinitely while
+/// dormant), then land a follow-up PR that sets the concrete epoch, re-verified against the
+/// live chain at merge time.
+///
+/// Non-adiri builds (mainnet) have no dormant period: the strict formula is active from
+/// genesis and this constant does not exist there.
+pub const STRICT_COMMIT_TIMESTAMP_FORK_EPOCH: Epoch = u32::MAX;
+
+/// Whether commits of `epoch` derive the strictly increasing `commit_timestamp` (#1191).
+///
+/// Callers MUST pass the epoch of the leader whose commit is being derived
+/// (`leader.epoch()`), never `Committee::epoch()` or other node-local state, for the same
+/// reason documented on [`seed_signature_active`]: the formula feeds the consensus digest, so
+/// it must follow the value being derived, not the node deriving it.
+///
+/// Adiri builds activate at [`STRICT_COMMIT_TIMESTAMP_FORK_EPOCH`]; all other builds are
+/// active from genesis. This gate deliberately has no `TN_*` environment override: exactly
+/// one production site consumes it (`CommittedSubDag::new`), and the formula behind it is a
+/// pure function with direct unit tests on both arms, so tests pin behavior without
+/// process-global state.
+#[inline]
+pub fn strict_commit_timestamp_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "adiri")]
+    {
+        epoch >= STRICT_COMMIT_TIMESTAMP_FORK_EPOCH
+    }
+    #[cfg(not(feature = "adiri"))]
+    {
+        let _ = epoch;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +375,36 @@ mod tests {
                 "an unset override must not shift the gate at epoch {epoch}",
             );
         });
+    }
+
+    /// Pin the strict-commit-timestamp gate to the rollout contract this build implements
+    /// (#1191): dormant on adiri at every real epoch until a follow-up PR sets the concrete
+    /// fork epoch, active from genesis on every other build (which is the build that produces
+    /// both the shipped node binary and the e2e binary).
+    #[test]
+    fn strict_commit_timestamp_gate_matches_this_builds_rollout_contract() {
+        #[cfg(not(feature = "adiri"))]
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert!(
+                strict_commit_timestamp_active(epoch),
+                "non-adiri builds run the strict formula from genesis; epoch {epoch} must be \
+                 active",
+            );
+        });
+        #[cfg(feature = "adiri")]
+        {
+            [0, 1, 2, STRICT_COMMIT_TIMESTAMP_FORK_EPOCH - 1].into_iter().for_each(|epoch| {
+                assert!(
+                    !strict_commit_timestamp_active(epoch),
+                    "adiri stays dormant before STRICT_COMMIT_TIMESTAMP_FORK_EPOCH; epoch \
+                     {epoch} must be pre-fork",
+                );
+            });
+            assert!(
+                strict_commit_timestamp_active(STRICT_COMMIT_TIMESTAMP_FORK_EPOCH),
+                "the gate must fire from the fork epoch onward (`>=`, not `>`)",
+            );
+        }
     }
 
     /// Pin [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`] to the worker-configs code committed in
