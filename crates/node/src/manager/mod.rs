@@ -6,4 +6,4 @@ mod node;
 pub use export_exec::{ExecStateExporter, ExportOutcome};
 pub use node::*;
 
-pub(crate) use epoch_votes::spawn_epoch_vote_collector;
+pub(crate) use epoch_votes::{resume_epoch_certification, spawn_epoch_vote_collector};

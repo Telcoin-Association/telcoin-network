@@ -15,7 +15,7 @@ use crate::{
     health::HealthcheckServer,
     manager::{
         exex::{run_critical_exex_future, run_isolated_exex_future},
-        spawn_epoch_vote_collector, ExecStateExporter,
+        resume_epoch_certification, spawn_epoch_vote_collector, ExecStateExporter,
     },
     metrics::EpochMetrics,
 };
@@ -751,6 +751,24 @@ where
             node_task_manager.get_spawner(),
             self.node_shutdown.subscribe(),
         );
+
+        // Resume the epoch-close vote protocol if the latest persisted epoch record has no
+        // certificate. A crash between the durable record write at epoch close and
+        // certification otherwise strands the record: nothing on the restart path
+        // re-publishes this node's vote or re-fires `epoch_record_watch`, and the next
+        // epoch open then blocks waiting for a certificate no restarted node is helping to
+        // form (#1187). The collector spawned above is already subscribed to the watch, so
+        // re-firing it replays the normal close-path handoff. The resume also subscribes
+        // the epoch-vote gossip topic first: the per-epoch subscribe only runs after the
+        // epoch open this recovery is unblocking.
+        resume_epoch_certification(
+            &self.consensus_chain,
+            &self.consensus_bus,
+            &primary_network_handle,
+            self.builder.tn_config.genesis().config.chain_id,
+            epoch,
+        )
+        .await;
 
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine_update_rx, &node_task_manager);

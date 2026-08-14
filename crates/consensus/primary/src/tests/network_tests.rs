@@ -4,7 +4,7 @@ use crate::{
     error::PrimaryNetworkError,
     network::{
         message::{PrimaryGossip, PrimaryResponse},
-        try_admit_epoch_record, MissingCertificatesRequest, RequestHandler,
+        try_admit_epoch_record, EpochVotePump, MissingCertificatesRequest, RequestHandler,
         MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONSENSUS_CERTS, MAX_PENDING_REQUESTS_PER_PEER,
         MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
@@ -23,7 +23,10 @@ use std::{
 };
 use tempfile::TempDir;
 use tn_config::{ConsensusConfig, KeyConfig, Parameters};
-use tn_network_libp2p::{GossipMessage, TopicHash};
+use tn_network_libp2p::{
+    types::{GossipPayload, NetworkEvent},
+    GossipMessage, TopicHash,
+};
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
     consensus_pack::PackError,
@@ -37,8 +40,8 @@ use tn_types::{
     BlockHeader, BlockNumHash, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner as _, Certificate,
     CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch,
     EpochDigest, EpochRecord, EpochSeedMessage, EpochVote, ExecHeader, Hash as _, HeaderDigest,
-    ReputationScores, Round, SealedHeader, TaskManager, TnReceiver as _, VoteDigest, VoteInfo,
-    B256,
+    ReputationScores, Round, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, VoteDigest,
+    VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -2302,4 +2305,89 @@ async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<(
     assert_eq!(handler.consensus_certs_len(), 0, "map must be cleared after a publish");
 
     Ok(())
+}
+
+/// The epoch-vote pump forwards a signature-checked vote to `new_epoch_votes`, buffers events
+/// it must not consume (undecodable gossip, a decodable vote with a bad signature), and on
+/// `stop_and_replay` releases the `primary_network_events` subscription and re-queues the
+/// buffered events in order for the next subscriber.
+#[tokio::test]
+async fn test_epoch_vote_pump_forwards_votes_and_replays_the_rest() {
+    let mut rng = StdRng::from_os_rng();
+    let key_config = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rng));
+    let epoch_rec = EpochRecord {
+        epoch: 1,
+        committee: vec![key_config.primary_public_key()],
+        next_committee: vec![key_config.primary_public_key()],
+        ..Default::default()
+    };
+    let vote = epoch_rec.sign_vote(&key_config);
+    assert!(vote.check_signature(), "fixture vote must verify");
+    // Decodes as an epoch vote but fails the signature check: the pump must not consume it.
+    let bad_vote = EpochVote { epoch_hash: EpochDigest::default(), ..vote };
+    assert!(!bad_vote.check_signature(), "fixture bad vote must not verify");
+
+    let topic = TopicHash::from_raw("test-epoch-vote-pump");
+    let gossip_event = |data: Vec<u8>| {
+        NetworkEvent::Gossip(Box::new(GossipPayload {
+            message: GossipMessage {
+                source: None,
+                data,
+                sequence_number: None,
+                topic: topic.clone(),
+            },
+            relayer: None,
+            author: None,
+        }))
+    };
+    let garbage_data = vec![0xde, 0xad, 0xbe, 0xef];
+    let vote_data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
+    let bad_vote_data = encode(&PrimaryGossip::EpochVote(Box::new(bad_vote)));
+
+    let consensus_bus = ConsensusBus::new();
+    let app = consensus_bus.app();
+    let mut votes_rx = app.subscribe_new_epoch_votes();
+
+    // Queue events before the pump starts; the channel queues without a subscriber.
+    app.primary_network_events().send(gossip_event(garbage_data.clone())).await.unwrap();
+    app.primary_network_events().send(gossip_event(vote_data)).await.unwrap();
+    app.primary_network_events().send(gossip_event(bad_vote_data.clone())).await.unwrap();
+
+    let pump = EpochVotePump::spawn(app);
+
+    // The valid vote reaches the collector channel while the pump holds the subscription.
+    let forwarded = tokio::time::timeout(Duration::from_secs(5), votes_rx.recv())
+        .await
+        .expect("pump must forward the vote before the timeout")
+        .expect("vote channel open");
+    assert_eq!(forwarded, vote);
+
+    // Give the pump time to route the trailing bad-signature event into its buffer.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    pump.stop_and_replay().await;
+
+    // The subscription slot is free again (this subscribe would panic otherwise). The
+    // replay itself is detached, so await the two replayed non-vote events instead of
+    // polling; they arrive in buffer order, and the consumed vote never does.
+    let mut events_rx = app.subscribe_primary_network_events();
+    let replayed_first = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+        .await
+        .expect("garbage event must be replayed before the timeout")
+        .expect("events channel open");
+    assert!(
+        matches!(&replayed_first, NetworkEvent::Gossip(payload) if payload.message.data == garbage_data),
+        "first replayed event must be the undecodable gossip"
+    );
+    let replayed_second = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+        .await
+        .expect("bad-signature event must be replayed before the timeout")
+        .expect("events channel open");
+    assert!(
+        matches!(&replayed_second, NetworkEvent::Gossip(payload) if payload.message.data == bad_vote_data),
+        "second replayed event must be the bad-signature vote"
+    );
+    // Give any straggling (incorrect) replay of the consumed vote time to land, then
+    // confirm the channel is empty.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(events_rx.try_recv().is_err(), "the consumed vote must not be replayed");
 }
