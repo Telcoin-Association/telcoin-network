@@ -65,11 +65,12 @@ fn run_pack_loop(
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             PackMessage::Save(cert) => {
-                // First-error-wins: after a real write failure poisons the pack, each queued
-                // save fails with the poisoned-pack guard's `ReadOnly` error. A plain
-                // `send_replace` would overwrite the root cause with that follow-on error
-                // before any reader could observe it (#1148). The log keeps every failure
-                // visible, including the ones the latch does not keep.
+                // First-error-wins: a plain `send_replace` would overwrite the root cause
+                // with a follow-on error before any reader could observe it (#1148). The
+                // pack also replays the root cause of its failed state on each later save,
+                // so this latch is defense in depth for failures that do not share one root
+                // cause. The log keeps every failure visible, including the ones the latch
+                // does not keep.
                 inner.save(&cert).unwrap_or_else(|e| {
                     error!(target: "certificate_pack", %e, "failed to save certificate");
                     latch_first_error(&tx_error, e);
@@ -159,8 +160,8 @@ impl CertificatePack {
     ///
     /// The slot does not clear on read. When more than one background operation fails, the
     /// slot keeps the first failure. In the poisoned-pack cascade (a write failure makes
-    /// every queued save fail with the read-only guard error) the first failure is the root
-    /// cause. Every failure, kept or not, is logged by the pack loop.
+    /// every queued save fail with a copy of that write failure) the first failure is the
+    /// root cause. Every failure, kept or not, is logged by the pack loop.
     pub fn get_error(&self) -> Result<(), PackError> {
         match &*self.error.borrow() {
             Some(e) => Err(e.clone()),
@@ -481,11 +482,15 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn queued_saves_after_a_failed_write_keep_the_root_cause() {
-        // Regression test for #1148: a real write failure poisons the pack, so every save
-        // queued behind it fails on the poisoned-pack guard with `AppendError::ReadOnly`.
-        // Before the fix the loop latched last-write-wins: the follow-on "read only" error
-        // overwrote the root cause before any reader could observe it, and the latch then
-        // reported a read-only condition on a pack that was opened read-write, forever.
+        // Regression test for #1148: a real write failure poisons the pack, and every save
+        // queued behind it fails on the poisoned-pack guard. Before the fix that guard
+        // returned `AppendError::ReadOnly` and the loop latched last-write-wins: the
+        // follow-on "read only" error overwrote the root cause before any reader could
+        // observe it, and the latch then reported a read-only condition on a pack that was
+        // opened read-write, forever. Now the guard replays the root cause and the latch
+        // keeps the first error; both layers report the root cause here, so this test stays
+        // green when either layer alone is reverted and fails only when both revert. The
+        // per-layer kills live in the error_latch and epoch_records unit tests.
         let temp_dir = TempDir::with_prefix("queued_saves_root_cause").expect("temp dir");
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
 
@@ -529,7 +534,7 @@ mod test {
             !text.contains("read only"),
             "latch must not report the follow-on read-only error, got: {text}"
         );
-        // Positive control for the negative assertion above: the follow-on guard error
+        // Positive control for the negative assertion above: the read-only guard error
         // really renders as "read only" today, so a later Display reword cannot make that
         // check pass vacuously without failing here.
         assert_eq!(AppendError::ReadOnly.to_string(), "read only");

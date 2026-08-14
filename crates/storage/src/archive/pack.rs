@@ -83,9 +83,10 @@ where
     ///   - key data
     ///   - value data
     ///
-    /// For the erros IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to a
-    /// failed state and become read only.  These errors all indicate serious underlying issues that
-    /// can not be trivially fixed, a reopen/repair might help.
+    /// A WriteDataError moves the DB to a failed state.  While the DB is failed, each append
+    /// and each commit returns a copy of the error that caused the failed state.  This error
+    /// indicates a serious underlying issue that can not be trivially fixed, a reopen/repair
+    /// might help.
     pub fn append(&mut self, value: &V) -> Result<u64, AppendError> {
         self.inner.append(value)
     }
@@ -117,6 +118,8 @@ where
     /// Flush any caches to disk and sync the data and index file.
     /// All data should be safely on disk if this call succeeds.
     /// Note this is an expensive call (syncing to disk is not cheap).
+    /// On a pack in the failed state this returns [`CommitError::Failed`] with a copy of the
+    /// error that caused the failed state.
     pub fn commit(&mut self) -> Result<(), CommitError> {
         self.inner.commit()
     }
@@ -171,7 +174,10 @@ where
     value_buffer: Vec<u8>,
     /// Used as a second buffer for compress and decompress operations on records.
     compression_buffer: Vec<u8>,
-    failed: bool,
+    /// Root cause of the failed state: a copy of the io error from the append that failed
+    /// the pack. While this is `Some`, each append and each commit returns a copy of this
+    /// error so callers see the root cause and not a generic guard error.
+    failed: Option<io::Error>,
     read_only: bool,
     uid_idx: u64, // Store for opening an iterator.
     /// Test-only: when set, the next append fails as if the data write hit an io error.
@@ -211,7 +217,7 @@ where
             data_file,
             value_buffer: Vec::new(),
             compression_buffer: Vec::new(),
-            failed: false,
+            failed: None,
             read_only,
             uid_idx,
             #[cfg(test)]
@@ -248,24 +254,26 @@ where
     }
 
     /// Test-only injection point: fail the append the way a real io write failure fails.
-    /// Armed by [`Pack::fail_next_append_for_test`]; disarms after one use.
+    /// Armed by [`Pack::fail_next_append_for_test`]; disarms after one use. The injected
+    /// error carries the StorageFull kind, a sentinel that is not the Other default, so
+    /// tests can assert that a replayed copy keeps the kind.
     #[cfg(test)]
     fn injected_append_failure(&mut self) -> Result<(), AppendError> {
         std::mem::take(&mut self.fail_next_append)
-            .then(|| AppendError::WriteDataError(io::Error::other("injected write failure")))
+            .then(|| {
+                AppendError::WriteDataError(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "injected write failure",
+                ))
+            })
             .map_or(Ok(()), Err)
-    }
-
-    /// Outside tests the injection point compiles to a no-op.
-    #[cfg(not(test))]
-    fn injected_append_failure(&mut self) -> Result<(), AppendError> {
-        Ok(())
     }
 
     /// Do the actual insert so the public function can rollback easily on an error.
     fn append_inner(&mut self, value: &V) -> Result<u64, AppendError> {
         let record_pos = self.data_file.len();
 
+        #[cfg(test)]
         self.injected_append_failure()?;
 
         write_value(
@@ -286,18 +294,22 @@ where
     ///   - key data
     ///   - value data
     ///
-    /// For the errors IndexCrcError, IndexOverflow, WriteDataError or KeyError the DB will move to
-    /// a failed state and become read only.  These errors all indicate serious underlying
-    /// issues that can not be trivially fixed, a reopen/repair might help.
+    /// A WriteDataError moves the DB to a failed state.  While the DB is failed, each append
+    /// and each commit returns a copy of the error that caused the failed state.  This error
+    /// indicates a serious underlying issue that can not be trivially fixed, a reopen/repair
+    /// might help.
     fn append(&mut self, value: &V) -> Result<u64, AppendError> {
-        if self.read_only || self.failed {
+        if self.read_only {
             return Err(AppendError::ReadOnly);
         }
+        self.failed_cause().map_err(AppendError::WriteDataError)?;
         let result = self.append_inner(value);
         if let Err(err) = &result {
             match err {
                 // These errors all indicate a failed DB that can no longer be inserted too.
-                AppendError::WriteDataError(_io_err) => self.failed = true,
+                AppendError::WriteDataError(io_err) => {
+                    self.failed = Some(Self::copy_io_error(io_err))
+                }
                 // These errors do not indicate a failed DB.
                 AppendError::SerializeValue(_)
                 | AppendError::ReadOnly
@@ -306,6 +318,19 @@ where
             }
         }
         result
+    }
+
+    /// Copy an io error: io::Error is not Clone, so the copy keeps the error kind and the
+    /// message of the original.
+    fn copy_io_error(cause: &io::Error) -> io::Error {
+        io::Error::new(cause.kind(), cause.to_string())
+    }
+
+    /// When the pack is in the failed state, return a copy of the io error that caused it.
+    /// The copy keeps the error kind and the message of the first failure, so every later
+    /// append or commit reports the root cause of the failed state.
+    fn failed_cause(&self) -> Result<(), io::Error> {
+        self.failed.as_ref().map_or(Ok(()), |cause| Err(Self::copy_io_error(cause)))
     }
 
     /// Return the DB version.
@@ -327,9 +352,10 @@ where
     /// All data should be safely on disk if this call succeeds.
     /// Note this is a very expensive call (syncing to disk is not cheap).
     fn commit(&mut self) -> Result<(), CommitError> {
-        if self.read_only || self.failed {
+        if self.read_only {
             return Err(CommitError::ReadOnly);
         }
+        self.failed_cause().map_err(CommitError::Failed)?;
         self.flush().map_err(CommitError::Flush)?;
         self.data_file.sync_all().map_err(CommitError::DataFileSync)?;
         Ok(())
@@ -695,6 +721,85 @@ mod tests {
         name: String,
     }
     type TestPack = Pack<TestRec>;
+
+    /// Regression test for the failed-state guard: a failed pack replays the error that
+    /// caused the failed state, on both the append and the commit path, instead of the
+    /// read-only guard error it returned before. The replayed copy keeps the error kind
+    /// and the message of the root cause.
+    #[test]
+    fn failed_pack_replays_the_root_cause() {
+        let tmp_path = TempDir::with_prefix("test_failed_pack_replay").expect("temp dir");
+        let mut db: TestPack = Pack::open(
+            tmp_path.path().join("pack_failed_replay"),
+            0,
+            false,
+            PackCompression::None,
+            0,
+        )
+        .expect("open pack");
+
+        // Arm the injector: the next append fails the way a real io write failure fails and
+        // moves the pack to the failed state.
+        db.fail_next_append_for_test();
+        let root_cause = db
+            .append(&TestRec { idx: 1, name: "Value One".to_string() })
+            .expect_err("armed append must fail");
+        assert!(
+            root_cause.to_string().contains("injected write failure"),
+            "unexpected root cause: {root_cause}"
+        );
+        // Positive control for the negative assertions below: the root cause does not
+        // render as the guard error.
+        assert!(!root_cause.to_string().contains("read only"), "got: {root_cause}");
+        // Positive control for the kind assertions below: the injected root cause really
+        // carries the StorageFull sentinel kind, not the Other default a degenerate copy
+        // would produce.
+        assert!(
+            matches!(&root_cause, AppendError::WriteDataError(io_err) if io_err.kind() == io::ErrorKind::StorageFull),
+            "unexpected root cause shape: {root_cause}"
+        );
+
+        // Each later append replays a copy of the root cause, not the read-only guard error.
+        let replayed = db
+            .append(&TestRec { idx: 2, name: "Value Two".to_string() })
+            .expect_err("a failed pack rejects appends");
+        assert_eq!(
+            replayed.to_string(),
+            root_cause.to_string(),
+            "append must replay the root cause"
+        );
+        assert!(
+            matches!(&replayed, AppendError::WriteDataError(io_err) if io_err.kind() == io::ErrorKind::StorageFull),
+            "the append replay must keep the error kind, got: {replayed}"
+        );
+
+        // Commit reports the failed state with its own discriminant and the same root cause.
+        let commit_err = db.commit().expect_err("a failed pack rejects commits");
+        assert!(
+            matches!(&commit_err, CommitError::Failed(io_err) if io_err.kind() == io::ErrorKind::StorageFull),
+            "commit must report the failed state and keep the error kind, got: {commit_err:?}"
+        );
+        assert!(
+            commit_err.to_string().contains("injected write failure"),
+            "commit must carry the root cause, got: {commit_err}"
+        );
+
+        // A genuinely read-only pack still reports the read-only guard error. The injected
+        // failure fired before any record write, so the file reopens cleanly.
+        drop(db);
+        let mut ro: TestPack = Pack::open(
+            tmp_path.path().join("pack_failed_replay"),
+            0,
+            true,
+            PackCompression::None,
+            0,
+        )
+        .expect("reopen read only");
+        let ro_err = ro
+            .append(&TestRec { idx: 3, name: "Value Three".to_string() })
+            .expect_err("a read-only pack rejects appends");
+        assert_eq!(ro_err.to_string(), "read only");
+    }
 
     fn archive_pack_(compression: PackCompression) {
         let tmp_path = TempDir::with_prefix("test_archive_pack_one").expect("temp dir");

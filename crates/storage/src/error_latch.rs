@@ -5,12 +5,14 @@ use tokio::sync::watch;
 /// Latch `error` into `slot` only when the slot is empty.
 ///
 /// The store loops latch each failed background write into a `watch` slot. A plain
-/// `send_replace` is last-write-wins: after a real write failure poisons a pack, each queued
-/// write fails on the poisoned-pack guard with `ReadOnly` and overwrites the root cause before
-/// a reader can observe it. This helper keeps the first error, so in that cascade the root
-/// cause survives its follow-on failures. A reader that drains the slot still acknowledges
-/// exactly one failure; first-write-wins only changes which failure that is. Callers log every
-/// failure, so the errors the latch does not keep stay visible.
+/// `send_replace` is last-write-wins: a later failure overwrites an earlier one before a
+/// reader can observe it, so the first failure of a cascade is lost. This helper keeps the
+/// first error. The pack itself also replays the root cause of its failed state on every
+/// later append and commit (flush is not guarded), so in that cascade both layers report
+/// the same root cause; the latch stays as defense in depth for failures that do not share
+/// one root cause. A reader that drains the slot still acknowledges exactly one failure;
+/// first-write-wins only changes which failure that is. Callers log every failure, so the
+/// errors the latch does not keep stay visible.
 pub(crate) fn latch_first_error<E>(slot: &watch::Sender<Option<E>>, error: E) {
     slot.send_if_modified(|current| {
         let vacant = current.is_none();
