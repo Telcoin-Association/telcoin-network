@@ -234,6 +234,14 @@ sol!(
         function getNextCommitteeSize() external view returns (uint16);
         /// Returns the current stake config version.
         function getCurrentStakeVersion() external view returns (uint8);
+        /// Returns the active stake config (`versions[stakeVersion]`); a config stored by
+        /// `upgradeStakeVersion` is visible here immediately, with no settlement delay.
+        function getCurrentStakeConfig() external view returns (StakeConfig memory);
+        /// Store `newConfig` as a new stake version and activate it immediately, returning the
+        /// new version. Owner-only; rejects a zero `epochDuration`. Every epoch opened after the
+        /// call stamps its `EpochInfo.epochDuration` from this config; epochs already opened
+        /// keep their stamped duration.
+        function upgradeStakeVersion(StakeConfig calldata newConfig) external override onlyOwner returns (uint8);
         /// Returns true if the BLS pubkey belongs to a known validator.
         ///
         /// NOTE (post-`CONSENSUS_REGISTRY_FORK_EPOCH`): the upgraded contract keys its internal
