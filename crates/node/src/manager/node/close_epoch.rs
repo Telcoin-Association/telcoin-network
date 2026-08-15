@@ -28,9 +28,9 @@ use tn_storage::{
     },
 };
 use tn_types::{
-    Batch, BlockHash, BlockNumHash, BlsPublicKey, ConsensusHeaderDigest, ConsensusNumHash,
-    ConsensusOutput, Database as TNDatabase, Epoch, EpochDigest, EpochRecord, TaskManager,
-    TnReceiver,
+    deconstruct_nonce, Batch, BlockHash, BlockNumHash, BlsPublicKey, ConsensusHeaderDigest,
+    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, Epoch, EpochDigest, EpochRecord,
+    TaskManager, TnReceiver,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
@@ -392,6 +392,84 @@ where
         // flush it durably here before publishing
         self.consensus_chain.epochs().persist().await?;
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
+        Ok(())
+    }
+
+    /// Re-derive the previous epoch's [`EpochRecord`] locally when a restart finds it missing.
+    ///
+    /// This happens when the node was killed at epoch N-1's boundary: the engine had already
+    /// executed the epoch-closing block - whose `concludeEpoch` advanced the on-chain epoch to N,
+    /// so on restart we enter epoch N - but [`Self::write_epoch_record`] had not yet persisted
+    /// record N-1. Execution and the record write are not atomic and cannot be reordered
+    /// (record N-1's `final_state` IS that closing block, which must execute first), so this
+    /// gap is inherent, not corruption.
+    ///
+    /// We still hold everything needed to regenerate the record: the executed closing block and
+    /// record N-2. Recover epoch N-1's boundary consensus header from the closing block (the same
+    /// `parent_beacon_block_root` + nonce decode `try_restore_state` uses) and re-run the exact
+    /// deterministic close-time path via [`Self::write_epoch_record`], so the re-derived record is
+    /// bit-identical to the one every other node sealed - no peer fetch, no certificate.
+    ///
+    /// A cheap no-op whenever the record is already present (the common case), including epoch 0
+    /// and the epoch 0 -> 1 boundary (the dummy epoch-0 record keeps `contains_epoch(0)` true).
+    pub(super) async fn recover_previous_epoch_record(
+        &mut self,
+        current_epoch: Epoch,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<()> {
+        if current_epoch == 0 {
+            return Ok(());
+        }
+        let previous_epoch = current_epoch - 1;
+        if self.consensus_chain.epochs().contains_epoch(previous_epoch).await {
+            return Ok(());
+        }
+
+        // Recover epoch `previous_epoch`'s boundary consensus header from the closing block we
+        // already executed (the canonical tip - no epoch-`current_epoch` block has executed yet).
+        let blocks = engine.last_executed_output_blocks(1).await?;
+        let closing_block = blocks.first().ok_or_else(|| {
+            eyre!(
+                "cannot re-derive the epoch {previous_epoch} record: no executed blocks on restart"
+            )
+        })?;
+        let consensus_digest: ConsensusHeaderDigest =
+            closing_block.parent_beacon_block_root.unwrap_or_default().into();
+        let (header_epoch, _round) = deconstruct_nonce(closing_block.nonce.into());
+        if header_epoch != previous_epoch {
+            return Err(eyre!(
+                "cannot re-derive the epoch {previous_epoch} record: the executed tip was produced \
+                 by epoch {header_epoch} - refusing to re-derive from an unexpected block"
+            ));
+        }
+        let boundary_header = self
+            .consensus_chain
+            .consensus_header_by_digest(header_epoch, consensus_digest)
+            .await
+            .map_err(|e| {
+                eyre!(
+                    "failed to READ the consensus store re-deriving the epoch {previous_epoch} \
+                     record (a storage error, not a missing record - do NOT delete chain-data): {e}"
+                )
+            })?
+            .ok_or_else(|| {
+                eyre!(
+                    "cannot re-derive the epoch {previous_epoch} record: its boundary consensus \
+                     header {consensus_digest} is absent from the consensus chain"
+                )
+            })?;
+
+        warn!(
+            target: "epoch-manager",
+            previous_epoch,
+            current_epoch,
+            "previous epoch record missing on restart (killed at its boundary); re-deriving it locally",
+        );
+        // Feed the recovered boundary header into the deterministic close-time path: it reads the
+        // committees at the closing block and chains on record N-2, and build_epoch_record's
+        // continuity check hard-errors rather than persisting a divergent record if inputs are off.
+        self.last_consensus_header = Some(boundary_header);
+        self.write_epoch_record(previous_epoch, engine).await?;
         Ok(())
     }
 

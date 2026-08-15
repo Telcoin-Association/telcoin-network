@@ -241,6 +241,13 @@ where
         // Do not wait long for tasks to exit, just drop them and move on to next epoch.
         epoch_task_manager.set_join_wait(200);
 
+        // If a restart was killed at epoch N-1's boundary - the engine executed the closing block
+        // (advancing the on-chain epoch to N) but write_epoch_record(N-1) never persisted the
+        // record
+        // - re-derive record N-1 locally from the executed closing block before opening the pack.
+        // A no-op unless the previous epoch's record is actually missing.
+        self.recover_previous_epoch_record(committee.epoch(), engine).await?;
+
         let prior_epoch_record = self.open_epoch_pack(committee.clone()).await?;
         if epoch_mode.replay_consensus() {
             // If we are starting up then make sure that any consensus we previously validated goes
