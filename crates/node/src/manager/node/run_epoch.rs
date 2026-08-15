@@ -29,10 +29,12 @@ use tn_config::{NetworkConfig, TelcoinDirs};
 use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::ConsensusBus;
 use tn_reth::{error::StateReadError, RethEnv};
-use tn_storage::{certificate_pack::CertificatePack, tables::OurNodeBatchesCache};
+use tn_storage::{
+    certificate_pack::CertificatePack, epoch_records::EpochRecordDb, tables::OurNodeBatchesCache,
+};
 use tn_types::{
     gas_accumulator::{next_base_fee_for_config, GasAccumulator},
-    BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase,
+    BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
     EpochDigest, EpochRecord, SealedHeader, ShutdownNotifier, TaskJoinError, TaskManager,
     TnReceiver,
 };
@@ -553,53 +555,13 @@ where
         let requested = *self.consensus_bus.requested_missing_epoch().borrow();
         self.consensus_bus.requested_missing_epoch().send_replace(requested.max(previous_epoch));
 
-        let previous_epoch_rec = if current_epoch == 0 {
-            // Genesis: no prior record to seal. Seed the chain from a filler carrying the genesis
-            // committee (identical to the `save_dummy_epoch0` record); the anchor below is the
-            // default digest. Gated on `current_epoch == 0`: by epoch 1 the real epoch-0 record has
-            // been sealed and persisted, so that boundary resolves it through the branch below
-            // rather than this filler.
-            EpochRecord {
-                epoch: 0,
-                committee: committee.bls_keys().iter().copied().collect(),
-                next_committee: committee.bls_keys().iter().copied().collect(),
-                ..Default::default()
-            }
-        } else {
-            // Check that we are not trying to use the dummy epoch 0 record.
-            if previous_epoch == 0 && self.consensus_chain.epochs().contains_dummy_epoch0().await {
-                return Err(eyre::eyre!(
-                    "previous epoch record for epoch {previous_epoch} is missing while opening \
-                 epoch {current_epoch}: corrupted or incomplete datadir (do NOT delete \
-                 chain-data - investigate)- we only have the dummy epoch 0 record not the real one"
-                ));
-            }
-            // Invariant: every node seals and durably persists epoch N-1's record at that epoch's
-            // close before advancing (`write_epoch_record`), and an imported node receives a
-            // contiguous, certificate-verified record chain from genesis. State sync never runs
-            // execution past the current epoch (`handle_sync_output` no-ops output beyond it), so a
-            // node crosses every boundary through `write_epoch_record`. A missing record here is
-            // therefore a corrupted or incomplete datadir, not a recoverable sync gap - fail loudly
-            // rather than waiting on a peer that cannot supply what a valid node already has.
-            self.consensus_chain.epochs().record_by_epoch(previous_epoch).await.ok_or_else(
-                || {
-                    eyre::eyre!(
-                    "previous epoch record for epoch {previous_epoch} is missing while opening \
-                     epoch {current_epoch}: corrupted or incomplete datadir (do NOT delete \
-                     chain-data - investigate)"
-                )
-                },
-            )?
-        };
-
-        // Anchor the epoch-close seed message on the digest of the record sealed for epoch N-1
-        // (the default digest for epoch 0, which has no prior record). The record is computed
-        // deterministically from the pinned closing block, so every honest node derives the same
-        // digest and no certificate is needed to trust it here: a divergent record implies a fork,
-        // which a certificate could not repair. Proposer signing/verification of the seed message
-        // stays fork-gated elsewhere; only the "anchor must be certified" coupling is dropped.
-        let prior_epoch_record =
-            if current_epoch == 0 { EpochDigest::default() } else { previous_epoch_rec.digest() };
+        let committee_keys: Vec<BlsPublicKey> = committee.bls_keys().iter().copied().collect();
+        let (previous_epoch_rec, prior_epoch_record) = resolve_prior_epoch_record(
+            self.consensus_chain.epochs(),
+            current_epoch,
+            &committee_keys,
+        )
+        .await?;
         self.consensus_chain.new_epoch(previous_epoch_rec, committee).await?;
         Ok(prior_epoch_record)
     }
@@ -1006,6 +968,60 @@ fn check_output_continuity(last_forwarded: u64, number: u64) -> OutputContinuity
     }
 }
 
+/// Resolve the record that seeds the new epoch's chain and the digest that anchors its epoch-close
+/// seed message, from the prior epoch's [`EpochRecord`].
+///
+/// Extracted from [`EpochManager::open_epoch_pack`] so the resolution is unit-testable against a
+/// bare [`EpochRecordDb`]. Epoch 0 has no prior record: it seeds from a genesis filler carrying the
+/// current committee (identical to the `save_dummy_epoch0` record) and anchors on
+/// [`EpochDigest::default`]. For epoch >= 1 the prior record must already be present (self-sealed
+/// at its close, imported, or re-derived on restart); its absence - or only the uncertified dummy
+/// epoch-0 record standing in for a real epoch-0 record - is a corrupted or incomplete datadir and
+/// a hard error. The anchor is the record's own digest: the record is deterministic, so no
+/// certificate is needed to trust it (a divergent record implies a fork a certificate could not
+/// repair).
+async fn resolve_prior_epoch_record(
+    epochs: &EpochRecordDb,
+    current_epoch: Epoch,
+    committee_keys: &[BlsPublicKey],
+) -> eyre::Result<(EpochRecord, EpochDigest)> {
+    if current_epoch == 0 {
+        let filler = EpochRecord {
+            epoch: 0,
+            committee: committee_keys.to_vec(),
+            next_committee: committee_keys.to_vec(),
+            ..Default::default()
+        };
+        return Ok((filler, EpochDigest::default()));
+    }
+    let previous_epoch = current_epoch - 1;
+    // The dummy epoch-0 record exists only to bootstrap lookups; it is not a real sealed record, so
+    // opening epoch 1 with only the dummy (never the real epoch-0 record) is a corrupt datadir.
+    if previous_epoch == 0 && epochs.contains_dummy_epoch0().await {
+        return Err(eyre::eyre!(
+            "previous epoch record for epoch {previous_epoch} is missing while opening epoch \
+             {current_epoch}: corrupted or incomplete datadir (do NOT delete chain-data - \
+             investigate) - we only have the dummy epoch 0 record not the real one"
+        ));
+    }
+    // Invariant: every node seals and durably persists epoch N-1's record at that epoch's close
+    // before advancing (`write_epoch_record`); an imported node receives a contiguous,
+    // certificate-verified record chain from genesis; and a restart killed at the boundary
+    // re-derives it (`recover_previous_epoch_record`). State sync never runs execution past the
+    // current epoch, so every boundary is crossed through `write_epoch_record`. A missing record
+    // here is therefore a corrupted or incomplete datadir, not a recoverable sync gap - fail
+    // loudly.
+    let rec = epochs.record_by_epoch(previous_epoch).await.ok_or_else(|| {
+        eyre::eyre!(
+            "previous epoch record for epoch {previous_epoch} is missing while opening epoch \
+             {current_epoch}: corrupted or incomplete datadir (do NOT delete chain-data - \
+             investigate)"
+        )
+    })?;
+    let digest = rec.digest();
+    Ok((rec, digest))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,6 +1051,95 @@ mod tests {
         gas_accumulator::WorkerFeeConfig, Address, ExecHeader, GenesisAccount, SolCall as _,
         WorkerId, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
+
+    /// Deterministic BLS public keys for anchor-resolution tests.
+    fn resolve_test_keys(n: u8) -> Vec<BlsPublicKey> {
+        (0..n)
+            .map(|i| *tn_types::BlsKeypair::generate(&mut StdRng::from_seed([i + 1; 32])).public())
+            .collect()
+    }
+
+    /// Epoch 0 resolves to a genesis filler carrying the committee, anchored on the default digest.
+    #[tokio::test]
+    async fn resolve_prior_epoch_zero_uses_filler() {
+        let temp = TempDir::with_prefix("resolve_epoch0").expect("temp dir");
+        let epochs = EpochRecordDb::open(temp.path()).expect("open epochs db");
+        let committee = resolve_test_keys(4);
+        let (rec, anchor) =
+            resolve_prior_epoch_record(&epochs, 0, &committee).await.expect("epoch 0 filler");
+        assert_eq!(rec.epoch, 0);
+        assert_eq!(rec.committee, committee);
+        assert_eq!(rec.next_committee, committee);
+        assert_eq!(anchor, EpochDigest::default(), "epoch 0 anchors on the default digest");
+    }
+
+    /// A self-sealed prior record stored WITHOUT a certificate still releases the seed anchor (the
+    /// post-fork uncertified-anchor open), and the anchor equals the record's own digest.
+    #[tokio::test]
+    async fn resolve_prior_epoch_uncertified_record_is_the_anchor() {
+        let temp = TempDir::with_prefix("resolve_uncertified").expect("temp dir");
+        let epochs = EpochRecordDb::open(temp.path()).expect("open epochs db");
+        let committee = resolve_test_keys(4);
+        // Records are appended contiguously from epoch 0; save 0 then 1, both uncertified.
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: committee.clone(),
+            next_committee: committee.clone(),
+            ..Default::default()
+        };
+        let rec1 = EpochRecord {
+            epoch: 1,
+            committee: committee.clone(),
+            next_committee: committee.clone(),
+            parent_hash: rec0.digest(),
+            ..Default::default()
+        };
+        epochs.save_record(rec0).await.expect("save uncertified record 0");
+        epochs.save_record(rec1.clone()).await.expect("save uncertified record 1");
+
+        let (rec, anchor) = resolve_prior_epoch_record(&epochs, 2, &committee)
+            .await
+            .expect("resolve the uncertified epoch 1 record");
+        assert_eq!(rec.digest(), rec1.digest());
+        assert_eq!(anchor, rec1.digest(), "the anchor is the uncertified record's digest");
+    }
+
+    /// Opening epoch 3 with no record for epoch 2 is a corrupt/incomplete datadir: hard error.
+    #[tokio::test]
+    async fn resolve_prior_epoch_missing_record_hard_errors() {
+        let temp = TempDir::with_prefix("resolve_missing").expect("temp dir");
+        let epochs = EpochRecordDb::open(temp.path()).expect("open epochs db");
+        let err = resolve_prior_epoch_record(&epochs, 3, &resolve_test_keys(4))
+            .await
+            .expect_err("a missing prior record must hard-error");
+        assert!(
+            err.to_string().contains("corrupted or incomplete datadir"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Opening epoch 1 when only the dummy epoch-0 record exists (never the real one) is a corrupt
+    /// datadir: the dummy is a bootstrap placeholder, not a sealed record.
+    #[tokio::test]
+    async fn resolve_prior_epoch_rejects_dummy_epoch0_as_real() {
+        let temp = TempDir::with_prefix("resolve_dummy0").expect("temp dir");
+        let epochs = EpochRecordDb::open(temp.path()).expect("open epochs db");
+        let committee = resolve_test_keys(4);
+        let dummy = EpochRecord {
+            epoch: 0,
+            committee: committee.clone(),
+            next_committee: committee.clone(),
+            ..Default::default()
+        };
+        epochs.save_dummy_epoch0(dummy).await.expect("seed dummy epoch 0");
+        let err = resolve_prior_epoch_record(&epochs, 1, &committee)
+            .await
+            .expect_err("a dummy-only epoch 0 must hard-error");
+        assert!(
+            err.to_string().contains("dummy epoch 0 record not the real one"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn retry_provider_faults_halts_after_exhausting_attempts() {

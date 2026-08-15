@@ -2682,6 +2682,67 @@ mod test {
         assert_eq!(err, CertifiedRecordError::MissingCertificate(0, rec.digest()));
     }
 
+    /// The de-recursed poll retries across a `MissingRecord` (not just `MissingCertificate`): the
+    /// record and its certificate both arrive mid-poll (e.g. re-derived or collected after a
+    /// restart), and the certified read is released within the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn certified_record_poll_heals_from_missing_record() {
+        let temp_dir = TempDir::with_prefix("certified_heal_missing_record").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        let expected = rec0.digest();
+
+        // Nothing is stored yet, so the first poll sees the retryable MissingRecord; the full
+        // record+cert land at 300ms, well inside the 10s budget.
+        let db_writer = db.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            db_writer.save(rec0, cert0).await.expect("late record+cert save");
+        });
+
+        let certified = db
+            .certified_record_by_epoch_with_timeout(0, std::time::Duration::from_secs(10))
+            .await
+            .expect("the record must be released once it and its certificate arrive");
+        assert_eq!(certified.digest(), expected);
+        writer.await.expect("record+cert writer task");
+    }
+
+    /// Deadline-boundary coverage for the de-recursed `certified_record_poll`: a certificate saved
+    /// during the last poll interval before the deadline is still picked up and the record
+    /// released. Restores (for the certified poll) the coverage lost when the
+    /// `record_by_epoch_with_timeout` test was removed. Virtual time makes the interval math
+    /// exact.
+    #[tokio::test(start_paused = true)]
+    async fn certified_record_with_timeout_sees_cert_saved_in_final_poll_interval() {
+        let temp_dir = TempDir::with_prefix("certified_final_interval").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        let expected = rec0.digest();
+        db.save_record(rec0).await.expect("save record without cert");
+
+        // Poll interval is 200ms; save the cert at 900ms - inside the final interval before the 1s
+        // deadline - so it is only visible to the poll's last lookup.
+        let db_writer = db.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            db_writer.save_certificate(expected, cert0).await.expect("final-interval cert save");
+        });
+
+        let certified = db
+            .certified_record_by_epoch_with_timeout(0, std::time::Duration::from_secs(1))
+            .await
+            .expect(
+                "a cert saved in the final poll interval must be picked up before the deadline",
+            );
+        assert_eq!(certified.digest(), expected);
+        writer.await.expect("cert writer task");
+    }
+
     /// On-disk corruption under the certified read path must classify as the non-retryable
     /// [`CertifiedRecordError::Storage`] — never as a retryable "missing" outcome that the
     /// timeout variant would poll for the full budget before mislabeling the corruption.

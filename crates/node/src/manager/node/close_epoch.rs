@@ -30,7 +30,7 @@ use tn_storage::{
 use tn_types::{
     deconstruct_nonce, Batch, BlockHash, BlockNumHash, BlsPublicKey, ConsensusHeaderDigest,
     ConsensusNumHash, ConsensusOutput, Database as TNDatabase, Epoch, EpochDigest, EpochRecord,
-    TaskManager, TnReceiver,
+    SealedHeader, TaskManager, TnReceiver,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
@@ -436,18 +436,10 @@ where
                 "cannot re-derive the epoch {previous_epoch} record: no executed blocks on restart"
             )
         })?;
-        let consensus_digest: ConsensusHeaderDigest =
-            closing_block.parent_beacon_block_root.unwrap_or_default().into();
-        let (header_epoch, _round) = deconstruct_nonce(closing_block.nonce.into());
-        if header_epoch != previous_epoch {
-            return Err(eyre!(
-                "cannot re-derive the epoch {previous_epoch} record: the executed tip was produced \
-                 by epoch {header_epoch} - refusing to re-derive from an unexpected block"
-            ));
-        }
+        let consensus_digest = boundary_consensus_digest(closing_block, previous_epoch)?;
         let boundary_header = self
             .consensus_chain
-            .consensus_header_by_digest(header_epoch, consensus_digest)
+            .consensus_header_by_digest(previous_epoch, consensus_digest)
             .await
             .map_err(|e| {
                 eyre!(
@@ -813,11 +805,35 @@ pub fn build_epoch_record(
     Ok(record)
 }
 
+/// Decode which consensus header the executed closing block points to, and verify it closes the
+/// epoch we intend to re-derive.
+///
+/// Extracted from [`EpochManager::recover_previous_epoch_record`] so the decode is unit-testable
+/// against a synthetic header. The closing block's `parent_beacon_block_root` IS the producing
+/// consensus header's digest, and its nonce encodes the producing epoch (`epoch << 32 | round`,
+/// read back by [`deconstruct_nonce`]). A nonce epoch other than `previous_epoch` means the
+/// executed tip is not the boundary block we expect, so we refuse to re-derive from it.
+fn boundary_consensus_digest(
+    closing_block: &SealedHeader,
+    previous_epoch: Epoch,
+) -> eyre::Result<ConsensusHeaderDigest> {
+    let consensus_digest: ConsensusHeaderDigest =
+        closing_block.parent_beacon_block_root.unwrap_or_default().into();
+    let (header_epoch, _round) = deconstruct_nonce(closing_block.nonce.into());
+    if header_epoch != previous_epoch {
+        return Err(eyre!(
+            "cannot re-derive the epoch {previous_epoch} record: the executed tip was produced \
+             by epoch {header_epoch} - refusing to re-derive from an unexpected block"
+        ));
+    }
+    Ok(consensus_digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng as _};
-    use tn_types::BlsKeypair;
+    use tn_types::{BlsKeypair, ExecHeader, B256};
 
     /// Deterministic BLS public keys, one per seed byte.
     fn keys(seeds: std::ops::Range<u8>) -> Vec<BlsPublicKey> {
@@ -840,6 +856,38 @@ mod tests {
 
     fn final_consensus() -> ConsensusNumHash {
         ConsensusNumHash::new(9, ConsensusHeaderDigest::default())
+    }
+
+    /// A synthetic executed closing block whose nonce encodes `epoch` (the payload builder's
+    /// `nonce = epoch << 32 | round` layout, matching node.rs `tip_at`) and whose
+    /// `parent_beacon_block_root` is `parent_beacon` — the two fields `boundary_consensus_digest`
+    /// reads.
+    fn closing_block(epoch: u32, parent_beacon: B256) -> SealedHeader {
+        let header = ExecHeader {
+            nonce: ((epoch as u64) << 32).into(),
+            parent_beacon_block_root: Some(parent_beacon),
+            ..Default::default()
+        };
+        SealedHeader::new(header, B256::repeat_byte(0xab))
+    }
+
+    /// A closing block produced by the expected epoch yields its parent-beacon consensus digest.
+    #[test]
+    fn boundary_digest_matches_expected_epoch() {
+        let parent_beacon = B256::repeat_byte(0x11);
+        let tip = closing_block(2, parent_beacon);
+        let got = boundary_consensus_digest(&tip, 2).expect("a tip closing epoch 2 is accepted");
+        assert_eq!(got, ConsensusHeaderDigest::from(parent_beacon));
+    }
+
+    /// A closing block whose nonce encodes a different epoch than the one we are re-deriving is
+    /// refused (the tip is not the boundary block we expect).
+    #[test]
+    fn boundary_digest_rejects_wrong_epoch() {
+        let tip = closing_block(5, B256::repeat_byte(0x22));
+        let err = boundary_consensus_digest(&tip, 2)
+            .expect_err("a tip produced by the wrong epoch must be refused");
+        assert!(err.to_string().contains("produced by epoch 5"), "unexpected error: {err}");
     }
 
     /// identical committee handoff succeeds and preserves the read order.
