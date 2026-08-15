@@ -566,6 +566,14 @@ where
                 ..Default::default()
             }
         } else {
+            // Check that we are not trying to use the dummy epoch 0 record.
+            if previous_epoch == 0 && self.consensus_chain.epochs().contains_dummy_epoch0().await {
+                return Err(eyre::eyre!(
+                    "previous epoch record for epoch {previous_epoch} is missing while opening \
+                 epoch {current_epoch}: corrupted or incomplete datadir (do NOT delete \
+                 chain-data - investigate)- we only have the dummy epoch 0 record not the real one"
+                ));
+            }
             // Invariant: every node seals and durably persists epoch N-1's record at that epoch's
             // close before advancing (`write_epoch_record`), and an imported node receives a
             // contiguous, certificate-verified record chain from genesis. State sync never runs

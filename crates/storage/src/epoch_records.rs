@@ -70,6 +70,8 @@ enum EpochDbMessage {
     TryCertByDigest(EpochDigest, oneshot::Sender<Result<Option<EpochCertificate>, FetchError>>),
     /// True if the database contains a record for the given epoch number.
     ContainsEpoch(Epoch, oneshot::Sender<bool>),
+    /// True if the database contains a dummy record for the given epoch 0.
+    ContainsDummyEpoch0(oneshot::Sender<bool>),
     /// True if the database contains a record with the given digest.
     ContainsRecordDigest(EpochDigest, oneshot::Sender<bool>),
     /// Return the latest (highest epoch) [`EpochRecord`] stored, if any.
@@ -150,6 +152,9 @@ fn run_db_loop(
             }
             EpochDbMessage::ContainsEpoch(epoch, tx) => {
                 let _ = tx.send(inner.contains_epoch(epoch));
+            }
+            EpochDbMessage::ContainsDummyEpoch0(tx) => {
+                let _ = tx.send(inner.contains_dummy_epoch0());
             }
             EpochDbMessage::ContainsRecordDigest(digest, tx) => {
                 let _ = tx.send(inner.contains_record_digest(digest));
@@ -679,6 +684,7 @@ impl EpochRecordDb {
             let mut retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
                 && tokio::time::Instant::now() < deadline;
             while retry {
+                tokio::time::sleep(Duration::from_millis(200)).await;
                 outcome = self.certified_record_by_epoch(epoch).await;
                 retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
                     && tokio::time::Instant::now() < deadline;
@@ -728,6 +734,16 @@ impl EpochRecordDb {
     pub async fn contains_epoch(&self, epoch: Epoch) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(EpochDbMessage::ContainsEpoch(epoch, tx)).await.is_ok() {
+            rx.await.unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    /// True if the database contains a dummy record for epoch 0.
+    pub async fn contains_dummy_epoch0(&self) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(EpochDbMessage::ContainsDummyEpoch0(tx)).await.is_ok() {
             rx.await.unwrap_or(false)
         } else {
             false
@@ -1327,6 +1343,14 @@ impl Inner {
             self.dummy_epoch0.is_some()
         } else {
             ((epoch - self.start_epoch) as u64) < self.epoch_idx.len() as u64
+        }
+    }
+
+    fn contains_dummy_epoch0(&self) -> bool {
+        if self.epoch_idx.is_empty() {
+            self.dummy_epoch0.is_some()
+        } else {
+            false
         }
     }
 

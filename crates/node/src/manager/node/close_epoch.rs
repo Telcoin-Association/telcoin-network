@@ -422,7 +422,10 @@ where
         }
         let previous_epoch = current_epoch - 1;
         if self.consensus_chain.epochs().contains_epoch(previous_epoch).await {
-            return Ok(());
+            // Do not be fooled by the dummy epoch 0 record on the epoch 0 -> 1 transition.
+            if previous_epoch != 0 || !self.consensus_chain.epochs().contains_dummy_epoch0().await {
+                return Ok(());
+            }
         }
 
         // Recover epoch `previous_epoch`'s boundary consensus header from the closing block we
