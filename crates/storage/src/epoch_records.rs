@@ -42,8 +42,7 @@ use crate::{
 /// Current version of the epoch pack file.
 const EPOCH_PACK_VERSION: u16 = 0;
 
-/// Interval between lookups in the bounded waits [`EpochRecordDb::record_by_epoch_with_timeout`]
-/// and [`EpochRecordDb::cert_by_digest_with_timeout`].
+/// Interval between lookups in the bounded waits [`EpochRecordDb::cert_by_digest_with_timeout`].
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 enum EpochDbMessage {
@@ -650,9 +649,8 @@ impl EpochRecordDb {
             })
     }
 
-    /// Like [`Self::certified_record_by_epoch`], but waits up to `timeout` for the record and
-    /// its certificate to arrive, polling every 200ms (matching
-    /// [`Self::record_by_epoch_with_timeout`]).
+    /// Waits up to `timeout` for the record and
+    /// its certificate to arrive, polling every 200ms
     ///
     /// Only the retryable outcomes are waited on (see [`CertifiedRecordError::is_retryable`]):
     /// a record or certificate that has not arrived yet can still be supplied asynchronously,

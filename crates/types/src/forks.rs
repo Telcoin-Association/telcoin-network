@@ -270,7 +270,7 @@ mod tests {
     /// [`SEED_SIGNATURE_FORK_EPOCH`] (then the `u32::MAX` placeholder, now a concrete epoch).
     /// That holds only under `adiri`. Every other build — including the default
     /// one that produces both the shipped node binary and the e2e binary — is active from
-    /// genesis, so epoch 1 takes the post-fork certified-anchor path in production. Nothing
+    /// genesis, so epoch 1 takes the post-fork anchor path in production. Nothing
     /// asserted either half, so the "dormant everywhere" reading survived review; this states
     /// it outright so no future reader infers dormancy from the constant alone.
     ///
