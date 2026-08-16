@@ -417,6 +417,7 @@ mod test {
         assert!(db.get::<TestTable>(&123456789).expect("Failed to get").is_some());
 
         db.remove::<TestTable>(&123456789).expect("Failed to remove");
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         assert!(db.get::<TestTable>(&123456789).expect("Failed to get").is_none());
     }
 
