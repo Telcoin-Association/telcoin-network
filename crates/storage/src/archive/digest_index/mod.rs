@@ -5,4 +5,5 @@
 pub mod bloom;
 pub mod bucket_iter;
 pub mod index;
+pub mod index_mmap;
 pub mod odx_header;

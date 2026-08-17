@@ -26,31 +26,31 @@ use std::{
 };
 
 /// Size of a header.
-const HEADER_SIZE: usize = 68;
+pub(super) const HEADER_SIZE: usize = 68;
 
 /// Header for an hdx (index) file.  This contains the hash buckets for lookups.
 /// This file is not a log file and the header and buckets will change in place over time.
 /// This data in the file will be followed by a CRC32 checksum value to verify it.
 #[derive(Debug)]
-struct HdxHeader {
+pub(super) struct HdxHeader {
     type_id: [u8; 8], // The characters "telcoinx"
     version: u16,     // Holds the version number
     uid: u64,         // Unique ID generated on creation
     appnum: u32,      // Application defined constant
-    buckets: u32,
+    pub(super) buckets: u32,
     bucket_elements: u16,
     bucket_size: u16,
     salt: u64,
     pepper: u64,
     load_factor: u16,
-    values: u64,
-    data_file_length: u64,
+    pub(super) values: u64,
+    pub(super) data_file_length: u64,
 }
 
 impl HdxHeader {
     /// Return a default HdxHeader with any values from data_header overridden.
     /// This includes the version, uid, appnum, bucket_size and bucket_elements.
-    fn from_data_header<const KSIZE: usize, S: BuildHasher + Default>(
+    pub(super) fn from_data_header<const KSIZE: usize, S: BuildHasher + Default>(
         data_header: &DataHeader,
         salt: u64,
         pepper: u64,
@@ -73,7 +73,7 @@ impl HdxHeader {
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    fn load_header(hdx_file: &mut dyn PackFileIo) -> Result<Self, LoadHeaderError> {
+    pub(super) fn load_header(hdx_file: &mut dyn PackFileIo) -> Result<Self, LoadHeaderError> {
         hdx_file.rewind()?;
         let mut buffer = [0_u8; HEADER_SIZE];
         let mut buf16 = [0_u8; 2];
@@ -140,7 +140,7 @@ impl HdxHeader {
     }
 
     /// Write this header to sync at current seek position.
-    fn write_header(&mut self, hdx_file: &mut dyn PackFileIo) -> Result<(), io::Error> {
+    pub(super) fn write_header(&mut self, hdx_file: &mut dyn PackFileIo) -> Result<(), io::Error> {
         hdx_file.rewind()?;
         let header_size = self.header_size();
         let mut buffer = vec![0_u8; header_size];
@@ -184,17 +184,17 @@ impl HdxHeader {
     }
 
     /// Number of elements in each bucket.
-    fn bucket_elements(&self) -> u16 {
+    pub(super) fn bucket_elements(&self) -> u16 {
         self.bucket_elements
     }
 
     /// Size in bytes of a bucket.
-    fn bucket_size(&self) -> u16 {
+    pub(super) fn bucket_size(&self) -> u16 {
         self.bucket_size
     }
 
     /// Load factor converted to a f32.
-    fn load_factor(&self) -> f32 {
+    pub(super) fn load_factor(&self) -> f32 {
         self.load_factor as f32 / u16::MAX as f32
     }
 
@@ -204,27 +204,27 @@ impl HdxHeader {
     }
 
     /// File version number.
-    fn version(&self) -> u16 {
+    pub(super) fn version(&self) -> u16 {
         self.version
     }
 
     /// Unique ID generated on creation
-    fn uid(&self) -> u64 {
+    pub(super) fn uid(&self) -> u64 {
         self.uid
     }
 
     /// Application defined constant
-    fn appnum(&self) -> u32 {
+    pub(super) fn appnum(&self) -> u32 {
         self.appnum
     }
 
     /// Return the index salt.
-    fn salt(&self) -> u64 {
+    pub(super) fn salt(&self) -> u64 {
         self.salt
     }
 
     /// Return the index pepper.
-    fn pepper(&self) -> u64 {
+    pub(super) fn pepper(&self) -> u64 {
         self.pepper
     }
 
