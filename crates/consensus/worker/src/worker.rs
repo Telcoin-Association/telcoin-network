@@ -5,7 +5,7 @@
 
 use crate::{
     batch_fetcher::BatchFetcher,
-    metrics::WorkerMetrics,
+    metrics::{ForwardDropReason, WorkerMetrics},
     network::primary::PrimaryReceiverHandler,
     quorum_waiter::{QuorumWaiter, QuorumWaiterTrait},
     WorkerNetworkHandle,
@@ -252,6 +252,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             return Ok(());
         }
 
+        // Whole-batch count for the discovery dead ends below (issue #1133).
+        let num_txns = transactions.len();
         let validator_rpcs = self
             .network_handle
             .get_all_validator_rpcs()
@@ -262,6 +264,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                     ?err,
                     "failed to discover validator JSON-RPC endpoints for transaction forwarding"
                 );
+                self.metrics.record_forward_dropped(ForwardDropReason::DiscoveryFailed, num_txns);
             })
             .inspect(|rpcs| {
                 // Only the discovery-succeeded-but-empty case earns this message; a
@@ -272,6 +275,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                         "no committee validator has advertised a JSON-RPC endpoint; \
                          cannot forward accepted transactions"
                     );
+                    self.metrics
+                        .record_forward_dropped(ForwardDropReason::NoEndpointAdvertised, num_txns);
                 }
             })
             .unwrap_or_default();
