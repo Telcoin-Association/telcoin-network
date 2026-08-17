@@ -19,7 +19,7 @@ use tn_test_utils::wait_until;
 use tn_types::{
     gas_accumulator::GasAccumulator, test_genesis, Address, Batch, BatchValidation, Bytes,
     Certificate, CertifiedBatch, CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Database,
-    Encodable2718, NoopTxnForwarder, ReputationScores, SealedBatch, TaskManager,
+    Encodable2718, GenesisAccount, NoopTxnForwarder, ReputationScores, SealedBatch, TaskManager,
     MIN_PROTOCOL_BASE_FEE, U160, U256,
 };
 use tn_worker::{test_utils::TestMakeBlockQuorumWaiter, Worker, WorkerNetworkHandle};
@@ -201,11 +201,11 @@ async fn test_make_batch_el_to_cl() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Create 4 valid EIP-1559 transactions.
+/// Create 4 valid EIP-1559 transactions and 1 valid EIP-4844 (blob) transaction.
 ///
-/// No blob transaction is involved: the pool now rejects EIP-4844 transactions at admission,
-/// so none can reach the batch builder. First 3 transactions mined in the first batch.
-/// Before a canonical state change, mine the 4th transaction in the next batch.
+/// The pool rejects the blob transaction at admission (issue #1159), so it never reaches the
+/// batch builder. First 3 transactions mined in the first batch. Before a canonical state
+/// change, mine the 4th transaction in the next batch.
 #[tokio::test]
 async fn test_batch_builder_produces_valid_batches() {
     //
@@ -213,6 +213,14 @@ async fn test_batch_builder_produces_valid_batches() {
     //
     // adiri genesis with TxFactory funded
     let genesis = test_genesis();
+
+    // fund a second random factory for the eip-4844 transaction, so its rejection below can
+    // only come from the pool's type gate, never from insufficient balance
+    let mut blob_tx_factory = TransactionFactory::new_random();
+    let genesis = genesis.extend_accounts([(
+        blob_tx_factory.address(),
+        GenesisAccount::default().with_balance(U256::MAX),
+    )]);
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
     let address = Address::from(U160::from(333));
     let tmp_dir = TempDir::new().unwrap();
@@ -278,10 +286,14 @@ async fn test_batch_builder_produces_valid_batches() {
     let added_result = tx_factory.submit_tx_to_pool(transaction3.clone(), txpool.clone()).await;
     assert_matches!(added_result, hash if &hash == transaction3.hash());
 
-    // txpool size
+    // submit a valid eip-4844 blob transaction: the pool must reject it at admission (#1159)
+    let blob_pooled = blob_tx_factory.create_eip4844_pooled(chain.clone(), None, gas_price);
+    let blob_result = txpool.add_transaction_local(blob_pooled).await;
+    assert!(blob_result.is_err());
+
+    // txpool size: the rejected blob left nothing behind
     let pool_size = txpool.pool_size();
     assert_eq!(pool_size.pending, 3);
-    // blobs are rejected at pool admission, so none can be present
     assert_eq!(pool_size.blob, 0);
 
     // spawn batch_builder once worker is ready
