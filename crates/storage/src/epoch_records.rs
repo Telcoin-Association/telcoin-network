@@ -37,6 +37,7 @@ use crate::{
         position_index::index::PositionIndex,
     },
     consensus_pack::fetch_error_is_absent,
+    error_latch::latch_first_error,
 };
 
 /// Current version of the epoch pack file.
@@ -87,9 +88,11 @@ enum EpochDbMessage {
 ///
 /// Operations are dispatched to a background thread that owns the file handles.
 /// Errors from background writes are surfaced on the next call via [`get_error`], which clears
-/// the slot as it reads, so exactly one subsequent caller observes a given failure. Use
-/// [`peek_error`] to check without consuming. [`persist`] is the durability barrier: it reports
-/// any earlier write failure even if that write was still queued when the flush was requested.
+/// the slot as it reads, so exactly one subsequent caller observes a given failure. When more
+/// than one write fails before a read, the slot keeps the first failure (for a poisoned-pack
+/// cascade that is the root cause; every failure is logged either way). Use [`peek_error`] to
+/// check without consuming. [`persist`] is the durability barrier: it reports any earlier
+/// write failure even if that write was still queued when the flush was requested.
 #[derive(Debug, Clone)]
 pub struct EpochRecordDb {
     /// Channel to send commands to the background thread.
@@ -110,29 +113,33 @@ fn run_db_loop(
 ) {
     while let Some(msg) = rx.blocking_recv() {
         match msg {
+            // The four save arms latch first-error-wins: two queued saves can fail with no
+            // reader between them, and a plain `send_replace` would lose the first failure
+            // (#1148). In the poisoned-pack cascade the first failure is the root cause.
+            // The log line still records every failure.
             EpochDbMessage::SaveDummy0Record(record) => {
-                if let Err(e) = inner.save_dummy_epoch0(record) {
+                inner.save_dummy_epoch0(record).unwrap_or_else(|e| {
                     error!(target: "epoch-db", %e, "failed to save dummy epoch 0 record");
-                    tx_error.send_replace(Some(e));
-                }
+                    latch_first_error(&tx_error, e);
+                });
             }
             EpochDbMessage::SaveRecord(record) => {
-                if let Err(e) = inner.save_record(record) {
+                inner.save_record(record).unwrap_or_else(|e| {
                     error!(target: "epoch-db", %e, "failed to save epoch record");
-                    tx_error.send_replace(Some(e));
-                }
+                    latch_first_error(&tx_error, e);
+                });
             }
             EpochDbMessage::Save(record, cert) => {
-                if let Err(e) = inner.save(record, cert) {
+                inner.save(record, cert).unwrap_or_else(|e| {
                     error!(target: "epoch-db", %e, "failed to save epoch record and certificate");
-                    tx_error.send_replace(Some(e));
-                }
+                    latch_first_error(&tx_error, e);
+                });
             }
             EpochDbMessage::SaveCertificate(digest, cert) => {
-                if let Err(e) = inner.save_certificate(digest, cert) {
+                inner.save_certificate(digest, cert).unwrap_or_else(|e| {
                     error!(target: "epoch-db", %e, "failed to save epoch certificate");
-                    tx_error.send_replace(Some(e));
-                }
+                    latch_first_error(&tx_error, e);
+                });
             }
             EpochDbMessage::RecordByEpoch(epoch, tx) => {
                 let _ = tx.send(inner.record_by_epoch(epoch));
@@ -427,6 +434,7 @@ impl EpochRecordDb {
 
     /// Return any delayed error recorded by the background thread.
     /// Also clears the error.
+    /// When more than one write failed since the last read, this returns the first failure.
     pub fn get_error(&self) -> Result<(), EpochDbError> {
         match self.error.send_replace(None) {
             Some(e) => Err(e.clone()),
@@ -1808,6 +1816,46 @@ mod test {
 
         // The flush consumed the failure, so it is not left behind to be misattributed to an
         // unrelated later caller.
+        db.get_error().expect("persist acknowledged the error");
+    }
+
+    #[tokio::test]
+    async fn queued_save_failures_keep_the_first_error() {
+        // Regression test for #1148: two saves fail back to back with no reader between them.
+        // The latch was last-write-wins, so the second failure silently replaced the first
+        // and the root cause was lost. The latch must keep the first failure.
+        let temp_dir = TempDir::with_prefix("queued_saves_first_error").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+
+        // Queue two saves the actor will reject: epochs 5 and 7 are both out of order on an
+        // empty db and produce distinguishable errors. Both go straight to the channel so no
+        // handle-side guard or reader runs between the two failures. A single consumer
+        // draining a FIFO channel guarantees the save order, so this is deterministic rather
+        // than a race.
+        let first = EpochRecord { epoch: 5, ..Default::default() };
+        let second = EpochRecord { epoch: 7, ..Default::default() };
+        db.tx
+            .send(super::EpochDbMessage::SaveRecord(first))
+            .await
+            .expect("queue first failing save");
+        db.tx
+            .send(super::EpochDbMessage::SaveRecord(second))
+            .await
+            .expect("queue second failing save");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        db.tx.send(super::EpochDbMessage::Persist(tx)).await.expect("queue persist");
+
+        // The persist reply drains the latch, so it must carry the FIRST failure, not the
+        // one that happened to fail last.
+        let err = rx
+            .await
+            .expect("actor replied to the persist")
+            .expect_err("persist must report the queued save failures");
+        assert!(
+            matches!(err, EpochDbError::EpochOutOfOrder(0, 5)),
+            "latch must keep the first failure, got: {err:?}"
+        );
+        // The reply consumed the slot; nothing is left to misattribute to a later caller.
         db.get_error().expect("persist acknowledged the error");
     }
 
