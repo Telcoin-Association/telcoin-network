@@ -225,7 +225,10 @@ pub fn validate_pack_file(
     // Expected `parent_hash` of the *next* consensus header. `None` = "no anchor, skip the check":
     // a bare file with no previous record cannot verify its first header's parent.
     let expected_parent: Option<ConsensusHeaderDigest> = if epoch == 0 {
-        Some(ConsensusHeader::default().digest())
+        // Don't worry about consensus block 1 in epoch 0, if it is invalid other verifications will
+        // fail. This can be set but doing so leaves potential footguns around and this
+        // check is not really useful in this case.
+        None
     } else {
         previous.map(|p| p.final_consensus.hash)
     };

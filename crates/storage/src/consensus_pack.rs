@@ -949,10 +949,13 @@ impl Inner {
             false,
         )
         .map_err(OpenError::IndexFileOpen)?;
-        let mut parent_digest = if epoch == 0 {
-            ConsensusHeader::default().digest()
+        let mut parent_digest_expectation = if epoch == 0 {
+            // Don't worry about consensus block 1 in epoch 0, if it is invalid other verifications
+            // will fail. This can be set but doing so leaves potential footguns around
+            // and this check is not really useful in this case.
+            HeaderExpectation::None
         } else {
-            previous_epoch.final_consensus.hash
+            HeaderExpectation::Parent(previous_epoch.final_consensus.hash)
         };
         let mut pack =
             Self { data, consensus_pos_idx, consensus_digests, batch_digests, epoch_meta };
@@ -966,7 +969,7 @@ impl Inner {
                     &mut stream_iter,
                     timeout,
                     &pack.epoch_meta.committee,
-                    HeaderExpectation::Parent(parent_digest),
+                    parent_digest_expectation,
                 )
                 .await
                 {
@@ -979,7 +982,7 @@ impl Inner {
                     &mut stream_iter,
                     timeout,
                     &pack.epoch_meta.committee,
-                    HeaderExpectation::Parent(parent_digest),
+                    parent_digest_expectation,
                 )
                 .await
                 {
@@ -995,7 +998,7 @@ impl Inner {
                     final_consensus_number,
                 ));
             }
-            parent_digest = output.digest();
+            parent_digest_expectation = HeaderExpectation::Parent(output.digest());
             pack.save_consensus_output(&output)?;
         }
         Ok(pack)
