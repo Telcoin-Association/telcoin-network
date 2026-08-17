@@ -327,7 +327,8 @@ where
         // and its consensus hash in ONE watch write, so the bus can lag the true tip
         // mid-execution but never lead it. At every call site (the live boundary arm and the
         // two replay-and-close recovery arms of `run_epoch`, each running after `close_epoch`'s
-        // `wait_for_consensus_execution`) the wait resolved on the exact write that carries the
+        // `wait_for_consensus_execution` as well as try_restore_state() on startup) the wait
+        // resolved on the exact write that carries the
         // closing block, so this read IS that block; the pin makes the record's committee reads
         // and its `final_state` derive from the same header by construction instead of by
         // timing.
@@ -436,6 +437,16 @@ where
                 "cannot re-derive the epoch {previous_epoch} record: no executed blocks on restart"
             )
         })?;
+        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
+        if parent_state.hash != closing_block.hash() {
+            return Err(eyre!(
+                "expected last executed state {}/{} does not match on chain closing block {}/{}",
+                parent_state.number,
+                parent_state.hash,
+                closing_block.number,
+                closing_block.hash()
+            ));
+        }
         let consensus_digest = boundary_consensus_digest(closing_block, previous_epoch)?;
         let boundary_header = self
             .consensus_chain
@@ -817,13 +828,21 @@ fn boundary_consensus_digest(
     closing_block: &SealedHeader,
     previous_epoch: Epoch,
 ) -> eyre::Result<ConsensusHeaderDigest> {
-    let consensus_digest: ConsensusHeaderDigest =
-        closing_block.parent_beacon_block_root.unwrap_or_default().into();
+    let Some(consensus_digest) = closing_block.parent_beacon_block_root else {
+        return Err(eyre!(
+            "cannot re-derive the epoch {previous_epoch} record: the closing block is missing \
+             the required consensus block digest (parent_beacon_block_root) - refusing to re-derive \
+             from an unexpected block: \
+             corrupted or incomplete datadir (do NOT delete chain-data - investigate)"
+        ));
+    };
+    let consensus_digest: ConsensusHeaderDigest = consensus_digest.into();
     let (header_epoch, _round) = deconstruct_nonce(closing_block.nonce.into());
     if header_epoch != previous_epoch {
         return Err(eyre!(
             "cannot re-derive the epoch {previous_epoch} record: the executed tip was produced \
-             by epoch {header_epoch} - refusing to re-derive from an unexpected block"
+             by epoch {header_epoch} - refusing to re-derive from an unexpected block: \
+             corrupted or incomplete datadir (do NOT delete chain-data - investigate)"
         ));
     }
     Ok(consensus_digest)
