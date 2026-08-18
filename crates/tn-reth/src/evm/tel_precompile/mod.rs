@@ -7,11 +7,15 @@
 //! precompile.
 //!
 //! The precompile is registered as a [`DynPrecompile`] inside a [`PrecompilesMap`] at
-//! [`TELCOIN_PRECOMPILE_ADDRESS`] (`0x7e1`). Any `CALL`/`STATICCALL` targeting that address is
-//! intercepted and routed to [`telcoin_precompile`] instead of executing bytecode. Bypassing
-//! bytecode execution also bypasses the interpreter's static-call write protection, so
-//! [`telcoin_precompile`] enforces that itself: inside a `STATICCALL` frame it serves the
-//! read-only selectors and refuses every state-mutating one.
+//! [`TELCOIN_PRECOMPILE_ADDRESS`] (`0x7e1`). Every call frame whose code address is `0x7e1` is
+//! intercepted and routed to [`telcoin_precompile`] instead of executing bytecode. revm keys that
+//! lookup on the frame's `bytecode_address` alone, so `DELEGATECALL` and `CALLCODE` frames reach
+//! the dispatcher as well as `CALL`/`STATICCALL`. Bypassing bytecode execution leaves two frame
+//! properties for [`telcoin_precompile`] to enforce itself. It refuses any frame that did not
+//! reach `0x7e1` by a direct call: under `DELEGATECALL` the `caller` it would authorize is
+//! inherited from the parent frame, while every handler still writes the canonical `0x7e1`
+//! ledger. And inside a `STATICCALL` frame it serves the read-only selectors and refuses every
+//! state-mutating one.
 //!
 //! # Module structure
 //!
@@ -42,6 +46,8 @@
 //! - **Any account**: can call `totalSupply()` (read-only).
 //! - **Static frames**: regardless of caller, only the read-only selectors (`totalSupply()`, plus
 //!   `hasMintRole` with the faucet feature) are served inside a `STATICCALL`.
+//! - **Indirect frames**: regardless of caller and selector, a `DELEGATECALL` or `CALLCODE` into
+//!   `0x7e1` is refused before dispatch. Only a direct `CALL`/`STATICCALL` reaches a handler.
 //!
 //! # Feature flags
 //!
@@ -122,9 +128,29 @@ pub fn add_telcoin_precompile(map: &mut PrecompilesMap) {
 /// Rejection emitted when a state-mutating selector is reached inside a `STATICCALL` frame.
 const STATIC_CALL_MUTATION: &str = "static call: state mutation not permitted";
 
+/// Rejection emitted when the precompile is entered through `DELEGATECALL` or `CALLCODE` rather
+/// than by a direct call to its own address.
+const INDIRECT_ENTRY: &str = "telcoin precompile: only a direct call to 0x7e1 is permitted";
+
 /// Top-level dispatcher for the Telcoin precompile.
 ///
 /// Extracts the 4-byte selector from calldata and routes to the matching handler.
+///
+/// # Direct-call guard
+///
+/// revm looks a precompile up by the frame's `bytecode_address` alone, so a `DELEGATECALL` or
+/// `CALLCODE` whose code address is `0x7e1` lands here exactly like a plain `CALL`. Under
+/// `DELEGATECALL` the frame's `caller` is inherited from the parent frame: a contract that
+/// governance chose to `CALL`, delegating into `0x7e1`, presents `caller ==
+/// GOVERNANCE_SAFE_ADDRESS`. Every handler below reads and writes the canonical `0x7e1` ledger,
+/// never the delegating contract's storage, so the authorization gates would be trusting a
+/// spoofable identity. The first check therefore refuses any frame that is not a direct call,
+/// through [`PrecompileInput::is_direct_call`] (`target_address == bytecode_address`): a direct
+/// `CALL`/`STATICCALL` sets both to `0x7e1`, whereas `DELEGATECALL`/`CALLCODE` keep the calling
+/// contract's own address as `target_address`. It runs ahead of the calldata length check and of
+/// selector dispatch, so it covers the read-only selectors too: an indirect frame has no legitimate
+/// use of this precompile, and refusing it whole is cheaper to reason about than a per-selector
+/// exemption.
 ///
 /// # Static-call write protection
 ///
@@ -144,6 +170,12 @@ const STATIC_CALL_MUTATION: &str = "static call: state mutation not permitted";
 /// unrecognised selector inside a static frame reports [`STATIC_CALL_MUTATION`] rather than
 /// `"Unknown function selector"`; both are [`PrecompileError::Other`] and both revert the frame.
 fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
+    // Refuse DELEGATECALL/CALLCODE before anything else. See "Direct-call guard" above.
+    input
+        .is_direct_call()
+        .then_some(())
+        .ok_or_else(|| PrecompileError::Other(INDIRECT_ENTRY.into()))?;
+
     if input.data.len() < 4 {
         return Err(PrecompileError::Other("Invalid input: too short".into()));
     }
