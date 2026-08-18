@@ -481,6 +481,15 @@ async fn test_mid_epoch_restart_recovers_static_fee() -> eyre::Result<()> {
     //    validator-1 even if the restarted node recovered MIN. Routing a priced tx through the
     //    restarted node's OWN RPC exercises its local pool/batch path: a node that recovered MIN
     //    instead of the on-chain static fee would misprice the tx and diverge on its batch path.
+    //
+    // Serving the historical blocks above only proves state sync reached those heights; the
+    // restarted node can still be several epochs behind on LIVE consensus, its worker's batch path
+    // not yet participating (its stale-epoch proposals get rejected by peers until it converges).
+    // Submitting through its own RPC before then races the 15s confirmation window against
+    // multi-epoch catch-up. Wait for it to reach the network's current epoch first, so its local
+    // pool/batch path is live when we submit.
+    let live_epoch = current_epoch(&provider).await?.epoch_id;
+    wait_for_epoch_at_least(&restarted_provider, live_epoch).await?;
     let local_to = address_from_word("basefee-restart-local");
     let (local_block, local_fee) =
         land_tx_and_read_fee(&client_urls[kill_idx], &funded_key, local_to, 2, HIGH_GAS_PRICE)
