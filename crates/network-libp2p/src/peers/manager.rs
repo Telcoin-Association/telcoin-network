@@ -1095,13 +1095,16 @@ impl PeerManager {
         // via kad closest-peers or peer exchange) would otherwise be selected for
         // a self-dial during the heartbeat.
         !self.is_local_peer(&info.peer_id)
-            // reject entries with more addresses than an honest peer can share. The peer
-            // store bounds each peer's address set at MAX_MULTIADDRS_PER_PEER, so an honest
-            // exchange entry never exceeds it (kad records are bounded tighter at
-            // MAX_ADVERTISED_MULTIADDRS). Every stored address is dialed by the discovery
-            // heartbeat, so an uncapped list lets one PeerExchange message turn this node
-            // into a dial-amplification proxy against attacker-chosen targets (issue #1183).
-            // The heartbeat re-checks eligibility, so an oversized entry is also purged.
+            // reject entries with more addresses than an honest peer can share. An honest
+            // exchange entry is a copy of a sender's stored set for that peer, and the forms
+            // one honest address takes fit within MAX_MULTIADDRS_PER_PEER (see its doc)
+            // whatever cap the sender runs, so no honest entry is rejected. A kad
+            // closest-peers entry carries whatever the remote responder's routing table
+            // holds for that peer, which nothing upstream caps, so this is the first bound
+            // on that path too. Every stored address is dialed by the discovery heartbeat,
+            // so an uncapped list lets one PeerExchange message turn this node into a
+            // dial-amplification proxy against attacker-chosen targets (issue #1183). The
+            // heartbeat re-checks eligibility, so an oversized entry is also purged.
             && info.addrs.len() <= MAX_MULTIADDRS_PER_PEER
             && self.has_valid_unbanned_ips(&info.addrs)
             && self.peers.can_dial(&info.peer_id)
