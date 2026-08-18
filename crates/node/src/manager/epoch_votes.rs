@@ -12,7 +12,10 @@ use tn_types::{
     BlsAggregateSignature, BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochDigest,
     EpochRecord, EpochVote, Noticer, TaskSpawner, TnReceiver as _,
 };
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    watch,
+};
 use tracing::{error, info, warn};
 
 type VoteQueue = VecDeque<(Epoch, Sender<EpochVote>, Option<Receiver<EpochVote>>)>;
@@ -377,6 +380,53 @@ pub(crate) fn spawn_epoch_vote_collector(
     });
 }
 
+/// Re-arm the epoch-vote round for a stored-but-uncertified latest epoch record.
+///
+/// The vote collector is armed only by `epoch_record_watch`, and only the epoch-close paths
+/// write that channel. The channel is in-memory. A node that persists its epoch record and
+/// then shuts down before a vote quorum aggregates never writes the channel again: after a
+/// restart no vote is re-signed, so a fleet that holds records without certificates cannot
+/// self-heal (issue #1198). This startup hook closes that gap. It re-publishes the stored
+/// record on the watch when the store holds no certificate for it, which makes the doc
+/// contract of `CERTIFIED_ANCHOR_WAIT` ("the vote collector and this wait start from nearly
+/// the same instant") hold on the restart path too.
+///
+/// The re-publish is idempotent and bounded. Votes re-sign deterministically (BLS over the
+/// record's digest), the vote handler verifies and deduplicates them, certificate writes are
+/// append-once per digest, and [`manage_epoch_votes`] bounds the round (vote windows, then
+/// peer fetch) even when no quorum can form. A node outside the record's committee signs
+/// nothing; its round only listens for votes and then tries the peer fetch.
+///
+/// Epoch 0 is re-armed like any other epoch. The uncertifiable epoch-0 dummy record is not
+/// observable here: `run_epochs` seeds it in-memory AFTER this hook runs and
+/// `save_dummy_epoch0` never persists it, so a stored epoch-0 record at startup is a genuine
+/// closed-epoch-0 record.
+///
+/// Deliberate scope (the issue defers the rest to the network refactor): this heals the
+/// latest stored record only, once per process start. A historical gap behind an already
+/// certified later record needs the refactor's certificate backfill, and a round that
+/// expires before enough peers are back up is retried only by the next restart.
+///
+/// Call this AFTER [`spawn_epoch_vote_collector`]: the collector subscribes to the watch
+/// inside the spawn call, and a subscription created after a send treats that value as
+/// already seen.
+pub(crate) async fn revote_uncertified_epoch_record_on_startup(
+    db: &EpochRecordDb,
+    epoch_record_watch: &watch::Sender<Option<EpochRecord>>,
+) {
+    if let Some(record) = db.latest_record().await {
+        let epoch_hash = record.digest();
+        if db.cert_by_digest(epoch_hash).await.is_none() {
+            info!(
+                target: "epoch-manager",
+                epoch = record.epoch,
+                "re-arming epoch vote round for stored-but-uncertified epoch record {epoch_hash}",
+            );
+            epoch_record_watch.send_replace(Some(record));
+        }
+    }
+}
+
 #[cfg(test)]
 mod epoch_vote_collector_tests {
     use super::*;
@@ -388,8 +438,200 @@ mod epoch_vote_collector_tests {
         ConsensusBus,
     };
     use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils::wait_until;
     use tn_test_utils_committee::CommitteeFixture;
     use tn_types::{BlsKeypair, Notifier, TaskManager, TnSender as _};
+
+    /// #1198 startup re-vote: a persisted-but-uncertified latest record re-fires the watch.
+    #[tokio::test]
+    async fn test_startup_revote_fires_for_uncertified_record() {
+        let temp_dir = TempDir::with_prefix("startup_revote_uncertified").unwrap();
+        let db = EpochRecordDb::open(temp_dir.path()).unwrap();
+        let rec0 = EpochRecord::default();
+        let rec1 = EpochRecord { epoch: 1, ..Default::default() };
+        db.save_record(rec0).await.unwrap();
+        db.save_record(rec1.clone()).await.unwrap();
+        db.persist().await.unwrap();
+
+        let (watch_tx, watch_rx) = watch::channel(None);
+        revote_uncertified_epoch_record_on_startup(&db, &watch_tx).await;
+
+        let armed = watch_rx.borrow().as_ref().map(|rec| rec.digest());
+        assert_eq!(armed, Some(rec1.digest()), "uncertified latest record must re-arm the watch");
+    }
+
+    /// #1198 startup re-vote: a latest record whose certificate is already stored stays quiet.
+    #[tokio::test]
+    async fn test_startup_revote_skips_certified_record() {
+        let temp_dir = TempDir::with_prefix("startup_revote_certified").unwrap();
+        let db = EpochRecordDb::open(temp_dir.path()).unwrap();
+        let rec0 = EpochRecord::default();
+        let rec1 = EpochRecord { epoch: 1, ..Default::default() };
+        let mut rng = StdRng::from_os_rng();
+        let key_config = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut rng));
+        let vote = rec1.sign_vote(&key_config);
+        let cert = EpochCertificate {
+            epoch_hash: rec1.digest(),
+            signature: vote.signature,
+            signed_authorities: roaring::RoaringBitmap::new(),
+        };
+        db.save_record(rec0).await.unwrap();
+        db.save(rec1.clone(), cert).await.unwrap();
+        db.persist().await.unwrap();
+
+        let (watch_tx, watch_rx) = watch::channel(None);
+        revote_uncertified_epoch_record_on_startup(&db, &watch_tx).await;
+
+        assert!(watch_rx.borrow().is_none(), "certified latest record must not re-arm the watch");
+    }
+
+    /// #1198 startup re-vote: a genuine closed-epoch-0 record without a certificate re-arms
+    /// the watch like any other epoch. The in-memory dummy record cannot be observed at
+    /// startup (it is seeded after this hook runs and never persisted), so no epoch-number
+    /// skip applies at the very first boundary.
+    #[tokio::test]
+    async fn test_startup_revote_fires_for_uncertified_epoch_zero_record() {
+        let temp_dir = TempDir::with_prefix("startup_revote_epoch_zero").unwrap();
+        let db = EpochRecordDb::open(temp_dir.path()).unwrap();
+        let mut rng = StdRng::from_os_rng();
+        let pk = *BlsKeypair::generate(&mut rng).public();
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: vec![pk],
+            next_committee: vec![pk],
+            ..Default::default()
+        };
+        db.save_record(rec0.clone()).await.unwrap();
+        db.persist().await.unwrap();
+
+        let (watch_tx, watch_rx) = watch::channel(None);
+        revote_uncertified_epoch_record_on_startup(&db, &watch_tx).await;
+
+        let armed = watch_rx.borrow().as_ref().map(|rec| rec.digest());
+        assert_eq!(armed, Some(rec0.digest()), "uncertified epoch-0 record must re-arm the watch");
+    }
+
+    /// #1198 startup re-vote: an empty store stays quiet.
+    #[tokio::test]
+    async fn test_startup_revote_skips_empty_store() {
+        let temp_dir = TempDir::with_prefix("startup_revote_empty").unwrap();
+        let db = EpochRecordDb::open(temp_dir.path()).unwrap();
+
+        let (watch_tx, watch_rx) = watch::channel(None);
+        revote_uncertified_epoch_record_on_startup(&db, &watch_tx).await;
+
+        assert!(watch_rx.borrow().is_none(), "empty store must not re-arm the watch");
+    }
+
+    /// Reply `Ok` to every `Publish` command until the channel closes.
+    fn spawn_publish_ack(
+        mut net_rx: tokio::sync::mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+    ) {
+        tokio::spawn(async move {
+            if let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+                spawn_publish_ack(net_rx);
+            }
+        });
+    }
+
+    /// #1198 end to end: the startup re-vote arms the collector for a record restored from
+    /// durable storage, the node re-signs, peer votes aggregate, and the certificate lands in
+    /// the store: the exact self-heal a restarted fleet needs after a failed vote quorum.
+    #[tokio::test]
+    async fn test_startup_revote_reaches_quorum_and_stores_cert() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+
+        // Node is kp1
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        // Committee of 4: super_quorum = (4*2)/3 + 1 = 3.
+        let epoch_rec = EpochRecord {
+            epoch: 1,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let temp_dir =
+            TempDir::with_prefix("test_startup_revote_reaches_quorum_and_stores_cert").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+
+        // The restart precondition: records persisted by the previous process, no certificate.
+        consensus_chain.epochs().save_record(EpochRecord::default()).await.unwrap();
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
+
+        // Mock network: reply to Publish commands
+        let (net_tx, net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        spawn_publish_ack(net_rx);
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = Notifier::new();
+
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.subscribe(),
+        );
+
+        // Sign votes from the 3 other committee members
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        let kc4 = KeyConfig::new_with_testing_key(kp4);
+        let vote2 = epoch_rec.sign_vote(&kc2);
+        let vote3 = epoch_rec.sign_vote(&kc3);
+        let vote4 = epoch_rec.sign_vote(&kc4);
+
+        // Buffer the votes in the channel (channel is already subscribed)
+        consensus_bus.app().new_epoch_votes().send(vote2).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(vote3).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(vote4).await.unwrap();
+
+        // The startup hook, not a manual watch write, arms the collector from storage.
+        revote_uncertified_epoch_record_on_startup(
+            consensus_chain.epochs(),
+            consensus_bus.app().epoch_record_watch(),
+        )
+        .await;
+
+        // Wait for collector to aggregate and store
+        wait_until(Duration::from_secs(5), "epoch certificate stored", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_some())
+        })
+        .await
+        .unwrap();
+
+        // Verify cert is in DB
+        let cert = consensus_chain.epochs().cert_by_digest(epoch_hash).await.expect("cert missing");
+        assert_eq!(cert.epoch_hash, epoch_hash);
+        assert!(epoch_rec.verify_with_cert(&cert), "cert should verify against epoch record");
+
+        // Shutdown
+        node_shutdown.notify();
+    }
 
     /// Happy path: committee of 4, node signs + receives 3 peer votes → cert stored.
     #[tokio::test]
