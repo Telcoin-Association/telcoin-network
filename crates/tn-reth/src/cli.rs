@@ -18,10 +18,11 @@
 //!   against fully indexed history. [`RethConfig::ensure_archive_mode`] enforces this at startup
 //!   rather than leaving it to the defaults above, and `etc/archive-mode-guard.sh` fails the build
 //!   if a pruner entry point is introduced.
-//! - The per-sender transaction-pool slot default is raised to
-//!   [`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`] (256, vs reth's 16) by seeding reth's global pool
-//!   defaults via [`init_txpool_defaults`], which must run before any [`TxPoolArgs`] is parsed or
-//!   default-constructed.
+//! - Reth's process-global defaults are seeded with TN's values via [`init_reth_defaults`], which
+//!   must run before any [`TxPoolArgs`] or reth `RpcServerArgs` is parsed or default-constructed:
+//!   the per-sender transaction-pool slot default is raised to
+//!   [`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`] (256, vs reth's 16), and the default IPC endpoint
+//!   becomes TN's [`DEFAULT_IPC_ENDPOINT`] (`tn.ipc`) rather than reth's `reth.ipc`.
 
 use std::{
     collections::HashSet,
@@ -34,9 +35,9 @@ use std::{
 use clap::Parser;
 use reth::{
     args::{
-        DatabaseArgs, DebugArgs, DefaultTxPoolValues, DevArgs, DiscoveryArgs, EngineArgs, EraArgs,
-        EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, StaticFilesArgs,
-        StorageArgs, TxPoolArgs,
+        DatabaseArgs, DebugArgs, DefaultRpcServerArgs, DefaultTxPoolValues, DevArgs, DiscoveryArgs,
+        EngineArgs, EraArgs, EraSourceArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs,
+        PruningArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     network::transactions::{
         config::TransactionPropagationKind, TransactionIngressPolicy, TransactionPropagationMode,
@@ -54,7 +55,10 @@ use reth_node_core::node_config::DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB;
 use tn_types::ETHEREUM_BLOCK_GAS_LIMIT_30M;
 use tracing::warn;
 
-use crate::{dirs::path_to_datadir, rpc_server_args::RpcServerArgs};
+use crate::{
+    dirs::path_to_datadir,
+    rpc_server_args::{RpcServerArgs, DEFAULT_IPC_ENDPOINT},
+};
 
 /// A wrapper abstraction around a Reth node config.
 #[derive(Clone, Debug)]
@@ -100,21 +104,30 @@ const ALL_MODULES: [RethRpcModule; 6] = [
 /// including back down to reth's 16.
 pub const TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER: usize = 256;
 
-/// Seed reth's global transaction pool defaults with [`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`].
+/// Seed reth's process-global defaults with TN's values.
 ///
-/// Must run before any [`TxPoolArgs`] is parsed or default-constructed. Reth resolves the
-/// `--txpool.max-account-slots` clap default out of a process-wide `OnceLock`, and the first
-/// read of that lock fixes it for the life of the process, so a late call cannot take effect.
-/// Both the clap default and `TxPoolArgs::default()` read it.
+/// Must run before any [`TxPoolArgs`] or reth `RpcServerArgs` is parsed or default-constructed.
+/// Reth resolves those defaults out of process-wide `OnceLock`s, and the first read of each lock
+/// fixes it for the life of the process, so a late call cannot take effect. The clap defaults and
+/// the `Default` impls both read the locks.
 ///
-/// Seeding is what makes an explicit `--txpool.max-account-slots 16` reachable: the value clap
-/// injects when the flag is absent becomes 256, so an operator-supplied 16 is no longer
-/// indistinguishable from an unset flag and needs no sentinel to detect.
+/// Transaction pool: the per-sender slot default becomes
+/// [`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER`] (256, vs reth's 16). Seeding is what makes an
+/// explicit `--txpool.max-account-slots 16` reachable: the value clap injects when the flag is
+/// absent becomes 256, so an operator-supplied 16 is no longer indistinguishable from an unset
+/// flag and needs no sentinel to detect.
 ///
-/// Idempotent, and safe to call from more than one entry point. A call that loses the race, or
-/// that arrives after some other code has already read the lock, warns only when the effective
+/// RPC server: the default `ipcpath` becomes TN's [`DEFAULT_IPC_ENDPOINT`] (`tn.ipc`, vs reth's
+/// `reth.ipc`). TN's own [`RpcServerArgs`] already carries that default through CLI parsing; the
+/// seed covers the construction paths that never parse. Without it, `NodeConfig::default()` fills
+/// a temp chain's config with reth's `ipcpath`, and every test env binds a socket at the fixed
+/// global path `/tmp/reth.ipc` (issue #1165). TN's `From` impl also fills reth-side fields with
+/// `..Default::default()`, which reads the same lock.
+///
+/// Idempotent, and safe to call from more than one entry point. A call that loses a race, or
+/// that arrives after some other code has already read a lock, warns only when an effective
 /// default actually differs from TN's, so repeat calls are silent.
-pub fn init_txpool_defaults() {
+pub fn init_reth_defaults() {
     if DefaultTxPoolValues::default()
         .with_max_account_slots(TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER)
         .try_init()
@@ -128,6 +141,22 @@ pub fn init_txpool_defaults() {
                 effective,
                 expected = TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
                 "reth transaction pool defaults already initialized; TN per-sender slot default not applied"
+            );
+        }
+    }
+    if DefaultRpcServerArgs::default()
+        .with_ipcpath(DEFAULT_IPC_ENDPOINT.to_string())
+        .try_init()
+        .is_err()
+    {
+        // The lock is already taken, so reading it back cannot change the outcome.
+        let effective = reth::args::RpcServerArgs::default().ipcpath;
+        if effective != DEFAULT_IPC_ENDPOINT {
+            warn!(
+                target: "tn::reth",
+                effective = %effective,
+                expected = DEFAULT_IPC_ENDPOINT,
+                "reth RPC server defaults already initialized; TN IPC endpoint default not applied"
             );
         }
     }
@@ -172,7 +201,7 @@ impl RethConfig {
         // create a reth DatadirArgs from tn datadir
         let datadir = path_to_datadir(datadir.as_ref());
         // TN's per-sender slot default is seeded into reth's global pool defaults by
-        // `init_txpool_defaults` before parsing, so `txpool` already carries either that default
+        // `init_reth_defaults` before parsing, so `txpool` already carries either that default
         // or the operator's explicit value. Nothing to override here.
         let RethCommand { mut rpc, txpool, db } = reth_config;
 
@@ -469,7 +498,7 @@ mod tests {
     /// [`RethConfig::new`] used to raise reth's default to TN's by sentinel equality against
     /// reth's constant, so an explicit `--txpool.max-account-slots 16` was indistinguishable from
     /// an absent flag and was silently rewritten to 256. The default now arrives through
-    /// [`init_txpool_defaults`], leaving nothing for this function to override. Restoring that
+    /// [`init_reth_defaults`], leaving nothing for this function to override. Restoring that
     /// guard fails this test.
     ///
     /// Only the explicit case is asserted here. What an *absent* flag resolves to depends on
@@ -499,7 +528,7 @@ mod tests {
     /// `NodeConfig::default` locks reth's process-wide per-sender slot default, and these tests
     /// should not be the thing that pins it at reth's 16 for the rest of the binary.
     fn config_with_pruning(enable: impl FnOnce(&mut PruningArgs)) -> RethConfig {
-        init_txpool_defaults();
+        init_reth_defaults();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let mut config = RethConfig(NodeConfig { chain, ..NodeConfig::default() });
         enable(&mut config.0.pruning);
