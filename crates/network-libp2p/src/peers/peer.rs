@@ -23,22 +23,17 @@ use tracing::{error, warn};
 /// the set keeps a single peer entry bounded in memory and keeps the peer-exchange payload built
 /// from it (`exchange_info`) bounded (GHSA-29v6-gvv5-45gx).
 ///
-/// The value is derived from the forms one honest address takes in this set. The protocol
-/// advertises exactly one address per node (`NodeRecord::build`, the committee `network_address`),
-/// but the set is keyed on exact `Multiaddr` equality and one endpoint appears in up to two
-/// syntactic forms, with and without the `/p2p/<peer_id>` suffix: the advertised form is whatever
-/// the operator configured (`keytool` writes it with `/p2p`, test fixtures without), the dialed
-/// form always carries `/p2p` (libp2p-swarm appends it to every dial and `register_outgoing`
-/// stores the address the connection was established on), and the inbound observed form
-/// (`send_back_addr`) never does. libp2p-quic dials from the listening socket, so for a peer
-/// whose observed source endpoint matches its advertised one (no NAT rewrite) the inbound form is
-/// its own listen address and adds no third endpoint. Two forms for the current address plus two
-/// for the previous one while an in-process address change is in flight gives 4. Such a peer stays
-/// within it, so nothing is evicted in normal operation. If a peer ever exceeds it (a NAT-rewritten
-/// endpoint adds a third form), eviction only trims the peer-exchange payload (`exchange_info`):
-/// dialing reads `known_peers`, kad and `discovery_peers`, and banning reads
-/// `observed_ip_addresses`, never this set. A tight value also bounds the dial fan-out one
-/// discovery entry can cause.
+/// The protocol assumes exactly one address per peer: a `NodeRecord` advertises one address
+/// (`NodeRecord::build`), a committee entry carries one (`network_address`), and every consumer
+/// acts on a single address for a peer. The set therefore holds only the address the peer most
+/// recently presented. The set is keyed on exact `Multiaddr` equality and one endpoint appears
+/// in two syntactic forms, with and without the `/p2p/<peer_id>` suffix (the advertised form is
+/// whatever the operator configured, the dialed form always carries `/p2p` because libp2p-swarm
+/// appends it to every dial, the inbound observed form never does); under this cap those forms
+/// replace each other instead of accumulating, and either form dials the same endpoint. An
+/// eviction only trims the peer-exchange payload (`exchange_info`): dialing reads `known_peers`,
+/// kad and `discovery_peers`, and banning reads `observed_ip_addresses`, never this set. A cap of
+/// one also bounds the dial fan-out one discovery entry can cause to a single address.
 ///
 /// The discovery path reuses this value as the per-entry ceiling in `eligible_for_discovery`:
 /// a PeerExchange entry with more addresses than this set can hold cannot come from an honest
@@ -46,7 +41,7 @@ use tracing::{error, warn};
 /// validation cap `MAX_ADVERTISED_MULTIADDRS` is tied to this value, so validation and storage
 /// agree on how many addresses one peer may present: a record can never carry more addresses than
 /// the store keeps for a peer.
-pub(crate) const MAX_MULTIADDRS_PER_PEER: usize = 4;
+pub(crate) const MAX_MULTIADDRS_PER_PEER: usize = 1;
 
 /// Information about a given connected peer.
 /// Note that bls_public_key and network_key are Optional.
@@ -178,10 +173,11 @@ impl Peer {
     /// payload built by [`Self::exchange_info`]. If admitting it pushes the set over the cap, one
     /// of the other addresses is evicted to restore the bound. Re-recording an address already
     /// present is a no-op. A self-advertised republish flood therefore churns the set within the
-    /// cap instead of growing it without bound (GHSA-29v6-gvv5-45gx). The forms an honest peer's
-    /// address takes fit within the cap (see [`MAX_MULTIADDRS_PER_PEER`]), so nothing is evicted
-    /// in normal operation, and an eviction can only ever trim that payload: the ban path reads
-    /// [`Self::observed_ip_addresses`], not this set.
+    /// cap instead of growing it without bound (GHSA-29v6-gvv5-45gx). With the cap at one (see
+    /// [`MAX_MULTIADDRS_PER_PEER`]) the set is the address the peer most recently presented, and
+    /// the bare and `/p2p`-suffixed forms of one honest endpoint replace each other. An eviction
+    /// can only ever trim that payload: the ban path reads [`Self::observed_ip_addresses`], not
+    /// this set.
     fn note_multiaddr(&mut self, multiaddr: Multiaddr) {
         if self.multiaddrs.insert(multiaddr.clone())
             && self.multiaddrs.len() > MAX_MULTIADDRS_PER_PEER
@@ -510,12 +506,14 @@ mod tests {
         assert!(peer.multiaddrs.len() <= MAX_MULTIADDRS_PER_PEER);
     }
 
-    /// The cap is derived from the forms one honest address takes in the set (see
-    /// [`MAX_MULTIADDRS_PER_PEER`]): one endpoint with and without the `/p2p/<peer_id>` suffix,
-    /// for the current address and for the previous one while an in-process address change is in
-    /// flight. All four forms must be retained, so an honest peer never has an address evicted.
+    /// The cap holds the address a peer most recently presented (see
+    /// [`MAX_MULTIADDRS_PER_PEER`]). One honest endpoint reaches the set in two syntactic forms,
+    /// with and without the `/p2p/<peer_id>` suffix (advertised bare, dialed with `/p2p`, seen bare
+    /// again on an inbound connection). Each form replaces the previous one instead of
+    /// accumulating, so the set never grows past one and always holds a form that dials the
+    /// endpoint. The cap is exact: two forms of one endpoint would fill a cap of two.
     #[test]
-    fn honest_address_forms_fit_within_the_cap() {
+    fn honest_address_forms_replace_each_other_within_the_cap() {
         // constructing a `Peer` builds its `Score`, which reads the global score config
         super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
@@ -525,39 +523,27 @@ mod tests {
             peer_id.iter().fold(bare.clone(), |addr, id| addr.with(Protocol::P2p(*id)))
         };
         // a QUIC listen endpoint (TEST-NET-3), the shape this node advertises and dials
-        let endpoint = |host: u8| {
-            Multiaddr::empty()
-                .with(Protocol::Ip4([203, 0, 113, host].into()))
-                .with(Protocol::Udp(49_584))
-                .with(Protocol::QuicV1)
-        };
+        let endpoint = Multiaddr::empty()
+            .with(Protocol::Ip4([203, 0, 113, 10].into()))
+            .with(Protocol::Udp(49_584))
+            .with(Protocol::QuicV1);
         assert!(peer_id.is_some(), "the test peer carries a network key, so it has a peer id");
 
-        // the previous address: advertised bare (a record or committee entry), then dialed (the
-        // dial always carries `/p2p`), then seen on an inbound connection, which presents the
-        // bare listen address again because libp2p-quic dials from the listening socket.
-        let previous = endpoint(10);
-        peer.note_multiaddr(previous.clone());
-        peer.register_outgoing(with_p2p(&previous));
-        peer.register_incoming(previous.clone());
-        assert_eq!(peer.multiaddrs.len(), 2, "one honest address is at most two forms");
+        // advertised bare (a record or committee entry)
+        peer.note_multiaddr(endpoint.clone());
+        assert_eq!(peer.multiaddrs.len(), MAX_MULTIADDRS_PER_PEER);
+        assert!(peer.multiaddrs.contains(&endpoint), "the advertised form is stored");
 
-        // an in-process address change: the new address arrives on a fresher record and is dialed
-        // while the previous pair is still stored
-        let current = endpoint(11);
-        peer.note_multiaddr(current.clone());
-        peer.register_outgoing(with_p2p(&current));
+        // then dialed: the dial always carries `/p2p`, and that form replaces the bare one
+        peer.register_outgoing(with_p2p(&endpoint));
+        assert_eq!(peer.multiaddrs.len(), 1, "one honest endpoint, one entry");
+        assert!(peer.multiaddrs.contains(&with_p2p(&endpoint)), "the dialed form is stored");
 
-        assert_eq!(
-            peer.multiaddrs.len(),
-            MAX_MULTIADDRS_PER_PEER,
-            "the honest forms of the current and previous address fill the cap exactly"
-        );
-        [previous.clone(), with_p2p(&previous), current.clone(), with_p2p(&current)]
-            .iter()
-            .for_each(|form| {
-                assert!(peer.multiaddrs.contains(form), "honest form {form} must not be evicted")
-            });
+        // then seen on an inbound connection, which presents the bare listen address again
+        // because libp2p-quic dials from the listening socket; it replaces the dialed form
+        peer.register_incoming(endpoint.clone());
+        assert_eq!(peer.multiaddrs.len(), 1, "one honest endpoint, one entry");
+        assert!(peer.multiaddrs.contains(&endpoint), "the most recently presented form is stored");
     }
 
     /// Regression (issue #1010, informational): the per-connection counters are `u8` and were
