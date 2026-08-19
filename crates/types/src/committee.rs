@@ -110,38 +110,78 @@ impl From<(NetworkPublicKey, Multiaddr)> for P2pNode {
     }
 }
 
-/// On-disk representations of a primary plus its worker list.
+/// The current on-disk shape of a primary plus its worker list: `{ primary, workers }`.
 ///
-/// Shared by [BootstrapServer] and `NodeP2pInfo`, which both persist the same
-/// `{ primary, workers }` shape. `Current` is the shape written today. `Legacy` is the
-/// pre-multi-worker single `worker` map, still accepted on read so files written before the
-/// worker list existed load unchanged.
+/// Shared by [BootstrapServer] and `NodeP2pInfo`. This is the only shape written today and the
+/// only shape binary codecs (bcs: the consensus store and pack encoding) read.
+#[derive(Deserialize)]
+pub(crate) struct PrimaryWorkersCurrent {
+    /// The p2p info of the primary.
+    pub(crate) primary: P2pNode,
+    /// The p2p info for each worker, never empty.
+    #[serde(deserialize_with = "deserialize_non_empty_workers")]
+    pub(crate) workers: Vec<P2pNode>,
+}
+
+/// The legacy single-worker shape: `{ primary, worker }`.
+///
+/// Still accepted from human-readable files written before the worker list existed.
+#[derive(Deserialize)]
+pub(crate) struct PrimaryWorkersLegacy {
+    /// The p2p info of the primary.
+    pub(crate) primary: P2pNode,
+    /// The p2p info of the single worker.
+    pub(crate) worker: P2pNode,
+}
+
+/// Human-readable (YAML, JSON) representations of a primary plus its worker list.
+///
+/// Both variants are boxed so the enum stays small (clippy `large_enum_variant`; `P2pNode` is
+/// wide). Untagged: serde tries [PrimaryWorkersCurrent] first, then [PrimaryWorkersLegacy].
+/// Untagged enums buffer the input through `deserialize_any`, which non-self-describing codecs
+/// (bcs) do not support, so this enum is only used when the deserializer reports
+/// `is_human_readable()`; see [deserialize_primary_workers].
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(crate) enum PrimaryWorkersRepr {
     /// The current shape: `workers: [..]`.
-    Current {
-        /// The p2p info of the primary.
-        primary: P2pNode,
-        /// The p2p info for each worker, never empty.
-        #[serde(deserialize_with = "deserialize_non_empty_workers")]
-        workers: Vec<P2pNode>,
-    },
+    Current(Box<PrimaryWorkersCurrent>),
     /// The legacy shape: `worker: {..}`.
-    Legacy {
-        /// The p2p info of the primary.
-        primary: P2pNode,
-        /// The p2p info of the single worker (boxed to keep the variants a similar size).
-        worker: Box<P2pNode>,
-    },
+    Legacy(Box<PrimaryWorkersLegacy>),
 }
 
 impl From<PrimaryWorkersRepr> for (P2pNode, Vec<P2pNode>) {
     fn from(value: PrimaryWorkersRepr) -> Self {
         match value {
-            PrimaryWorkersRepr::Current { primary, workers } => (primary, workers),
-            PrimaryWorkersRepr::Legacy { primary, worker } => (primary, vec![*worker]),
+            PrimaryWorkersRepr::Current(current) => {
+                let PrimaryWorkersCurrent { primary, workers } = *current;
+                (primary, workers)
+            }
+            PrimaryWorkersRepr::Legacy(legacy) => {
+                let PrimaryWorkersLegacy { primary, worker } = *legacy;
+                (primary, vec![worker])
+            }
         }
+    }
+}
+
+/// Deserialize the `(primary, workers)` pair shared by [BootstrapServer] and `NodeP2pInfo`.
+///
+/// Human-readable formats (the YAML and JSON config and committee files) accept both the
+/// current `workers: [..]` list and the legacy single `worker: {..}` map. Binary formats (bcs,
+/// used by the consensus store and the consensus pack) carry only the current shape and are read
+/// directly: the untagged legacy fallback needs `deserialize_any`, which bcs rejects.
+pub(crate) fn deserialize_primary_workers<'de, D>(
+    deserializer: D,
+) -> Result<(P2pNode, Vec<P2pNode>), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    if deserializer.is_human_readable() {
+        PrimaryWorkersRepr::deserialize(deserializer).map(Into::into)
+    } else {
+        PrimaryWorkersCurrent::deserialize(deserializer)
+            .map(|PrimaryWorkersCurrent { primary, workers }| (primary, workers))
     }
 }
 
@@ -171,8 +211,7 @@ where
 /// Serialization: the current on-disk shape is `workers: [..]`. The legacy single-worker shape
 /// `worker: {..}` is still accepted on read so existing committee files load unchanged; it is
 /// written back in the new shape.
-#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
-#[serde(from = "PrimaryWorkersRepr")]
+#[derive(Clone, Serialize, Debug, Eq, PartialEq)]
 pub struct BootstrapServer {
     /// The p2p info the primary.
     pub primary: P2pNode,
@@ -180,10 +219,13 @@ pub struct BootstrapServer {
     pub workers: Vec<P2pNode>,
 }
 
-impl From<PrimaryWorkersRepr> for BootstrapServer {
-    fn from(value: PrimaryWorkersRepr) -> Self {
-        let (primary, workers) = value.into();
-        Self { primary, workers }
+impl<'de> Deserialize<'de> for BootstrapServer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_primary_workers(deserializer)
+            .map(|(primary, workers)| Self { primary, workers })
     }
 }
 
@@ -964,6 +1006,44 @@ mod tests {
         let doc = format!("primary:\n{}\nworkers: []\n", indent(&primary_yaml));
         let result: Result<BootstrapServer, _> = serde_yaml::from_str(&doc);
         assert!(result.is_err(), "empty workers must be rejected");
+    }
+
+    #[test]
+    fn bootstrap_server_bcs_round_trips() {
+        // bcs is not self-describing: the legacy-tolerant untagged path cannot run there, so the
+        // binary codec must read the current shape directly.
+        let bootstrap = bootstrap_with_workers(2);
+        let bytes = crate::encode(&bootstrap);
+        let decoded: BootstrapServer = crate::try_decode(&bytes).expect("bcs deserialize");
+        assert_eq!(decoded, bootstrap);
+    }
+
+    #[test]
+    fn committee_bcs_round_trips_with_bootstrap_servers() {
+        // The consensus store and the consensus pack persist committees with bcs.
+        let mut rng = rng();
+        let authorities = (0..4u8)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                (*keypair.public(), Authority::new(*keypair.public(), Address::repeat_byte(i)))
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| (*key, bootstrap_with_workers(2)))
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+        let committee = Committee::new(
+            authorities,
+            7,
+            bootstrap_servers,
+            std::num::NonZeroUsize::new(2).expect("2 is not 0"),
+        );
+        let bytes = crate::encode(&committee);
+        let decoded: Committee = crate::try_decode(&bytes).expect("bcs deserialize");
+        assert_eq!(decoded, committee);
+        assert_eq!(decoded.number_of_workers(), 2);
+        assert_eq!(decoded.bootstrap_servers().len(), 4);
+        assert!(decoded.bootstrap_servers().values().all(|server| server.num_workers() == 2));
     }
 
     #[test]

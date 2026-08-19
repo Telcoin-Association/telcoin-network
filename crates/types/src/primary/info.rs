@@ -1,6 +1,7 @@
 //! Primary information for peers.
 use crate::{
-    committee::PrimaryWorkersRepr, get_available_udp_port, NetworkKeypair, P2pNode, WorkerId,
+    committee::deserialize_primary_workers, get_available_udp_port, NetworkKeypair, P2pNode,
+    WorkerId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -13,10 +14,10 @@ use serde::{Deserialize, Serialize};
 /// `Committee::number_of_workers`). The list is never empty.
 ///
 /// Serialization: the current on-disk shape is `workers: [..]`. The legacy single-worker shape
-/// `worker: {..}` is still accepted on read so existing node-info and validator files load
-/// unchanged; it is written back in the new shape.
-#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
-#[serde(from = "PrimaryWorkersRepr")]
+/// `worker: {..}` is still accepted on read from human-readable files so existing node-info and
+/// validator files load unchanged; it is written back in the new shape. Binary codecs read the
+/// current shape only.
+#[derive(Serialize, PartialEq, Clone, Debug)]
 pub struct NodeP2pInfo {
     /// The primary's public network settings.
     pub primary: P2pNode,
@@ -24,10 +25,13 @@ pub struct NodeP2pInfo {
     pub workers: Vec<P2pNode>,
 }
 
-impl From<PrimaryWorkersRepr> for NodeP2pInfo {
-    fn from(value: PrimaryWorkersRepr) -> Self {
-        let (primary, workers) = value.into();
-        Self { primary, workers }
+impl<'de> Deserialize<'de> for NodeP2pInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_primary_workers(deserializer)
+            .map(|(primary, workers)| Self { primary, workers })
     }
 }
 
