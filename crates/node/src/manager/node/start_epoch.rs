@@ -24,7 +24,7 @@
 //! yet executed is replayed to the engine, with a guard that refuses to cross an
 //! epoch boundary.
 
-use super::run_epoch::retry_provider_faults;
+use super::{read_num_workers_at_epoch_entry, run_epoch::retry_provider_faults};
 use crate::{
     engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode, worker::WorkerNode,
     EngineToPrimaryRpc,
@@ -32,6 +32,7 @@ use crate::{
 use eyre::{eyre, OptionExt, WrapErr as _};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    num::NonZeroUsize,
     sync::Arc,
     time::Duration,
 };
@@ -174,8 +175,10 @@ where
             .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
 
+        let reth_env = engine.get_reth_env().await;
         Ok((
-            self.create_committee_from_state(epoch, validators).await?,
+            self.create_committee_from_state(&reth_env, epoch, epoch_info.blockHeight, validators)
+                .await?,
             epoch_info,
             epoch_start,
             epoch_start_header,
@@ -239,7 +242,8 @@ where
                 .builder
                 .tn_config
                 .node_info
-                .worker_network_address()
+                .worker_network_address(DEFAULT_WORKER_ID)
+                .ok_or_eyre("no worker network address in node info")?
                 .clone(),
             version: self.version_str,
         };
@@ -335,27 +339,53 @@ where
     /// Epoch 0 has no on-chain history, so the genesis committee is loaded from the
     /// committee file on disk. Every later epoch is built with a [`CommitteeBuilder`] from the
     /// statically configured bootstrap servers plus the on-chain validator set for that epoch.
+    ///
+    /// In both cases the committee's worker count comes from the on-chain `WorkerConfigs` state
+    /// at the previous epoch's closing block (`epoch_first_block - 1`; genesis state for epoch
+    /// 0), the same read that sizes the [`GasAccumulator`], so the count that validates header
+    /// payloads is the count execution runs with. A failed read halts epoch entry.
     async fn create_committee_from_state(
         &self,
+        reth_env: &tn_reth::RethEnv,
         epoch: Epoch,
+        epoch_first_block: u64,
         validators: HashMap<BlsPublicKey, &ConsensusRegistry::ValidatorInfo>,
     ) -> eyre::Result<Committee> {
         info!(target: "epoch-manager", "creating committee from state");
 
+        let num_workers = read_num_workers_at_epoch_entry(reth_env, epoch_first_block)
+            .await
+            .and_then(|count| {
+                NonZeroUsize::new(count)
+                    .ok_or_else(|| eyre!("on-chain WorkerConfigs reports zero workers"))
+            })
+            .wrap_err("failed to read the committee worker count from chain")?;
+        if num_workers.get() != 1 {
+            warn!(
+                target: "epoch-manager",
+                epoch,
+                num_workers,
+                spawned_worker = DEFAULT_WORKER_ID,
+                "committee runs multiple workers but this node version spawns only worker {DEFAULT_WORKER_ID}: \
+                 ids >= 1 are accepted by header validation but not produced locally"
+            );
+        }
+
         // the network must be live
         let committee = if epoch == 0 {
-            // read from fs for genesis
+            // read from fs for genesis, then stamp the on-chain count
             Config::load_from_path_or_default::<Committee>(
                 self.tn_datadir.committee_path(),
                 ConfigFmt::YAML,
             )?
+            .with_num_workers(num_workers)
         } else {
-            let mut committee_builder = CommitteeBuilder::new(epoch);
+            let mut committee_builder = CommitteeBuilder::new(epoch).with_num_workers(num_workers);
             for (key, bootstrap) in &self.bootstrap_servers {
                 committee_builder.add_bootstrap_server(
                     *key,
                     bootstrap.primary.clone(),
-                    bootstrap.worker.clone(),
+                    bootstrap.workers.clone(),
                 );
             }
 
@@ -771,7 +801,9 @@ where
             .committee()
             .bootstrap_servers()
             .iter()
-            .map(|(k, v)| (*k, v.worker.clone()))
+            // worker 0 always exists (the non-empty list invariant is enforced at deserialize), so
+            // this `filter_map` cannot drop a peer
+            .filter_map(|(k, v)| v.worker(DEFAULT_WORKER_ID).cloned().map(|worker| (*k, worker)))
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
@@ -790,12 +822,14 @@ where
             let worker_address = Self::parse_listener_address_for_swarm(
                 "WORKER_LISTENER_MULTIADDR",
                 consensus_config.primary_networkkey(),
-                consensus_config.worker_address(),
+                consensus_config
+                    .worker_address(DEFAULT_WORKER_ID)
+                    .ok_or_eyre("no worker network address in node info")?,
             )?;
             network_handle.inner_handle().start_listening(worker_address).await?;
         }
 
-        let worker_address = consensus_config.worker_address();
+        let worker_address = consensus_config.worker_address(DEFAULT_WORKER_ID);
 
         // always attempt to dial peers for the new epoch
         // the network's peer manager will intercept dial attempts for peers that are already
@@ -824,7 +858,10 @@ where
         // later epoch unless the subscription is explicitly dropped. Skipping alone would also
         // skip the only refresh of this topic's authorized-publisher allowlist, freezing it on
         // the committee that was current when the node last subscribed.
-        let batch_topic = tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id());
+        let batch_topic = tn_config::LibP2pConfig::worker_batch_topic(
+            consensus_config.chain_id(),
+            DEFAULT_WORKER_ID,
+        );
         let mode = self.consensus_bus.current_node_mode();
         if should_subscribe_batch_topic(mode) {
             debug!(target: "epoch-manager", ?mode, "subscribing to worker batch topic");

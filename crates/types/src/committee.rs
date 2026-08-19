@@ -2,13 +2,13 @@
 
 use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
-    Address, Multiaddr,
+    Address, Multiaddr, WorkerId,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     str::FromStr,
     sync::Arc,
 };
@@ -110,19 +110,106 @@ impl From<(NetworkPublicKey, Multiaddr)> for P2pNode {
     }
 }
 
+/// On-disk representations of a primary plus its worker list.
+///
+/// Shared by [BootstrapServer] and `NodeP2pInfo`, which both persist the same
+/// `{ primary, workers }` shape. `Current` is the shape written today. `Legacy` is the
+/// pre-multi-worker single `worker` map, still accepted on read so files written before the
+/// worker list existed load unchanged.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(crate) enum PrimaryWorkersRepr {
+    /// The current shape: `workers: [..]`.
+    Current {
+        /// The p2p info of the primary.
+        primary: P2pNode,
+        /// The p2p info for each worker, never empty.
+        #[serde(deserialize_with = "deserialize_non_empty_workers")]
+        workers: Vec<P2pNode>,
+    },
+    /// The legacy shape: `worker: {..}`.
+    Legacy {
+        /// The p2p info of the primary.
+        primary: P2pNode,
+        /// The p2p info of the single worker (boxed to keep the variants a similar size).
+        worker: Box<P2pNode>,
+    },
+}
+
+impl From<PrimaryWorkersRepr> for (P2pNode, Vec<P2pNode>) {
+    fn from(value: PrimaryWorkersRepr) -> Self {
+        match value {
+            PrimaryWorkersRepr::Current { primary, workers } => (primary, workers),
+            PrimaryWorkersRepr::Legacy { primary, worker } => (primary, vec![*worker]),
+        }
+    }
+}
+
+/// Deserialize a worker list and reject an empty one.
+///
+/// A node must run at least one worker, so an empty list is a configuration error rather than a
+/// valid value.
+pub(crate) fn deserialize_non_empty_workers<'de, D>(
+    deserializer: D,
+) -> Result<Vec<P2pNode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let workers = Vec::<P2pNode>::deserialize(deserializer)?;
+    (!workers.is_empty())
+        .then_some(workers)
+        .ok_or_else(|| serde::de::Error::custom("`workers` must contain at least one entry"))
+}
+
 /// Bootstrap p2p server info to join the network.
+///
+/// `workers` holds one [P2pNode] per worker, indexed by [WorkerId], and is never empty. It is a
+/// dial-hint list, not a validated invariant: a bootstrap entry may advertise fewer workers than
+/// [Committee::number_of_workers] (today every entry advertises exactly one). Per-worker
+/// bootstrap addresses arrive with the per-worker swarms.
+///
+/// Serialization: the current on-disk shape is `workers: [..]`. The legacy single-worker shape
+/// `worker: {..}` is still accepted on read so existing committee files load unchanged; it is
+/// written back in the new shape.
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[serde(from = "PrimaryWorkersRepr")]
 pub struct BootstrapServer {
     /// The p2p info the primary.
     pub primary: P2pNode,
-    /// The p2p info the worker.
-    pub worker: P2pNode,
+    /// The p2p info for each worker, indexed by [WorkerId].
+    pub workers: Vec<P2pNode>,
+}
+
+impl From<PrimaryWorkersRepr> for BootstrapServer {
+    fn from(value: PrimaryWorkersRepr) -> Self {
+        let (primary, workers) = value.into();
+        Self { primary, workers }
+    }
 }
 
 impl BootstrapServer {
-    pub fn new(primary_node: P2pNode, worker_node: P2pNode) -> Self {
-        Self { primary: primary_node, worker: worker_node }
+    /// Create a new [BootstrapServer] with one [P2pNode] per worker.
+    pub fn new(primary_node: P2pNode, worker_nodes: Vec<P2pNode>) -> Self {
+        Self { primary: primary_node, workers: worker_nodes }
     }
+
+    /// Return the [P2pNode] for `worker_id`, or `None` if the server has no such worker.
+    pub fn worker(&self, worker_id: WorkerId) -> Option<&P2pNode> {
+        self.workers.get(usize::from(worker_id))
+    }
+
+    /// Return the number of workers this bootstrap server advertises.
+    pub fn num_workers(&self) -> usize {
+        self.workers.len()
+    }
+}
+
+/// The default worker count for a committee: one worker per validator.
+const ONE_WORKER: NonZeroUsize = NonZeroUsize::MIN;
+
+/// Serde default for [CommitteeInner::num_workers] so committee files without the field load.
+fn default_num_workers() -> NonZeroUsize {
+    ONE_WORKER
 }
 
 /// Immutable authority data.
@@ -197,7 +284,7 @@ impl<'de> Deserialize<'de> for Authority {
 }
 
 /// The committee lists all validators that participate in consensus.
-#[derive(Serialize, Deserialize, Debug, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Eq)]
 struct CommitteeInner {
     /// The authorities of epoch.
     authorities: BTreeMap<BlsPublicKey, Authority>,
@@ -216,6 +303,27 @@ struct CommitteeInner {
     /// The bootstrap servers to initially join a network (probably the initial committee).
     /// Note, not included in partial eq since they are not relevand to overall committee equality.
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// The number of workers every validator in this committee runs.
+    ///
+    /// This is a protocol-level value: all nodes must agree on it. Its source of truth is the
+    /// on-chain `WorkerConfigs` contract, read at the previous epoch's closing block when the
+    /// committee for an epoch is created. Committee files without the field default to one.
+    #[serde(default = "default_num_workers")]
+    num_workers: NonZeroUsize,
+}
+
+impl Default for CommitteeInner {
+    fn default() -> Self {
+        Self {
+            authorities: BTreeMap::default(),
+            authorities_by_id: BTreeMap::default(),
+            epoch: Epoch::default(),
+            quorum_threshold: VotingPower::default(),
+            validity_threshold: VotingPower::default(),
+            bootstrap_servers: BTreeMap::default(),
+            num_workers: ONE_WORKER,
+        }
+    }
 }
 
 impl PartialEq for CommitteeInner {
@@ -223,6 +331,7 @@ impl PartialEq for CommitteeInner {
         self.epoch == other.epoch
             && self.quorum_threshold == other.quorum_threshold
             && self.validity_threshold == other.validity_threshold
+            && self.num_workers == other.num_workers
             && self.authorities.eq(&other.authorities)
     }
 }
@@ -419,6 +528,7 @@ impl Committee {
         authorities: BTreeMap<BlsPublicKey, Authority>,
         epoch: Epoch,
         bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+        num_workers: NonZeroUsize,
     ) -> Self {
         let mut committee = CommitteeInner {
             authorities,
@@ -427,6 +537,7 @@ impl Committee {
             validity_threshold: 0,
             quorum_threshold: 0,
             bootstrap_servers,
+            num_workers,
         };
         committee.load();
 
@@ -443,7 +554,7 @@ impl Committee {
     /// on new.
     ///
     /// Pass an optional epoch_boundary timestamp. Defaults to u64::MAX to disable epoch
-    /// transitions.
+    /// transitions. The committee has one worker; use [Committee::with_num_workers] to widen it.
     pub fn new_for_test(
         authorities: BTreeMap<BlsPublicKey, Authority>,
         epoch: Epoch,
@@ -456,6 +567,7 @@ impl Committee {
             validity_threshold: 0,
             quorum_threshold: 0,
             bootstrap_servers,
+            num_workers: ONE_WORKER,
         };
 
         committee.authorities_by_id = committee
@@ -599,11 +711,32 @@ impl Committee {
     }
 
     /// Return the number of workers that are in use for this committee.
+    ///
     /// This is a protocol level value, all nodes have to agree on this and be
-    /// running the required number of workers.
-    /// Currently 1 but may change with a future fork on an epoch boundary.
+    /// running the required number of workers. The source of truth is the on-chain
+    /// `WorkerConfigs` contract at the previous epoch's closing block, so a change takes
+    /// effect at an epoch boundary. Committees built without an explicit count have one worker.
     pub fn number_of_workers(&self) -> usize {
-        1
+        self.inner.num_workers.get()
+    }
+
+    /// Return a copy of this committee with the worker count set to `num_workers`.
+    ///
+    /// The epoch-0 committee is loaded from the committee file, whose count is a default; the
+    /// epoch manager uses this to stamp the on-chain count onto it. Every other field, including
+    /// the derived indexes and thresholds, is copied as-is: this does not re-run
+    /// `CommitteeInner::load`, so it is safe on a default (empty) committee as well.
+    pub fn with_num_workers(&self, num_workers: NonZeroUsize) -> Committee {
+        let inner = CommitteeInner {
+            authorities: self.inner.authorities.clone(),
+            authorities_by_id: self.inner.authorities_by_id.clone(),
+            epoch: self.inner.epoch,
+            quorum_threshold: self.inner.quorum_threshold,
+            validity_threshold: self.inner.validity_threshold,
+            bootstrap_servers: self.inner.bootstrap_servers.clone(),
+            num_workers,
+        };
+        Committee { inner: Arc::new(inner) }
     }
 }
 
@@ -637,12 +770,25 @@ pub struct CommitteeBuilder {
     authorities: BTreeMap<BlsPublicKey, Authority>,
     /// The map of [BlsPublicKey] for each [BootstrapServer].
     bootstrap_server: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// The number of workers every validator runs (defaults to one).
+    num_workers: NonZeroUsize,
 }
 
 impl CommitteeBuilder {
     /// Create a new instance of [CommitteeBuilder] for making a new [Committee].
     pub fn new(epoch: Epoch) -> Self {
-        Self { epoch, authorities: BTreeMap::default(), bootstrap_server: BTreeMap::default() }
+        Self {
+            epoch,
+            authorities: BTreeMap::default(),
+            bootstrap_server: BTreeMap::default(),
+            num_workers: ONE_WORKER,
+        }
+    }
+
+    /// Set the number of workers every validator in the committee runs.
+    pub fn with_num_workers(mut self, num_workers: NonZeroUsize) -> Self {
+        self.num_workers = num_workers;
+        self
     }
 
     /// Add an authority and bootstrap server to the committee builder.
@@ -650,12 +796,12 @@ impl CommitteeBuilder {
         &mut self,
         protocol_key: BlsPublicKey,
         primary_node: P2pNode,
-        worker_node: P2pNode,
+        worker_nodes: Vec<P2pNode>,
         execution_address: Address,
     ) {
         let authority = Authority::new(protocol_key, execution_address);
         self.authorities.insert(protocol_key, authority);
-        let bootstrap = BootstrapServer::new(primary_node, worker_node);
+        let bootstrap = BootstrapServer::new(primary_node, worker_nodes);
         self.bootstrap_server.insert(protocol_key, bootstrap);
     }
 
@@ -665,19 +811,20 @@ impl CommitteeBuilder {
         self.authorities.insert(protocol_key, authority);
     }
 
-    /// Add an authority to the committee builder.
+    /// Add a bootstrap server to the committee builder.
     pub fn add_bootstrap_server(
         &mut self,
         protocol_key: BlsPublicKey,
         primary_node: P2pNode,
-        worker_node: P2pNode,
+        worker_nodes: Vec<P2pNode>,
     ) {
-        let bootstrap = BootstrapServer::new(primary_node, worker_node);
+        let bootstrap = BootstrapServer::new(primary_node, worker_nodes);
         self.bootstrap_server.insert(protocol_key, bootstrap);
     }
 
+    /// Build the [Committee].
     pub fn build(self) -> Committee {
-        Committee::new(self.authorities, self.epoch, self.bootstrap_server)
+        Committee::new(self.authorities, self.epoch, self.bootstrap_server, self.num_workers)
     }
 }
 
@@ -723,7 +870,7 @@ mod tests {
 
                 let b = BootstrapServer::new(
                     (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
-                    (Multiaddr::empty(), worker_keypair.public().clone().into()).into(),
+                    vec![(Multiaddr::empty(), worker_keypair.public().clone().into()).into()],
                 );
 
                 (*key, b)
@@ -731,7 +878,7 @@ mod tests {
             .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
 
         // WHEN
-        let committee = Committee::new(authorities, 10, bootstrap_servers);
+        let committee = Committee::new(authorities, 10, bootstrap_servers, super::ONE_WORKER);
 
         // THEN
         assert_eq!(committee.inner.authorities_by_id.len() as u64, num_of_authorities);
@@ -760,6 +907,136 @@ mod tests {
         assert_eq!(total, num_of_authorities);
     }
 
+    /// A [BootstrapServer] with fresh keys and `num_workers` workers.
+    fn bootstrap_with_workers(num_workers: usize) -> BootstrapServer {
+        let primary_keypair = NetworkKeypair::generate_ed25519();
+        BootstrapServer::new(
+            (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
+            (0..num_workers)
+                .map(|_| {
+                    let keypair = NetworkKeypair::generate_ed25519();
+                    (Multiaddr::empty(), keypair.public().clone().into()).into()
+                })
+                .collect(),
+        )
+    }
+
+    /// Indent every line of a YAML fragment by two spaces so it nests under a key (the document
+    /// start marker is dropped).
+    fn indent(fragment: &str) -> String {
+        fragment
+            .lines()
+            .filter(|l| *l != "---")
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn bootstrap_server_new_shape_round_trips() {
+        let bootstrap = bootstrap_with_workers(2);
+        let yaml = serde_yaml::to_string(&bootstrap).expect("serialize");
+        assert!(yaml.contains("workers:"), "new shape must serialize `workers`: {yaml}");
+        assert!(!yaml.contains("\nworker:"), "new shape must not serialize `worker`: {yaml}");
+        let decoded: BootstrapServer = serde_yaml::from_str(&yaml).expect("deserialize");
+        assert_eq!(decoded, bootstrap);
+        assert_eq!(decoded.num_workers(), 2);
+        assert_eq!(decoded.worker(1), bootstrap.workers.get(1));
+        assert!(decoded.worker(2).is_none());
+    }
+
+    #[test]
+    fn bootstrap_server_legacy_shape_decodes_as_one_worker() {
+        let expected = bootstrap_with_workers(1);
+        let worker = expected.worker(0).expect("one worker").clone();
+        let primary_yaml = serde_yaml::to_string(&expected.primary).expect("serialize primary");
+        let worker_yaml = serde_yaml::to_string(&worker).expect("serialize worker");
+        let legacy =
+            format!("primary:\n{}\nworker:\n{}\n", indent(&primary_yaml), indent(&worker_yaml));
+        let decoded: BootstrapServer = serde_yaml::from_str(&legacy).expect("legacy deserialize");
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn bootstrap_server_empty_workers_rejected() {
+        let bootstrap = bootstrap_with_workers(1);
+        let primary_yaml = serde_yaml::to_string(&bootstrap.primary).expect("serialize primary");
+        let doc = format!("primary:\n{}\nworkers: []\n", indent(&primary_yaml));
+        let result: Result<BootstrapServer, _> = serde_yaml::from_str(&doc);
+        assert!(result.is_err(), "empty workers must be rejected");
+    }
+
+    #[test]
+    fn committee_yaml_without_num_workers_defaults_to_one() {
+        let mut rng = rng();
+        let authorities = (0..4u8)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                (*keypair.public(), Authority::new(*keypair.public(), Address::repeat_byte(i)))
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| (*key, bootstrap_with_workers(1)))
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+        let committee = Committee::new(
+            authorities,
+            3,
+            bootstrap_servers,
+            std::num::NonZeroUsize::new(2).expect("2 is not 0"),
+        );
+        assert_eq!(committee.number_of_workers(), 2);
+
+        // strip the field: an older committee file has no `num_workers`
+        let mut yaml_value = serde_yaml::to_value(&committee).expect("YAML serialization failed");
+        let map = yaml_value.as_mapping_mut().expect("committee should serialize to a mapping");
+        assert!(map.remove(&serde_yaml::Value::String("num_workers".to_string())).is_some());
+        let decoded: Committee = serde_yaml::from_value(yaml_value).expect("deserialize");
+        assert_eq!(decoded.number_of_workers(), 1);
+        assert_eq!(decoded.epoch(), 3);
+        // and the count round-trips when present
+        let yaml = serde_yaml::to_string(&committee).expect("serialize");
+        let decoded: Committee = serde_yaml::from_str(&yaml).expect("deserialize");
+        assert_eq!(decoded.number_of_workers(), 2);
+        assert_eq!(decoded.with_num_workers(std::num::NonZeroUsize::MIN).number_of_workers(), 1);
+    }
+
+    #[test]
+    fn with_num_workers_keeps_derived_fields_and_accepts_default_committee() {
+        // a default (empty) committee is what a missing committee file loads as: no panic
+        let widened = Committee::default()
+            .with_num_workers(std::num::NonZeroUsize::new(2).expect("2 is not 0"));
+        assert_eq!(widened.number_of_workers(), 2);
+        assert_eq!(widened.size(), 0);
+
+        // a real committee keeps its authorities, indexes and thresholds
+        let mut rng = rng();
+        let authorities = (0..4u8)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                (*keypair.public(), Authority::new(*keypair.public(), Address::repeat_byte(i)))
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| (*key, bootstrap_with_workers(1)))
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+        let committee =
+            Committee::new(authorities, 5, bootstrap_servers, std::num::NonZeroUsize::MIN);
+        let widened =
+            committee.with_num_workers(std::num::NonZeroUsize::new(3).expect("3 is not 0"));
+        assert_eq!(widened.number_of_workers(), 3);
+        assert_eq!(widened.epoch(), 5);
+        assert_eq!(widened.size(), committee.size());
+        assert_eq!(widened.quorum_threshold(), committee.quorum_threshold());
+        assert_eq!(widened.validity_threshold(), committee.validity_threshold());
+        assert_eq!(widened.bootstrap_servers().len(), 4);
+        assert!(committee
+            .authorities()
+            .iter()
+            .all(|authority| widened.authority(&authority.id()).is_some()));
+    }
+
     #[test]
     fn committee_yaml_deserialize_with_legacy_authority_voting_power() {
         let mut rng = rng();
@@ -782,13 +1059,13 @@ mod tests {
                 let worker_keypair = NetworkKeypair::generate_ed25519();
                 let bootstrap = BootstrapServer::new(
                     (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
-                    (Multiaddr::empty(), worker_keypair.public().clone().into()).into(),
+                    vec![(Multiaddr::empty(), worker_keypair.public().clone().into()).into()],
                 );
                 (*key, bootstrap)
             })
             .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
 
-        let committee = Committee::new(authorities, 0, bootstrap_servers);
+        let committee = Committee::new(authorities, 0, bootstrap_servers, super::ONE_WORKER);
         let mut yaml_value = serde_yaml::to_value(&committee).expect("YAML serialization failed");
         let committee_map =
             yaml_value.as_mapping_mut().expect("committee should serialize to a mapping");

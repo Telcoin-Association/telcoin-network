@@ -6,7 +6,9 @@ use crate::{
 };
 use clap::{value_parser, Args, Subcommand};
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NodeInfo, TelcoinDirs};
-use tn_types::{get_available_udp_port, Address, BlsPublicKey, Multiaddr, Protocol, RpcInfo};
+use tn_types::{
+    get_available_udp_port, Address, BlsPublicKey, Multiaddr, Protocol, RpcInfo, DEFAULT_WORKER_ID,
+};
 use tracing::info;
 use url::Url;
 
@@ -190,29 +192,32 @@ impl KeygenArgs {
 
         info!(target: "tn::generate_keys", primary=?node_info.p2p_info.primary.network_address, "updating primary external network address");
 
-        // network keypair for workers
+        // network keypair for workers (the key config holds worker 0's key)
         let network_publickey = key_config.worker_network_public_key();
-        node_info.p2p_info.worker.network_key = network_publickey.clone();
-        node_info.p2p_info.worker.network_address =
-            if let Some(worker_addrs) = &self.external_worker_addrs {
-                if let Some(worker_addr) = worker_addrs.first() {
-                    worker_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
-                        eyre::eyre!("worker address already contains a different P2P protocol")
-                    })?
-                } else {
-                    let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-                    let addr: Multiaddr =
-                        format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
-                    addr.with(Protocol::P2p(network_publickey.into()))
-                }
+        let worker = node_info
+            .p2p_info
+            .worker_mut(DEFAULT_WORKER_ID)
+            .ok_or_else(|| eyre::eyre!("node info has no worker {DEFAULT_WORKER_ID}"))?;
+        worker.network_key = network_publickey.clone();
+        worker.network_address = if let Some(worker_addrs) = &self.external_worker_addrs {
+            if let Some(worker_addr) = worker_addrs.first() {
+                worker_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
+                    eyre::eyre!("worker address already contains a different P2P protocol")
+                })?
             } else {
                 let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
                 let addr: Multiaddr =
                     format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
                 addr.with(Protocol::P2p(network_publickey.into()))
-            };
+            }
+        } else {
+            let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
+            let addr: Multiaddr =
+                format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
+            addr.with(Protocol::P2p(network_publickey.into()))
+        };
 
-        info!(target: "tn::generate_keys", worker=?node_info.p2p_info.worker.network_address, "updating worker external network address");
+        info!(target: "tn::generate_keys", worker=?worker.network_address, "updating worker external network address");
 
         Ok(())
     }
@@ -246,8 +251,12 @@ impl KeygenArgs {
         self.update_keys(&mut node_info, key_config)?;
 
         // execution address is set inside `set_proof_of_possession` (called by `update_keys`);
-        // only `worker.rpc` is set here (update_keys owns the worker network key/address).
-        node_info.p2p_info.worker.rpc = worker_rpc;
+        // only worker 0's `rpc` is set here (update_keys owns the worker network key/address).
+        node_info
+            .p2p_info
+            .worker_mut(DEFAULT_WORKER_ID)
+            .map(|worker| worker.rpc = worker_rpc)
+            .ok_or_else(|| eyre::eyre!("node info has no worker {DEFAULT_WORKER_ID}"))?;
         Config::write_to_path(tn_datadir.node_info_path(), &node_info, ConfigFmt::YAML)?;
 
         Ok(())

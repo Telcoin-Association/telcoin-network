@@ -20,7 +20,7 @@ use tn_network_libp2p::{
 };
 use tn_types::{
     encode, max_batch_size, try_decode, Batch, BlockHash, BlsPublicKey, Epoch, RpcInfo,
-    SealedBatch, TaskSpawner,
+    SealedBatch, TaskSpawner, WorkerId,
 };
 use tracing::{debug, warn};
 
@@ -85,13 +85,16 @@ pub struct WorkerNetworkHandle {
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
     /// The genesis chain id, used to namespace gossip topics this handle publishes.
     chain_id: u64,
+    /// The id of the worker this handle belongs to, used to select its gossip topics.
+    worker_id: WorkerId,
 }
 
 impl WorkerNetworkHandle {
-    /// Create a new instance of [Self].
+    /// Create a new instance of [Self] for worker `worker_id`.
     pub fn new(
         handle: NetworkHandle<Req, Res>,
         task_spawner: TaskSpawner,
+        worker_id: WorkerId,
         epoch: Epoch,
         chain_id: u64,
     ) -> Self {
@@ -100,8 +103,14 @@ impl WorkerNetworkHandle {
             task_spawner,
             epoch,
             chain_id,
+            worker_id,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Return the id of the worker this handle belongs to.
+    pub fn worker_id(&self) -> WorkerId {
+        self.worker_id
     }
 
     /// Return a reference to the task spawner.
@@ -118,7 +127,10 @@ impl WorkerNetworkHandle {
     pub(crate) async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(self.epoch, batch_digest));
         self.handle
-            .publish(tn_config::LibP2pConfig::worker_batch_topic(self.chain_id), data)
+            .publish(
+                tn_config::LibP2pConfig::worker_batch_topic(self.chain_id, self.worker_id),
+                data,
+            )
             .await?;
         Ok(())
     }
@@ -547,6 +559,7 @@ impl WorkerNetworkHandle {
             task_spawner,
             epoch: 0,
             chain_id: 0,
+            worker_id: tn_types::DEFAULT_WORKER_ID,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
         }
     }
