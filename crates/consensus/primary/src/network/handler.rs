@@ -72,9 +72,10 @@ struct ConsensusCertTally {
     signers: HashSet<BlsPublicKey>,
 }
 
-/// Dedup key for an epoch vote at ingress: `(author, epoch, epoch-record hash)`. See the
+/// Dedup key for an epoch vote at ingress: `(author, epoch)`. See the
 /// `epoch_votes_seen` field and issue #898.
-type EpochVoteKey = (BlsPublicKey, Epoch, EpochDigest);
+/// Note we only accept votes for the epoch record digest we expect so do not store it here.
+type EpochVoteKey = (BlsPublicKey, Epoch);
 
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
@@ -261,8 +262,8 @@ where
     /// Cheap read used as a pre-verify gate: an accepted vote is re-gossiped by its author on a
     /// timer and duplicated by the gossip mesh, so this caps repeated BLS verifies of the same
     /// valid vote. See [`RequestHandler::record_epoch_vote`] and issue #898.
-    fn epoch_vote_seen(&self, author: BlsPublicKey, epoch: Epoch, epoch_hash: EpochDigest) -> bool {
-        self.epoch_votes_seen.lock().contains_key(&(author, epoch, epoch_hash))
+    fn epoch_vote_seen(&self, author: BlsPublicKey, epoch: Epoch) -> bool {
+        self.epoch_votes_seen.lock().contains_key(&(author, epoch))
     }
 
     /// Record a verified `(author, epoch, epoch-record)` vote so later replays are dropped before
@@ -274,8 +275,8 @@ where
     /// [`MAX_EPOCH_VOTES`](super::MAX_EPOCH_VOTES), so a flood of distinct keys cannot grow it
     /// without bound; a false negative after eviction only costs one extra verify (the collector
     /// dedups per signer downstream), never a dropped honest vote.
-    fn record_epoch_vote(&self, author: BlsPublicKey, epoch: Epoch, epoch_hash: EpochDigest) {
-        let key = (author, epoch, epoch_hash);
+    fn record_epoch_vote(&self, author: BlsPublicKey, epoch: Epoch) {
+        let key = (author, epoch);
         let mut guard = self.epoch_votes_seen.lock();
         let next_seq = guard.values().copied().max().unwrap_or(0) + 1;
         if guard.len() >= super::MAX_EPOCH_VOTES && !guard.contains_key(&key) {
@@ -506,23 +507,32 @@ where
                     )),
                     PrimaryNetworkError::InvalidTopic
                 );
-                // 2. Committee membership BEFORE crypto. An epoch vote is signed by a member of the
-                //    committee for `vote.epoch` (see `EpochVote` and `manage_epoch_votes`), so a
-                //    non-member is rejected without a signature check. `get_committee` resolves the
-                //    current/next committee synchronously (the live-voting window) and falls back
-                //    to stored epoch records for older epochs. Membership is by epoch *number*, not
-                //    `epoch_hash`, so a member's vote for a forked/alternative record is still
-                //    admitted (the collector's equivocation path needs it). A non-member yields the
-                //    benign, non-penalizing `PeerNotInCommittee` rather than the `Fatal`
-                //    `PeerNotAuthor`, which on the gossip path is charged to the honest relayer
-                //    rather than the author (GHSA-j2g4-553f-875r). Mirrors the `Consensus` arm.
-                if let Some(committee) = self.get_committee(vote.epoch).await {
+                // 2. Only accept votes for EpochRecords we expect, that are not yet certified and
+                //    have committee membership BEFORE crypto. An epoch vote is signed by a member
+                //    of the committee for `vote.epoch` (see `EpochVote` and `manage_epoch_votes`),
+                //    so a non-member is rejected without a signature check. Committee resolves the
+                //    one stored on our EpochRecord. A non-member yields the benign, non-penalizing
+                //    `PeerNotInCommittee` rather than the `Fatal` `PeerNotAuthor`, which on the
+                //    gossip path is charged to the honest relayer rather than the author
+                //    (GHSA-j2g4-553f-875r). Mirrors the `Consensus` arm.
+                if let Some((record, None)) =
+                    self.consensus_chain.epochs().get_epoch_by_number(vote.epoch).await
+                {
+                    // Make sure this is a vote for the same digest we expect for EpochRecord.
                     ensure!(
-                        committee.contains(&vote.public_key),
+                        record.digest() == vote.epoch_hash,
+                        PrimaryNetworkError::InvalidEpochVote(
+                            vote.epoch,
+                            vote.epoch_hash,
+                            record.digest()
+                        )
+                    );
+                    ensure!(
+                        record.committee.contains(&vote.public_key),
                         PrimaryNetworkError::PeerNotInCommittee(Box::new(vote.public_key))
                     );
                     // 3. Drop votes already verified and forwarded for this (author, record).
-                    if !self.epoch_vote_seen(vote.public_key, vote.epoch, vote.epoch_hash) {
+                    if !self.epoch_vote_seen(vote.public_key, vote.epoch) {
                         // 4. Signature check LAST — the most expensive gate.
                         ensure!(
                             vote.check_signature(),
@@ -530,7 +540,7 @@ where
                         );
                         // Record only AFTER a valid signature so a bad-signature vote cannot
                         // poison the dedup slot for the real author.
-                        self.record_epoch_vote(vote.public_key, vote.epoch, vote.epoch_hash);
+                        self.record_epoch_vote(vote.public_key, vote.epoch);
                         // Fire-and-forget: no oneshot, no blocking.
                         let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
                     }
@@ -543,7 +553,7 @@ where
                         target: "primary",
                         epoch = vote.epoch,
                         author = ?vote.public_key,
-                        "dropping epoch vote for unknown committee epoch"
+                        "dropping epoch vote for unknown OR already certified epoch record"
                     );
                 }
             }
