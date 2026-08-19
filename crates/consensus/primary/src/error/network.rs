@@ -49,7 +49,7 @@ pub(crate) enum PrimaryNetworkError {
     /// EpochRecords are deterministic so a vote for an invalid record
     /// (does not match ours) indicates a bogus vote (or we have forked...).
     /// Assume it's a bogus vote.
-    #[error("Recieved a vote for epoch {0}, got {1} but expected {2}")]
+    #[error("Received a vote for epoch {0}, got {1} but expected {2}")]
     InvalidEpochVote(Epoch, EpochDigest, EpochDigest),
     /// Unavaliable epoch (either it is invalid or this node does not have it).
     #[error("Unknown epoch record: {0}")]
@@ -106,7 +106,8 @@ impl PrimaryNetworkError {
     /// True for the envelope faults [`Self::Decode`] / [`Self::InvalidTopic`] and for the embedded
     /// signed-payload content faults reachable from the gossip handler: [`Self::Certificate`] (a
     /// malformed / unsigned / inquorate / bad-signature certificate), [`Self::InvalidHeader`] (an
-    /// `EpochVote` failing its signature or committee-membership check), and
+    /// `EpochVote` failing its signature or committee-membership check), [`Self::InvalidEpochVote`]
+    /// (an `EpochVote` whose epoch-record digest does not match the one we hold), and
     /// [`Self::UnknownConsensusHeaderCert`] (a `ConsensusResult` with a bad signature). The
     /// remaining arms are transport/local/benign and keep their relayer / no-penalty attribution;
     /// [`Self::PeerNotInCommittee`] is content-determined but already maps to no penalty, so the

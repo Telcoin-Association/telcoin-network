@@ -545,10 +545,11 @@ where
                         let _ = self.consensus_bus.new_epoch_votes().send(*vote).await;
                     }
                 } else {
-                    // Committee for this epoch is not known yet (we are behind, or the epoch is
-                    // bogus). Drop without penalty and without writing request state from an
-                    // unverified, attacker-controlled epoch number; the author re-gossips its
-                    // vote and the epoch is learned via consensus / epoch-record sync.
+                    // We hold no uncertified record for this epoch: either it is not known yet (we
+                    // are behind, or the epoch is bogus) or it is already certified (no more votes
+                    // needed). Drop without penalty and without writing request state from an
+                    // unverified, attacker-controlled epoch number; the author re-gossips its vote
+                    // and the epoch is learned via consensus / epoch-record sync.
                     debug!(
                         target: "primary",
                         epoch = vote.epoch,
