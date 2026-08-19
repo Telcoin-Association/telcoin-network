@@ -22,6 +22,20 @@ use alloy::primitives::{b256, B256};
 pub const CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH: B256 =
     b256!("0x5318ebc5cd8123cfb0808fac0f3c0b95ed6f45f67c0853fea0766b52035fea53");
 
+/// Keccak-256 hash of the upgraded (post-fork) `ConsensusRegistry` runtime bytecode the
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] boundary swaps in: the embedded `ConsensusRegistry.json`
+/// `deployedBytecode.object` (`tn-config`'s `CONSENSUS_REGISTRY_JSON`, loaded by
+/// `tn-reth::evm::block::consensus_registry_runtime_code`).
+///
+/// Unlike the pre-fork pins this is not a gate — nothing compares against it at runtime. It exists
+/// so an artifact bump is caught at compile-and-test time rather than at replay time: once the
+/// fork has run live, re-executing the fork block must swap in these exact bytes, and a
+/// tn-contracts submodule bump would silently change them and break historical state roots.
+///
+/// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
+pub const CONSENSUS_REGISTRY_POST_FORK_CODE_HASH: B256 =
+    b256!("0xbd1ade0e07b6827794e1e0cb181e756ff3b6916535c81941b634cd783a9cd8ce");
+
 /// Keccak-256 hash of the pre-fork `WorkerConfigs` runtime bytecode deployed on the live adiri
 /// testnet (the worker-configs account's `code` in the committed
 /// `chain-configs/testnet/genesis.yaml`).
@@ -39,6 +53,18 @@ pub const CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH: B256 =
 /// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
 pub const WORKER_CONFIGS_PRE_FORK_CODE_HASH: B256 =
     b256!("0x5e8a93f4eb1b5d645f32e5b8615463a996aaf4d8af2a90a444378a2d4b4b3bf2");
+
+/// Keccak-256 hash of the upgraded (post-fork) `WorkerConfigs` runtime bytecode the
+/// [`CONSENSUS_REGISTRY_FORK_EPOCH`] boundary splices over the deployed contract: the embedded
+/// `WorkerConfigs.json` `deployedBytecode.object` (`tn-config`'s `WORKER_CONFIGS_JSON`, loaded by
+/// `tn-reth::evm::block::worker_configs_runtime_code`).
+///
+/// The splice rides the same boundary block as the registry swap, so it carries the same replay
+/// constraint for the same reason: see [`CONSENSUS_REGISTRY_POST_FORK_CODE_HASH`].
+///
+/// Unconditional (not `adiri`-gated) so the pin test guarding it runs in default-feature CI.
+pub const WORKER_CONFIGS_POST_FORK_CODE_HASH: B256 =
+    b256!("0x58304c00bbfaa7e348220efb95843614756207311245abc4949f91bb3ddb2ff7");
 
 #[cfg(feature = "adiri")]
 /// The epoch below which Adiri testnet may have had duplicate batches.
@@ -65,9 +91,24 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 /// returning `false` (RPC-only, not consensus-critical) and a weakened cross-fork duplicate-key
 /// check (governance-gated NFT minting prevents abuse on the permissioned testnet).
 ///
-/// PLACEHOLDER: `u32::MAX` practically never fires (the trigger would need epoch `u32::MAX - 1`,
-/// ~4.29e9 epochs away). Set to a concrete future epoch with ample lead time in a dedicated
-/// epoch-setting PR before deploy.
+/// Armed for adiri (chain 2017) at epoch 407, so both code swaps execute one boundary earlier, in
+/// the epoch-closing block of 406. Projected boundary: 2026-08-19 15:29 UTC, give or take about
+/// 26 minutes at 1σ. Derived by binary-searching first-block timestamps over epochs 398→404 on the
+/// live chain (mean epoch length 21,985 s, σ 902 s), snapshotted at epoch 404 / block 317826 on
+/// 2026-08-18.
+///
+/// That projection is a live measurement, NOT the fixed
+/// `T(E) = 2026-08-11T02:20:52Z + (E - 373) × 6h` grid earlier revisions of this comment used. A
+/// roughly six-hour halt during the epoch-383 recovery pushed every real boundary later than that
+/// grid, which now runs about an hour fast, so a future retarget must re-derive from live boundary
+/// timestamps rather than extrapolate a fixed cadence.
+///
+/// Nothing machine-checks that this epoch is still in the future — no const-assert, no test — so
+/// manual re-verification is the only guard. Re-verify against the live chain at merge time. If
+/// epoch 407 has already begun, raise the constant in the same PR: the trigger
+/// (`concluding_epoch + 1 == CONSENSUS_REGISTRY_FORK_EPOCH`) cannot fire retroactively, so the
+/// live fleet would skip the swap for good while a node replaying that boundary on this build
+/// applies it and diverges from canonical history.
 ///
 /// Rollout sequence (standard hard-fork rule): every validator must run a fork-capable build
 /// (compiled `--features adiri` — verify the deploy image — and including the epoch-setting PR)
@@ -86,31 +127,38 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 /// confirmed by the operator dry-run below, not promised here.
 ///
 /// Pre-deploy checklist for the epoch-setting PR:
-/// - pin the swapped-in (post-fork) runtime code hashes of **both** contracts the same way
-///   [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`] and [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`] pin the
-///   pre-fork code, with pin tests against the embedded `ConsensusRegistry.json` and
+/// - **DONE** — the swapped-in (post-fork) runtime code hashes of **both** contracts are pinned the
+///   same way [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`] and [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`]
+///   pin the pre-fork code, with pin tests against the embedded `ConsensusRegistry.json` and
 ///   `WorkerConfigs.json` artifacts: after the fork runs live, a tn-contracts artifact bump would
-///   otherwise change the bytes re-execution swaps in and break historical state roots;
-/// - read the LIVE deployed `WorkerConfigs` and confirm `numWorkers()` and, for every `i <
-///   numWorkers`, `_workerConfigSet[i] == true` (a storage probe — the mapping is internal): the
-///   first post-fork closing block's `setWorkerConfigsData` system call reverts
-///   `MissingWorkerConfig` on any unset row, aborting the one-shot fork-boundary close.
-///   Additionally confirm `data == 0` for every `Eip1559` row on the live contract — the entry read
-///   prices epochs from that word (see the rollout constraint below). Do this alongside the
-///   post-fork hash re-pinning above, since an artifact rebuild silently moves those hashes.
-///   Informational reference only, NOT a compiled constant: at the time of writing, the embedded
-///   artifact's post-fork `WorkerConfigs` splice hashes to
-///   `0x58304c00bbfaa7e348220efb95843614756207311245abc4949f91bb3ddb2ff7`;
+///   otherwise change the bytes re-execution swaps in and break historical state roots. Re-pinned
+///   against tn-contracts `0fb6b01`, which moved the registry hash only — the `WorkerConfigs`
+///   artifact is byte-identical across that bump, so [`WORKER_CONFIGS_POST_FORK_CODE_HASH`] did not
+///   move;
+/// - **DONE** — the LIVE deployed `WorkerConfigs` was read on 2026-08-18: `numWorkers() == 1`, and
+///   a storage probe of `_workerConfigSet[0]` (the mapping is internal) reads `1`, so every row
+///   below `numWorkers` is set and the first post-fork closing block's `setWorkerConfigsData`
+///   system call cannot revert `MissingWorkerConfig` and abort that one-shot close. Worker 0 reads
+///   back as `Eip1559 { target_gas: u64::MAX }` with `data == 0`, so the entry read prices the
+///   first post-fork epoch from MIN and no governance write has landed on any row (see the rollout
+///   constraint below). The embedded artifact's post-fork `WorkerConfigs` splice hashes to
+///   `0x58304c00bbfaa7e348220efb95843614756207311245abc4949f91bb3ddb2ff7`, reproduced here for
+///   readability; the binding copy is [`WORKER_CONFIGS_POST_FORK_CODE_HASH`], guarded by
+///   `test_post_fork_worker_configs_code_hash_pinned`;
 /// - the `WorkerConfigs` bytecode swap ships at this same fork epoch (see
 ///   [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`]) — both swaps land in the epoch-closing block of
 ///   `CONSENSUS_REGISTRY_FORK_EPOCH - 1`, so a build applying one but not the other diverges;
-/// - confirm the live validator/ConsensusNFT count leaves headroom under the 100M system-call gas
-///   cap that bounds the one-shot `migrateValidatorSets()` walk;
-/// - operator dry-run: resync a fork-build node against a live adiri archive across the fork
-///   boundary and confirm matching state roots (also measures the live migration gas);
+/// - **DONE** — the live ConsensusNFT count is 5 (`totalSupply()` on 2026-08-18), so the one-shot
+///   `migrateValidatorSets()` walk covers five entries: orders of magnitude of headroom under the
+///   100M system-call gas cap that bounds it;
+/// - **OPEN** — operator dry-run: resync a fork-build node against a live adiri archive across the
+///   fork boundary and confirm matching state roots (also measures the live migration gas). This is
+///   the last unfinished item on this checklist;
 /// - both swaps fail closed on their pre-fork pin ([`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`],
 ///   [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`]): an unexpected on-chain deployment aborts the block
-///   (fatal error) rather than migrating over an incompatible layout;
+///   (fatal error) rather than migrating over an incompatible layout. Both gates still held on
+///   2026-08-18, when the live registry and `WorkerConfigs` code hashes each matched their pinned
+///   pre-fork value;
 /// - adiri rollout constraint: until this fork epoch has passed on a fleet running the entry-read
 ///   build, governance must not touch ANY `WorkerConfigs` row — no `setWorkerConfig` writes, no
 ///   strategy flips, no `data` writes. The deployed pre-fork contract's
@@ -129,7 +177,7 @@ pub const ADIRI_DUP_BATCH_EPOCH: Epoch = 160;
 ///   fork before any Static assignment. This is not urgent: neither the protocol write path
 ///   (`setWorkerConfigsData` / `setWorkerConfigsValue`) nor the epoch-boundary read path consults
 ///   `maxStrategy`, so a zeroed ceiling gates future governance actions only.
-pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = u32::MAX;
+pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = 407;
 
 #[cfg(feature = "adiri")]
 /// First epoch whose `Header`s carry the `seed_signature` field on the wire (#1032).
@@ -239,6 +287,22 @@ mod tests {
     use super::*;
     use alloy::primitives::{address, keccak256};
 
+    /// The `ConsensusRegistry` build artifact whose `deployedBytecode.object` the fork boundary
+    /// swaps in.
+    ///
+    /// Re-embedded from the tn-contracts submodule rather than read through `tn-config`'s
+    /// `CONSENSUS_REGISTRY_JSON`, because tn-config depends on tn-types and the reverse edge would
+    /// be circular — the same reason the pre-fork tests below hardcode their contract addresses.
+    /// It is the identical file, so the bytes are identical by construction; keep this path in
+    /// step with `tn-config::genesis` if that constant is ever repointed.
+    const CONSENSUS_REGISTRY_ARTIFACT_JSON: &str =
+        include_str!("../../../tn-contracts/artifacts/ConsensusRegistry.json");
+
+    /// The `WorkerConfigs` build artifact whose `deployedBytecode.object` the fork boundary
+    /// splices in. Embedded on the same terms as [`CONSENSUS_REGISTRY_ARTIFACT_JSON`].
+    const WORKER_CONFIGS_ARTIFACT_JSON: &str =
+        include_str!("../../../tn-contracts/artifacts/WorkerConfigs.json");
+
     /// Pin [`CONSENSUS_REGISTRY_PRE_FORK_CODE_HASH`] to the registry code committed in
     /// `chain-configs/testnet/genesis.yaml`.
     ///
@@ -270,7 +334,7 @@ mod tests {
     /// [`SEED_SIGNATURE_FORK_EPOCH`] (then the `u32::MAX` placeholder, now a concrete epoch).
     /// That holds only under `adiri`. Every other build — including the default
     /// one that produces both the shipped node binary and the e2e binary — is active from
-    /// genesis, so epoch 1 takes the post-fork certified-anchor path in production. Nothing
+    /// genesis, so epoch 1 takes the post-fork anchor path in production. Nothing
     /// asserted either half, so the "dormant everywhere" reading survived review; this states
     /// it outright so no future reader infers dormancy from the constant alone.
     ///
@@ -350,5 +414,59 @@ mod tests {
              blindly update this constant to make the test pass; if genesis.yaml was regenerated, \
              reassess the fork plan and `CONSENSUS_REGISTRY_FORK_EPOCH` first",
         );
+    }
+
+    /// Pin [`CONSENSUS_REGISTRY_POST_FORK_CODE_HASH`] to the embedded `ConsensusRegistry.json`
+    /// artifact the fork boundary swaps in.
+    ///
+    /// Unconditional (not `adiri`-gated) so it runs in default-feature CI even though the fork
+    /// machinery consuming the constant is `adiri`-only.
+    #[test]
+    fn test_post_fork_consensus_registry_code_hash_pinned() {
+        assert_eq!(
+            deployed_bytecode_hash(CONSENSUS_REGISTRY_ARTIFACT_JSON),
+            CONSENSUS_REGISTRY_POST_FORK_CODE_HASH,
+            "the embedded ConsensusRegistry artifact drifted from the pinned post-fork code hash \
+             — do not blindly update this constant to make the test pass; these are the bytes the \
+             fork boundary swaps in, so once the fork has run live, shipping a different artifact \
+             breaks historical state roots. Reassess the tn-contracts submodule pin first",
+        );
+    }
+
+    /// Pin [`WORKER_CONFIGS_POST_FORK_CODE_HASH`] to the embedded `WorkerConfigs.json` artifact
+    /// the fork boundary splices in.
+    ///
+    /// Unconditional (not `adiri`-gated) so it runs in default-feature CI even though the fork
+    /// machinery consuming the constant is `adiri`-only.
+    #[test]
+    fn test_post_fork_worker_configs_code_hash_pinned() {
+        assert_eq!(
+            deployed_bytecode_hash(WORKER_CONFIGS_ARTIFACT_JSON),
+            WORKER_CONFIGS_POST_FORK_CODE_HASH,
+            "the embedded WorkerConfigs artifact drifted from the pinned post-fork code hash — do \
+             not blindly update this constant to make the test pass; these are the bytes the fork \
+             boundary splices in, so once the fork has run live, shipping a different artifact \
+             breaks historical state roots. Reassess the tn-contracts submodule pin first",
+        );
+    }
+
+    /// Keccak-256 of an artifact's hex-encoded `deployedBytecode.object`.
+    ///
+    /// Reproduces what the fork boundary pins against: `Bytecode::new_raw(bytes).hash_slow()` over
+    /// these same decoded bytes, which for raw (unanalyzed) legacy bytecode is plain keccak-256 of
+    /// the runtime code — the same value the EVM stores as the account's `code_hash`.
+    ///
+    /// Decoded through `alloy::hex` (not the `hex` crate) to match the runtime loaders in
+    /// `tn-reth::evm::block` byte for byte: the artifact's object string is `0x`-prefixed and only
+    /// alloy's decoder strips that prefix.
+    fn deployed_bytecode_hash(artifact_json: &str) -> B256 {
+        let artifact: serde_json::Value =
+            serde_json::from_str(artifact_json).expect("embedded artifact json is valid");
+        let hex_str = artifact["deployedBytecode"]["object"]
+            .as_str()
+            .expect("artifact deployedBytecode.object is a string");
+        keccak256(
+            alloy::hex::decode(hex_str).expect("artifact deployedBytecode.object is valid hex"),
+        )
     }
 }

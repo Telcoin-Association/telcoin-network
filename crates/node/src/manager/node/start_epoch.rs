@@ -305,10 +305,7 @@ where
     /// `open_epoch_pack` (default digest for epoch 0). It anchors the canonical epoch-close
     /// seed message this epoch's proposers sign and voters verify, so it MUST be the real
     /// chain-derived digest - never a silent default. For seed-signature-active epochs
-    /// `open_epoch_pack` additionally guarantees the digest is certificate-backed: it is only
-    /// released after the record's `EpochCertificate` verified with a super-quorum of the
-    /// prior committee (see `certified_prior_epoch_anchor`), so an uncertified locally-divergent
-    /// record can never be captured as this epoch's anchor.
+    /// the EpochRecord is deterministic and can be derived after executing the epoch boundary.
     pub(super) async fn configure_consensus(
         &self,
         network_config: &NetworkConfig,
