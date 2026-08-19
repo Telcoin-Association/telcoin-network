@@ -2,9 +2,10 @@
 
 use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
+    forks::committee_workers_active,
     Address, Multiaddr, WorkerId,
 };
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
@@ -229,6 +230,13 @@ impl<'de> Deserialize<'de> for BootstrapServer {
     }
 }
 
+impl From<PrimaryWorkersLegacy> for BootstrapServer {
+    fn from(value: PrimaryWorkersLegacy) -> Self {
+        let PrimaryWorkersLegacy { primary, worker } = value;
+        Self { primary, workers: vec![worker] }
+    }
+}
+
 impl BootstrapServer {
     /// Create a new [BootstrapServer] with one [P2pNode] per worker.
     pub fn new(primary_node: P2pNode, worker_nodes: Vec<P2pNode>) -> Self {
@@ -326,21 +334,25 @@ impl<'de> Deserialize<'de> for Authority {
 }
 
 /// The committee lists all validators that participate in consensus.
-#[derive(Serialize, Deserialize, Debug, Eq)]
+///
+/// Deliberately carries no serde derives: the binary wire layout is epoch-gated (#554, gated by
+/// [`crate::forks::committee_workers_active`]), so every encode and decode path routes through the
+/// hand-written impls below. Human-readable formats keep the derive's exact behavior through
+/// [`CommitteeInnerHr`].
+#[derive(Debug, Eq)]
 struct CommitteeInner {
     /// The authorities of epoch.
     authorities: BTreeMap<BlsPublicKey, Authority>,
     /// Keeps and index of the Authorities by their respective identifier
     /// This is a helper struct, not included in serde or equality.
-    #[serde(skip)]
     authorities_by_id: BTreeMap<AuthorityIdentifier, Authority>,
     /// The epoch number of this committee
     epoch: Epoch,
     /// The quorum threshold (2f+1)
-    #[serde(skip)]
+    /// Derived from the authorities, never serialized.
     quorum_threshold: VotingPower,
     /// The validity threshold (f+1)
-    #[serde(skip)]
+    /// Derived from the authorities, never serialized.
     validity_threshold: VotingPower,
     /// The bootstrap servers to initially join a network (probably the initial committee).
     /// Note, not included in partial eq since they are not relevand to overall committee equality.
@@ -350,7 +362,6 @@ struct CommitteeInner {
     /// This is a protocol-level value: all nodes must agree on it. Its source of truth is the
     /// on-chain `WorkerConfigs` contract, read at the previous epoch's closing block when the
     /// committee for an epoch is created. Committee files without the field default to one.
-    #[serde(default = "default_num_workers")]
     num_workers: NonZeroUsize,
 }
 
@@ -379,6 +390,28 @@ impl PartialEq for CommitteeInner {
 }
 
 impl CommitteeInner {
+    /// Assemble the wire fields of a committee into a [CommitteeInner].
+    ///
+    /// The three derived indexes are left at their defaults: they are absent from every wire
+    /// layout in both directions, and [`Committee::deserialize`] rebuilds them by calling
+    /// [`CommitteeInner::load`].
+    fn from_wire_fields(
+        authorities: BTreeMap<BlsPublicKey, Authority>,
+        epoch: Epoch,
+        bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+        num_workers: NonZeroUsize,
+    ) -> Self {
+        Self {
+            authorities,
+            authorities_by_id: BTreeMap::default(),
+            epoch,
+            quorum_threshold: VotingPower::default(),
+            validity_threshold: VotingPower::default(),
+            bootstrap_servers,
+            num_workers,
+        }
+    }
+
     /// Updates the committee internal secondary indexes.
     fn load(&mut self) {
         self.authorities_by_id = self
@@ -411,6 +444,190 @@ impl CommitteeInner {
 
     fn total_voting_power(&self) -> VotingPower {
         self.authorities.len() as VotingPower
+    }
+}
+
+/// Number of `CommitteeInner` wire fields on the legacy (pre-multi-worker) layout.
+const COMMITTEE_FIELDS_LEGACY: usize = 3;
+/// Number of `CommitteeInner` wire fields once the multi-worker layout is active for the
+/// committee's epoch.
+const COMMITTEE_FIELDS_V1: usize = 4;
+/// Field names for [`serde::Deserializer::deserialize_struct`], superset (post-fork) layout.
+///
+/// Naming all four fields is load-bearing, not cosmetic: bcs sizes its field sequence from this
+/// list, so a three-entry list would make the post-fork read of the trailing `num_workers` return
+/// `None` instead of decoding it. The legacy arm simply stops after three fields, which bcs
+/// permits — it never checks that the sequence was drained.
+const COMMITTEE_FIELD_NAMES: [&str; COMMITTEE_FIELDS_V1] =
+    ["authorities", "epoch", "bootstrap_servers", "num_workers"];
+
+/// Human-readable (YAML, JSON) representation of [`CommitteeInner`], carrying the exact field set
+/// and attributes the removed derive had.
+///
+/// The epoch gate is binary-only. Human-readable formats name their fields, so a committee file
+/// written by any build loads on any other: `num_workers` defaults when absent (as in every
+/// `chain-configs/*/committee.yaml` today), and each [`BootstrapServer`] still accepts the legacy
+/// `worker:` key through its own deserializer. Both are covered by the tests below.
+#[derive(Deserialize)]
+#[serde(rename = "CommitteeInner")]
+struct CommitteeInnerHr {
+    /// The authorities of epoch.
+    authorities: BTreeMap<BlsPublicKey, Authority>,
+    /// The epoch number of this committee.
+    epoch: Epoch,
+    /// The bootstrap servers to initially join a network.
+    bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// The number of workers every validator in this committee runs.
+    #[serde(default = "default_num_workers")]
+    num_workers: NonZeroUsize,
+}
+
+/// Borrowed serialization view writing a [`BootstrapServer`] in the legacy single-worker shape
+/// (`{ primary, worker }`), byte-identical to the pre-#554 derive.
+///
+/// Used only by the pre-fork arm of [`CommitteeInner`]'s binary serializer. The shape cannot
+/// represent more than one worker, so the view fails closed rather than silently dropping the
+/// rest: a committee that the legacy layout cannot express must be unrepresentable, not
+/// mis-encoded. Callers below the fork epoch are structurally single-worker (the pre-fork
+/// on-chain registry exposes no path that raises the count), so this error means a bug or a
+/// governance action taken too early, never routine operation.
+struct BootstrapServerLegacyRef<'a>(&'a BootstrapServer);
+
+impl Serialize for BootstrapServerLegacyRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let [worker] = self.0.workers.as_slice() else {
+            return Err(serde::ser::Error::custom(format!(
+                "the pre-fork layout holds exactly one worker per bootstrap server, got {}",
+                self.0.workers.len()
+            )));
+        };
+        // serialize_struct mirrors the pre-#554 derive exactly: bcs emits no framing for structs,
+        // so the wire bytes are the concatenated fields in declaration order.
+        let mut state = serializer.serialize_struct("BootstrapServer", 2)?;
+        state.serialize_field("primary", &self.0.primary)?;
+        state.serialize_field("worker", worker)?;
+        state.end()
+    }
+}
+
+/// Extracts the next element of the committee field sequence, converting an early end of input
+/// into a field-labeled error (bcs would otherwise surface only a distal `Eof`).
+fn next_committee_field<'de, A, T>(seq: &mut A, field: &'static str) -> Result<T, A::Error>
+where
+    A: serde::de::SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    seq.next_element()?.ok_or_else(|| serde::de::Error::missing_field(field))
+}
+
+impl Serialize for CommitteeInner {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // human-readable formats name their fields, so the committee file is never gated: it
+        // carries the current shape at every epoch, exactly as the derive wrote it. for binary
+        // formats the gate reads the epoch inside this committee, never node-local state, so a
+        // historical committee keeps its historical layout at any nesting depth (pack records,
+        // epoch records, state-sync payloads).
+        if serializer.is_human_readable() || committee_workers_active(self.epoch) {
+            let mut state = serializer.serialize_struct("CommitteeInner", COMMITTEE_FIELDS_V1)?;
+            state.serialize_field("authorities", &self.authorities)?;
+            state.serialize_field("epoch", &self.epoch)?;
+            state.serialize_field("bootstrap_servers", &self.bootstrap_servers)?;
+            state.serialize_field("num_workers", &self.num_workers)?;
+            return state.end();
+        }
+
+        // fail closed: the legacy layout has no field to carry a worker count, so encoding a
+        // multi-worker committee below the fork epoch would silently write a committee that
+        // decodes as single-worker on every node, including this one.
+        if self.num_workers != ONE_WORKER {
+            return Err(serde::ser::Error::custom(format!(
+                "committee for epoch {} runs {} workers, which the pre-fork layout cannot hold",
+                self.epoch, self.num_workers
+            )));
+        }
+        let legacy_servers: BTreeMap<&BlsPublicKey, BootstrapServerLegacyRef<'_>> = self
+            .bootstrap_servers
+            .iter()
+            .map(|(key, server)| (key, BootstrapServerLegacyRef(server)))
+            .collect();
+        let mut state = serializer.serialize_struct("CommitteeInner", COMMITTEE_FIELDS_LEGACY)?;
+        state.serialize_field("authorities", &self.authorities)?;
+        state.serialize_field("epoch", &self.epoch)?;
+        state.serialize_field("bootstrap_servers", &legacy_servers)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CommitteeInner {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let CommitteeInnerHr { authorities, epoch, bootstrap_servers, num_workers } =
+                CommitteeInnerHr::deserialize(deserializer)?;
+            return Ok(Self::from_wire_fields(authorities, epoch, bootstrap_servers, num_workers));
+        }
+
+        /// Reads the two ungated fields, then branches on the just-decoded `epoch`: pre-fork
+        /// values carry one unprefixed `worker` per bootstrap server and no `num_workers`.
+        struct CommitteeInnerVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CommitteeInnerVisitor {
+            type Value = CommitteeInner;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(
+                    "a CommitteeInner: authorities and epoch, then bootstrap servers in the \
+                     layout that epoch selects, plus num_workers once the multi-worker fork is \
+                     active",
+                )
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let authorities = next_committee_field(&mut seq, "authorities")?;
+                let epoch: Epoch = next_committee_field(&mut seq, "epoch")?;
+                if committee_workers_active(epoch) {
+                    let bootstrap_servers = next_committee_field(&mut seq, "bootstrap_servers")?;
+                    let num_workers = next_committee_field(&mut seq, "num_workers")?;
+                    return Ok(CommitteeInner::from_wire_fields(
+                        authorities,
+                        epoch,
+                        bootstrap_servers,
+                        num_workers,
+                    ));
+                }
+
+                // the legacy value type is the whole discriminator: the two shapes are not
+                // self-describing under bcs (`primary ++ worker` against `primary ++ ULEB128(n)
+                // ++ n worker`), so sniffing the bytes is unsound and only the epoch decides.
+                let legacy: BTreeMap<BlsPublicKey, PrimaryWorkersLegacy> =
+                    next_committee_field(&mut seq, "bootstrap_servers")?;
+                let bootstrap_servers =
+                    legacy.into_iter().map(|(key, server)| (key, server.into())).collect();
+                Ok(CommitteeInner::from_wire_fields(
+                    authorities,
+                    epoch,
+                    bootstrap_servers,
+                    ONE_WORKER,
+                ))
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "CommitteeInner",
+            &COMMITTEE_FIELD_NAMES,
+            CommitteeInnerVisitor,
+        )
     }
 }
 
@@ -1018,6 +1235,61 @@ mod tests {
         assert_eq!(decoded, bootstrap);
     }
 
+    /// A committee at `epoch` with four authorities whose bootstrap servers each advertise
+    /// `workers_per_server` workers, with the committee's worker count set to match.
+    #[cfg(feature = "adiri")]
+    fn committee_with_workers(epoch: crate::Epoch, workers_per_server: usize) -> Committee {
+        let mut rng = rng();
+        let authorities = (0..4u8)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                (*keypair.public(), Authority::new(*keypair.public(), Address::repeat_byte(i)))
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| (*key, bootstrap_with_workers(workers_per_server)))
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+        Committee::new(
+            authorities,
+            epoch,
+            bootstrap_servers,
+            std::num::NonZeroUsize::new(workers_per_server).expect("worker count is not 0"),
+        )
+    }
+
+    /// Below the fork epoch a committee is encoded in the legacy single-worker layout, which has
+    /// no field for a worker count: the encoder refuses a committee it cannot represent rather
+    /// than write one that decodes as single-worker on every node.
+    ///
+    /// The adiri fork epoch is a `u32::MAX` placeholder, so every epoch is pre-fork in this lane.
+    /// `TN_COMMITTEE_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
+    /// `OnceLock` is process-wide and the whole test binary shares one process.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn committee_bcs_legacy_layout_refuses_multi_worker() {
+        // bcs directly rather than `crate::encode`, which panics on a serializer error
+        let multi_worker = committee_with_workers(7, 2);
+        assert!(
+            bcs::to_bytes(&multi_worker).is_err(),
+            "the pre-fork layout cannot represent a two-worker committee"
+        );
+
+        // a single-worker committee round-trips, and re-encoding the decoded value reproduces the
+        // exact bytes: a pre-fork pack survives the decode/re-append cycle unchanged
+        let committee = committee_with_workers(7, 1);
+        let bytes = bcs::to_bytes(&committee).expect("legacy encode");
+        let decoded: Committee = crate::try_decode(&bytes).expect("bcs deserialize");
+        assert_eq!(decoded, committee);
+        assert_eq!(decoded.number_of_workers(), 1);
+        assert_eq!(decoded.bootstrap_servers().len(), 4);
+        assert!(decoded.bootstrap_servers().values().all(|server| server.num_workers() == 1));
+        assert_eq!(bcs::to_bytes(&decoded).expect("legacy re-encode"), bytes);
+    }
+
+    /// Default builds have the multi-worker layout active from genesis, so this exercises the
+    /// post-fork arm; the adiri lane covers the legacy arm above.
+    #[cfg(not(feature = "adiri"))]
     #[test]
     fn committee_bcs_round_trips_with_bootstrap_servers() {
         // The consensus store and the consensus pack persist committees with bcs.
