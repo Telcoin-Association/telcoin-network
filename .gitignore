@@ -24,3 +24,6 @@ gha-creds-*.json
 
 # e2e test logs
 test_logs/
+
+# local planning docs
+.github/.plans/
