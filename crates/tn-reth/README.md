@@ -66,7 +66,7 @@ TN repurposes several Ethereum header fields for protocol data. Assembly happens
   `BestTxns::ignore_eip4844` and purges them and their descendants with
   `WorkerTxPool::remove_eip4844_txs` (which also deletes sidecars from the blob store).
 - The in-protocol `ConsensusRegistry` upgrade is gated by `CONSENSUS_REGISTRY_FORK_EPOCH`
-  (`tn-types` `forks.rs`, currently the `u32::MAX` placeholder) and compiled only under the
+  (`tn-types` `forks.rs`, currently armed at adiri epoch 407) and compiled only under the
   `adiri` feature. See "ConsensusRegistry fork gate" below.
 
 ## Epoch close
