@@ -120,7 +120,7 @@ async fn manage_epoch_votes(
                         } else if vote.epoch_hash != epoch_hash {
                             error!(
                                 target: "epoch-manager",
-                                "Recieved an epoch record vote for {} instead of {}. This should not be possible (gossip is filtered).",
+                                "Received an epoch record vote for {} instead of {}. This should not be possible (gossip is filtered).",
                                 vote.epoch_hash,
                                 epoch_hash,
                             );
@@ -360,6 +360,7 @@ pub(crate) fn spawn_epoch_vote_collector(
             let me = key_config.primary_public_key();
             if epoch_rec.epoch > 0 {
                 // Lets do a quick check that the previous epoch is certified and if it is not and we were in the committee start a new voting round.
+                // A syncing node by definition has to have certs for historic epochs so this will not fire during sync.
                 if let Some((last_epoch_rec, None)) = consensus_chain.epochs().get_epoch_by_number(epoch_rec.epoch.saturating_sub(1)).await {
                     // No cert for last epoch.  Were we in the committee?
                     if last_epoch_rec.committee.contains(&me) {
@@ -722,6 +723,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(vote4).await.unwrap();
 
         // Send the epoch record — collector wakes up, self-signs, reads buffered votes
+        // Seed the uncertified record so the vote-triggered collector's `get_epoch_by_hash`
+        // finds it — production persists the record before firing the watch (see
+        // `write_epoch_record`), so mirror that here.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // Wait for collector to aggregate and store
@@ -811,6 +817,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
 
         // Send the epoch record — collector wakes up, self-signs, reads buffered votes
+        // Seed the uncertified record so the vote-triggered collector's `get_epoch_by_hash`
+        // finds it — production persists the record before firing the watch (see
+        // `write_epoch_record`), so mirror that here.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // After reaching quorum the collector waits up to 1s for more votes before aggregating
@@ -922,6 +933,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(vote4).await.unwrap();
 
         // Send the correct epoch record — collector wakes up, self-signs, reads buffered votes
+        // Seed the uncertified record so the vote-triggered collector's `get_epoch_by_hash`
+        // finds it — production persists the record before firing the watch (see
+        // `write_epoch_record`), so mirror that here.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // Wait for collector to aggregate and store.
@@ -1014,6 +1030,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc2)).await.unwrap();
 
         // Send the epoch record — collector wakes up, self-signs, reads buffered votes
+        // Seed the uncertified record so the vote-triggered collector's `get_epoch_by_hash`
+        // finds it — production persists the record before firing the watch (see
+        // `write_epoch_record`), so mirror that here.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // kp1 (self) + kp2 = 2 < 3: the ejected vote must not tip this over quorum
@@ -1115,6 +1136,11 @@ mod epoch_vote_collector_tests {
         consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
 
         // Send the epoch record — the self-sign gate must skip the non-member node key
+        // Seed the uncertified record so the vote-triggered collector's `get_epoch_by_hash`
+        // finds it — production persists the record before firing the watch (see
+        // `write_epoch_record`), so mirror that here.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
         consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
 
         // Quorum (3 of 4) reached without a fourth vote: collector waits its 1s straggler
