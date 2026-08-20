@@ -10,9 +10,9 @@ use std::{
     path::Path,
 };
 use tn_types::{
-    address, test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature,
-    Committee, CommitteeBuilder, Genesis, GenesisAccount, Multiaddr, NetworkPublicKey, NodeP2pInfo,
-    P2pNode, WorkerId,
+    address, forks::multi_workers_fork_active, test_genesis, verify_proof_of_possession_bls,
+    Address, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder, Genesis, GenesisAccount,
+    Multiaddr, NetworkPublicKey, NodeP2pInfo, P2pNode, WorkerId,
 };
 use tracing::{info, warn};
 
@@ -128,7 +128,8 @@ impl NetworkGenesis {
 
     /// Validate each validator:
     /// - verify proof of possession
-    /// - every validator runs the same, non-zero number of workers
+    /// - every validator runs the same, non-zero number of workers, and that count is one the
+    ///   epoch-0 [`Committee`] layout can hold
     pub fn validate(&self) -> eyre::Result<()> {
         for (pubkey, validator) in self.validators.iter() {
             info!(target: "genesis::validate", "verifying validator: {}", pubkey);
@@ -147,6 +148,13 @@ impl NetworkGenesis {
     ///
     /// The count is a protocol-level value, so genesis is rejected when validators disagree or
     /// when any validator advertises no worker. An empty validator set yields one worker.
+    ///
+    /// A count above one additionally requires [`multi_workers_fork_active`] at epoch 0, the epoch
+    /// of the committee this genesis produces. Below that fork the [`Committee`] bcs layout has no
+    /// field to carry a worker count, so the encoder refuses the value outright — a genesis that
+    /// slipped through here would not fail until the first consensus pack tried to write its
+    /// `EpochMeta`, i.e. a panic at epoch-0 startup rather than a config error while generating
+    /// genesis.
     fn agreed_num_workers(&self) -> eyre::Result<NonZeroUsize> {
         let counts = self
             .validators
@@ -158,12 +166,23 @@ impl NetworkGenesis {
             })
             .collect::<eyre::Result<Vec<_>>>()?;
         let first = counts.first().map_or(NonZeroUsize::MIN, |(_, count)| *count);
-        counts.iter().find(|(_, count)| *count != first).map_or(Ok(first), |(pubkey, count)| {
-            Err(eyre::eyre!(
+        // disagreement is checked before the fork gate so its message stays the same in every
+        // build: a mismatched set is malformed regardless of which counts the fork allows
+        if let Some((pubkey, count)) = counts.iter().find(|(_, count)| *count != first) {
+            eyre::bail!(
                 "validator {pubkey} advertises {count} workers but the first validator advertises \
                  {first}: all validators must run the same number of workers"
-            ))
-        })
+            );
+        }
+        // the committee built from this genesis is epoch 0, which is the epoch the gate reads
+        if first.get() != 1 && !multi_workers_fork_active(0) {
+            eyre::bail!(
+                "genesis validators agree on {first} workers but the multi-workers fork is not \
+                 active at epoch 0: the pre-fork committee layout cannot hold a worker count, so \
+                 this network must be generated with one worker per validator"
+            );
+        }
+        Ok(first)
     }
 
     /// Create a [Committee] from the validators in [NetworkGenesis].
@@ -408,8 +427,27 @@ mod tests {
         }
     }
 
+    /// Default builds have the multi-worker committee layout active from genesis, so an agreed
+    /// count above one is a valid genesis and reaches the committee unchanged; the adiri lane
+    /// covers the pre-fork rejection below.
+    ///
+    /// The `cfg` selects this test on this crate's feature set, but the gate it relies on lives in
+    /// tn-types — so the two can desync, and the runtime check below is what names it. A build
+    /// where tn-config compiles without `adiri` while tn-types compiles with it (feature
+    /// unification from elsewhere in the graph, or a missing `tn-config/adiri` forward) would
+    /// otherwise reach `validate` and fail with a fork-rejection message this lane never expects.
+    #[cfg(not(feature = "adiri"))]
     #[test]
     fn test_validate_genesis_agrees_on_worker_count() {
+        // spelled out through tn_types rather than the module's import, because which crate owns
+        // the gate is the whole point of the desync this catches
+        assert!(
+            tn_types::forks::multi_workers_fork_active(0),
+            "epoch 0 must be post-fork for this lane to mean anything: tn-config compiled without \
+             `adiri` yet the gate is dormant, so tn-types' `adiri` feature is desynced from this \
+             crate's; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment?"
+        );
+
         let mut network_genesis = NetworkGenesis::new_for_test();
         (0..4).for_each(|v| network_genesis.add_validator(validator_with_workers(v, 2)));
         assert!(network_genesis.validate().is_ok());
@@ -419,6 +457,32 @@ mod tests {
         assert!(bootstrap.values().all(|server| server.num_workers() == 2));
     }
 
+    /// Pre-fork the committee layout has no field for a worker count, so an agreed count above one
+    /// is rejected while generating genesis instead of panicking the first time epoch 0's
+    /// `EpochMeta` is encoded. A single worker still validates.
+    ///
+    /// The adiri fork epoch is a `u32::MAX` placeholder and its arming constraint floors it at 407,
+    /// so epoch 0 is pre-fork in this lane however the constant moves.
+    /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
+    /// `OnceLock` is process-wide and the whole test binary shares one process.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn test_validate_genesis_rejects_multiple_workers_pre_fork() {
+        let mut network_genesis = NetworkGenesis::new_for_test();
+        (0..4).for_each(|v| network_genesis.add_validator(validator_with_workers(v, 2)));
+        let err = network_genesis.validate().expect_err("pre-fork multi-worker genesis must fail");
+        assert!(err.to_string().contains("multi-workers fork is not active"), "{err}");
+        assert!(network_genesis.create_committee().is_err());
+
+        let mut single_worker = NetworkGenesis::new_for_test();
+        (0..4).for_each(|v| single_worker.add_validator(validator_with_workers(v, 1)));
+        single_worker.validate().expect("single-worker genesis is valid pre-fork");
+        let committee = single_worker.create_committee().expect("committee");
+        assert_eq!(committee.number_of_workers(), 1);
+    }
+
+    /// Validators disagreeing is malformed in every build, so this assertion holds in both lanes:
+    /// the disagreement check runs before the fork gate.
     #[test]
     fn test_validate_genesis_rejects_mismatched_worker_count() {
         let mut network_genesis = NetworkGenesis::new_for_test();

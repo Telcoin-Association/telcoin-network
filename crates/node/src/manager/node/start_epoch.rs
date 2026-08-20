@@ -51,10 +51,10 @@ use tn_reth::{
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
-    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
-    CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    EpochDigest, Multiaddr, NetworkPublicKey, P2pNode, SealedHeader, TaskManager, TaskSpawner,
-    DEFAULT_WORKER_ID,
+    forks::multi_workers_fork_active, gas_accumulator::GasAccumulator, BatchValidation,
+    BlsPublicKey, BlsSigner, Committee, CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput,
+    Database as TNDatabase, Epoch, EpochDigest, Multiaddr, NetworkPublicKey, P2pNode, SealedHeader,
+    TaskManager, TaskSpawner, DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -343,7 +343,8 @@ where
     /// In both cases the committee's worker count comes from the on-chain `WorkerConfigs` state
     /// at the previous epoch's closing block (`epoch_first_block - 1`; genesis state for epoch
     /// 0), the same read that sizes the [`GasAccumulator`], so the count that validates header
-    /// payloads is the count execution runs with. A failed read halts epoch entry.
+    /// payloads is the count execution runs with. A failed read halts epoch entry, and so does a
+    /// count the epoch's committee layout cannot hold (see [`check_committee_worker_count`]).
     async fn create_committee_from_state(
         &self,
         reth_env: &tn_reth::RethEnv,
@@ -360,16 +361,7 @@ where
                     .ok_or_else(|| eyre!("on-chain WorkerConfigs reports zero workers"))
             })
             .wrap_err("failed to read the committee worker count from chain")?;
-        if num_workers.get() != 1 {
-            warn!(
-                target: "epoch-manager",
-                epoch,
-                num_workers,
-                spawned_worker = DEFAULT_WORKER_ID,
-                "committee runs multiple workers but this node version spawns only worker {DEFAULT_WORKER_ID}: \
-                 ids >= 1 are accepted by header validation but not produced locally"
-            );
-        }
+        check_committee_worker_count(epoch, num_workers)?;
 
         // the network must be live
         let committee = if epoch == 0 {
@@ -1072,9 +1064,48 @@ fn should_subscribe_batch_topic(mode: NodeMode) -> bool {
     }
 }
 
+/// Whether `epoch` may be entered with an on-chain worker count of `num_workers`.
+///
+/// A single worker is always fine. Above one, the answer depends on the multi-workers fork
+/// ([`multi_workers_fork_active`]), evaluated at the epoch being entered - the same epoch carried
+/// inside the [`Committee`] this count is about to be stamped onto, so the gate here and the gate
+/// the encoder consults cannot disagree:
+///
+/// - pre-fork the legacy committee layout has no field to carry a worker count, so the encoder
+///   refuses the value. Halting here turns that into a diagnosable epoch-entry failure instead of a
+///   panic from the first pack write, which is the only thing the node could do about it anyway:
+///   the count is chain state and cannot be talked down locally.
+/// - post-fork the count is representable and epoch entry proceeds. It still only warns, because
+///   this node version spawns worker [`DEFAULT_WORKER_ID`] alone: header payloads keyed to higher
+///   worker ids validate, but nothing local produces them.
+fn check_committee_worker_count(epoch: Epoch, num_workers: NonZeroUsize) -> eyre::Result<()> {
+    if num_workers.get() == 1 {
+        return Ok(());
+    }
+
+    if !multi_workers_fork_active(epoch) {
+        return Err(eyre!(
+            "on-chain WorkerConfigs reports {num_workers} workers but the multi-workers fork \
+             is not active at epoch {epoch}: the pre-fork committee layout cannot hold a worker \
+             count, so this epoch's committee cannot be encoded"
+        ));
+    }
+
+    warn!(
+        target: "epoch-manager",
+        epoch,
+        num_workers,
+        spawned_worker = DEFAULT_WORKER_ID,
+        "committee runs multiple workers but this node version spawns only worker {DEFAULT_WORKER_ID}: \
+         ids >= 1 are accepted by header validation but not produced locally"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{should_subscribe_batch_topic, NodeMode};
+    use super::{check_committee_worker_count, should_subscribe_batch_topic, NodeMode};
+    use std::num::NonZeroUsize;
 
     /// An active committee validator prefetches batches for the vote path.
     #[test]
@@ -1093,5 +1124,38 @@ mod tests {
     #[test]
     fn observer_does_not_subscribe_to_batch_topic() {
         assert!(!should_subscribe_batch_topic(NodeMode::Observer));
+    }
+
+    /// One worker is representable in both committee layouts, so entry never blocks on it.
+    #[test]
+    fn single_worker_epoch_entry_is_always_allowed() {
+        for epoch in [0, 1, 407, u32::MAX] {
+            check_committee_worker_count(epoch, NonZeroUsize::MIN)
+                .expect("one worker is representable at every epoch");
+        }
+    }
+
+    /// Pre-fork the legacy committee layout cannot carry a worker count, so entry halts rather than
+    /// deferring the failure to the first pack write.
+    ///
+    /// The adiri fork epoch is a `u32::MAX` placeholder and its arming constraint floors it at 407,
+    /// so epoch 0 is pre-fork in this lane however the constant moves.
+    /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
+    /// `OnceLock` is process-wide and the whole test binary shares one process.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn pre_fork_epoch_entry_rejects_multiple_workers() {
+        let err = check_committee_worker_count(0, NonZeroUsize::new(2).expect("2 is not 0"))
+            .expect_err("a pre-fork multi-worker committee cannot be encoded");
+        assert!(err.to_string().contains("multi-workers fork is not active"), "{err}");
+    }
+
+    /// Default builds have the multi-worker layout active from genesis, so a count above one is
+    /// representable and entry proceeds (with a warning that this node still spawns one worker).
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn post_fork_epoch_entry_allows_multiple_workers() {
+        check_committee_worker_count(0, NonZeroUsize::new(2).expect("2 is not 0"))
+            .expect("the post-fork layout holds a worker count");
     }
 }
