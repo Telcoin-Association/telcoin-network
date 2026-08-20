@@ -266,7 +266,7 @@ where
         self.epoch_votes_seen.lock().contains_key(&(author, epoch))
     }
 
-    /// Record a verified `(author, epoch, epoch-record)` vote so later replays are dropped before
+    /// Record a verified `(author, epoch)` vote so later replays are dropped before
     /// the signature check.
     ///
     /// Callers MUST invoke this only after [`EpochVote::check_signature`] succeeds: recording a
