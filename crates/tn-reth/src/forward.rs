@@ -11,7 +11,7 @@
 //! traffic spreads across the committee instead of concentrating on the lowest-keyed
 //! validator.
 //!
-//! Three properties worth knowing at this boundary:
+//! Four properties worth knowing at this boundary:
 //!
 //! - Transport security is whatever the validator advertised. Endpoint validation accepts both `https://`
 //!   and plain `http://` URLs, and the forwarder adds no encryption of its own, so a plain-HTTP
@@ -29,17 +29,26 @@
 //!   [`ForwardTargetPolicy`] therefore refuses non-public hosts at the dial site by default, so a
 //!   committee member cannot aim an observer's outbound HTTP at hosts inside that observer's own
 //!   perimeter (issue #1092).
+//! - Delivery feeds back into admission and the pool (issue #1145). Admission counts an endpoint as
+//!   usable the moment its URL resolves, because the lazy HTTP client never dials until the first
+//!   send. Two signals close the gap that leaves: an endpoint that fails at the connection level is
+//!   demoted from admission for [`UNREACHABLE_COOLDOWN`] at the failure itself (a later delivery
+//!   through the same endpoint lifts the demotion), so later batches are refused (and stay in the
+//!   caller's pool) instead of being admitted against a dead endpoint; and a transaction that got
+//!   no verdict is returned to the worker's own pool, so the batch builder repackages it instead of
+//!   losing it.
 //!
 //! [`submit_txn_if_mine`]: tn_types::BatchValidation::submit_txn_if_mine
 
 use crate::{
     metrics::{ForwardDropReason, ForwarderMetrics},
-    recover_raw_transaction,
+    recover_raw_transaction, WorkerTxPool,
 };
 use alloy::{
     providers::{Provider as _, RootProvider},
     transports::{RpcError, TransportErrorKind},
 };
+use futures::{future::OptionFuture, StreamExt};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, Ipv6Addr},
@@ -54,7 +63,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{timeout, Instant},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::{Host, Url};
 
 /// Bounds a single validator's `eth_sendRawTransaction` round-trip so one unresponsive endpoint
@@ -112,6 +121,32 @@ const TRANSIENT_RPC_CODES: [i64; 2] = [-32003, -32603];
 /// Substring of reth's `eth_sendRawTransaction` error message when the transaction is already in a
 /// validator's pool (`code -32000`). Treated as a successful delivery, not a failure to retry.
 const ALREADY_KNOWN_MESSAGE: &str = "already known";
+
+/// How long an endpoint that failed at the connection level (send timeout, or a transport error
+/// with no server response) is held out of admission.
+///
+/// Admission ([`TxnForwarder::forward_txns`]) counts an endpoint as usable the moment its URL
+/// resolves, because the lazy HTTP client never dials until the first send. This cooldown is the
+/// delivery signal that closes that gap (issue #1145): once a send proves the endpoint dead, later
+/// batches are refused (and therefore stay in the caller's pool) instead of being admitted
+/// against it, until the cooldown elapses and one batch probes it again.
+///
+/// Sized against the two failure directions. Shorter would re-probe a dead endpoint more often,
+/// and each probe batch pays real send timeouts before its transactions are requeued; longer
+/// would keep refusing admission after an endpoint recovers, delaying delivery that could
+/// succeed. Thirty seconds is a few tens of batch delays (default 1s): a brief endpoint blip
+/// costs one cooldown of pooled (not lost) transactions, while a dead endpoint is probed at a
+/// rate the forward budget absorbs without stacking tasks.
+const UNREACHABLE_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// How long a forward task waits after its start before its first requeue.
+///
+/// Admission returns to the batch builder synchronously, but the prune that marks this batch's
+/// transactions as mined runs on the builder loop concurrently with this task. A requeue that
+/// lands before that prune hands the transactions straight back to it and loses them. One
+/// second is orders of magnitude above the channel hops the prune path spends, and one batch
+/// cadence, so it costs the recovery nothing observable while closing the race.
+const REQUEUE_GRACE: Duration = Duration::from_secs(1);
 
 /// The JSON-RPC code reth answers with for both chain-wide verdicts and the node-local refusals
 /// in [`NODE_LOCAL_MESSAGES`] (`EthRpcErrorCode::InvalidInput`). The message carve-out is scoped
@@ -354,6 +389,12 @@ struct EndpointCache {
     /// the warning. Never evicting would silence that, but would let a member rotating through
     /// fresh URLs grow the set without bound, which is the worse failure for an unattended node.
     refused: BTreeSet<String>,
+    /// Endpoints demoted after a connection-level send failure, keyed to the moment of
+    /// demotion. A demoted endpoint is skipped by [`WorkerRpcForwarder::cached_providers`],
+    /// and so does not count toward admission, until [`UNREACHABLE_COOLDOWN`] elapses or the
+    /// endpoint leaves the advertisement set, whichever comes first. Bounded the same way as
+    /// `providers`: entries for endpoints no longer advertised are evicted on each forward.
+    unreachable: BTreeMap<String, Instant>,
 }
 
 /// Forwards observer transactions to validators over their advertised JSON-RPC endpoints.
@@ -372,6 +413,12 @@ pub struct WorkerRpcForwarder {
     /// node-wide rather than per-clone. A permit is taken before the spawn and moved into the
     /// task, so capacity comes back when a forward actually finishes.
     forwards_in_flight: Arc<Semaphore>,
+    /// The worker's own transaction pool, where a forward task returns every transaction that
+    /// got no verdict (issue #1145). The batch builder prunes a batch's transactions as mined
+    /// the moment the batch is admitted, so an admitted-then-undelivered transaction is
+    /// otherwise in no pool and no table. `None` means there is no pool to return them to
+    /// (tests); undelivered transactions are then dropped as before, with the same warnings.
+    requeue_pool: Option<WorkerTxPool>,
     /// Rotation counter for the fallback dial order.
     ///
     /// Starts at a random per-process value and advances once per spawned forward: see
@@ -389,17 +436,23 @@ impl std::fmt::Debug for WorkerRpcForwarder {
 
 impl WorkerRpcForwarder {
     /// Create a new forwarder that runs forwards on `task_spawner` and dials only the advertised
-    /// hosts `policy` admits.
+    /// hosts `policy` admits. `requeue_pool` is the worker's own transaction pool, where a
+    /// forward task returns transactions that got no verdict; `None` drops them as before.
     ///
     /// Registering the forwarder's counters here means a node that never sheds still exports
     /// them from start, so an absent series stays distinguishable from a broken exporter.
-    pub fn new(task_spawner: TaskSpawner, policy: ForwardTargetPolicy) -> Self {
+    pub fn new(
+        task_spawner: TaskSpawner,
+        policy: ForwardTargetPolicy,
+        requeue_pool: Option<WorkerTxPool>,
+    ) -> Self {
         ForwarderMetrics::init();
         Self {
             task_spawner,
             policy,
             cache: Arc::new(Mutex::new(EndpointCache::default())),
             forwards_in_flight: Arc::new(Semaphore::new(MAX_CONCURRENT_FORWARDS)),
+            requeue_pool,
             // Random, not zero: observers restarted together must not share one rotation
             // phase, and no committee key can buy a fixed position in the order (issue
             // #1173). This seeds fairness, not secrecy: predicting it moves no trust
@@ -420,16 +473,26 @@ impl WorkerRpcForwarder {
     fn cached_providers(
         &self,
         validator_rpcs: &[(BlsPublicKey, RpcInfo)],
-    ) -> BTreeMap<BlsPublicKey, RootProvider> {
+    ) -> BTreeMap<BlsPublicKey, (String, RootProvider)> {
         let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let advertised: BTreeSet<String> =
             validator_rpcs.iter().map(|(_, rpc)| rpc.http.to_string()).collect();
         cache.providers.retain(|url, _| advertised.contains(url));
         cache.refused.retain(|url| advertised.contains(url));
+        // A demotion expires two ways: its cooldown elapses, or the endpoint leaves the
+        // advertisement set (the same bound that keeps `providers` finite).
+        cache.unreachable.retain(|url, demoted| {
+            advertised.contains(url) && demoted.elapsed() < UNREACHABLE_COOLDOWN
+        });
         validator_rpcs
             .iter()
             .filter_map(|(key, rpc)| {
                 let url = rpc.http.to_string();
+                // A demoted endpoint sits out admission entirely: it is neither served from
+                // the provider cache nor re-created, so a committee whose only advertised
+                // endpoint just proved unreachable refuses the next batch (keeping its
+                // transactions pooled) instead of admitting it (issue #1145).
+                (!cache.unreachable.contains_key(&url)).then_some(())?;
                 cache
                     .providers
                     .get(&url)
@@ -471,7 +534,7 @@ impl WorkerRpcForwarder {
                                 provider
                             })
                     })
-                    .map(|provider| (*key, provider))
+                    .map(|provider| (*key, (url, provider)))
             })
             .collect()
     }
@@ -490,7 +553,7 @@ impl WorkerRpcForwarder {
         transactions: Vec<Vec<u8>>,
         committee_slots: Vec<BlsPublicKey>,
         committee_size: u64,
-        providers: BTreeMap<BlsPublicKey, RootProvider>,
+        providers: BTreeMap<BlsPublicKey, (String, RootProvider)>,
     ) {
         // Fallback order: every usable endpoint, so a transaction whose owning validator has
         // not advertised (or is unreachable) can still reach the committee. Rotated per
@@ -500,24 +563,45 @@ impl WorkerRpcForwarder {
             providers.keys().cloned().collect(),
             self.fallback_rotation.fetch_add(1, Ordering::Relaxed),
         );
+        let cache = Arc::clone(&self.cache);
+        let requeue_pool = self.requeue_pool.clone();
 
         self.task_spawner.spawn_task("forward-txns", async move {
             // Moved in rather than released when `forward_txns` returned, so capacity comes
             // back when this forward actually finishes.
             let _permit = permit;
             let deadline = Instant::now() + FORWARD_BATCH_BUDGET;
+            // The point in time the first requeue may land; see [`REQUEUE_GRACE`].
+            let requeue_ready = Instant::now() + REQUEUE_GRACE;
             let queued = transactions.len();
             let mut delivered = 0_usize;
             let mut rejected = 0_usize;
             let mut unreached = 0_usize;
+            // Transactions that got no verdict, and how many of those the worker's own pool
+            // accepted back (issue #1145). Requeueing happens per transaction, as each verdict
+            // lands, so an epoch-boundary abort of this task loses at most the transactions it
+            // had not walked yet rather than the whole batch.
+            let mut no_verdict = 0_usize;
+            let mut requeued = 0_usize;
+            // Endpoints this task proved unreachable. Each demotion is published to the shared
+            // cache at the failure itself, so admission for batches sealed while this task is
+            // still walking stops counting the endpoint at once, and the set doubles as the
+            // within-batch skip list, so later transactions here do not re-pay the send
+            // timeout against a proven-dead endpoint. A later delivery through the same
+            // endpoint clears both.
+            let mut unreachable_endpoints: BTreeSet<String> = BTreeSet::new();
+            // How many transactions the loop pulled before the batch deadline ended it;
+            // everything at and past this index is the abandoned (also undelivered) tail.
+            let mut pulled = 0_usize;
             // `map_while` is what ends the batch at the deadline: it runs as the loop pulls each
             // transaction, so every iteration sees the budget left at that moment and the batch
             // stops at the first transaction that finds none.
-            let budgeted = transactions
-                .iter()
-                .map_while(|tx| next_txn_budget(deadline, Instant::now()).map(|left| (tx, left)));
+            let budgeted = transactions.iter().enumerate().map_while(|(idx, tx)| {
+                next_txn_budget(deadline, Instant::now()).map(|left| (idx, tx, left))
+            });
 
-            for (tx, txn_budget) in budgeted {
+            for (idx, tx, txn_budget) in budgeted {
+                pulled = idx + 1;
                 // A budget below [`FORWARD_TX_BUDGET`] means the batch deadline is what clamped
                 // it (see [`next_txn_budget`]). On its own that says nothing about how this
                 // transaction ends: a clamped budget can still carry a whole fast-failing
@@ -539,7 +623,13 @@ impl WorkerRpcForwarder {
                         if !tried.insert(key) {
                             continue;
                         }
-                        let Some(provider) = providers.get(&key) else {
+                        // The filter is the within-batch half of the demotion: an endpoint
+                        // this task already proved dead is not re-dialed for later
+                        // transactions in the same batch.
+                        let Some((endpoint, provider)) = providers
+                            .get(&key)
+                            .filter(|(endpoint, _)| !unreachable_endpoints.contains(endpoint))
+                        else {
                             continue;
                         };
                         // Bound each validator's round-trip: an endpoint that accepts the
@@ -550,7 +640,7 @@ impl WorkerRpcForwarder {
                         )
                         .await
                         .map_or_else(
-                            |_elapsed| Disposition::TryNext("send timed out".to_string()),
+                            |_elapsed| Disposition::Unreachable("send timed out".to_string()),
                             |res| res.err().map_or(Disposition::Delivered, classify_error),
                         );
 
@@ -558,6 +648,17 @@ impl WorkerRpcForwarder {
                             // Delivered, or a considered rejection every validator would repeat:
                             // either way this transaction is done, so stop the fallback chain.
                             Disposition::Delivered => {
+                                // A delivery proves the endpoint reachable again: lift any
+                                // demotion this task recorded, locally and in admission, so a
+                                // single earlier blip (one timed-out send against an otherwise
+                                // healthy validator) cannot hold a delivering endpoint out.
+                                if unreachable_endpoints.remove(endpoint) {
+                                    cache
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .unreachable
+                                        .remove(endpoint);
+                                }
                                 result = ForwardOutcome::Delivered;
                                 break;
                             }
@@ -565,8 +666,26 @@ impl WorkerRpcForwarder {
                                 result = ForwardOutcome::Rejected(reason);
                                 break;
                             }
-                            // Endpoint-local problem (timeout, transport error, full pool, or a
-                            // node-local refusal): the transaction's fate is unknown here, so
+                            // The endpoint gave no verdict: publish the demotion at the
+                            // failure itself, not at task end, so batches sealed while this
+                            // task is still walking already find the endpoint unusable at
+                            // admission and the cooldown runs from the failure (issue #1145).
+                            Disposition::Unreachable(reason) => {
+                                if unreachable_endpoints.insert(endpoint.clone()) {
+                                    cache
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .unreachable
+                                        .insert(endpoint.clone(), Instant::now());
+                                }
+                                debug!(
+                                    target: "worker::forward",
+                                    reason = %reason,
+                                    "validator RPC endpoint was unreachable; trying next"
+                                );
+                            }
+                            // Endpoint-local, but the server answered (full pool, internal
+                            // error, or a node-local refusal): reachable, so not demoted;
                             // try the next validator.
                             Disposition::TryNext(reason) => {
                                 debug!(
@@ -604,6 +723,9 @@ impl WorkerRpcForwarder {
                     // unresponsive validators), and a verdict reached inside a clamped budget
                     // is a real verdict; each of those counts as `unreached` in the arm below.
                     ForwardOutcome::NoEndpointReached if budget_expired && deadline_clamped => {
+                        no_verdict += 1;
+                        requeued +=
+                            requeue_one(requeue_pool.as_ref(), requeue_ready, tx.clone()).await;
                         warn!(
                             target: "worker::forward",
                             "batch budget expired before this transaction could reach a validator RPC"
@@ -611,6 +733,9 @@ impl WorkerRpcForwarder {
                     }
                     ForwardOutcome::NoEndpointReached => {
                         unreached += 1;
+                        no_verdict += 1;
+                        requeued +=
+                            requeue_one(requeue_pool.as_ref(), requeue_ready, tx.clone()).await;
                         warn!(
                             target: "worker::forward",
                             "could not forward transaction to any advertised validator RPC"
@@ -658,9 +783,69 @@ impl WorkerRpcForwarder {
                     u64::try_from(abandoned).unwrap_or(u64::MAX),
                 );
             }
+
+            // Report the endpoints this task demoted. Each was already published to admission
+            // at its failure; an endpoint that later delivered was cleared again and is not
+            // counted here.
+            if !unreachable_endpoints.is_empty() {
+                let demoted = unreachable_endpoints.len();
+                warn!(
+                    target: "worker::forward",
+                    demoted,
+                    cooldown_secs = UNREACHABLE_COOLDOWN.as_secs(),
+                    "demoting unreachable validator RPC endpoints from forward admission"
+                );
+                ForwarderMetrics::record_endpoints_demoted(
+                    u64::try_from(demoted).unwrap_or(u64::MAX),
+                );
+            }
+
+            // The abandoned tail never got a verdict either: requeue it the same way. The
+            // builder pruned the whole batch as mined at admission, so a transaction that is
+            // not requeued is in no pool and no table. A considered rejection is a verdict
+            // and is never requeued; a requeued transaction that was in fact delivered is
+            // dropped by the destination pool as a duplicate on the next forward
+            // ("already known").
+            no_verdict += queued.saturating_sub(pulled);
+            requeued += futures::stream::iter(transactions.into_iter().skip(pulled))
+                .then(|tx| requeue_one(requeue_pool.as_ref(), requeue_ready, tx))
+                .fold(0_usize, |acc, added| async move { acc + added })
+                .await;
+            if no_verdict > 0 {
+                info!(
+                    target: "worker::forward",
+                    undelivered = no_verdict,
+                    requeued,
+                    "returned undelivered forwarded transactions to the worker's pool"
+                );
+            }
             Ok(())
         });
     }
+}
+
+/// Return one undelivered transaction to the worker's own pool, no earlier than `ready_at`.
+///
+/// The wait orders the requeue after the batch builder's prune of this batch (the ack+prune
+/// path this task races; see [`REQUEUE_GRACE`]). It is a point in time, not a per-call delay,
+/// so only a task's first requeue can actually sleep. Returns 1 when the pool accepted the
+/// transaction back, 0 otherwise: with no pool to return to (tests), or bytes that no longer
+/// recover, or a pool refusal (full, replaced, already executed), the transaction is dropped
+/// exactly as the whole path dropped it before issue #1145. The metric moves per transaction,
+/// so an epoch-boundary abort of the task cannot erase requeues that already happened.
+async fn requeue_one(pool: Option<&WorkerTxPool>, ready_at: Instant, tx: Vec<u8>) -> usize {
+    tokio::time::sleep_until(ready_at).await;
+    let added = OptionFuture::from(pool.and_then(|pool| {
+        recover_raw_transaction(&tx)
+            .ok()
+            .map(|recovered| pool.add_recovered_transaction_external(recovered))
+    }))
+    .await
+    .is_some_and(|outcome| outcome.is_ok());
+    if added {
+        ForwarderMetrics::record_txns_requeued(1);
+    }
+    usize::from(added)
 }
 
 impl TxnForwarder for WorkerRpcForwarder {
@@ -806,10 +991,15 @@ enum Disposition {
     /// The validator returned a considered rejection of the transaction itself (bad nonce,
     /// invalid, wrong fork). No other validator will accept it either.
     Rejected(String),
-    /// This endpoint gave no verdict (timeout, transport error, a transient full pool, or a
-    /// refusal tied to this validator's own pool contents or admission config); the transaction
-    /// may still be accepted by another validator.
+    /// This endpoint answered but gave no verdict (a transient full pool, an internal error,
+    /// or a refusal tied to this validator's own pool contents or admission config); the
+    /// transaction may still be accepted by another validator.
     TryNext(String),
+    /// This endpoint produced no JSON-RPC verdict (send timeout, transport failure, or a
+    /// response that carries none). The transaction may still be accepted by another
+    /// validator, and the endpoint is demoted from admission for [`UNREACHABLE_COOLDOWN`]
+    /// unless a later delivery through it clears the demotion (issue #1145).
+    Unreachable(String),
 }
 
 /// Terminal result of forwarding one transaction across the ordered validators.
@@ -826,10 +1016,22 @@ enum ForwardOutcome {
 /// Classify a failed `send_raw_transaction` by whether the server returned a JSON-RPC error (a
 /// verdict about the transaction) or the transport failed (an endpoint problem).
 fn classify_error(err: RpcError<TransportErrorKind>) -> Disposition {
-    err.as_error_resp().map(|payload| (payload.code, payload.message.to_string())).map_or_else(
-        || Disposition::TryNext(err.to_string()),
-        |(code, message)| classify_server_error(code, message),
-    )
+    match err {
+        // The server returned a JSON-RPC verdict: classify it by code and message.
+        RpcError::ErrorResp(payload) => {
+            classify_server_error(payload.code, payload.message.to_string())
+        }
+        // Local faults: the request could not even be built or used. They say nothing about
+        // the endpoint, so try the next validator without demoting this one.
+        RpcError::SerError(err) => Disposition::TryNext(err.to_string()),
+        RpcError::LocalUsageError(err) => Disposition::TryNext(err.to_string()),
+        // No usable verdict from the remote side: a transport failure, a response that does
+        // not parse, an empty response, or a capability the endpoint lacks. All demote.
+        RpcError::Transport(err) => Disposition::Unreachable(err.to_string()),
+        RpcError::DeserError { err, .. } => Disposition::Unreachable(err.to_string()),
+        RpcError::NullResp => Disposition::Unreachable("null response".to_string()),
+        RpcError::UnsupportedFeature(feature) => Disposition::Unreachable(feature.to_string()),
+    }
 }
 
 /// Classify a server-side JSON-RPC rejection of a forwarded transaction.
@@ -868,7 +1070,11 @@ mod tests {
     fn test_forwarder_with(policy: ForwardTargetPolicy) -> WorkerRpcForwarder {
         // Leak the manager: a dropped TaskManager latches its one-shot shutdown,
         // which would cancel any task later spawned through the spawner.
-        WorkerRpcForwarder::new(Box::leak(Box::new(TaskManager::default())).get_spawner(), policy)
+        WorkerRpcForwarder::new(
+            Box::leak(Box::new(TaskManager::default())).get_spawner(),
+            policy,
+            None,
+        )
     }
 
     /// [`MAX_CONCURRENT_FORWARDS`] as the width the semaphore API wants.
@@ -1010,6 +1216,14 @@ mod tests {
             .cache
             .lock()
             .map(|cache| cache.refused.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn demoted_urls(forwarder: &WorkerRpcForwarder) -> Vec<String> {
+        forwarder
+            .cache
+            .lock()
+            .map(|cache| cache.unreachable.keys().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -1192,7 +1406,7 @@ mod tests {
         // `AllowPrivate`: the fixture endpoint is a loopback socket, which the shipped default
         // policy would refuse before the admission control under test was ever reached.
         let forwarder =
-            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate);
+            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate, None);
         let rpcs = vec![(test_key(1), test_rpc(&format!("http://{addr}"))?)];
         forwarder.forward_txns(vec![vec![0_u8; 32]], vec![test_key(1)], rpcs);
 
@@ -1211,23 +1425,29 @@ mod tests {
 
     /// A batch stops at [`FORWARD_BATCH_BUDGET`] instead of paying one budget per transaction.
     ///
-    /// Three advertised slots sit behind one blackholed endpoint, so a transaction exhausts its
-    /// whole fallback chain and costs the full [`FORWARD_TX_BUDGET`]. Twenty of them is five
-    /// minutes of work, and without a per-task ceiling the task would live for all of it with
-    /// the batch's bytes pinned. Time is virtual here, so the test measures that shape without
-    /// waiting for it.
+    /// Every advertised slot hides behind its own blackholed endpoint, so each transaction
+    /// burns a fresh fallback chain of accept-and-hang sends. (Distinct endpoints matter
+    /// since issue #1145: demotion retires an endpoint after its first hung send, so a single
+    /// shared endpoint would cost one send timeout for the whole batch and the ceiling under
+    /// test would never bind.) Twenty transactions is five minutes of work, and without a
+    /// per-task ceiling the task would live for all of it with the batch's bytes pinned. Time
+    /// is virtual here, so the test measures that shape without waiting for it.
     #[tokio::test(start_paused = true)]
     async fn forward_txns_abandons_the_rest_of_a_batch_at_the_batch_budget() -> eyre::Result<()> {
-        let endpoint = blackhole_endpoint()?;
         let manager = TaskManager::default();
-        // `AllowPrivate`: the fixture endpoint is a loopback socket, which the shipped default
+        // `AllowPrivate`: the fixture endpoints are loopback sockets, which the shipped default
         // policy would refuse before the admission control under test was ever reached.
         let forwarder =
-            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate);
-        let slots = vec![test_key(1), test_key(2), test_key(3)];
+            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate, None);
+        // Enough distinct endpoints that demotion cannot drain the pool of undialed targets
+        // before the batch budget binds: the budget covers eight full transaction chains, and
+        // each chain demotes at most three endpoints.
+        let slots: Vec<BlsPublicKey> = (1..=30_u8).map(test_key).collect();
         let rpcs = slots
             .iter()
-            .map(|key| test_rpc(&endpoint).map(|rpc| (*key, rpc)))
+            .map(|key| {
+                blackhole_endpoint().and_then(|endpoint| test_rpc(&endpoint).map(|rpc| (*key, rpc)))
+            })
             .collect::<eyre::Result<Vec<_>>>()?;
 
         let start = Instant::now();
@@ -1493,11 +1713,93 @@ mod tests {
     async fn forward_txns_admits_when_a_provider_resolves() -> eyre::Result<()> {
         // Keep the task manager alive so the spawned forward task is tracked normally.
         let task_manager = TaskManager::default();
-        let forwarder =
-            WorkerRpcForwarder::new(task_manager.get_spawner(), ForwardTargetPolicy::PublicOnly);
+        let forwarder = WorkerRpcForwarder::new(
+            task_manager.get_spawner(),
+            ForwardTargetPolicy::PublicOnly,
+            None,
+        );
         let rpcs = vec![(test_key(1), test_rpc("http://validator.example.com:8545")?)];
 
         assert!(forwarder.forward_txns(vec![vec![0u8; 8]], vec![test_key(1)], rpcs));
+        Ok(())
+    }
+
+    /// An endpoint that fails at the connection level is demoted when its forward task ends,
+    /// so the next batch against the same advertisement is refused (`forward_txns` returns
+    /// `false` and the caller keeps its transactions) instead of being admitted against an
+    /// endpoint that just proved dead (issue #1145).
+    #[tokio::test]
+    async fn forward_txns_demotes_an_unreachable_endpoint_then_refuses_the_next_batch(
+    ) -> eyre::Result<()> {
+        // A port with nothing behind it: the URL resolves (so the first batch is admitted)
+        // and the send then fails with a transport error and no server response, which is
+        // the connection-level failure that demotes.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = closed.local_addr()?;
+        drop(closed);
+
+        // The manager outlives the forward: dropping it would shut the spawned task down
+        // before it could record the demotion.
+        let manager = TaskManager::default();
+        // `AllowPrivate`: the fixture endpoint is a loopback socket, which the shipped default
+        // policy would refuse before the demotion under test was ever reached.
+        let forwarder =
+            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate, None);
+        let endpoint = format!("http://{addr}");
+        let rpcs = vec![(test_key(1), test_rpc(&endpoint)?)];
+
+        // The first batch is admitted: admission counts an endpoint as usable the moment its
+        // URL resolves, because the lazy HTTP client has not dialed yet.
+        assert!(forwarder.forward_txns(vec![vec![0_u8; 32]], vec![test_key(1)], rpcs.clone()));
+
+        // Draining every permit can only complete once the forward task has dropped the one
+        // it took, and the task records the demotion before releasing its permit.
+        let drained = timeout(
+            Duration::from_secs(30),
+            Arc::clone(&forwarder.forwards_in_flight).acquire_many_owned(max_permits()),
+        )
+        .await;
+        assert!(drained.is_ok(), "forward task never released its permit");
+        // Return the drained permits so the next admission attempt is not refused for
+        // capacity, which would pass the assertion below for the wrong reason.
+        drop(drained);
+
+        // The demotion names the endpoint, under the exact (normalized) key the cache uses.
+        assert_eq!(demoted_urls(&forwarder), vec![test_rpc(&endpoint)?.http.to_string()]);
+
+        // The same advertisement now resolves no usable endpoint: the batch is refused.
+        assert!(!forwarder.forward_txns(vec![vec![0_u8; 32]], vec![test_key(1)], rpcs));
+        Ok(())
+    }
+
+    /// A demoted endpoint re-enters admission once [`UNREACHABLE_COOLDOWN`] elapses: batches
+    /// sealed inside the window are refused so the caller keeps its transactions, and the
+    /// first seal after the window is admitted again. Time is virtual here, so the test
+    /// measures the whole window without waiting for it.
+    #[tokio::test(start_paused = true)]
+    async fn demoted_endpoint_reenters_admission_after_the_cooldown() -> eyre::Result<()> {
+        // Keep the task manager alive so the re-admitted forward task is tracked normally.
+        let manager = TaskManager::default();
+        let forwarder =
+            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::PublicOnly, None);
+        // The exact key the cache stores: URL parsing normalizes the advertisement (say, a
+        // trailing slash), so the key is computed from the parsed URL, never hand-written.
+        let rpc = test_rpc("http://validator.example.com:8545")?;
+        let advertised = rpc.http.to_string();
+        let rpcs = vec![(test_key(1), rpc)];
+        forwarder
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unreachable
+            .insert(advertised, Instant::now());
+
+        // Inside the cooldown the only advertised endpoint sits out admission: refused.
+        assert!(!forwarder.forward_txns(vec![vec![0_u8; 32]], vec![test_key(1)], rpcs.clone()));
+
+        // Past the cooldown the demotion expires and the same advertisement is admitted.
+        tokio::time::advance(UNREACHABLE_COOLDOWN + Duration::from_secs(1)).await;
+        assert!(forwarder.forward_txns(vec![vec![0_u8; 32]], vec![test_key(1)], rpcs));
         Ok(())
     }
 
@@ -1542,7 +1844,7 @@ mod tests {
         // `AllowPrivate`: the fixture endpoints are loopback sockets, which the shipped
         // default policy would refuse before the rotation under test was ever reached.
         let forwarder =
-            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate);
+            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate, None);
         forwarder.fallback_rotation.store(0, Ordering::Relaxed);
         // Pair each sorted committee key with one endpoint: `providers` iterates in key
         // order, so the sorted pairing makes "which endpoint is fallback N" exact.
