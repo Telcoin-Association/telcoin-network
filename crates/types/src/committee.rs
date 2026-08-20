@@ -1341,6 +1341,21 @@ mod tests {
         }
     }
 
+    /// Post-fork shadow of the [`BootstrapServer`] wire layout: a primary plus a length-prefixed
+    /// worker list.
+    ///
+    /// Derived serde, so it is byte-identical to a plain derive on [`BootstrapServer`] BY
+    /// CONSTRUCTION — and that derive is what the post-fork arm writes, since #554 hand-wrote only
+    /// the enclosing committee's serializer, not this one. Pairs with [`BootstrapReprLegacy`]: the
+    /// two shapes differ by exactly the ULEB128 worker-list prefix.
+    #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+    struct BootstrapReprV1 {
+        /// The p2p info the primary.
+        primary: P2pNode,
+        /// The p2p info for each worker, indexed by [`crate::WorkerId`].
+        workers: Vec<P2pNode>,
+    }
+
     /// Legacy (pre-#554) shadow of the [`CommitteeInner`] wire layout: its three serialized
     /// fields, with derived serde, so it is byte-identical to the `origin/main` derive output BY
     /// CONSTRUCTION.
@@ -1358,6 +1373,25 @@ mod tests {
         epoch: Epoch,
         /// The bootstrap servers to initially join a network.
         bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapReprLegacy>,
+    }
+
+    /// Post-fork shadow of the [`CommitteeInner`] wire layout: its four serialized fields with
+    /// derived serde, byte-identical to a plain derive on the current struct BY CONSTRUCTION.
+    ///
+    /// The same reasoning as [`CommitteeReprLegacy`] applies to the field set: the three helper
+    /// fields the real struct carries are absent from every wire layout, and bcs writes neither
+    /// struct nor field names, so only the types and their order decide the bytes. Anchors the
+    /// post-fork golden vector independently of the hand-written epoch gate.
+    #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+    struct CommitteeReprV1 {
+        /// The authorities of epoch.
+        authorities: BTreeMap<BlsPublicKey, Authority>,
+        /// The epoch number of this committee.
+        epoch: Epoch,
+        /// The bootstrap servers to initially join a network.
+        bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapReprV1>,
+        /// The number of workers every validator in this committee runs.
+        num_workers: NonZeroUsize,
     }
 
     /// Build the real [`Committee`] a legacy shadow describes.
@@ -1413,6 +1447,15 @@ mod tests {
     /// epoch whose single-worker guarantee is operational rather than structural — the pre-fork
     /// epoch with the least margin for error.
     const LEGACY_FIXTURE_EPOCH: Epoch = 407;
+
+    /// Epoch of the post-fork-layout fixtures: `u32::MAX`, the one epoch that carries the
+    /// multi-worker layout under every build, armed or not.
+    ///
+    /// Non-adiri is post-fork from genesis. Adiri gates on `epoch >= COMMITTEE_WORKERS_FORK_EPOCH`
+    /// and that constant is the `u32::MAX` placeholder, so the top epoch is post-fork even while
+    /// the fork is dormant — and stays post-fork once the epoch-setting PR lowers the constant. One
+    /// frozen vector therefore pins the post-fork bytes on every lane, before and after arming.
+    const V1_FIXTURE_EPOCH: Epoch = u32::MAX;
 
     /// Seed tag marking a fixture primary's network key, so no primary shares a key with a worker.
     const PRIMARY_SEED_TAG: u8 = 0xB0;
@@ -1515,6 +1558,17 @@ mod tests {
             Self { epoch, authorities, bootstrap_servers, workers_per_server: 1 }
         }
 
+        /// A fixture whose every bootstrap server advertises `workers_per_server` workers, which is
+        /// also the committee's worker count: a shape only the post-fork layout can express.
+        const fn multi_worker(
+            epoch: Epoch,
+            authorities: u8,
+            bootstrap_servers: u8,
+            workers_per_server: u8,
+        ) -> Self {
+            Self { epoch, authorities, bootstrap_servers, workers_per_server }
+        }
+
         /// The committee-level worker count this fixture describes.
         fn num_workers(self) -> NonZeroUsize {
             NonZeroUsize::new(usize::from(self.workers_per_server))
@@ -1595,6 +1649,32 @@ mod tests {
                 authorities: self.authority_map(),
                 epoch: self.epoch,
                 bootstrap_servers,
+            }
+        }
+
+        /// Build the post-fork shadow this fixture describes.
+        ///
+        /// Like [`Self::legacy_repr`], reaches the shadow reprs straight from the slot-derived keys
+        /// and nodes rather than through [`Self::committee`], so a bug in the gated encoder cannot
+        /// make the two sides of the differential agree.
+        fn v1_repr(self) -> CommitteeReprV1 {
+            let bootstrap_servers = self
+                .bootstrap_slots()
+                .map(|(slot, key)| {
+                    let repr = BootstrapReprV1 {
+                        primary: fixture_primary_node(slot),
+                        workers: (0..self.workers_per_server)
+                            .map(|worker| fixture_worker_node(slot, worker))
+                            .collect(),
+                    };
+                    (key, repr)
+                })
+                .collect();
+            CommitteeReprV1 {
+                authorities: self.authority_map(),
+                epoch: self.epoch,
+                bootstrap_servers,
+                num_workers: self.num_workers(),
             }
         }
     }
@@ -1687,6 +1767,179 @@ mod tests {
         let read_back: CommitteeReprLegacy =
             try_decode(&gated_bytes).expect("pre-fork Committee bytes decode as the legacy repr");
         assert_eq!(read_back, repr, "pre-fork Committee bytes are not the legacy layout");
+    }
+
+    /// Decode a frozen hex vector, failing loudly on a malformed constant.
+    fn unhex(hex_str: &str) -> Vec<u8> {
+        hex::decode(hex_str).expect("frozen hex vector must be valid hex")
+    }
+
+    /// FROZEN pre-fork committee vector: the bcs bytes of
+    /// `CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3)` — four authorities and
+    /// three single-worker bootstrap servers, one worker of which advertises rpc — wire-identical
+    /// to the pre-#554 derive output by construction of [`CommitteeReprLegacy`].
+    ///
+    /// This is the layout every committee already on adiri disk is written in: [`Committee`] is
+    /// embedded in `EpochMeta`, the first record of every consensus pack. If this pin breaks, that
+    /// historical layout moved and those packs stop decoding — a compatibility break to fix in the
+    /// encoder, NOT a constant to refresh. The fixture takes no rng, clock or OS-assigned port, so
+    /// the bytes only move when an encoder, a field type, or a dependency's serde impl moves.
+    const GOLDEN_LEGACY_COMMITTEE_HEX: &str = "046085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87356085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87351401010101010101010101010101010101010101016096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad6096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad14020202020202020202020202020202020202020260991387de238ff1a895ccff0d14bbdd0ad15e27504209243d391d5fcd07b6dd620af231d7852a007b4f149e43531ea94402446153bf7a53b5f907d54d1e208fb5b5a1088725b772777f87391ae331d9124c58a66d24c65ddb957314eeb607ca0460991387de238ff1a895ccff0d14bbdd0ad15e27504209243d391d5fcd07b6dd620af231d7852a007b4f149e43531ea94402446153bf7a53b5f907d54d1e208fb5b5a1088725b772777f87391ae331d9124c58a66d24c65ddb957314eeb607ca0414030303030303030303030303030303030303030360ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b8444460ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b8444414000000000000000000000000000000000000000097010000036085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87350b047f00000191029c41cd032408011220b14a3296426492458270c2e577fdc549b6d67155e5800b0bf96c3f4106b4ae71000b047f0000019102a030cd032408011220c602145e9a9f1672b151652377fa8c23fc78ded1add621fe177d33b8ebcd4214006096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad0b047f00000191029c42cd03240801122032fb5b7c292018fbb8b436c83f39526a6035aa410421a8c5f46e8d06de48fa66000b047f0000019102a038cd0324080112201edb6a1734e1f14d1461431b25a7f3ca348acab2fa98e4262685d2b46ce335800060ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b844440b047f00000191029c40cd032408011220e0fcb53429020d03e8f4e471ec73993f9329ad0d76e69cfdfcb08c94aa39fdab000b047f0000019102a028cd032408011220055139b0f6daf33b3fdc294e2bfc1ad914de91f7d6e9f717b4509c047fbc6acc012468747470733a2f2f76616c696461746f72302e6578616d706c652e636f6d3a383534352f01227773733a2f2f76616c696461746f72302e6578616d706c652e636f6d3a383534362f";
+    /// FROZEN post-fork committee vector: the bcs bytes of
+    /// `CommitteeWireFixture::multi_worker(V1_FIXTURE_EPOCH, 4, 3, 2)` — the same authorities and
+    /// servers as [`GOLDEN_LEGACY_COMMITTEE_HEX`], now with two workers per server and a trailing
+    /// `num_workers`, so a diff of the two constants is a diff of the fork itself.
+    ///
+    /// Multi-worker deliberately: it freezes both halves of the layout change (the ULEB128
+    /// worker-list prefix and the trailing count) where a single-worker fixture would only show the
+    /// second. Same warning as the pre-fork pin — this is the layout every post-fork pack is
+    /// written in.
+    const GOLDEN_V1_COMMITTEE_HEX: &str = "046085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87356085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87351401010101010101010101010101010101010101016096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad6096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad14020202020202020202020202020202020202020260991387de238ff1a895ccff0d14bbdd0ad15e27504209243d391d5fcd07b6dd620af231d7852a007b4f149e43531ea94402446153bf7a53b5f907d54d1e208fb5b5a1088725b772777f87391ae331d9124c58a66d24c65ddb957314eeb607ca0460991387de238ff1a895ccff0d14bbdd0ad15e27504209243d391d5fcd07b6dd620af231d7852a007b4f149e43531ea94402446153bf7a53b5f907d54d1e208fb5b5a1088725b772777f87391ae331d9124c58a66d24c65ddb957314eeb607ca0414030303030303030303030303030303030303030360ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b8444460ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b84444140000000000000000000000000000000000000000ffffffff036085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87350b047f00000191029c41cd032408011220b14a3296426492458270c2e577fdc549b6d67155e5800b0bf96c3f4106b4ae7100020b047f0000019102a030cd032408011220c602145e9a9f1672b151652377fa8c23fc78ded1add621fe177d33b8ebcd4214000b047f0000019102a031cd0324080112201ad1a467248480996c12b0f2eebe5082dc5687256fd150b29806142d3ac6f052006096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad0b047f00000191029c42cd03240801122032fb5b7c292018fbb8b436c83f39526a6035aa410421a8c5f46e8d06de48fa6600020b047f0000019102a038cd0324080112201edb6a1734e1f14d1461431b25a7f3ca348acab2fa98e4262685d2b46ce33580000b047f0000019102a039cd032408011220be1e84fd08b72a68647b9cfe4aa9f04ed7726ff7d9d0d1415eeab62c4b1c98090060ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b844440b047f00000191029c40cd032408011220e0fcb53429020d03e8f4e471ec73993f9329ad0d76e69cfdfcb08c94aa39fdab00020b047f0000019102a028cd032408011220055139b0f6daf33b3fdc294e2bfc1ad914de91f7d6e9f717b4509c047fbc6acc012468747470733a2f2f76616c696461746f72302e6578616d706c652e636f6d3a383534352f01227773733a2f2f76616c696461746f72302e6578616d706c652e636f6d3a383534362f0b047f0000019102a029cd032408011220a72b23753f2dc308151fba8b061458979bce8ec10e3c6448c27a7cbfd7dc12fd000200000000000000";
+
+    /// PIN (all cfgs): the frozen pre-fork vector, anchored through the derived legacy shadow.
+    ///
+    /// The shadow is `origin/main`-identical by construction, so this keeps the historical bytes
+    /// pinned even in builds whose gate never selects the legacy arm (non-adiri is post-fork from
+    /// genesis, [`LEGACY_FIXTURE_EPOCH`] included). The gated encoder is held to the same constant
+    /// by the adiri test below.
+    #[test]
+    fn golden_legacy_committee_wire_bytes_pinned() {
+        let fixture = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3);
+        let repr = fixture.legacy_repr();
+
+        // re-encoding the fixture must reproduce the frozen vector: drift in the fixture, in a
+        // field type or in a serde impl fails here instead of being absorbed silently
+        assert_eq!(
+            hex::encode(encode(&repr)),
+            GOLDEN_LEGACY_COMMITTEE_HEX,
+            "legacy shadow encode diverged from the frozen pre-fork vector"
+        );
+
+        let decoded: CommitteeReprLegacy = try_decode(&unhex(GOLDEN_LEGACY_COMMITTEE_HEX))
+            .expect("frozen pre-fork vector decodes as the legacy repr");
+        assert_eq!(decoded, repr, "decode of the frozen pre-fork vector diverged");
+        assert_eq!(decoded.epoch, LEGACY_FIXTURE_EPOCH, "frozen pre-fork epoch moved");
+        assert_eq!(decoded.authorities.len(), 4, "frozen pre-fork authority count moved");
+        assert_eq!(decoded.bootstrap_servers.len(), 3, "frozen pre-fork server count moved");
+
+        // the two maps carry independent length prefixes but the same keys: every server in the
+        // frozen vector still belongs to an authority in it
+        assert!(
+            decoded.bootstrap_servers.keys().all(|key| decoded.authorities.contains_key(key)),
+            "a frozen bootstrap server is keyed off no authority"
+        );
+
+        // exactly one fixture worker advertises rpc, so both arms of `P2pNode::rpc` are frozen here
+        assert_eq!(
+            decoded.bootstrap_servers.values().filter(|server| server.worker.rpc.is_some()).count(),
+            1,
+            "the frozen pre-fork vector lost its single rpc endpoint"
+        );
+    }
+
+    /// PIN (adiri): the epoch-gated [`Committee`] emits and re-reads the frozen pre-fork vector at
+    /// [`LEGACY_FIXTURE_EPOCH`].
+    ///
+    /// The second, independent anchor of that constant, and the direct proof that the gate selects
+    /// the legacy arm for historical bytes: what a pre-#554 binary wrote decodes here, and what
+    /// this build writes for that epoch is what that binary would have written.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn golden_legacy_committee_gated_wire_bytes_pinned() {
+        assert!(
+            !crate::forks::committee_workers_active(LEGACY_FIXTURE_EPOCH),
+            "epoch {LEGACY_FIXTURE_EPOCH} must be pre-fork for this pin to mean anything; is \
+             TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed?"
+        );
+
+        let committee = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3).committee();
+        let bytes = encode(&committee);
+        assert_eq!(
+            hex::encode(&bytes),
+            GOLDEN_LEGACY_COMMITTEE_HEX,
+            "pre-fork Committee encode diverged from the frozen pre-fork vector"
+        );
+
+        let decoded: Committee = try_decode(&unhex(GOLDEN_LEGACY_COMMITTEE_HEX))
+            .expect("frozen pre-fork vector decodes as a Committee");
+        assert_eq!(decoded.epoch(), LEGACY_FIXTURE_EPOCH, "frozen pre-fork epoch moved");
+        assert_eq!(decoded.size(), 4, "frozen pre-fork authority count moved");
+        assert_eq!(decoded.bootstrap_servers().len(), 3, "frozen pre-fork server count moved");
+        assert_eq!(decoded.number_of_workers(), 1, "the pre-fork layout carries no worker count");
+        assert!(
+            decoded.bootstrap_servers().values().all(|server| server.num_workers() == 1),
+            "the pre-fork layout holds exactly one worker per bootstrap server"
+        );
+        assert_eq!(decoded, committee, "the frozen pre-fork vector is a different committee");
+        // `Committee`'s PartialEq deliberately ignores bootstrap servers, so compare those too
+        assert_eq!(decoded.bootstrap_servers(), committee.bootstrap_servers());
+
+        // re-encoding what the frozen vector decoded to reproduces it byte for byte: a pre-fork
+        // pack survives the decode/re-append cycle unchanged
+        assert_eq!(encode(&decoded), bytes, "pre-fork re-encode diverged from the frozen vector");
+    }
+
+    /// PIN (all cfgs): the frozen post-fork vector, anchored twice — through the derived four-field
+    /// shadow and through the epoch-gated [`Committee`] itself.
+    ///
+    /// Runs on every lane because [`V1_FIXTURE_EPOCH`] is post-fork under every build, so a single
+    /// vector pins the post-fork bytes for adiri and mainnet alike. The two anchors agreeing is
+    /// also the post-fork half of the layout differential — the gated encoder emits exactly
+    /// what a plain derive on the four-field struct emits — mirroring the pre-fork differential
+    /// above.
+    #[test]
+    fn golden_v1_committee_wire_bytes_pinned() {
+        assert!(
+            crate::forks::committee_workers_active(V1_FIXTURE_EPOCH),
+            "epoch {V1_FIXTURE_EPOCH} must be post-fork for this pin to mean anything; is \
+             TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment?"
+        );
+
+        let fixture = CommitteeWireFixture::multi_worker(V1_FIXTURE_EPOCH, 4, 3, 2);
+        let repr = fixture.v1_repr();
+        assert_eq!(
+            hex::encode(encode(&repr)),
+            GOLDEN_V1_COMMITTEE_HEX,
+            "post-fork shadow encode diverged from the frozen post-fork vector"
+        );
+
+        let committee = fixture.committee();
+        let bytes = encode(&committee);
+        assert_eq!(
+            hex::encode(&bytes),
+            GOLDEN_V1_COMMITTEE_HEX,
+            "post-fork Committee encode diverged from the frozen post-fork vector"
+        );
+
+        let decoded: Committee = try_decode(&unhex(GOLDEN_V1_COMMITTEE_HEX))
+            .expect("frozen post-fork vector decodes as a Committee");
+        assert_eq!(decoded.epoch(), V1_FIXTURE_EPOCH, "frozen post-fork epoch moved");
+        assert_eq!(decoded.size(), 4, "frozen post-fork authority count moved");
+        assert_eq!(decoded.bootstrap_servers().len(), 3, "frozen post-fork server count moved");
+        assert_eq!(decoded.number_of_workers(), 2, "the frozen post-fork worker count moved");
+        assert!(
+            decoded.bootstrap_servers().values().all(|server| server.num_workers() == 2),
+            "the frozen post-fork vector lost a worker from a length-prefixed list"
+        );
+        assert_eq!(
+            decoded
+                .bootstrap_servers()
+                .values()
+                .flat_map(|server| server.workers.iter())
+                .filter(|worker| worker.rpc.is_some())
+                .count(),
+            1,
+            "the frozen post-fork vector lost its single rpc endpoint"
+        );
+        assert_eq!(decoded, committee, "the frozen post-fork vector is a different committee");
+        assert_eq!(decoded.bootstrap_servers(), committee.bootstrap_servers());
+        assert_eq!(encode(&decoded), bytes, "post-fork re-encode diverged from the frozen vector");
+
+        // the shadow reads the gated bytes back, closing the same loop the pre-fork differential
+        // closes for the legacy arm
+        let read_back: CommitteeReprV1 =
+            try_decode(&bytes).expect("post-fork Committee bytes decode as the post-fork repr");
+        assert_eq!(read_back, repr, "post-fork Committee bytes are not the derived layout");
     }
 
     #[test]
