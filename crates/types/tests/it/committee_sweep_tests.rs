@@ -23,6 +23,14 @@
 //! wire holds exactly one worker per bootstrap server and carries no worker count at all, so a
 //! wider committee must be *unrepresentable*: those points assert the encoder fails closed
 //! rather than writing a committee that decodes as single-worker on every node.
+//!
+//! Two tests here are keepers rather than sweeps. The layout selector lives INSIDE the encoded
+//! value — the gate reads the committee's own `epoch`, the second of its four wire fields — so a
+//! corrupted epoch selects the wrong layout for the bytes that follow it. While a legacy arm still
+//! exists (`adiri`) that must fail loudly: a decode that resumed at a wrong offset would hand back
+//! a plausible-but-wrong committee. Without `adiri` the layout is active from genesis, so the same
+//! poke is expected to change the epoch value and nothing else, and the keeper for that lane says
+//! exactly that instead of asserting a failure that could only pass vacuously.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -243,6 +251,26 @@ impl SweepPoint {
         (0..self.workers_per_server).map(|worker| sweep_worker_node(slot, worker)).collect()
     }
 
+    /// The `authorities` map this point encodes, which is also the committee's first wire field.
+    ///
+    /// Built straight from the slot-derived keys rather than read back out of
+    /// [`Self::committee`], so it can serve as an independent measure of where that field ends.
+    fn authority_map(self) -> BTreeMap<BlsPublicKey, Authority> {
+        self.authority_slots()
+            .map(|(slot, key)| (key, Authority::new_for_test(key, Address::repeat_byte(slot))))
+            .collect()
+    }
+
+    /// Byte offset of the little-endian `epoch` field inside this point's encoded committee.
+    ///
+    /// bcs writes a struct as its fields back to back with no framing of its own, and
+    /// `authorities` is the first field of both layouts, so the epoch begins exactly where the
+    /// encoded authority map ends. Measured from that map rather than counted by hand, so nothing
+    /// here depends on how bcs sizes a BLS key, an [`Authority`], or a map's ULEB128 length prefix.
+    fn epoch_offset(self) -> usize {
+        encode(&self.authority_map()).len()
+    }
+
     /// Build the [`Committee`] this point describes.
     fn committee(self) -> Committee {
         let mut builder = CommitteeBuilder::new(self.epoch).with_num_workers(self.num_workers());
@@ -268,10 +296,6 @@ impl SweepPoint {
     /// [`Self::committee`], so a bug in the gated encoder cannot make the two sides of the length
     /// identity agree.
     fn legacy_mirror(self) -> LegacyCommitteeMirror {
-        let authorities = self
-            .authority_slots()
-            .map(|(slot, key)| (key, Authority::new_for_test(key, Address::repeat_byte(slot))))
-            .collect();
         let bootstrap_servers = self
             .bootstrap_slots()
             .map(|(slot, key)| {
@@ -282,7 +306,11 @@ impl SweepPoint {
                 (key, mirror)
             })
             .collect();
-        LegacyCommitteeMirror { authorities, epoch: self.epoch, bootstrap_servers }
+        LegacyCommitteeMirror {
+            authorities: self.authority_map(),
+            epoch: self.epoch,
+            bootstrap_servers,
+        }
     }
 
     /// The exact byte count an open gate adds to this point's wire, measured by encoding the parts
@@ -375,6 +403,51 @@ fn assert_committee_grid_point(point: SweepPoint) {
     );
 }
 
+/// The committee shape the two epoch-poke keepers below encode: the point where the two layouts
+/// diverge most, so a wrong-layout read has the least chance of accidentally lining up.
+///
+/// Post-fork every bootstrap server carries a ULEB128-prefixed worker list and the committee
+/// carries a trailing `num_workers`; the legacy shape carries one unprefixed worker per server and
+/// no count at all. Four authorities against three servers also gives the two maps distinct length
+/// prefixes, so a read that landed on the wrong map would not line up either.
+fn epoch_poke_point(epoch: Epoch) -> SweepPoint {
+    SweepPoint { epoch, authorities: 4, bootstrap_servers: 3, workers_per_server: 2 }
+}
+
+/// `bytes` with the four-byte little-endian `epoch` field at `offset` rewritten from `from` to
+/// `to`.
+///
+/// Checks the window it is about to overwrite really holds `from`, so a wrong offset fails here
+/// with a clear message instead of quietly corrupting some other field and leaving the callers
+/// below to prove nothing. The result keeps the original buffer's length, so a decode outcome
+/// follows from the layout the new epoch selects rather than from a buffer that grew or shrank.
+///
+/// # Panics
+///
+/// If `offset` does not hold `from`, if `from == to` (a poke that changes nothing), or if the
+/// rewrite left the bytes unchanged.
+fn poke_epoch(bytes: &[u8], offset: usize, from: Epoch, to: Epoch) -> Vec<u8> {
+    let window: Vec<u8> = bytes.iter().skip(offset).take(4).copied().collect();
+    assert_eq!(
+        from.to_le_bytes().to_vec(),
+        window,
+        "offset {offset} must land on the encoded epoch {from}"
+    );
+    assert_ne!(from, to, "an epoch poke that rewrites the epoch to itself proves nothing");
+
+    let replacement = to.to_le_bytes();
+    let poked: Vec<u8> = bytes
+        .iter()
+        .enumerate()
+        .map(|(position, byte)| {
+            position.checked_sub(offset).and_then(|index| replacement.get(index)).unwrap_or(byte)
+        })
+        .copied()
+        .collect();
+    assert_ne!(bytes, poked.as_slice(), "the poke must actually rewrite the epoch field");
+    poked
+}
+
 /// The epoch grid must straddle the gate the way this build's lane requires, or the sweep passes
 /// vacuously: an adiri grid with no pre-fork epoch silently drops the legacy arm and every
 /// fail-closed point, and a non-adiri grid is meant to be gate-open throughout.
@@ -424,4 +497,112 @@ fn test_committee_layout_parameter_sweep() {
             });
         });
     });
+}
+
+/// Negative keeper (adiri): rewriting the `epoch` field inside an encoded post-fork [`Committee`]
+/// to the dormant side of the fork makes the decoder read everything after it with the legacy field
+/// set, and that decode MUST fail.
+///
+/// The gate reads the epoch carried inside the value, so the layout selector travels with the very
+/// bytes it selects for and one corrupted field can point it at the wrong layout. Succeeding here
+/// is the dangerous outcome, not the reassuring one: it would mean the legacy arm consumed
+/// post-fork bytes at a wrong offset and produced a plausible committee — some other validator set,
+/// worker count or bootstrap topology than the bytes describe — where it should have rejected them.
+///
+/// Adiri-only because it needs a legacy arm to mis-select; every other build is gate-open from
+/// genesis, which the sibling below states instead. Both epochs come from
+/// [`tn_types::forks::COMMITTEE_WORKERS_FORK_EPOCH`], so arming the fork retargets this keeper with
+/// no edit here.
+#[cfg(feature = "adiri")]
+#[test]
+fn test_committee_epoch_corruption_fails_loudly() {
+    let post_fork = tn_types::forks::COMMITTEE_WORKERS_FORK_EPOCH;
+    // the corruption nearest the boundary: one epoch below the gate, which while the constant is
+    // the `u32::MAX` placeholder is a single byte of the encoded epoch
+    let pre_fork = post_fork - 1;
+    assert!(
+        committee_workers_active(post_fork),
+        "epoch {post_fork} must be gate-open for this keeper to encode the post-fork layout; is \
+         TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment?"
+    );
+    assert!(
+        !committee_workers_active(pre_fork),
+        "epoch {pre_fork} must be dormant for this keeper to mean anything; is \
+         TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed at \
+         epoch 0?"
+    );
+
+    let point = epoch_poke_point(post_fork);
+    let committee = point.committee();
+    let bytes = encode(&committee);
+
+    // anti-vacuity: the fixture's own bytes must decode, or the failure below could just as well
+    // be a broken fixture
+    let honest: Committee =
+        try_decode(&bytes).expect("the post-fork fixture decodes its own wire bytes");
+    assert_eq!(post_fork, honest.epoch(), "fixture lost its epoch across an honest decode");
+    assert_eq!(
+        usize::from(point.workers_per_server),
+        honest.number_of_workers(),
+        "fixture lost its worker count across an honest decode"
+    );
+
+    let corrupted = poke_epoch(&bytes, point.epoch_offset(), post_fork, pre_fork);
+    assert!(
+        try_decode::<Committee>(&corrupted).is_err(),
+        "an epoch-corrupted committee must fail to decode, not resume at a wrong offset and hand \
+         back a plausible committee"
+    );
+}
+
+/// The gate-open counterpart (non-adiri): with the multi-worker layout active from genesis there is
+/// no legacy arm to mis-select, so poking the `epoch` field changes that value and nothing else.
+///
+/// This is the honest form of the keeper above on a build with a single layout. The poked bytes
+/// still decode, and they re-encode byte-exactly, which is what proves the layout did not shift
+/// under them. Requiring a loud failure here would pass vacuously: the epoch is not a layout
+/// selector on this lane.
+#[cfg(not(feature = "adiri"))]
+#[test]
+fn test_committee_epoch_poke_leaves_the_genesis_active_layout_intact() {
+    // genesis is the poke target because under `adiri` it is the deepest dormant epoch there is,
+    // so this states plainly that no epoch selects a different layout here. no constant marks a
+    // boundary on this lane, so the source epoch is a literal like the rest of the non-adiri grid.
+    let poked_epoch: Epoch = 0;
+    let point = epoch_poke_point(5);
+    assert!(
+        committee_workers_active(point.epoch) && committee_workers_active(poked_epoch),
+        "the multi-worker layout is active from genesis without `adiri`, so both epochs must be \
+         gate-open; is TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment?"
+    );
+
+    let committee = point.committee();
+    let bytes = encode(&committee);
+
+    // anti-vacuity: the fixture's own bytes must decode, or what follows proves nothing
+    let honest: Committee = try_decode(&bytes).expect("the fixture decodes its own wire bytes");
+    assert_eq!(point.epoch, honest.epoch(), "fixture lost its epoch across an honest decode");
+
+    let corrupted = poke_epoch(&bytes, point.epoch_offset(), point.epoch, poked_epoch);
+    let poked: Committee =
+        try_decode(&corrupted).expect("one layout at every epoch: the poked bytes still decode");
+    assert_eq!(poked_epoch, poked.epoch(), "the poked committee must carry the poked epoch");
+    assert_eq!(
+        committee.number_of_workers(),
+        poked.number_of_workers(),
+        "the poke must not move the worker count"
+    );
+    // `Committee`'s PartialEq deliberately ignores bootstrap servers, so compare those directly:
+    // they are the half of this layout no equality above can see
+    assert_eq!(
+        committee.bootstrap_servers(),
+        poked.bootstrap_servers(),
+        "the poke must not reshape a bootstrap server"
+    );
+    assert_eq!(
+        corrupted,
+        encode(&poked),
+        "the poked committee must re-encode byte-exactly: only the epoch value changed, not the \
+         layout it selects"
+    );
 }
