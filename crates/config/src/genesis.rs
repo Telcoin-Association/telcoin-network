@@ -430,9 +430,24 @@ mod tests {
     /// Default builds have the multi-worker committee layout active from genesis, so an agreed
     /// count above one is a valid genesis and reaches the committee unchanged; the adiri lane
     /// covers the pre-fork rejection below.
+    ///
+    /// The `cfg` selects this test on this crate's feature set, but the gate it relies on lives in
+    /// tn-types — so the two can desync, and the runtime check below is what names it. A build
+    /// where tn-config compiles without `adiri` while tn-types compiles with it (feature
+    /// unification from elsewhere in the graph, or a missing `tn-config/adiri` forward) would
+    /// otherwise reach `validate` and fail with a fork-rejection message this lane never expects.
     #[cfg(not(feature = "adiri"))]
     #[test]
     fn test_validate_genesis_agrees_on_worker_count() {
+        // spelled out through tn_types rather than the module's import, because which crate owns
+        // the gate is the whole point of the desync this catches
+        assert!(
+            tn_types::forks::committee_workers_active(0),
+            "epoch 0 must be post-fork for this lane to mean anything: tn-config compiled without \
+             `adiri` yet the gate is dormant, so tn-types' `adiri` feature is desynced from this \
+             crate's; is TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment?"
+        );
+
         let mut network_genesis = NetworkGenesis::new_for_test();
         (0..4).for_each(|v| network_genesis.add_validator(validator_with_workers(v, 2)));
         assert!(network_genesis.validate().is_ok());
