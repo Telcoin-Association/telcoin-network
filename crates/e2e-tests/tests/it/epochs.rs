@@ -24,8 +24,8 @@ use tn_reth::{
 use tn_storage::pack_validate::{validate_pack_file, Verdict};
 use tn_test_utils::wait_until;
 use tn_types::{
-    forks::committee_workers_active, keccak256, Address, Epoch, EpochCertificate, EpochRecord,
-    Genesis, B256,
+    forks::{committee_workers_active, seed_signature_active},
+    keccak256, Address, Epoch, EpochCertificate, EpochRecord, Genesis, B256,
 };
 use tokio::time::timeout;
 use tracing::{debug, info};
@@ -43,6 +43,10 @@ const EPOCH_DURATION: u64 = 5;
 /// Environment variable selecting the committee-workers fork epoch (#554) for this process and
 /// every node it spawns (`tn_types::forks::committee_workers_fork_epoch_override`).
 const COMMITTEE_WORKERS_FORK_ENV: &str = "TN_COMMITTEE_WORKERS_FORK_EPOCH";
+
+/// Environment variable selecting the seed-signature fork epoch (#1032) for this process and every
+/// node it spawns (`tn_types::forks::seed_signature_fork_epoch_override`).
+const SEED_SIGNATURE_FORK_ENV: &str = "TN_SEED_SIGNATURE_FORK_EPOCH";
 
 /// Committee-workers fork epoch for [`test_epoch_sync_across_committee_workers_fork`].
 ///
@@ -474,10 +478,11 @@ fn fingerprint_sealed_packs(
 ///    which would mask the regression this pins, that restarting into an existing datadir leaves
 ///    closed epochs alone.
 ///
-/// Decoding a pack means decoding the [`tn_types::Committee`] in its `EpochMeta` record, whose bcs
-/// layout is selected by the committee's own epoch against the committee-workers fork
-/// ([`committee_workers_active`]). This process therefore has to sit on the same fork epoch the
-/// nodes wrote under, which is what [`pin_committee_workers_fork`] arranges.
+/// Decoding a pack reaches two epoch-gated layouts: the [`tn_types::Committee`] in its `EpochMeta`
+/// record, selected by the committee's own epoch against the committee-workers fork
+/// ([`committee_workers_active`]), and every nested `ConsensusHeader`, selected against the
+/// seed-signature fork ([`seed_signature_active`]). This process therefore has to sit on the same
+/// fork epochs the nodes wrote under for BOTH, which is what [`pin_fork_epochs`] arranges.
 fn assert_sealed_packs_unchanged(
     datadir: &Path,
     fingerprints: &BTreeMap<Epoch, B256>,
@@ -516,50 +521,75 @@ fn assert_sealed_packs_unchanged(
     Ok(())
 }
 
-/// Pin the committee-workers fork epoch (#554) for this process and every node it spawns.
+/// Pin every fork epoch this suite's decoding depends on — the committee-workers fork (#554) and
+/// the seed-signature fork (#1032) — for this process and every node it spawns.
 ///
-/// Step 8 decodes sealed pack bytes in the harness, so the harness's gate
-/// ([`committee_workers_active`]) has to resolve to the same fork point the nodes wrote under.
-/// Left alone the two disagree: `TestBinary::command` forwards `u32::MAX` to a child when the
-/// variable is unset, while this (non-adiri) harness build is active from genesis without it.
-/// Writing the variable settles both sides at once — children inherit it verbatim at spawn, and
-/// the harness's own override latches it on first read.
+/// Step 8 decodes sealed pack bytes in the harness, and that reaches both gates: the `EpochMeta`'s
+/// [`tn_types::Committee`] is laid out by [`committee_workers_active`] and every nested
+/// `ConsensusHeader` by [`seed_signature_active`]. So the harness has to resolve both to the same
+/// fork points the nodes wrote under. Left alone the two sides disagree the same way for each
+/// fork: `TestBinary::command` forwards `u32::MAX` to a child when the variable is unset, while
+/// this (non-adiri) harness build is active from genesis without it. Writing the variables settles
+/// both sides at once — children inherit them verbatim at spawn, and the harness's own overrides
+/// latch them on first read.
 ///
-/// `force` states a fork epoch outright, for a test whose claim is about a specific boundary.
-/// `None` inherits whatever the lane exported, defaulting to the dormant `u32::MAX` that
-/// `TestBinary::command` would have forwarded anyway, so `TN_COMMITTEE_WORKERS_FORK_EPOCH=1 make
-/// test-epochs` keeps meaning what it says.
+/// Both forks are pinned, not just the one a given test is about. Pinning only one leaves the other
+/// asymmetric whenever the suite runs outside the Makefile wrapper that exports it, and the
+/// symptom is misleading: children write dormant-layout headers, the harness decodes them as
+/// genesis-active, and step 8 reports a corrupt pack rather than an environment mismatch.
 ///
-/// Call once per test, before the first node spawn and before anything in the process reads the
-/// gate: the override is a process-wide `OnceLock` and the environment is process-wide too. That
+/// `force_committee_workers` states the committee-workers fork epoch outright, for a test whose
+/// claim is about a specific boundary. `None` — and the seed-signature pin always — inherits
+/// whatever the lane exported, defaulting to the dormant `u32::MAX` that `TestBinary::command`
+/// would have forwarded anyway, so `TN_COMMITTEE_WORKERS_FORK_EPOCH=1 make test-epochs` keeps
+/// meaning what it says.
+///
+/// Call once per test, before the first node spawn and before anything in the process reads either
+/// gate: the overrides are process-wide `OnceLock`s and the environment is process-wide too. That
 /// is sound because nextest runs each test in its own process (`.config/nextest.toml`); under
 /// plain `cargo test` two of these tests in one process would fight over it, and the assertions
 /// below are what turn that into a loud failure instead of a mis-decoded pack.
-fn pin_committee_workers_fork(force: Option<Epoch>) {
-    let fork_epoch = force.unwrap_or_else(|| {
-        std::env::var(COMMITTEE_WORKERS_FORK_ENV)
-            .ok()
-            .and_then(|raw| raw.trim().parse().ok())
-            .unwrap_or(u32::MAX)
-    });
-    std::env::set_var(COMMITTEE_WORKERS_FORK_ENV, fork_epoch.to_string());
+fn pin_fork_epochs(force_committee_workers: Option<Epoch>) {
+    // what `TestBinary::command` would forward to a child: the value the lane exported, or the
+    // dormant `u32::MAX` when it exported nothing. an unparseable value normalizes to the same
+    // dormant default the gate would have fallen back to.
+    let lane = |var: &str| -> Epoch {
+        std::env::var(var).ok().and_then(|raw| raw.trim().parse().ok()).unwrap_or(u32::MAX)
+    };
 
-    // Read the gate now, while a mismatch is still cheap to explain. The gate is `>=`, so it fires
-    // at the fork epoch and nowhere below it; both assertions hold for the dormant pin too, since
-    // `u32::MAX >= u32::MAX`.
+    // one shared helper rather than a block per fork, mirroring `TestBinary::command`, so the two
+    // cannot drift apart in mechanism; they arm independently, so each carries its own gate
+    pin_fork_epoch(
+        COMMITTEE_WORKERS_FORK_ENV,
+        force_committee_workers.unwrap_or_else(|| lane(COMMITTEE_WORKERS_FORK_ENV)),
+        committee_workers_active,
+    );
+    pin_fork_epoch(SEED_SIGNATURE_FORK_ENV, lane(SEED_SIGNATURE_FORK_ENV), seed_signature_active);
+}
+
+/// Write `fork_epoch` to the `var` override and check `gate` reads the same fork point back.
+///
+/// Reading the gate here, rather than leaving it to whatever decodes a pack minutes later, is what
+/// turns an override that latched before this pin into a named failure instead of a corrupt-looking
+/// pack.
+fn pin_fork_epoch(var: &str, fork_epoch: Epoch, gate: impl Fn(Epoch) -> bool) {
+    std::env::set_var(var, fork_epoch.to_string());
+
+    // The gate is `>=`, so it fires at the fork epoch and nowhere below it; both assertions hold
+    // for the dormant pin too, since `u32::MAX >= u32::MAX`.
     assert!(
-        committee_workers_active(fork_epoch),
-        "harness gate must be active at the pinned fork epoch {fork_epoch}: \
-         {COMMITTEE_WORKERS_FORK_ENV} latched to another value before this test pinned it"
+        gate(fork_epoch),
+        "harness gate must be active at the pinned fork epoch {fork_epoch}: {var} latched to \
+         another value before this test pinned it"
     );
     if let Some(below) = fork_epoch.checked_sub(1) {
         assert!(
-            !committee_workers_active(below),
-            "harness gate must be dormant below the pinned fork epoch {fork_epoch}: \
-             {COMMITTEE_WORKERS_FORK_ENV} latched to another value before this test pinned it"
+            !gate(below),
+            "harness gate must be dormant below the pinned fork epoch {fork_epoch}: {var} latched \
+             to another value before this test pinned it"
         );
     }
-    info!(target: "epoch-test", fork_epoch, "pinned the committee-workers fork epoch");
+    info!(target: "epoch-test", var, fork_epoch, "pinned a fork epoch");
 }
 
 /// Spin up the epoch-sync network and run [`test_epoch_sync_inner`] against it.
@@ -654,9 +684,9 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 /// Test that sync works to fill in missing epochs.
 async fn test_epoch_sync() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    // whatever fork epoch the lane stated, dormant by default - this test is about sync, not about
-    // the fork, but the harness still decodes pack bytes and must agree with the nodes
-    pin_committee_workers_fork(None);
+    // whatever fork epochs the lane stated, dormant by default - this test is about sync, not about
+    // either fork, but the harness still decodes pack bytes and must agree with the nodes
+    pin_fork_epochs(None);
 
     run_epoch_sync_scenario("epoch_sync").await.map(|_sealed| ())
 }
@@ -673,9 +703,10 @@ async fn test_epoch_sync() -> eyre::Result<()> {
 /// then decodes both layouts again from the harness.
 async fn test_epoch_sync_across_committee_workers_fork() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    // forced rather than inherited: this test's claim is a crossing at a known epoch, so it states
-    // the fork point even when the lane exported a different one
-    pin_committee_workers_fork(Some(CROSS_FORK_EPOCH));
+    // forced rather than inherited: this test's claim is a crossing at a known committee-workers
+    // epoch, so it states that fork point even when the lane exported a different one. the
+    // seed-signature pin still follows the lane - this test makes no claim about it.
+    pin_fork_epochs(Some(CROSS_FORK_EPOCH));
 
     let sealed = run_epoch_sync_scenario("epoch_sync_fork").await?;
 
