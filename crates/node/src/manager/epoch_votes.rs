@@ -34,6 +34,11 @@ pub(crate) const MAX_EPOCH_VOTE_TIMEOUTS: u32 = 24;
 /// `request_epoch_cert` call) after failing to reach a local vote quorum.
 pub(crate) const EPOCH_CERT_RECOVERY_ATTEMPTS: u32 = 5;
 
+/// Delay before gossiping our freshly-signed epoch vote, so slower nodes can reach the new epoch
+/// and hold its record before our vote arrives (otherwise they drop it and wait for a republish).
+/// The local collector is still seeded immediately; only the outbound gossip is staggered.
+const INITIAL_VOTE_PUBLISH_DELAY: Duration = Duration::from_millis(500);
+
 /// Both save and persist an epoch record and cert with logging.
 async fn save_and_persist_with_logs(
     db: &EpochRecordDb,
@@ -219,7 +224,10 @@ async fn manage_epoch_votes(
                                 target: "epoch-manager",
                                 "Network came to consensus on epoch record {new_epoch_hash} we expected epoch record {epoch_hash}, we have forked!",
                             );
-                            // We have forked so shut the node down.
+                            // We generated a different record than the network certified, so we
+                            // have forked. A fork is not something a node can safely recover from
+                            // (records are deterministic, so ours is simply wrong) — fail-stop
+                            // rather than adopt the network's record and pretend to recover.
                             node_shutdown.notify();
                         } else {
                             info!(
@@ -358,9 +366,19 @@ pub(crate) fn spawn_epoch_vote_collector(
             };
 
             let me = key_config.primary_public_key();
+            // Failsafe for a previous epoch whose certification failed (e.g. some of its committee
+            // were down for an hour or two). It should never fire under normal conditions.
+            //
+            // Deliberately NOT gated on node mode / `is_active_cvv()`: that reflects the CURRENT
+            // committee, but the node we need here was in epoch N-1's committee and may have rotated
+            // out of N's (now an `Observer`) — precisely the node that should re-vote to certify N-1.
+            // Membership in N-1's committee (checked below) is the only correct gate. This is already
+            // sync-safe: state-sync saves each record together with its cert (`epochs().save`) and
+            // never fires `epoch_record_watch`, so a syncing node's historic records are certified and
+            // this arm is skipped.
             if epoch_rec.epoch > 0 {
-                // Lets do a quick check that the previous epoch is certified and if it is not and we were in the committee start a new voting round.
-                // A syncing node by definition has to have certs for historic epochs so this will not fire during sync.
+                // Previous epoch has no cert; if we were in its committee, re-sign and re-publish our
+                // vote to trigger a fresh collection attempt.
                 if let Some((last_epoch_rec, None)) = consensus_chain.epochs().get_epoch_by_number(epoch_rec.epoch.saturating_sub(1)).await {
                     // No cert for last epoch.  Were we in the committee?
                     if last_epoch_rec.committee.contains(&me) {
@@ -390,7 +408,15 @@ pub(crate) fn spawn_epoch_vote_collector(
                     );
                     // Sending our vote to this channel will trigger us to start the vote collector when we get it.
                     let _ = consensus_bus.new_epoch_votes().send(epoch_vote).await;
-                    let _ = primary_network.publish_epoch_vote(epoch_vote).await;
+                    let primary_network_clone = primary_network.clone();
+                    task_spawner.spawn_task("publish_epoch_vote_delayed", async move {
+                        // Stagger the outbound gossip (see INITIAL_VOTE_PUBLISH_DELAY) so slower
+                        // nodes reach the new epoch and hold its record before our vote arrives;
+                        // republishes cover any that still miss it.
+                        tokio::time::sleep(INITIAL_VOTE_PUBLISH_DELAY).await;
+                        let _ = primary_network_clone.publish_epoch_vote(epoch_vote).await;
+                        Ok(())
+                    });
                 }
             }
         }
@@ -452,7 +478,7 @@ mod epoch_vote_collector_tests {
     use tn_network_libp2p::types::{MessageId, NetworkCommand};
     use tn_primary::{
         network::{PrimaryRequest, PrimaryResponse},
-        ConsensusBus,
+        ConsensusBus, NodeMode,
     };
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::wait_until;
@@ -1157,6 +1183,104 @@ mod epoch_vote_collector_tests {
         assert!(cert.signed_authorities.contains(2));
 
         // Shutdown
+        node_shutdown.notify();
+    }
+
+    /// The previous-epoch certification failsafe is gated on PREVIOUS-committee membership, NOT on
+    /// node mode. A node that was in epoch N-1's committee but has rotated out of N's committee
+    /// runs as an `Observer` (`is_active_cvv() == false`), yet it must still re-vote to help
+    /// certify an uncertified N-1. Here kp1 is in epoch 0's committee but not epoch 1's; epoch
+    /// 0 needs kp1's failsafe vote to reach quorum, so it certifies only because the failsafe
+    /// is not mode-gated.
+    #[tokio::test]
+    async fn test_previous_epoch_recovery_not_gated_by_node_mode() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+
+        // Node is kp1: in epoch 0's committee (super_quorum 3) but rotated OUT of epoch 1's.
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        // Previous epoch (0): uncertified, kp1 in committee — the failsafe target.
+        let prev_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk2, pk3, pk4],
+            ..Default::default()
+        };
+        let prev_hash = prev_rec.digest();
+        // Current epoch (1): kp1 is NOT in this committee (rotated out).
+        let cur_rec = EpochRecord {
+            epoch: 1,
+            committee: vec![pk2, pk3, pk4],
+            next_committee: vec![pk2, pk3, pk4],
+            ..Default::default()
+        };
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("prev_epoch_recovery_not_gated").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+
+        // Seed both records uncertified so the collector's `get_epoch_by_*` lookups find them.
+        consensus_chain.epochs().save_record(prev_rec.clone()).await.unwrap();
+        consensus_chain.epochs().save_record(cur_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
+
+        // Mock network: drain and ack publishes.
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move {
+            while let Some(cmd) = net_rx.recv().await {
+                if let NetworkCommand::Publish { reply, .. } = cmd {
+                    let _ = reply.send(Ok(MessageId::new(b"test")));
+                }
+            }
+        });
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::new();
+
+        // kp1 rotated out of epoch 1's committee, so it runs as an Observer — is_active_cvv() is
+        // false. The failsafe must still fire because kp1 was in epoch 0's committee.
+        consensus_bus.app().node_mode().send_replace(NodeMode::Observer);
+
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.clone(),
+        );
+
+        // Two epoch-0 peers vote — one short of quorum(3). Only kp1's failsafe vote can complete
+        // it.
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        consensus_bus.app().new_epoch_votes().send(prev_rec.sign_vote(&kc2)).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(prev_rec.sign_vote(&kc3)).await.unwrap();
+
+        // Epoch 1 arriving triggers the previous-epoch failsafe for epoch 0.
+        consensus_bus.app().epoch_record_watch().send_replace(Some(cur_rec.clone()));
+
+        // Despite the Observer mode, the failsafe re-votes for epoch 0 and completes quorum.
+        wait_until(Duration::from_secs(5), "epoch 0 certified via failsafe", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(prev_hash).await.is_some())
+        })
+        .await
+        .unwrap();
+
         node_shutdown.notify();
     }
 }
