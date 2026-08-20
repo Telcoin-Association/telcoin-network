@@ -3574,16 +3574,21 @@ pub(crate) mod test {
         );
     }
 
-    /// Epoch of the frozen pre-fork pack: 407.
+    /// Epoch of the frozen pre-fork pack: 406.
     ///
-    /// `CONSENSUS_REGISTRY_FORK_EPOCH`, the documented arming floor of the committee worker-list
-    /// fork (#554), and the same epoch `tn_types`' `LEGACY_FIXTURE_EPOCH` pins — so the frozen
-    /// committee vector there and the frozen pack file here describe one wire moment from opposite
-    /// ends of the stack. Under `adiri` it sits below the worker fork (dormant at `u32::MAX`), so
-    /// the embedded [`Committee`] encodes in the legacy single-worker layout, and at or above
-    /// `SEED_SIGNATURE_FORK_EPOCH` (383), so the nested headers carry `seed_signature`: exactly the
-    /// shape of an epoch pack sitting on an adiri node's disk today.
-    const LEGACY_PACK_EPOCH: Epoch = 407;
+    /// One epoch below `CONSENSUS_REGISTRY_FORK_EPOCH` (407), the documented arming floor of the
+    /// committee worker-list fork (#554), and the same epoch `tn_types`' `LEGACY_FIXTURE_EPOCH`
+    /// pins — so the frozen committee vector there and the frozen pack file here describe one wire
+    /// moment from opposite ends of the stack.
+    ///
+    /// One below the floor rather than the floor itself, because the fork may legally be armed AT
+    /// 407: the gate is `>=`, so 407 would become post-fork and the anti-vacuity assert in
+    /// `test_golden_legacy_pack_regenerates` would fail. 406 is structurally pre-fork under every
+    /// legal arming, so the embedded [`Committee`] encodes in the legacy single-worker layout
+    /// whichever epoch the arming PR picks. It is still at or above `SEED_SIGNATURE_FORK_EPOCH`
+    /// (383), so the nested headers carry `seed_signature`: exactly the shape of an epoch pack
+    /// sitting on an adiri node's disk today.
+    const LEGACY_PACK_EPOCH: Epoch = 406;
 
     /// Final consensus number of the epoch before [`LEGACY_PACK_EPOCH`].
     ///
@@ -3602,7 +3607,7 @@ pub(crate) mod test {
     /// Last consensus number in the frozen pack, which holds two outputs.
     const LEGACY_PACK_LAST_CONSENSUS: u64 = LEGACY_PACK_PREV_CONSENSUS + 2;
 
-    /// FROZEN pre-fork epoch pack: the complete, sealed `epoch-407/data` file (978 bytes) a build
+    /// FROZEN pre-fork epoch pack: the complete, sealed `epoch-406/data` file (978 bytes) a build
     /// of this crate writes at [`LEGACY_PACK_EPOCH`] on the `adiri` lane — data header, then an
     /// `EpochMeta` record whose [`Committee`] is in the legacy single-worker layout, then two
     /// consensus outputs (header record followed by its batch record, the v1 ordering).
@@ -3615,6 +3620,9 @@ pub(crate) mod test {
     ///
     /// If a test here fails, work out WHICH pin moved before touching this constant:
     ///
+    /// - [`LEGACY_PACK_EPOCH`] moving is the one legitimate reason to re-freeze these bytes: the
+    ///   epoch is a field of the `EpochMeta`, of every nested header and of every batch, so its
+    ///   bytes move with it. Regenerate from `test_golden_legacy_pack_regenerates`, never by hand.
     /// - `tn_types`' `golden_legacy_committee_wire_bytes_pinned` also failing means the committee
     ///   wire layout moved. That is a compatibility break to fix in the encoder, NOT a constant to
     ///   refresh — refreshing it strands every pack already written.
@@ -3624,14 +3632,14 @@ pub(crate) mod test {
     ///   committee assertion next to a red byte-identity assertion is the "container moved" signal.
     ///
     /// The fixture takes no rng, no clock and no OS-assigned port, so nothing else can move it.
-    const GOLDEN_LEGACY_PACK_HEX: &str = "74656c6e65740100fcd1899ff6d1e6500100000001000000e208b486aa01000028b52ffd00580d0d0004170097010000026085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e8735140260ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b8444414010b047f00000191029c41cd032408011220b14a3296426492458270c2e577fdc549b6d67155e5800b0bf96c3f4106b4ae7100a029c602145e9a9f1672b151652377fa8c23fc78ded1add621fe177d33b8ebcd4214009c40e0fcb53429020d03e8f4e471ec73993f9329ad0d76e69cfdfcb08c94aa39fdab28055139b0f6daf33b3fdc294e2bfc1ad914de91f7d6e9f717b4509c047fbc6acc008d2300921000205e8c207a1100b88654650c7403e7886b049c00d2c0070e2df686f8d09a0f642c550918b62b0d7882a193613a78d24e27a7100503d0f621c500000028b52ffd0058e50500740a02207a017b403bb2f1bcfe223c27bf0d350aa0dc2e7f02f257580d538ac8a36f21223d29010000009701000001000120cd320d69a6101da84655bd1164f4ae8eca33019ec39900d453153855c9b0614b002000309455941aa83bcaa9f33fa21533d526c4b824ef51132c5629a21619f9975befc7fcf1097d590c01356c37ba346bfc2c42203cd4585ccad5b8f09b28c2444dfda62125ab6d4c235efc635ecc10ddf4f447048d2307000833c000bf60980d828607f61b184a03dc54c7ce081e00000028b52ffd0058ad000060010108019701000014000700031000044e252302eedd7021e300000028b52ffd0058d50600640c02202463b8f4d9ece8aae9530e1e7bf678e44cc7e4c5d259e42d44375bfa5be398b3015237b9c5d795289c9a054ba2761ff631cd622c9d94df6ab749814cede8549d3f020000009701000002000120a5ae45f82b326fa9462a5e73672f9dc4900564f4294edcf58fc85edf762ae931002000309455941aa83bcaa9f33fa21533d526c4b824ef51132c5629a21619f9975befc7fcf1097d590c01356c37ba346bfc2c42206f9ec6c464377d4f9f935156387873e428662cfe18ef258641136a71aa5cb7da8e2306000833c000bf60980d828607f63703300371df93221e00000028b52ffd0058ad000060010108029701000014000700031000044e2523026a86ea72";
+    const GOLDEN_LEGACY_PACK_HEX: &str = "74656c6e6574010091dcabc6ad9363a20100000001000000a9434593aa01000028b52ffd00580d0d0004170096010000026085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e8735140260ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b8444414010b047f00000191029c41cd032408011220b14a3296426492458270c2e577fdc549b6d67155e5800b0bf96c3f4106b4ae7100a029c602145e9a9f1672b151652377fa8c23fc78ded1add621fe177d33b8ebcd4214009c40e0fcb53429020d03e8f4e471ec73993f9329ad0d76e69cfdfcb08c94aa39fdab28055139b0f6daf33b3fdc294e2bfc1ad914de91f7d6e9f717b4509c047fbc6acc008d2300921000205e8c207a1100b88654650c7403e7886b049c00d2c0070e2df686f8d09a0f642c550918b62b0d7882a193613a78d24e27a71005806fcb4ec500000028b52ffd0058e50500740a02207a017b403bb2f1bcfe223c27bf0d350aa0dc2e7f02f257580d538ac8a36f21223d29010000009601000001000120c0a1c7fd531551d30b3db2802e873b75067059e1d41d433b8e086c0b79143b5e002000309455941aa83bcaa9f33fa21533d526c4b824ef51132c5629a21619f9975befc7fcf1097d590c01356c37ba346bfc2c42203cd4585ccad5b8f09b28c2444dfda62125ab6d4c235efc635ecc10ddf4f447048d2307000833c000bf60980d828607f61b184a03dc39a570361e00000028b52ffd0058ad000060010108019601000014000700031000044e2523027f4c188fe300000028b52ffd0058d50600640c0220e9ef2e767a88948d2c477c097f516a936acdc86a3ea64f290630d28c5030d6e3015237b9c5d795289c9a054ba2761ff631cd622c9d94df6ab749814cede8549d3f02000000960100000200012031a3a82b0b9828c83bafb69afd821c11801ec62cfb6a88b7fed03599e21b507c002000309455941aa83bcaa9f33fa21533d526c4b824ef51132c5629a21619f9975befc7fcf1097d590c01356c37ba346bfc2c42206f9ec6c464377d4f9f935156387873e428662cfe18ef258641136a71aa5cb7da8e2306000833c000bf60980d828607f637033003692185471e00000028b52ffd0058ad000060010108029601000014000700031000044e252302fb1782dc";
 
     /// Decode [`GOLDEN_LEGACY_PACK_HEX`], failing loudly on a malformed constant.
     fn golden_legacy_pack_bytes() -> Vec<u8> {
         tn_types::hex::decode(GOLDEN_LEGACY_PACK_HEX).expect("frozen hex vector must be valid hex")
     }
 
-    /// Lay the frozen bytes down as a bare `epoch-407/data` file with NO sidecar indexes, and
+    /// Lay the frozen bytes down as a bare `epoch-406/data` file with NO sidecar indexes, and
     /// return its path.
     ///
     /// The strictest shape a read door can be handed: nothing but the pack stream, so whatever it
