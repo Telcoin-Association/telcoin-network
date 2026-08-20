@@ -1096,12 +1096,13 @@ pub fn quorum_threshold(committee_members: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, BootstrapServer,
-        Committee, Multiaddr, NetworkKeypair, ParseAuthorityIdentifierError, ReputationScores,
-        EQUAL_VOTING_POWER,
+        encode, try_decode, Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey,
+        BootstrapServer, Committee, Epoch, Multiaddr, NetworkKeypair, P2pNode,
+        ParseAuthorityIdentifierError, ReputationScores, RpcInfo, EQUAL_VOTING_POWER,
     };
     use rand::rng;
-    use std::collections::BTreeMap;
+    use serde::{Deserialize, Serialize};
+    use std::{collections::BTreeMap, num::NonZeroUsize};
 
     #[test]
     fn committee_load() {
@@ -1316,6 +1317,376 @@ mod tests {
         assert_eq!(decoded.number_of_workers(), 2);
         assert_eq!(decoded.bootstrap_servers().len(), 4);
         assert!(decoded.bootstrap_servers().values().all(|server| server.num_workers() == 2));
+    }
+
+    /// Legacy (pre-#554) shadow of the [`BootstrapServer`] wire layout: a primary plus a single
+    /// unprefixed `worker`.
+    ///
+    /// Derived serde, so it is byte-identical to the `origin/main` `BootstrapServer` derive output
+    /// BY CONSTRUCTION — same field types, same order, same attributes. #554 left [`P2pNode`]
+    /// untouched, so the real type is reused here rather than shadowed: only the field that
+    /// changed shape gets a shadow.
+    #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+    struct BootstrapReprLegacy {
+        /// The p2p info the primary.
+        primary: P2pNode,
+        /// The p2p info the worker.
+        worker: P2pNode,
+    }
+
+    impl From<BootstrapReprLegacy> for BootstrapServer {
+        fn from(value: BootstrapReprLegacy) -> Self {
+            let BootstrapReprLegacy { primary, worker } = value;
+            Self { primary, workers: vec![worker] }
+        }
+    }
+
+    /// Legacy (pre-#554) shadow of the [`CommitteeInner`] wire layout: its three serialized
+    /// fields, with derived serde, so it is byte-identical to the `origin/main` derive output BY
+    /// CONSTRUCTION.
+    ///
+    /// `origin/main` interleaved three `#[serde(skip)]` helper fields between these
+    /// (`authorities_by_id`, `quorum_threshold`, `validity_threshold`). Skipped fields never reach
+    /// the wire, so omitting them preserves both the field set and its order. Names are absent
+    /// too: bcs writes neither struct nor field names, so only the types and their order decide
+    /// the bytes and no `#[serde(rename)]` is load-bearing here.
+    #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+    struct CommitteeReprLegacy {
+        /// The authorities of epoch.
+        authorities: BTreeMap<BlsPublicKey, Authority>,
+        /// The epoch number of this committee.
+        epoch: Epoch,
+        /// The bootstrap servers to initially join a network.
+        bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapReprLegacy>,
+    }
+
+    /// Build the real [`Committee`] a legacy shadow describes.
+    ///
+    /// The worker count is one: the legacy layout holds exactly one worker per bootstrap server
+    /// and carries no count field, so a single-worker committee is the only thing it can express.
+    fn committee_from_legacy_repr(repr: &CommitteeReprLegacy) -> Committee {
+        let bootstrap_servers = repr
+            .bootstrap_servers
+            .iter()
+            .map(|(key, server)| (*key, server.clone().into()))
+            .collect();
+        Committee::new(repr.authorities.clone(), repr.epoch, bootstrap_servers, super::ONE_WORKER)
+    }
+
+    /// Project a [`Committee`] onto its legacy shadow, so both sides of the differential can also
+    /// be derived from a single committee rather than only from a single fixture.
+    ///
+    /// # Panics
+    ///
+    /// If any bootstrap server advertises anything other than exactly one worker. The legacy
+    /// layout has no field to hold a second worker, so such a committee has no legacy shadow at
+    /// all — the same value the pre-fork encoder refuses to write rather than truncate.
+    fn legacy_repr_from_committee(committee: &Committee) -> CommitteeReprLegacy {
+        let bootstrap_servers = committee
+            .inner
+            .bootstrap_servers
+            .iter()
+            .map(|(key, server)| {
+                let [worker] = server.workers.as_slice() else {
+                    panic!(
+                        "the legacy layout holds exactly one worker per bootstrap server, got {}",
+                        server.workers.len()
+                    );
+                };
+                let repr =
+                    BootstrapReprLegacy { primary: server.primary.clone(), worker: worker.clone() };
+                (*key, repr)
+            })
+            .collect();
+        CommitteeReprLegacy {
+            authorities: committee.inner.authorities.clone(),
+            epoch: committee.inner.epoch,
+            bootstrap_servers,
+        }
+    }
+
+    /// Epoch of the legacy-layout fixtures: 407, which is `CONSENSUS_REGISTRY_FORK_EPOCH` and the
+    /// documented arming floor of the committee worker-list fork.
+    ///
+    /// It sits below the worker fork epoch under every build, so `adiri` encodes it in the legacy
+    /// layout. Choosing the floor rather than an arbitrary number puts the fixture on the first
+    /// epoch whose single-worker guarantee is operational rather than structural — the pre-fork
+    /// epoch with the least margin for error.
+    const LEGACY_FIXTURE_EPOCH: Epoch = 407;
+
+    /// Seed tag marking a fixture primary's network key, so no primary shares a key with a worker.
+    const PRIMARY_SEED_TAG: u8 = 0xB0;
+    /// Seed tag marking a fixture worker's network key.
+    const WORKER_SEED_TAG: u8 = 0xC0;
+
+    /// Deterministic BLS keypair for fixture authority slot `slot`.
+    ///
+    /// Built from a fixed scalar rather than a seeded rng, so the derived public key — and with it
+    /// the `authorities` map order and every encoded byte — is stable across `rand` version bumps
+    /// as well as across runs. The leading bytes stay zero, which keeps the scalar far below the
+    /// BLS12-381 group order and nonzero, the only two values `blst` rejects.
+    fn fixture_bls_keypair(slot: u8) -> BlsKeypair {
+        let mut scalar = [0_u8; 32];
+        scalar[30] = slot;
+        scalar[31] = 0x2A;
+        BlsKeypair::from_bytes(&scalar).expect("fixture bls scalar is a valid private key")
+    }
+
+    /// A fixed 32-byte ed25519 secret seed identifying one fixture node.
+    fn fixture_seed(tag: u8, authority: u8, worker: u8) -> [u8; 32] {
+        let mut seed = [0_u8; 32];
+        seed[0] = tag;
+        seed[1] = authority;
+        seed[2] = worker;
+        seed
+    }
+
+    /// A [`P2pNode`] from a fixed ed25519 seed and port.
+    ///
+    /// ed25519 secret keys *are* 32-byte seeds, so a fixed seed yields a fixed public key with no
+    /// rng in the path; the multiaddr comes from a literal rather than an OS-assigned port.
+    fn fixture_p2p_node(seed: [u8; 32], port: u16, rpc: Option<RpcInfo>) -> P2pNode {
+        P2pNode {
+            network_address: format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+                .parse()
+                .expect("fixture multiaddr parses"),
+            network_key: NetworkKeypair::ed25519_from_bytes(seed)
+                .expect("a 32-byte array is a valid ed25519 secret seed")
+                .public()
+                .clone()
+                .into(),
+            rpc,
+        }
+    }
+
+    /// The primary node of fixture authority `authority`. Primaries never advertise rpc.
+    fn fixture_primary_node(authority: u8) -> P2pNode {
+        fixture_p2p_node(
+            fixture_seed(PRIMARY_SEED_TAG, authority, 0),
+            40_000 + u16::from(authority),
+            None,
+        )
+    }
+
+    /// Worker `worker` of fixture authority `authority`.
+    ///
+    /// The first worker of the first authority advertises an rpc endpoint and no other worker
+    /// does, so both arms of [`P2pNode::rpc`]'s `Option` appear in the encoded fixture.
+    fn fixture_worker_node(authority: u8, worker: u8) -> P2pNode {
+        let rpc = (authority == 0 && worker == 0).then(|| RpcInfo {
+            http: "https://validator0.example.com:8545/".parse().expect("fixture http url"),
+            ws: Some("wss://validator0.example.com:8546/".parse().expect("fixture ws url")),
+        });
+        fixture_p2p_node(
+            fixture_seed(WORKER_SEED_TAG, authority, worker),
+            41_000 + u16::from(authority) * 8 + u16::from(worker),
+            rpc,
+        )
+    }
+
+    /// Shape of a deterministic committee fixture for wire-layout tests.
+    ///
+    /// Every value it produces — BLS keys, network keys, multiaddrs, execution addresses, rpc
+    /// endpoints — is derived from a constant plus a slot index, with no rng, no clock and no
+    /// OS-assigned port, so the encoded bytes are reproducible across runs, machines and
+    /// dependency bumps. Here that matters more than realism: these fixtures anchor the
+    /// differential assertions below and, later, frozen golden byte vectors.
+    #[derive(Clone, Copy, Debug)]
+    struct CommitteeWireFixture {
+        /// The committee's epoch, which is the only input the wire-layout gate reads.
+        epoch: Epoch,
+        /// Number of authorities. Must be at least two: `CommitteeInner::load` asserts a committee
+        /// larger than one.
+        authorities: u8,
+        /// Number of bootstrap servers, attached to authority slots `0..bootstrap_servers`.
+        ///
+        /// Tracked separately from [`Self::authorities`] because the two maps are independent on
+        /// the wire: a committee may carry fewer bootstrap hints than it has authorities. Letting
+        /// the two lengths differ gives the maps distinct ULEB128 length prefixes, so a layout
+        /// that read one where the other belongs would not line up.
+        bootstrap_servers: u8,
+        /// Workers each bootstrap server advertises, which is also the committee's worker count.
+        workers_per_server: u8,
+    }
+
+    impl CommitteeWireFixture {
+        /// A single-worker fixture: the only shape the legacy layout can express.
+        const fn single_worker(epoch: Epoch, authorities: u8, bootstrap_servers: u8) -> Self {
+            Self { epoch, authorities, bootstrap_servers, workers_per_server: 1 }
+        }
+
+        /// The committee-level worker count this fixture describes.
+        fn num_workers(self) -> NonZeroUsize {
+            NonZeroUsize::new(usize::from(self.workers_per_server))
+                .expect("a fixture runs at least one worker per server")
+        }
+
+        /// The fixture's authorities, keyed by BLS public key.
+        ///
+        /// Shared by both builders below: #554 left this field's layout untouched, and a byte
+        /// comparison is only meaningful when both sides hold the same values. Only the fields
+        /// whose shape changed are built twice.
+        fn authority_map(self) -> BTreeMap<BlsPublicKey, Authority> {
+            (0..self.authorities)
+                .map(|slot| {
+                    let key = *fixture_bls_keypair(slot).public();
+                    (key, Authority::new(key, Address::repeat_byte(slot)))
+                })
+                .collect()
+        }
+
+        /// The `(slot, bls key)` pairs that carry a bootstrap server.
+        ///
+        /// # Panics
+        ///
+        /// If the fixture has more bootstrap servers than authorities: servers attach to authority
+        /// slots, so a wider fixture would key them off nonexistent authorities.
+        fn bootstrap_slots(self) -> impl Iterator<Item = (u8, BlsPublicKey)> {
+            assert!(
+                self.bootstrap_servers <= self.authorities,
+                "fixture has {} bootstrap servers but only {} authorities to attach them to",
+                self.bootstrap_servers,
+                self.authorities
+            );
+            (0..self.bootstrap_servers).map(|slot| (slot, *fixture_bls_keypair(slot).public()))
+        }
+
+        /// Build the [`Committee`] this fixture describes.
+        fn committee(self) -> Committee {
+            let bootstrap_servers = self
+                .bootstrap_slots()
+                .map(|(slot, key)| {
+                    let workers = (0..self.workers_per_server)
+                        .map(|worker| fixture_worker_node(slot, worker))
+                        .collect();
+                    (key, BootstrapServer::new(fixture_primary_node(slot), workers))
+                })
+                .collect();
+            Committee::new(self.authority_map(), self.epoch, bootstrap_servers, self.num_workers())
+        }
+
+        /// Build the legacy shadow this fixture describes.
+        ///
+        /// Reaches the shadow reprs straight from the slot-derived keys and nodes, never through
+        /// [`Self::committee`], so a bug in the gated encoder cannot make the two sides of the
+        /// differential agree.
+        ///
+        /// # Panics
+        ///
+        /// If the fixture runs more than one worker per server. The legacy layout carries exactly
+        /// one unprefixed `worker` per bootstrap server and no count field, so a wider fixture has
+        /// no legacy shadow at all.
+        fn legacy_repr(self) -> CommitteeReprLegacy {
+            assert_eq!(
+                self.workers_per_server, 1,
+                "the legacy layout holds exactly one worker per bootstrap server"
+            );
+            let bootstrap_servers = self
+                .bootstrap_slots()
+                .map(|(slot, key)| {
+                    let repr = BootstrapReprLegacy {
+                        primary: fixture_primary_node(slot),
+                        worker: fixture_worker_node(slot, 0),
+                    };
+                    (key, repr)
+                })
+                .collect();
+            CommitteeReprLegacy {
+                authorities: self.authority_map(),
+                epoch: self.epoch,
+                bootstrap_servers,
+            }
+        }
+    }
+
+    /// The legacy shadow reprs are self-consistent under bcs, reproducible, and describe the same
+    /// value as the [`Committee`] the same fixture builds.
+    ///
+    /// Runs on every lane so the reprs, the fixture and the conversions stay compiled and
+    /// exercised in builds whose gate never selects the legacy layout (non-adiri is post-fork from
+    /// genesis). The byte-level differential against the gated encoder is adiri-only, below.
+    #[test]
+    fn legacy_committee_repr_round_trips() {
+        let fixture = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3);
+        let repr = fixture.legacy_repr();
+        let bytes = encode(&repr);
+
+        // a second, independent build of the same fixture encodes to the same bytes: no rng,
+        // clock or OS-assigned port leaked into the fixture
+        assert_eq!(encode(&fixture.legacy_repr()), bytes, "fixture bytes are not reproducible");
+
+        // encode -> decode -> re-encode is byte-identical
+        let decoded: CommitteeReprLegacy =
+            try_decode(&bytes).expect("legacy repr decodes its own bytes");
+        assert_eq!(decoded, repr, "legacy repr lost data through bcs");
+        assert_eq!(encode(&decoded), bytes, "legacy repr re-encode diverged");
+
+        // the shadow and the real committee describe the same value in both directions.
+        // `Committee`'s PartialEq deliberately ignores bootstrap servers, so compare those too.
+        let committee = fixture.committee();
+        let from_repr = committee_from_legacy_repr(&repr);
+        assert_eq!(from_repr, committee, "legacy repr describes a different committee");
+        assert_eq!(
+            from_repr.bootstrap_servers(),
+            committee.bootstrap_servers(),
+            "legacy repr describes different bootstrap servers"
+        );
+        assert_eq!(
+            legacy_repr_from_committee(&committee),
+            repr,
+            "committee projects onto a different legacy repr"
+        );
+
+        // the two bootstrap layouts genuinely differ: the current shape length-prefixes its worker
+        // list, so the same value encodes exactly one byte longer. if these ever matched, the fork
+        // gate — and every assertion built on it — would be testing nothing.
+        let legacy_server = repr.bootstrap_servers.values().next().expect("fixture has servers");
+        let current_server = BootstrapServer::from(legacy_server.clone());
+        assert_eq!(
+            encode(&current_server).len(),
+            encode(legacy_server).len() + 1,
+            "the current bootstrap layout must differ from the legacy one"
+        );
+    }
+
+    /// Pre-fork differential: the epoch-gated [`Committee`] and the derived legacy shadow encode
+    /// to the same bytes, and each side reads what the other wrote.
+    ///
+    /// The `adiri` worker-fork epoch is a `u32::MAX` placeholder, so every epoch is pre-fork in
+    /// this lane. `TN_COMMITTEE_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the
+    /// override's `OnceLock` is process-wide and the whole test binary shares one process.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn committee_bcs_pre_fork_layout_matches_legacy_repr() {
+        let fixture = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3);
+        let committee = fixture.committee();
+        assert!(
+            !crate::forks::committee_workers_active(committee.epoch()),
+            "epoch {} must be pre-fork for this differential to mean anything; is \
+             TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed?",
+            committee.epoch()
+        );
+
+        let repr = fixture.legacy_repr();
+        let legacy_bytes = encode(&repr);
+        let gated_bytes = encode(&committee);
+
+        // the gated encoder reproduces the pre-#554 derive byte for byte
+        assert_eq!(gated_bytes, legacy_bytes, "pre-fork Committee bytes left the legacy layout");
+
+        // legacy bytes decode through the gated `Committee`: a pack written by a pre-#554 binary
+        // still loads on this build
+        let from_legacy: Committee =
+            try_decode(&legacy_bytes).expect("legacy bytes decode as a Committee");
+        assert_eq!(from_legacy, committee);
+        assert_eq!(from_legacy.bootstrap_servers(), committee.bootstrap_servers());
+        assert_eq!(from_legacy.number_of_workers(), 1);
+
+        // gated bytes decode through the shadow: a pre-#554 binary still reads what this build
+        // writes for a pre-fork epoch
+        let read_back: CommitteeReprLegacy =
+            try_decode(&gated_bytes).expect("pre-fork Committee bytes decode as the legacy repr");
+        assert_eq!(read_back, repr, "pre-fork Committee bytes are not the legacy layout");
     }
 
     #[test]
