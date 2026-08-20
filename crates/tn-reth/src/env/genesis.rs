@@ -50,7 +50,7 @@ use std::{path::Path, sync::Arc};
 use alloy::{hex, sol_types::SolConstructor as _};
 use eyre::OptionExt as _;
 use reth::{
-    args::{DatabaseArgs, DatadirArgs},
+    args::{DatabaseArgs, DatadirArgs, RpcServerArgs},
     dirs::MaybePlatformPath,
 };
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -75,7 +75,7 @@ use tn_types::{
 use tracing::debug;
 
 use crate::{
-    init_txpool_defaults,
+    init_reth_defaults,
     system_calls::{
         ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS, PRECOMPILE_GENESIS_BYTECODE,
     },
@@ -100,11 +100,12 @@ impl RethEnv {
         /// (reth pairs its 8 TB default with a 4 GiB step; mirror reth's `test()` 4 MiB step).
         const TEMP_CHAIN_DB_GROWTH_STEP: usize = 4 * 1024 * 1024; // 4 MiB
 
-        // `NodeConfig::default` reads reth's process-wide pool defaults through
-        // `TxPoolArgs::default`, which locks them. Seed first so a temp chain built before any
-        // command is parsed does not fix the per-sender slot default at reth's 16 for the rest of
-        // the process, which would then also apply to every node parsed later.
-        init_txpool_defaults();
+        // `NodeConfig::default` reads reth's process-wide pool and RPC-server defaults through
+        // the args types' `Default` impls, which lock them. Seed first so a temp chain built
+        // before any command is parsed does not fix reth's own values (per-sender slots 16,
+        // ipcpath `reth.ipc`) for the rest of the process, which would then also apply to every
+        // node parsed later.
+        init_reth_defaults();
 
         let node_config = NodeConfig {
             datadir: DatadirArgs {
@@ -121,6 +122,13 @@ impl RethEnv {
                 growth_step: Some(TEMP_CHAIN_DB_GROWTH_STEP),
                 ..Default::default()
             },
+            // A temp chain parses no CLI, so its IPC path can only be a process-global
+            // default: a fixed path shared by every process on the host. Concurrent test runs
+            // would race to bind it and leave the socket file behind (issue #1165: every test
+            // env bound reth's `/tmp/reth.ipc`). Nothing connects to a temp chain over IPC
+            // (tests that exercise IPC spawn nodes through the CLI with a per-tempdir
+            // `--ipcpath`), so disable the IPC server outright.
+            rpc: RpcServerArgs { ipcdisable: true, ..Default::default() },
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config);
@@ -487,7 +495,7 @@ mod tests {
     /// predicate itself is covered by the `ensure_archive_mode` tests in `cli.rs`).
     #[tokio::test]
     async fn test_reth_env_new_rejects_pruned_config() -> eyre::Result<()> {
-        init_txpool_defaults();
+        init_reth_defaults();
         let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::new("Archive Mode Test Task Manager");
@@ -510,6 +518,23 @@ mod tests {
         let err = RethEnv::new(&config, &task_manager, database, None, GasAccumulator::default())
             .expect_err("RethEnv::new must refuse a pruned config");
         assert!(err.to_string().contains("archive mode"), "unexpected error: {err}");
+        Ok(())
+    }
+
+    /// A temp chain must not open an IPC socket. Its config never passes CLI parsing, so its
+    /// `ipcpath` can only be a process-global default: a fixed path every process on the host
+    /// shares, which concurrent test runs would race for (issue #1165: every test env bound
+    /// reth's `/tmp/reth.ipc`). `ipcdisable` is asserted rather than the path because which path
+    /// the global holds depends on which test in this binary read reth's RPC defaults first; the
+    /// seeded path itself is pinned in the `reth_defaults` integration test that owns its
+    /// process.
+    #[tokio::test]
+    async fn test_temp_chain_disables_ipc() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Temp Chain IPC Test Task Manager");
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+        assert!(reth_env.node_config().rpc.ipcdisable, "temp chain must disable the IPC server");
         Ok(())
     }
 }

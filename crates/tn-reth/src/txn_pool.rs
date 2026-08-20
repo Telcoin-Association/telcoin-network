@@ -16,7 +16,7 @@
 //!   distribution happens via the worker batch protocol, and observer nodes forward RPC submissions
 //!   to committee validators over JSON-RPC (see `forward.rs`) — never via devp2p gossip.
 //! - The per-sender slot default is 256 (`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER` in `src/cli.rs`,
-//!   seeded process-wide by `init_txpool_defaults`) instead of reth's 16.
+//!   seeded process-wide by `init_reth_defaults`) instead of reth's 16.
 //! - Blob (EIP-4844) transactions are unsupported in batches: the batch builder strips them via
 //!   [`TxPool::remove_eip4844_txs`] (removes descendants and deletes sidecars from the blob store),
 //!   and every canonical pool update — `process_canon_state_update` here and the batch builder's
@@ -114,6 +114,19 @@ impl WorkerTxPool {
             blockchain_provider.clone(),
             evm_config.clone(),
         )
+        // Reject EIP-4844 (blob) and EIP-7702 (set-code) transactions at admission. TN never
+        // mines either type: the batch builder strips them and the batch validator rejects any
+        // batch that carries one, so an admitted transaction of either type can never be executed.
+        // For blobs this is also a denial-of-service fix. On a successful add reth writes the blob
+        // sidecar to the on-disk DiskFileBlobStore, but that store uses deferred deletion whose
+        // only unlink runs in reth's maintain_transaction_pool loop. TN drives pool
+        // maintenance itself and never runs that loop, so nothing removes the sidecars at
+        // runtime and a remote unprivileged sender could grow a validator's disk without
+        // bound. Rejecting both unsupported types here, before insertion, closes that
+        // vector and mirrors reth's own node builder for a chain that supports neither
+        // type. See issue #1159.
+        .no_eip4844()
+        .no_eip7702()
         .kzg_settings(EnvKzgSettings::Default)
         .with_local_transactions_config(pool_config.local_transactions_config.clone())
         .with_additional_tasks(node_config.txpool.additional_validation_tasks)
@@ -432,9 +445,30 @@ mod tests {
     use super::*;
     use crate::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
     use rand::{rngs::StdRng, SeedableRng as _};
+    use reth_chainspec::EthChainSpec as _;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tn_types::{test_genesis, Address, Bytes, Encodable2718 as _, TaskManager, U256};
+    use tn_types::{
+        test_genesis, Address, Bytes, Encodable2718 as _, GenesisAccount, TaskManager, U256,
+    };
+
+    /// Build a pool over a chain whose genesis funds the factory's sender, so a rejected
+    /// transaction can only be refused by a validator policy, never by insufficient balance.
+    fn funded_pool_for_test(
+        tx_factory: &TransactionFactory,
+        tmp_dir: &TempDir,
+        task_manager: &TaskManager,
+    ) -> (Arc<RethChainSpec>, RethEnv, WorkerTxPool) {
+        let genesis = test_genesis().extend_accounts([(
+            tx_factory.address(),
+            GenesisAccount::default().with_balance(U256::MAX),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), task_manager, None).unwrap();
+        let pool = reth_env.init_txn_pool().unwrap();
+        (chain, reth_env, pool)
+    }
 
     #[test]
     fn test_recover_raw_transaction_preserves_signer() {
@@ -488,6 +522,54 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(pool.pool_size().pending, 1);
         assert!(pool.get(&hash).is_some());
+    }
+
+    /// The DoS fix for issue #1159: the pool refuses EIP-4844 (blob) transactions at
+    /// admission. The sender is funded at genesis and the blob's KZG proof is valid, so the
+    /// only remaining reason for rejection is the `.no_eip4844()` type gate in
+    /// [`WorkerTxPool::new`].
+    #[tokio::test]
+    async fn test_pool_rejects_blob_transaction() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut tx_factory = TransactionFactory::new_random();
+        let (chain, reth_env, pool) = funded_pool_for_test(&tx_factory, &tmp_dir, &task_manager);
+
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let pooled = tx_factory.create_eip4844_pooled(chain.clone(), None, gas_price);
+        let result = pool.add_transaction_local(pooled).await;
+        assert!(result.is_err());
+
+        // The pool admitted nothing. Reth writes the blob sidecar to the blob store only on
+        // successful insertion, so an empty pool proves no sidecar reached disk.
+        let s = pool.pool_size();
+        assert_eq!(s.pending, 0);
+        assert_eq!(s.blob, 0);
+        assert_eq!(s.queued, 0);
+    }
+
+    /// The pool refuses EIP-7702 (set-code) transactions at admission. Prague is active at
+    /// genesis so the transaction is fork-valid, and the sender is funded, so rejection is due
+    /// to the `.no_eip7702()` type gate in [`WorkerTxPool::new`], consistent with TN's existing
+    /// policy of treating EIP-7702 as an unsupported transaction type.
+    #[tokio::test]
+    async fn test_pool_rejects_eip7702_transaction() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut tx_factory = TransactionFactory::new_random();
+        let (chain, reth_env, pool) = funded_pool_for_test(&tx_factory, &tmp_dir, &task_manager);
+
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let signed = tx_factory.create_eip7702(chain.chain_id(), None, gas_price);
+        // 7702 carries no sidecar, so the production external ingress accepts the raw tx.
+        let result = pool.add_raw_transaction_external(signed).await;
+        assert!(result.is_err());
+
+        // The pool admitted nothing.
+        let s = pool.pool_size();
+        assert_eq!(s.pending, 0);
+        assert_eq!(s.blob, 0);
+        assert_eq!(s.queued, 0);
     }
 
     #[tokio::test]

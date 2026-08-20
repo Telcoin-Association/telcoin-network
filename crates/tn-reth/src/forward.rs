@@ -7,7 +7,9 @@
 //! sent to the validator whose committee slot owns the sender, so all transactions from one
 //! account converge on a single validator and nonce ordering is preserved. A validator that has
 //! not advertised an endpoint (or is momentarily unreachable) is skipped in favor of one that
-//! has.
+//! has. The fallback order rotates per node and per forward (issue #1173), so redirected
+//! traffic spreads across the committee instead of concentrating on the lowest-keyed
+//! validator.
 //!
 //! Three properties worth knowing at this boundary:
 //!
@@ -41,7 +43,10 @@ use alloy::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, Ipv6Addr},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tn_types::{BlsPublicKey, RpcInfo, TaskSpawner, TxnForwarder};
@@ -95,15 +100,44 @@ const FORWARD_BATCH_BUDGET: Duration = Duration::from_secs(120);
 /// and a tighter cap would shed batches an unstressed node could have delivered.
 const MAX_CONCURRENT_FORWARDS: usize = 64;
 
-/// JSON-RPC error codes reth returns for a validator-local, transient condition (a full pool,
-/// `-32003`, or an internal/IO error, `-32603`) rather than a verdict on the transaction itself.
-/// The forward falls through to the next advertised validator on these, since another validator
-/// may still accept the transaction.
+/// JSON-RPC error codes reth reserves for conditions that are validator-local or indeterminate,
+/// never cleanly a verdict on the transaction: `-32003` is a full pool (`TxPoolOverflow`) plus
+/// reth's catch-all for invalid-transaction variants with no explicit code of their own (for
+/// example insufficient funds), and `-32603` is an internal/IO error. The forward falls through
+/// to the next advertised validator on these: retrying a deterministic verdict caught in the
+/// `-32003` mix costs at most one bounded pass over the committee, while stopping on a full pool
+/// would drop a transaction another validator may still accept.
 const TRANSIENT_RPC_CODES: [i64; 2] = [-32003, -32603];
 
 /// Substring of reth's `eth_sendRawTransaction` error message when the transaction is already in a
 /// validator's pool (`code -32000`). Treated as a successful delivery, not a failure to retry.
 const ALREADY_KNOWN_MESSAGE: &str = "already known";
+
+/// The JSON-RPC code reth answers with for both chain-wide verdicts and the node-local refusals
+/// in [`NODE_LOCAL_MESSAGES`] (`EthRpcErrorCode::InvalidInput`). The message carve-out is scoped
+/// to this code so a matching substring under any other code keeps its terminal meaning.
+const INVALID_INPUT_RPC_CODE: i64 = -32000;
+
+/// Substrings of reth `eth_sendRawTransaction` error messages (code `-32000`) that describe one
+/// validator's pool contents or one operator's admission config rather than a verdict on the
+/// transaction itself. Reth maps almost every pool refusal to `-32000`, the same code it uses
+/// for chain-wide verdicts, so the code axis cannot make this split; the message can. The
+/// forward tries the next advertised validator on these, since a validator with different pool
+/// contents or config may accept the same bytes.
+const NODE_LOCAL_MESSAGES: [&str; 4] = [
+    // `RpcPoolError::Underpriced`: priced below that operator's `--txpool.minimal-protocol-fee`.
+    "transaction underpriced",
+    // `RpcPoolError::ReplaceUnderpriced`: a same-nonce transaction already sits in that
+    // validator's pool and the fee bump is below its `--txpool.pricebump`. Subsumed by the
+    // entry above under `contains`, pinned separately so a reth rewording of one message
+    // cannot silently drop coverage of the other.
+    "replacement transaction underpriced",
+    // `RpcPoolError::ExceedsFeeCap`: the fee is above that node's `--rpc.txfeecap`.
+    "exceeds the configured cap",
+    // `RpcPoolError::AddressAlreadyReserved`: blob-vs-regular sender exclusivity against that
+    // validator's current pool contents.
+    "address already reserved",
+];
 
 /// Whether the forwarder may dial an advertised endpoint whose host is not a public internet
 /// address.
@@ -338,6 +372,13 @@ pub struct WorkerRpcForwarder {
     /// node-wide rather than per-clone. A permit is taken before the spawn and moved into the
     /// task, so capacity comes back when a forward actually finishes.
     forwards_in_flight: Arc<Semaphore>,
+    /// Rotation counter for the fallback dial order.
+    ///
+    /// Starts at a random per-process value and advances once per spawned forward: see
+    /// [`rotated_fallbacks`] for why the order must differ per node and per forward. Shared
+    /// through the `Arc` by every clone of this forwarder, so the rotation is node-wide like
+    /// the forward cap.
+    fallback_rotation: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for WorkerRpcForwarder {
@@ -359,6 +400,11 @@ impl WorkerRpcForwarder {
             policy,
             cache: Arc::new(Mutex::new(EndpointCache::default())),
             forwards_in_flight: Arc::new(Semaphore::new(MAX_CONCURRENT_FORWARDS)),
+            // Random, not zero: observers restarted together must not share one rotation
+            // phase, and no committee key can buy a fixed position in the order (issue
+            // #1173). This seeds fairness, not secrecy: predicting it moves no trust
+            // boundary.
+            fallback_rotation: Arc::new(AtomicU64::new(rand::random())),
         }
     }
 
@@ -447,8 +493,13 @@ impl WorkerRpcForwarder {
         providers: BTreeMap<BlsPublicKey, RootProvider>,
     ) {
         // Fallback order: every usable endpoint, so a transaction whose owning validator has
-        // not advertised (or is unreachable) can still reach the committee.
-        let fallbacks: Vec<BlsPublicKey> = providers.keys().cloned().collect();
+        // not advertised (or is unreachable) can still reach the committee. Rotated per
+        // forward, so the redirect load of a downed owner spreads across the committee
+        // instead of landing on the lowest-keyed validator every time (issue #1173).
+        let fallbacks = rotated_fallbacks(
+            providers.keys().cloned().collect(),
+            self.fallback_rotation.fetch_add(1, Ordering::Relaxed),
+        );
 
         self.task_spawner.spawn_task("forward-txns", async move {
             // Moved in rather than released when `forward_txns` returned, so capacity comes
@@ -514,8 +565,9 @@ impl WorkerRpcForwarder {
                                 result = ForwardOutcome::Rejected(reason);
                                 break;
                             }
-                            // Endpoint-local problem (timeout, transport error, full pool): the
-                            // transaction's fate is unknown here, so try the next validator.
+                            // Endpoint-local problem (timeout, transport error, full pool, or a
+                            // node-local refusal): the transaction's fate is unknown here, so
+                            // try the next validator.
                             Disposition::TryNext(reason) => {
                                 debug!(
                                     target: "worker::forward",
@@ -701,6 +753,35 @@ fn next_txn_budget(deadline: Instant, now: Instant) -> Option<Duration> {
     (!remaining.is_zero()).then(|| remaining.min(FORWARD_TX_BUDGET))
 }
 
+/// The fallback dial order for one spawned forward: `fallbacks` rotated left by `counter`,
+/// reduced modulo the list length.
+///
+/// Without rotation the order is the raw byte sort of the committee's BLS public keys, the
+/// same on every observer. Every observer then redirects a downed owner's transactions to the
+/// same lowest-keyed reachable validator at the same time, and a validator can grind its BLS
+/// keypair offline so its key sorts first and that position becomes permanent (issue #1173).
+/// The counter starts at a per-process random value, so observers walk different orders and a
+/// ground key buys nothing, and it advances once per spawned forward, so one observer also
+/// spreads consecutive batches. Owner-first routing is unchanged: the owner is dialed ahead
+/// of this list (see [`WorkerRpcForwarder::spawn_forward`]).
+fn rotated_fallbacks(fallbacks: Vec<BlsPublicKey>, counter: u64) -> Vec<BlsPublicKey> {
+    let count = fallbacks.len();
+    let start = rotation_start(counter, count);
+    fallbacks.iter().cycle().skip(start).take(count).cloned().collect()
+}
+
+/// Starting offset into a fallback list of `fallback_count` entries: `counter` reduced modulo
+/// the length. Total for every input: an empty list gets offset zero rather than a division
+/// by zero, and a length past `u64` (impossible on any real target) also degrades to zero
+/// rather than truncating.
+fn rotation_start(counter: u64, fallback_count: usize) -> usize {
+    u64::try_from(fallback_count)
+        .ok()
+        .filter(|count| *count > 0)
+        .and_then(|count| usize::try_from(counter % count).ok())
+        .unwrap_or_default()
+}
+
 /// Return the BLS key of the committee slot that owns `tx_bytes`, matching the receiver-side
 /// routing in `submit_txn_if_mine`. Returns `None` if the transaction cannot be recovered or the
 /// derived slot is out of range.
@@ -723,10 +804,11 @@ enum Disposition {
     /// The validator accepted the transaction, or it was already in a validator's pool.
     Delivered,
     /// The validator returned a considered rejection of the transaction itself (bad nonce,
-    /// underpriced, invalid, wrong fork). No other validator will accept it either.
+    /// invalid, wrong fork). No other validator will accept it either.
     Rejected(String),
-    /// This endpoint gave no verdict (timeout, transport error, or a transient full pool); the
-    /// transaction may still be accepted by another validator.
+    /// This endpoint gave no verdict (timeout, transport error, a transient full pool, or a
+    /// refusal tied to this validator's own pool contents or admission config); the transaction
+    /// may still be accepted by another validator.
     TryNext(String),
 }
 
@@ -752,15 +834,22 @@ fn classify_error(err: RpcError<TransportErrorKind>) -> Disposition {
 
 /// Classify a server-side JSON-RPC rejection of a forwarded transaction.
 fn classify_server_error(code: i64, message: String) -> Disposition {
-    if TRANSIENT_RPC_CODES.contains(&code) {
+    let lowered = message.to_ascii_lowercase();
+    match () {
         // A full pool or an internal error is validator-local; another validator may accept it.
-        Disposition::TryNext(message)
-    } else if message.to_ascii_lowercase().contains(ALREADY_KNOWN_MESSAGE) {
+        () if TRANSIENT_RPC_CODES.contains(&code) => Disposition::TryNext(message),
         // Already in a validator's pool: the transaction is delivered.
-        Disposition::Delivered
-    } else {
+        () if lowered.contains(ALREADY_KNOWN_MESSAGE) => Disposition::Delivered,
+        // A refusal tied to this validator's own pool contents or admission config, not a
+        // verdict: the next validator may accept the same bytes. Scoped to `-32000` so the
+        // substrings cannot hijack a verdict that arrives under any other code.
+        () if code == INVALID_INPUT_RPC_CODE
+            && NODE_LOCAL_MESSAGES.iter().any(|needle| lowered.contains(needle)) =>
+        {
+            Disposition::TryNext(message)
+        }
         // Every validator shares consensus state, so a considered rejection repeats everywhere.
-        Disposition::Rejected(format!("code {code}: {message}"))
+        () => Disposition::Rejected(format!("code {code}: {message}")),
     }
 }
 
@@ -804,6 +893,63 @@ mod tests {
                 listener.incoming().map_while(Result::ok).collect();
         });
         Ok(format!("http://{addr}"))
+    }
+
+    /// An endpoint that answers every `eth_sendRawTransaction` with success and counts its
+    /// hits.
+    ///
+    /// The response echoes the request id, so the provider accepts it as the answer to its
+    /// call, and closes the connection, so every request opens a fresh one and the hit count
+    /// is exact. The count is what the rotation test reads: which endpoint absorbed a
+    /// forward is otherwise invisible from outside the task.
+    fn counting_ok_endpoint() -> eyre::Result<(String, Arc<std::sync::atomic::AtomicUsize>)> {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            listener.incoming().map_while(Result::ok).for_each(|stream| {
+                recorded.fetch_add(1, Ordering::Relaxed);
+                let mut reader = std::io::BufReader::new(&stream);
+                // The body length arrives in the headers; the fold keeps the last
+                // `content-length` seen and stops at the blank line that ends the headers.
+                let content_length = reader
+                    .by_ref()
+                    .lines()
+                    .map_while(Result::ok)
+                    .take_while(|line| !line.is_empty())
+                    .fold(0_usize, |length, line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse().ok())
+                            .unwrap_or(length)
+                    });
+                let mut body = vec![0_u8; content_length];
+                let id = reader
+                    .read_exact(&mut body)
+                    .ok()
+                    .and_then(|()| String::from_utf8(body).ok())
+                    .and_then(|text| {
+                        text.split("\"id\":").nth(1).map(|rest| {
+                            rest.chars().take_while(char::is_ascii_digit).collect::<String>()
+                        })
+                    })
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| "0".to_string());
+                let result = format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":\"0x{}\"}}",
+                    "00".repeat(32)
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\nConnection: close\r\n\r\n{result}",
+                    result.len(),
+                );
+                let _sent = (&stream).write_all(response.as_bytes());
+            });
+        });
+        Ok((format!("http://{addr}"), hits))
     }
 
     /// One recorder capture. [`metrics_util::debugging::Snapshotter::snapshot`] drains the
@@ -1290,6 +1436,40 @@ mod tests {
         Ok(())
     }
 
+    /// Reth answers `-32000` for refusals that depend on one validator's pool contents or one
+    /// operator's admission config. These are not verdicts on the transaction: the forward tries
+    /// the next advertised validator instead of dropping the transaction as rejected.
+    #[test]
+    fn classify_server_error_tries_next_on_node_local_refusals() {
+        [
+            "transaction underpriced",
+            "replacement transaction underpriced",
+            "tx fee (2000000000000000000 wei) exceeds the configured cap (1000000000000000000 wei)",
+            "address already reserved",
+            // The scan is case-insensitive, matching the `already known` handling.
+            "Transaction Underpriced",
+        ]
+        .into_iter()
+        .for_each(|message| {
+            assert_eq!(
+                classify_server_error(-32000, message.to_string()),
+                Disposition::TryNext(message.to_string())
+            )
+        });
+        // An adjacent chain-wide verdict stays terminal: sharing words with a carve-out entry
+        // is not a match.
+        assert!(matches!(
+            classify_server_error(-32000, "gas required exceeds allowance (21000)".to_string()),
+            Disposition::Rejected(_)
+        ));
+        // The carve-out is scoped to code -32000: the same substring under another code (for
+        // example a revert reason echoed under reth's code 3) stays terminal.
+        assert!(matches!(
+            classify_server_error(3, "execution reverted: transaction underpriced".to_string()),
+            Disposition::Rejected(_)
+        ));
+    }
+
     /// With no advertised endpoint, or with only endpoints the policy refuses, the batch is
     /// not admitted: `forward_txns` returns `false` so the caller keeps its transactions.
     #[test]
@@ -1318,6 +1498,98 @@ mod tests {
         let rpcs = vec![(test_key(1), test_rpc("http://validator.example.com:8545")?)];
 
         assert!(forwarder.forward_txns(vec![vec![0u8; 8]], vec![test_key(1)], rpcs));
+        Ok(())
+    }
+
+    /// The rotation offset is the counter reduced modulo the list length, total for every
+    /// input a caller can produce.
+    #[test]
+    fn rotation_start_wraps_and_is_total() {
+        assert_eq!(rotation_start(0, 3), 0);
+        assert_eq!(rotation_start(5, 3), 2);
+        assert_eq!(rotation_start(u64::MAX, 3), 0);
+        assert_eq!(rotation_start(7, 1), 0);
+        // An empty list has no offset to pick: zero, not a division by zero.
+        assert_eq!(rotation_start(9, 0), 0);
+    }
+
+    /// Rotation permutes the fallback list without dropping or duplicating an entry, and a
+    /// full cycle of counters returns to the identity order.
+    #[test]
+    fn rotated_fallbacks_rotates_left_without_losing_entries() {
+        let (a, b, c) = (test_key(1), test_key(2), test_key(3));
+        assert_eq!(rotated_fallbacks(vec![a, b, c], 0), vec![a, b, c]);
+        assert_eq!(rotated_fallbacks(vec![a, b, c], 1), vec![b, c, a]);
+        assert_eq!(rotated_fallbacks(vec![a, b, c], 2), vec![c, a, b]);
+        // The cycle closes: three fallbacks, counter three, identity again.
+        assert_eq!(rotated_fallbacks(vec![a, b, c], 3), vec![a, b, c]);
+        assert_eq!(rotated_fallbacks(Vec::new(), 7), Vec::new());
+    }
+
+    /// Consecutive forwards dial a different first fallback: the rotation counter, not the
+    /// key sort, picks where the fallback walk starts, and it advances once per spawned
+    /// forward.
+    ///
+    /// Three counting endpoints, transactions that recover no owner, and the counter pinned
+    /// at zero: four single-transaction batches must land on endpoint one, two, three, then
+    /// one again. Without rotation all four land on the lowest-keyed endpoint.
+    #[tokio::test]
+    async fn spawned_forwards_rotate_the_first_fallback_dialed() -> eyre::Result<()> {
+        let (url_one, hits_one) = counting_ok_endpoint()?;
+        let (url_two, hits_two) = counting_ok_endpoint()?;
+        let (url_three, hits_three) = counting_ok_endpoint()?;
+        let manager = TaskManager::default();
+        // `AllowPrivate`: the fixture endpoints are loopback sockets, which the shipped
+        // default policy would refuse before the rotation under test was ever reached.
+        let forwarder =
+            WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate);
+        forwarder.fallback_rotation.store(0, Ordering::Relaxed);
+        // Pair each sorted committee key with one endpoint: `providers` iterates in key
+        // order, so the sorted pairing makes "which endpoint is fallback N" exact.
+        let sorted: Vec<BlsPublicKey> = [test_key(1), test_key(2), test_key(3)]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let urls = [url_one, url_two, url_three];
+        let rpcs = sorted
+            .iter()
+            .zip(urls.iter())
+            .map(|(key, url)| test_rpc(url).map(|rpc| (*key, rpc)))
+            .collect::<eyre::Result<Vec<_>>>()?;
+        let counts = || {
+            [
+                hits_one.load(Ordering::Relaxed),
+                hits_two.load(Ordering::Relaxed),
+                hits_three.load(Ordering::Relaxed),
+            ]
+        };
+
+        // One batch of one unrecoverable transaction, awaited to completion, then the hit
+        // counts must equal `expected`. No owner is recovered, so the first fallback is the
+        // first dial, and the permit drain is what awaits the spawned task: capacity only
+        // returns when the forward finishes.
+        let settle = |expected: [usize; 3]| {
+            let forwarder = &forwarder;
+            let sorted = &sorted;
+            let rpcs = &rpcs;
+            let counts = &counts;
+            async move {
+                assert!(forwarder.forward_txns(vec![vec![0_u8; 32]], sorted.clone(), rpcs.clone()));
+                let drained = timeout(
+                    Duration::from_secs(30),
+                    Arc::clone(&forwarder.forwards_in_flight).acquire_many_owned(max_permits()),
+                )
+                .await??;
+                drop(drained);
+                assert_eq!(counts(), expected);
+                eyre::Ok(())
+            }
+        };
+        settle([1, 0, 0]).await?;
+        settle([1, 1, 0]).await?;
+        settle([1, 1, 1]).await?;
+        settle([2, 1, 1]).await?;
         Ok(())
     }
 }

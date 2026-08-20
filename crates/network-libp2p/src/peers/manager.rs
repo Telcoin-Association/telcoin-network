@@ -3,6 +3,7 @@
 use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
+    peer::MAX_MULTIADDRS_PER_PEER,
     score::init_peer_score_config,
     status::NewConnectionStatus,
     types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
@@ -1085,6 +1086,7 @@ impl PeerManager {
     ///
     /// A peer is eligible if:
     /// - it is not this node's own identity
+    /// - its address list is within [`MAX_MULTIADDRS_PER_PEER`]
     /// - it has at least one valid ip address (ipv4/ipv6)
     /// - none of its ip addresses are banned
     /// - it can be dialed (not connected/dialing/banned)
@@ -1093,6 +1095,16 @@ impl PeerManager {
         // via kad closest-peers or peer exchange) would otherwise be selected for
         // a self-dial during the heartbeat.
         !self.is_local_peer(&info.peer_id)
+            // reject entries with more addresses than an honest peer can share. An honest
+            // exchange entry is a copy of a sender's stored set for that peer, which holds the
+            // one address the peer most recently presented (MAX_MULTIADDRS_PER_PEER, see its
+            // doc). A kad closest-peers entry carries whatever the remote responder's routing
+            // table holds for that peer, which nothing upstream caps, so this is the first
+            // bound on that path too. Every stored address is dialed by the discovery
+            // heartbeat, so an uncapped list lets one PeerExchange message turn this node
+            // into a dial-amplification proxy against attacker-chosen targets (issue #1183).
+            // The heartbeat re-checks eligibility, so an oversized entry is also purged.
+            && info.addrs.len() <= MAX_MULTIADDRS_PER_PEER
             && self.has_valid_unbanned_ips(&info.addrs)
             && self.peers.can_dial(&info.peer_id)
     }
