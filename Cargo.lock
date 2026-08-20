@@ -3142,6 +3142,7 @@ dependencies = [
  "tn-config",
  "tn-node",
  "tn-reth",
+ "tn-storage",
  "tn-test-utils",
  "tn-types",
  "tokio",
