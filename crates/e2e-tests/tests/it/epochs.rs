@@ -24,7 +24,7 @@ use tn_reth::{
 use tn_storage::pack_validate::{validate_pack_file, Verdict};
 use tn_test_utils::wait_until;
 use tn_types::{
-    forks::{committee_workers_active, seed_signature_active},
+    forks::{multi_workers_fork_active, seed_signature_active},
     keccak256, Address, Epoch, EpochCertificate, EpochRecord, Genesis, B256,
 };
 use tokio::time::timeout;
@@ -40,15 +40,15 @@ const MIN_EPOCHS_TO_TEST: usize = 6;
 // not shrink with the epoch cadence.
 const EPOCH_DURATION: u64 = 5;
 
-/// Environment variable selecting the committee-workers fork epoch (#554) for this process and
-/// every node it spawns (`tn_types::forks::committee_workers_fork_epoch_override`).
-const COMMITTEE_WORKERS_FORK_ENV: &str = "TN_COMMITTEE_WORKERS_FORK_EPOCH";
+/// Environment variable selecting the multi-workers fork epoch (#554) for this process and
+/// every node it spawns (`tn_types::forks::multi_workers_fork_epoch_override`).
+const MULTI_WORKERS_FORK_ENV: &str = "TN_MULTI_WORKERS_FORK_EPOCH";
 
 /// Environment variable selecting the seed-signature fork epoch (#1032) for this process and every
 /// node it spawns (`tn_types::forks::seed_signature_fork_epoch_override`).
 const SEED_SIGNATURE_FORK_ENV: &str = "TN_SEED_SIGNATURE_FORK_EPOCH";
 
-/// Committee-workers fork epoch for [`test_epoch_sync_across_committee_workers_fork`].
+/// Multi-workers fork epoch for [`test_epoch_sync_across_multi_workers_fork`].
 ///
 /// The kill in [`test_epoch_sync_inner`] happens after `loop_epochs` has watched three boundaries
 /// pass, so the epoch open at that point is at least 3 and the sealed set — which stops two below
@@ -479,8 +479,8 @@ fn fingerprint_sealed_packs(
 ///    closed epochs alone.
 ///
 /// Decoding a pack reaches two epoch-gated layouts: the [`tn_types::Committee`] in its `EpochMeta`
-/// record, selected by the committee's own epoch against the committee-workers fork
-/// ([`committee_workers_active`]), and every nested `ConsensusHeader`, selected against the
+/// record, selected by the committee's own epoch against the multi-workers fork
+/// ([`multi_workers_fork_active`]), and every nested `ConsensusHeader`, selected against the
 /// seed-signature fork ([`seed_signature_active`]). This process therefore has to sit on the same
 /// fork epochs the nodes wrote under for BOTH, which is what [`pin_fork_epochs`] arranges.
 fn assert_sealed_packs_unchanged(
@@ -521,11 +521,11 @@ fn assert_sealed_packs_unchanged(
     Ok(())
 }
 
-/// Pin every fork epoch this suite's decoding depends on — the committee-workers fork (#554) and
+/// Pin every fork epoch this suite's decoding depends on — the multi-workers fork (#554) and
 /// the seed-signature fork (#1032) — for this process and every node it spawns.
 ///
 /// Step 8 decodes sealed pack bytes in the harness, and that reaches both gates: the `EpochMeta`'s
-/// [`tn_types::Committee`] is laid out by [`committee_workers_active`] and every nested
+/// [`tn_types::Committee`] is laid out by [`multi_workers_fork_active`] and every nested
 /// `ConsensusHeader` by [`seed_signature_active`]. So the harness has to resolve both to the same
 /// fork points the nodes wrote under. Left alone the two sides disagree the same way for each
 /// fork: `TestBinary::command` forwards `u32::MAX` to a child when the variable is unset, while
@@ -538,10 +538,10 @@ fn assert_sealed_packs_unchanged(
 /// symptom is misleading: children write dormant-layout headers, the harness decodes them as
 /// genesis-active, and step 8 reports a corrupt pack rather than an environment mismatch.
 ///
-/// `force_committee_workers` states the committee-workers fork epoch outright, for a test whose
+/// `force_multi_workers` states the multi-workers fork epoch outright, for a test whose
 /// claim is about a specific boundary. `None` — and the seed-signature pin always — inherits
 /// whatever the lane exported, defaulting to the dormant `u32::MAX` that `TestBinary::command`
-/// would have forwarded anyway, so `TN_COMMITTEE_WORKERS_FORK_EPOCH=1 make test-epochs` keeps
+/// would have forwarded anyway, so `TN_MULTI_WORKERS_FORK_EPOCH=1 make test-epochs` keeps
 /// meaning what it says.
 ///
 /// Call once per test, before the first node spawn and before anything in the process reads either
@@ -549,7 +549,7 @@ fn assert_sealed_packs_unchanged(
 /// is sound because nextest runs each test in its own process (`.config/nextest.toml`); under
 /// plain `cargo test` two of these tests in one process would fight over it, and the assertions
 /// below are what turn that into a loud failure instead of a mis-decoded pack.
-fn pin_fork_epochs(force_committee_workers: Option<Epoch>) {
+fn pin_fork_epochs(force_multi_workers: Option<Epoch>) {
     // what `TestBinary::command` would forward to a child: the value the lane exported, or the
     // dormant `u32::MAX` when it exported nothing. an unparseable value normalizes to the same
     // dormant default the gate would have fallen back to.
@@ -560,9 +560,9 @@ fn pin_fork_epochs(force_committee_workers: Option<Epoch>) {
     // one shared helper rather than a block per fork, mirroring `TestBinary::command`, so the two
     // cannot drift apart in mechanism; they arm independently, so each carries its own gate
     pin_fork_epoch(
-        COMMITTEE_WORKERS_FORK_ENV,
-        force_committee_workers.unwrap_or_else(|| lane(COMMITTEE_WORKERS_FORK_ENV)),
-        committee_workers_active,
+        MULTI_WORKERS_FORK_ENV,
+        force_multi_workers.unwrap_or_else(|| lane(MULTI_WORKERS_FORK_ENV)),
+        multi_workers_fork_active,
     );
     pin_fork_epoch(SEED_SIGNATURE_FORK_ENV, lane(SEED_SIGNATURE_FORK_ENV), seed_signature_active);
 }
@@ -693,7 +693,7 @@ async fn test_epoch_sync() -> eyre::Result<()> {
 
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test(flavor = "multi_thread")]
-/// Test that an epoch pack archive spanning the committee-workers fork boundary (#554) survives a
+/// Test that an epoch pack archive spanning the multi-workers fork boundary (#554) survives a
 /// restart.
 ///
 /// The same kill/restart scenario as [`test_epoch_sync`], with the fork pinned at
@@ -701,9 +701,9 @@ async fn test_epoch_sync() -> eyre::Result<()> {
 /// single-worker layout, every later epoch in the multi-worker one. The restarted node has to read
 /// its own history back across that boundary to decide which epochs it still needs, and step 8
 /// then decodes both layouts again from the harness.
-async fn test_epoch_sync_across_committee_workers_fork() -> eyre::Result<()> {
+async fn test_epoch_sync_across_multi_workers_fork() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    // forced rather than inherited: this test's claim is a crossing at a known committee-workers
+    // forced rather than inherited: this test's claim is a crossing at a known multi-workers
     // epoch, so it states that fork point even when the lane exported a different one. the
     // seed-signature pin still follows the lane - this test makes no claim about it.
     pin_fork_epochs(Some(CROSS_FORK_EPOCH));
@@ -716,7 +716,7 @@ async fn test_epoch_sync_across_committee_workers_fork() -> eyre::Result<()> {
     // single-layout test above.
     assert!(
         sealed.start < CROSS_FORK_EPOCH && CROSS_FORK_EPOCH < sealed.end,
-        "sealed epochs {sealed:?} do not straddle the committee-workers fork at \
+        "sealed epochs {sealed:?} do not straddle the multi-workers fork at \
          {CROSS_FORK_EPOCH}: the restart proved only one committee layout"
     );
 

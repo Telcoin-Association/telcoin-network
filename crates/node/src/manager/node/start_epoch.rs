@@ -51,7 +51,7 @@ use tn_reth::{
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
-    forks::committee_workers_active, gas_accumulator::GasAccumulator, BatchValidation,
+    forks::multi_workers_fork_active, gas_accumulator::GasAccumulator, BatchValidation,
     BlsPublicKey, BlsSigner, Committee, CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput,
     Database as TNDatabase, Epoch, EpochDigest, Multiaddr, NetworkPublicKey, P2pNode, SealedHeader,
     TaskManager, TaskSpawner, DEFAULT_WORKER_ID,
@@ -1066,8 +1066,8 @@ fn should_subscribe_batch_topic(mode: NodeMode) -> bool {
 
 /// Whether `epoch` may be entered with an on-chain worker count of `num_workers`.
 ///
-/// A single worker is always fine. Above one, the answer depends on the committee-workers fork
-/// ([`committee_workers_active`]), evaluated at the epoch being entered - the same epoch carried
+/// A single worker is always fine. Above one, the answer depends on the multi-workers fork
+/// ([`multi_workers_fork_active`]), evaluated at the epoch being entered - the same epoch carried
 /// inside the [`Committee`] this count is about to be stamped onto, so the gate here and the gate
 /// the encoder consults cannot disagree:
 ///
@@ -1083,9 +1083,9 @@ fn check_committee_worker_count(epoch: Epoch, num_workers: NonZeroUsize) -> eyre
         return Ok(());
     }
 
-    if !committee_workers_active(epoch) {
+    if !multi_workers_fork_active(epoch) {
         return Err(eyre!(
-            "on-chain WorkerConfigs reports {num_workers} workers but the committee-workers fork \
+            "on-chain WorkerConfigs reports {num_workers} workers but the multi-workers fork \
              is not active at epoch {epoch}: the pre-fork committee layout cannot hold a worker \
              count, so this epoch's committee cannot be encoded"
         ));
@@ -1140,14 +1140,14 @@ mod tests {
     ///
     /// The adiri fork epoch is a `u32::MAX` placeholder and its arming constraint floors it at 407,
     /// so epoch 0 is pre-fork in this lane however the constant moves.
-    /// `TN_COMMITTEE_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
+    /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
     /// `OnceLock` is process-wide and the whole test binary shares one process.
     #[cfg(feature = "adiri")]
     #[test]
     fn pre_fork_epoch_entry_rejects_multiple_workers() {
         let err = check_committee_worker_count(0, NonZeroUsize::new(2).expect("2 is not 0"))
             .expect_err("a pre-fork multi-worker committee cannot be encoded");
-        assert!(err.to_string().contains("committee-workers fork is not active"), "{err}");
+        assert!(err.to_string().contains("multi-workers fork is not active"), "{err}");
     }
 
     /// Default builds have the multi-worker layout active from genesis, so a count above one is

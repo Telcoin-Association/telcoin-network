@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 use tn_types::{
-    address, forks::committee_workers_active, test_genesis, verify_proof_of_possession_bls,
+    address, forks::multi_workers_fork_active, test_genesis, verify_proof_of_possession_bls,
     Address, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder, Genesis, GenesisAccount,
     Multiaddr, NetworkPublicKey, NodeP2pInfo, P2pNode, WorkerId,
 };
@@ -149,7 +149,7 @@ impl NetworkGenesis {
     /// The count is a protocol-level value, so genesis is rejected when validators disagree or
     /// when any validator advertises no worker. An empty validator set yields one worker.
     ///
-    /// A count above one additionally requires [`committee_workers_active`] at epoch 0, the epoch
+    /// A count above one additionally requires [`multi_workers_fork_active`] at epoch 0, the epoch
     /// of the committee this genesis produces. Below that fork the [`Committee`] bcs layout has no
     /// field to carry a worker count, so the encoder refuses the value outright — a genesis that
     /// slipped through here would not fail until the first consensus pack tried to write its
@@ -175,9 +175,9 @@ impl NetworkGenesis {
             );
         }
         // the committee built from this genesis is epoch 0, which is the epoch the gate reads
-        if first.get() != 1 && !committee_workers_active(0) {
+        if first.get() != 1 && !multi_workers_fork_active(0) {
             eyre::bail!(
-                "genesis validators agree on {first} workers but the committee-workers fork is not \
+                "genesis validators agree on {first} workers but the multi-workers fork is not \
                  active at epoch 0: the pre-fork committee layout cannot hold a worker count, so \
                  this network must be generated with one worker per validator"
             );
@@ -442,10 +442,10 @@ mod tests {
         // spelled out through tn_types rather than the module's import, because which crate owns
         // the gate is the whole point of the desync this catches
         assert!(
-            tn_types::forks::committee_workers_active(0),
+            tn_types::forks::multi_workers_fork_active(0),
             "epoch 0 must be post-fork for this lane to mean anything: tn-config compiled without \
              `adiri` yet the gate is dormant, so tn-types' `adiri` feature is desynced from this \
-             crate's; is TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment?"
+             crate's; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment?"
         );
 
         let mut network_genesis = NetworkGenesis::new_for_test();
@@ -463,7 +463,7 @@ mod tests {
     ///
     /// The adiri fork epoch is a `u32::MAX` placeholder and its arming constraint floors it at 407,
     /// so epoch 0 is pre-fork in this lane however the constant moves.
-    /// `TN_COMMITTEE_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
+    /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
     /// `OnceLock` is process-wide and the whole test binary shares one process.
     #[cfg(feature = "adiri")]
     #[test]
@@ -471,7 +471,7 @@ mod tests {
         let mut network_genesis = NetworkGenesis::new_for_test();
         (0..4).for_each(|v| network_genesis.add_validator(validator_with_workers(v, 2)));
         let err = network_genesis.validate().expect_err("pre-fork multi-worker genesis must fail");
-        assert!(err.to_string().contains("committee-workers fork is not active"), "{err}");
+        assert!(err.to_string().contains("multi-workers fork is not active"), "{err}");
         assert!(network_genesis.create_committee().is_err());
 
         let mut single_worker = NetworkGenesis::new_for_test();

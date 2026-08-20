@@ -14,8 +14,8 @@
 //! the encoder unconditionally wrote (or unconditionally stripped) the multi-worker fields.
 //!
 //! The epoch axis brackets the fork boundary and is derived from
-//! [`tn_types::forks::COMMITTEE_WORKERS_FORK_EPOCH`] itself, so arming the fork retargets this
-//! sweep with no edit here. `TN_COMMITTEE_WORKERS_FORK_EPOCH` is deliberately never set: the
+//! [`tn_types::forks::MULTI_WORKERS_FORK_EPOCH`] itself, so arming the fork retargets this
+//! sweep with no edit here. `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately never set: the
 //! sweep asserts what this build's lane actually does, and an override would only prove that
 //! the override works.
 //!
@@ -37,7 +37,7 @@ use std::{
     num::NonZeroUsize,
 };
 use tn_types::{
-    encode, forks::committee_workers_active, try_decode, Address, Authority, BlsKeypair,
+    encode, forks::multi_workers_fork_active, try_decode, Address, Authority, BlsKeypair,
     BlsPublicKey, Committee, CommitteeBuilder, Epoch, NetworkKeypair, P2pNode, RpcInfo,
 };
 
@@ -87,7 +87,7 @@ struct LegacyCommitteeMirror {
 /// constant below would also fail const-eval, but this states the requirement rather than leaving
 /// it to an underflow.
 #[cfg(feature = "adiri")]
-const _: () = assert!(tn_types::forks::COMMITTEE_WORKERS_FORK_EPOCH != 0);
+const _: () = assert!(tn_types::forks::MULTI_WORKERS_FORK_EPOCH != 0);
 
 /// Epochs swept under `adiri`: the legacy floor, both sides of the fork boundary (the last
 /// pre-fork epoch and the first gate-open one), and the top of the epoch range.
@@ -99,8 +99,8 @@ const _: () = assert!(tn_types::forks::COMMITTEE_WORKERS_FORK_EPOCH != 0);
 #[cfg(feature = "adiri")]
 const SWEEP_EPOCHS: [Epoch; 4] = [
     0,
-    tn_types::forks::COMMITTEE_WORKERS_FORK_EPOCH - 1,
-    tn_types::forks::COMMITTEE_WORKERS_FORK_EPOCH,
+    tn_types::forks::MULTI_WORKERS_FORK_EPOCH - 1,
+    tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
     Epoch::MAX,
 ];
 
@@ -344,7 +344,7 @@ impl SweepPoint {
 /// otherwise the byte-length oracle against the legacy mirror plus a byte-exact re-encode.
 fn assert_committee_grid_point(point: SweepPoint) {
     let committee = point.committee();
-    let gate_open = committee_workers_active(point.epoch);
+    let gate_open = multi_workers_fork_active(point.epoch);
 
     // fail closed: the pre-fork layout has no field for a worker count and holds exactly one
     // worker per bootstrap server, so a wider committee must be unrepresentable rather than
@@ -452,18 +452,18 @@ fn poke_epoch(bytes: &[u8], offset: usize, from: Epoch, to: Epoch) -> Vec<u8> {
 /// vacuously: an adiri grid with no pre-fork epoch silently drops the legacy arm and every
 /// fail-closed point, and a non-adiri grid is meant to be gate-open throughout.
 ///
-/// Also the tripwire for an ambient `TN_COMMITTEE_WORKERS_FORK_EPOCH`, which this suite never sets
+/// Also the tripwire for an ambient `TN_MULTI_WORKERS_FORK_EPOCH`, which this suite never sets
 /// but a test-utils build would still honor from the environment.
 #[test]
 fn test_committee_sweep_grid_brackets_the_fork() {
     let gate_states: BTreeSet<bool> =
-        sweep_epochs().into_iter().map(committee_workers_active).collect();
+        sweep_epochs().into_iter().map(multi_workers_fork_active).collect();
 
     #[cfg(feature = "adiri")]
     assert_eq!(
         BTreeSet::from([false, true]),
         gate_states,
-        "the adiri grid must cover both gate states; is TN_COMMITTEE_WORKERS_FORK_EPOCH set in \
+        "the adiri grid must cover both gate states; is TN_MULTI_WORKERS_FORK_EPOCH set in \
          the environment, or has the fork been armed at epoch 0?"
     );
 
@@ -472,7 +472,7 @@ fn test_committee_sweep_grid_brackets_the_fork() {
         BTreeSet::from([true]),
         gate_states,
         "the multi-worker layout is active from genesis without `adiri`, so every swept epoch \
-         must be gate-open; is TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment?"
+         must be gate-open; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment?"
     );
 }
 
@@ -511,24 +511,24 @@ fn test_committee_layout_parameter_sweep() {
 ///
 /// Adiri-only because it needs a legacy arm to mis-select; every other build is gate-open from
 /// genesis, which the sibling below states instead. Both epochs come from
-/// [`tn_types::forks::COMMITTEE_WORKERS_FORK_EPOCH`], so arming the fork retargets this keeper with
+/// [`tn_types::forks::MULTI_WORKERS_FORK_EPOCH`], so arming the fork retargets this keeper with
 /// no edit here.
 #[cfg(feature = "adiri")]
 #[test]
 fn test_committee_epoch_corruption_fails_loudly() {
-    let post_fork = tn_types::forks::COMMITTEE_WORKERS_FORK_EPOCH;
+    let post_fork = tn_types::forks::MULTI_WORKERS_FORK_EPOCH;
     // the corruption nearest the boundary: one epoch below the gate, which while the constant is
     // the `u32::MAX` placeholder is a single byte of the encoded epoch
     let pre_fork = post_fork - 1;
     assert!(
-        committee_workers_active(post_fork),
+        multi_workers_fork_active(post_fork),
         "epoch {post_fork} must be gate-open for this keeper to encode the post-fork layout; is \
-         TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment?"
+         TN_MULTI_WORKERS_FORK_EPOCH set in the environment?"
     );
     assert!(
-        !committee_workers_active(pre_fork),
+        !multi_workers_fork_active(pre_fork),
         "epoch {pre_fork} must be dormant for this keeper to mean anything; is \
-         TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed at \
+         TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed at \
          epoch 0?"
     );
 
@@ -571,9 +571,9 @@ fn test_committee_epoch_poke_leaves_the_genesis_active_layout_intact() {
     let poked_epoch: Epoch = 0;
     let point = epoch_poke_point(5);
     assert!(
-        committee_workers_active(point.epoch) && committee_workers_active(poked_epoch),
+        multi_workers_fork_active(point.epoch) && multi_workers_fork_active(poked_epoch),
         "the multi-worker layout is active from genesis without `adiri`, so both epochs must be \
-         gate-open; is TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment?"
+         gate-open; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment?"
     );
 
     let committee = point.committee();

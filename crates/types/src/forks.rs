@@ -299,7 +299,7 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// this epoch the encoder writes the legacy single-worker shape byte-identically to the pre-#554
 /// binary, so packs stay readable in both directions across a mixed fleet.
 ///
-/// The gate ([`committee_workers_active`]) always reads the epoch carried inside the value being
+/// The gate ([`multi_workers_fork_active`]) always reads the epoch carried inside the value being
 /// encoded or decoded — never node-local committee state — so mixed-epoch containers (pack
 /// records, epoch records, state-sync payloads) decode correctly at any nesting depth and
 /// historical digests are preserved end to end.
@@ -324,7 +324,7 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 ///
 /// Non-adiri builds (mainnet) have no dormant period: the multi-worker layout is active from
 /// genesis and this constant does not exist there.
-pub const COMMITTEE_WORKERS_FORK_EPOCH: Epoch = u32::MAX;
+pub const MULTI_WORKERS_FORK_EPOCH: Epoch = u32::MAX;
 
 /// Whether the [`Committee`](crate::Committee) of `epoch` is bcs-encoded in the multi-worker
 /// layout (#554).
@@ -334,47 +334,47 @@ pub const COMMITTEE_WORKERS_FORK_EPOCH: Epoch = u32::MAX;
 /// never the running node's `Committee::epoch()` or any other node-local state, so that
 /// historical values keep their historical layout at any nesting depth.
 ///
-/// Adiri builds activate at [`COMMITTEE_WORKERS_FORK_EPOCH`]; all other builds are active from
+/// Adiri builds activate at [`MULTI_WORKERS_FORK_EPOCH`]; all other builds are active from
 /// genesis (mainnet never carries the legacy layout). Under `test-utils`, an explicit
-/// `TN_COMMITTEE_WORKERS_FORK_EPOCH` override takes precedence over both (see
-/// [`committee_workers_fork_epoch_override`]), so a test states the fork point it means rather
-/// than inheriting whichever one its feature set happens to select.
+/// `TN_MULTI_WORKERS_FORK_EPOCH` override takes precedence over both (see
+/// [`multi_workers_fork_epoch_override`]), so a test states the fork point it means rather than
+/// inheriting whichever one its feature set happens to select.
 #[inline]
-pub fn committee_workers_active(epoch: Epoch) -> bool {
+pub fn multi_workers_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "test-utils")]
     {
-        committee_workers_fork_epoch_override()
-            .map_or_else(|| committee_workers_build_fork_active(epoch), |fork| epoch >= fork)
+        multi_workers_fork_epoch_override()
+            .map_or_else(|| multi_workers_build_fork_active(epoch), |fork| epoch >= fork)
     }
     #[cfg(not(feature = "test-utils"))]
     {
-        committee_workers_build_fork_active(epoch)
+        multi_workers_build_fork_active(epoch)
     }
 }
 
-/// This build's compile-time fork point for the committee worker-list layout, with no test
-/// override applied.
+/// This build's compile-time fork point for the multi-workers fork, with no test override
+/// applied.
 ///
 /// Spelled out in full rather than sharing [`build_fork_active`] (the seed-signature gate)
 /// because the two forks arm independently and must never be tied to one constant.
 ///
-/// Unchanged from [`COMMITTEE_WORKERS_FORK_EPOCH`]'s documented contract: adiri (testnet, which
+/// Unchanged from [`MULTI_WORKERS_FORK_EPOCH`]'s documented contract: adiri (testnet, which
 /// carries pre-#554 packs on disk) stays dormant until the constant is lowered, and every other
 /// build is active from genesis. The genesis default rests on an assumption worth stating: no
 /// non-adiri network holds packs written by a pre-#554 binary, so no such build ever has to read
 /// the legacy single-worker layout. A non-adiri deployment that predates #554 would need its own
 /// dormant period here instead.
 #[inline]
-const fn committee_workers_build_fork_active(epoch: Epoch) -> bool {
+const fn multi_workers_build_fork_active(epoch: Epoch) -> bool {
     #[cfg(feature = "adiri")]
     #[expect(
         clippy::absurd_extreme_comparisons,
-        reason = "COMMITTEE_WORKERS_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) is \
+        reason = "MULTI_WORKERS_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not `==`) is \
                   the gate the future epoch-setting PR relies on, and this expectation flags \
                   itself for removal once that PR lowers the constant"
     )]
     {
-        epoch >= COMMITTEE_WORKERS_FORK_EPOCH
+        epoch >= MULTI_WORKERS_FORK_EPOCH
     }
     #[cfg(not(feature = "adiri"))]
     {
@@ -383,8 +383,8 @@ const fn committee_workers_build_fork_active(epoch: Epoch) -> bool {
     }
 }
 
-/// Test-only override of the effective committee worker-list fork epoch, read once from
-/// `TN_COMMITTEE_WORKERS_FORK_EPOCH` (`4294967295` for "never fires", `0` for "active from
+/// Test-only override of the effective multi-workers fork epoch, read once from
+/// `TN_MULTI_WORKERS_FORK_EPOCH` (`4294967295` for "never fires", `0` for "active from
 /// genesis").
 ///
 /// An environment variable rather than a process-global setter because e2e tests drive real node
@@ -396,12 +396,10 @@ const fn committee_workers_build_fork_active(epoch: Epoch) -> bool {
 /// constant and cannot be repointed at runtime by its environment. An unparseable value is
 /// ignored rather than defaulted, leaving the build's own fork point in force.
 #[cfg(feature = "test-utils")]
-pub fn committee_workers_fork_epoch_override() -> Option<Epoch> {
+pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
     static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
     *OVERRIDE.get_or_init(|| {
-        std::env::var("TN_COMMITTEE_WORKERS_FORK_EPOCH")
-            .ok()
-            .and_then(|raw| raw.trim().parse().ok())
+        std::env::var("TN_MULTI_WORKERS_FORK_EPOCH").ok().and_then(|raw| raw.trim().parse().ok())
     })
 }
 
@@ -514,7 +512,7 @@ mod tests {
         });
     }
 
-    /// Pin the committee worker-list gate to the rollout contract this build actually implements.
+    /// Pin the multi-workers gate to the rollout contract this build actually implements.
     ///
     /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`] states
     /// for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds only under
@@ -522,31 +520,31 @@ mod tests {
     /// binary and the e2e binary — is active from genesis, so epoch 1 already uses the
     /// multi-worker layout there.
     ///
-    /// Asserts against [`committee_workers_build_fork_active`], the override-free decision, so
-    /// the result does not depend on whether `test-utils` was unified into this build. The grid
-    /// is derived from the constant, so arming the fork does not require editing this test.
+    /// Asserts against [`multi_workers_build_fork_active`], the override-free decision, so the
+    /// result does not depend on whether `test-utils` was unified into this build. The grid is
+    /// derived from the constant, so arming the fork does not require editing this test.
     #[test]
-    fn committee_workers_build_fork_gate_matches_this_builds_rollout_contract() {
+    fn multi_workers_build_fork_gate_matches_this_builds_rollout_contract() {
         #[cfg(not(feature = "adiri"))]
         [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
             assert!(
-                committee_workers_build_fork_active(epoch),
+                multi_workers_build_fork_active(epoch),
                 "non-adiri builds carry no legacy committee layout and are active from genesis; \
                  epoch {epoch} must be post-fork",
             );
         });
         #[cfg(feature = "adiri")]
         {
-            [0, 1, 2, COMMITTEE_WORKERS_FORK_EPOCH - 1].into_iter().for_each(|epoch| {
+            [0, 1, 2, MULTI_WORKERS_FORK_EPOCH - 1].into_iter().for_each(|epoch| {
                 assert!(
-                    !committee_workers_build_fork_active(epoch),
-                    "adiri stays dormant before COMMITTEE_WORKERS_FORK_EPOCH; epoch {epoch} must \
-                     be pre-fork",
+                    !multi_workers_build_fork_active(epoch),
+                    "adiri stays dormant before MULTI_WORKERS_FORK_EPOCH; epoch {epoch} must be \
+                     pre-fork",
                 );
             });
-            [COMMITTEE_WORKERS_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+            [MULTI_WORKERS_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
                 assert!(
-                    committee_workers_build_fork_active(epoch),
+                    multi_workers_build_fork_active(epoch),
                     "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
                      {epoch} must be post-fork",
                 );
@@ -554,23 +552,23 @@ mod tests {
         }
     }
 
-    /// With no `TN_COMMITTEE_WORKERS_FORK_EPOCH` in the environment, the test override must be
+    /// With no `TN_MULTI_WORKERS_FORK_EPOCH` in the environment, the test override must be
     /// completely inert: the gate answers exactly as the compile-time contract does.
     #[cfg(feature = "test-utils")]
     #[test]
-    fn committee_workers_override_is_inert_when_unset() {
+    fn multi_workers_override_is_inert_when_unset() {
         // The override latches in a process-wide `OnceLock`, so a harness launched WITH the
         // variable set cannot observe the unset behaviour. Fail loudly rather than assert a
         // property this process cannot hold — a silent skip here would read as a pass.
         assert!(
-            committee_workers_fork_epoch_override().is_none(),
-            "this test requires a process without TN_COMMITTEE_WORKERS_FORK_EPOCH set; the \
-             override is OnceLock-latched, so run the unset case in its own process",
+            multi_workers_fork_epoch_override().is_none(),
+            "this test requires a process without TN_MULTI_WORKERS_FORK_EPOCH set; the override \
+             is OnceLock-latched, so run the unset case in its own process",
         );
         [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
             assert_eq!(
-                committee_workers_active(epoch),
-                committee_workers_build_fork_active(epoch),
+                multi_workers_fork_active(epoch),
+                multi_workers_build_fork_active(epoch),
                 "an unset override must not shift the gate at epoch {epoch}",
             );
         });

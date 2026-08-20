@@ -1389,8 +1389,8 @@ fn collect_batches(consensus: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
 /// Beyond the linkage this also pins the record's two internal identities to each other: the
 /// embedded [`Committee`]'s own epoch must equal the record's `epoch`. The committee's epoch is
 /// what SELECTED its bcs layout on the way in —
-/// [`committee_workers_active`](tn_types::forks::committee_workers_active) reads the epoch carried
-/// inside the value being decoded, not the record's — so a record whose committee claims a
+/// [`multi_workers_fork_active`](tn_types::forks::multi_workers_fork_active) reads the epoch
+/// carried inside the value being decoded, not the record's — so a record whose committee claims a
 /// different epoch was parsed under a layout the record's own epoch does not select, and no later
 /// reader can tell. Both halves are then used as if they agreed: `epoch_meta.epoch` decides which
 /// outputs [`Inner::save_consensus_output`] accepts, while `epoch_meta.committee` is the validator
@@ -3577,7 +3577,7 @@ pub(crate) mod test {
     /// Epoch of the frozen pre-fork pack: 406.
     ///
     /// One epoch below `CONSENSUS_REGISTRY_FORK_EPOCH` (407), the documented arming floor of the
-    /// committee worker-list fork (#554), and the same epoch `tn_types`' `LEGACY_FIXTURE_EPOCH`
+    /// multi-workers fork (#554), and the same epoch `tn_types`' `LEGACY_FIXTURE_EPOCH`
     /// pins — so the frozen committee vector there and the frozen pack file here describe one wire
     /// moment from opposite ends of the stack.
     ///
@@ -3939,7 +3939,7 @@ pub(crate) mod test {
     /// meant to hold still.
     ///
     /// Also the anti-vacuity check for the whole group: it asserts the two gates that decide the
-    /// frozen layout, so a stray `TN_COMMITTEE_WORKERS_FORK_EPOCH` in the environment (or the fork
+    /// frozen layout, so a stray `TN_MULTI_WORKERS_FORK_EPOCH` in the environment (or the fork
     /// being armed) fails here with a diagnosis instead of downstream as an unexplained byte diff.
     #[cfg(feature = "adiri")]
     #[tokio::test]
@@ -3947,9 +3947,9 @@ pub(crate) mod test {
         use tn_types::{encode, forks};
 
         assert!(
-            !forks::committee_workers_active(LEGACY_PACK_EPOCH),
+            !forks::multi_workers_fork_active(LEGACY_PACK_EPOCH),
             "epoch {LEGACY_PACK_EPOCH} must be PRE-fork for the frozen pack to be a legacy-layout \
-             pack; is TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment, or has the fork been \
+             pack; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been \
              armed?"
         );
         assert!(
@@ -4166,8 +4166,8 @@ pub(crate) mod test {
         assert_eq!(report.last_consensus_number, Some(LEGACY_PACK_LAST_CONSENSUS));
     }
 
-    /// PIN (non-adiri): the frozen pre-fork bytes are indecodable in a build whose committee
-    /// worker-list gate is active from genesis, and every read door says so loudly.
+    /// PIN (non-adiri): the frozen pre-fork bytes are indecodable in a build whose multi-workers
+    /// gate is active from genesis, and every read door says so loudly.
     ///
     /// This documents the build-gate contract at the storage layer rather than a gap: no non-adiri
     /// network carries pre-fork packs, so mainnet's gate is active at every epoch and the legacy
@@ -4178,7 +4178,7 @@ pub(crate) mod test {
     #[tokio::test]
     async fn test_golden_legacy_pack_rejected_without_adiri() {
         assert!(
-            tn_types::forks::committee_workers_active(LEGACY_PACK_EPOCH),
+            tn_types::forks::multi_workers_fork_active(LEGACY_PACK_EPOCH),
             "a non-adiri build must be post-fork at every epoch, epoch {LEGACY_PACK_EPOCH} included"
         );
 

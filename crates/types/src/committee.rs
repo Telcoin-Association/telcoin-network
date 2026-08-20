@@ -2,7 +2,7 @@
 
 use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
-    forks::committee_workers_active,
+    forks::multi_workers_fork_active,
     Address, Multiaddr, WorkerId,
 };
 use serde::{ser::SerializeStruct, Deserialize, Serialize};
@@ -336,7 +336,7 @@ impl<'de> Deserialize<'de> for Authority {
 /// The committee lists all validators that participate in consensus.
 ///
 /// Deliberately carries no serde derives: the binary wire layout is epoch-gated (#554, gated by
-/// [`crate::forks::committee_workers_active`]), so every encode and decode path routes through the
+/// [`crate::forks::multi_workers_fork_active`]), so every encode and decode path routes through the
 /// hand-written impls below. Human-readable formats keep the derive's exact behavior through
 /// [`CommitteeInnerHr`].
 #[derive(Debug, Eq)]
@@ -533,7 +533,7 @@ impl Serialize for CommitteeInner {
         // formats the gate reads the epoch inside this committee, never node-local state, so a
         // historical committee keeps its historical layout at any nesting depth (pack records,
         // epoch records, state-sync payloads).
-        if serializer.is_human_readable() || committee_workers_active(self.epoch) {
+        if serializer.is_human_readable() || multi_workers_fork_active(self.epoch) {
             let mut state = serializer.serialize_struct("CommitteeInner", COMMITTEE_FIELDS_V1)?;
             state.serialize_field("authorities", &self.authorities)?;
             state.serialize_field("epoch", &self.epoch)?;
@@ -585,8 +585,8 @@ impl<'de> Deserialize<'de> for CommitteeInner {
             fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
                     "a CommitteeInner: authorities and epoch, then bootstrap servers in the \
-                     layout that epoch selects, plus num_workers once the multi-worker fork is \
-                     active",
+                     layout that epoch selects, plus num_workers once the multi-workers fork \
+                     is active",
                 )
             }
 
@@ -596,7 +596,7 @@ impl<'de> Deserialize<'de> for CommitteeInner {
             {
                 let authorities = next_committee_field(&mut seq, "authorities")?;
                 let epoch: Epoch = next_committee_field(&mut seq, "epoch")?;
-                if committee_workers_active(epoch) {
+                if multi_workers_fork_active(epoch) {
                     let bootstrap_servers = next_committee_field(&mut seq, "bootstrap_servers")?;
                     let num_workers = next_committee_field(&mut seq, "num_workers")?;
                     return Ok(CommitteeInner::from_wire_fields(
@@ -1264,7 +1264,7 @@ mod tests {
     /// than write one that decodes as single-worker on every node.
     ///
     /// The adiri fork epoch is a `u32::MAX` placeholder, so every epoch is pre-fork in this lane.
-    /// `TN_COMMITTEE_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
+    /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
     /// `OnceLock` is process-wide and the whole test binary shares one process.
     #[cfg(feature = "adiri")]
     #[test]
@@ -1440,7 +1440,7 @@ mod tests {
     }
 
     /// Epoch of the legacy-layout fixtures: 406, one epoch below `CONSENSUS_REGISTRY_FORK_EPOCH`
-    /// (407), which is the documented arming floor of the committee worker-list fork.
+    /// (407), which is the documented arming floor of the multi-workers fork.
     ///
     /// One below the floor rather than the floor itself, because the fork may legally be armed AT
     /// 407: the gate is `>=`, so 407 would become post-fork and every anti-vacuity assert below
@@ -1457,7 +1457,7 @@ mod tests {
     /// Epoch of the post-fork-layout fixtures: `u32::MAX`, the one epoch that carries the
     /// multi-worker layout under every build, armed or not.
     ///
-    /// Non-adiri is post-fork from genesis. Adiri gates on `epoch >= COMMITTEE_WORKERS_FORK_EPOCH`
+    /// Non-adiri is post-fork from genesis. Adiri gates on `epoch >= MULTI_WORKERS_FORK_EPOCH`
     /// and that constant is the `u32::MAX` placeholder, so the top epoch is post-fork even while
     /// the fork is dormant — and stays post-fork once the epoch-setting PR lowers the constant. One
     /// frozen vector therefore pins the post-fork bytes on every lane, before and after arming.
@@ -1738,18 +1738,19 @@ mod tests {
     /// Pre-fork differential: the epoch-gated [`Committee`] and the derived legacy shadow encode
     /// to the same bytes, and each side reads what the other wrote.
     ///
-    /// The `adiri` worker-fork epoch is a `u32::MAX` placeholder, so every epoch is pre-fork in
-    /// this lane. `TN_COMMITTEE_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the
-    /// override's `OnceLock` is process-wide and the whole test binary shares one process.
+    /// The `adiri` multi-workers fork epoch is a `u32::MAX` placeholder, so every epoch is
+    /// pre-fork in this lane. `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage
+    /// that: the override's `OnceLock` is process-wide and the whole test binary shares one
+    /// process.
     #[cfg(feature = "adiri")]
     #[test]
     fn committee_bcs_pre_fork_layout_matches_legacy_repr() {
         let fixture = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3);
         let committee = fixture.committee();
         assert!(
-            !crate::forks::committee_workers_active(committee.epoch()),
+            !crate::forks::multi_workers_fork_active(committee.epoch()),
             "epoch {} must be pre-fork for this differential to mean anything; is \
-             TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed?",
+             TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed?",
             committee.epoch()
         );
 
@@ -1855,9 +1856,9 @@ mod tests {
     #[test]
     fn golden_legacy_committee_gated_wire_bytes_pinned() {
         assert!(
-            !crate::forks::committee_workers_active(LEGACY_FIXTURE_EPOCH),
+            !crate::forks::multi_workers_fork_active(LEGACY_FIXTURE_EPOCH),
             "epoch {LEGACY_FIXTURE_EPOCH} must be pre-fork for this pin to mean anything; is \
-             TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed?"
+             TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed?"
         );
 
         let committee = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3).committee();
@@ -1898,9 +1899,9 @@ mod tests {
     #[test]
     fn golden_v1_committee_wire_bytes_pinned() {
         assert!(
-            crate::forks::committee_workers_active(V1_FIXTURE_EPOCH),
+            crate::forks::multi_workers_fork_active(V1_FIXTURE_EPOCH),
             "epoch {V1_FIXTURE_EPOCH} must be post-fork for this pin to mean anything; is \
-             TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment?"
+             TN_MULTI_WORKERS_FORK_EPOCH set in the environment?"
         );
 
         let fixture = CommitteeWireFixture::multi_worker(V1_FIXTURE_EPOCH, 4, 3, 2);

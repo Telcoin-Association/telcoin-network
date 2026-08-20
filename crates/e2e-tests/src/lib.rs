@@ -42,7 +42,7 @@ impl TestBinary {
     /// `u32::MAX`, holding that fork dormant: wire-identical to pre-fork mainnet for the seed
     /// signature, the legacy single-worker layout for the committee worker list. A harness-level
     /// value is forwarded verbatim so a fork-active lane can export
-    /// `TN_SEED_SIGNATURE_FORK_EPOCH=0` or `TN_COMMITTEE_WORKERS_FORK_EPOCH=1`, and a single test
+    /// `TN_SEED_SIGNATURE_FORK_EPOCH=0` or `TN_MULTI_WORKERS_FORK_EPOCH=1`, and a single test
     /// can still override a pin with its own later `env()` call. Only binaries built with
     /// `tn-types/test-utils` (pulled in via `tn-storage/test-utils`, see `make build-e2e-bin`)
     /// consult these variables; production binaries ignore them.
@@ -53,7 +53,7 @@ impl TestBinary {
         };
         // one loop rather than a block per variable so the two forks cannot drift apart in
         // mechanism; they arm independently, so each is read and forwarded on its own
-        for var in ["TN_SEED_SIGNATURE_FORK_EPOCH", "TN_COMMITTEE_WORKERS_FORK_EPOCH"] {
+        for var in ["TN_SEED_SIGNATURE_FORK_EPOCH", "TN_MULTI_WORKERS_FORK_EPOCH"] {
             let fork_epoch = std::env::var(var).unwrap_or_else(|_| u32::MAX.to_string());
             command.env(var, fork_epoch);
         }
