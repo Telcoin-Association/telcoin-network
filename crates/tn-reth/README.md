@@ -231,6 +231,8 @@ All fee handling lives in `TNEvmHandler` (`src/evm/handler.rs`); system calls by
   `penalty = ((10^8 - usage_ratio_scaled)^2 × unused_gas) / 10^16` in deterministic u128 integer
   math. The penalty is deducted from the caller's unused-gas refund and credited to the base-fee
   address. Penalty is computed from pre-refund gas so SSTORE refunds don't inflate it.
+  User-facing documentation (formula, examples, detection recipe for wallets and integrators):
+  [`docs/gas-penalty.md`](../../docs/gas-penalty.md) at the repo root. Keep the two in sync.
 - **`BASEFEE_ADDRESS` is a process-global `OnceLock`** (`src/lib.rs`), written once by
   `set_basefee_address` during `RethEnv::new` (`src/env/mod.rs`). The first write wins; later
   writes are **silently discarded** (the `set` error is intentionally ignored). If it is never
