@@ -200,9 +200,24 @@ pub fn execute_consensus_output(
             // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per batch
             // for round
             let mix_hash = output_digest ^ batch_digest;
+            // Resolve the block beneficiary that receives this batch's priority fees (#1222).
+            //
+            // From `BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH` onward the producer's own
+            // `Batch::beneficiary` is used. That field is covered by the batch digest, so a
+            // byzantine header that copies another validator's batch digest cannot redirect the
+            // fees: whichever header references the digest, the batch carries its producer's
+            // beneficiary. Before the fork the header author's committee execution address
+            // (`cert_batch.address`) is used, so already-committed blocks re-execute unchanged.
+            // The epoch is the one carried by the consensus output being executed, matching the
+            // fork contract in `tn_types::forks`.
+            let beneficiary = if tn_types::forks::batch_producer_beneficiary_active(epoch) {
+                batch.beneficiary
+            } else {
+                cert_batch.address
+            };
             let payload = TNPayload::new(
                 canonical_header,
-                cert_batch.address,
+                beneficiary,
                 batch_index,
                 batch_digest,
                 &output,

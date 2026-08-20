@@ -31,9 +31,15 @@ pub type EngineUpdate = (Round, ConsensusNumHash, Option<SealedHeader>);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Struct that contains all necessary information for executing a batch post-consensus.
 pub struct CertifiedBatch {
-    /// The ECDSA address of the authority that produced the batch. This address is used as the
-    /// block beneficiary during execution. This may not be unique within a single
-    /// [ConsensusOutput].
+    /// The execution address of the sub-DAG header author that referenced these batches, resolved
+    /// through the committee.
+    ///
+    /// This is the block beneficiary during execution only while
+    /// [`batch_producer_beneficiary_active`](crate::forks::batch_producer_beneficiary_active)
+    /// is false for the output's epoch. From the producer-beneficiary fork onward each batch's
+    /// priority fees are credited to the producer's own [`Batch::beneficiary`] instead, so a
+    /// byzantine header cannot steal fees by copying another validator's batch digest (#1222).
+    /// This address may not be unique within a single [ConsensusOutput].
     pub address: Address,
     /// The collection of batches (in order) that reached consensus.
     pub batches: Vec<Batch>,
