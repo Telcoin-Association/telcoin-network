@@ -299,6 +299,8 @@ async fn handle_new_vote(
             // in so this should not happen.
             return;
         };
+        // Spawn the vote collector in response to a vote if it was missing.
+        // This allows the possibility of recovering a cert with a republished vote even if stale.
         task_spawner.spawn_task(format!("epoch votes for epoch {}", epoch_rec.epoch), async move {
             manage_epoch_votes(
                 epoch_rec,
@@ -419,6 +421,7 @@ pub(crate) fn spawn_epoch_vote_collector(
                     });
                 }
             }
+            // See spawn_epoch_record_collector() for how syncing nodes can keep up there epoch certs if not following the tip.
         }
     });
 }
