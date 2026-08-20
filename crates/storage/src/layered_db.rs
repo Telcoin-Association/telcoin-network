@@ -481,6 +481,14 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         Ok(())
     }
 
+    /// Remove the value for `key`.
+    ///
+    /// The mem-layer delete is visible at once, but the persistent delete runs on the
+    /// background thread and there is no tombstone. Until the queued remove is applied,
+    /// a `get` for the same key can fall through to the persistent layer and still see
+    /// the old value. Callers that remove and then read must call
+    /// [`Database::sync_persist`] (or await [`Database::persist`]) first, as
+    /// [`LayeredDbTxMut::commit`] documents for iteration.
     fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
         self.mem_db.remove::<T>(key)?;
         let rm = Box::new(KeyRemove::<T> { key: key.clone() });

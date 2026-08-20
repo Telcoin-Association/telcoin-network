@@ -4,9 +4,9 @@ use crate::{
     error::PrimaryNetworkError,
     network::{
         message::{PrimaryGossip, PrimaryResponse},
-        try_admit_epoch_record, MissingCertificatesRequest, RequestHandler,
-        MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONSENSUS_CERTS, MAX_PENDING_REQUESTS_PER_PEER,
-        MAX_TALLIES_PER_SIGNER_PER_NUMBER,
+        try_admit_epoch_record, MissingCertificatesRequest, PrimaryNetwork, PrimaryNetworkHandle,
+        RequestHandler, MAX_CONCURRENT_EPOCH_RECORD_REQUESTS, MAX_CONSENSUS_CERTS,
+        MAX_PENDING_REQUESTS_PER_PEER, MAX_TALLIES_PER_SIGNER_PER_NUMBER,
     },
     state_sync::StateSynchronizer,
     ConsensusBus, ConsensusBusApp, NodeMode, RecentBlocks,
@@ -23,7 +23,10 @@ use std::{
 };
 use tempfile::TempDir;
 use tn_config::{ConsensusConfig, KeyConfig, Parameters};
-use tn_network_libp2p::{GossipMessage, TopicHash};
+use tn_network_libp2p::{
+    types::{GossipPayload, NetworkEvent},
+    GossipMessage, TopicHash,
+};
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
     consensus_pack::PackError,
@@ -37,8 +40,8 @@ use tn_types::{
     BlockHeader, BlockNumHash, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner as _, Certificate,
     CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch,
     EpochDigest, EpochRecord, EpochSeedMessage, EpochVote, ExecHeader, Hash as _, HeaderDigest,
-    ReputationScores, Round, SealedHeader, TaskManager, TnReceiver as _, VoteDigest, VoteInfo,
-    B256,
+    ReputationScores, Round, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, VoteDigest,
+    VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -1097,6 +1100,151 @@ async fn test_epoch_vote_committee_key_bad_sig_reaches_verify() -> eyre::Result<
         "a committee-key vote with a bad signature must reach and fail the verify (PeerNotAuthor), \
          documenting the copied-key residual: {res:?}"
     );
+    Ok(())
+}
+
+/// The epoch-scoped [`PrimaryNetwork`] event loop is torn down and re-spawned every epoch, but it
+/// consumes from the application-scoped `primary_network_events` channel on the [`ConsensusBus`].
+/// That channel is a `QueChannel::new_always_subscribed()`, so events that arrive while no
+/// `PrimaryNetwork` is running are queued (not dropped) and delivered to the next epoch's network.
+/// Stream commands and epoch-record voting depend on this; enforce it going forward.
+///
+/// This drives the guarantee end-to-end through the real event loop. `NetworkEvent::Gossip` is the
+/// only variant constructible from this crate (`Request`/`Error` carry a `pub(crate)` libp2p
+/// `ResponseChannel`; `InboundStream` needs a live `Stream`), and a valid committee epoch-vote
+/// gossip is forwarded to the observable `new_epoch_votes` channel. The queuing is a property of
+/// the shared channel and the recv loop, so exercising it with one event type validates it for all.
+#[tokio::test]
+async fn test_primary_network_events_queue_across_epoch_restart() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+
+    // ----- application-scoped parts (outlive any single epoch's PrimaryNetwork) -----
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let auth0 = committee.authority_fixture_by_idx(0).expect("committee has authority 0");
+    let auth1 = committee.authority_fixture_by_idx(1).expect("committee has authority 1");
+    let config = auth0.consensus_config();
+    let chain_id = config.chain_id();
+    // Distinct committee signers so the "exercise" and "gap" votes are distinguishable and do not
+    // collide in the handler's per-authority equivocation map.
+    let key0 = config.key_config().clone();
+    let key1 = auth1.consensus_config().key_config().clone();
+
+    let cb = ConsensusBus::new();
+    let app = cb.app().clone();
+
+    // Long-lived task manager for the StateSynchronizer (kept alive for the whole test).
+    let state_sync_manager = TaskManager::default();
+    let state_sync =
+        StateSynchronizer::new(config.clone(), cb.clone(), state_sync_manager.get_spawner());
+    state_sync.spawn(&state_sync_manager);
+
+    // Seed the genesis execution result, mirroring `create_test_types`.
+    let parent = SealedHeader::seal_slow(ExecHeader::default());
+    let mut recent = RecentBlocks::new(1);
+    recent.push_latest(0, ConsensusNumHash::new(0, ConsensusHeaderDigest::default()), Some(parent));
+    app.recent_blocks().send_replace(recent);
+
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.committee()).await?;
+
+    // The sender the node-scope swarm holds across epochs to push events at the application.
+    let events_tx = app.primary_network_events_cloned();
+    // Dummy response sink for the test handle; the valid-vote path never uses it, but keep the
+    // receiver bound so any stray send cannot error.
+    let (handle_tx, _handle_rx) = tokio::sync::mpsc::channel(10);
+    let network_handle = PrimaryNetworkHandle::new_for_test(handle_tx);
+
+    // Observe forwarded epoch votes. `new_epoch_votes` is a plain `QueChannel`, so hold this one
+    // subscription for the whole test (a second concurrent subscribe would panic).
+    let mut votes_rx = app.subscribe_new_epoch_votes();
+
+    let sign_vote = |key: &KeyConfig| EpochRecord { epoch: 0, ..Default::default() }.sign_vote(key);
+
+    // ===== Epoch A: bring up a PrimaryNetwork and exercise it =====
+    let mut epoch_a = TaskManager::new("epoch-a");
+    let spawner_a = epoch_a.get_spawner();
+    PrimaryNetwork::new(
+        app.subscribe_primary_network_events(),
+        network_handle.clone(),
+        config.clone(),
+        app.clone(),
+        state_sync.clone(),
+        spawner_a.clone(),
+        consensus_chain.clone(),
+    )
+    .spawn(&spawner_a);
+
+    let vote_a = sign_vote(&key0);
+    let pubkey_a = vote_a.public_key;
+    events_tx
+        .send(NetworkEvent::Gossip(Box::new(GossipPayload {
+            message: epoch_vote_gossip(vote_a, chain_id),
+            relayer: None,
+            author: None,
+        })))
+        .await
+        .expect("inject epoch-A event");
+    let received = tokio::time::timeout(Duration::from_millis(500), votes_rx.recv())
+        .await
+        .expect("epoch-A network must process the injected event")
+        .expect("epoch vote channel closed");
+    assert_eq!(received.public_key, pubkey_a, "epoch-A network must forward the injected vote");
+
+    // ===== Drop epoch A and confirm its event-loop task has finished =====
+    // `update_tasks()` is REQUIRED before abort: tasks spawned via the spawner sit in the manager's
+    // pending queue until drained into `self.tasks`. Skip it and abort/await are no-ops, leaking
+    // the loop task that still holds the app-scoped receiver — which would panic the
+    // re-subscribe below.
+    epoch_a.update_tasks();
+    epoch_a.abort_all_tasks();
+    epoch_a.wait_for_task_shutdown().await;
+
+    // ===== Gap: inject an event while no PrimaryNetwork is running =====
+    let vote_gap = sign_vote(&key1);
+    let pubkey_gap = vote_gap.public_key;
+    events_tx
+        .send(NetworkEvent::Gossip(Box::new(GossipPayload {
+            message: epoch_vote_gossip(vote_gap, chain_id),
+            relayer: None,
+            author: None,
+        })))
+        .await
+        .expect("inject gap event");
+    // With nothing consuming the channel the event must be queued, not processed or lost.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), votes_rx.recv()).await.is_err(),
+        "with no PrimaryNetwork running the gap event must be queued, not processed",
+    );
+
+    // ===== Epoch B: spawn a new PrimaryNetwork over the SAME app-scoped parts =====
+    let mut epoch_b = TaskManager::new("epoch-b");
+    let spawner_b = epoch_b.get_spawner();
+    // A non-panicking re-subscribe is itself proof epoch A's loop released the shared receiver
+    // (`subscribe()` panics if a receiver is still checked out).
+    PrimaryNetwork::new(
+        app.subscribe_primary_network_events(),
+        network_handle.clone(),
+        config.clone(),
+        app.clone(),
+        state_sync.clone(),
+        spawner_b.clone(),
+        consensus_chain.clone(),
+    )
+    .spawn(&spawner_b);
+
+    // The event queued during the gap must now be delivered to and processed by the new network.
+    let received = tokio::time::timeout(Duration::from_millis(500), votes_rx.recv())
+        .await
+        .expect("epoch-B network must process the event queued during the gap")
+        .expect("epoch vote channel closed");
+    assert_eq!(
+        received.public_key, pubkey_gap,
+        "the event queued between epochs must be processed by the next epoch's network",
+    );
+
+    epoch_b.update_tasks();
+    epoch_b.abort_all_tasks();
+    epoch_b.wait_for_task_shutdown().await;
     Ok(())
 }
 

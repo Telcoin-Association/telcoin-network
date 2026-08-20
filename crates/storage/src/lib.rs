@@ -21,6 +21,7 @@ pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
 pub mod epoch_records;
+pub(crate) mod error_latch;
 pub mod exec_state_pack;
 pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
@@ -417,6 +418,7 @@ mod test {
         assert!(db.get::<TestTable>(&123456789).expect("Failed to get").is_some());
 
         db.remove::<TestTable>(&123456789).expect("Failed to remove");
+        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
         assert!(db.get::<TestTable>(&123456789).expect("Failed to get").is_none());
     }
 
