@@ -1385,6 +1385,20 @@ fn collect_batches(consensus: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
 /// Extracted from [`Inner::stream_import`] as a free function (it is stateless) so the offline pack
 /// validator ([`crate::pack_validate`]) can reuse the exact same epoch-linkage checks without
 /// duplicating them.
+///
+/// Beyond the linkage this also pins the record's two internal identities to each other: the
+/// embedded [`Committee`]'s own epoch must equal the record's `epoch`. The committee's epoch is
+/// what SELECTED its bcs layout on the way in —
+/// [`committee_workers_active`](tn_types::forks::committee_workers_active) reads the epoch carried
+/// inside the value being decoded, not the record's — so a record whose committee claims a
+/// different epoch was parsed under a layout the record's own epoch does not select, and no later
+/// reader can tell. Both halves are then used as if they agreed: `epoch_meta.epoch` decides which
+/// outputs [`Inner::save_consensus_output`] accepts, while `epoch_meta.committee` is the validator
+/// set every output in the pack is decoded and verified against, and
+/// [`ConsensusPack::stream_import`] reports `epoch()` from the request while `committee()` comes
+/// from this record. A local write cannot break the equality — [`Inner::open_append`] derives the
+/// record's epoch FROM the committee — so a divergence only ever arrives over the wire (peer epoch
+/// sync) or from an imported bundle, which is precisely what this function screens.
 pub(crate) fn verify_epoch_meta(
     epoch: Epoch,
     previous_epoch: &EpochRecord,
@@ -1394,6 +1408,16 @@ pub(crate) fn verify_epoch_meta(
         return Err(PackError::InvalidEpoch(
             epoch,
             format!("meta data epoch is {}", epoch_meta.epoch),
+        ));
+    }
+    if epoch_meta.committee.epoch() != epoch_meta.epoch {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            format!(
+                "meta data epoch is {} but its committee is for epoch {}",
+                epoch_meta.epoch,
+                epoch_meta.committee.epoch()
+            ),
         ));
     }
     let start_consensus_number =
@@ -3321,6 +3345,133 @@ pub(crate) mod test {
         let err = verify_epoch_meta(2, &rec1, &meta_for(2, &committee5_next, &rec1))
             .expect_err("shrunken vs full must fail");
         assert!(matches!(err, PackError::InvalidEpoch(2, _)), "got {err:?}");
+    }
+
+    /// `verify_epoch_meta` pins the [`EpochMeta`]'s embedded committee to the record's own epoch.
+    ///
+    /// The committee's epoch is what selects its bcs layout, so a meta whose outer epoch and
+    /// committee epoch disagree carries a committee decoded under a layout that record does not
+    /// select — while `epoch_meta.epoch` and `epoch_meta.committee` are used downstream as if they
+    /// agreed. Every other check here is satisfied (identical key set, matching start number and
+    /// genesis links), so only the committee-epoch check can reject these metas, and the error text
+    /// is asserted to prove it is the arm that fired.
+    #[test]
+    fn test_verify_epoch_meta_rejects_committee_epoch_mismatch() {
+        use std::collections::BTreeMap;
+
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::{Address, Authority, BlsKeypair, BlsPublicKey};
+
+        use crate::consensus_pack::{verify_epoch_meta, EpochMeta, PackError};
+
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let keys: Vec<BlsPublicKey> =
+            (0..3).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+        let authorities = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (*k, Authority::new_for_test(*k, Address::repeat_byte(i as u8 + 1))))
+            .collect::<BTreeMap<_, _>>();
+        let committee = Committee::new_for_test(authorities, 1, BTreeMap::default());
+
+        let previous = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            final_consensus: ConsensusNumHash::new(77, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        let meta_with = |committee: Committee| EpochMeta {
+            epoch: 1,
+            committee,
+            start_consensus_number: previous.final_consensus.number + 1,
+            genesis_exec_state: previous.final_state,
+            genesis_consensus: previous.final_consensus,
+        };
+
+        // A committee carrying the record's own epoch verifies.
+        verify_epoch_meta(1, &previous, &meta_with(committee.clone()))
+            .expect("a committee at the record's epoch must verify");
+
+        // A committee from either side of the record's epoch does not, even though its key set is
+        // the one the previous record hands off to.
+        for committee_epoch in [0, 2] {
+            let meta = meta_with(committee.advance_epoch_for_test(committee_epoch));
+            let Err(err) = verify_epoch_meta(1, &previous, &meta) else {
+                panic!("committee epoch {committee_epoch} must not verify in an epoch-1 record")
+            };
+            assert!(
+                matches!(err, PackError::InvalidEpoch(1, _)),
+                "committee epoch {committee_epoch}: got {err:?}"
+            );
+            assert!(
+                err.to_string().contains(&format!("committee is for epoch {committee_epoch}")),
+                "committee epoch {committee_epoch}: a different check rejected this meta: {err}"
+            );
+        }
+    }
+
+    /// PEER PATH: `stream_import` rejects a record stream whose [`EpochMeta`] carries a committee
+    /// for a different epoch, and rejects it before appending anything.
+    ///
+    /// This is the door the check exists for: a local write cannot produce such a meta, since
+    /// `Inner::open_append` derives the record's epoch from the committee it is handed. Only a
+    /// hostile or buggy peer (or an imported bundle) can, and the committee it ships is the
+    /// validator set every output in the pack would then be verified against.
+    #[tokio::test]
+    async fn test_stream_import_rejects_committee_epoch_mismatch() {
+        use crate::{
+            archive::pack::Pack,
+            consensus_pack::{EpochMeta, PackError, PackRecord},
+        };
+
+        let temp_dir = TempDir::with_prefix("test_cp_meta_committee_epoch").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // The container and every linkage field are well formed for epoch 0; only the embedded
+        // committee claims epoch 1.
+        let source = temp_dir.path().join("peer_stream");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&source, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open peer stream");
+            pack.append(&PackRecord::EpochMeta(EpochMeta {
+                epoch: 0,
+                committee: committee.advance_epoch_for_test(1),
+                start_consensus_number: 1,
+                genesis_exec_state: previous_epoch.final_state,
+                genesis_consensus: previous_epoch.final_consensus,
+            }))
+            .expect("append hostile meta");
+            pack.commit().expect("commit peer stream");
+        }
+
+        let target = TempDir::with_prefix("test_cp_meta_committee_epoch_out").expect("temp dir");
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let err = ConsensusPack::stream_import(
+            target.path(),
+            stream,
+            0,
+            &previous_epoch,
+            1,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a meta whose committee is for another epoch must not import");
+        assert!(matches!(err, PackError::InvalidEpoch(0, _)), "got {err:?}");
+        assert!(
+            err.to_string().contains("committee is for epoch 1"),
+            "a different check rejected the import: {err}"
+        );
+
+        // Rejected before the append: the epoch has no readable meta record, so no reader can pick
+        // the hostile committee up.
+        assert!(
+            ConsensusPack::open_append_exists(target.path(), 0).is_err(),
+            "the rejected meta was appended anyway"
+        );
     }
 
     /// Deterministic BLS seed signature for fork-active fixture headers: the keypair comes
