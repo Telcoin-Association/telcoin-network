@@ -3422,4 +3422,654 @@ pub(crate) mod test {
             "per-element gate visibility must survive the round trip"
         );
     }
+
+    /// Epoch of the frozen pre-fork pack: 407.
+    ///
+    /// `CONSENSUS_REGISTRY_FORK_EPOCH`, the documented arming floor of the committee worker-list
+    /// fork (#554), and the same epoch `tn_types`' `LEGACY_FIXTURE_EPOCH` pins — so the frozen
+    /// committee vector there and the frozen pack file here describe one wire moment from opposite
+    /// ends of the stack. Under `adiri` it sits below the worker fork (dormant at `u32::MAX`), so
+    /// the embedded [`Committee`] encodes in the legacy single-worker layout, and at or above
+    /// `SEED_SIGNATURE_FORK_EPOCH` (383), so the nested headers carry `seed_signature`: exactly the
+    /// shape of an epoch pack sitting on an adiri node's disk today.
+    const LEGACY_PACK_EPOCH: Epoch = 407;
+
+    /// Final consensus number of the epoch before [`LEGACY_PACK_EPOCH`].
+    ///
+    /// Nonzero on purpose: it keeps the fixture on the `previous_epoch.final_consensus.number + 1`
+    /// branch of `Inner::open_append` rather than the epoch-0 special case, so the frozen
+    /// `start_consensus_number` is a value the linkage checks can actually disagree with.
+    const LEGACY_PACK_PREV_CONSENSUS: u64 = 9_100;
+
+    /// First consensus number in the frozen pack.
+    ///
+    /// Only the `adiri` lane ever reads it: on a post-fork build the frozen bytes never decode far
+    /// enough to have a consensus range at all.
+    #[cfg(feature = "adiri")]
+    const LEGACY_PACK_FIRST_CONSENSUS: u64 = LEGACY_PACK_PREV_CONSENSUS + 1;
+
+    /// Last consensus number in the frozen pack, which holds two outputs.
+    const LEGACY_PACK_LAST_CONSENSUS: u64 = LEGACY_PACK_PREV_CONSENSUS + 2;
+
+    /// FROZEN pre-fork epoch pack: the complete, sealed `epoch-407/data` file (978 bytes) a build
+    /// of this crate writes at [`LEGACY_PACK_EPOCH`] on the `adiri` lane — data header, then an
+    /// `EpochMeta` record whose [`Committee`] is in the legacy single-worker layout, then two
+    /// consensus outputs (header record followed by its batch record, the v1 ordering).
+    ///
+    /// This is the layout of every consensus pack already on adiri disk: `Committee` is embedded in
+    /// `EpochMeta`, the FIRST record of every pack, and bcs is not self-describing. Before the
+    /// epoch-gated encoder landed, every adiri node restarting against an existing consensus-db
+    /// failed to decode this record and exited 1, and epoch-pack peer sync broke across versions.
+    /// The tests below open these exact bytes through every read door in the crate.
+    ///
+    /// If a test here fails, work out WHICH pin moved before touching this constant:
+    ///
+    /// - `tn_types`' `golden_legacy_committee_wire_bytes_pinned` also failing means the committee
+    ///   wire layout moved. That is a compatibility break to fix in the encoder, NOT a constant to
+    ///   refresh — refreshing it strands every pack already written.
+    /// - that pin still passing means the container moved, not the payload: the record framing, the
+    ///   crc, the zstd encoder, or the fixture. `test_golden_legacy_pack_regenerates` cross-checks
+    ///   the committee bytes inside the frozen container for exactly this reason, so a green
+    ///   committee assertion next to a red byte-identity assertion is the "container moved" signal.
+    ///
+    /// The fixture takes no rng, no clock and no OS-assigned port, so nothing else can move it.
+    const GOLDEN_LEGACY_PACK_HEX: &str = "74656c6e65740100fcd1899ff6d1e6500100000001000000e208b486aa01000028b52ffd00580d0d0004170097010000026085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e8735140260ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b8444414010b047f00000191029c41cd032408011220b14a3296426492458270c2e577fdc549b6d67155e5800b0bf96c3f4106b4ae7100a029c602145e9a9f1672b151652377fa8c23fc78ded1add621fe177d33b8ebcd4214009c40e0fcb53429020d03e8f4e471ec73993f9329ad0d76e69cfdfcb08c94aa39fdab28055139b0f6daf33b3fdc294e2bfc1ad914de91f7d6e9f717b4509c047fbc6acc008d2300921000205e8c207a1100b88654650c7403e7886b049c00d2c0070e2df686f8d09a0f642c550918b62b0d7882a193613a78d24e27a7100503d0f621c500000028b52ffd0058e50500740a02207a017b403bb2f1bcfe223c27bf0d350aa0dc2e7f02f257580d538ac8a36f21223d29010000009701000001000120cd320d69a6101da84655bd1164f4ae8eca33019ec39900d453153855c9b0614b002000309455941aa83bcaa9f33fa21533d526c4b824ef51132c5629a21619f9975befc7fcf1097d590c01356c37ba346bfc2c42203cd4585ccad5b8f09b28c2444dfda62125ab6d4c235efc635ecc10ddf4f447048d2307000833c000bf60980d828607f61b184a03dc54c7ce081e00000028b52ffd0058ad000060010108019701000014000700031000044e252302eedd7021e300000028b52ffd0058d50600640c02202463b8f4d9ece8aae9530e1e7bf678e44cc7e4c5d259e42d44375bfa5be398b3015237b9c5d795289c9a054ba2761ff631cd622c9d94df6ab749814cede8549d3f020000009701000002000120a5ae45f82b326fa9462a5e73672f9dc4900564f4294edcf58fc85edf762ae931002000309455941aa83bcaa9f33fa21533d526c4b824ef51132c5629a21619f9975befc7fcf1097d590c01356c37ba346bfc2c42206f9ec6c464377d4f9f935156387873e428662cfe18ef258641136a71aa5cb7da8e2306000833c000bf60980d828607f63703300371df93221e00000028b52ffd0058ad000060010108029701000014000700031000044e2523026a86ea72";
+
+    /// Decode [`GOLDEN_LEGACY_PACK_HEX`], failing loudly on a malformed constant.
+    fn golden_legacy_pack_bytes() -> Vec<u8> {
+        tn_types::hex::decode(GOLDEN_LEGACY_PACK_HEX).expect("frozen hex vector must be valid hex")
+    }
+
+    /// Lay the frozen bytes down as a bare `epoch-407/data` file with NO sidecar indexes, and
+    /// return its path.
+    ///
+    /// The strictest shape a read door can be handed: nothing but the pack stream, so whatever it
+    /// learns about the epoch it learns by decoding the `EpochMeta` record itself.
+    fn write_golden_legacy_data_file(dir: &std::path::Path) -> std::path::PathBuf {
+        let base = dir.join(format!("epoch-{LEGACY_PACK_EPOCH}"));
+        std::fs::create_dir_all(&base).expect("create pack dir");
+        let path = base.join(Inner::DATA_NAME);
+        std::fs::write(&path, golden_legacy_pack_bytes()).expect("write frozen data file");
+        path
+    }
+
+    /// Deterministic BLS keypair for fixture slot `slot`.
+    ///
+    /// A fixed scalar rather than a seeded rng, so the derived public key — and with it the
+    /// `authorities` map order and every frozen byte above — survives `rand` and `blst` bumps as
+    /// well as reruns. The leading bytes stay zero, which keeps the scalar nonzero and far below
+    /// the BLS12-381 group order, the only two values `blst` rejects.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_bls_keypair(slot: u8) -> tn_types::BlsKeypair {
+        let mut scalar = [0_u8; 32];
+        scalar[30] = slot;
+        scalar[31] = 0x2A;
+        tn_types::BlsKeypair::from_bytes(&scalar)
+            .expect("fixture bls scalar is a valid private key")
+    }
+
+    /// A fixture [`P2pNode`](tn_types::P2pNode) from a fixed ed25519 seed and port.
+    ///
+    /// ed25519 secret keys *are* 32-byte seeds, so a fixed seed yields a fixed public key with no
+    /// rng in the path, and the multiaddr comes from a literal rather than an OS-assigned port.
+    /// `rpc` stays `None`: the `Some` arm needs a `url::Url`, which this crate does not depend on,
+    /// and `tn_types`' frozen committee vectors already pin both arms.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_p2p_node(tag: u8, slot: u8, port: u16) -> tn_types::P2pNode {
+        let mut seed = [0_u8; 32];
+        seed[0] = tag;
+        seed[1] = slot;
+        tn_types::P2pNode {
+            network_address: format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+                .parse()
+                .expect("fixture multiaddr parses"),
+            network_key: tn_types::NetworkKeypair::ed25519_from_bytes(seed)
+                .expect("a 32-byte array is a valid ed25519 secret seed")
+                .public()
+                .clone()
+                .into(),
+            rpc: None,
+        }
+    }
+
+    /// The frozen pack's committee: two authorities, each with a single-worker bootstrap server.
+    ///
+    /// Two is the minimum — `CommitteeInner::load` asserts a committee larger than one — and the
+    /// point of the fixture is the wire layout, not the quorum math, so it stays at the minimum to
+    /// keep the frozen vector small. One worker per server is the only shape the legacy layout can
+    /// express at all.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_committee() -> Committee {
+        use std::collections::BTreeMap;
+
+        use tn_types::{Address, Authority, BootstrapServer};
+
+        let mut authorities = BTreeMap::new();
+        let mut bootstrap_servers = BTreeMap::new();
+        for slot in 0..2_u8 {
+            let key = *legacy_pack_bls_keypair(slot).public();
+            authorities.insert(key, Authority::new_for_test(key, Address::repeat_byte(slot + 1)));
+            bootstrap_servers.insert(
+                key,
+                BootstrapServer::new(
+                    legacy_pack_p2p_node(0xB0, slot, 40_000 + u16::from(slot)),
+                    vec![legacy_pack_p2p_node(0xC0, slot, 41_000 + u16::from(slot))],
+                ),
+            );
+        }
+        Committee::new_for_test(authorities, LEGACY_PACK_EPOCH, bootstrap_servers)
+    }
+
+    /// The previous epoch's record the frozen pack links to.
+    ///
+    /// Every field here is frozen INTO the pack: `open_append` copies `final_state` and
+    /// `final_consensus` into the `EpochMeta` and derives `start_consensus_number` from them, and
+    /// `verify_epoch_meta` re-checks all three plus the committee key set on every import and
+    /// validation. Feeding this record to those doors therefore pins the meta's fields, not just
+    /// its committee.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_previous_epoch(committee: &Committee) -> EpochRecord {
+        EpochRecord {
+            epoch: LEGACY_PACK_EPOCH - 1,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            final_state: tn_types::BlockNumHash::new(4_242, tn_types::B256::repeat_byte(0x5E)),
+            final_consensus: ConsensusNumHash::new(
+                LEGACY_PACK_PREV_CONSENSUS,
+                ConsensusHeaderDigest::from([0x7A_u8; 32]),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// One fully deterministic output for the frozen pack: a single-certificate sub-DAG whose
+    /// leader header references exactly one batch.
+    ///
+    /// `tag` seeds every value that distinguishes one fixture output from another (round,
+    /// `created_at`, the batch's payload bytes, and which authority authors it), so the two outputs
+    /// differ in every hashed field while neither reaches for a clock or an rng. The seed signature
+    /// is a real BLS signature over a fixed message: BLS signing takes no nonce, so it is
+    /// reproducible, and it is on the wire at this epoch because the seed-signature fork is active
+    /// here.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_output(
+        committee: &Committee,
+        number: u64,
+        parent: ConsensusHeaderDigest,
+        tag: u8,
+    ) -> ConsensusOutput {
+        use tn_types::Signer as _;
+
+        let batch =
+            Batch::new_for_test(vec![vec![tag; 8]], ExecHeader::default(), 0, LEGACY_PACK_EPOCH);
+        let authorities = committee.authorities();
+        let authority = authorities
+            .get(usize::from(tag) % authorities.len())
+            .expect("modulo keeps the index in range");
+        let seed_signature = legacy_pack_bls_keypair(0xF0).sign(b"pack-fixture-seed");
+        let header = HeaderBuilder::default()
+            .author(authority.id())
+            .round(u32::from(tag))
+            .epoch(LEGACY_PACK_EPOCH)
+            .created_at(u64::from(tag))
+            .seed_signature(seed_signature)
+            .with_payload_batch(&batch, 0_u16)
+            .build();
+        let mut leader = Certificate::default();
+        leader.update_header_for_test(header);
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            u64::from(tag),
+            ReputationScores::default(),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        let batch_digests: VecDeque<BlockHash> = [batch.digest()].into_iter().collect();
+        ConsensusOutput::new(
+            sub_dag,
+            parent,
+            number,
+            false,
+            batch_digests,
+            vec![CertifiedBatch { address: authority.execution_address(), batches: vec![batch] }],
+        )
+    }
+
+    /// The frozen pack's two outputs, chained: the first parents off the previous epoch's final
+    /// consensus header, the second off the first. Tags 1 and 2 land on different authorities, so
+    /// both committee members author one output and the decoder's author lookup is exercised for
+    /// each.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_outputs(committee: &Committee, previous: &EpochRecord) -> Vec<ConsensusOutput> {
+        let mut parent = previous.final_consensus.hash;
+        let mut number = previous.final_consensus.number + 1;
+        let mut outputs = Vec::new();
+        for tag in [1_u8, 2] {
+            let output = legacy_pack_output(committee, number, parent, tag);
+            parent = output.digest();
+            number += 1;
+            outputs.push(output);
+        }
+        outputs
+    }
+
+    /// Write the fixture pack through the normal write path (`open_append` +
+    /// `save_consensus_output`) into `dir` and return the resulting `data` file bytes.
+    ///
+    /// On the `adiri` lane at [`LEGACY_PACK_EPOCH`] the gated encoder emits the legacy committee
+    /// layout, which `tn_types`' differentials prove is byte-identical to the pre-#554 derive. A
+    /// pack this writes at that epoch therefore IS a pre-fork pack, byte for byte — which is what
+    /// makes freezing its output a fixture of history rather than of this build.
+    #[cfg(feature = "adiri")]
+    async fn write_legacy_pack(dir: &std::path::Path) -> Vec<u8> {
+        let committee = legacy_pack_committee();
+        let previous_epoch = legacy_pack_previous_epoch(&committee);
+        let pack = ConsensusPack::open_append(dir, previous_epoch.clone(), committee.clone())
+            .expect("open fixture pack for append");
+        for output in legacy_pack_outputs(&committee, &previous_epoch) {
+            pack.save_consensus_output(output).await.expect("save fixture output");
+        }
+        pack.persist().await.expect("persist fixture pack");
+        drop(pack);
+        std::fs::read(dir.join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME))
+            .expect("read fixture data file")
+    }
+
+    /// Materialize a complete pack directory (data file plus sidecar indexes) in `dir` FROM the
+    /// frozen bytes, by feeding them to `stream_import` the way a peer stream arrives.
+    ///
+    /// `stream_import` is the only path that builds a pack's indexes from a record stream, so it is
+    /// how the doors that need sidecars (`open_static`, and reading outputs back through
+    /// `open_append_exists` / `open_append`) get an on-disk pack whose `data` file is provably the
+    /// frozen constant — asserted here, so every caller inherits the guarantee.
+    #[cfg(feature = "adiri")]
+    async fn import_golden_legacy_pack(dir: &std::path::Path) {
+        let frozen = golden_legacy_pack_bytes();
+        let source = dir.join("peer_stream");
+        std::fs::write(&source, &frozen).expect("write peer stream");
+        let committee = legacy_pack_committee();
+        let previous_epoch = legacy_pack_previous_epoch(&committee);
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let pack = ConsensusPack::stream_import(
+            dir,
+            stream,
+            LEGACY_PACK_EPOCH,
+            &previous_epoch,
+            LEGACY_PACK_LAST_CONSENSUS,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("stream import of the frozen pre-fork pack");
+        pack.persist().await.expect("persist imported pack");
+        drop(pack);
+        let on_disk =
+            std::fs::read(dir.join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME))
+                .expect("read imported data file");
+        assert_eq!(
+            tn_types::hex::encode(&on_disk),
+            GOLDEN_LEGACY_PACK_HEX,
+            "the materialized pack's data file is not the frozen pre-fork bytes"
+        );
+    }
+
+    /// Assert `pack`'s handle-level committee is the frozen pre-fork committee, in the legacy
+    /// single-worker shape.
+    ///
+    /// `Committee`'s `PartialEq` deliberately ignores bootstrap servers, so the map is compared
+    /// separately — without that a pack whose bootstrap hints decoded to something else entirely
+    /// would compare equal.
+    #[cfg(feature = "adiri")]
+    fn assert_legacy_pack_committee(pack: &ConsensusPack) {
+        let expected = legacy_pack_committee();
+        assert_eq!(pack.epoch(), LEGACY_PACK_EPOCH, "pack epoch moved");
+        assert_eq!(pack.committee().epoch(), LEGACY_PACK_EPOCH, "meta committee epoch moved");
+        assert_eq!(pack.committee().size(), 2, "meta committee authority count moved");
+        assert_eq!(
+            pack.committee().number_of_workers(),
+            1,
+            "the legacy layout carries no worker count, so it must decode as single-worker"
+        );
+        assert_eq!(pack.committee().bootstrap_servers().len(), 2, "bootstrap server count moved");
+        assert!(
+            pack.committee().bootstrap_servers().values().all(|server| server.num_workers() == 1),
+            "the legacy layout holds exactly one worker per bootstrap server"
+        );
+        assert_eq!(*pack.committee(), expected, "the meta holds a different committee");
+        assert_eq!(
+            pack.committee().bootstrap_servers(),
+            expected.bootstrap_servers(),
+            "the meta holds different bootstrap servers"
+        );
+    }
+
+    /// Read both frozen outputs back through `pack` and compare them to the fixture, and confirm
+    /// the frozen `start_consensus_number` by rejecting the number just below it.
+    #[cfg(feature = "adiri")]
+    async fn assert_legacy_pack_outputs(pack: &ConsensusPack) {
+        let committee = legacy_pack_committee();
+        let previous_epoch = legacy_pack_previous_epoch(&committee);
+        let expected = legacy_pack_outputs(&committee, &previous_epoch);
+        for output in &expected {
+            let read_back = pack.get_consensus_output(output.number()).await.unwrap_or_else(|e| {
+                panic!("read output {} from the frozen pack: {e}", output.number())
+            });
+            compare_outputs(&read_back, output);
+        }
+        assert!(
+            pack.get_consensus_output(LEGACY_PACK_PREV_CONSENSUS).await.is_err(),
+            "a number below the frozen start_consensus_number must be rejected"
+        );
+        assert!(
+            !pack
+                .contains_consensus_header_number(LEGACY_PACK_PREV_CONSENSUS)
+                .await
+                .expect("query the frozen pack"),
+            "the frozen pack must not claim the previous epoch's final consensus number"
+        );
+        assert!(
+            pack.contains_consensus_header_number(LEGACY_PACK_LAST_CONSENSUS)
+                .await
+                .expect("query the frozen pack"),
+            "the frozen pack must claim its own last consensus number"
+        );
+    }
+
+    /// ANCHOR (adiri): the frozen pre-fork pack is exactly what this build's normal write path
+    /// produces at [`LEGACY_PACK_EPOCH`], so the fixture cannot drift away from the encoder it is
+    /// meant to hold still.
+    ///
+    /// Also the anti-vacuity check for the whole group: it asserts the two gates that decide the
+    /// frozen layout, so a stray `TN_COMMITTEE_WORKERS_FORK_EPOCH` in the environment (or the fork
+    /// being armed) fails here with a diagnosis instead of downstream as an unexplained byte diff.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_regenerates() {
+        use tn_types::{encode, forks};
+
+        assert!(
+            !forks::committee_workers_active(LEGACY_PACK_EPOCH),
+            "epoch {LEGACY_PACK_EPOCH} must be PRE-fork for the frozen pack to be a legacy-layout \
+             pack; is TN_COMMITTEE_WORKERS_FORK_EPOCH set in the environment, or has the fork been \
+             armed?"
+        );
+        assert!(
+            forks::seed_signature_active(LEGACY_PACK_EPOCH),
+            "epoch {LEGACY_PACK_EPOCH} must be seed-signature-active for the frozen headers to \
+             carry seed_signature; is TN_SEED_SIGNATURE_FORK_EPOCH set in the environment?"
+        );
+
+        let first = TempDir::with_prefix("golden_legacy_pack_a").expect("temp dir");
+        let bytes = write_legacy_pack(first.path()).await;
+        assert_eq!(
+            tn_types::hex::encode(&bytes),
+            GOLDEN_LEGACY_PACK_HEX,
+            "the pre-fork write path diverged from the frozen pack"
+        );
+
+        // a second, independent write of the same fixture must produce the same file: no rng,
+        // clock or OS-assigned port leaked into the fixture
+        let second = TempDir::with_prefix("golden_legacy_pack_b").expect("temp dir");
+        assert_eq!(
+            write_legacy_pack(second.path()).await,
+            bytes,
+            "the fixture pack is not reproducible"
+        );
+
+        // Cross-check the committee bytes INSIDE the frozen container. This separates the two ways
+        // the byte-identity assertion above can fail: if this still passes, the container moved
+        // (framing, crc, zstd) and not the committee wire layout.
+        let pack = ConsensusPack::open_append_exists(first.path(), LEGACY_PACK_EPOCH)
+            .expect("reopen the pack just written");
+        assert_eq!(
+            tn_types::hex::encode(encode(pack.committee())),
+            tn_types::hex::encode(encode(&legacy_pack_committee())),
+            "the committee stored in the frozen pack is not the legacy-layout fixture committee"
+        );
+        assert_legacy_pack_committee(&pack);
+    }
+
+    /// DOOR 1 (adiri): warm restart — `open_append_exists`, the door that exited 1 in production.
+    ///
+    /// Driven twice over the same frozen bytes: first as a bare `data` file with no sidecar
+    /// indexes, which is the strictest form (everything the door knows about the epoch it decodes
+    /// out of the `EpochMeta` record itself), then over a full pack directory, where the frozen
+    /// outputs must also read back. Opening for append must not rewrite the file either way.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_opens_append_exists() {
+        let bare = TempDir::with_prefix("golden_legacy_warm_bare").expect("temp dir");
+        let data_file = write_golden_legacy_data_file(bare.path());
+        {
+            let pack = ConsensusPack::open_append_exists(bare.path(), LEGACY_PACK_EPOCH)
+                .expect("warm restart against a bare frozen pre-fork data file");
+            assert_eq!(pack.version, PACK_VERSION, "frozen pack version moved");
+            assert!(!pack.is_static(), "a warm-restart handle is writable");
+            assert_legacy_pack_committee(&pack);
+            pack.persist().await.expect("persist");
+        }
+        assert_eq!(
+            tn_types::hex::encode(std::fs::read(&data_file).expect("reread data file")),
+            GOLDEN_LEGACY_PACK_HEX,
+            "opening a pre-fork pack for append rewrote or truncated it"
+        );
+
+        let full = TempDir::with_prefix("golden_legacy_warm_full").expect("temp dir");
+        import_golden_legacy_pack(full.path()).await;
+        let pack = ConsensusPack::open_append_exists(full.path(), LEGACY_PACK_EPOCH)
+            .expect("warm restart against a complete frozen pre-fork pack");
+        assert_legacy_pack_committee(&pack);
+        assert_legacy_pack_outputs(&pack).await;
+    }
+
+    /// DOOR 2 (adiri): historical reads — `open_static` over the frozen bytes.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_opens_static() {
+        let dir = TempDir::with_prefix("golden_legacy_static").expect("temp dir");
+        import_golden_legacy_pack(dir.path()).await;
+
+        let pack = ConsensusPack::open_static(dir.path(), LEGACY_PACK_EPOCH)
+            .expect("read-only open of the frozen pre-fork pack");
+        assert!(pack.is_static(), "open_static must yield a read-only handle");
+        assert_legacy_pack_committee(&pack);
+        assert_legacy_pack_outputs(&pack).await;
+    }
+
+    /// DOOR 3 (adiri): peer epoch sync — `stream_import` of the frozen bytes.
+    ///
+    /// The load-bearing assertion is byte identity: importing and then serving a pre-fork pack must
+    /// leave the meta record exactly as it arrived, because those same bytes are what this node
+    /// hands to a peer still running a pre-fork build. A rewritten meta would decode here and
+    /// nowhere else.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_stream_imports() {
+        let dir = TempDir::with_prefix("golden_legacy_import").expect("temp dir");
+        // asserts the imported data file is byte-identical to the frozen bytes
+        import_golden_legacy_pack(dir.path()).await;
+
+        let committee = legacy_pack_committee();
+        let previous_epoch = legacy_pack_previous_epoch(&committee);
+        let expected = legacy_pack_outputs(&committee, &previous_epoch);
+        let pack = ConsensusPack::open_append_exists(dir.path(), LEGACY_PACK_EPOCH)
+            .expect("reopen the imported pack");
+        assert_legacy_pack_committee(&pack);
+        assert_legacy_pack_outputs(&pack).await;
+
+        // serving: the bytes handed to a peer decode back to the same outputs under the pack's own
+        // (legacy-layout) committee
+        for output in &expected {
+            let served = pack
+                .get_consensus_output_bytes(output.number())
+                .await
+                .expect("serve a frozen output to a peer");
+            let decoded = pack.decode_output(served).await.expect("peer-side decode");
+            compare_outputs(&decoded, output);
+        }
+        pack.persist().await.expect("persist after serving");
+        drop(pack);
+
+        let on_disk = std::fs::read(
+            dir.path().join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME),
+        )
+        .expect("reread the imported data file");
+        assert_eq!(
+            tn_types::hex::encode(&on_disk),
+            GOLDEN_LEGACY_PACK_HEX,
+            "importing and serving a pre-fork pack rewrote its bytes, so peers on a pre-fork build \
+             would no longer be able to read it"
+        );
+    }
+
+    /// DOOR 4 (adiri): the meta-compare arm of `open_append`.
+    ///
+    /// Reopening a pre-fork pack with the same committee takes the compare branch — the meta this
+    /// build constructs must equal the one decoded off disk — so it must succeed WITHOUT appending
+    /// a second `EpochMeta` record. The file length and bytes are unchanged.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_reopens_append_without_duplicate_meta() {
+        let dir = TempDir::with_prefix("golden_legacy_reappend").expect("temp dir");
+        import_golden_legacy_pack(dir.path()).await;
+        let data_file =
+            dir.path().join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME);
+        let len_before = std::fs::metadata(&data_file).expect("stat data file").len();
+
+        let committee = legacy_pack_committee();
+        let previous_epoch = legacy_pack_previous_epoch(&committee);
+        {
+            let pack =
+                ConsensusPack::open_append(dir.path(), previous_epoch.clone(), committee.clone())
+                    .expect("reopen the frozen pre-fork pack for append with the same committee");
+            assert_legacy_pack_committee(&pack);
+            assert_legacy_pack_outputs(&pack).await;
+            pack.persist().await.expect("persist");
+        }
+
+        assert_eq!(
+            std::fs::metadata(&data_file).expect("stat data file").len(),
+            len_before,
+            "open_append grew a pre-fork pack, so it appended a duplicate EpochMeta"
+        );
+        assert_eq!(
+            tn_types::hex::encode(std::fs::read(&data_file).expect("reread data file")),
+            GOLDEN_LEGACY_PACK_HEX,
+            "open_append rewrote the frozen pre-fork bytes"
+        );
+
+        // A validation pass proves the file still holds exactly one EpochMeta: a second one is
+        // reported as an EpochMetaMismatch issue.
+        let report = crate::pack_validate::validate_pack_file(
+            &data_file,
+            LEGACY_PACK_EPOCH,
+            Some(&previous_epoch),
+        )
+        .expect("validate after reopen");
+        assert_eq!(
+            report.verdict,
+            crate::pack_validate::Verdict::Valid,
+            "reopened pre-fork pack no longer validates: {:?}",
+            report.issues
+        );
+    }
+
+    /// DOOR 5 (adiri): the offline validator — `validate_pack_file` over the bare frozen bytes.
+    ///
+    /// Run with the previous epoch's record so the full `verify_epoch_meta` linkage executes: this
+    /// is what pins the frozen meta's `start_consensus_number`, `genesis_exec_state`,
+    /// `genesis_consensus` and committee key set, not just its committee layout.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn test_golden_legacy_pack_validates() {
+        use crate::pack_validate::{validate_pack_file, Verdict};
+
+        let dir = TempDir::with_prefix("golden_legacy_validate").expect("temp dir");
+        let data_file = write_golden_legacy_data_file(dir.path());
+        let previous_epoch = legacy_pack_previous_epoch(&legacy_pack_committee());
+
+        let report = validate_pack_file(&data_file, LEGACY_PACK_EPOCH, Some(&previous_epoch))
+            .expect("validate the frozen pre-fork pack");
+        assert_eq!(
+            report.verdict,
+            Verdict::Valid,
+            "the frozen pre-fork pack must validate clean: {:?}",
+            report.issues
+        );
+        assert_eq!(report.epoch, LEGACY_PACK_EPOCH);
+        assert_eq!(
+            report.start_consensus_number, LEGACY_PACK_FIRST_CONSENSUS,
+            "frozen start_consensus_number moved"
+        );
+        assert_eq!(report.consensus_count, 2, "frozen consensus record count moved");
+        assert_eq!(report.batch_count, 2, "frozen batch record count moved");
+        assert_eq!(report.first_consensus_number, Some(LEGACY_PACK_FIRST_CONSENSUS));
+        assert_eq!(report.last_consensus_number, Some(LEGACY_PACK_LAST_CONSENSUS));
+    }
+
+    /// PIN (non-adiri): the frozen pre-fork bytes are indecodable in a build whose committee
+    /// worker-list gate is active from genesis, and every read door says so loudly.
+    ///
+    /// This documents the build-gate contract at the storage layer rather than a gap: no non-adiri
+    /// network carries pre-fork packs, so mainnet's gate is active at every epoch and the legacy
+    /// layout is unreadable there BY DESIGN. What matters is that it fails with an error instead of
+    /// decoding into a plausible-looking committee — a silent misparse of the first record of every
+    /// pack is how a node ends up verifying consensus against the wrong validator set.
+    #[cfg(not(feature = "adiri"))]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_rejected_without_adiri() {
+        assert!(
+            tn_types::forks::committee_workers_active(LEGACY_PACK_EPOCH),
+            "a non-adiri build must be post-fork at every epoch, epoch {LEGACY_PACK_EPOCH} included"
+        );
+
+        let dir = TempDir::with_prefix("golden_legacy_non_adiri").expect("temp dir");
+        let data_file = write_golden_legacy_data_file(dir.path());
+
+        // the warm-restart door: the meta fails to decode, so the open fails
+        let warm = ConsensusPack::open_append_exists(dir.path(), LEGACY_PACK_EPOCH);
+        assert!(
+            matches!(warm, Err(super::PackError::EpochLoad(_))),
+            "expected the legacy-layout meta to fail decoding, got {:?}",
+            warm.map(|pack| pack.epoch())
+        );
+
+        // The offline validator reports the same failure rather than a clean pack. Anti-vacuity:
+        // the failure must NOT be an open error — the frozen container (data header, framing) is
+        // well formed on every lane, and only the legacy-layout record inside it is unreadable
+        // here. Without that the assertion would also pass on a garbage constant.
+        let validated =
+            crate::pack_validate::validate_pack_file(&data_file, LEGACY_PACK_EPOCH, None);
+        match validated {
+            Err(super::PackError::Open(e)) => {
+                panic!("the frozen pack container must open on any lane, got open error {e}")
+            }
+            Err(_) => {}
+            Ok(report) => panic!(
+                "the offline validator must reject legacy-layout bytes on a post-fork build, got \
+                 {:?}",
+                report.verdict
+            ),
+        }
+
+        // the peer-sync door: the first streamed record fails to decode
+        let source = dir.path().join("peer_stream");
+        std::fs::write(&source, golden_legacy_pack_bytes()).expect("write peer stream");
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let imported = TempDir::with_prefix("golden_legacy_non_adiri_import").expect("temp dir");
+        let import = ConsensusPack::stream_import(
+            imported.path(),
+            stream,
+            LEGACY_PACK_EPOCH,
+            &EpochRecord::default(),
+            LEGACY_PACK_LAST_CONSENSUS,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            import.is_err(),
+            "peer sync must reject legacy-layout bytes on a post-fork build, got {:?}",
+            import.map(|pack| pack.epoch())
+        );
+    }
 }
