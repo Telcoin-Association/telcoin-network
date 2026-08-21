@@ -180,6 +180,8 @@ impl PackValidationReport {
 /// [`verify_epoch_meta`] linkage checks run and the first header's `parent_hash` is anchored to the
 /// previous epoch's final consensus header. With no previous record those linkage checks and the
 /// first-header parent check are skipped (everything else still runs).
+/// Note the previous link is NOT checked on block 1 (epoch 0- first block after genesis).
+/// If this value is incorrect then all future linkage checks will fail (chain will be corrupted).
 pub fn validate_pack_file(
     path: &Path,
     epoch: Epoch,
@@ -225,9 +227,10 @@ pub fn validate_pack_file(
     // Expected `parent_hash` of the *next* consensus header. `None` = "no anchor, skip the check":
     // a bare file with no previous record cannot verify its first header's parent.
     let expected_parent: Option<ConsensusHeaderDigest> = if epoch == 0 {
-        // Don't worry about consensus block 1 in epoch 0, if it is invalid other verifications will
-        // fail. This can be set but doing so leaves potential footguns around and this
-        // check is not really useful in this case.
+        // Don't worry about consensus block 1 in epoch 0, if it is invalid other verifications
+        // will fail (for instance epoch 0 final state will not verify). This can be set but
+        // doing so forces fork aware code here and verification will fail with an invalid value
+        // either way.
         None
     } else {
         previous.map(|p| p.final_consensus.hash)

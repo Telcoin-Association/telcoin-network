@@ -951,8 +951,9 @@ impl Inner {
         .map_err(OpenError::IndexFileOpen)?;
         let mut parent_digest_expectation = if epoch == 0 {
             // Don't worry about consensus block 1 in epoch 0, if it is invalid other verifications
-            // will fail. This can be set but doing so leaves potential footguns around
-            // and this check is not really useful in this case.
+            // will fail (for instance epoch 0 final state will not verify). This can be set but
+            // doing so forces fork aware code here and verification will fail with an invalid value
+            // either way.
             HeaderExpectation::None
         } else {
             HeaderExpectation::Parent(previous_epoch.final_consensus.hash)
