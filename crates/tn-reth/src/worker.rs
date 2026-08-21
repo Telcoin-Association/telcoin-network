@@ -76,6 +76,22 @@ pub struct WorkerNetwork {
     peer_count: Arc<RwLock<usize>>,
     /// App version.
     version: &'static str,
+    /// Consensus catch-up state backing `eth_syncing` (issue #1231).
+    sync_flags: Arc<RwLock<SyncFlags>>,
+}
+
+/// Sync flags backing the shim's `eth_syncing` answers.
+///
+/// `syncing` mirrors whether the node is catching up on consensus output; the node manager
+/// drives it from the consensus node-mode watch. `completed_initial_sync` latches on the
+/// first caught-up report so `is_initially_syncing` distinguishes the first catch-up of
+/// this process from a later mid-epoch fall-behind.
+#[derive(Debug, Default)]
+struct SyncFlags {
+    /// True while the node is catching up on consensus output.
+    syncing: bool,
+    /// True once the node has reported caught-up at least once.
+    completed_initial_sync: bool,
 }
 
 impl WorkerNetwork {
@@ -97,7 +113,42 @@ impl WorkerNetwork {
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
         });
-        Self { chain_spec: chain_spec.reth_chain_spec(), peer_count, version }
+        Self {
+            chain_spec: chain_spec.reth_chain_spec(),
+            peer_count,
+            version,
+            sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
+        }
+    }
+
+    /// Create a test instance that does not track peers.
+    ///
+    /// The peer count stays zero. Tests that build an RPC server use this so they
+    /// do not need a live worker network handle.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_test(chain_spec: ChainSpec) -> Self {
+        Self {
+            chain_spec: chain_spec.reth_chain_spec(),
+            peer_count: Arc::new(RwLock::new(0)),
+            version: "test",
+            sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
+        }
+    }
+
+    /// Record whether the node is catching up on consensus output (issue #1231).
+    ///
+    /// The node manager drives this from the consensus node-mode watch; the stock reth
+    /// `eth_syncing` handler reads it back through [`NetworkInfo::is_syncing`]. The first
+    /// caught-up report latches `completed_initial_sync`, so a later mid-epoch fall-behind
+    /// reports as syncing but no longer as initially syncing. The node boots
+    /// optimistic-current, so the driver's first not-syncing report usually latches the
+    /// initial sync as already complete; `is_initially_syncing` is true only when a
+    /// demotion lands before that first report. Nothing in TN's RPC surface consumes the
+    /// initial-sync distinction today: `eth_syncing` reads only `is_syncing`.
+    pub fn set_syncing(&self, syncing: bool) {
+        let mut flags = self.sync_flags.write();
+        flags.completed_initial_sync = flags.completed_initial_sync || !syncing;
+        flags.syncing = syncing;
     }
 
     /// Spawn a new task to keep up with peer counts.
@@ -144,12 +195,14 @@ impl NetworkInfo for WorkerNetwork {
         self.chain_spec.chain().id()
     }
 
+    // eth_syncing
     fn is_syncing(&self) -> bool {
-        false
+        self.sync_flags.read().syncing
     }
 
     fn is_initially_syncing(&self) -> bool {
-        false
+        let flags = self.sync_flags.read();
+        flags.syncing && !flags.completed_initial_sync
     }
 }
 
@@ -226,5 +279,44 @@ impl Peers for WorkerNetwork {
         _udp_addr: Option<SocketAddr>,
     ) {
         // unimplemented!
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tn_types::test_genesis;
+
+    /// Build a shim over the test genesis without a live worker network handle.
+    fn test_network() -> WorkerNetwork {
+        WorkerNetwork {
+            chain_spec: Arc::new(test_genesis().into()),
+            peer_count: Arc::new(RwLock::new(0)),
+            version: "test",
+            sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
+        }
+    }
+
+    /// `is_syncing` follows the recorded state and the initial-sync latch covers only the
+    /// first catch-up of the process (issue #1231).
+    #[test]
+    fn test_sync_flags_follow_recorded_state() {
+        let network = test_network();
+        assert!(!network.is_syncing());
+        assert!(!network.is_initially_syncing());
+
+        // A node that starts behind is initially syncing.
+        network.set_syncing(true);
+        assert!(network.is_syncing());
+        assert!(network.is_initially_syncing());
+
+        network.set_syncing(false);
+        assert!(!network.is_syncing());
+        assert!(!network.is_initially_syncing());
+
+        // A later fall-behind reports syncing, but the initial sync is over.
+        network.set_syncing(true);
+        assert!(network.is_syncing());
+        assert!(!network.is_initially_syncing());
     }
 }

@@ -219,6 +219,14 @@ impl ExecutionNodeInner {
         }
     }
 
+    /// Push the node's consensus catch-up state into every worker's RPC network shim.
+    ///
+    /// The epoch manager's node-mode watch task drives this on every mode change so the
+    /// stock `eth_syncing` handler answers from live consensus state (issue #1231).
+    pub(super) fn set_workers_syncing(&self, syncing: bool) {
+        self.workers.iter().for_each(|worker| worker.worker_network().set_syncing(syncing));
+    }
+
     /// Create a new block validator.
     pub(super) fn new_batch_validator(
         &self,

@@ -72,6 +72,9 @@ reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
 
 [dev-dependencies]
+# `server` + `macros` give the tests `RpcModule`/`rpc_params!` for calls through the
+# production RPC registration.
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
 metrics-util = { workspace = true }
 serde_yaml = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }
