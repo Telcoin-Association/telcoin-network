@@ -11883,6 +11883,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "alloy-evm",
+ "async-trait",
  "clap",
  "dirs-next",
  "eyre",

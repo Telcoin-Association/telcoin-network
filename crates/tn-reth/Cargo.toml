@@ -11,7 +11,10 @@ authors = [
 publish = false
 
 [dependencies]
-jsonrpsee = { workspace = true }
+# `server` + `macros` back the TN eth-method overrides (`rpc_fee_history`; #1176's
+# fee-cap guard shares them).
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 tn-config = { workspace = true }
 tn-types = { workspace = true }

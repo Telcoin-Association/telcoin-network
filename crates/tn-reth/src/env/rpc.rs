@@ -6,24 +6,31 @@
 //! window, cache sizes) come from the CLI allowlist (`crate::cli`) via `node_config().rpc`.
 //!
 //! Note: [`RethEnv::get_rpc_server`] swallows a failure to merge the TN-specific module at
-//! `error!` level — the server still starts and serves the standard namespaces with the TN
-//! module missing.
+//! `error!` level; the server still starts and serves the standard namespaces with the TN
+//! module missing. The corrected `eth_feeHistory` install (`crate::rpc_fee_history`)
+//! returns an error instead of logging. The correction's coverage is structural: the same
+//! module config drives both the module build and the handler replacement, so every
+//! transport that serves the eth namespace gets the corrected method, and a transport
+//! without the namespace has no fee-history method to correct. The `Result` keeps a
+//! future registration failure from passing silently (issue #1231).
 
 use std::sync::Arc;
 
 use jsonrpsee::Methods;
 use reth::rpc::{
-    builder::{config::RethRpcServerConfig as _, RpcModuleBuilder, RpcServerHandle},
+    builder::{config::RethRpcServerConfig as _, RethRpcModule, RpcModuleBuilder, RpcServerHandle},
     eth::{EthApi, EthApiBuilder},
 };
 use reth_provider::providers::BlockchainProvider;
 use reth_rpc_eth_api::RpcNodeCore;
 use reth_rpc_eth_types::EthConfig;
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
+use tn_types::gas_accumulator::BaseFeeContainer;
 
 use crate::{
     error::TnRethResult,
     evm::TnEvmConfig,
+    rpc_fee_history::{EpochFeeHistoryServer as _, FeeHistoryWithEpochBaseFee},
     traits::{TNExecution, TelcoinNode},
     worker::WorkerNetwork,
     RethEnv, RpcServer, WorkerTxPool,
@@ -67,12 +74,20 @@ fn apply_eth_config<N: RpcNodeCore, Rpc, NextEnv>(
 impl RethEnv {
     /// Build and return the RPC server for the instance.
     /// This probably needs better abstraction.
+    ///
+    /// `base_fee` is this worker's shared epoch base-fee container: the corrected
+    /// `eth_feeHistory` answers its next-block entry from it (`crate::rpc_fee_history`).
+    ///
+    /// Errors when the corrected fee-history method cannot replace the stock handler.
+    /// Returns `eyre::Result` to match the node callers' error context; open #1176
+    /// makes the identical signature change, so the two merge cleanly.
     pub fn get_rpc_server(
         &self,
         transaction_pool: WorkerTxPool,
         network: WorkerNetwork,
+        base_fee: BaseFeeContainer,
         other: impl Into<Methods>,
-    ) -> RpcServer {
+    ) -> eyre::Result<RpcServer> {
         let transaction_pool: EthTransactionPool<
             BlockchainProvider<TelcoinNode>,
             DiskFileBlobStore,
@@ -100,12 +115,19 @@ impl RethEnv {
         .build();
 
         let engine_events = reth_tokio_util::EventSender::default();
+        // Correct `eth_feeHistory`'s next-block base-fee entry: reth predicts it with
+        // Ethereum's EIP-1559 schedule, and TN prices the next block from the epoch fee
+        // schedule instead (issue #1231).
+        let fee_history = FeeHistoryWithEpochBaseFee::new(eth_api.clone(), self.clone(), base_fee);
         let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
         if let Err(e) = server.merge_configured(other) {
             tracing::error!(target: "tn::execution", "Error merging TN rpc module: {e:?}");
         }
+        // Replace `eth_feeHistory` on every transport that exposes the eth namespace. A
+        // transport without the namespace serves no fee-history method to correct.
+        server.add_or_replace_if_module_configured(RethRpcModule::Eth, fee_history.into_rpc())?;
 
-        server
+        Ok(server)
     }
 
     /// Start running the RPC server for this instance.
@@ -118,7 +140,11 @@ impl RethEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{rpc_server_args::RpcServerArgs as TnRpcServerArgs, RethChainSpec};
+    use crate::{
+        init_reth_defaults, rpc_server_args::RpcServerArgs as TnRpcServerArgs, RethChainSpec,
+    };
+    use alloy::{primitives::U64, rpc::types::FeeHistory};
+    use jsonrpsee::{rpc_params, RpcModule};
     use reth::args::RpcStateCacheArgs;
     use reth_network_api::noop::NoopNetwork;
     use reth_rpc_eth_types::{
@@ -214,5 +240,76 @@ mod tests {
         assert_eq!(config.eth_proof_window, 99);
         assert_eq!(config.proof_permits, 7);
         assert_eq!(config.cache.max_blocks, 11);
+    }
+
+    /// Build a temp env whose worker base-fee container holds `epoch_fee` and return the
+    /// production-registered `eth_feeHistory`.
+    ///
+    /// [`RethEnv::get_rpc_server`] is the only RPC construction path in the node, so a
+    /// call through the returned methods exercises the registered handler, not a copy.
+    fn fee_history_methods(
+        epoch_fee: u64,
+        task_manager: &TaskManager,
+        tmp_dir: &TempDir,
+    ) -> Methods {
+        // Seed reth's process-global RPC defaults before building the args (#1165): a
+        // `Default`-constructed `RpcServerArgs` reads them, and the first builder in the
+        // test process locks them.
+        init_reth_defaults();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain,
+            tmp_dir.path(),
+            task_manager,
+            None,
+            reth::args::RpcServerArgs::default(),
+        )
+        .expect("temp chain env");
+        let pool = reth_env.init_txn_pool().expect("txn pool");
+        let network = WorkerNetwork::new_for_test(reth_env.chainspec());
+        let server = reth_env
+            .get_rpc_server(pool, network, BaseFeeContainer::new(epoch_fee), RpcModule::new(()))
+            .expect("rpc server with corrected fee history");
+        server.methods_by(|name| name == "eth_feeHistory")
+    }
+
+    /// The next-block `baseFeePerGas` entry at the tip is the worker's epoch base fee,
+    /// not reth's EIP-1559 prediction, and the returned-block entries stay untouched.
+    #[tokio::test]
+    async fn test_fee_history_next_block_entry_is_epoch_base_fee() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        // A value no EIP-1559 step from the genesis header can produce.
+        let epoch_fee = 2_468_013_579_u64;
+        let methods = fee_history_methods(epoch_fee, &task_manager, &tmp_dir);
+
+        let history: FeeHistory = methods
+            .call("eth_feeHistory", rpc_params![U64::from(1_u64), "latest"])
+            .await
+            .expect("fee history");
+
+        // One returned block (genesis) plus the predicted next-block entry.
+        assert_eq!(history.gas_used_ratio.len(), 1);
+        assert_eq!(history.base_fee_per_gas.len(), 2);
+        assert_eq!(history.base_fee_per_gas.last().copied(), Some(u128::from(epoch_fee)));
+        let genesis_entry = history.base_fee_per_gas.first().copied().expect("genesis entry");
+        assert_ne!(genesis_entry, u128::from(epoch_fee), "only the final entry is corrected");
+    }
+
+    /// The `pending` tag takes the same corrected path: reth caps it to `latest`, so the
+    /// final entry is the epoch base fee.
+    #[tokio::test]
+    async fn test_fee_history_pending_tag_gets_the_corrected_entry() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let epoch_fee = 1_357_924_680_u64;
+        let methods = fee_history_methods(epoch_fee, &task_manager, &tmp_dir);
+
+        let history: FeeHistory = methods
+            .call("eth_feeHistory", rpc_params![U64::from(1_u64), "pending"])
+            .await
+            .expect("fee history for the pending tag");
+
+        assert_eq!(history.base_fee_per_gas.last().copied(), Some(u128::from(epoch_fee)));
     }
 }

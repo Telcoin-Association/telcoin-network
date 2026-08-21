@@ -21,9 +21,9 @@ use tn_reth::{
 };
 use tn_rpc::EngineToPrimary;
 use tn_types::{
-    gas_accumulator::GasAccumulator, BatchSender, BatchValidation, BlsPublicKey,
-    ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader,
-    TaskSpawner, WorkerId, B256,
+    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    BatchSender, BatchValidation, BlsPublicKey, ConsensusHeaderDigest, ConsensusOutput,
+    EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -147,12 +147,15 @@ impl ExecutionNode {
     /// Initialize the worker's transaction pool and public RPC.
     ///
     /// This method should be called on node startup.
+    ///
+    /// `base_fee` is the worker's shared epoch base-fee container: a snapshot feeds the
+    /// transaction pool, and the RPC server keeps the live handle for `eth_feeHistory`.
     pub async fn initialize_worker_components<EP>(
         &self,
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
-        base_fee: u64,
+        base_fee: BaseFeeContainer,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
