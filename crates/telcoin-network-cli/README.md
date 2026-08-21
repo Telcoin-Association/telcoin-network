@@ -297,7 +297,7 @@ telcoin-network node \
 | Flag                  | Default        | Description                                                                                    |
 | --------------------- | -------------- | ---------------------------------------------------------------------------------------------- |
 | `--chain`             | none           | Join a named network (`adiri`, `testnet`, `mainnet`)                                           |
-| `--instance`          | none           | Instance number (0-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
+| `--instance`          | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
 | `--observer`          | `false`        | Run as an observer (no consensus participation)                                                |
 | `--metrics`           | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                       |
 | `--healthcheck`       | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                             |
@@ -588,7 +588,7 @@ RUST_LOG=info,consensus=debug,evm=trace telcoin-network node ...
 
 ## Multi-instance setup
 
-The `--instance` flag adjusts port numbers so multiple nodes can run on the same machine without conflicts. Instance numbers range from 0 to 200. This configuration is only recommended for spawning local networks and should not be used in production environments.
+The `--instance` flag adjusts port numbers so multiple nodes can run on the same machine without conflicts. Instance numbers range from 1 to 200; the CLI rejects 0 before the node starts (earlier releases accepted 0 and derived conflicting ports from it). This configuration is only recommended for spawning local networks and should not be used in production environments.
 
 Note: `--instance` does NOT offset `--metrics` (or `--healthcheck`) — pass a distinct
 address per instance, as in the example below.
@@ -599,7 +599,7 @@ address per instance, as in the example below.
 | ------------- | -------------------- | --------------- | --------------- | --------------- |
 | HTTP RPC      | `8545 - N + 1`       | 8545            | 8544            | 8543            |
 | WebSocket RPC | `8546 + (N * 2 - 2)` | 8546            | 8548            | 8550            |
-| IPC path      | `/tmp/tn-{N}.ipc`    | `/tmp/tn-1.ipc` | `/tmp/tn-2.ipc` | `/tmp/tn-3.ipc` |
+| IPC path      | `/tmp/tn.ipc-{N}`    | `/tmp/tn.ipc-1` | `/tmp/tn.ipc-2` | `/tmp/tn.ipc-3` |
 
 Example starting four validators on one machine:
 
