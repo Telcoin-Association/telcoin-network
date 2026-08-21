@@ -5,8 +5,11 @@
 //!
 //! The `sol!` blocks bind three contracts from the tn-contracts submodule:
 //! - `ConsensusRegistry` — validator lifecycle (mint/stake/activate/exit/burn), epoch and committee
-//!   views, and the three epoch-boundary mutators the protocol invokes as system calls in the
-//!   closing block: `applyIncentives`, then `applySlashes`, then `concludeEpoch`.
+//!   views, the three epoch-boundary mutators the protocol invokes as system calls in the closing
+//!   block (`applyIncentives`, then `applySlashes`, then `concludeEpoch`), and the contract's
+//!   events. System calls build no receipt, so the lifecycle events those mutators emit are
+//!   surfaced node-side only: [`log_registry_event`] names and emits each one at `info!` from the
+//!   system-call path in `evm/block.rs`.
 //! - `LegacyConsensusRegistry` — the pre-fork registry's epoch-close surface, frozen so pre-fork
 //!   epoch closes replay byte-identically (see the code-hash gate in `evm/block.rs`).
 //! - `WorkerConfigs` — per-worker base-fee strategy used for base fee adjustment, plus the
@@ -26,6 +29,7 @@ use tn_types::{
     gas_accumulator::{WorkerConfigEntry, WorkerFeeConfig},
     Address, Epoch,
 };
+use tracing::info;
 
 /// The system address.
 pub(super) const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
@@ -160,6 +164,94 @@ sol!(
         struct ProofOfPossession {
             bytes signature;
         }
+
+        // Events, mirrored from `IConsensusRegistry.sol`. System calls produce no receipt, so
+        // the events the `onlySystemCall` entry points emit (`concludeEpoch`: `NewEpoch`,
+        // `ValidatorActivated`, `ValidatorExited`, plus the stake-version settlement pair
+        // `ValidatorStakeVersionUpgraded` / `RefundQueued`; `applySlashes`: `ValidatorSlashed`,
+        // `ValidatorExited`, `ValidatorRetired`, `NextCommitteeSizeUpdated`, `RefundQueued`;
+        // `migrateValidatorSets`: `ValidatorSetsMigrated`) never reach a receipts root, the header
+        // bloom, or `eth_getLogs`. The node decodes them off-consensus through
+        // [`log_registry_event`] and emits them at `info!`. The full interface is bound, not only
+        // the system-call subset, so a future emit added behind `onlySystemCall` decodes by name
+        // instead of falling through as an unknown topic. Each signature's selector is pinned
+        // against the Solidity ABI by `registry_event_selectors_match_the_solidity_interface`.
+
+        /// A validator first staked, entering the `Staked` lifecycle state.
+        #[derive(Debug)]
+        event ValidatorStaked(ValidatorInfo validator);
+        /// A staked validator self-activated, entering the activation queue.
+        #[derive(Debug)]
+        event ValidatorPendingActivation(ValidatorInfo validator);
+        /// A validator's activation resolved at epoch conclusion or at genesis.
+        #[derive(Debug)]
+        event ValidatorActivated(ValidatorInfo validator);
+        /// An active validator requested exit, entering the exit queue.
+        #[derive(Debug)]
+        event ValidatorPendingExit(ValidatorInfo validator);
+        /// A pending-exit validator was removed from the active set by the protocol.
+        #[derive(Debug)]
+        event ValidatorExited(ValidatorInfo validator);
+        /// A validator was permanently retired; its address can never rejoin.
+        #[derive(Debug)]
+        event ValidatorRetired(ValidatorInfo validator);
+        /// One slash applied to a validator's outstanding balance.
+        #[derive(Debug)]
+        event ValidatorSlashed(Slash slash);
+        /// A new epoch began at epoch conclusion.
+        #[derive(Debug)]
+        event NewEpoch(EpochInfo epoch);
+        /// Governance updated a validator's geographic region.
+        #[derive(Debug)]
+        event ValidatorRegionUpdated(address indexed validatorAddress, uint8 region);
+        /// A stake originator claimed accrued rewards or unstaked.
+        #[derive(Debug)]
+        event RewardsClaimed(address indexed claimant, uint256 rewards);
+        /// A validator's stake version was upgraded in place.
+        #[derive(Debug)]
+        event ValidatorStakeVersionUpgraded(
+            address indexed validatorAddress,
+            uint8 oldVersion,
+            uint8 newVersion,
+            uint256 oldStakeAmount,
+            uint256 newStakeAmount
+        );
+        /// An in-service validator queued a stake version change for settlement in
+        /// `concludeEpoch`.
+        #[derive(Debug)]
+        event StakeVersionChangeRequested(
+            address indexed validatorAddress, uint8 targetVersion, uint32 requestEpoch, uint256 escrow
+        );
+        /// A pending stake version change was withdrawn before settlement.
+        #[derive(Debug)]
+        event StakeVersionChangeCanceled(address indexed validatorAddress);
+        /// A refund or escrow return was credited for a later `claimRefund` pull.
+        #[derive(Debug)]
+        event RefundQueued(address indexed recipient, uint256 amount);
+        /// An accumulated refund credit was claimed.
+        #[derive(Debug)]
+        event RefundClaimed(address indexed recipient, uint256 amount);
+        /// Governance or the protocol adjusted the next epoch's committee size.
+        #[derive(Debug)]
+        event NextCommitteeSizeUpdated(uint16 oldSize, uint16 newSize, uint256 numActiveValidators);
+        /// `migrateValidatorSets` back-filled the per-status sets during the in-place upgrade.
+        #[derive(Debug)]
+        event ValidatorSetsMigrated(uint256 eligibleValidatorCount);
+        /// Governance authored a new global stake-config version.
+        #[derive(Debug)]
+        event StakeVersionAuthored(
+            uint8 indexed version,
+            uint256 stakeAmount,
+            uint256 minWithdrawAmount,
+            uint256 epochIssuance,
+            uint32 epochDuration
+        );
+        /// Governance toggled whether `topUpSlashedStake` is restricted to the top-up authority.
+        #[derive(Debug)]
+        event TopUpAuthorityRequirementUpdated(bool required);
+        /// A slashed validator's balance was restored to its version's full stake amount.
+        #[derive(Debug)]
+        event ValidatorStakeToppedUp(address indexed validatorAddress, uint256 amount);
 
         /// Initialize the contract.
         #[derive(Debug)]
@@ -340,6 +432,47 @@ sol!(
     }
 );
 
+/// Emit one decoded `ConsensusRegistry` event at `info!` under the `engine` target, named.
+///
+/// The only consumer is the system-call path in `evm/block.rs`: a system call produces no
+/// receipt, so this line is the sole place the registry's `onlySystemCall` lifecycle events
+/// (`NewEpoch`, `ValidatorActivated`, `ValidatorExited`, `ValidatorSlashed`, ...) surface.
+/// `description` names the system call that emitted the event; the `event` field carries the
+/// Solidity event name so a log filter on it is stable across wording changes, and `detail` is
+/// the decoded payload. Purely observational: nothing here reads or writes state.
+///
+/// Exhaustive over the events enum on purpose: binding a new event in the `sol!` block without
+/// naming it here is a compile error, not a silently unnamed log line.
+pub(crate) fn log_registry_event(
+    description: &str,
+    event: ConsensusRegistry::ConsensusRegistryEvents,
+) {
+    use ConsensusRegistry::ConsensusRegistryEvents as E;
+    let emit = |name: &'static str, detail: &dyn core::fmt::Debug| info!(target: "engine", event = name, ?detail, "{description} emitted registry event");
+    match event {
+        E::ValidatorStaked(e) => emit("ValidatorStaked", &e),
+        E::ValidatorPendingActivation(e) => emit("ValidatorPendingActivation", &e),
+        E::ValidatorActivated(e) => emit("ValidatorActivated", &e),
+        E::ValidatorPendingExit(e) => emit("ValidatorPendingExit", &e),
+        E::ValidatorExited(e) => emit("ValidatorExited", &e),
+        E::ValidatorRetired(e) => emit("ValidatorRetired", &e),
+        E::ValidatorSlashed(e) => emit("ValidatorSlashed", &e),
+        E::NewEpoch(e) => emit("NewEpoch", &e),
+        E::ValidatorRegionUpdated(e) => emit("ValidatorRegionUpdated", &e),
+        E::RewardsClaimed(e) => emit("RewardsClaimed", &e),
+        E::ValidatorStakeVersionUpgraded(e) => emit("ValidatorStakeVersionUpgraded", &e),
+        E::StakeVersionChangeRequested(e) => emit("StakeVersionChangeRequested", &e),
+        E::StakeVersionChangeCanceled(e) => emit("StakeVersionChangeCanceled", &e),
+        E::RefundQueued(e) => emit("RefundQueued", &e),
+        E::RefundClaimed(e) => emit("RefundClaimed", &e),
+        E::NextCommitteeSizeUpdated(e) => emit("NextCommitteeSizeUpdated", &e),
+        E::ValidatorSetsMigrated(e) => emit("ValidatorSetsMigrated", &e),
+        E::StakeVersionAuthored(e) => emit("StakeVersionAuthored", &e),
+        E::TopUpAuthorityRequirementUpdated(e) => emit("TopUpAuthorityRequirementUpdated", &e),
+        E::ValidatorStakeToppedUp(e) => emit("ValidatorStakeToppedUp", &e),
+    }
+}
+
 /// The state of consensus retrieved from chain.
 #[derive(Debug)]
 pub struct EpochState {
@@ -458,7 +591,7 @@ pub(crate) fn decode_worker_fee_configs(
 mod tests {
     use super::*;
     use alloy::{
-        primitives::{aliases::U184, keccak256},
+        primitives::{aliases::U184, keccak256, Bytes, B256, U256},
         sol_types::SolCall,
     };
 
@@ -470,6 +603,141 @@ mod tests {
         let expected: [u8; 4] =
             keccak256("delegationDigest(bytes,address,address,uint256)")[..4].try_into().unwrap();
         assert_eq!(ConsensusRegistry::delegationDigestCall::SELECTOR, expected);
+    }
+
+    /// Every event bound in the `ConsensusRegistry` `sol!` block must carry the topic-0 hash the
+    /// deployed contract emits. The signatures below are the `tn-contracts`
+    /// `artifacts/ConsensusRegistry.json` ABI (struct params flattened to their tuple types), so
+    /// a drift between the Rust binding and the Solidity interface fails here instead of making
+    /// the system-call log path fall through to "unknown topic" at every epoch boundary. The row
+    /// count is pinned to the enum's `COUNT` so a newly bound event cannot ship unpinned.
+    #[test]
+    fn registry_event_selectors_match_the_solidity_interface() {
+        use alloy::sol_types::{SolEvent, SolEventInterface};
+        let expected: [(&str, B256); 20] = [
+            (
+                "ValidatorStaked((address,uint32,uint32,uint8,bool,uint8,uint8))",
+                ConsensusRegistry::ValidatorStaked::SIGNATURE_HASH,
+            ),
+            (
+                "ValidatorPendingActivation((address,uint32,uint32,uint8,bool,uint8,uint8))",
+                ConsensusRegistry::ValidatorPendingActivation::SIGNATURE_HASH,
+            ),
+            (
+                "ValidatorActivated((address,uint32,uint32,uint8,bool,uint8,uint8))",
+                ConsensusRegistry::ValidatorActivated::SIGNATURE_HASH,
+            ),
+            (
+                "ValidatorPendingExit((address,uint32,uint32,uint8,bool,uint8,uint8))",
+                ConsensusRegistry::ValidatorPendingExit::SIGNATURE_HASH,
+            ),
+            (
+                "ValidatorExited((address,uint32,uint32,uint8,bool,uint8,uint8))",
+                ConsensusRegistry::ValidatorExited::SIGNATURE_HASH,
+            ),
+            (
+                "ValidatorRetired((address,uint32,uint32,uint8,bool,uint8,uint8))",
+                ConsensusRegistry::ValidatorRetired::SIGNATURE_HASH,
+            ),
+            (
+                "ValidatorSlashed((address,uint256))",
+                ConsensusRegistry::ValidatorSlashed::SIGNATURE_HASH,
+            ),
+            (
+                "NewEpoch((address[],uint256,uint64,uint32,uint32,uint8))",
+                ConsensusRegistry::NewEpoch::SIGNATURE_HASH,
+            ),
+            (
+                "ValidatorRegionUpdated(address,uint8)",
+                ConsensusRegistry::ValidatorRegionUpdated::SIGNATURE_HASH,
+            ),
+            ("RewardsClaimed(address,uint256)", ConsensusRegistry::RewardsClaimed::SIGNATURE_HASH),
+            (
+                "ValidatorStakeVersionUpgraded(address,uint8,uint8,uint256,uint256)",
+                ConsensusRegistry::ValidatorStakeVersionUpgraded::SIGNATURE_HASH,
+            ),
+            (
+                "StakeVersionChangeRequested(address,uint8,uint32,uint256)",
+                ConsensusRegistry::StakeVersionChangeRequested::SIGNATURE_HASH,
+            ),
+            (
+                "StakeVersionChangeCanceled(address)",
+                ConsensusRegistry::StakeVersionChangeCanceled::SIGNATURE_HASH,
+            ),
+            ("RefundQueued(address,uint256)", ConsensusRegistry::RefundQueued::SIGNATURE_HASH),
+            ("RefundClaimed(address,uint256)", ConsensusRegistry::RefundClaimed::SIGNATURE_HASH),
+            (
+                "NextCommitteeSizeUpdated(uint16,uint16,uint256)",
+                ConsensusRegistry::NextCommitteeSizeUpdated::SIGNATURE_HASH,
+            ),
+            (
+                "ValidatorSetsMigrated(uint256)",
+                ConsensusRegistry::ValidatorSetsMigrated::SIGNATURE_HASH,
+            ),
+            (
+                "StakeVersionAuthored(uint8,uint256,uint256,uint256,uint32)",
+                ConsensusRegistry::StakeVersionAuthored::SIGNATURE_HASH,
+            ),
+            (
+                "TopUpAuthorityRequirementUpdated(bool)",
+                ConsensusRegistry::TopUpAuthorityRequirementUpdated::SIGNATURE_HASH,
+            ),
+            (
+                "ValidatorStakeToppedUp(address,uint256)",
+                ConsensusRegistry::ValidatorStakeToppedUp::SIGNATURE_HASH,
+            ),
+        ];
+        assert_eq!(
+            expected.len(),
+            <ConsensusRegistry::ConsensusRegistryEvents as SolEventInterface>::COUNT,
+            "every bound registry event must be pinned here"
+        );
+        expected.iter().for_each(|(signature, hash)| {
+            assert_eq!(keccak256(signature), *hash, "topic-0 drift for {signature}");
+        });
+    }
+
+    /// A registry log from a system call must decode into its named event, and a log carrying a
+    /// topic the binding does not know must be rejected rather than mis-decoded: that pair is the
+    /// seam `surface_system_call_logs` (`evm/block.rs`) relies on to route a decoded event to
+    /// `log_registry_event` and everything else to the raw `debug!` line. Round-trips a
+    /// `NewEpoch` through `encode_log_data` so the oracle is the contract's own ABI encoding.
+    #[test]
+    fn registry_log_decodes_to_named_event_and_rejects_unknown_topic() {
+        use alloy::{
+            primitives::{Log, LogData},
+            sol_types::{SolEvent, SolEventInterface},
+        };
+        let epoch = ConsensusRegistry::EpochInfo {
+            committee: vec![Address::repeat_byte(0x11), Address::repeat_byte(0x22)],
+            epochIssuance: U256::from(7u64),
+            blockHeight: 42,
+            epochId: 3,
+            epochDuration: 600,
+            stakeVersion: 1,
+        };
+        let emitted = ConsensusRegistry::NewEpoch { epoch: epoch.clone() };
+        let log = Log { address: CONSENSUS_REGISTRY_ADDRESS, data: emitted.encode_log_data() };
+        let decoded = ConsensusRegistry::ConsensusRegistryEvents::decode_log(&log)
+            .expect("registry NewEpoch log must decode");
+        assert_eq!(decoded.address, CONSENSUS_REGISTRY_ADDRESS);
+        assert!(
+            matches!(decoded.data, ConsensusRegistry::ConsensusRegistryEvents::NewEpoch(ref e) if e.epoch == epoch),
+            "decoded the wrong event or payload"
+        );
+
+        // negative control: a foreign topic-0 must not decode into any registry event
+        let foreign = Log {
+            address: CONSENSUS_REGISTRY_ADDRESS,
+            data: LogData::new_unchecked(
+                vec![keccak256("Transfer(address,address,uint256)")],
+                Bytes::new(),
+            ),
+        };
+        assert!(
+            ConsensusRegistry::ConsensusRegistryEvents::decode_log(&foreign).is_err(),
+            "an unknown topic must be rejected, not decoded"
+        );
     }
 
     /// An unknown strategy id must decode fail-open to `Eip1559` (deterministic per build), never
