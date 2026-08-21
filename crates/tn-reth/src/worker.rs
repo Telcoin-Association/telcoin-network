@@ -3,16 +3,16 @@
 //! Inspired by reth_node_ethereum crate. TN does not run reth's devp2p networking, but reth's
 //! RPC builder needs `NetworkInfo`/`Peers` implementations to serve the `net`, `web3`, and
 //! `eth` namespaces. [`WorkerNetwork`] is that shim: it answers with the chain id, a
-//! genesis-derived status, and a peer count that a background task refreshes every 15 seconds
-//! by polling the worker's libp2p network handle. Everything reth-specific (peer management,
-//! ENR/node records, the admin namespace) is a deliberate no-op. The chain spec is held behind
-//! an `Arc`, so cloning the shim is cheap.
+//! status headed at the canonical tip, and a peer count that a background task refreshes every 15
+//! seconds by polling the worker's libp2p network handle. Everything reth-specific (peer
+//! management, ENR/node records, the admin namespace) is a deliberate no-op. The chain spec is held
+//! behind an `Arc`, so cloning the shim is cheap.
 //!
 //! [`WorkerComponents`] bundles what the node keeps per worker: the RPC server handle, the
 //! worker's transaction pool, and the [`WorkerNetwork`] (retained so its peer-count task can be
 //! respawned when the epoch rolls over).
 
-use crate::{ChainSpec, WorkerTxPool};
+use crate::{ChainSpec, RethEnv, WorkerTxPool};
 use parking_lot::RwLock;
 use reth::{network::config::SecretKey, rpc::builder::RpcServerHandle};
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -78,6 +78,8 @@ pub struct WorkerNetwork {
     version: &'static str,
     /// Consensus catch-up state backing `eth_syncing` (issue #1231).
     sync_flags: Arc<RwLock<SyncFlags>>,
+    /// Execution env backing the `network_status` head; `None` only in tests (issue #1231).
+    reth_env: Option<RethEnv>,
 }
 
 /// Sync flags backing the shim's `eth_syncing` answers.
@@ -100,6 +102,7 @@ impl WorkerNetwork {
         chain_spec: ChainSpec,
         worker_network: WorkerNetworkHandle,
         version: &'static str,
+        reth_env: RethEnv,
     ) -> Self {
         let peer_count = Arc::new(RwLock::new(0));
         let peer_count_clone = peer_count.clone();
@@ -118,6 +121,7 @@ impl WorkerNetwork {
             peer_count,
             version,
             sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
+            reth_env: Some(reth_env),
         }
     }
 
@@ -132,6 +136,7 @@ impl WorkerNetwork {
             peer_count: Arc::new(RwLock::new(0)),
             version: "test",
             sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
+            reth_env: None,
         }
     }
 
@@ -176,14 +181,23 @@ impl NetworkInfo for WorkerNetwork {
 
     #[allow(deprecated, reason = "EthProtocolInfo::difficulty is deprecated")]
     async fn network_status(&self) -> Result<NetworkStatus, NetworkError> {
+        // The head is the canonical tip from the execution env (issue #1231). Test shims
+        // have no env; the genesis hash is the true tip of their fresh chain.
+        let head = self
+            .reth_env
+            .as_ref()
+            .map(|env| env.canonical_tip().hash())
+            .unwrap_or_else(|| self.chain_spec.genesis_hash());
         Ok(NetworkStatus {
             client_version: self.version.to_string(), // web3_clientVersion
-            protocol_version: 1,                      // eth_protocolVersion
+            // TN speaks no eth wire protocol, so `eth_protocolVersion` has no real value
+            // to report; this is a fixed placeholder, and `capabilities` is honestly empty.
+            protocol_version: 1,
             eth_protocol_info: EthProtocolInfo {
                 difficulty: None,
                 network: self.chain_id(),
                 genesis: self.chain_spec.genesis_hash(),
-                head: Default::default(),
+                head,
                 config: self.chain_spec.genesis().config.clone(),
             },
             capabilities: vec![],
@@ -285,7 +299,8 @@ impl Peers for WorkerNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tn_types::test_genesis;
+    use tempfile::TempDir;
+    use tn_types::{test_genesis, TaskManager, B256};
 
     /// Build a shim over the test genesis without a live worker network handle.
     fn test_network() -> WorkerNetwork {
@@ -294,7 +309,36 @@ mod tests {
             peer_count: Arc::new(RwLock::new(0)),
             version: "test",
             sync_flags: Arc::new(RwLock::new(SyncFlags::default())),
+            reth_env: None,
         }
+    }
+
+    /// `network_status` heads at the canonical tip when an execution env is present
+    /// (issue #1231). A fresh chain's tip is its genesis block, whose hash is non-zero,
+    /// so the non-zero assert also pins that the head is no longer left defaulted.
+    #[tokio::test]
+    async fn test_network_status_head_is_canonical_tip() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
+        let network = WorkerNetwork { reth_env: Some(reth_env.clone()), ..test_network() };
+
+        let status = network.network_status().await?;
+        assert_eq!(status.eth_protocol_info.head, reth_env.canonical_tip().hash());
+        assert_ne!(status.eth_protocol_info.head, B256::ZERO);
+
+        Ok(())
+    }
+
+    /// Without an execution env (`new_for_test`) the head falls back to the genesis hash,
+    /// the true tip of a fresh chain (issue #1231).
+    #[tokio::test]
+    async fn test_network_status_head_falls_back_to_genesis() -> eyre::Result<()> {
+        let network = test_network();
+        let status = network.network_status().await?;
+        assert_eq!(status.eth_protocol_info.head, network.chain_spec.genesis_hash());
+        Ok(())
     }
 
     /// `is_syncing` follows the recorded state and the initial-sync latch covers only the

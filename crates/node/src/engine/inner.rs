@@ -144,8 +144,12 @@ impl ExecutionNodeInner {
     {
         let transaction_pool = self.reth_env.init_txn_pool()?;
 
-        let network =
-            WorkerNetwork::new(self.reth_env.chainspec(), network_handle, self.tn_config.version);
+        let network = WorkerNetwork::new(
+            self.reth_env.chainspec(),
+            network_handle,
+            self.tn_config.version,
+            self.reth_env.clone(),
+        );
         let mut tx_pool_latest = transaction_pool.block_info();
         tx_pool_latest.pending_basefee = base_fee;
         let last_seen = self.reth_env.finalized_block_hash_number_for_startup()?;
