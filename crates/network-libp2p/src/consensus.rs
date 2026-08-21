@@ -81,7 +81,10 @@ const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("1
 /// as the store keeps for a peer, and the set cap is what bounds accumulation across repeated
 /// records. Folding a record into an entry that already holds a connection form replaces that
 /// form; that only trims the peer-exchange payload built from the entry.
-const MAX_ADVERTISED_MULTIADDRS: usize = peers::MAX_MULTIADDRS_PER_PEER;
+///
+/// The same cap bounds the address list of a kad provider record before it is written to the
+/// consensus database (`KadStore::add_provider`, issue #1185).
+pub(crate) const MAX_ADVERTISED_MULTIADDRS: usize = peers::MAX_MULTIADDRS_PER_PEER;
 
 /// Maximum number of concurrent established connections a single peer may hold, across both
 /// directions (inbound and outbound).
