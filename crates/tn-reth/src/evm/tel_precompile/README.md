@@ -101,6 +101,19 @@ This matters because staticcall-into-precompile is a live pattern in this codeba
 
 Four regression tests pin both directions, reaching the precompile through the `STATICCALL` relay in `crates/tn-reth/tests/it/precompile_relays.rs`: `test_staticcall_cannot_mutate_precompile_state` and `test_staticcall_still_serves_read_only_selectors` (mainnet, in `tel_precompile_props.rs`), and `test_staticcall_cannot_grant_mint_role` and `test_staticcall_still_serves_has_mint_role` (`faucet`, in `tel_precompile_faucet_props.rs`).
 
+### Rejection semantics: halt, not revert
+
+Every rejection the precompile issues — the `STATICCALL` refusal above, the `call value: selector is not payable` refusal, an unrecognised selector, and each handler's own `unauthorized`, calldata-length, and arithmetic errors — is a `PrecompileError`. revm maps that to `InstructionResult::PrecompileError`, which is a **halt**, not a revert, and a halt consumes every unit of gas the frame was given: unspent gas is returned only for results that are `is_ok_or_revert()`, and a precompile error is neither.
+
+So a rejected call is not a cheap failure:
+
+- A **sub-call** into `0x7e1` loses the entire 63/64 of the caller's gas that was forwarded to it, leaving the calling frame the 1/64 it withheld.
+- A **top-level transaction** is charged its full `gas_limit` and reported as `Halt`, not `Revert`.
+
+The `false` a rejected `CALL` pushes on the stack is therefore not usefully actionable. A contract written as "forward `msg.value` into `0x7e1`, then branch on the returned boolean" reaches the branch with 1/64 of its gas and, in practice, dies there — a pattern worth noting because a value-bearing call that used to succeed (for example `0x7e1.call{value: v}(totalSupply())`, which cost ~2,100 before the payability gate) now consumes the caller's whole budget.
+
+This behaviour is not new with the payability gate; the `STATICCALL` refusal has always had it, and the gates match each other on purpose. Consuming the limit is the EVM's ordinary price for an invalid operation, and reaching either gate means the caller violated a documented rule. Callers should satisfy those rules up front — do not attach value to anything but `burn`, do not reach mutating selectors from a static frame — rather than expecting to detect the rejection and continue.
+
 ### Timelock bypass (`faucet` feature)
 
 The `faucet` feature **removes the 7-day timelock** on minting. A mainnet binary must never be compiled with this feature enabled. The feature is set at compile time — there is no runtime toggle.
