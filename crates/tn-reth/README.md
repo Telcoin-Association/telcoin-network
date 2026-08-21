@@ -60,7 +60,11 @@ TN repurposes several Ethereum header fields for protocol data. Assembly happens
   (`set_genesis_defaults` in `tn-types` `genesis.rs`). The chain is post-merge from genesis.
   `TnEvmConfig` (`src/evm/config.rs`) resolves the revm spec from that schedule.
 - **EIP-4844 blob transactions are economically disabled, not fork-disabled.** The block
-  environment prices blob gas at `u128::MAX` (`next_evm_env`), the pool's canonical-state update
+  environment prices blob gas at `u128::MAX` on every path (`TN_BLOB_EXCESS_GAS_AND_PRICE` in
+  `src/evm/config.rs`, shared by `next_evm_env` for block building and execution and by `evm_env`
+  for every header-derived environment: `eth_call`, tracing and block re-execution, so
+  `BLOBBASEFEE` agrees between simulation, re-execution and execution), the pool's canonical-state
+  update
   passes `pending_block_blob_fee = Some(u128::MAX)` (`src/txn_pool.rs`), and the batch builder
   (`crates/batch-builder/src/batch.rs`) marks blob transactions invalid via
   `BestTxns::ignore_eip4844` and purges them and their descendants with

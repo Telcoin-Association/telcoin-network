@@ -34,6 +34,12 @@
 //! an epoch-closing block there would price every EIP-1559 worker from one empty slot (zero gas,
 //! `MIN_PROTOCOL_BASE_FEE`) and produce a divergent state root, not merely degraded reward
 //! accounting.
+//!
+//! Blob gas is not priced on TN. Both block-environment constructors (`evm_env` for every
+//! header-derived environment: `eth_call`, tracing, the replay-side registry queries and reth's
+//! block re-execution through `executor_for_block`; `next_evm_env` for block building and
+//! execution) pin [`TN_BLOB_EXCESS_GAS_AND_PRICE`] instead of deriving the price from the header,
+//! so `BLOBBASEFEE` reads the same value in simulation, in re-execution and on chain.
 
 use super::{TNBlockAssembler, TNBlockExecutionCtx, TNBlockExecutorFactory, TNEvmFactory};
 use crate::{error::TnRethError, payload::TNPayload, TNPrimitives};
@@ -49,6 +55,20 @@ use std::sync::Arc;
 use tn_types::{
     gas_accumulator::GasAccumulator, BlockHeader as _, SealedBlock, SealedHeader, B256, U256,
 };
+
+/// The blob gas values every TN block environment carries: no excess blob gas and a blob gas
+/// price of `u128::MAX`.
+///
+/// EIP-4844 transactions never reach a TN block (the batch builder skips them, the batch validator
+/// rejects any batch that carries one, and the pool prices them out of the pending set with
+/// `pending_block_blob_fee = Some(u128::MAX)`), so blob gas has no market and the price is pinned
+/// rather than derived from the header. `evm_env` and `next_evm_env` both use this one value:
+/// deriving it in only one place made `BLOBBASEFEE` return `1` in every `evm_env` environment
+/// (`eth_call` / `eth_estimateGas` / tracing, and a block re-executed through
+/// `executor_for_block`) but `u128::MAX` in block building and execution (#1205). Every TN header
+/// carries `excess_blob_gas: Some(0)` (`TNBlockAssembler`), matching `excess_blob_gas` here.
+const TN_BLOB_EXCESS_GAS_AND_PRICE: BlobExcessGasAndPrice =
+    BlobExcessGasAndPrice { excess_blob_gas: 0, blob_gasprice: u128::MAX };
 
 /// TN-related EVM configuration.
 #[derive(Debug, Clone)]
@@ -119,15 +139,13 @@ impl ConfigureEvm for TnEvmConfig {
             cfg_env.set_max_blobs_per_tx(blob_params.max_blob_count);
         }
 
-        // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current
-        // blobparams
-        let blob_excess_gas_and_price = header
-            .excess_blob_gas
-            .zip(self.chain_spec().blob_params_at_timestamp(header.timestamp))
-            .map(|(excess_blob_gas, params)| {
-                let blob_gasprice = params.calc_blob_fee(excess_blob_gas);
-                BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
-            });
+        // TN does not price blob gas: use the value block execution pins (see
+        // `TN_BLOB_EXCESS_GAS_AND_PRICE`) instead of `params.calc_blob_fee(excess_blob_gas)`,
+        // which is `1` for every TN header and made `BLOBBASEFEE` disagree between `eth_call` and
+        // execution. Keep upstream's `Option` shape: `None` only when the header carries no
+        // `excess_blob_gas` or the timestamp has no blob params (pre-Cancun, which TN never is).
+        let blob_excess_gas_and_price =
+            header.excess_blob_gas.zip(blob_params).map(|_| TN_BLOB_EXCESS_GAS_AND_PRICE);
 
         let block_env = BlockEnv {
             number: U256::from(header.number()),
@@ -175,10 +193,8 @@ impl ConfigureEvm for TnEvmConfig {
             prevrandao: Some(payload.prev_randao()),
             gas_limit: payload.gas_limit,
             basefee: payload.base_fee_per_gas,
-            blob_excess_gas_and_price: Some(BlobExcessGasAndPrice {
-                excess_blob_gas: 0,       // no excess gas for blobs
-                blob_gasprice: u128::MAX, // eip4844 transactions are ignored
-            }),
+            // eip4844 transactions are ignored: pinned, and shared with `evm_env`
+            blob_excess_gas_and_price: Some(TN_BLOB_EXCESS_GAS_AND_PRICE),
         };
 
         let evm_env = EvmEnv::new(cfg, block_env);
@@ -243,7 +259,99 @@ impl ConfigureEvm for TnEvmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tn_types::{Block, Bytes, ExecHeader};
+    use reth_evm::{Evm as _, EvmFactory as _};
+    use reth_revm::{bytecode::Bytecode, context::TxEnv, db::InMemoryDB, state::AccountInfo};
+    use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv as _;
+    use tn_types::{Address, Block, Bytes, ExecHeader, TxKind};
+
+    /// Run `BLOBBASEFEE PUSH0 MSTORE PUSH1 32 PUSH0 RETURN` through the TN EVM under `env`, from
+    /// a funded caller sending a plain (non-blob) call, and decode the returned word.
+    fn blobbasefee_under(config: &TnEvmConfig, env: EvmEnv) -> U256 {
+        let caller = Address::ZERO;
+        let contract = Address::with_last_byte(0xaa);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo::from_balance(U256::from(10u64).pow(U256::from(18u64))),
+        );
+        db.insert_account_info(
+            contract,
+            AccountInfo::from_bytecode(Bytecode::new_raw(Bytes::from_static(&[
+                0x4a, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+            ]))),
+        );
+        // pay exactly the block's base fee so validation passes without touching the env
+        let gas_price = u128::from(env.block_env.basefee);
+        let mut evm = config.evm_factory().create_evm(db, env);
+        let tx = TxEnv {
+            caller,
+            kind: TxKind::Call(contract),
+            gas_limit: 100_000,
+            gas_price,
+            chain_id: None,
+            ..Default::default()
+        };
+        let result = evm.transact(tx).expect("transact").result;
+        assert!(result.is_success(), "BLOBBASEFEE probe did not succeed: {result:?}");
+        U256::from_be_slice(&result.into_output().expect("returned word"))
+    }
+
+    /// The observable form of the invariant: `BLOBBASEFEE` (what a contract reads under
+    /// `eth_call` / `eth_estimateGas` / tracing, which run under `evm_env`) returns the same
+    /// pinned price the block executor's environment (`next_evm_env`) exposes on chain.
+    #[test]
+    fn test_blobbasefee_opcode_reads_pinned_price_under_both_envs() {
+        let chain: Arc<ChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let config = TnEvmConfig::new(chain.clone(), GasAccumulator::default());
+        let genesis = chain.sealed_genesis_header();
+        let read = config.evm_env(&genesis).expect("evm env");
+        let executed = config
+            .next_evm_env(&genesis, &TNPayload::build_pending_env(&genesis))
+            .expect("next evm env");
+        let pinned = U256::from(u128::MAX);
+        assert_eq!(blobbasefee_under(&config, read), pinned, "evm_env (RPC reads)");
+        assert_eq!(blobbasefee_under(&config, executed), pinned, "next_evm_env (execution)");
+    }
+
+    /// `evm_env` (RPC reads, tracing, replay-side registry queries) and `next_evm_env` (block
+    /// building and execution) must carry the same blob gas values, or `BLOBBASEFEE` returns one
+    /// answer in `eth_call` / `eth_estimateGas` and another on chain (#1205).
+    #[test]
+    fn test_evm_env_blob_gasprice_matches_next_evm_env() {
+        let chain: Arc<ChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let config = TnEvmConfig::new(chain.clone(), GasAccumulator::default());
+        // every TN header carries `excess_blob_gas: Some(0)` (see `TNBlockAssembler`); the
+        // genesis header does too because Cancun is active at genesis
+        let genesis = chain.sealed_genesis_header();
+        assert_eq!(genesis.excess_blob_gas, Some(0));
+
+        let executed = config
+            .next_evm_env(&genesis, &TNPayload::build_pending_env(&genesis))
+            .expect("next evm env");
+        let read = config.evm_env(&genesis).expect("evm env");
+
+        assert_eq!(
+            read.block_env.blob_excess_gas_and_price,
+            executed.block_env.blob_excess_gas_and_price,
+        );
+        // the pinned execution value, not the header-derived `calc_blob_fee(0) = 1`
+        assert_eq!(
+            read.block_env.blob_excess_gas_and_price,
+            Some(BlobExcessGasAndPrice { excess_blob_gas: 0, blob_gasprice: u128::MAX }),
+        );
+    }
+
+    /// `evm_env` keeps upstream's `Option` shape: a header without `excess_blob_gas` (the
+    /// pre-Cancun header shape, which TN never produces) still yields no blob gas values rather
+    /// than the pinned ones.
+    #[test]
+    fn test_evm_env_blob_gasprice_none_without_header_excess_blob_gas() {
+        let chain: ChainSpec = tn_types::test_genesis().into();
+        let config = TnEvmConfig::new(Arc::new(chain), GasAccumulator::default());
+        let header = ExecHeader { excess_blob_gas: None, ..Default::default() };
+        let env = config.evm_env(&header).expect("evm env");
+        assert!(env.block_env.blob_excess_gas_and_price.is_none());
+    }
 
     /// Replay-path `extra_data` decode: empty → no epoch close, 32 bytes → the closing-epoch
     /// digest, anything else → an error rather than a `B256::from_slice` panic.
