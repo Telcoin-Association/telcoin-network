@@ -15,7 +15,7 @@ use crate::{
     health::HealthcheckServer,
     manager::{
         exex::{run_critical_exex_future, run_isolated_exex_future},
-        spawn_epoch_vote_collector, ExecStateExporter,
+        revote_uncertified_epoch_record_on_startup, spawn_epoch_vote_collector, ExecStateExporter,
     },
     metrics::EpochMetrics,
 };
@@ -751,6 +751,16 @@ where
             node_task_manager.get_spawner(),
             self.node_shutdown.subscribe(),
         );
+
+        // Re-vote from durable storage on restart (issue #1198): the collector above is armed
+        // only by the in-memory `epoch_record_watch`, so a record that a previous process
+        // persisted at epoch close but never got a vote quorum for would otherwise stay
+        // uncertified forever: no path at head can manufacture the missing certificate.
+        revote_uncertified_epoch_record_on_startup(
+            self.consensus_chain.epochs(),
+            self.consensus_bus.epoch_record_watch(),
+        )
+        .await;
 
         // spawn task to update the latest execution results for consensus
         self.spawn_engine_update_task(engine_update_rx, &node_task_manager);

@@ -13,7 +13,9 @@
 //! against it, `tn_reth.forwarded_txns_dropped_total` (labeled by `reason`, see
 //! [`ForwardDropReason`]) counts the transactions the pipeline gave up on, and two series count
 //! work the forwarder sheds to stay within its own bounds:
-//! `tn_reth.forwarded_batches_shed_total` and `tn_reth.forwarded_txns_abandoned_total`. See
+//! `tn_reth.forwarded_batches_shed_total` and `tn_reth.forwarded_txns_abandoned_total`. Two more
+//! count the delivery feedback added for issue #1145:
+//! `tn_reth.forward_endpoints_demoted_total` and `tn_reth.forwarded_txns_requeued_total`. See
 //! [`ForwarderMetrics`] for per-series semantics.
 //!
 //! [`report_db_metrics`] additionally samples reth database metrics as a pre-scrape hook.
@@ -112,6 +114,8 @@ pub(crate) struct RethEnvMetrics {
 /// registration in [`ForwarderMetrics::init`] and the increments below cannot drift apart.
 const FORWARDED_BATCHES_SHED: &str = "tn_reth.forwarded_batches_shed_total";
 const FORWARDED_TXNS_ABANDONED: &str = "tn_reth.forwarded_txns_abandoned_total";
+const FORWARD_ENDPOINTS_DEMOTED: &str = "tn_reth.forward_endpoints_demoted_total";
+const FORWARDED_TXNS_REQUEUED: &str = "tn_reth.forwarded_txns_requeued_total";
 const FORWARDED_TXNS_QUEUED: &str = "tn_reth.forwarded_txns_queued_total";
 const FORWARDED_TXNS_DROPPED: &str = "tn_reth.forwarded_txns_dropped_total";
 
@@ -124,8 +128,10 @@ const FORWARDED_TXNS_DROPPED: &str = "tn_reth.forwarded_txns_dropped_total";
 /// delivered (issue #1133). The accounting is per attempt: the pre-admission reasons
 /// (`EmptyCommittee`, `NoUsableEndpoint`, `BatchShed`) refuse the batch so the caller keeps
 /// its transactions and requeues them on a later build (issue #1132), while `Rejected` and
-/// `Unreached` happen after admission, when the transactions are already evicted as mined,
-/// and are final losses.
+/// `Unreached` happen after admission, when the transactions are already evicted as mined.
+/// A `Rejected` transaction is a final loss; an `Unreached` one got no verdict, so the task
+/// also returns it to the worker's own pool (issue #1145) and a later build repackages it
+/// into a fresh attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ForwardDropReason {
     /// The batch reached the forwarder with an empty committee or no advertised endpoint, so
@@ -185,7 +191,8 @@ impl ForwardDropReason {
 /// they read against. Forwarding is best-effort, so shedding is a correct outcome rather
 /// than an error - but it is an *absorbed* failure, invisible until it is not, which is
 /// exactly the category that needs to show up somewhere other than a `warn!` line. Transactions
-/// counted as lost here were accepted by this node's RPC and never handed to a validator.
+/// counted here were accepted by this node's RPC and not handed to a validator by that
+/// attempt; [`ForwardDropReason`] documents which drops are final and which go back to the pool.
 ///
 /// Associated functions rather than instance handles, matching the epoch manager's
 /// `record_provider_fault_retry`: the emission sites are inside a spawned task that holds no
@@ -194,8 +201,9 @@ impl ForwardDropReason {
 pub(crate) struct ForwarderMetrics;
 
 impl ForwarderMetrics {
-    /// Register every forwarder series (shed, abandoned, queued, and one dropped series per
-    /// [`ForwardDropReason`]) with the current recorder without recording an event.
+    /// Register every forwarder series (shed, abandoned, demoted, requeued, queued, and one
+    /// dropped series per [`ForwardDropReason`]) with the current recorder without recording
+    /// an event.
     ///
     /// Called from `WorkerRpcForwarder::new`, which runs at epoch start, long after the CLI
     /// installs the global recorder. The reason to register eagerly is the same one [`init`]
@@ -206,6 +214,8 @@ impl ForwarderMetrics {
     pub(crate) fn init() {
         metrics::counter!(FORWARDED_BATCHES_SHED).increment(0);
         metrics::counter!(FORWARDED_TXNS_ABANDONED).increment(0);
+        metrics::counter!(FORWARD_ENDPOINTS_DEMOTED).increment(0);
+        metrics::counter!(FORWARDED_TXNS_REQUEUED).increment(0);
         metrics::counter!(FORWARDED_TXNS_QUEUED).increment(0);
         ForwardDropReason::ALL.iter().for_each(|reason| {
             metrics::counter!(FORWARDED_TXNS_DROPPED, "reason" => reason.label()).increment(0);
@@ -229,6 +239,24 @@ impl ForwarderMetrics {
     /// could not be walked inside its budget.
     pub(crate) fn record_txns_abandoned(count: u64) {
         metrics::counter!(FORWARDED_TXNS_ABANDONED).increment(count);
+    }
+
+    /// Count endpoints demoted from forward admission after a connection-level send failure
+    /// (issue #1145).
+    ///
+    /// A steady rate on one committee means an advertised endpoint is persistently dead: every
+    /// cooldown expiry admits one probe batch against it and demotes it again. That is the
+    /// intended containment, but the advertisement itself is the operator-actionable fault.
+    pub(crate) fn record_endpoints_demoted(count: u64) {
+        metrics::counter!(FORWARD_ENDPOINTS_DEMOTED).increment(count);
+    }
+
+    /// Count transactions returned to the worker's own pool after their forward got no verdict
+    /// (issue #1145). These are recovered, not lost: the batch builder repackages them on a
+    /// later build. Pairs with [`Self::record_txns_abandoned`] and the `Unreached` label of
+    /// [`Self::record_txns_dropped`], whose transactions are the ones this requeue rescues.
+    pub(crate) fn record_txns_requeued(count: u64) {
+        metrics::counter!(FORWARDED_TXNS_REQUEUED).increment(count);
     }
 
     /// Count transactions handed to the forwarder, before any admission decision.
@@ -469,7 +497,7 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(0)));
     }
 
-    /// [`ForwarderMetrics::init`] must register both forwarder series at zero, and each record
+    /// [`ForwarderMetrics::init`] must register every forwarder series at zero, and each record
     /// helper must move only its own series.
     ///
     /// The negative half matters as much as the positive one: a single mistyped counter name
@@ -487,16 +515,22 @@ mod tests {
         let snapshot = snapshotter.snapshot().into_vec();
         assert!(matches!(series(&snapshot, FORWARDED_BATCHES_SHED), DebugValue::Counter(0)));
         assert!(matches!(series(&snapshot, FORWARDED_TXNS_ABANDONED), DebugValue::Counter(0)));
+        assert!(matches!(series(&snapshot, FORWARD_ENDPOINTS_DEMOTED), DebugValue::Counter(0)));
+        assert!(matches!(series(&snapshot, FORWARDED_TXNS_REQUEUED), DebugValue::Counter(0)));
 
         metrics::with_local_recorder(&recorder, || {
             ForwarderMetrics::record_batch_shed();
             ForwarderMetrics::record_batch_shed();
             ForwarderMetrics::record_txns_abandoned(7);
+            ForwarderMetrics::record_endpoints_demoted(3);
+            ForwarderMetrics::record_txns_requeued(5);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
         assert!(matches!(series(&snapshot, FORWARDED_BATCHES_SHED), DebugValue::Counter(2)));
         assert!(matches!(series(&snapshot, FORWARDED_TXNS_ABANDONED), DebugValue::Counter(7)));
+        assert!(matches!(series(&snapshot, FORWARD_ENDPOINTS_DEMOTED), DebugValue::Counter(3)));
+        assert!(matches!(series(&snapshot, FORWARDED_TXNS_REQUEUED), DebugValue::Counter(5)));
     }
 
     /// [`ForwarderMetrics::init`] must register the queued base series and one dropped series

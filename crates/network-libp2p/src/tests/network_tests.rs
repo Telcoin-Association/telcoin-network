@@ -2543,6 +2543,50 @@ async fn test_node_record_validation() {
     assert!(network.peer_record_valid(&peer_record).is_none());
 }
 
+/// A signed record may advertise at most `MAX_MULTIADDRS_PER_PEER` addresses (the record cap is
+/// tied to the per-peer set cap): a record exactly at the cap is accepted, one address more is
+/// rejected (GHSA-29v6-gvv5-45gx). The boundary is exact.
+#[tokio::test]
+async fn test_node_record_validation_rejects_oversized_multiaddr_list() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let network = peer1.network;
+    let key_config = peer1.config.key_config();
+    let cap = crate::peers::MAX_MULTIADDRS_PER_PEER;
+
+    // a correctly signed and published record carrying `count` distinct addresses
+    let record_with = |count: usize| {
+        let multiaddrs: Vec<Multiaddr> = (0..count)
+            .filter_map(|i| {
+                format!("/ip4/198.51.100.{}/udp/{}/quic-v1", i + 1, 49_000 + i).parse().ok()
+            })
+            .collect();
+        assert_eq!(multiaddrs.len(), count, "every fixture address must parse");
+        let info = NetworkInfo {
+            pubkey: key_config.primary_network_public_key(),
+            multiaddrs,
+            timestamp: now(),
+            rpc: None,
+        };
+        let signature = key_config.request_signature_direct(&encode(&info));
+        let mut record = network.get_peer_record();
+        record.value = encode(&NodeRecord { info, signature });
+        record
+    };
+
+    // exactly at the cap: accepted with every address intact
+    let at_cap = network.peer_record_valid(&record_with(cap));
+    assert!(
+        matches!(&at_cap, Some((_, node_record)) if node_record.info.multiaddrs.len() == cap),
+        "a record advertising exactly MAX_MULTIADDRS_PER_PEER addresses must be accepted"
+    );
+
+    // one address over the cap: rejected
+    assert!(
+        network.peer_record_valid(&record_with(cap + 1)).is_none(),
+        "a record advertising more than MAX_MULTIADDRS_PER_PEER addresses must be rejected"
+    );
+}
+
 /// Repeated `MissingAuthorities` reports for one key must not stack duplicate
 /// in-flight kad queries (issue #1135).
 ///
