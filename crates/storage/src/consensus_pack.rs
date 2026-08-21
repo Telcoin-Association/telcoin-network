@@ -914,9 +914,10 @@ impl Inner {
     ) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         let _ = create_dir_synced(&base_dir);
-        let mut stream_iter = AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64)
-            .await
-            .map_err(|e| PackError::ReadError(e.to_string()))?;
+        let mut stream_iter =
+            AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64, PACK_VERSION)
+                .await
+                .map_err(|e| PackError::ReadError(e.to_string()))?;
         let mut data = Pack::open(
             base_dir.join(Self::DATA_NAME),
             epoch as u64,
@@ -2991,6 +2992,54 @@ pub(crate) mod test {
             );
         }
         drop(pack);
+    }
+
+    /// A peer streaming a pack whose header is stamped NEWER than [`PACK_VERSION`] must be
+    /// rejected up front by `stream_import` (the version gate in `AsyncPackIter::open`) instead
+    /// of misparsed with current-format logic. The rejection surfaces as
+    /// [`PackError::ReadError`], which `is_missing_static_files` must NOT classify as a normal
+    /// "epoch files absent" miss — callers must propagate it, not collapse it to `None`.
+    #[tokio::test]
+    async fn test_stream_import_rejects_newer_pack_version() {
+        use crate::{
+            archive::pack::Pack,
+            consensus_pack::{PackError, PackRecord},
+        };
+
+        let temp_dir = TempDir::with_prefix("test_stream_newer_version").expect("temp dir");
+        // Build a header-only pack file stamped one version ahead of this reader. The uid_idx
+        // matches the epoch streamed below so only the version gate can reject it.
+        let path = temp_dir.path().join("newer_version");
+        {
+            let _pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION + 1)
+                    .expect("open pack");
+        }
+
+        let stream = tokio::fs::File::open(&path).await.expect("stream file");
+        let temp_dir2 = TempDir::with_prefix("test_stream_newer_version2").expect("temp dir");
+        let err = ConsensusPack::stream_import(
+            temp_dir2.path(),
+            stream,
+            0,
+            &EpochRecord::default(),
+            0,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("newer-version stream must be rejected");
+        match &err {
+            PackError::ReadError(msg) => {
+                assert!(msg.contains("invalid version"), "unexpected message: {msg}");
+            }
+            other => panic!("expected ReadError, got {other:?}"),
+        }
+        // A version rejection means the peer's bytes are unreadable, not that the epoch files
+        // are absent on disk: the miss classifier must propagate it as an error.
+        assert!(
+            !err.is_missing_static_files(),
+            "version rejection must not classify as missing static files"
+        );
     }
 
     /// A v0 (batches-first) pack that stores a SHARED batch (one digest referenced by two certs)
