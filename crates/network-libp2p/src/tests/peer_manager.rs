@@ -543,6 +543,76 @@ async fn test_process_peer_exchange() {
     assert!(peer_manager.next_dial_request().is_none());
 }
 
+/// Helper to build a distinct, deterministic multiaddr per index.
+///
+/// All addresses target the same IP with different ports, the shape of a dial-amplification
+/// payload aimed at one victim host (issue #1183).
+fn multiaddr_for_index(i: usize) -> Multiaddr {
+    Multiaddr::empty()
+        .with(Ipv4Addr::new(203, 0, 113, 1).into())
+        .with(Protocol::Tcp(8000 + u16::try_from(i).expect("index fits u16")))
+}
+
+#[tokio::test]
+async fn test_process_peer_exchange_rejects_oversized_multiaddr_list() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    let mut rng = StdRng::from_seed([0; 32]);
+    let bls_oversized = *BlsKeypair::generate(&mut rng).public();
+    let bls_at_cap = *BlsKeypair::generate(&mut rng).public();
+    let net_oversized: NetworkPublicKey =
+        NetworkKeypair::generate_ed25519().public().clone().into();
+    let net_at_cap: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
+    let peer_id_oversized: PeerId = net_oversized.clone().into();
+    let peer_id_at_cap: PeerId = net_at_cap.clone().into();
+
+    // one entry with one address more than an honest peer's store can hold
+    let oversized: HashSet<_> =
+        (0..crate::peers::MAX_MULTIADDRS_PER_PEER + 1).map(multiaddr_for_index).collect();
+    assert_eq!(oversized.len(), crate::peers::MAX_MULTIADDRS_PER_PEER + 1);
+
+    // one entry exactly at the cap
+    let at_cap: HashSet<_> =
+        (0..crate::peers::MAX_MULTIADDRS_PER_PEER).map(multiaddr_for_index).collect();
+    assert_eq!(at_cap.len(), crate::peers::MAX_MULTIADDRS_PER_PEER);
+
+    let mut exchange_map = HashMap::new();
+    exchange_map.insert(bls_oversized, (net_oversized, oversized));
+    exchange_map.insert(bls_at_cap, (net_at_cap, at_cap));
+
+    peer_manager.process_peer_exchange(PeerExchangeMap::from(exchange_map));
+
+    // the oversized entry is rejected; the at-cap entry is stored
+    assert!(
+        !peer_manager.discovery_peers.contains_key(&peer_id_oversized),
+        "entry over MAX_MULTIADDRS_PER_PEER must not enter discovery"
+    );
+    assert!(
+        peer_manager.discovery_peers.contains_key(&peer_id_at_cap),
+        "entry at MAX_MULTIADDRS_PER_PEER must enter discovery"
+    );
+}
+
+#[tokio::test]
+async fn test_discovery_heartbeat_purges_oversized_multiaddr_entry() {
+    let mut peer_manager = create_test_peer_manager(None);
+
+    // an oversized entry stored before the cap existed (or through any future ingest gap)
+    let peer_id = PeerId::random();
+    let addrs: Vec<_> =
+        (0..crate::peers::MAX_MULTIADDRS_PER_PEER + 1).map(multiaddr_for_index).collect();
+    peer_manager.discovery_peers.insert(peer_id, addrs);
+
+    peer_manager.discovery_heartbeat();
+
+    // the heartbeat re-checks eligibility: the entry is purged, never dialed
+    assert!(
+        !peer_manager.discovery_peers.contains_key(&peer_id),
+        "oversized entry must be purged by the heartbeat"
+    );
+    assert!(peer_manager.next_dial_request().is_none(), "oversized entry must not be dialed");
+}
+
 #[tokio::test]
 async fn test_prune_connected_peers() {
     let mut peer_manager = create_test_peer_manager(None);

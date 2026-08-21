@@ -37,13 +37,13 @@ use crate::{
         position_index::index::PositionIndex,
     },
     consensus_pack::fetch_error_is_absent,
+    error_latch::latch_first_error,
 };
 
 /// Current version of the epoch pack file.
 const EPOCH_PACK_VERSION: u16 = 0;
 
-/// Interval between lookups in the bounded waits [`EpochRecordDb::record_by_epoch_with_timeout`]
-/// and [`EpochRecordDb::cert_by_digest_with_timeout`].
+/// Interval between lookups in the bounded waits [`EpochRecordDb::cert_by_digest_with_timeout`].
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 enum EpochDbMessage {
@@ -70,6 +70,8 @@ enum EpochDbMessage {
     TryCertByDigest(EpochDigest, oneshot::Sender<Result<Option<EpochCertificate>, FetchError>>),
     /// True if the database contains a record for the given epoch number.
     ContainsEpoch(Epoch, oneshot::Sender<bool>),
+    /// True if the database contains a dummy record for the given epoch 0.
+    ContainsDummyEpoch0(oneshot::Sender<bool>),
     /// True if the database contains a record with the given digest.
     ContainsRecordDigest(EpochDigest, oneshot::Sender<bool>),
     /// Return the latest (highest epoch) [`EpochRecord`] stored, if any.
@@ -86,9 +88,11 @@ enum EpochDbMessage {
 ///
 /// Operations are dispatched to a background thread that owns the file handles.
 /// Errors from background writes are surfaced on the next call via [`get_error`], which clears
-/// the slot as it reads, so exactly one subsequent caller observes a given failure. Use
-/// [`peek_error`] to check without consuming. [`persist`] is the durability barrier: it reports
-/// any earlier write failure even if that write was still queued when the flush was requested.
+/// the slot as it reads, so exactly one subsequent caller observes a given failure. When more
+/// than one write fails before a read, the slot keeps the first failure (for a poisoned-pack
+/// cascade that is the root cause; every failure is logged either way). Use [`peek_error`] to
+/// check without consuming. [`persist`] is the durability barrier: it reports any earlier
+/// write failure even if that write was still queued when the flush was requested.
 #[derive(Debug, Clone)]
 pub struct EpochRecordDb {
     /// Channel to send commands to the background thread.
@@ -109,29 +113,33 @@ fn run_db_loop(
 ) {
     while let Some(msg) = rx.blocking_recv() {
         match msg {
+            // The four save arms latch first-error-wins: two queued saves can fail with no
+            // reader between them, and a plain `send_replace` would lose the first failure
+            // (#1148). In the poisoned-pack cascade the first failure is the root cause.
+            // The log line still records every failure.
             EpochDbMessage::SaveDummy0Record(record) => {
-                if let Err(e) = inner.save_dummy_epoch0(record) {
+                inner.save_dummy_epoch0(record).unwrap_or_else(|e| {
                     error!(target: "epoch-db", %e, "failed to save dummy epoch 0 record");
-                    tx_error.send_replace(Some(e));
-                }
+                    latch_first_error(&tx_error, e);
+                });
             }
             EpochDbMessage::SaveRecord(record) => {
-                if let Err(e) = inner.save_record(record) {
+                inner.save_record(record).unwrap_or_else(|e| {
                     error!(target: "epoch-db", %e, "failed to save epoch record");
-                    tx_error.send_replace(Some(e));
-                }
+                    latch_first_error(&tx_error, e);
+                });
             }
             EpochDbMessage::Save(record, cert) => {
-                if let Err(e) = inner.save(record, cert) {
+                inner.save(record, cert).unwrap_or_else(|e| {
                     error!(target: "epoch-db", %e, "failed to save epoch record and certificate");
-                    tx_error.send_replace(Some(e));
-                }
+                    latch_first_error(&tx_error, e);
+                });
             }
             EpochDbMessage::SaveCertificate(digest, cert) => {
-                if let Err(e) = inner.save_certificate(digest, cert) {
+                inner.save_certificate(digest, cert).unwrap_or_else(|e| {
                     error!(target: "epoch-db", %e, "failed to save epoch certificate");
-                    tx_error.send_replace(Some(e));
-                }
+                    latch_first_error(&tx_error, e);
+                });
             }
             EpochDbMessage::RecordByEpoch(epoch, tx) => {
                 let _ = tx.send(inner.record_by_epoch(epoch));
@@ -150,6 +158,9 @@ fn run_db_loop(
             }
             EpochDbMessage::ContainsEpoch(epoch, tx) => {
                 let _ = tx.send(inner.contains_epoch(epoch));
+            }
+            EpochDbMessage::ContainsDummyEpoch0(tx) => {
+                let _ = tx.send(inner.contains_dummy_epoch0());
             }
             EpochDbMessage::ContainsRecordDigest(digest, tx) => {
                 let _ = tx.send(inner.contains_record_digest(digest));
@@ -423,6 +434,7 @@ impl EpochRecordDb {
 
     /// Return any delayed error recorded by the background thread.
     /// Also clears the error.
+    /// When more than one write failed since the last read, this returns the first failure.
     pub fn get_error(&self) -> Result<(), EpochDbError> {
         match self.error.send_replace(None) {
             Some(e) => Err(e.clone()),
@@ -554,19 +566,6 @@ impl EpochRecordDb {
         }
     }
 
-    /// Retrieve an [`EpochRecord`] by epoch number.
-    /// This version will wait up to timeout time for the record to show up if not available.
-    ///
-    /// The wait ends with a lookup at the deadline, so a record saved during the last poll
-    /// interval is still returned (see `poll_until_deadline`).
-    pub async fn record_by_epoch_with_timeout(
-        &self,
-        epoch: Epoch,
-        timeout: Duration,
-    ) -> Option<EpochRecord> {
-        Self::poll_until_deadline(timeout, || self.record_by_epoch(epoch)).await
-    }
-
     /// Retrieve the [`EpochRecord`] for `epoch` only when a stored [`EpochCertificate`]
     /// cryptographically verifies against it.
     ///
@@ -658,9 +657,8 @@ impl EpochRecordDb {
             })
     }
 
-    /// Like [`Self::certified_record_by_epoch`], but waits up to `timeout` for the record and
-    /// its certificate to arrive, polling every 200ms (matching
-    /// [`Self::record_by_epoch_with_timeout`]).
+    /// Waits up to `timeout` for the record and
+    /// its certificate to arrive, polling every 200ms
     ///
     /// Only the retryable outcomes are waited on (see [`CertifiedRecordError::is_retryable`]):
     /// a record or certificate that has not arrived yet can still be supplied asynchronously,
@@ -688,15 +686,16 @@ impl EpochRecordDb {
         deadline: tokio::time::Instant,
     ) -> Pin<Box<dyn Future<Output = Result<EpochRecord, CertifiedRecordError>> + Send + '_>> {
         Box::pin(async move {
-            let outcome = self.certified_record_by_epoch(epoch).await;
-            let retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
+            let mut outcome = self.certified_record_by_epoch(epoch).await;
+            let mut retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
                 && tokio::time::Instant::now() < deadline;
-            if retry {
+            while retry {
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                self.certified_record_poll(epoch, deadline).await
-            } else {
-                outcome
+                outcome = self.certified_record_by_epoch(epoch).await;
+                retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
+                    && tokio::time::Instant::now() < deadline;
             }
+            outcome
         })
     }
 
@@ -741,6 +740,16 @@ impl EpochRecordDb {
     pub async fn contains_epoch(&self, epoch: Epoch) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(EpochDbMessage::ContainsEpoch(epoch, tx)).await.is_ok() {
+            rx.await.unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    /// True if the database contains a dummy record for epoch 0.
+    pub async fn contains_dummy_epoch0(&self) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(EpochDbMessage::ContainsDummyEpoch0(tx)).await.is_ok() {
             rx.await.unwrap_or(false)
         } else {
             false
@@ -1343,6 +1352,14 @@ impl Inner {
         }
     }
 
+    fn contains_dummy_epoch0(&self) -> bool {
+        if self.epoch_idx.is_empty() {
+            self.dummy_epoch0.is_some()
+        } else {
+            false
+        }
+    }
+
     fn contains_record_digest(&mut self, digest: EpochDigest) -> bool {
         if let Ok(pos) = self.record_digests.load(digest.into()) {
             pos < self.records.file_len()
@@ -1799,6 +1816,46 @@ mod test {
 
         // The flush consumed the failure, so it is not left behind to be misattributed to an
         // unrelated later caller.
+        db.get_error().expect("persist acknowledged the error");
+    }
+
+    #[tokio::test]
+    async fn queued_save_failures_keep_the_first_error() {
+        // Regression test for #1148: two saves fail back to back with no reader between them.
+        // The latch was last-write-wins, so the second failure silently replaced the first
+        // and the root cause was lost. The latch must keep the first failure.
+        let temp_dir = TempDir::with_prefix("queued_saves_first_error").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+
+        // Queue two saves the actor will reject: epochs 5 and 7 are both out of order on an
+        // empty db and produce distinguishable errors. Both go straight to the channel so no
+        // handle-side guard or reader runs between the two failures. A single consumer
+        // draining a FIFO channel guarantees the save order, so this is deterministic rather
+        // than a race.
+        let first = EpochRecord { epoch: 5, ..Default::default() };
+        let second = EpochRecord { epoch: 7, ..Default::default() };
+        db.tx
+            .send(super::EpochDbMessage::SaveRecord(first))
+            .await
+            .expect("queue first failing save");
+        db.tx
+            .send(super::EpochDbMessage::SaveRecord(second))
+            .await
+            .expect("queue second failing save");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        db.tx.send(super::EpochDbMessage::Persist(tx)).await.expect("queue persist");
+
+        // The persist reply drains the latch, so it must carry the FIRST failure, not the
+        // one that happened to fail last.
+        let err = rx
+            .await
+            .expect("actor replied to the persist")
+            .expect_err("persist must report the queued save failures");
+        assert!(
+            matches!(err, EpochDbError::EpochOutOfOrder(0, 5)),
+            "latch must keep the first failure, got: {err:?}"
+        );
+        // The reply consumed the slot; nothing is left to misattribute to a later caller.
         db.get_error().expect("persist acknowledged the error");
     }
 
@@ -2673,6 +2730,67 @@ mod test {
         assert_eq!(err, CertifiedRecordError::MissingCertificate(0, rec.digest()));
     }
 
+    /// The de-recursed poll retries across a `MissingRecord` (not just `MissingCertificate`): the
+    /// record and its certificate both arrive mid-poll (e.g. re-derived or collected after a
+    /// restart), and the certified read is released within the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn certified_record_poll_heals_from_missing_record() {
+        let temp_dir = TempDir::with_prefix("certified_heal_missing_record").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        let expected = rec0.digest();
+
+        // Nothing is stored yet, so the first poll sees the retryable MissingRecord; the full
+        // record+cert land at 300ms, well inside the 10s budget.
+        let db_writer = db.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            db_writer.save(rec0, cert0).await.expect("late record+cert save");
+        });
+
+        let certified = db
+            .certified_record_by_epoch_with_timeout(0, std::time::Duration::from_secs(10))
+            .await
+            .expect("the record must be released once it and its certificate arrive");
+        assert_eq!(certified.digest(), expected);
+        writer.await.expect("record+cert writer task");
+    }
+
+    /// Deadline-boundary coverage for the de-recursed `certified_record_poll`: a certificate saved
+    /// during the last poll interval before the deadline is still picked up and the record
+    /// released. Restores (for the certified poll) the coverage lost when the
+    /// `record_by_epoch_with_timeout` test was removed. Virtual time makes the interval math
+    /// exact.
+    #[tokio::test(start_paused = true)]
+    async fn certified_record_with_timeout_sees_cert_saved_in_final_poll_interval() {
+        let temp_dir = TempDir::with_prefix("certified_final_interval").expect("temp dir");
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (rec0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        let expected = rec0.digest();
+        db.save_record(rec0).await.expect("save record without cert");
+
+        // Poll interval is 200ms; save the cert at 900ms - inside the final interval before the 1s
+        // deadline - so it is only visible to the poll's last lookup.
+        let db_writer = db.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            db_writer.save_certificate(expected, cert0).await.expect("final-interval cert save");
+        });
+
+        let certified = db
+            .certified_record_by_epoch_with_timeout(0, std::time::Duration::from_secs(1))
+            .await
+            .expect(
+                "a cert saved in the final poll interval must be picked up before the deadline",
+            );
+        assert_eq!(certified.digest(), expected);
+        writer.await.expect("cert writer task");
+    }
+
     /// On-disk corruption under the certified read path must classify as the non-retryable
     /// [`CertifiedRecordError::Storage`] — never as a retryable "missing" outcome that the
     /// timeout variant would poll for the full budget before mislabeling the corruption.
@@ -2812,33 +2930,6 @@ mod test {
         saver.await.expect("saver task");
         let got = got.expect("a cert saved before the deadline must be returned");
         assert_eq!(got.epoch_hash, cert.epoch_hash);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn record_by_epoch_with_timeout_sees_record_saved_in_final_poll_interval() {
-        // Same property on the record wait, which restart catch-up depends on: a record that lands
-        // in the last poll interval before the deadline is returned rather than turned into the
-        // error that ends the node. See the sibling cert test for why virtual time is exact here.
-        let temp_dir = TempDir::with_prefix("record_timeout_final_interval").expect("temp dir");
-        let mut rng = StdRng::from_os_rng();
-        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
-
-        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
-        let (record, _cert) = make_test_pair(0, &signers, EpochDigest::default());
-
-        let saver = {
-            let db = db.clone();
-            let record = record.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-                db.save_record(record).await.expect("save record");
-            })
-        };
-
-        let got = db.record_by_epoch_with_timeout(0, std::time::Duration::from_secs(1)).await;
-        saver.await.expect("saver task");
-        let got = got.expect("a record saved before the deadline must be returned");
-        assert_eq!(got.digest(), record.digest());
     }
 
     #[tokio::test(start_paused = true)]

@@ -237,18 +237,25 @@ pub trait TxnForwarder: Send + Sync + Debug {
     /// single validator and nonce ordering is preserved. `validator_rpcs` is the set of
     /// currently-known advertised endpoints; a validator that has not advertised an endpoint is
     /// skipped in favor of one that has.
+    ///
+    /// Returns `true` if the batch was admitted to a forward task. `false` means it was dropped
+    /// at the door and the caller still owns these transactions: they must stay in the caller's
+    /// pool for a future batch. Admission is not delivery — delivery stays best-effort on the
+    /// background task.
     fn forward_txns(
         &self,
         transactions: Vec<Vec<u8>>,
         committee_slots: Vec<BlsPublicKey>,
         validator_rpcs: Vec<(BlsPublicKey, RpcInfo)>,
-    );
+    ) -> bool;
 }
 
-/// A [`TxnForwarder`] that drops every transaction.
+/// A [`TxnForwarder`] that admits nothing.
 ///
 /// Committee voting validators never forward (they include transactions directly), so they can
 /// be constructed with this; it is also convenient in tests that do not exercise forwarding.
+/// Refusing admission keeps the honest contract: a caller that relies on forwarding sees the
+/// batch refused and keeps its transactions, instead of believing they were handed off.
 #[derive(Clone, Debug, Default)]
 pub struct NoopTxnForwarder;
 
@@ -258,7 +265,8 @@ impl TxnForwarder for NoopTxnForwarder {
         _transactions: Vec<Vec<u8>>,
         _committee_slots: Vec<BlsPublicKey>,
         _validator_rpcs: Vec<(BlsPublicKey, RpcInfo)>,
-    ) {
+    ) -> bool {
+        false
     }
 }
 

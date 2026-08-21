@@ -60,15 +60,32 @@ use tracing::info;
 /// (genesis creation requires the extra node) but never starts it.
 const GENESIS_OBSERVER: &str = "genesis-observer";
 
-/// Per-test epoch duration (seconds) for the mid-epoch restart regression.
+/// Sequence-epoch duration (seconds) for the mid-epoch restart regression.
 ///
 /// [`test_committee_member_restarted_mid_epoch_after_ejection`] must fit its whole in-epoch
-/// sequence — fresh-boundary entry, one full leader rotation, the governance burn, the burn-block
-/// execution pin, kill, restart, and the mid-epoch consensus rejoin — inside ONE epoch. That
-/// sequence's worst case is ~29s, so the module-wide [`EPOCH_DURATION`] (10s) cannot host it;
-/// 40s banks comfortable margin without stretching the test into extra epochs. Every timeout in
-/// that test which scales with epoch length derives from this constant, not [`EPOCH_DURATION`].
+/// sequence (one full leader rotation, the governance burn, the burn-block execution pin, kill,
+/// restart, and the mid-epoch consensus rejoin) inside ONE epoch. That sequence's worst case is
+/// ~29s, so the module-wide [`EPOCH_DURATION`] (10s) cannot host it; 40s banks comfortable
+/// margin without stretching the sequence across extra epochs.
+///
+/// This constant is the anchor, not the genesis seed: genesis ships the short
+/// [`RESTART_WARMUP_EPOCH_DURATION`] and the test restores this duration on chain (via
+/// `upgradeStakeVersion`) for the epoch hosting the sequence, because only that epoch needs the
+/// 40s. Every timeout in the test which scales with epoch length keeps deriving from this
+/// constant, not [`EPOCH_DURATION`] and not the warmup seed.
 const RESTART_EPOCH_DURATION: u64 = 40;
+
+/// Genesis epoch duration (seconds) for the mid-epoch restart regression's warmup epochs.
+///
+/// The warmup epochs before the sequence epoch have one job: produce and certify epoch record 0,
+/// which the kill gate requires the kill target to serve. Genesis seeds ONE duration for every
+/// epoch, so without a second lever the warmup would pay the 40s that only the sequence epoch
+/// needs; instead genesis seeds this short duration and the test's startup `upgradeStakeVersion`
+/// restores [`RESTART_EPOCH_DURATION`] from the next epoch opening on. 8s sits above the
+/// documented 5s consensus minimum (`basefee.rs` / `epochs.rs` ship 5s, the sibling test 6s per
+/// [`EJECT_EPOCH_DURATION`]) with margin for the upgrade to confirm inside epoch 0 on the
+/// nominal path.
+const RESTART_WARMUP_EPOCH_DURATION: u64 = 8;
 
 /// Per-test epoch duration (seconds) for the mid-epoch current-committee ejection test.
 ///
@@ -118,6 +135,43 @@ async fn burn_with_retry<P: Provider>(
         Ok((_hash, block)) => Ok(block),
         Err(first_try) => {
             info!(target: "eject-test", %first_try, ?victim, "burn confirmation failed; retrying once");
+            governance_wallet.set_nonce(nonce);
+            wait_for_mid_epoch(provider, rpc_url).await?;
+            let (_hash, block) = send_owner_tx(rpc_url, governance_wallet, chain, calldata).await?;
+            Ok(block)
+        }
+    }
+}
+
+/// Submit the governance `upgradeStakeVersion` that restores [`RESTART_EPOCH_DURATION`], with
+/// owner nonce `nonce`, and wait for confirmation.
+///
+/// The new config copies the current `StakeConfig` verbatim except `epochDuration`, so stake and
+/// issuance stay byte-identical. A confirmation straddling an epoch boundary can get orphaned
+/// and lost; on failure the identical tx is retried once with the same nonce (idempotent: same
+/// payload, same hash) from the next measured mid-epoch window. Returns the block the upgrade's
+/// receipt landed in.
+async fn upgrade_duration_with_retry<P: Provider>(
+    provider: &P,
+    rpc_url: &str,
+    governance_wallet: &mut TransactionFactory,
+    chain: Arc<RethChainSpec>,
+    nonce: u64,
+) -> eyre::Result<u64> {
+    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider);
+    let current = registry.getCurrentStakeConfig().call().await?;
+    let new_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: current.stakeAmount,
+        minWithdrawAmount: current.minWithdrawAmount,
+        epochIssuance: current.epochIssuance,
+        epochDuration: u32::try_from(RESTART_EPOCH_DURATION)?,
+    };
+    let calldata: Bytes =
+        ConsensusRegistry::upgradeStakeVersionCall { newConfig: new_config }.abi_encode().into();
+    match send_owner_tx(rpc_url, governance_wallet, chain.clone(), calldata.clone()).await {
+        Ok((_hash, block)) => Ok(block),
+        Err(first_try) => {
+            info!(target: "eject-test", %first_try, "upgrade confirmation failed; retrying once");
             governance_wallet.set_nonce(nonce);
             wait_for_mid_epoch(provider, rpc_url).await?;
             let (_hash, block) = send_owner_tx(rpc_url, governance_wallet, chain, calldata).await?;
@@ -197,12 +251,10 @@ async fn test_validator_ejected_from_future_committee_only() -> eyre::Result<()>
     info!(target: "eject-test", activation_epoch, last_tx_block, "new validator activated");
 
     // 6 eligible validators, committee size stays 5: each shuffle now excludes exactly one
-    assert_eq!(
-        registry.getEligibleValidatorCount().call().await?,
-        U256::from(6),
-        "eligible count must be 6 after activation"
-    );
-    assert_eq!(registry.getNextCommitteeSize().call().await?, 5);
+    let eligible = registry.getEligibleValidatorCount().call().await?;
+    assert_eq!(eligible, U256::from(6), "eligible count must be 6 after activation");
+    let committee_size = registry.getNextCommitteeSize().call().await?;
+    assert_eq!(committee_size, 5);
 
     // scenario-1 baseline for the new validator: staked + active, not retired, full stake
     let newval_addr = new_validator.address();
@@ -215,10 +267,44 @@ async fn test_validator_ejected_from_future_committee_only() -> eyre::Result<()>
     // Find an epoch W (the current epoch) with newval ∉ W, ∉ W+1, ∈ W+2. The earliest committee
     // that can seat the new validator is chosen at the close of the activation epoch, two epochs
     // ahead — before that, ∉ W and ∉ W+1 hold by construction, and each fresh shuffle seats it
-    // with p = 5/6. Five attempts miss with p = (1/6)^5 ≈ 0.01%.
+    // with p = 5/6.
+    //
+    // The sample budget is the smallest n with (excluded/eligible)^n ≤ (1/6)^5 ≈ 0.01%,
+    // derived from the live counts asserted above so the documented miss bound keeps holding
+    // if the fixture ever changes shape (6 eligible and committee size 5 give exactly 5).
+    let (eligible, committee_size) = (
+        u128::try_from(eligible).map_err(|e| eyre::eyre!("eligible count: {e}"))?,
+        u128::from(committee_size),
+    );
+    let excluded = eligible
+        .checked_sub(committee_size)
+        .ok_or_else(|| eyre::eyre!("committee size exceeds eligible count"))?;
+    let sample_budget = (1u32..=20)
+        .find(|&n| {
+            excluded
+                .checked_pow(n)
+                .and_then(|miss| miss.checked_mul(6u128.pow(5)))
+                .zip(eligible.checked_pow(n))
+                .is_some_and(|(scaled_miss, total)| scaled_miss <= total)
+        })
+        .ok_or_else(|| {
+            eyre::eyre!("no budget of ≤ 20 sampled shuffles keeps the miss bound at (1/6)^5")
+        })?;
+
+    // Only a clean (non-straddled) read of W, W+1, W+2 samples a shuffle and spends budget; a
+    // straddled read retries in the fresh epoch for free, so slow RPC round-trips near a
+    // boundary cannot silently shrink the (1/6)^5 bound to (1/6)^(5-k). The iteration cap of
+    // 4x the budget bounds a pathological straddle spin: a straddle needs an epoch boundary
+    // inside one iteration's reads, so even one straddle per sampled epoch fits in 2x and the
+    // cap doubles that headroom; a genuinely stuck chain already fails fast inside
+    // `wait_for_epoch_at_least`.
     let mut candidate = activation_epoch + 1;
     let mut arrangement = None;
-    for _attempt in 0..5 {
+    let mut sampled = 0u32;
+    for _iteration in 0..sample_budget * 4 {
+        if arrangement.is_some() || sampled >= sample_budget {
+            break;
+        }
         let snap = wait_for_epoch_at_least(&provider, candidate).await?;
         let w = snap.epoch_id;
         let in_committee = |vals: &[ConsensusRegistry::ValidatorInfo]| {
@@ -227,22 +313,25 @@ async fn test_validator_ejected_from_future_committee_only() -> eyre::Result<()>
         let c_w = registry.getCommitteeValidators(w).call().await?;
         let c_w1 = registry.getCommitteeValidators(w + 1).call().await?;
         let c_w2 = registry.getCommitteeValidators(w + 2).call().await?;
-        // the three reads must not straddle a boundary
+        // the four reads must not straddle a boundary
         let still = registry.getCurrentEpochInfo().call().await?.epochId;
         if still != w {
             candidate = still;
             continue;
         }
+        sampled += 1;
         let (in_w, in_w1, in_w2) = (in_committee(&c_w), in_committee(&c_w1), in_committee(&c_w2));
-        info!(target: "eject-test", w, in_w, in_w1, in_w2, "arrangement check");
+        info!(target: "eject-test", w, sampled, in_w, in_w1, in_w2, "arrangement check");
         if !in_w && !in_w1 && in_w2 {
             arrangement = Some((w, c_w2.len()));
-            break;
         }
         candidate = w + 1;
     }
     let (w, w2_len_before) = arrangement.ok_or_else(|| {
-        eyre::eyre!("new validator not seated in a future-only committee within 5 epochs")
+        eyre::eyre!(
+            "new validator not seated in a future-only committee after {sampled} sampled \
+             shuffles of the epoch pipeline (budget {sample_budget})"
+        )
     })?;
     assert_eq!(w2_len_before, 5, "future committee must have 5 members before ejection");
 
@@ -680,6 +769,11 @@ async fn test_validator_ejected_from_current_committee_mid_epoch() -> eyre::Resu
 ///   (the current epoch when its remaining budget clears the margin, otherwise a fresh flip into
 ///   the next epoch), and every wait re-checks that epoch E is still current, failing loudly as
 ///   "premise broken" if the sequence straddles a boundary.
+/// - TWO-DURATION SCHEDULE: genesis seeds the short [`RESTART_WARMUP_EPOCH_DURATION`] (warmup
+///   epochs exist only to get record 0 certified for the kill gate); a governance
+///   `upgradeStakeVersion` submitted at startup restores the 40s sequence duration, and the test
+///   enters the first epoch observed running it. Only the sequence epoch pays for the ~29s
+///   sequence. Bonus coverage: no other e2e test exercises `upgradeStakeVersion` end to end.
 ///
 /// The detectors, in order: (a) the restarted node's consensus height re-advances past
 /// everything it could have held at death — commits it can only acquire by verifying the
@@ -703,7 +797,8 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
     // the victim (burned mid-epoch, node stays up); the kill target is validator-2 = index 1
     let victim_addr = nodes[4].1;
 
-    // setup genesis with the longer per-test epoch (see RESTART_EPOCH_DURATION)
+    // setup genesis with the short warmup epoch; the sequence duration is restored on chain at
+    // startup (see RESTART_WARMUP_EPOCH_DURATION)
     let temp_dir = tempfile::TempDir::with_prefix("eject_restart")?;
     let temp_path = temp_dir.path();
 
@@ -714,7 +809,7 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
         (GENESIS_OBSERVER, observer_wallet.address()),
         governance_wallet.address(),
         &nodes,
-        RESTART_EPOCH_DURATION,
+        RESTART_WARMUP_EPOCH_DURATION,
     )?;
 
     // start all six nodes (committee + genesis observer)
@@ -730,30 +825,65 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
     wait_for_rpc(&provider).await?;
     let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
 
-    // ---- Phase 0: cross the 0 -> 1 boundary ----
-    wait_for_epoch_at_least(&provider, 1).await?;
-
+    // ---- Kill gate, spawned concurrently: certified record 0 on the kill target ----
     // Before killing validator-2, require ITS datadir to hold the certified epoch-0 record.
     // `save_dummy_epoch0` is in-memory only, so a node killed after executing the epoch-0
     // closing block but before persisting the real record 0 cannot restart (`run_epoch` exits:
     // "We have epoch 0 in our database if we are past epoch 0"). That crash window is a
     // pre-existing product issue orthogonal to the pinning fix under test; gating the kill on
-    // the kill target serving certified record 0 keeps this test deterministic.
-    fetch_verified_epoch_record(&endpoints[1].http_url, 0, RESTART_EPOCH_DURATION * 2).await?;
+    // the kill target serving certified record 0 keeps this test deterministic. Spawned here and
+    // awaited before the sequence epoch is entered, so certification overlaps the warmup work
+    // below and its latency can never land inside the measured sequence budget. The ceiling is
+    // 3x the sequence duration because its clock starts at process launch, so it must cover
+    // multi-process cold boot as well as warmup-epoch certification.
+    let record0_url = endpoints[1].http_url.clone();
+    let record0_gate = tokio::spawn(async move {
+        fetch_verified_epoch_record(&record0_url, 0, RESTART_EPOCH_DURATION * 3).await
+    });
 
-    // ---- Enter epoch E: reuse the epoch we are already in when it still has runway ----
-    // Phase 0 crossed into the current epoch within a poll cadence of the flip, so we are already
-    // fresh in it. The in-epoch sequence below (rotation, burn, pin, kill, restart, rejoin)
-    // worst-cases at ~29s; if the current epoch still holds that much runway plus margin, run the
-    // sequence here and save a whole ~40s warm-up epoch. Otherwise (for example a slow record-0
-    // certification above that burned into the budget) fall back to the next fresh boundary, which
-    // banks the full epoch duration. The fall-back branch is exactly the prior behavior, so this
-    // is a strict improvement; the budget guard is REQUIRED, not cosmetic: without it a
-    // degraded-network record-0 fetch could shove the ~29s sequence past the boundary and trip a
-    // spurious "premise broken" at one of the in-epoch guards below.
+    // ---- Restore the sequence duration on chain, concurrently with warmup ----
+    // Genesis seeded every epoch with the short warmup duration; store the 40s sequence config
+    // now. Each epoch opened after the receipt stamps the new duration, so the entry wait below
+    // keys on the OBSERVED duration rather than on "receipt epoch + 1": under CI load the
+    // receipt may land in epoch 1 instead of 0, and a receipt in an epoch's closing block can
+    // defer the stamp one more epoch; every such path must stay green and costs only extra
+    // short warmup epochs. Nonce 0: the upgrade is the governance wallet's first transaction.
+    let upgrade_block =
+        upgrade_duration_with_retry(&provider, &rpc_url, &mut governance_wallet, chain.clone(), 0)
+            .await?;
+    let upgrade_epoch = epoch_of_block(&provider, upgrade_block).await?;
+    info!(
+        target: "eject-test",
+        upgrade_block,
+        epoch = upgrade_epoch,
+        "sequence duration stored on chain"
+    );
+
+    // ---- Kill gate due: the record-0 fetch spawned above must deliver before the sequence ----
+    // Awaited here rather than at the kill site: any gate latency lands in the warmup phase
+    // (or eats runway the budget guard below still observes and falls back on), and a gate
+    // failure aborts the test before the irreversible governance burn.
+    record0_gate.await??;
+
+    // ---- Enter epoch E: the first epoch running the restored sequence duration ----
+    // The poll observes the boundary within its cadence, so entry is fresh; the budget guard
+    // below remains REQUIRED, not cosmetic: a stall between the flip and the guard (or a slow
+    // startup path) could still burn the runway, and without the guard that would shove the
+    // ~29s sequence past the boundary and trip a spurious "premise broken" at one of the
+    // in-epoch guards below. Its fall-back branch banks a full fresh epoch, exactly the prior
+    // behavior.
     //
     // ~29s worst-case sequence (see `RESTART_EPOCH_DURATION`) plus ~4s margin.
     const SEQUENCE_BUDGET_SECS: u64 = 33;
+    wait_until(
+        Duration::from_secs(RESTART_EPOCH_DURATION * 2),
+        &format!(
+            "sequence entry: waiting for the first {RESTART_EPOCH_DURATION}s epoch after the \
+             upgrade receipt (epoch {upgrade_epoch}) on node 0"
+        ),
+        || async { Ok(current_epoch(&provider).await?.epoch_duration == RESTART_EPOCH_DURATION) },
+    )
+    .await?;
     let entry = current_epoch(&provider).await?;
     let e = if epoch_seconds_remaining(&rpc_url, &entry)? >= SEQUENCE_BUDGET_SECS {
         info!(
@@ -816,8 +946,8 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
 
     // ---- Governance burn of the victim, mid-epoch E — deliberately NO retry ----
     // A retry could slide the burn across the boundary and silently break the mid-epoch
-    // premise; the ensure below turns that into a loud failure instead. Nonce 0: the burn is
-    // this wallet's first transaction.
+    // premise; the ensure below turns that into a loud failure instead. The burn is this
+    // wallet's second transaction (nonce 1); the duration upgrade at startup was its first.
     let calldata: Bytes =
         ConsensusRegistry::burnCall { validatorAddress: victim_addr }.abi_encode().into();
     let (_burn_hash, burn_block) =

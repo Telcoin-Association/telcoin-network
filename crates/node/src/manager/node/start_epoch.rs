@@ -305,10 +305,7 @@ where
     /// `open_epoch_pack` (default digest for epoch 0). It anchors the canonical epoch-close
     /// seed message this epoch's proposers sign and voters verify, so it MUST be the real
     /// chain-derived digest - never a silent default. For seed-signature-active epochs
-    /// `open_epoch_pack` additionally guarantees the digest is certificate-backed: it is only
-    /// released after the record's `EpochCertificate` verified with a super-quorum of the
-    /// prior committee (see `certified_prior_epoch_anchor`), so an uncertified locally-divergent
-    /// record can never be captured as this epoch's anchor.
+    /// the EpochRecord is deterministic and can be derived after executing the epoch boundary.
     pub(super) async fn configure_consensus(
         &self,
         network_config: &NetworkConfig,
@@ -505,12 +502,15 @@ where
         // accepts to the JSON-RPC endpoint of the validator that owns it, discovered over
         // kademlia (issue #804). The endpoint is chosen by a committee member, so the policy
         // decides which advertised hosts this node is willing to dial (issue #1092); it refuses
-        // non-public hosts unless the operator opted in for a single-host deployment.
+        // non-public hosts unless the operator opted in for a single-host deployment. The
+        // worker's own pool rides along so a forward that gets no verdict returns its
+        // transactions there instead of losing them (issue #1145).
         let forwarder = Arc::new(WorkerRpcForwarder::new(
             network_handle.get_task_spawner().clone(),
             ForwardTargetPolicy::from_allow_private(
                 consensus_config.parameters().allow_private_forward_targets,
             ),
+            Some(engine.get_worker_transaction_pool(&worker_id).await?),
         ));
 
         let worker = WorkerNode::new(

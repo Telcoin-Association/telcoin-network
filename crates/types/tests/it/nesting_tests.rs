@@ -29,8 +29,8 @@ const BLS_SIGNATURE_WIRE_BYTES: usize = 48 + 1;
 const CERT_EPOCH_OFFSET: usize = 32 + 4;
 
 /// Build one pre-fork certificate (epoch 0, legacy seven-field layout under `adiri`) and one
-/// fork-active certificate (epoch `u32::MAX`, the `adiri` placeholder fork epoch) over the
-/// same fixture committee.
+/// fork-active certificate (epoch `u32::MAX`, far past the `adiri` fork epoch, so fork-active
+/// under both cfgs) over the same fixture committee.
 ///
 /// Both headers come from the same authority with the same payload and parent shape (empty
 /// payload, the genesis parents, round 1), so the only wire difference between them besides
@@ -103,10 +103,11 @@ fn test_mixed_epoch_certificate_vector_round_trip() {
     );
 }
 
-/// Negative nesting proof (adiri), a permanent keeper: corrupting one byte of the
-/// fork-active element's `epoch` (the in-band layout selector) makes the decoder parse that
-/// element with the WRONG field count, and the decode must fail loudly: a wrong-offset
-/// resume that silently succeeded would let one flipped byte rewrite the rest of the vector.
+/// Negative nesting proof (adiri), a permanent keeper: corrupting the fork-active element's
+/// `epoch` (the in-band layout selector) to the dormant side of the fork makes the decoder
+/// parse that element with the WRONG field count, and the decode must fail loudly: a
+/// wrong-offset resume that silently succeeded would let an epoch corruption rewrite the
+/// rest of the vector.
 #[cfg(feature = "adiri")]
 #[test]
 fn test_mixed_epoch_vector_epoch_corruption_fails_loudly() {
@@ -123,12 +124,21 @@ fn test_mixed_epoch_vector_epoch_corruption_fails_loudly() {
     let window: Vec<u8> = bytes.iter().skip(epoch_pos).take(4).copied().collect();
     assert_eq!(vec![0xFF; 4], window, "offset arithmetic must land on the V1 epoch field");
 
-    // One flipped bit demotes the epoch below the fork, so the decoder stops after seven
-    // fields and the 49 signature bytes are left misinterpreted as the certificate's tail.
+    // Rewrite the epoch to the last dormant epoch (`SEED_SIGNATURE_FORK_EPOCH - 1`), the
+    // corruption nearest the boundary: the element now claims the legacy layout, so the
+    // decoder stops after seven fields and the 49 signature bytes are left misinterpreted as
+    // the certificate's tail.
+    let dormant_bytes = (tn_types::forks::SEED_SIGNATURE_FORK_EPOCH - 1).to_le_bytes();
     let corrupted: Vec<u8> = bytes
         .iter()
         .enumerate()
-        .map(|(position, byte)| if position == epoch_pos { byte ^ 0x01 } else { *byte })
+        .map(|(position, byte)| {
+            position
+                .checked_sub(epoch_pos)
+                .and_then(|offset| dormant_bytes.get(offset))
+                .unwrap_or(byte)
+        })
+        .copied()
         .collect();
     assert!(
         try_decode::<Vec<Certificate>>(&corrupted).is_err(),

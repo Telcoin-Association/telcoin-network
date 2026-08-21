@@ -804,28 +804,17 @@ impl RethEnv {
     /// no state and no history, and blocks below the window are zero-hash placeholders (see
     /// `SnapshotRestorer::import_chain_scaffold` in `snapshot.rs`). reth's checkpoint-less
     /// history walk answers reads anywhere below `B` with `Ok(None)` per account ("never
-    /// written") — no error, no log — so pins below the persisted floor (= `B`) are refused
-    /// HERE, before any state is built, as [`StateReadError::Provider`]: the gap is this node's
-    /// datadir, not the chain, and a peer with full history answers the same read correctly.
+    /// written"), with no error and no log, so pins below the persisted floor (= `B`) are
+    /// refused in `read_only_state_db` (`env/mod.rs`), the shared state constructor this helper
+    /// builds on, before any state is built. The refusal surfaces here as
+    /// [`StateReadError::Provider`]:
+    /// the gap is this node's datadir, not the chain, and a peer with full history answers the
+    /// same read correctly.
     fn pinned_state_and_env(
         &self,
         header: &SealedHeader,
     ) -> StateReadResult<(State<StateProviderDatabase<StateProviderBox>>, EvmEnv)> {
-        // refuse pins below the restored-state floor before touching the provider: below it the
-        // datadir holds headers but no state, and the read would resolve silently to "never
-        // written" values instead of failing
-        self.inner.restored_state_floor.filter(|floor| header.number < *floor).map_or(
-            Ok(()),
-            |floor| {
-                Err(StateReadError::Provider(format!(
-                    "pinned read at block {} is below this datadir's restored-state floor \
-                     (block {floor}, the snapshot's final block): the snapshot shipped no state \
-                     below it",
-                    header.number
-                )))
-            },
-        )?;
-        let db = self.read_only_state_db(header.hash()).map_err(|e| {
+        let db = self.read_only_state_db(header).map_err(|e| {
             StateReadError::Provider(format!("state provider at {}: {e}", header.hash()))
         })?;
         let evm_env = self.inner.evm_config.evm_env(header).map_err(|e| {
@@ -1260,7 +1249,8 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
         let genesis_header = chain.sealed_genesis_header();
 
-        // a normal epoch close, far from the fork boundary (`u32::MAX - 1`), so no swap can fire
+        // a normal epoch close, far from the fork boundary (`CONSENSUS_REGISTRY_FORK_EPOCH - 1`),
+        // so no swap can fire
         let concluding_epoch = 3;
         let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
         let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
@@ -1885,8 +1875,8 @@ mod tests {
         // so no single hardcoded committee is correct for both builds. `make attest` runs this
         // test twice: once with default features, where `seed_signature_active` is true from
         // genesis and the seed is the epoch seed chain value, and once with `--features adiri`,
-        // where the gate is dormant while `SEED_SIGNATURE_FORK_EPOCH` is the `u32::MAX`
-        // placeholder and the seed stays the legacy keccak256 of the leader certificate's
+        // where these early epochs sit far below `SEED_SIGNATURE_FORK_EPOCH` so the gate is
+        // dormant and the seed stays the legacy keccak256 of the leader certificate's
         // aggregate BLS signature. Pinning either literal on its own turns the other pass red, so
         // derive the pin from the gate rather than picking a side.
         //

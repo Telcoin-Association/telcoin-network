@@ -5,8 +5,8 @@
 //! construction (an iterator product, not sampled), and all field content comes from a
 //! per-combination seeded rng (no entropy), so a failure reproduces byte-for-byte.
 //!
-//! The epoch axis brackets the fork boundary: under `adiri` it covers both sides of the
-//! `SEED_SIGNATURE_FORK_EPOCH` placeholder (`u32::MAX`) including its immediate neighbors;
+//! The epoch axis brackets the fork boundary: under `adiri` it covers both sides of
+//! `SEED_SIGNATURE_FORK_EPOCH` including its immediate neighbors;
 //! without `adiri` every epoch is fork-active, so two representative epochs pin the V1-only
 //! behavior in the default-feature suite.
 
@@ -53,10 +53,21 @@ struct LegacyHeaderMirror {
     latest_execution_block: BlockNumHash,
 }
 
-/// Epochs swept under `adiri`: the legacy floor, a small legacy epoch, and both sides of the
-/// `u32::MAX` fork placeholder (the last legacy epoch and the first fork-active one).
+/// The sweep grid needs four distinct epochs. `SEED_SIGNATURE_FORK_EPOCH - 1` below already
+/// turns a fork epoch of 0 into a const-eval error; this guard also makes a fork epoch of 1
+/// loud, which would otherwise silently collapse the grid to three distinct epochs.
 #[cfg(feature = "adiri")]
-const SWEEP_EPOCHS: [Epoch; 4] = [0, 1, Epoch::MAX - 1, Epoch::MAX];
+const _: () = assert!(tn_types::forks::SEED_SIGNATURE_FORK_EPOCH > 1);
+
+/// Epochs swept under `adiri`: the legacy floor, both sides of the fork boundary (the last
+/// legacy epoch and the first fork-active one), and the top of the epoch range.
+#[cfg(feature = "adiri")]
+const SWEEP_EPOCHS: [Epoch; 4] = [
+    0,
+    tn_types::forks::SEED_SIGNATURE_FORK_EPOCH - 1,
+    tn_types::forks::SEED_SIGNATURE_FORK_EPOCH,
+    Epoch::MAX,
+];
 
 /// Epochs swept without `adiri`: every epoch is fork-active, so genesis plus one later epoch
 /// pin the always-V1 layout in the default-feature suite.

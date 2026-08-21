@@ -154,6 +154,16 @@ curl 127.0.0.1:8545 \
 -H "Content-Type: application/json" \
 --data '{"method":"eth_chainId","params":[],"id":1,"jsonrpc":"2.0"}'
 
+## Gas over-reservation penalty
+
+Telcoin Network charges a gas penalty when a transaction sets a gas limit far above its actual usage.
+The penalty is zero when the gas limit is at or below 210,000, or when the transaction uses at least 10 percent of its limit.
+Below that, the penalty grows quadratically and is deducted from the unused-gas refund, then credited to the chain's base-fee address.
+For EIP-7702 set-code transactions, the authorization-list intrinsic is subtracted from both the gas limit and the gas spent before either check, so a sender is not penalized for mandatory authorization gas.
+That also means padding the authorization list with extra tuples cannot lift a transaction over the 10 percent line.
+Transaction receipts do not show the penalty.
+See [docs/gas-penalty.md](docs/gas-penalty.md) for the formula, examples, and how wallets and integrators can detect the charge.
+
 ## TN-Contracts Submodule
 
 Telcoin-Network infrastructure makes use of several onchain contracts which serve as critical infrastructure for the network.

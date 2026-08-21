@@ -73,12 +73,15 @@ const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("1
 
 /// Maximum number of multiaddrs a single signed `NodeRecord` may advertise.
 ///
-/// A legitimate node advertises exactly one address per record (see `get_peer_record`), so this is
-/// generous headroom. A record exceeding it is rejected at validation, bounding the attacker-chosen
-/// address data admitted per record before it can accumulate on the peer entry
-/// (GHSA-29v6-gvv5-45gx). This is defence in depth for the per-peer set cap
-/// `MAX_MULTIADDRS_PER_PEER`; that set cap is what bounds accumulation across repeated records.
-const MAX_ADVERTISED_MULTIADDRS: usize = 16;
+/// A legitimate node advertises exactly one address per record (see `get_peer_record`). A record
+/// exceeding the cap is rejected at validation, bounding the attacker-chosen address data admitted
+/// per record before it can accumulate on the peer entry (GHSA-29v6-gvv5-45gx). The cap is tied to
+/// the per-peer set cap `MAX_MULTIADDRS_PER_PEER`, so validation and storage agree on how many
+/// addresses one peer may present: a single validated record contributes at most as many addresses
+/// as the store keeps for a peer, and the set cap is what bounds accumulation across repeated
+/// records. Folding a record into an entry that already holds a connection form replaces that
+/// form; that only trims the peer-exchange payload built from the entry.
+const MAX_ADVERTISED_MULTIADDRS: usize = peers::MAX_MULTIADDRS_PER_PEER;
 
 /// Maximum number of concurrent established connections a single peer may hold, across both
 /// directions (inbound and outbound).
@@ -1724,10 +1727,24 @@ where
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
             PeerEvent::MissingAuthorities(missing) => {
+                // Polling callers such as `current_committee_rpcs` report a member as
+                // missing on every call until its record lands in `known_peers`, so the
+                // same key arrives here repeatedly while its lookup is still in flight.
+                // Issue at most one live `get_record` per key: skip keys already tracked
+                // in `kad_record_queries` (issue #1135). The map is safe as the dedupe
+                // source because every terminal query path removes its entry (see
+                // `close_kad_query`), so a skipped key becomes queryable again as soon
+                // as its current query ends. The removal there runs before any result
+                // filtering, so even a query whose record is dropped as stale or
+                // non-committee re-arms the key.
                 for bls_key in missing {
-                    let key = kad::RecordKey::new(&bls_key);
-                    let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-                    self.kad_record_queries.insert(query_id, bls_key.into());
+                    if self.kad_record_queries.values().all(|q| q.request != bls_key) {
+                        let key = kad::RecordKey::new(&bls_key);
+                        let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
+                        self.kad_record_queries.insert(query_id, bls_key.into());
+                    } else {
+                        trace!(target: "network-kad", ?bls_key, "kad record query already in flight");
+                    }
                 }
             }
             PeerEvent::Discovery => {

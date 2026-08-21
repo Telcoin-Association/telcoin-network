@@ -6,7 +6,7 @@ use std::{path::Path, str::FromStr, sync::Arc};
 use telcoin_network_cli::{node::NodeCommand, NoArgs};
 use tn_config::Config;
 use tn_node::engine::{ExecutionNode, TnBuilder};
-use tn_reth::{init_txpool_defaults, RethChainSpec, RethCommand, RethConfig, RethEnv};
+use tn_reth::{init_reth_defaults, RethChainSpec, RethCommand, RethConfig, RethEnv};
 use tn_types::{
     gas_accumulator::GasAccumulator, Address, TaskManager, TimestampSec, Withdrawals, B256,
 };
@@ -33,16 +33,16 @@ pub fn default_test_execution_node(
     )?;
 
     // create engine node
+    // Leak the manager: a dropped TaskManager latches its one-shot shutdown, which
+    // would cancel every task later spawned through the retained spawner.
+    let task_manager = Box::leak(Box::new(TaskManager::default()));
     let engine = if let Some(chain) = opt_chain {
         ExecutionNode::new(
             &builder,
-            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir, &TaskManager::default(), rewards)?,
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir, task_manager, rewards)?,
         )?
     } else {
-        ExecutionNode::new(
-            &builder,
-            RethEnv::new_for_test(tmp_dir, &TaskManager::default(), rewards)?,
-        )?
+        ExecutionNode::new(&builder, RethEnv::new_for_test(tmp_dir, task_manager, rewards)?)?
     };
 
     Ok(engine)
@@ -64,9 +64,9 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         default_args.to_vec()
     };
 
-    // use same approach as telcoin-network binary, including seeding reth's pool defaults before
-    // the parse resolves `--txpool.max-account-slots`
-    init_txpool_defaults();
+    // use same approach as telcoin-network binary, including seeding reth's process-global defaults
+    // before the parse resolves `--txpool.max-account-slots`
+    init_reth_defaults();
     let command = NodeCommand::<CliExt>::try_parse_from(cli_args)?;
 
     let NodeCommand { instance, ext, reth, healthcheck, .. } = command;

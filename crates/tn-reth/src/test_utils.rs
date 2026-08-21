@@ -114,8 +114,8 @@ impl RethEnv {
 
     /// Create an EVM-environment from state provider.
     pub fn tn_evm(&self, hash: BlockHash) -> eyre::Result<TNEvmTestType> {
-        let header = self.header(hash)?.expect("provided hash in header table");
-        let db = self.read_only_state_db(hash)?;
+        let header = self.sealed_header_by_hash(hash)?.expect("provided hash in header table");
+        let db = self.read_only_state_db(&header)?;
         Ok(self.evm_config().evm_factory().create_evm(db, self.evm_config().evm_env(&header)?))
     }
 
@@ -648,14 +648,16 @@ impl TransactionFactory {
         (TransactionSigned::new_unhashed(tx.into(), signature), authorities)
     }
 
-    /// Create and sign an EIP4844 transaction.
-    pub async fn create_and_submit_eip4844(
+    /// Create and sign a valid EIP-4844 (blob) transaction, wrapped as a pooled transaction with
+    /// its sidecar and ready to submit. Uses the "zero blob" whose KZG commitment and proof are the
+    /// known point at infinity, so the envelope passes KZG validation and the only reason a pool
+    /// can reject it is a type-level policy such as `no_eip4844`.
+    pub fn create_eip4844_pooled(
         &mut self,
         chain: Arc<RethChainSpec>,
         gas_limit: Option<u64>,
         gas_price: u128,
-        pool: WorkerTxPool,
-    ) -> TxHash {
+    ) -> EthPooledTransaction {
         // Use the "zero blob" - a blob filled with zeros
         // This has known valid KZG commitments and proofs
         let blob_data = [0u8; 131072]; // 128KB of zeros
@@ -686,15 +688,13 @@ impl TransactionFactory {
         let sidecar: BlobTransactionSidecarVariant =
             BlobTransactionSidecarVariant::Eip4844(sidecar);
 
-        // construct transaction, sign, and submit to pool
+        // construct transaction and sign
         let blob_versioned_hashes = vec![versioned_hash.into()]; // use computed hash
         let signed_tx =
             self.create_eip4844(chain.chain_id(), gas_limit, gas_price, blob_versioned_hashes);
         let recovered = signed_tx.try_into_recovered().expect("recovered tx");
-        let pooled_tx = EthPooledTransaction::try_from_eip4844(recovered, sidecar)
-            .expect("recovered into eth pooled tx");
-        let hash = pool.add_transaction_local(pooled_tx).await.expect("recovered tx added to pool");
-        hash.hash
+        EthPooledTransaction::try_from_eip4844(recovered, sidecar)
+            .expect("recovered into eth pooled tx")
     }
 
     /// Create and sign an EIP1559 transaction with all possible parameters passed.

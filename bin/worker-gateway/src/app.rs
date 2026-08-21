@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use reqwest::Client;
-use tn_types::{Notifier, TaskManager};
+use tn_types::{ShutdownNotifier, TaskManager};
 use tracing::info;
 
 use crate::{
@@ -81,7 +81,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             .unwrap_or(u64::MAX),
     );
     let spawner = task_manager.get_spawner();
-    let shutdown = Notifier::new();
+    let shutdown = ShutdownNotifier::new();
 
     // Optional Prometheus scrape endpoint on its own listener. Reuses the node's
     // `tn-metrics` recorder + server so the gateway's `tn_worker_gateway_*` series
