@@ -37,6 +37,7 @@ use reth::{
     rpc::builder::{constants, RethRpcModule, RpcModuleSelection},
 };
 use reth_cli_util::parse_ether_value;
+use reth_rpc_eth_types::builder::config::PendingBlockKind;
 
 /// The default IPC endpoint
 #[cfg(windows)]
@@ -204,6 +205,17 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", default_value_t = constants::DEFAULT_PROOF_PERMITS)]
     pub rpc_proof_permits: usize,
 
+    /// The pending block behavior for `pending`-tag RPC queries.
+    ///
+    /// TN defaults to `none` (reth defaults to `full`): no worker ever produces the
+    /// block a simulated pending env describes, so its values are placeholder
+    /// approximations (see [`BuildPendingEnv`] on `TNPayload`). With `none`,
+    /// pending-tag queries answer null or fall back to the latest state.
+    ///
+    /// [`BuildPendingEnv`]: reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv
+    #[arg(long = "rpc.pending-block", default_value = "none", value_name = "KIND")]
+    pub rpc_pending_block: PendingBlockKind,
+
     /// State cache configuration.
     #[command(flatten)]
     pub rpc_state_cache: RpcStateCacheArgs,
@@ -238,6 +250,7 @@ impl Default for RpcServerArgs {
             rpc_tx_fee_cap: constants::DEFAULT_TX_FEE_CAP_WEI,
             rpc_max_simulate_blocks: constants::DEFAULT_MAX_SIMULATE_BLOCKS,
             rpc_eth_proof_window: constants::DEFAULT_ETH_PROOF_WINDOW,
+            rpc_pending_block: PendingBlockKind::None,
             rpc_state_cache: RpcStateCacheArgs::default(),
             rpc_proof_permits: constants::DEFAULT_PROOF_PERMITS,
         }
@@ -274,6 +287,7 @@ impl From<RpcServerArgs> for reth::args::RpcServerArgs {
             rpc_max_simulate_blocks: v.rpc_max_simulate_blocks,
             rpc_eth_proof_window: v.rpc_eth_proof_window,
             rpc_proof_permits: v.rpc_proof_permits,
+            rpc_pending_block: v.rpc_pending_block,
             rpc_state_cache: v.rpc_state_cache,
             ..Default::default()
         }
@@ -317,6 +331,7 @@ mod tests {
     use super::*;
     use crate::cli::RethCommand;
     use clap::Parser;
+    use reth::rpc::builder::config::RethRpcServerConfig as _;
 
     /// The manual `Default` impl and the clap CLI default must agree on TN's own
     /// IPC endpoint, not reth's `/tmp/reth.ipc`.
@@ -331,6 +346,22 @@ mod tests {
     fn cli_default_ipcpath_matches_default_impl() -> eyre::Result<()> {
         let parsed = RethCommand::try_parse_from(["tn-reth"])?;
         assert_eq!(parsed.rpc.ipcpath, RpcServerArgs::default().ipcpath);
+        Ok(())
+    }
+
+    /// TN defaults the pending block kind to `none` (issue #1231): the clap default and
+    /// the manual `Default` impl agree, and an explicit `--rpc.pending-block full`
+    /// survives the parse and the TN-args-to-reth-args conversion.
+    #[test]
+    fn pending_block_defaults_none_and_explicit_full_survives() -> eyre::Result<()> {
+        let parsed = RethCommand::try_parse_from(["tn-reth"])?;
+        assert_eq!(parsed.rpc.rpc_pending_block, PendingBlockKind::None);
+        assert_eq!(RpcServerArgs::default().rpc_pending_block, PendingBlockKind::None);
+
+        let full = RethCommand::try_parse_from(["tn-reth", "--rpc.pending-block", "full"])?;
+        assert_eq!(full.rpc.rpc_pending_block, PendingBlockKind::Full);
+        let config = reth::args::RpcServerArgs::from(full.rpc).eth_config();
+        assert_eq!(config.pending_block_kind, PendingBlockKind::Full);
         Ok(())
     }
 }
