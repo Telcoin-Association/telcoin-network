@@ -25,7 +25,7 @@ use reth_revm::{
     db::InMemoryDB,
     handler::{instructions::EthInstructions, EthPrecompiles, Handler, MainnetHandler},
     inspector::NoOpInspector,
-    primitives::{address, Address, KECCAK_EMPTY},
+    primitives::{address, Address, Log, KECCAK_EMPTY},
     state::AccountInfo,
     Database, MainContext,
 };
@@ -351,6 +351,13 @@ pub fn assert_not_success(result: &TestResult) {
     if let Ok(ExecutionResult::Success { .. }) = result {
         panic!("expected non-success, got Success")
     }
+}
+
+/// Extract the logs emitted by a successful execution, in emission order.
+///
+/// Panics if the result is not a success.
+pub fn extract_logs(result: &TestResult) -> &[Log] {
+    assert_success(result).logs()
 }
 
 /// Extract the raw output bytes from a successful execution result.

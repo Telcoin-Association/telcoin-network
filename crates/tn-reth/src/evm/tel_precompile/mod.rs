@@ -193,7 +193,9 @@ const NON_PAYABLE_CALL_VALUE: &str = "call value: selector is not payable";
 /// balance, a plain value send reverts on the calldata-length check above, and the genesis
 /// account starts with zero balance, so attaching value to `burn(amount)` is the sanctioned inlet
 /// for the pool it draws from: `msg.value == amount` funds and burns in one transaction, and any
-/// excess stays in the pool for later burns. The classification is a payable-list rather than a
+/// excess stays in the pool for later burns. The EVM's own transfer of that value emits nothing,
+/// so [`handle_burn`](burnable::handle_burn) mirrors it as an inbound `Transfer` log — see there.
+/// The classification is a payable-list rather than a
 /// reject-list for the same fail-safe reason as the static gate: a selector added later rejects
 /// value unless it is explicitly named payable, and an unrecognised value-bearing selector
 /// reports [`NON_PAYABLE_CALL_VALUE`] rather than `"Unknown function selector"`. Inside a
@@ -244,9 +246,13 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
         burnable::claimCall::SELECTOR => {
             burnable::handle_claim(&mut input.internals, calldata, input.caller, input.gas)
         }
-        burnable::burnCall::SELECTOR => {
-            burnable::handle_burn(&mut input.internals, calldata, input.caller, input.gas)
-        }
+        burnable::burnCall::SELECTOR => burnable::handle_burn(
+            &mut input.internals,
+            calldata,
+            input.caller,
+            input.gas,
+            input.value,
+        ),
         // Read-only functions
         burnable::totalSupplyCall::SELECTOR => {
             burnable::handle_total_supply(&mut input.internals, input.gas)
@@ -278,7 +284,7 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
 mod tests {
     use super::*;
     use crate::evm::precompile_test_utils::*;
-    use alloy::sol_types::SolCall;
+    use alloy::sol_types::{SolCall, SolEvent};
     use tn_config::GOVERNANCE_SAFE_ADDRESS;
 
     #[test]
@@ -353,6 +359,59 @@ mod tests {
         assert_eq!(env.get_balance(TELCOIN_PRECOMPILE_ADDRESS), U256::ZERO);
         assert_eq!(env.get_balance(GOVERNANCE_SAFE_ADDRESS), gov_before - amount);
         assert_eq!(env.get_total_supply(), supply_before - amount);
+    }
+
+    #[test]
+    fn test_value_funded_burn_mirrors_the_top_up_as_a_transfer() {
+        let one_tel = U256::from(10).pow(U256::from(18));
+        let mut env = TestEnv::new_with_balances(one_tel, one_tel, U256::ZERO);
+        let value = U256::from(500);
+        let amount = U256::from(200);
+        let result = env.exec_with_value(
+            GOVERNANCE_SAFE_ADDRESS,
+            burnCall { amount }.abi_encode(),
+            100_000,
+            value,
+        );
+        let logs = extract_logs(&result);
+        // Three logs: the mirrored top-up, then the burn pair. Without the first, an indexer
+        // rebuilding balances from these events sees the pool pay out wei it never received.
+        assert_eq!(logs.len(), 3);
+        assert_eq!(
+            logs[0].topics(),
+            [
+                burnable::Transfer::SIGNATURE_HASH,
+                GOVERNANCE_SAFE_ADDRESS.into_word(),
+                TELCOIN_PRECOMPILE_ADDRESS.into_word(),
+            ]
+        );
+        // The mirror reports the attached value, not the burned amount.
+        assert_eq!(U256::from_be_slice(logs[0].data.data.as_ref()), value);
+        assert_eq!(logs[1].topics(), [burnable::Burn::SIGNATURE_HASH]);
+        assert_eq!(
+            logs[2].topics(),
+            [
+                burnable::Transfer::SIGNATURE_HASH,
+                TELCOIN_PRECOMPILE_ADDRESS.into_word(),
+                Address::ZERO.into_word(),
+            ]
+        );
+        assert_eq!(U256::from_be_slice(logs[2].data.data.as_ref()), amount);
+    }
+
+    #[test]
+    fn test_zero_value_burn_emits_no_inbound_transfer() {
+        // The pool is pre-funded, so this burn moves no wei into the precompile.
+        let mut env = TestEnv::new();
+        let result = env.exec_with_value(
+            GOVERNANCE_SAFE_ADDRESS,
+            burnCall { amount: U256::from(100) }.abi_encode(),
+            100_000,
+            U256::ZERO,
+        );
+        let logs = extract_logs(&result);
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].topics(), [burnable::Burn::SIGNATURE_HASH]);
     }
 
     #[test]

@@ -123,6 +123,8 @@ After `claim` succeeds, both the amount and timestamp storage slots are zeroed, 
 
 Token holdings are native account balances, so any direct value transfer (e.g., `CALL` with value) changes a holder's TEL balance without going through the precompile. Off-chain indexers that track issuance/destruction must watch the precompile's `Mint`, `Claim`, `Burn`, and `Transfer(0x0,…)`/`Transfer(…,0x0)` events; ordinary user-to-user TEL movement is observable as native value transfers in transaction traces.
 
+One movement into the precompile does have an event: `burn` is payable, and the wei it receives arrives through the EVM's own transfer, which emits nothing. `handle_burn` therefore emits `Transfer(caller, 0x7e1, msg.value)` before the burn events whenever the call carries value, so an indexer reconstructing TEL as an ERC-20 from these logs never sees the pool pay out wei it was not seen receiving. The mirror reports the attached value, which may exceed the burned amount — the excess stays in the pool and is destroyed by a later `burn`.
+
 ### Total supply accounting
 
 `totalSupply` is only updated by `claim` (increment) and `burn` (decrement). It does **not** account for native balance changes outside the precompile (e.g., gas fees, coinbase rewards). The genesis value must be set correctly at chain initialization.
@@ -190,16 +192,19 @@ Native-balance mutations (`balance_incr` / `balance_decr` in `claim`, `burn`, an
 
 ### `burn` — 8,000 gas
 
-| Operation                | Access                | Gas        |
-| ------------------------ | --------------------- | ---------- |
-| load_account(precompile) | cold                  | 2,600      |
-| SLOAD totalSupply        | cold                  | 2,100      |
-| SSTORE totalSupply       | warm, nonzero→nonzero | 2,900      |
-| LOG1 (Burn, 32 B)        | —                     | 1,006      |
-| LOG3 (Transfer, 32 B)    | —                     | 1,756      |
-| **Total**                |                       | **10,362** |
+| Operation                     | Access                | Gas        |
+| ----------------------------- | --------------------- | ---------- |
+| load_account(precompile)      | cold                  | 2,600      |
+| SLOAD totalSupply             | cold                  | 2,100      |
+| SSTORE totalSupply            | warm, nonzero→nonzero | 2,900      |
+| LOG3 (inbound Transfer, 32 B) | value-funded only     | 1,756      |
+| LOG1 (Burn, 32 B)             | —                     | 1,006      |
+| LOG3 (Transfer, 32 B)         | —                     | 1,756      |
+| **Total**                     |                       | **12,118** |
 
-**Status: Undercharged** — 0.77× headroom. Gas constant is 2,362 below worst-case EVM cost.
+**Status: Undercharged** — 0.66× headroom. Gas constant is 4,118 below worst-case EVM cost. A
+zero-value burn skips the inbound `Transfer` and costs 10,362 (0.77× headroom). Burning is
+governance-only, so the subsidy is not reachable by untrusted callers.
 
 ### `mint` (faucet) — 30,000 gas
 
