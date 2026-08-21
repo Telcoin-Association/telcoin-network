@@ -181,6 +181,14 @@ impl TNPayload {
     }
 }
 
+/// Build the env a `pending`-tag query would simulate on top of the canonical tip.
+///
+/// No worker ever produces the block this env describes, so its values are placeholder
+/// approximations: `beneficiary` is the zero address (COINBASE-reading contracts see
+/// address zero), `worker_id` is 0, `timestamp` is parent + 1, and the base fee is the
+/// parent's, which goes stale across an epoch boundary (TN fees are epoch-flat). TN
+/// therefore defaults `--rpc.pending-block` to `none`, so this env is only simulated
+/// for an operator who opts in with `--rpc.pending-block full`.
 impl BuildPendingEnv<ExecHeader> for TNPayload {
     fn build_pending_env(parent: &SealedHeader<ExecHeader>) -> Self {
         Self {
