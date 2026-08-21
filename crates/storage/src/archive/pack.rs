@@ -66,6 +66,10 @@ pub trait PackFileIo: Read + Write + Seek + Send + Sync + Debug {
     /// None if outside the file range or unsupported (should fall back on normal Read trait in that
     /// case).
     fn slice(&self, offset: u64, len: usize) -> Option<&[u8]>;
+    /// If the underlying Io suports it (mmap) return the slice from offset of len bytes.
+    /// None if outside the file range or unsupported (should fall back on normal Read trait in that
+    /// case).
+    fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]>;
 }
 
 impl PackFileIo for DataFile {
@@ -91,6 +95,9 @@ impl PackFileIo for DataFile {
         DataFile::rename(self, path)
     }
     fn slice(&self, _offset: u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
+    fn slice_mut(&mut self, _offset: u64, _len: usize) -> Option<&mut [u8]> {
         None
     }
 }
@@ -119,6 +126,9 @@ impl PackFileIo for MmapDataFile {
     }
     fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         MmapDataFile::slice(self, offset, len)
+    }
+    fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]> {
+        MmapDataFile::slice_mut(self, offset, len)
     }
 }
 
@@ -152,6 +162,9 @@ impl PackFileIo for File {
         )))
     }
     fn slice(&self, _offset: u64, _len: usize) -> Option<&[u8]> {
+        None
+    }
+    fn slice_mut(&mut self, _offset: u64, _len: usize) -> Option<&mut [u8]> {
         None
     }
 }

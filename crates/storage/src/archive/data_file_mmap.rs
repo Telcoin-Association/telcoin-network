@@ -231,6 +231,28 @@ impl MmapDataFile {
         }
     }
 
+    /// Borrow the mapped bytes `[offset, offset + len)` directly, without copying — the building
+    /// block for zero-copy record reads (no `memcpy`, no allocation).
+    ///
+    /// Returns `None` if the range falls outside the logical data `[0, len())` (so the transient
+    /// capacity padding past `end` is never exposed) or the file is currently unmapped. The
+    /// returned slice borrows `&mut self`, so no concurrent write/remap (which needs `&mut self`)
+    /// can invalidate it while it is held. A caller that does not know a record's length up
+    /// front reads the size prefix with one `slice` call and the value with another; passing
+    /// `len = self.len() - offset` gives an offset-to-end view.
+    pub fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]> {
+        let range_end = offset.checked_add(len as u64)?;
+        if range_end > self.end {
+            return None;
+        }
+        let start = offset as usize;
+        match &mut self.backing {
+            Backing::Rw(map) => Some(&mut map[start..start + len]),
+            Backing::Ro(_map) => None,
+            Backing::Empty => None,
+        }
+    }
+
     /// Next capacity that holds `needed` bytes: double until a step would exceed `max_map_size`,
     /// then advance in `max_map_size` increments. Floors the first allocation at `initial_size`.
     fn next_capacity(&self, needed: u64) -> u64 {

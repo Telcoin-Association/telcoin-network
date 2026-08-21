@@ -67,9 +67,6 @@ pub struct HdxIndexMmap<
     read_only: bool,
     synced: bool,
     bloom: Bloom,
-    /// Pooled `BUCKET_SIZE` buffer reused for read-modify-write. Always `mem::take`n out of `self`
-    /// before use so it can be passed to `&mut self` helpers without a borrow conflict.
-    scratch: Vec<u8>,
     _index_dir: PathBuf,
 }
 
@@ -182,7 +179,6 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
             read_only,
             synced: true,
             bloom,
-            scratch: vec![0_u8; Self::BUCKET_SIZE],
             _index_dir: dir.to_owned(),
         })
     }
@@ -290,19 +286,19 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
     /// then the append-only overflow chain in the odx). Only one shared slice is live at a time.
     fn find_in_bucket(&self, bucket: u64, key: &[u8]) -> Result<Option<u64>, FetchError> {
         // Scan the in-place (main) bucket directly from the hdx mapping.
-        let mut overflow_pos =
-            match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE) {
-                Some(buf) => {
-                    if !check_crc(buf) {
-                        return Err(FetchError::CrcFailed);
-                    }
-                    if let Some(pos) = Self::scan_bucket(buf, key) {
-                        return Ok(Some(pos));
-                    }
-                    Self::read_overflow_pos(buf)
+        let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
+        {
+            Some(buf) => {
+                if !check_crc(buf) {
+                    return Err(FetchError::CrcFailed);
                 }
-                None => return Ok(None),
-            };
+                if let Some(pos) = Self::scan_bucket(buf, key) {
+                    return Ok(Some(pos));
+                }
+                Self::read_overflow_pos(buf)
+            }
+            None => return Ok(None),
+        };
         // Follow the append-only overflow chain, one zero-copy slice per hop.
         while overflow_pos > 0 {
             let buf = match self.odx_file.slice(overflow_pos, Self::BUCKET_SIZE) {
@@ -332,17 +328,17 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
     fn collect_bucket_elements(&self, bucket: u64) -> Result<Vec<(B256, u64)>, AppendError> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
-        let mut overflow_pos =
-            match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE) {
-                Some(buf) => {
-                    if !check_crc(buf) {
-                        return Err(AppendError::CrcError);
-                    }
-                    Self::collect_from_buffer(buf, &mut out, &mut seen);
-                    Self::read_overflow_pos(buf)
+        let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
+        {
+            Some(buf) => {
+                if !check_crc(buf) {
+                    return Err(AppendError::CrcError);
                 }
-                None => return Ok(out),
-            };
+                Self::collect_from_buffer(buf, &mut out, &mut seen);
+                Self::read_overflow_pos(buf)
+            }
+            None => return Ok(out),
+        };
         while overflow_pos > 0 {
             let buf = match self.odx_file.slice(overflow_pos, Self::BUCKET_SIZE) {
                 Some(buf) => buf,
@@ -361,24 +357,6 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         Ok(out)
     }
 
-    /// Read the bucket at `bucket_pos` into `buf` (zero-copy from the mapping when possible, else a
-    /// positioned read) and verify its CRC.
-    fn read_bucket_into(&mut self, bucket_pos: u64, buf: &mut [u8]) -> Result<(), AppendError> {
-        match self.hdx_file.slice(bucket_pos, Self::BUCKET_SIZE) {
-            Some(src) => buf.copy_from_slice(src),
-            None => {
-                self.hdx_file
-                    .seek(SeekFrom::Start(bucket_pos))
-                    .map_err(AppendError::WriteDataError)?;
-                self.hdx_file.read_exact(buf).map_err(AppendError::WriteDataError)?;
-            }
-        }
-        if !check_crc(buf) {
-            return Err(AppendError::CrcError);
-        }
-        Ok(())
-    }
-
     /// Write a fully-formed bucket buffer (CRC already stamped by the caller) back at `bucket_pos`.
     fn write_bucket(&mut self, bucket_pos: u64, buf: &[u8]) -> Result<(), AppendError> {
         self.hdx_file.seek(SeekFrom::Start(bucket_pos)).map_err(AppendError::WriteDataError)?;
@@ -392,7 +370,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         &mut self,
         key: &[u8],
         record_pos: u64,
-        buffer: &mut [u8],
+        bucket_pos: u64,
         inc_values: bool,
     ) -> Result<(), AppendError> {
         fn read_u32(buffer: &[u8], pos: &mut usize) -> u32 {
@@ -402,6 +380,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
             u32::from_le_bytes(buf32)
         }
 
+        let Some(buffer) = self.hdx_file.slice_mut(bucket_pos, Self::BUCKET_SIZE) else {
+            return Err(AppendError::ReadOnly);
+        };
         let mut pos = 8; // Skip over overflow_pos.
         let elements = read_u32(buffer, &mut pos);
         if elements >= self.header.bucket_elements() as u32 {
@@ -467,14 +448,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         let new_bucket = self.buckets() as u64 - 1;
         // Don't want buckets and modulus to be the same, so +1.
         self.modulus = (self.buckets() + 1).next_power_of_two();
+        let split_pos = self.bucket_pos(split_bucket);
+        let new_pos = self.bucket_pos(new_bucket);
+        // Make sure we have zeroed space for the new bucket.
+        self.write_bucket(new_pos, &vec![0_u8; Self::BUCKET_SIZE])?;
 
         // Gather the split bucket's elements with only shared borrows so the writes below can take
         // `&mut self`.
         let elements = self.collect_bucket_elements(split_bucket)?;
 
-        let bucket_size = Self::BUCKET_SIZE;
-        let mut buffer = vec![0_u8; bucket_size];
-        let mut buffer2 = vec![0_u8; bucket_size];
         for (hash, rec_pos) in elements {
             let bucket = self.hash_to_bucket(hash.as_slice());
             if bucket != split_bucket && bucket != new_bucket {
@@ -484,17 +466,19 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
                 );
             }
             if bucket == split_bucket {
-                self.save_to_bucket_buffer(hash.as_slice(), rec_pos, &mut buffer, false)?;
+                self.save_to_bucket_buffer(hash.as_slice(), rec_pos, split_pos, false)?;
             } else {
-                self.save_to_bucket_buffer(hash.as_slice(), rec_pos, &mut buffer2, false)?;
+                self.save_to_bucket_buffer(hash.as_slice(), rec_pos, new_pos, false)?;
             }
         }
-        add_crc32(&mut buffer);
-        add_crc32(&mut buffer2);
-        let split_pos = self.bucket_pos(split_bucket);
-        let new_pos = self.bucket_pos(new_bucket);
-        self.write_bucket(split_pos, &buffer)?;
-        self.write_bucket(new_pos, &buffer2)?;
+        if let Some(buffer) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
+            add_crc32(buffer);
+        }
+        if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
+            add_crc32(buffer);
+        }
+        //self.write_bucket(split_pos, &buffer)?;
+        //self.write_bucket(new_pos, &buffer2)?;
         Ok(())
     }
 
@@ -503,11 +487,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
     fn save_to_bucket(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
         let bucket = self.hash_to_bucket(key);
         let bucket_pos = self.bucket_pos(bucket);
-        // Borrow the pooled buffer out of `self` so it can be handed to `&mut self` helpers.
-        let mut scratch = std::mem::take(&mut self.scratch);
-        let result = self.save_to_bucket_inner(key, record_pos, bucket_pos, &mut scratch);
-        self.scratch = scratch;
-        result
+        self.save_to_bucket_inner(key, record_pos, bucket_pos)
     }
 
     /// Read-modify-write body of [`Self::save_to_bucket`], operating on a caller-owned `scratch`
@@ -518,12 +498,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         key: &[u8],
         record_pos: u64,
         bucket_pos: u64,
-        scratch: &mut [u8],
     ) -> Result<(), AppendError> {
-        self.read_bucket_into(bucket_pos, scratch)?;
-        self.save_to_bucket_buffer(key, record_pos, scratch, true)?;
-        add_crc32(scratch);
-        self.write_bucket(bucket_pos, scratch)
+        self.save_to_bucket_buffer(key, record_pos, bucket_pos, true)?;
+        if let Some(scratch) = self.hdx_file.slice_mut(bucket_pos, Self::BUCKET_SIZE) {
+            add_crc32(scratch);
+        }
+        Ok(())
     }
 
     /// Write the index's header and bloom filter to disk.
@@ -689,9 +669,13 @@ mod tests {
 
         {
             let builder = BuildHasherDefault::<FxHasher>::default();
-            let mut idx: HdxIndexMmap =
-                HdxIndexMmap::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
-                    .expect("hdx file");
+            let mut idx: HdxIndexMmap = HdxIndexMmap::open_hdx_file(
+                tmp_path.join("index.hdx"),
+                &data_header,
+                builder,
+                false,
+            )
+            .expect("hdx file");
             idx.save(key(0), 1).expect("add to index");
             idx.sync().expect("sync");
         }
