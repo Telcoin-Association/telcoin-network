@@ -747,6 +747,9 @@ impl Inner {
 
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
+    ///
+    /// A data file holding record bytes must begin with a readable [`EpochMeta`] matching this
+    /// epoch; an unreadable first record fails the open rather than appending a second meta.
     fn open_append<P: AsRef<Path>>(
         path: P,
         previous_epoch: &EpochRecord,
@@ -770,8 +773,16 @@ impl Inner {
             genesis_consensus: previous_epoch.final_consensus,
         };
 
-        if let Ok(meta) = data.fetch(DATA_HEADER_BYTES as u64) {
-            let meta = meta.into_epoch()?;
+        // Discriminate a missing meta by length, not by fetch error kind: fetch reports a read
+        // at EOF as an io error, the same class as a torn or corrupt record, so record bytes
+        // past the header mean the first record must load as a matching meta.  Failing the open
+        // here is deliberate; trunc_and_heal only repairs the tail, and a pack whose first
+        // record is unreadable holds no usable consensus data.
+        if data.file_len() > DATA_HEADER_BYTES as u64 {
+            let meta = data
+                .fetch(DATA_HEADER_BYTES as u64)
+                .map_err(|e| PackError::EpochLoad(e.to_string()))?
+                .into_epoch()?;
             if epoch_meta != meta {
                 return Err(PackError::InvalidEpoch(
                     epoch,
@@ -779,6 +790,8 @@ impl Inner {
                 ));
             }
         } else {
+            // Header-only file: brand new, or a crash landed between the header write and the
+            // meta append.  Either way appending the meta initializes the pack.
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
         }
@@ -2077,8 +2090,8 @@ pub(crate) mod test {
     };
 
     use crate::{
-        archive::pack::PackCompression,
-        consensus_pack::{max_batches_per_output, ConsensusPack, Inner, PACK_VERSION},
+        archive::pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+        consensus_pack::{max_batches_per_output, ConsensusPack, Inner, PackRecord, PACK_VERSION},
         mem_db::MemDatabase,
     };
 
@@ -3244,6 +3257,140 @@ pub(crate) mod test {
         // The healed pack dropped the damaged 5th output; the first four remain readable.
         assert!(pack.get_consensus_output(1).await.is_ok());
         assert!(pack.get_consensus_output(4).await.is_ok());
+    }
+
+    /// A pack whose first record (the epoch meta) is corrupt must fail `open_append` with
+    /// `EpochLoad` instead of treating the unreadable record as absent and appending a second
+    /// meta after it.
+    #[tokio::test]
+    async fn test_open_append_rejects_corrupt_first_record() {
+        let temp_dir = TempDir::with_prefix("test_cp_corrupt_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
+            let mut parent = ConsensusHeader::default().digest();
+            for i in 0..3 {
+                let output =
+                    make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+                parent = output.digest().into();
+                pack.save_consensus_output(output).await.unwrap();
+            }
+            pack.persist().await.expect("persist");
+        }
+
+        // Flip one byte inside the meta record's value; the record crc covers it, so the
+        // meta fetch itself fails rather than decoding to different values.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut bytes = std::fs::read(&data_path).expect("read data");
+        bytes[DATA_HEADER_BYTES + 6] ^= 0xff;
+        std::fs::write(&data_path, &bytes).expect("write data");
+        let len_before = bytes.len() as u64;
+
+        let result = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone());
+        assert!(
+            matches!(result, Err(super::PackError::EpochLoad(_))),
+            "expected EpochLoad, got {result:?}"
+        );
+        let len_after = std::fs::metadata(&data_path).expect("metadata").len();
+        assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// A pack whose first record is torn (a crash mid meta append left only part of the size
+    /// prefix) must fail `open_append` with `EpochLoad`, not append a second meta after the
+    /// partial bytes.
+    #[tokio::test]
+    async fn test_open_append_rejects_torn_first_record() {
+        let temp_dir = TempDir::with_prefix("test_cp_torn_meta").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
+            pack.persist().await.expect("persist");
+        }
+
+        // Tear the meta record mid size-prefix: record bytes exist past the header, but the
+        // first record cannot be read.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let torn_len = DATA_HEADER_BYTES as u64 + 2;
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.set_len(torn_len).expect("truncate");
+        }
+
+        let result = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone());
+        assert!(
+            matches!(result, Err(super::PackError::EpochLoad(_))),
+            "expected EpochLoad, got {result:?}"
+        );
+        let len_after = std::fs::metadata(&data_path).expect("metadata").len();
+        assert_eq!(torn_len, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// The crash window "data header written, meta never appended" must stay recoverable:
+    /// `open_append` on a header-only data file appends the meta and the pack works from
+    /// then on.
+    #[tokio::test]
+    async fn test_open_append_appends_meta_to_header_only_file() {
+        let temp_dir = TempDir::with_prefix("test_cp_header_only").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Write only the data header, the state a crash right after pack creation leaves.
+        let base_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&base_dir).expect("create epoch dir");
+        let data_path = base_dir.join(Inner::DATA_NAME);
+        {
+            let mut raw: Pack<PackRecord> =
+                Pack::open(&data_path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("raw pack");
+            raw.commit().expect("commit header");
+        }
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("metadata").len(),
+            DATA_HEADER_BYTES as u64,
+            "setup must produce a header-only data file"
+        );
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open append on header-only file");
+            let parent = ConsensusHeader::default().digest();
+            let output = make_test_output(&committee, 0, chain.clone(), 1, parent);
+            pack.save_consensus_output(output).await.unwrap();
+            pack.persist().await.expect("persist");
+        }
+        assert!(
+            std::fs::metadata(&data_path).expect("metadata").len() > DATA_HEADER_BYTES as u64,
+            "meta must have been appended"
+        );
+
+        // Reopening finds the appended meta and compares clean: recovering the crash window
+        // is idempotent.
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("reopen append");
+        assert!(pack.get_consensus_output(1).await.is_ok());
     }
 
     /// `verify_epoch_meta` committee linkage across the shapes a mid-epoch on-chain ejection
