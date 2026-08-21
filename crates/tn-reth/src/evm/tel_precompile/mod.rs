@@ -331,7 +331,9 @@ mod tests {
 
     #[test]
     fn test_burn_value_funds_pool_and_burns() {
-        // The pool starts empty (mainnet genesis also allocates the account zero balance).
+        // The pool starts empty, as it does on mainnet: genesis allocates the account zero
+        // balance with `0xfe` code, the nonzero code being what exempts it from EIP-158 state
+        // clearing while the balance sits at zero.
         let one_tel = U256::from(10).pow(U256::from(18));
         let mut env = TestEnv::new_with_balances(one_tel, one_tel, U256::ZERO);
         let amount = U256::from(500);
