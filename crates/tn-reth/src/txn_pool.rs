@@ -140,6 +140,11 @@ impl WorkerTxPool {
         .no_eip4844()
         .no_eip7702()
         .kzg_settings(EnvKzgSettings::Default)
+        // Apply the operator's `--rpc.txfeecap`. The validator checks it only for
+        // transactions it treats as local (`LocalTransactionConfig::is_local`); raw
+        // RPC submissions are External, so `crate::rpc_fee_cap` guards those at the
+        // RPC boundary (issue #1160).
+        .set_tx_fee_cap(node_config.rpc.rpc_tx_fee_cap)
         .with_local_transactions_config(pool_config.local_transactions_config.clone())
         .with_additional_tasks(node_config.txpool.additional_validation_tasks)
         .build_with_tasks(task_spawner.clone(), blob_store.clone());
@@ -625,6 +630,40 @@ mod tests {
             assert!(result.is_ok());
         }
         assert_eq!(pool.pool_size().pending, 3);
+    }
+
+    #[tokio::test]
+    async fn test_validator_applies_tx_fee_cap_to_local_transactions() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        // 1,000 wei cap: a 21,000-gas transfer at 7 wei/gas costs at most 147,000 wei.
+        let rpc_args = reth::args::RpcServerArgs { rpc_tx_fee_cap: 1_000, ..Default::default() };
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            rpc_args,
+        )
+        .unwrap();
+        let pool = reth_env.init_txn_pool().unwrap();
+
+        let mut tx_factory = TransactionFactory::new();
+        let tx = tx_factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let pooled = tx.try_into_pooled().unwrap().try_into_recovered().unwrap();
+        let err = pool
+            .add_transaction_local(EthPooledTransaction::from_pooled(pooled))
+            .await
+            .expect_err("local transaction over the cap is refused by the validator");
+        assert!(format!("{err:?}").contains("ExceedsFeeCap"), "unexpected error: {err:?}");
     }
 
     #[test]
