@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use std::{ffi::OsString, fmt, path::PathBuf, str::FromStr};
 use tn_config::KeyConfig;
 use tn_node::engine::TnBuilder;
-use tn_reth::{dirs::DEFAULT_ROOT_DIR, init_txpool_defaults, LogArgs};
+use tn_reth::{dirs::DEFAULT_ROOT_DIR, init_reth_defaults, LogArgs};
 use tokio::{runtime::Builder, task::JoinHandle};
 use tracing::info_span;
 
@@ -75,24 +75,24 @@ pub struct Cli<Ext: clap::Args + fmt::Debug = NoArgs> {
 impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// Parsers only the default CLI arguments
     ///
-    /// Seeds reth's transaction pool defaults first: the clap default for
+    /// Seeds reth's process-global defaults first: the clap default for
     /// `--txpool.max-account-slots` is resolved while the command is built, so seeding after the
     /// parse would be too late. Prefer this over [`clap::Parser::parse`] for that reason, and note
     /// that it is generic over `Ext` so an extended binary gets the same defaults as `tn` itself.
     pub fn parse_args() -> Self {
-        init_txpool_defaults();
+        init_reth_defaults();
         Self::parse()
     }
 
     /// Parsers only the default CLI arguments from the given iterator
     ///
-    /// Seeds reth's transaction pool defaults first, for the same reason as [`Self::parse_args`].
+    /// Seeds reth's process-global defaults first, for the same reason as [`Self::parse_args`].
     pub fn try_parse_args_from<I, T>(itr: I) -> Result<Self, clap::error::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        init_txpool_defaults();
+        init_reth_defaults();
         Self::try_parse_from(itr)
     }
 

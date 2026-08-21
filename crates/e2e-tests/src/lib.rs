@@ -14,7 +14,7 @@ use std::{
 use telcoin_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand, NoArgs};
 use tn_config::{Config, ConfigFmt, ConfigTrait, KeyConfig, Parameters};
 use tn_node::launch_node;
-use tn_reth::init_txpool_defaults;
+use tn_reth::init_reth_defaults;
 use tn_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
 use tracing::{error, info};
 // unused deps warnings
@@ -319,8 +319,9 @@ pub fn spawn_local_testnet(
             ipc_path: ipc_path_str.clone(),
         });
 
-        // seed reth's pool defaults before the parse resolves `--txpool.max-account-slots`
-        init_txpool_defaults();
+        // seed reth's process-global defaults before the parse resolves
+        // `--txpool.max-account-slots`
+        init_reth_defaults();
         let command = NodeCommand::parse_from([
             "tn",
             "--http",

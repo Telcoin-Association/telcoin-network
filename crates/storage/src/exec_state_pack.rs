@@ -66,6 +66,12 @@ const DATA_NAME: &str = "state_data";
 /// Public so streaming exporters can flush at exactly this bound — reproducing the chunk layout
 /// [`ExecStatePackWriter::append_account`] emits, byte for byte — and so the per-account
 /// working-set ceiling such an exporter must hold in memory is stated in one place.
+///
+/// The bound is enforced on both ends: the writer rejects a longer chunk at
+/// [`ExecStatePackWriter::append_storage_chunk_owned`], and the reader rejects one on every read
+/// path (as [`ExecStatePackError::OversizedStorageChunk`]) before any consumer sizes an
+/// allocation to it, so a corrupt or hand-crafted pack cannot push chunks past the documented
+/// working-set ceiling through a restore.
 pub const STORAGE_CHUNK_SLOTS: usize = 64 * 1024;
 
 /// Depth of the EVM `BLOCKHASH` lookback window: the opcode resolves the 256 most recent block
@@ -218,6 +224,19 @@ fn decode_header(bytes: &[u8]) -> Result<ExecHeader, ExecStatePackError> {
     ExecHeader::decode(&mut &bytes[..]).map_err(|e| ExecStatePackError::HeaderRlp(e.to_string()))
 }
 
+/// Enforce the documented [`STORAGE_CHUNK_SLOTS`] bound on one storage chunk's slot count.
+///
+/// A conforming writer keeps the bound by construction ([`ExecStatePackWriter::append_account`]
+/// splits at exactly this size), so a longer chunk can only come from a non-conforming writer or
+/// a corrupt / hand-crafted pack. Checked at both ends: on append (so a buggy exporter fails at
+/// write time, not at restore time) and on every record pulled by the reader (so the read side
+/// never trusts the writer-side convention).
+fn check_chunk_bound(len: usize) -> Result<(), ExecStatePackError> {
+    (len <= STORAGE_CHUNK_SLOTS)
+        .then_some(())
+        .ok_or(ExecStatePackError::OversizedStorageChunk { len, max: STORAGE_CHUNK_SLOTS })
+}
+
 /// Summary returned by a successful [`ExecStatePackReader::verify`] pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifyReport {
@@ -335,8 +354,8 @@ impl ExecStatePackWriter {
     }
 
     /// Append one chunk of storage slots for the current account. Empty chunks are ignored. A chunk
-    /// should hold at most [`STORAGE_CHUNK_SLOTS`] slots to stay under the container's record
-    /// limit.
+    /// must hold at most [`STORAGE_CHUNK_SLOTS`] slots to stay under the container's record
+    /// limit; a longer chunk is rejected as [`ExecStatePackError::OversizedStorageChunk`].
     pub fn append_storage_chunk(
         &mut self,
         slots: &[(B256, B256)],
@@ -345,8 +364,9 @@ impl ExecStatePackWriter {
     }
 
     /// Append one owned chunk of storage slots for the current account, moving it into its record
-    /// (no extra copy) and bumping the tally. Empty chunks are ignored. A chunk should hold at
-    /// most [`STORAGE_CHUNK_SLOTS`] slots to stay under the container's record limit; streaming
+    /// (no extra copy) and bumping the tally. Empty chunks are ignored. A chunk must hold at
+    /// most [`STORAGE_CHUNK_SLOTS`] slots to stay under the container's record limit (a longer
+    /// chunk is rejected as [`ExecStatePackError::OversizedStorageChunk`]); streaming
     /// callers that flush at exactly that bound reproduce
     /// [`append_account`](Self::append_account)'s chunk layout byte for byte.
     pub fn append_storage_chunk_owned(
@@ -356,6 +376,7 @@ impl ExecStatePackWriter {
         if slots.is_empty() {
             return Ok(());
         }
+        check_chunk_bound(slots.len())?;
         self.stats.storage_slots += slots.len() as u64;
         Self::append(&mut self.data, &ExecStateRecord::Storage(slots))
     }
@@ -472,11 +493,19 @@ impl ExecStatePackReader {
     }
 
     /// Pull the next record, honoring the one-record lookahead buffer.
+    ///
+    /// Every record enters the reader through here (the lookahead buffer only ever re-yields a
+    /// record this method already vetted), so this is also where the read path re-checks the
+    /// writer-side [`STORAGE_CHUNK_SLOTS`] bound: an oversized `Storage` record is rejected as
+    /// [`ExecStatePackError::OversizedStorageChunk`] before any consumer sees it.
     fn pull(&mut self) -> Option<Result<ExecStateRecord, ExecStatePackError>> {
         if let Some(record) = self.pending.take() {
             return Some(Ok(record));
         }
         match self.iter.next() {
+            Some(Ok(ExecStateRecord::Storage(chunk))) => {
+                Some(check_chunk_bound(chunk.len()).map(|()| ExecStateRecord::Storage(chunk)))
+            }
             Some(Ok(record)) => Some(Ok(record)),
             Some(Err(e)) => Some(Err(e.into())),
             None => None,
@@ -580,9 +609,10 @@ impl ExecStatePackReader {
     /// This opens its own reader (it does not disturb any reader you are streaming
     /// from) and checks: meta first + version, `header_count >= 1` plus the `BLOCKHASH`
     /// lookback floor (see [`BLOCKHASH_ANCESTORS`]), snapshot header's
-    /// `state_root`/number/hash agree with the meta, a trailing footer is present, and
-    /// its declared `account_count` matches the records actually read. Per-record CRC32
-    /// is enforced by the container during the walk.
+    /// `state_root`/number/hash agree with the meta, every storage chunk is within the
+    /// [`STORAGE_CHUNK_SLOTS`] bound, a trailing footer is present, and its declared
+    /// `account_count` matches the records actually read. Per-record CRC32 is enforced
+    /// by the container during the walk.
     ///
     /// Note: this does *not* recompute the Merkle state root from the accounts — see
     /// the module docs.
@@ -603,8 +633,11 @@ impl ExecStatePackReader {
 
         let mut counted = ExecStateStats::default();
         let mut saw_account = false;
+        // Walk through `pull` (not the raw container iterator) so the walk enforces the same
+        // per-chunk [`STORAGE_CHUNK_SLOTS`] bound the streaming read paths do: a pack `verify`
+        // accepts is a pack the import side will not reject on structural grounds.
         let footer = loop {
-            match reader.iter.next() {
+            match reader.pull() {
                 Some(Ok(ExecStateRecord::Account(record))) => {
                     counted.account_count += 1;
                     if record.code.as_ref().is_some_and(|code| !code.is_empty()) {
@@ -621,7 +654,7 @@ impl ExecStatePackReader {
                 }
                 Some(Ok(ExecStateRecord::End(stats))) => break stats,
                 Some(Ok(_)) => return Err(ExecStatePackError::CorruptPack),
-                Some(Err(e)) => return Err(e.into()),
+                Some(Err(e)) => return Err(e),
                 None => return Err(ExecStatePackError::MissingFooter),
             }
         };
@@ -685,6 +718,16 @@ pub enum ExecStatePackError {
         /// The pack's tip block number ([`ExecStateMeta::block_number`]).
         block: u64,
     },
+    /// A `Storage` record carried more slots than the writer-side chunk bound
+    /// ([`STORAGE_CHUNK_SLOTS`]), so the pack is corrupt or was not produced by a conforming
+    /// writer. Bounds what a crafted pack can drive through consumers that size allocations to a
+    /// chunk's length.
+    OversizedStorageChunk {
+        /// Slot count carried by the offending record.
+        len: usize,
+        /// Maximum accepted count ([`STORAGE_CHUNK_SLOTS`]).
+        max: usize,
+    },
     /// The snapshot header's `state_root` does not match the meta's `state_root`.
     StateRootMismatch,
     /// The snapshot header's number/hash do not match the meta.
@@ -724,6 +767,9 @@ impl fmt::Display for ExecStatePackError {
                     "pack declares {declared} headers for tip block {block}, below the \
                      BLOCKHASH lookback floor of {floor}"
                 )
+            }
+            Self::OversizedStorageChunk { len, max } => {
+                write!(f, "storage chunk holds {len} slots, exceeding the maximum of {max}")
             }
             Self::StateRootMismatch => {
                 write!(f, "snapshot header state_root does not match meta state_root")
@@ -898,6 +944,138 @@ mod test {
         assert_eq!(chunks.len(), n.div_ceil(STORAGE_CHUNK_SLOTS));
         assert!(chunks.iter().all(|c| c.len() <= STORAGE_CHUNK_SLOTS));
         assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), n);
+    }
+
+    /// One `(slot, value)` pair with a unique key derived from `i`.
+    fn slot(i: usize) -> (B256, B256) {
+        (B256::from(U256::from(i).to_be_bytes::<32>()), B256::from([1u8; 32]))
+    }
+
+    /// Craft a raw pack whose single account carries ONE storage chunk of exactly `slots` slots,
+    /// bypassing the writer's append-time bound check. An oversized chunk built this way stays
+    /// under the container's 16 MiB record cap, so only the [`STORAGE_CHUNK_SLOTS`] re-check can
+    /// reject it.
+    fn craft_pack_with_chunk_len(slots: usize) -> TempDir {
+        let dir = TempDir::with_prefix("exec_state_pack_chunk_len").expect("temp dir");
+        let root = B256::from([4u8; 32]);
+        // tip block 1, so the single-header pack reaches block 1 and satisfies `open`'s
+        // BLOCKHASH lookback floor
+        let snapshot = header(1, root);
+        let mut pack = open_raw(dir.path());
+        let meta = ExecStateMeta {
+            state_root: root,
+            block_number: 1,
+            block_hash: snapshot.hash_slow(),
+            header_count: 1,
+        };
+        pack.append(&ExecStateRecord::Meta(meta)).unwrap();
+        pack.append(&ExecStateRecord::Header(encode_header(&snapshot))).unwrap();
+        pack.append(&ExecStateRecord::Account(AccountRecord {
+            address: Address::from([1u8; 20]),
+            nonce: 1,
+            balance: B256::ZERO,
+            code: None,
+        }))
+        .unwrap();
+        pack.append(&ExecStateRecord::Storage((0..slots).map(slot).collect())).unwrap();
+        pack.append(&ExecStateRecord::End(ExecStateStats {
+            account_count: 1,
+            storage_slots: slots as u64,
+            bytecodes: 0,
+        }))
+        .unwrap();
+        pack.commit().unwrap();
+        dir
+    }
+
+    /// The read path must not trust the writer-side [`STORAGE_CHUNK_SLOTS`] convention: a
+    /// hand-crafted pack carrying an oversized storage chunk is rejected on every read path
+    /// (`next_account`, `next_entry`, `verify`), while the same fixture with the chunk at exactly
+    /// the bound is accepted by all three, so the rejections are attributable to the bound
+    /// check, not to the raw-crafted fixture.
+    #[test]
+    fn reader_rejects_oversized_storage_chunk() {
+        // Positive control: a chunk of exactly STORAGE_CHUNK_SLOTS streams through every path.
+        let dir = craft_pack_with_chunk_len(STORAGE_CHUNK_SLOTS);
+        let mut reader = ExecStatePackReader::open(dir.path()).expect("open");
+        let accounts: Vec<_> =
+            reader.accounts().collect::<Result<_, _>>().expect("exact-bound chunk must stream");
+        let slot_count =
+            accounts.first().and_then(|a| a.account.storage.as_ref()).map(BTreeMap::len);
+        assert_eq!(slot_count, Some(STORAGE_CHUNK_SLOTS));
+
+        let mut reader = ExecStatePackReader::open(dir.path()).expect("open");
+        let chunk_lens: Vec<usize> = std::iter::from_fn(|| reader.next_entry())
+            .map(|entry| entry.expect("exact-bound entries must read"))
+            .filter_map(|entry| match entry {
+                StateEntry::Account(_) => None,
+                StateEntry::Storage(chunk) => Some(chunk.len()),
+            })
+            .collect();
+        assert_eq!(chunk_lens, vec![STORAGE_CHUNK_SLOTS]);
+
+        let report = ExecStatePackReader::verify(dir.path()).expect("exact-bound pack must verify");
+        assert_eq!(report.storage_slots, STORAGE_CHUNK_SLOTS as u64);
+
+        // One slot past the bound: every read path rejects with the dedicated error.
+        let dir = craft_pack_with_chunk_len(STORAGE_CHUNK_SLOTS + 1);
+        let mut reader = ExecStatePackReader::open(dir.path()).expect("open");
+        let err = reader
+            .accounts()
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("next_account must reject an oversized chunk");
+        assert!(matches!(
+            err,
+            ExecStatePackError::OversizedStorageChunk { len, max }
+                if len == STORAGE_CHUNK_SLOTS + 1 && max == STORAGE_CHUNK_SLOTS
+        ));
+
+        let mut reader = ExecStatePackReader::open(dir.path()).expect("open");
+        let entries: Vec<_> = std::iter::from_fn(|| reader.next_entry()).collect();
+        let (oks, errs): (Vec<_>, Vec<_>) = entries.into_iter().partition(Result::is_ok);
+        assert_eq!(oks.len(), 1, "only the account header precedes the oversized chunk");
+        assert!(matches!(errs.as_slice(), [Err(ExecStatePackError::OversizedStorageChunk { .. })]));
+
+        let err = ExecStatePackReader::verify(dir.path())
+            .expect_err("verify must reject an oversized chunk");
+        assert!(matches!(err, ExecStatePackError::OversizedStorageChunk { .. }));
+    }
+
+    /// The writer enforces the bound it documents: an append at exactly [`STORAGE_CHUNK_SLOTS`]
+    /// succeeds (positive control), one slot more is rejected before anything is written or
+    /// tallied, and the surviving pack still round-trips.
+    #[test]
+    fn writer_rejects_oversized_storage_chunk() {
+        let dir = TempDir::with_prefix("exec_state_pack_writer_bound").expect("temp dir");
+        let root = B256::from([6u8; 32]);
+        // tip block 1, so the single-header pack reaches block 1 and satisfies the
+        // BLOCKHASH lookback floor on `verify`
+        let mut writer =
+            ExecStatePackWriter::create(dir.path(), root, &[header(1, root)]).expect("create");
+        writer
+            .append_account_header(Address::from([1u8; 20]), 1, U256::from(1u64), None)
+            .expect("account header");
+
+        let oversized: Vec<(B256, B256)> = (0..=STORAGE_CHUNK_SLOTS).map(slot).collect();
+        let err = writer
+            .append_storage_chunk(&oversized)
+            .expect_err("oversized chunk must be rejected at append time");
+        assert!(matches!(
+            err,
+            ExecStatePackError::OversizedStorageChunk { len, max }
+                if len == STORAGE_CHUNK_SLOTS + 1 && max == STORAGE_CHUNK_SLOTS
+        ));
+
+        let exact: Vec<(B256, B256)> = (0..STORAGE_CHUNK_SLOTS).map(slot).collect();
+        writer.append_storage_chunk(&exact).expect("exact-bound chunk must append");
+        let stats = writer.finish().expect("finish");
+        assert_eq!(
+            stats.storage_slots, STORAGE_CHUNK_SLOTS as u64,
+            "the rejected chunk must not have been tallied"
+        );
+
+        let report = ExecStatePackReader::verify(dir.path()).expect("verify");
+        assert_eq!(report.storage_slots, STORAGE_CHUNK_SLOTS as u64);
     }
 
     #[test]

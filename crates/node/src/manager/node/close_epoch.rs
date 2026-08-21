@@ -28,9 +28,9 @@ use tn_storage::{
     },
 };
 use tn_types::{
-    Batch, BlockHash, BlockNumHash, BlsPublicKey, ConsensusHeaderDigest, ConsensusNumHash,
-    ConsensusOutput, Database as TNDatabase, Epoch, EpochDigest, EpochRecord, TaskManager,
-    TnReceiver,
+    deconstruct_nonce, Batch, BlockHash, BlockNumHash, BlsPublicKey, ConsensusHeaderDigest,
+    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, Epoch, EpochDigest, EpochRecord,
+    SealedHeader, TaskManager, TnReceiver,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
@@ -115,6 +115,26 @@ async fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
     }
 }
 
+/// Hand every transaction in `batch` back to its worker's mempool.
+///
+/// This is the CVV recovery shape: the pool feeds the batch builder, so the transactions
+/// re-enter the normal build/seal/retry loop instead of being dropped. A transaction whose
+/// bytes no longer recover, or that the pool refuses, is dropped exactly as before: at epoch
+/// close there is no better destination for it.
+async fn repool_batch_txns(pools: &[tn_reth::WorkerTxPool], batch: &tn_types::Batch) {
+    use futures::StreamExt as _;
+    let pool = pools.get(usize::from(batch.worker_id));
+    futures::stream::iter(batch.transactions())
+        .filter_map(|tx_bytes| async move { recover_raw_transaction(tx_bytes).ok() })
+        .for_each(|recovered| async {
+            let _ = futures::future::OptionFuture::from(
+                pool.map(|pool| pool.add_recovered_transaction_external(recovered)),
+            )
+            .await;
+        })
+        .await;
+}
+
 impl<P, DB> EpochManager<P, DB>
 where
     P: TelcoinDirs + Clone + 'static,
@@ -160,17 +180,18 @@ where
                     // This is most likely because of epoch changes but could be caused by a restart as
                     // well.
                     if is_cvv {
-                        for tx_bytes in batch.transactions() {
-                            // Put txn back into the mempool.
-                            if let Ok(recovered) = recover_raw_transaction(tx_bytes) {
-                                if let Some(pool) = pools.get(batch.worker_id as usize) {
-                                    let _ = pool.add_recovered_transaction_external(recovered).await;
-                                }
-                            }
-                        }
+                        // Put the txns back into the mempool.
+                        repool_batch_txns(&pools, &batch).await;
                     } else {
                         // If we are not a CVV then go ahead and disburse the txns from the batch directly.
-                        let _ = worker.disburse_txns(batch.seal(digest)).await;
+                        // A refused disbursal (issue #1132) means no forward task owns these
+                        // transactions, and the table that held them was cleared above, so fall
+                        // back to the CVV shape and let the batch builder repackage them
+                        // (issue #1145).
+                        let disbursed = worker.disburse_txns(batch.clone().seal(digest)).await;
+                        if disbursed.is_err() {
+                            repool_batch_txns(&pools, &batch).await;
+                        }
                     }
                 }
                 Ok(())
@@ -327,7 +348,8 @@ where
         // and its consensus hash in ONE watch write, so the bus can lag the true tip
         // mid-execution but never lead it. At every call site (the live boundary arm and the
         // two replay-and-close recovery arms of `run_epoch`, each running after `close_epoch`'s
-        // `wait_for_consensus_execution`) the wait resolved on the exact write that carries the
+        // `wait_for_consensus_execution` as well as try_restore_state() on startup) the wait
+        // resolved on the exact write that carries the
         // closing block, so this read IS that block; the pin makes the record's committee reads
         // and its `final_state` derive from the same header by construction instead of by
         // timing.
@@ -392,6 +414,89 @@ where
         // flush it durably here before publishing
         self.consensus_chain.epochs().persist().await?;
         self.consensus_bus.epoch_record_watch().send_replace(Some(epoch_rec));
+        Ok(())
+    }
+
+    /// Re-derive the previous epoch's [`EpochRecord`] locally when a restart finds it missing.
+    ///
+    /// This happens when the node was killed at epoch N-1's boundary: the engine had already
+    /// executed the epoch-closing block - whose `concludeEpoch` advanced the on-chain epoch to N,
+    /// so on restart we enter epoch N - but [`Self::write_epoch_record`] had not yet persisted
+    /// record N-1. Execution and the record write are not atomic and cannot be reordered
+    /// (record N-1's `final_state` IS that closing block, which must execute first), so this
+    /// gap is inherent, not corruption.
+    ///
+    /// We still hold everything needed to regenerate the record: the executed closing block and
+    /// record N-2. Recover epoch N-1's boundary consensus header from the closing block (the same
+    /// `parent_beacon_block_root` + nonce decode `try_restore_state` uses) and re-run the exact
+    /// deterministic close-time path via [`Self::write_epoch_record`], so the re-derived record is
+    /// bit-identical to the one every other node sealed - no peer fetch, no certificate.
+    ///
+    /// A cheap no-op whenever the record is already present (the common case), including epoch 0
+    /// and the epoch 0 -> 1 boundary (the dummy epoch-0 record keeps `contains_epoch(0)` true).
+    pub(super) async fn recover_previous_epoch_record(
+        &mut self,
+        current_epoch: Epoch,
+        engine: &ExecutionNode,
+    ) -> eyre::Result<()> {
+        if current_epoch == 0 {
+            return Ok(());
+        }
+        let previous_epoch = current_epoch - 1;
+        if self.consensus_chain.epochs().contains_epoch(previous_epoch).await {
+            // Do not be fooled by the dummy epoch 0 record on the epoch 0 -> 1 transition.
+            if previous_epoch != 0 || !self.consensus_chain.epochs().contains_dummy_epoch0().await {
+                return Ok(());
+            }
+        }
+
+        // Recover epoch `previous_epoch`'s boundary consensus header from the closing block we
+        // already executed (the canonical tip - no epoch-`current_epoch` block has executed yet).
+        let blocks = engine.last_executed_output_blocks(1).await?;
+        let closing_block = blocks.first().ok_or_else(|| {
+            eyre!(
+                "cannot re-derive the epoch {previous_epoch} record: no executed blocks on restart"
+            )
+        })?;
+        let parent_state = self.consensus_bus.latest_execution_block_num_hash();
+        if parent_state.hash != closing_block.hash() {
+            return Err(eyre!(
+                "expected last executed state {}/{} does not match on chain closing block {}/{}",
+                parent_state.number,
+                parent_state.hash,
+                closing_block.number,
+                closing_block.hash()
+            ));
+        }
+        let consensus_digest = boundary_consensus_digest(closing_block, previous_epoch)?;
+        let boundary_header = self
+            .consensus_chain
+            .consensus_header_by_digest(previous_epoch, consensus_digest)
+            .await
+            .map_err(|e| {
+                eyre!(
+                    "failed to READ the consensus store re-deriving the epoch {previous_epoch} \
+                     record (a storage error, not a missing record - do NOT delete chain-data): {e}"
+                )
+            })?
+            .ok_or_else(|| {
+                eyre!(
+                    "cannot re-derive the epoch {previous_epoch} record: its boundary consensus \
+                     header {consensus_digest} is absent from the consensus chain"
+                )
+            })?;
+
+        warn!(
+            target: "epoch-manager",
+            previous_epoch,
+            current_epoch,
+            "previous epoch record missing on restart (killed at its boundary); re-deriving it locally",
+        );
+        // Feed the recovered boundary header into the deterministic close-time path: it reads the
+        // committees at the closing block and chains on record N-2, and build_epoch_record's
+        // continuity check hard-errors rather than persisting a divergent record if inputs are off.
+        self.last_consensus_header = Some(boundary_header);
+        self.write_epoch_record(previous_epoch, engine).await?;
         Ok(())
     }
 
@@ -732,11 +837,43 @@ pub fn build_epoch_record(
     Ok(record)
 }
 
+/// Decode which consensus header the executed closing block points to, and verify it closes the
+/// epoch we intend to re-derive.
+///
+/// Extracted from [`EpochManager::recover_previous_epoch_record`] so the decode is unit-testable
+/// against a synthetic header. The closing block's `parent_beacon_block_root` IS the producing
+/// consensus header's digest, and its nonce encodes the producing epoch (`epoch << 32 | round`,
+/// read back by [`deconstruct_nonce`]). A nonce epoch other than `previous_epoch` means the
+/// executed tip is not the boundary block we expect, so we refuse to re-derive from it.
+fn boundary_consensus_digest(
+    closing_block: &SealedHeader,
+    previous_epoch: Epoch,
+) -> eyre::Result<ConsensusHeaderDigest> {
+    let Some(consensus_digest) = closing_block.parent_beacon_block_root else {
+        return Err(eyre!(
+            "cannot re-derive the epoch {previous_epoch} record: the closing block is missing \
+             the required consensus block digest (parent_beacon_block_root) - refusing to re-derive \
+             from an unexpected block: \
+             corrupted or incomplete datadir (do NOT delete chain-data - investigate)"
+        ));
+    };
+    let consensus_digest: ConsensusHeaderDigest = consensus_digest.into();
+    let (header_epoch, _round) = deconstruct_nonce(closing_block.nonce.into());
+    if header_epoch != previous_epoch {
+        return Err(eyre!(
+            "cannot re-derive the epoch {previous_epoch} record: the executed tip was produced \
+             by epoch {header_epoch} - refusing to re-derive from an unexpected block: \
+             corrupted or incomplete datadir (do NOT delete chain-data - investigate)"
+        ));
+    }
+    Ok(consensus_digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng as _};
-    use tn_types::BlsKeypair;
+    use tn_types::{BlsKeypair, ExecHeader, B256};
 
     /// Deterministic BLS public keys, one per seed byte.
     fn keys(seeds: std::ops::Range<u8>) -> Vec<BlsPublicKey> {
@@ -759,6 +896,38 @@ mod tests {
 
     fn final_consensus() -> ConsensusNumHash {
         ConsensusNumHash::new(9, ConsensusHeaderDigest::default())
+    }
+
+    /// A synthetic executed closing block whose nonce encodes `epoch` (the payload builder's
+    /// `nonce = epoch << 32 | round` layout, matching node.rs `tip_at`) and whose
+    /// `parent_beacon_block_root` is `parent_beacon` — the two fields `boundary_consensus_digest`
+    /// reads.
+    fn closing_block(epoch: u32, parent_beacon: B256) -> SealedHeader {
+        let header = ExecHeader {
+            nonce: ((epoch as u64) << 32).into(),
+            parent_beacon_block_root: Some(parent_beacon),
+            ..Default::default()
+        };
+        SealedHeader::new(header, B256::repeat_byte(0xab))
+    }
+
+    /// A closing block produced by the expected epoch yields its parent-beacon consensus digest.
+    #[test]
+    fn boundary_digest_matches_expected_epoch() {
+        let parent_beacon = B256::repeat_byte(0x11);
+        let tip = closing_block(2, parent_beacon);
+        let got = boundary_consensus_digest(&tip, 2).expect("a tip closing epoch 2 is accepted");
+        assert_eq!(got, ConsensusHeaderDigest::from(parent_beacon));
+    }
+
+    /// A closing block whose nonce encodes a different epoch than the one we are re-deriving is
+    /// refused (the tip is not the boundary block we expect).
+    #[test]
+    fn boundary_digest_rejects_wrong_epoch() {
+        let tip = closing_block(5, B256::repeat_byte(0x22));
+        let err = boundary_consensus_digest(&tip, 2)
+            .expect_err("a tip produced by the wrong epoch must be refused");
+        assert!(err.to_string().contains("produced by epoch 5"), "unexpected error: {err}");
     }
 
     /// identical committee handoff succeeds and preserves the read order.
