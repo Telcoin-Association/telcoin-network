@@ -291,7 +291,7 @@ fn run_battery<DB: Database>(rt: &Runtime, db: &DB) -> Vec<(&'static str, Durati
         ("clear_table 50k", bench_clear_table(rt, db)),
         // Representative node-usage patterns (each resets its own table first).
         ("small_commits 500 x3", bench_small_commits(rt, db)),
-        ("durable_commits 50 x3", bench_durable_commits(rt, db)),
+        ("durable_commits 500 x3", bench_durable_commits(rt, db)),
         ("cert_writes 5k x1.5KB", bench_cert_writes(rt, db)),
         ("batch_writes 200 x256KB", bench_batch_writes(rt, db)),
         ("epoch_clear 20k", bench_epoch_clear(rt, db)),
