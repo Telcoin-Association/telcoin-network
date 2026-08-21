@@ -282,6 +282,106 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
     })
 }
 
+#[cfg(feature = "adiri")]
+/// First epoch whose executed blocks credit each batch's priority fees to the batch producer's
+/// own beneficiary (`Batch::beneficiary`) instead of the sub-DAG header author's committee
+/// execution address (#1222).
+///
+/// Before this epoch the block beneficiary is `committee.authority(header.author())`'s execution
+/// address, so a byzantine validator that copies another validator's already-gossiped batch
+/// digest into its own certified header, and wins the sub-DAG ordering race, redirects that
+/// batch's priority fees to itself. `Batch::beneficiary` is covered by the batch digest (only
+/// `received_at` is `#[serde(skip)]`), so it is identical no matter which header references the
+/// digest: crediting it sends the fees to the producer and closes the theft at the root.
+///
+/// The rule change moves value between accounts (the priority fee is credited to a different
+/// balance) and writes a different `beneficiary` into the sealed header, so it changes both the
+/// state root and the block hash of every block that carries priority fees. It is therefore a
+/// hard fork: earlier epochs MUST keep resolving the beneficiary from the header author so their
+/// already-committed blocks re-execute byte-identically during sync. The gate
+/// ([`batch_producer_beneficiary_active`]) always reads the epoch carried inside the consensus
+/// output being executed (`output.leader().epoch()`), never node-local committee state, so live
+/// execution and historical pack-replay agree at every epoch.
+///
+/// This value is a placeholder set safely in the future. Re-verify it against the live adiri
+/// chain at merge time and raise it in the same PR if that epoch has already begun: a mixed fleet
+/// must run this gate-capable build before the boundary closes, or a node still on the old build
+/// diverges on the first priority-fee block past the fork. The full fork schedule is logged at
+/// startup so operators can diff it across the fleet.
+///
+/// Non-adiri builds (mainnet, which never committed a block under the old rule) have no dormant
+/// period: the producer beneficiary is active from genesis and this constant does not exist there.
+pub const BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH: Epoch = 450;
+
+/// Whether executed blocks of `epoch` credit batch priority fees to the batch producer's
+/// beneficiary (`Batch::beneficiary`) rather than the sub-DAG header author's execution address
+/// (#1222).
+///
+/// Callers MUST pass the epoch carried inside the consensus output being executed
+/// (`output.leader().epoch()`), never `Committee::epoch()` or other node-local state, so that a
+/// historical output keeps re-executing under the rule that committed it.
+///
+/// Adiri builds activate at [`BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH`]; all other builds are active
+/// from genesis (mainnet never committed a block under the old rule). Under `test-utils`, an
+/// explicit `TN_BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH` override takes precedence over both (see
+/// [`batch_producer_beneficiary_fork_epoch_override`]), so a test states the fork point it means
+/// rather than inheriting whichever one its feature set happens to select.
+#[inline]
+pub fn batch_producer_beneficiary_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "test-utils")]
+    {
+        batch_producer_beneficiary_fork_epoch_override().map_or_else(
+            || batch_producer_beneficiary_build_fork_active(epoch),
+            |fork| epoch >= fork,
+        )
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        batch_producer_beneficiary_build_fork_active(epoch)
+    }
+}
+
+/// This build's compile-time fork point for the producer-beneficiary rule, with no test override
+/// applied.
+///
+/// Adiri (testnet, which carries pre-fork history) is dormant before the fork epoch and active
+/// from it; every other build (mainnet, which never committed a block under the old rule) is
+/// active from genesis.
+#[inline]
+const fn batch_producer_beneficiary_build_fork_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "adiri")]
+    {
+        epoch >= BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH
+    }
+    #[cfg(not(feature = "adiri"))]
+    {
+        let _ = epoch;
+        true
+    }
+}
+
+/// Test-only override of the effective producer-beneficiary fork epoch, read once from
+/// `TN_BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH` (`4294967295` for "never fires", `0` for "active
+/// from genesis").
+///
+/// An environment variable rather than a process-global setter for the same reason as
+/// [`seed_signature_fork_epoch_override`]: e2e tests drive real node processes spawned via
+/// `TN_BIN_PATH`, which share no memory with the harness, so a static would reach only the
+/// in-process tests.
+///
+/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
+/// constant and cannot be repointed at runtime by its environment. An unparseable value is
+/// ignored rather than defaulted, leaving the build's own fork point in force.
+#[cfg(feature = "test-utils")]
+pub fn batch_producer_beneficiary_fork_epoch_override() -> Option<Epoch> {
+    static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TN_BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +489,59 @@ mod tests {
                 "an unset override must not shift the gate at epoch {epoch}",
             );
         });
+    }
+
+    /// Pin the producer-beneficiary gate (#1222) to the rollout contract this build implements.
+    ///
+    /// The [`batch_producer_beneficiary_active`] gate decides whether a batch's priority fees are
+    /// credited to the batch producer's own beneficiary (`Batch::beneficiary`) or to the sub-DAG
+    /// header author's execution address. Under `adiri` the gate is dormant before
+    /// [`BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH`] and fires from it onward (`>=`, not `>`); every
+    /// other build (mainnet, which never committed a block under the old rule) is active from
+    /// genesis. Companion to [`build_fork_gate_matches_this_builds_rollout_contract`], which pins
+    /// the same contract for the seed-signature fork.
+    ///
+    /// Asserts through the public [`batch_producer_beneficiary_active`] entry point rather than the
+    /// build-level helper, so the test also covers the `test-utils` override path being inert when
+    /// unset; the guard below keeps that reading honest.
+    #[test]
+    fn batch_producer_beneficiary_boundary_matches_this_builds_rollout_contract() {
+        // With `test-utils`, the env override latches in a process-wide `OnceLock`, so a harness
+        // launched WITH `TN_BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH` set cannot observe the unset
+        // behaviour. Fail loudly rather than assert a property this process cannot hold: a silent
+        // skip here would read as a pass.
+        #[cfg(feature = "test-utils")]
+        assert!(
+            batch_producer_beneficiary_fork_epoch_override().is_none(),
+            "this test requires a process without TN_BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH set; \
+             the override is OnceLock-latched, so run this case in its own process",
+        );
+
+        #[cfg(not(feature = "adiri"))]
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert!(
+                batch_producer_beneficiary_active(epoch),
+                "non-adiri builds never committed a block under the header-author rule and credit \
+                 the batch producer from genesis; epoch {epoch} must be post-fork",
+            );
+        });
+        #[cfg(feature = "adiri")]
+        {
+            [0, 1, BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH - 1].into_iter().for_each(|epoch| {
+                assert!(
+                    !batch_producer_beneficiary_active(epoch),
+                    "adiri keeps the header-author rule before BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH; \
+                     epoch {epoch} must be pre-fork",
+                );
+            });
+            [BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+                assert!(
+                    batch_producer_beneficiary_active(epoch),
+                    "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch {epoch} \
+                     must be post-fork",
+                );
+            });
+        }
     }
 
     /// Pin [`WORKER_CONFIGS_PRE_FORK_CODE_HASH`] to the worker-configs code committed in

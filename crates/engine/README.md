@@ -43,7 +43,7 @@ Two shorthands used throughout:
 | `gas_limit` — **not a `Batch` field** | Nothing. `Batch` carries no gas limit (`tn-types` `worker/sealed_batch.rs:63-93`), so there is nothing here for the engine to read or ignore: the block's limit is derived locally as `max_batch_gas(epoch)` (`:196`), currently a constant 30,000,000 (`worker/sealed_batch.rs:197-199`). | n/a. The worker's own build cap is a separate, pre-certification check — `BatchValidator::validate_batch` calls `validate_batch_gas` over the decoded transactions (`crates/batch-validator/src/validator.rs:77`). |
 | `close_epoch` (`output.close_epoch()`, `:106`) | `true` exactly on the epoch's last output. Selects whether the epoch-close system calls run. | **Nothing, in any digest.** Derived node-locally; see below. |
 | Leader identity (`output.leader().author()`, `:40`, `:126`) | The leader is in the current committee, so `RewardsCounter` can resolve its execution address. | **Certified**: a committed sub-DAG leader is a committee member by construction (`LeaderSchedule::leader` indexes `committee.authorities()`), and `Header::validate` rejects an unknown author (`primary/header.rs:133-136`). The engine adds a `TnEngineError::UnknownAuthority` fail-stop (`:145-148`) — **on the empty epoch-closing path only**; see below. |
-| Batch beneficiary (`cert_batch.address`, `:203`) | Is the execution address of the certificate's author; receives priority fees. | Resolved rather than carried: the subscriber maps `header.author()` through the committee and fail-stops with `SubscriberError::UnexpectedAuthority` on a miss (`crates/consensus/executor/src/subscriber.rs:410-421`, used at `:520`); the pack-replay reader does the same with `PackError::MissingAuthority` (`crates/storage/src/consensus_pack.rs:1641`). The engine takes the resolved address on trust. |
+| Batch beneficiary (resolved just before `TNPayload::new`) | Receives the batch's priority fees. From `BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH` onward it is the producer's own `batch.beneficiary`; before that epoch it is the header author's execution address (`cert_batch.address`). Gated on the output's epoch by `tn_types::forks::batch_producer_beneficiary_active`. | **Post-fork: certified.** `batch.beneficiary` is covered by the batch digest (only `received_at` is `#[serde(skip)]`, `tn-types` `worker/sealed_batch.rs:91-93`), so a byzantine header that copies another validator's batch digest cannot redirect the fees (#1222). **Pre-fork: resolved rather than carried**. The subscriber maps `header.author()` through the committee and fail-stops with `SubscriberError::UnexpectedAuthority` on a miss (`crates/consensus/executor/src/subscriber.rs:410-421`, used at `:520`); the pack-replay reader does the same with `PackError::MissingAuthority` (`crates/storage/src/consensus_pack.rs:1641`). |
 | Commit timestamp (via `TNPayload`, becomes block `timestamp`) | Monotonic across outputs. | **Certified** — `commit_timestamp` is hashed into the sub-DAG digest (`primary/output.rs:468`). Monotonicity is imposed at construction by taking the max with the previous sub-DAG's timestamp (`primary/output.rs:367-374`). |
 
 ### The engine validates three things itself
@@ -61,8 +61,10 @@ Two shorthands used throughout:
    `ADIRI_DUP_BATCH_EPOCH`.
 3. **Unknown leader fail-stop** (`:145-148`), `TnEngineError::UnknownAuthority`. **Asymmetric:** it
    guards only the empty epoch-closing path, where the beneficiary has to be derived from
-   `output.leader().author()`. The non-empty path takes `cert_batch.address` (`:203`) on trust,
-   because the subscriber already resolved it against the committee and fail-stopped there instead.
+   `output.leader().author()`. The non-empty path takes its beneficiary from the batch: from
+   `BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH` onward it reads `batch.beneficiary`, which is covered by
+   the batch digest and so needs no trust; before that epoch it falls back to `cert_batch.address`,
+   which the subscriber already resolved against the committee and fail-stopped there instead.
    The empty-path check is deliberate and argued in place (`:127-144`); it is pinned by
    `test_empty_close_epoch_unknown_leader_fail_stops` and
    `test_empty_close_epoch_without_committee_fail_stops` (`tests/it/main.rs`).

@@ -2420,6 +2420,232 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Regression for #1222: a batch's priority fees are credited to the batch producer's own
+/// beneficiary (`Batch::beneficiary`), never to the sub-DAG header author's committee execution
+/// address (`CertifiedBatch::address`).
+///
+/// `Batch::beneficiary` is covered by the batch digest (only `received_at` is `#[serde(skip)]`), so
+/// it is identical no matter which header references the digest. The pre-fix code resolved the
+/// block beneficiary from `cert_batch.address`, so a byzantine validator that copied another
+/// validator's already-gossiped batch digest into its own certified header, and won the sub-DAG
+/// ordering race, redirected that batch's priority fees to itself. This test models exactly that
+/// theft: the honest producer's beneficiary (VICTIM) differs from the header author's address
+/// (ATTACKER, `cert_batch.address`), and it asserts both the sealed block's beneficiary and the
+/// priority-fee credit land on the VICTIM. Reverting `payload_builder` to credit
+/// `cert_batch.address` flips the block beneficiary and the balance credit to the ATTACKER, failing
+/// every assertion here.
+///
+/// Fork-gate determinism: the `tn-engine` integration-test binary is built WITHOUT the `adiri`
+/// feature (`adiri` is opt-in and no dev-dependency enables `tn-types/adiri`), so
+/// `batch_producer_beneficiary_build_fork_active` takes the non-adiri branch and the rule is active
+/// from genesis at every epoch. `tn-types/test-utils` IS enabled here, so the env override
+/// `TN_BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH` could in principle disable the rule; the precondition
+/// assertion below fails loudly if the rule is inactive for this run rather than silently
+/// exercising the pre-fork branch. A single post-fork case therefore suffices with no epoch
+/// juggling; the pre-fork boundary is pinned in the `tn_types::forks` unit tests instead.
+#[tokio::test]
+async fn test_priority_fee_credits_batch_producer_not_header_author() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+    const TX_GAS_LIMIT: u64 = 15_000_000;
+    const PRIORITY_FEE: u64 = 10;
+
+    // The honest producer's own beneficiary, carried INSIDE the batch digest. A fixed
+    // non-committee address with zero genesis balance, so its post-execution balance equals
+    // exactly the priority fees it is credited.
+    let victim_beneficiary = Address::from([0x11u8; 20]);
+
+    // create simple batch with different tx types (mirrors `test_simple_basefee_penalty`)
+    let genesis = test_genesis();
+    let mut tx_factory = TransactionFactory::new_random();
+    let encoded_eip1559_tx = tx_factory
+        .create_explicit_eip1559(
+            Some(genesis.config.chain_id),
+            None,
+            Some(PRIORITY_FEE as u128),    // priority at 10
+            Some(MAX_FEE_PER_GAS as u128), // max fee at 100 (100 > 17)
+            Some(TX_GAS_LIMIT),            // specify gas limit
+            Some(Address::random()),
+            None,
+            None,
+            None,
+        )
+        .encoded_2718();
+    let encoded_legacy_tx = tx_factory
+        .create_explicit_legacy_tx(
+            Some(genesis.config.chain_id),
+            None,
+            Some(MIN_PROTOCOL_BASE_FEE as u128), // gas price (no priority fee)
+            Some(TX_GAS_LIMIT),                  // specify gas limit
+            Some(Address::random()),
+            None,
+            None,
+        )
+        .encoded_2718();
+
+    let mut batch = Batch {
+        transactions: vec![encoded_eip1559_tx, encoded_legacy_tx],
+        epoch: 0,
+        beneficiary: victim_beneficiary, // the producer's own beneficiary (inside the digest)
+        base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+        worker_id: 0,
+        received_at: None,
+    };
+
+    // clones only seed genesis and recover signers; beneficiary value is irrelevant to seeding
+    let all_batches = vec![batch.clone()];
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, all_batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        Some(gas_accumulator.clone()),
+    )?;
+
+    // create committee from genesis state
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 =
+        committee.authorities().first().expect("first in 4 auth committee for tests").id();
+    // The byzantine header author's committee execution address, i.e. `CertifiedBatch::address`,
+    // the value the pre-fix code credited. Committee execution addresses are unfunded in genesis,
+    // so this account starts at a zero balance (same premise `test_simple_basefee_penalty` relies
+    // on when it asserts the producer balance equals only the priority fees).
+    let attacker_header_author =
+        committee.authority(&authority_1).expect("authority in committee").execution_address();
+    assert_ne!(
+        victim_beneficiary, attacker_header_author,
+        "the #1222 attack requires the producer beneficiary and the header author to differ",
+    );
+
+    // finalize the batch (state root, header) after the beneficiary is set
+    execute_test_batch(&mut batch);
+
+    // only the eip1559 tx pays a priority fee; the legacy tx's gas price equals the base fee, so it
+    // contributes zero. This mirrors `test_simple_basefee_penalty`'s `eip1559_priority_fees`.
+    let expected_priority_fees = U256::from(TOTAL_GAS_PER_TX * PRIORITY_FEE);
+    assert!(expected_priority_fees > U256::ZERO, "test must produce a nonzero priority fee");
+
+    //=== Consensus: an ATTACKER-authored sub-DAG header referencing the VICTIM's batch digest
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(authority_1);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(sub_dag_index as u32);
+    let batch_digest = batch.digest();
+    let batch_digests = VecDeque::from([batch_digest]);
+    let subdag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        subdag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        // the header author's `address` here is the pre-fix beneficiary; the fix must ignore it in
+        // favour of `batch.beneficiary` above.
+        vec![CertifiedBatch { address: attacker_header_author, batches: vec![batch] }],
+    );
+    let consensus_output_hash = consensus_output.consensus_header_hash();
+
+    // Precondition: the producer-beneficiary rule MUST be active for this output's epoch, or the
+    // assertions below would silently pass against the pre-fork branch. See the fork-gate note in
+    // the doc comment above.
+    let output_epoch = consensus_output.leader().epoch();
+    assert!(
+        tn_types::forks::batch_producer_beneficiary_active(output_epoch),
+        "producer-beneficiary rule must be active for epoch {output_epoch}; the tn-engine \
+         it-binary is non-adiri (active from genesis). If TN_BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH \
+         is set to disable it, run this test without that override",
+    );
+
+    //=== Execution
+    let rewards_counter = gas_accumulator.rewards_counter();
+    rewards_counter.set_committee(committee.clone());
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let parent = chain.sealed_genesis_header();
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let reth_env = execution_node.get_reth_env().await;
+    let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let engine = ExecutorEngine::new(
+        reth_env.clone(),
+        None,
+        from_consensus,
+        parent,
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        gas_accumulator.clone(),
+        engine_update_tx,
+    );
+
+    let broadcast_result = to_engine.send(consensus_output.clone()).await;
+    assert!(broadcast_result.is_ok());
+    // drop sending channel so the engine stops after the queued output
+    drop(to_engine);
+
+    let (tx, rx) = oneshot::channel();
+    task_manager.spawn_task("test task eng", async move {
+        let res = engine.run().await;
+        let _ = tx.send(res);
+        Ok(())
+    });
+
+    let engine_task = timeout(Duration::from_secs(5), rx).await??;
+    assert_matches!(engine_task, Err(TnEngineError::ConsensusOutputStreamClosed));
+
+    let final_block = reth_env.finalized_block_num_hash()?.expect("finalized block");
+    assert_eq!(reth_env.last_block_number()?, 1, "exactly one block executed");
+    let last_output = execution_node.last_executed_output().await?;
+    assert_eq!(last_output, consensus_output_hash);
+    let _ = final_block;
+
+    // (1) the sealed block's beneficiary is the VICTIM (batch producer), NOT the ATTACKER. The
+    // pre-fix code wrote `cert_batch.address` (the attacker) here, so this assertion kills a
+    // revert.
+    let executed_blocks = reth_env.block_with_senders_range(1..=1)?;
+    assert_eq!(executed_blocks.len(), 1);
+    assert_eq!(
+        executed_blocks[0].beneficiary, victim_beneficiary,
+        "block beneficiary must be the batch producer (batch.beneficiary), not the header author",
+    );
+
+    // (2) the VICTIM received exactly the priority fees (its account starts at a zero balance).
+    let victim_balance = reth_env
+        .retrieve_account(&victim_beneficiary)?
+        .map(|acct| acct.balance)
+        .unwrap_or(U256::ZERO);
+    assert_eq!(
+        victim_balance, expected_priority_fees,
+        "priority fees must be credited to the batch producer's beneficiary",
+    );
+
+    // (3) the ATTACKER (header author / cert_batch.address) received NOTHING. Under the pre-fix
+    // code this account would instead hold `expected_priority_fees`.
+    let attacker_balance = reth_env
+        .retrieve_account(&attacker_header_author)?
+        .map(|acct| acct.balance)
+        .unwrap_or(U256::ZERO);
+    assert_eq!(
+        attacker_balance,
+        U256::ZERO,
+        "the header author must not receive the batch producer's priority fees (#1222 theft)",
+    );
+
+    Ok(())
+}
+
 /// Test that gas refunds (e.g. from SSTORE clearing) do not inflate the
 /// gas-limit penalty.
 ///
