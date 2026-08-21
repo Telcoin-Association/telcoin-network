@@ -53,8 +53,13 @@ fn create_test_types_with_chain_id(chain_id: u64) -> TestTypes {
     let worker_id = 0;
     let batch_validator = Arc::new(NoopBatchValidator);
     let (tx, network_commands_rx) = mpsc::channel(10);
-    let network_handle =
-        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, chain_id);
+    let network_handle = WorkerNetworkHandle::new(
+        NetworkHandle::new(tx),
+        task_manager.get_spawner(),
+        0,
+        0,
+        chain_id,
+    );
     let handler = RequestHandler::new(worker_id, batch_validator, config, network_handle);
     TestTypes { committee, handler, task_manager, network_commands_rx }
 }
@@ -73,7 +78,7 @@ fn create_test_types_with_validator(
     let worker_id = 0;
     let (tx, network_commands_rx) = mpsc::channel(10);
     let network_handle =
-        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
     let handler = RequestHandler::new(worker_id, validator, config, network_handle);
     (TestTypes { committee, handler, task_manager, network_commands_rx }, store)
 }
@@ -129,7 +134,7 @@ async fn test_batch_gossip_topics() {
     let batch_digest = B256::random();
     let gossip = WorkerGossip::Batch(0, batch_digest);
     let data = tn_types::encode(&gossip);
-    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0));
+    let topic = TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0, 0));
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.pub_process_gossip_for_test(&good_msg).await.is_ok());
 
@@ -154,7 +159,7 @@ async fn test_batch_gossip_topic_is_chain_namespaced() {
         source: None,
         data: data.clone(),
         sequence_number: None,
-        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(2017)),
+        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(2017, 0)),
     };
     assert!(handler.pub_process_gossip_for_test(&good).await.is_ok());
 
@@ -163,7 +168,7 @@ async fn test_batch_gossip_topic_is_chain_namespaced() {
         source: None,
         data,
         sequence_number: None,
-        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0)),
+        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0, 0)),
     };
     assert_matches!(
         handler.pub_process_gossip_for_test(&bad).await,
@@ -185,7 +190,7 @@ async fn test_batch_gossip_prefetch_deduplicates_in_flight_digest() {
         source: None,
         data: data.clone(),
         sequence_number: None,
-        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0)),
+        topic: TopicHash::from_raw(tn_config::LibP2pConfig::worker_batch_topic(0, 0)),
     };
 
     // Task A: the first prefetch. It reaches `request_batches` (emitting a network
@@ -293,7 +298,8 @@ async fn test_unknown_stream_request_error_type() {
 async fn test_request_batches_no_peers() {
     let (tx, mut rx) = mpsc::channel(10);
     let task_manager = TaskManager::default();
-    let handle = WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
+    let handle =
+        WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
 
     // reply with empty peer list
     tokio::spawn(async move {
