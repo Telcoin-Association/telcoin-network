@@ -205,6 +205,26 @@ const NON_PAYABLE_CALL_VALUE: &str = "call value: selector is not payable";
 /// exemption requires [`PrecompileInput::target_address`] to be the precompile itself, so
 /// apparent value that never funded the pool could not authorize a draw from it even if an
 /// indirect frame reached this check.
+///
+/// # Rejection gas semantics
+///
+/// Every rejection here — the static-call refusal, the payability refusal, an unrecognised
+/// selector, and each handler's own `unauthorized` / decode / arithmetic error — returns
+/// [`PrecompileError`], which revm turns into `InstructionResult::PrecompileError`: a **halt**,
+/// not a revert. A halt consumes all the gas the frame was given. revm returns the unspent
+/// remainder only for results that are `is_ok_or_revert()` (`revm-handler`'s
+/// `insert_call_outcome` for a sub-call, `last_frame_result` for the top level), and a precompile
+/// error is neither, so a rejected sub-call loses the entire 63/64 it was forwarded and a
+/// rejected top-level transaction is charged its full `gas_limit`.
+///
+/// For callers this is a cliff rather than a soft failure. A contract that forwards `msg.value`
+/// into [`TELCOIN_PRECOMPILE_ADDRESS`] and inspects the returned boolean does get `false` — a
+/// non-ok call result pushes zero — but it holds only the 1/64 it retained, so the outer frame
+/// dies instead of handling the failure. The pre-existing static-call refusal has always behaved
+/// this way and the payability refusal deliberately matches it: consuming the limit is the
+/// EVM's standard price for an invalid operation, and a value-bearing call to a non-payable
+/// selector is a caller bug. Callers must satisfy the precompile's rules up front rather than
+/// plan to recover from a rejection.
 fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
     // Refuse DELEGATECALL/CALLCODE before anything else. See "Direct-call guard" above.
     input
