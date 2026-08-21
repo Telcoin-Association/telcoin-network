@@ -330,6 +330,21 @@ impl RethEnv {
         )
     }
 
+    /// Initialize a worker transaction pool WITHOUT its canonical-state maintenance task.
+    ///
+    /// Test seam for the broadcast-lag recovery path (issue #1236): a lagged pool is one
+    /// whose maintenance task missed `Commit` notifications, and reproducing that state
+    /// deterministically requires committing canonical blocks while no task is subscribed.
+    #[cfg(test)]
+    pub(crate) fn init_txn_pool_without_maintenance(&self) -> eyre::Result<WorkerTxPool> {
+        WorkerTxPool::build(
+            self.node_config(),
+            self.get_task_spawner(),
+            self.blockchain_provider(),
+            self.evm_config(),
+        )
+    }
+
     /// Return the reth [`NodeConfig`] this env was built from: chain spec, datadir,
     /// and the database/RPC/pool settings reth derives its helpers from.
     pub(crate) fn node_config(&self) -> &NodeConfig<RethChainSpec> {

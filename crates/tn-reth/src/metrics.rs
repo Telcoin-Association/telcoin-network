@@ -85,11 +85,12 @@ pub(crate) fn init() {
     LazyLock::force(&RETH_METRICS);
 }
 
-/// Metrics for building canonical blocks from certified batch payloads.
+/// Metrics for the execution environment: block building from certified batch payloads, plus
+/// the worker pool's canonical-state subscription health.
 ///
-/// Both counters cover transactions that `build_block_from_batch_payload` silently declines to
-/// include in the block it returns. The two drop sites have opposite expectedness, so they are
-/// counted separately rather than summed - see the per-field docs.
+/// The two block-building counters cover transactions that `build_block_from_batch_payload`
+/// silently declines to include in the block it returns. The two drop sites have opposite
+/// expectedness, so they are counted separately rather than summed - see the per-field docs.
 #[derive(Metrics)]
 #[metrics(scope = "tn_reth")]
 pub(crate) struct RethEnvMetrics {
@@ -108,6 +109,16 @@ pub(crate) struct RethEnvMetrics {
     /// second copy is skipped as a duplicate. A steady nonzero rate is normal operation. The
     /// alertable counter is [`RethEnvMetrics::unrecoverable_txs_dropped_total`].
     pub(crate) invalid_txs_skipped_total: Counter,
+
+    /// Canonical-state broadcast lag events observed by the worker pool maintenance task.
+    ///
+    /// Alert on any nonzero value. Each increment means the pool task fell more than the
+    /// broadcast channel's capacity behind `notify_canon_state` and lost `Commit`
+    /// notifications it can never replay; the task marks every pool sender dirty and reloads
+    /// canonical account state in bounded chunks to recover (see `txn_pool.rs`). A nonzero
+    /// rate means the worker cannot keep up with per-round pool maintenance - resync bounds
+    /// the damage, but sustained lag warrants investigation.
+    pub(crate) canon_state_lagged_total: Counter,
 }
 
 /// Counter names for the observer forwarder, kept next to their only emission sites so the
