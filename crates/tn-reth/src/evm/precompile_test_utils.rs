@@ -25,7 +25,7 @@ use reth_revm::{
     db::InMemoryDB,
     handler::{instructions::EthInstructions, EthPrecompiles, Handler, MainnetHandler},
     inspector::NoOpInspector,
-    primitives::{address, Address, KECCAK_EMPTY},
+    primitives::{address, Address, Log, KECCAK_EMPTY},
     state::AccountInfo,
     Database, MainContext,
 };
@@ -67,6 +67,13 @@ pub const USER: Address = address!("1111100000000000000000000000000000000001");
 /// Test address used as a transfer/mint recipient in unit and integration tests.
 pub const RECIPIENT: Address = address!("2222222000000000000000000000000000000002");
 
+/// Code deployed at [`TELCOIN_PRECOMPILE_ADDRESS`] in genesis: a bare `INVALID` opcode.
+///
+/// The precompile map short-circuits before any bytecode load, so this is never executed. It
+/// exists so the account is not EIP-158-empty when its balance is zero, matching
+/// `chain-configs/mainnet/genesis.yaml`.
+const PRECOMPILE_GENESIS_CODE: Bytes = Bytes::from_static(&[0xfe]);
+
 // --- Test environment ---
 
 /// Lightweight in-memory EVM environment for testing the native precompiles.
@@ -81,8 +88,9 @@ pub const RECIPIENT: Address = address!("222222200000000000000000000000000000000
 /// - [`GOVERNANCE_SAFE_ADDRESS`] — governance caller
 /// - [`USER`] — unprivileged caller
 ///
-/// The TEL precompile account at [`TELCOIN_PRECOMPILE_ADDRESS`] is funded with 1000 wei and
-/// seeded with [`GENESIS_SUPPLY`] in `totalSupply`.
+/// The TEL precompile account at [`TELCOIN_PRECOMPILE_ADDRESS`] is funded with 1000 wei, given
+/// the same `0xfe` code mainnet genesis assigns it, and seeded with [`GENESIS_SUPPLY`] in
+/// `totalSupply`.
 #[derive(Debug)]
 pub struct TestEnv {
     /// The EVM instance with in-memory state and the precompiles registered.
@@ -128,13 +136,20 @@ impl TestEnv {
             },
         );
 
+        // Mirror the mainnet genesis account for the precompile: zero nonce, the requested
+        // balance, and `0xfe` code (`chain-configs/mainnet/genesis.yaml`). The code is what keeps
+        // the account out of EIP-158 state clearing once its balance drains to zero, so tests that
+        // burn the pool empty exercise the same account shape production has. An empty account
+        // here would only diverge once something finalizes the journal, which this harness never
+        // does, but the divergence is free to remove.
+        let precompile_code = Bytecode::new_raw(PRECOMPILE_GENESIS_CODE);
         db.insert_account_info(
             TELCOIN_PRECOMPILE_ADDRESS,
             AccountInfo {
                 balance: precompile_bal,
                 nonce: 0,
-                code_hash: KECCAK_EMPTY,
-                code: None,
+                code_hash: precompile_code.hash_slow(),
+                code: Some(precompile_code),
                 ..Default::default()
             },
         );
@@ -336,6 +351,13 @@ pub fn assert_not_success(result: &TestResult) {
     if let Ok(ExecutionResult::Success { .. }) = result {
         panic!("expected non-success, got Success")
     }
+}
+
+/// Extract the logs emitted by a successful execution, in emission order.
+///
+/// Panics if the result is not a success.
+pub fn extract_logs(result: &TestResult) -> &[Log] {
+    assert_success(result).logs()
 }
 
 /// Extract the raw output bytes from a successful execution result.
