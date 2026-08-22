@@ -1,23 +1,32 @@
-# Documentation site (mdBook -> GitHub Pages).
+# Documentation site (mdBook -> GitHub Pages), with versioning.
 #
-# Builds the mdBook site from docs/ and publishes it to GitHub Pages whenever a merge
-# into main touches the book (docs/** or this workflow), or on demand via
-# workflow_dispatch. Merges that leave the book untouched are skipped by the paths
-# filter, so the public site always matches the docs on main without redundant deploys.
+# Every deploy assembles the full multi-version site from scratch:
+#   - main is built to the site root and served as "latest" (the default);
+#   - every v* tag whose tree contains docs/book.toml is built under /<tag>/;
+#   - versions.json at the site root lists the tags (newest first) and feeds
+#     the version picker in the book header (docs/theme/tn-custom.js).
+# Tags that predate the docs directory are skipped automatically.
 #
-# One-time repo setup: Settings -> Pages -> Source must be set to "GitHub Actions"
-# (not "Deploy from a branch"), and the github-pages environment's deployment rules
-# must allow deployments from main; without both, the deploy job fails before
-# actions/deploy-pages runs.
+# Triggers: merges into main that touch the book (docs/** or this workflow),
+# any v* tag push (GitHub does not apply path filters to tag pushes), or
+# workflow_dispatch. Rebuilding everything keeps the "GitHub Actions" Pages
+# source, which replaces the whole site on each deployment.
+#
+# One-time repo setup: Settings -> Pages -> Source must be set to "GitHub
+# Actions" (not "Deploy from a branch"), and the github-pages environment's
+# deployment rules must allow deployments from main and from v* tags; without
+# both, the deploy job fails before actions/deploy-pages runs.
 #
 # Local preview: `make book` (build) or `make book-serve` (live-reload) -- both
 # require `cargo install mdbook --version 0.5.4 --locked` to match the version
-# pinned below.
+# pinned below. Local builds have no versions.json, so the picker only shows
+# the current version.
 name: Documentation
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - "docs/**"
       - ".github/workflows/docs.yaml"
@@ -34,28 +43,69 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  # Path prefix the site is served under. At the docs.telcoin.network DNS
+  # cutover, flip this to "" (and site-url in docs/book.toml to "/").
+  SITE_ROOT: /telcoin-network
+
 jobs:
-  # Build the static site with the pinned mdBook and hand it to the deploy job as a
-  # Pages artifact.
+  # Build latest + every tagged version with the pinned mdBook and hand the
+  # assembled site to the deploy job as a Pages artifact.
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      # Plain checkout: the docs build never touches the tn-contracts submodule.
+      # Full-history checkout: version builds check out each v* tag in a
+      # worktree, and "latest" always builds from main even when the trigger
+      # is a tag push. The docs build never touches the tn-contracts submodule.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install mdbook
         uses: taiki-e/install-action@v2
         with:
           tool: mdbook@0.5.4
 
-      - name: Build the book
-        run: mdbook build docs
+      - name: Build the versioned site
+        run: |
+          set -euo pipefail
+          site="$PWD/site"
+          mkdir -p "$site"
+
+          # Latest: always main, regardless of which ref triggered the run.
+          # site-url is overridden per build (mdBook reads MDBOOK_* env vars)
+          # so asset paths and the 404 page resolve under each prefix.
+          git worktree add --detach wt-latest origin/main
+          MDBOOK_OUTPUT__HTML__SITE_URL="${SITE_ROOT}/" \
+            mdbook build wt-latest/docs --dest-dir "$site"
+
+          # One build per v* tag that has a book; older tags without docs/
+          # are skipped. Newest first so versions.json is already sorted.
+          versions=()
+          for tag in $(git tag -l 'v*' | sort -rV); do
+            if ! git cat-file -e "${tag}:docs/book.toml" 2>/dev/null; then
+              echo "skipping ${tag}: no docs/book.toml"
+              continue
+            fi
+            git worktree add --detach "wt-${tag}" "refs/tags/${tag}"
+            MDBOOK_OUTPUT__HTML__SITE_URL="${SITE_ROOT}/${tag}/" \
+              mdbook build "wt-${tag}/docs" --dest-dir "${site}/${tag}"
+            versions+=("$tag")
+          done
+
+          # Manifest for the header version picker ("latest" is implicit).
+          if [ "${#versions[@]}" -eq 0 ]; then
+            echo '{"versions":[]}' > "${site}/versions.json"
+          else
+            printf '%s\n' "${versions[@]}" | jq -R . | jq -s '{versions: .}' > "${site}/versions.json"
+          fi
+          cat "${site}/versions.json"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/book
+          path: site
 
   # Publish the artifact to the github-pages environment.
   deploy:
