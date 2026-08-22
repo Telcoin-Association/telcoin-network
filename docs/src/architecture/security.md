@@ -30,7 +30,7 @@ This permissionless property enables huge innovation but requires more care to b
 
 #### Finality
 
-The asynchronous consensus mechanism “Bullshark” ensures transactions on Telcoin Network are confirmed quickly. Successful transactions are immediately finalized, resulting in no unexpected reorganizations of chain data.
+The Byzantine fault tolerant consensus mechanism “Bullshark” ensures transactions on Telcoin Network are confirmed quickly. Successful transactions are immediately finalized, resulting in no unexpected reorganizations of chain data.
 
 Gas must be paid, in the form of TEL, to pay for the compute required to process a transaction. Transactions can be successful or may be aborted - either due to conditions within the smart contract not being met or due to an insufficient amount of gas being paid. Aborted transactions will have no effect on the state of the blockchain, but will still require some gas to execute. This also protects the system against denial of service attacks.
 

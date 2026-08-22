@@ -122,4 +122,4 @@ function sendNative(string calldata destinationChain, string calldata destinatio
 
 ### Validator Issuance
 
-Validators are issued native TEL on a per block reward. The current TEL issuance is inside a governance safe. TN needs this TEL bridged at genesis if possible. If not possible, then we should consider manual issuance and upgrading the protocol once bridging is complete.
+Validators are issued native TEL rewards at the end of each epoch, weighted by the number of consensus blocks they led. The current TEL issuance is inside a governance safe. TN needs this TEL bridged at genesis if possible. If not possible, then we should consider manual issuance and upgrading the protocol once bridging is complete.
