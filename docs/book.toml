@@ -1,0 +1,15 @@
+[book]
+title = "Telcoin Network"
+description = "Documentation for Telcoin Network, an EVM-compatible public blockchain secured by GSMA member Mobile Network Operators using proof of stake consensus."
+authors = ["Telcoin Association"]
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/Telcoin-Association/telcoin-network"
+edit-url-template = "https://github.com/Telcoin-Association/telcoin-network/edit/main/docs/src/{path}"
+# GitHub Pages project-site prefix; flip to "/" when docs.telcoin.network DNS cuts over.
+site-url = "/telcoin-network/"
