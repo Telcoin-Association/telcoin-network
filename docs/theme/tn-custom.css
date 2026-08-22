@@ -847,8 +847,9 @@ body {
        book/assets/ (src assets are copied verbatim and never hash-renamed).
        The SVG badge stays crisp at any pixel density; engines that cannot
        decode SVG cursors (Safari) fall through to the 24px PNG, then to the
-       default arrow. */
-    cursor: url("../assets/tel-cursor.svg") 3 3,
-        url("../assets/tel-cursor-24.png") 3 3,
+       default arrow. The 12 12 hotspot centers the click point in the ~24px
+       badge, so it acts where the arrow's tip would. */
+    cursor: url("../assets/tel-cursor.svg") 12 12,
+        url("../assets/tel-cursor-24.png") 12 12,
         default;
 }
