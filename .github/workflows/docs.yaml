@@ -1,12 +1,13 @@
 # Documentation site (mdBook -> GitHub Pages).
 #
-# Builds the mdBook site from docs/ and publishes it to GitHub Pages on every release
-# tag (v*), or on demand via workflow_dispatch. Tag-driven publishing keeps the public
-# site pinned to released code instead of tracking every merge to main.
+# Builds the mdBook site from docs/ and publishes it to GitHub Pages whenever a merge
+# into main touches the book (docs/** or this workflow), or on demand via
+# workflow_dispatch. Merges that leave the book untouched are skipped by the paths
+# filter, so the public site always matches the docs on main without redundant deploys.
 #
 # One-time repo setup: Settings -> Pages -> Source must be set to "GitHub Actions"
 # (not "Deploy from a branch"), and the github-pages environment's deployment rules
-# must allow v* tag deployments; without both, the deploy job fails before
+# must allow deployments from main; without both, the deploy job fails before
 # actions/deploy-pages runs.
 #
 # Local preview: `make book` (build) or `make book-serve` (live-reload) -- both
@@ -16,7 +17,10 @@ name: Documentation
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
   workflow_dispatch:
 
 # Building only reads the repository; the deploy job below adds the Pages scopes it
@@ -24,8 +28,8 @@ on:
 permissions:
   contents: read
 
-# One Pages deployment at a time. Queued runs wait rather than cancel so a tagged
-# release is never skipped mid-deploy.
+# One Pages deployment at a time. Queued runs wait rather than cancel so the newest
+# docs merge is never skipped mid-deploy.
 concurrency:
   group: pages
   cancel-in-progress: false
