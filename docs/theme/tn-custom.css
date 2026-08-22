@@ -350,37 +350,76 @@ html:not(.js) .right-buttons button {
     line-height: 1.45em;
 }
 
+/* The wrapper span holds the page link AND (on foldable rows) the fold-toggle
+   anchor. The pill lives on the wrapper so the row reads as ONE element, like
+   GitBook — never on the inner <a>s, which would split the hover in two. */
 .chapter .chapter-link-wrapper {
     align-items: center;
+    gap: 4px;
+    padding: 6px 6px 6px 10px;
     border-radius: 8px;
+}
+
+.chapter .chapter-link-wrapper:hover {
+    background: var(--tn-surface-2);
+}
+
+/* Row tint for the active page (falls back to colored text alone in engines
+   without :has()). */
+.chapter .chapter-link-wrapper:has(> a.active) {
+    background: rgba(55, 174, 255, 0.10);
+    background: color-mix(in srgb, var(--sidebar-active) 10%, transparent);
 }
 
 .chapter li a {
     flex: 1;
     min-width: 0;
-    padding: 6px 10px;
-    border-radius: 8px;
+    padding: 0;
     color: var(--sidebar-fg);
     font-weight: 500;
 }
 
-.chapter li a:hover {
-    background: var(--tn-surface-2);
+.chapter li a:hover,
+.chapter .chapter-link-wrapper:hover a {
     color: var(--fg);
     text-decoration: none;
 }
 
-.chapter li a.active {
-    /* 10% brand tint behind the active pill. */
-    background: rgba(55, 174, 255, 0.10);
-    background: color-mix(in srgb, var(--sidebar-active) 10%, transparent);
+.chapter li a.active,
+.chapter .chapter-link-wrapper:hover a.active {
     color: var(--sidebar-active);
     font-weight: 600;
 }
 
-.chapter-fold-toggle {
-    padding: 0 8px;
-    color: var(--sidebar-fg);
+/* Fold toggle: a fixed square button pinned to the row's end. */
+.chapter li a.chapter-fold-toggle {
+    flex: 0 0 auto;
+    margin-inline-start: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border-radius: 6px;
+    color: var(--tn-muted);
+    font-size: 0.85em;
+}
+
+.chapter li a.chapter-fold-toggle:hover {
+    background: var(--tn-border);
+    color: var(--fg);
+}
+
+/* The chevron rotates 90deg when expanded (stock rule); keep the rotating
+   element a centered SQUARE so the glyph cannot swing outside the row. */
+.chapter-fold-toggle div {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1em;
+    height: 1em;
+    line-height: 1;
 }
 
 .chapter li.part-title {
