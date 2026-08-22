@@ -8,7 +8,6 @@ Brief run downs of the docs sections are given below:
 
 * Getting Started - Guides to help developers start building with Telcoin Network.
   * Reading Blockchain Data - An overview of the simplest types of blockchain interactions.
-  * Writing to Blockchain - Mastered reading data from the blockchain? Let's start writing.
   * Dapp Development - Let's start building decentralized apps!
 * Networks and RPC Endpoints - Reference documentation for connecting to Telcoin Network.
 * RPC Methods - Reference documentation providing information on interacting with nodes.
