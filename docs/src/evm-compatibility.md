@@ -68,10 +68,10 @@ TN modifies where transaction fees are sent compared to Ethereum.
 | Fee Component      | Ethereum          | Telcoin Network                          |
 | ------------------ | ----------------- | ---------------------------------------- |
 | Priority fee (tip) | Block proposer    | Batch producer (validator)               |
-| Base fee           | Burned (EIP-1559) | Burned then minted to governance address |
-| Gas limit penalty  | N/A               | Burned then minted to governance address |
+| Base fee           | Burned (EIP-1559) | Credited to the base-fee address (for governance processing) |
+| Gas limit penalty  | N/A               | Credited to the base-fee address (for governance processing) |
 
-The base fee is **not removed from circulation** on TN. It is collected by the governance address for protocol use. See [basefees](basefees.md) for details on how the base fee adjusts per epoch, and [penalties](gas-limit-penalty.md) for the quadratic gas limit penalty mechanism.
+The base fee is **not removed from circulation** on TN. It is credited to the chain's base-fee address (the governance safe by default) for protocol use. See [basefees](basefees.md) for details on how the base fee adjusts per epoch, and [penalties](gas-limit-penalty.md) for the quadratic gas limit penalty mechanism.
 
 ### Chain IDs
 
@@ -97,7 +97,7 @@ TN repurposes several Ethereum block header fields to carry consensus-layer meta
 | `mix_hash`                 | PoW mix digest               | Consensus output digest XOR'd with batch digest. If no batches, just the output digest     |
 | `ommers_hash`              | Uncle block hash             | Digest of the consensus `Batch` executed to produce this block. `B256::ZERO` if no batches |
 | `parent_beacon_block_root` | Beacon chain parent root     | Digest of the `ConsensusHeader` that committed the transactions                            |
-| `extra_data`               | Arbitrary miner data         | `keccak256(BLS aggregate signature)` at epoch boundaries, empty bytes otherwise            |
+| `extra_data`               | Arbitrary miner data         | Committee-shuffle seed (the epoch seed chain value) at epoch boundaries, empty bytes otherwise |
 | `base_fee_per_gas`         | Adjusts per block (EIP-1559) | Fixed for the entire epoch, adjusts at epoch boundaries. See [basefees](basefees.md)       |
 | `withdrawals`              | Beacon chain withdrawals     | Validator reward records at epoch boundaries, empty otherwise                              |
 
@@ -145,7 +145,7 @@ nonce = (epoch << 32) | round
 | Gas costs            | Standard                             | Standard (identical)          |
 | Transaction types    | Legacy, EIP-2930, EIP-1559, EIP-4844 | Legacy, EIP-2930, EIP-1559    |
 | Native asset ERC-20  | Requires WETH wrapper                | Built-in at `0x7e1`           |
-| Base fee destination | Burned                               | Governance address            |
+| Base fee destination | Burned                               | Base-fee address (governance) |
 | Blob transactions    | Supported                            | Not used                      |
 | Contract languages   | Solidity, Vyper, etc.                | Same                          |
 | Tooling              | Hardhat, Foundry, ethers.js, viem    | Same                          |
