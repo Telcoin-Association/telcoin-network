@@ -137,9 +137,25 @@ dt:target::before {
     display: none;
 }
 
-/* Badge-only mark for small screens (swapped in by the 767px media block). */
+/* Badge-only mark for small screens (swapped in by the 767px media block and,
+   with the sidebar open, by the 899px block below). */
 .tn-logo-badge {
     display: none;
+}
+
+/* Below 900px an open sidebar pushes the header and leaves the wordmark too
+   little room to stay legible; show the badge while the sidebar is open.
+   book.js keeps html.sidebar-visible in sync with the toggle. */
+@media only screen and (max-width: 899px) {
+    .sidebar-visible .tn-logo-light,
+    .sidebar-visible .tn-logo-dark {
+        display: none !important;
+    }
+
+    .sidebar-visible .tn-logo-badge {
+        display: block;
+        height: 28px;
+    }
 }
 
 .navy .tn-logo-light {
