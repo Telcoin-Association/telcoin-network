@@ -184,6 +184,15 @@ impl ExecutionNode {
         guard.respawn_worker_network_tasks(network_handle).await
     }
 
+    /// Push the node's consensus catch-up state into every worker's RPC network shim.
+    ///
+    /// The epoch manager's node-mode watch task drives this on every mode change so the
+    /// stock `eth_syncing` handler answers from live consensus state (issue #1231).
+    pub async fn set_workers_syncing(&self, syncing: bool) {
+        let guard = self.internal.read().await;
+        guard.set_workers_syncing(syncing)
+    }
+
     /// Returns true if worker components have already been initialized.
     pub async fn are_workers_initialized(&self) -> bool {
         !self.internal.read().await.workers.is_empty()
