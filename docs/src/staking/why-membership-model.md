@@ -80,7 +80,7 @@ Validators stake a fixed amount determined by the current stake version to gain 
 **Cons:**
 
 * Mixed-version committees create unequal per-header reward rates, which may be perceived as unfair by validators on lower-stake versions.
-* Validators cannot upgrade their version in-place. They must fully exit, retire, and rejoin with a new identity, which involves downtime.
+* Version upgrades are one-way. A validator can move to a newer version in-place via `upgradeValidatorStakeVersion()` (topping up the exact stake deficit if the requirement increased), but can never downgrade to an older version.
 * The permissioned model (ConsensusNFT) means governance is a bottleneck for onboarding, which limits how quickly new nodes can be added even when operators are willing.
 
 ### Summary

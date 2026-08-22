@@ -11,9 +11,9 @@ Every validator joins the network under a specific **stake version**. Each versi
 | `epochIssuance`     | Total TEL distributed as rewards per epoch |
 | `epochDuration`     | Length of each epoch                       |
 
-Governance can create new versions by calling `upgradeStakeVersion()`. The new version takes effect next epoch. Validators who already staked retain the version they joined under -- their `stakeVersion` is permanent and set at stake time.
+Governance can create new versions by calling `upgradeStakeVersion()`. The new version takes effect next epoch. Validators who already staked retain the version they joined under by default -- their `stakeVersion` is set at stake time and does not change automatically.
 
-There is no mechanism to upgrade an existing validator's stake version in-place. To move to a new version, a validator would need to fully exit, unstake, and rejoin with a new address and new keys under the current version.
+A validator (or its delegator) can move to a newer version in-place by calling `upgradeValidatorStakeVersion()`. Upgrades are one-way -- only to a strictly newer version -- and are available while the validator is `Staked`, `PendingActivation`, or `Active`. If the new version requires more stake, the caller must send the exact deficit; if it requires less, the surplus is refunded to the reward recipient.
 
 ### How Rewards Are Calculated
 
@@ -23,7 +23,7 @@ At each epoch boundary, `applyIncentives()` distributes the epoch's issuance acr
 weight = stakeAmount * consensusHeaderCount
 ```
 
-Where `stakeAmount` comes from the validator's own stake version (the version they joined under), and `consensusHeaderCount` is how many consensus headers they produced that epoch.
+Where `stakeAmount` comes from the validator's own current stake version, and `consensusHeaderCount` is how many consensus headers they produced that epoch.
 
 Each validator's share of the epoch issuance is:
 
@@ -31,7 +31,7 @@ Each validator's share of the epoch issuance is:
 reward = (epochIssuance * weight) / totalWeight
 ```
 
-Where `totalWeight` is the sum of all validators' weights.
+Where `totalWeight` is the sum of all validators' weights. Any issuance left undistributed by integer rounding rolls over into the next epoch's reward pool.
 
 In a committee where all validators share the same stake version, the `stakeAmount` cancels out and rewards depend purely on header count. But in a **mixed committee** -- where validators joined under different versions with different stake amounts -- the version affects reward weight directly.
 
@@ -156,7 +156,7 @@ With a uniform version, the stake amount is irrelevant to relative distribution.
 
 ### Key Takeaways
 
-* A validator's stake version is **permanent** -- it is locked in at the time of staking and cannot be changed.
+* A validator's stake version is set at the time of staking and only changes if the validator (or its delegator) opts into an in-place upgrade to a newer version via `upgradeValidatorStakeVersion()`.
 * In a **uniform committee** (all same version), rewards depend only on consensus header production.
 * In a **mixed committee**, validators on higher-stake versions earn proportionally more per header.
 * If the stake **increases**, new validators have higher weight and earn more per header than legacy validators.

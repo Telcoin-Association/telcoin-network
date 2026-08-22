@@ -44,7 +44,7 @@ telcoin-network keytool generate validator \
 
 **Parameters:**
 
-* `--address` - The validator's Ethereum-style address (receives block rewards). This does not need to be the same address that holds the validator NFT.
+* `--address` - The validator's Ethereum-style address (receives block rewards). The BLS proof of possession commits to this address, so it must be the same address that governance whitelists with the ConsensusNFT.
 * `--external-primary-addr` - Public multiaddr for primary P2P network
 * `--external-worker-addrs` - Public multiaddr(s) for worker P2P network
 * `--datadir` - Directory to store node data and keys
@@ -152,15 +152,21 @@ telcoin-network node \
 
 #### Verify Sync Status
 
-Use the `tn_syncing` RPC method to check if the node is synced:
+There is no dedicated syncing RPC method (`eth_syncing` always returns `false` on Telcoin Network). Compare the node's latest block number against a public RPC endpoint:
 
 ```bash
+# local node
 curl -X POST -H "Content-Type: application/json" \
-  --data '{"jsonrpc":"2.0","method":"tn_syncing","params":[],"id":1}' \
+  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
   http://localhost:8545
+
+# network
+curl -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+  <RPC_URL>
 ```
 
-Wait until the node reports it is fully synced with the current epoch before proceeding.
+Wait until the node's block number matches the network's and keeps advancing with it before proceeding.
 
 ### Step 5: Activate
 
