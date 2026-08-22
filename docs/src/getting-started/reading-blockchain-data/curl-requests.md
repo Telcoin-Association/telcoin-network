@@ -17,7 +17,7 @@ cURL is a command-line tool used to transfer data to and from a server using var
 
 ### eth\_blockNumber
 
-The [eth\_blockNumber](../../rpc-methods/eth_blocknumber.md) method is one of the simplest RPC calls to make. From the [documentation](curl-requests.md#eth_blocknumber) we see it takes no arguments (parameters) - the 'parameters' section shows `None`, and it returns one value representing the current block number of the network.
+The [eth\_blockNumber](../../rpc-methods/eth_blocknumber.md) method is one of the simplest RPC calls to make. From the [documentation](../../rpc-methods/eth_blocknumber.md) we see it takes no arguments (parameters) - the 'parameters' section shows `None`, and it returns one value representing the current block number of the network.
 
 #### Request
 

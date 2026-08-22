@@ -26,7 +26,7 @@ We begin by importing ethers into our script. It is easiest to import everything
 import { ethers } from "ethers";
 ```
 
-From here, we need to connect to the RPC node (ethers still needs to know where to get the information we need from). This introduces the idea of a `provider`. A [Provider](https://docs.ethers.org/v6/api/providers/#Provider) is a read-only connection to the blockchain. Ethers also has another object, the [Sigher](https://docs.ethers.org/v6/api/providers/#Signer), which uses an RPC node along with a private key to allow write access to the blockchain. We will cover this later.
+From here, we need to connect to the RPC node (ethers still needs to know where to get the information we need from). This introduces the idea of a `provider`. A [Provider](https://docs.ethers.org/v6/api/providers/#Provider) is a read-only connection to the blockchain. Ethers also has another object, the [Signer](https://docs.ethers.org/v6/api/providers/#Signer), which uses an RPC node along with a private key to allow write access to the blockchain. We will cover this later.
 
 We create a provider instance with the line:
 
@@ -66,7 +66,7 @@ const provider = new ethers.JsonRpcProvider("https://rpc.adiri.tel");
 
 async function fetchData() {
   const result = await provider.call({
-    to: "0x4392743B97C46c6Aa186A7f3D0468fbF177ee70F",
+    to: "0xc9593289e95938FC4170B3Fc51dbcCa0A46b4486",
     data: "0x06fdde03",
   });
 
@@ -110,7 +110,7 @@ We now have all the components required to create an ethers `Contract` object wh
 ```typescript
 // Create the contract instance with the provider
   const contract = new ethers.Contract(
-    "0x4392743B97C46c6Aa186A7f3D0468fbF177ee70F",
+    "0xc9593289e95938FC4170B3Fc51dbcCa0A46b4486",
     abi,
     provider
   );
@@ -141,7 +141,7 @@ async function fetchData() {
   const abi = JSON.parse(abiJson);
 
   const contract = new ethers.Contract(
-    "0x4392743B97C46c6Aa186A7f3D0468fbF177ee70F",
+    "0xc9593289e95938FC4170B3Fc51dbcCa0A46b4486",
     abi,
     provider
   );

@@ -85,13 +85,13 @@ const data = {
 
 Here we see we have the `to`and `data`keys in our parameters object, and we will be querying at the `latest` block. We have also updated the method we are calling to `eth_call`. We now need to find values for `to`and `data`.
 
-For this example, we will consider the Telcoin AUD token which has contract address `0x4392743B97C46c6Aa186A7f3D0468fbF177ee70F`. This will be our value for our `to` parameter.
+For this example, we will consider the Telcoin AUD token which has contract address `0xc9593289e95938FC4170B3Fc51dbcCa0A46b4486`. This will be our value for our `to` parameter.
 
 ### Function Selector
 
 Telcoin stablecoins are modified ERC-20 tokens. For this example we will use the ERC-20 getter function 'name()' to demonstrate the use of eth\_call.
 
-Since we know 'name()' is a function on the smart contract, and we see it takes no arguments, we can pass this into the data field of our parameters object. There is one slight caveat - the EVM will not understand the function call 'name()', but will only accept the '0x' prefixed first four bytes (8 characters in hexadecimal) of the Keccak-256 hash of name(). These 5 bytes ('0x' + four bytes) are known as the _function selector_. Let's run through this:
+Since we know 'name()' is a function on the smart contract, and we see it takes no arguments, we can pass this into the data field of our parameters object. There is one slight caveat - the EVM will not understand the function call 'name()', but will only accept the '0x' prefixed first four bytes (8 characters in hexadecimal) of the Keccak-256 hash of name(). These four bytes (with the '0x' prefix) are known as the _function selector_. Let's run through this:
 
 The function selector for `name()` can be computed from its signature (`"name()"`), which hashes to:
 
@@ -117,7 +117,7 @@ const data = {
       method: "eth_call",
       params: [
         {
-          to: "0x4392743B97C46c6Aa186A7f3D0468fbF177ee70F",
+          to: "0xc9593289e95938FC4170B3Fc51dbcCa0A46b4486",
           data: "0x06fdde03",
         },
         "latest",
@@ -139,7 +139,7 @@ const data = {
       method: "eth_call",
       params: [
         {
-          to: "0x4392743B97C46c6Aa186A7f3D0468fbF177ee70F",
+          to: "0xc9593289e95938FC4170B3Fc51dbcCa0A46b4486",
           data: "0x06fdde03",
         },
         "latest",
@@ -188,7 +188,7 @@ The console should give the following response:
 Here we see the RPC node returns:
 
 * The JSON-RPC protocol version, which matches the one we specified.
-* The 'result' which in this case is the hexadecimal value representing the name of the token at the contract address `0x4392743B97C46c6Aa186A7f3D0468fbF177ee70F`.
+* The 'result' which in this case is the hexadecimal value representing the name of the token at the contract address `0xc9593289e95938FC4170B3Fc51dbcCa0A46b4486`.
 * The id, which we had specified as 1 in our request.
 
 ### Decoding the Result
@@ -209,7 +209,7 @@ The first 32 bytes symbolise the offset of the value. In this case, the 32 bytes
 
 #### Length
 
-The next 32 bytes, `0000000000000000000000000000000000000000000000000000000000000b`, tell us the data we are interested in is 11 bytes long.
+The next 32 bytes, `000000000000000000000000000000000000000000000000000000000000000b`, tell us the data we are interested in is 11 bytes long.
 
 #### Actual data
 

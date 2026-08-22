@@ -18,4 +18,4 @@ Hardhat has a thorough walkthrough and setup available [here](https://hardhat.or
 
 Foundry is an extremely fast testing environment. Contrary to Hardhat, tests are written in solidity (rather than Type/JavaScript) and it also provides advanced testing features such as fuzzing and invariant testing.
 
-Foundry has useful documentation on hetting started [here](https://book.getfoundry.sh/getting-started/installation).
+Foundry has useful documentation on getting started [here](https://book.getfoundry.sh/getting-started/installation).
