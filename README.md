@@ -167,7 +167,9 @@ See [docs/src/gas-penalty.md](docs/src/gas-penalty.md) for the formula, examples
 Developer documentation lives in [`docs/`](docs/) and is built into a static site with [mdBook](https://rust-lang.github.io/mdBook/) 0.5.4.
 Markdown sources are in `docs/src/`, with `docs/src/SUMMARY.md` defining the sidebar.
 `docs/book.toml` is the book configuration and `docs/theme/` holds the site theme.
-CI publishes the book to GitHub Pages whenever a merge into `main` touches `docs/` or the docs workflow (`.github/workflows/docs.yaml`).
+CI publishes the book to GitHub Pages whenever a merge into `main` touches `docs/` or the docs workflow (`.github/workflows/docs.yaml`), and on every `v*` tag push.
+The site is versioned: `main` is served at the site root as **latest** (the default), and every `v*` tag that contains `docs/book.toml` is served under `/<tag>/`; readers switch versions with the picker in the book header.
+Intended site behaviors (version switching, sidebar, header, cursor) are pinned in [`docs/ux.md`](docs/ux.md) — update it in the same PR when a theme change intentionally alters one.
 
 To preview locally, install mdBook with `cargo install mdbook --version 0.5.4 --locked`, then:
 
