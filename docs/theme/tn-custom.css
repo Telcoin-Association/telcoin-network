@@ -338,10 +338,125 @@ ul#mdbook-searchresults em {
 
 /* Without JS the switch cannot work; the no-JS palette follows the OS.
    The search pill is also JS-driven (stock hides .left-buttons buttons only,
-   and E2 moved the search toggle into .right-buttons). */
+   and E2 moved the search toggle into .right-buttons). The version picker
+   button is caught by the same .right-buttons rule. */
 html:not(.js) .tn-theme-switch,
 html:not(.js) .right-buttons button {
     display: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* Version picker (E7) + version notices                               */
+/* ------------------------------------------------------------------ */
+
+.tn-version-picker {
+    position: relative;
+    display: inline-flex;
+}
+
+.tn-version-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 34px;
+    padding: 0 12px;
+    border: 1px solid var(--tn-border);
+    border-radius: 999px;
+    background: var(--tn-surface);
+    color: var(--tn-muted);
+    font-family: inherit;
+    font-size: 1.3rem;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.tn-version-button:hover {
+    border-color: var(--sidebar-active);
+    color: var(--fg);
+}
+
+.tn-version-caret {
+    flex: none;
+    transition: transform 0.15s ease;
+}
+
+.tn-version-button[aria-expanded="true"] .tn-version-caret {
+    transform: rotate(180deg);
+}
+
+.tn-version-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    inset-inline-end: 0;
+    z-index: 300;
+    min-width: 168px;
+    margin: 0;
+    padding: 6px;
+    list-style: none;
+    background: var(--bg);
+    border: 1px solid var(--tn-border);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+}
+
+.tn-version-menu li {
+    margin: 0;
+}
+
+.tn-version-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    width: 100%;
+    padding: 7px 10px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 1.3rem;
+    text-align: start;
+    cursor: pointer;
+}
+
+.tn-version-option:hover {
+    background: var(--tn-surface-2);
+}
+
+.tn-version-option.current {
+    color: var(--sidebar-active);
+    font-weight: 600;
+}
+
+.tn-version-option.current::after {
+    content: "\2713";
+    font-size: 1.2rem;
+}
+
+/* Banners injected at the top of the content by tn-custom.js: a standing
+   amber notice on old-version pages, and a blue one explaining a fallback
+   landing when the requested page does not exist in this version. */
+.tn-version-notice {
+    margin: 0 0 20px;
+    padding: 10px 14px;
+    border: 1px solid var(--tn-border);
+    border-radius: 8px;
+    font-size: 1.4rem;
+}
+
+.tn-version-notice a {
+    color: var(--sidebar-active);
+}
+
+.tn-version-notice-old {
+    border-color: rgba(247, 178, 51, 0.55);
+    background: rgba(247, 178, 51, 0.12);
+}
+
+.tn-version-notice-missing {
+    border-color: rgba(55, 174, 255, 0.55);
+    background: rgba(55, 174, 255, 0.12);
 }
 
 /* ------------------------------------------------------------------ */
@@ -784,6 +899,13 @@ blockquote:not(.blockquote-tag) {
         margin: 0 8px;
     }
 
+    /* The version pill stays (unlike the desktop-chrome links above) so old
+       versions remain reachable on phones; it just sheds some padding. */
+    .tn-version-button {
+        padding: 0 9px;
+        gap: 4px;
+    }
+
     .content h1 {
         font-size: 2.6rem;
     }
@@ -792,6 +914,8 @@ blockquote:not(.blockquote-tag) {
 @media print {
     .tn-theme-switch,
     #mdbook-menu-bar .tn-search-pill,
+    .tn-version-picker,
+    .tn-version-notice,
     #tn-page-toc {
         display: none !important;
     }
