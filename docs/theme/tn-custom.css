@@ -796,3 +796,24 @@ blockquote:not(.blockquote-tag) {
     object-fit: contain;
     object-position: left center;
 }
+
+/* ------------------------------------------------------------------ */
+/* TEL-badge mouse cursor                                              */
+/* ------------------------------------------------------------------ */
+
+/* Replaces only the default arrow; interactive elements keep their native
+   cursors (links: pointer, text/search fields: I-beam). Hotspot 4 4 keeps the
+   click point near the badge's top-left, where the arrow tip used to be.
+   Browsers cap cursor bitmaps (~32px is the safe size); the image-set line
+   upgrades to the 64px asset on 2x displays where supported, and engines
+   without image-set() in cursor keep the plain url() declaration. */
+html,
+body {
+    /* Plain relative URLs: this file is emitted at book/theme/, the images at
+       book/assets/ (src assets are copied verbatim and never hash-renamed). */
+    cursor: url("../assets/tel-cursor-32.png") 4 4, default;
+    cursor: image-set(
+            url("../assets/tel-cursor-32.png") 1x,
+            url("../assets/tel-cursor-64.png") 2x
+        ) 4 4, default;
+}
