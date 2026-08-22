@@ -1,0 +1,72 @@
+# Documentation site (mdBook -> GitHub Pages).
+#
+# Builds the mdBook site from docs/ and publishes it to GitHub Pages on every release
+# tag (v*), or on demand via workflow_dispatch. Tag-driven publishing keeps the public
+# site pinned to released code instead of tracking every merge to main.
+#
+# One-time repo setup: Settings -> Pages -> Source must be set to "GitHub Actions"
+# (not "Deploy from a branch"), and the github-pages environment's deployment rules
+# must allow v* tag deployments; without both, the deploy job fails before
+# actions/deploy-pages runs.
+#
+# Local preview: `make book` (build) or `make book-serve` (live-reload) -- both
+# require `cargo install mdbook --version 0.5.4 --locked` to match the version
+# pinned below.
+name: Documentation
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Building only reads the repository; the deploy job below adds the Pages scopes it
+# needs (least privilege, CodeQL actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
+# One Pages deployment at a time. Queued runs wait rather than cancel so a tagged
+# release is never skipped mid-deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  # Build the static site with the pinned mdBook and hand it to the deploy job as a
+  # Pages artifact.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Plain checkout: the docs build never touches the tn-contracts submodule.
+      - uses: actions/checkout@v4
+
+      - name: Install mdbook
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.5.4
+
+      - name: Build the book
+        run: mdbook build docs
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  # Publish the artifact to the github-pages environment.
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # Deploying writes the Pages deployment and mints the OIDC token that
+    # actions/deploy-pages exchanges for it; nothing else is granted.
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
