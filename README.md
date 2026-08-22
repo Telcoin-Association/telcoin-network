@@ -160,7 +160,25 @@ Telcoin Network charges a gas penalty when a transaction sets a gas limit far ab
 The penalty is zero when the gas limit is at or below 210,000, or when the transaction uses at least 10 percent of its limit.
 Below that, the penalty grows quadratically and is deducted from the unused-gas refund, then credited to the chain's base-fee address.
 Transaction receipts do not show the penalty.
-See [docs/gas-penalty.md](docs/gas-penalty.md) for the formula, examples, and how wallets and integrators can detect the charge.
+See [docs/src/gas-penalty.md](docs/src/gas-penalty.md) for the formula, examples, and how wallets and integrators can detect the charge.
+
+## Documentation
+
+Developer documentation lives in [`docs/`](docs/) and is built into a static site with [mdBook](https://rust-lang.github.io/mdBook/) 0.5.4.
+Markdown sources are in `docs/src/`, with `docs/src/SUMMARY.md` defining the sidebar.
+`docs/book.toml` is the book configuration and `docs/theme/` holds the site theme.
+CI publishes the book to GitHub Pages whenever a merge into `main` touches `docs/` or the docs workflow (`.github/workflows/docs.yaml`).
+
+To preview locally, install mdBook with `cargo install mdbook --version 0.5.4 --locked`, then:
+
+```bash
+make book        # build the book and open it in your browser
+make book-serve  # serve at localhost:3000 with live reload
+```
+
+Treat the docs as part of the protocol: a change that alters documented behavior should update the affected pages in `docs/src/` in the same PR.
+The pages most often affected are `rpc-methods/` for RPC behavior, `basefees.md`, `gas-limit-penalty.md`, and `gas-penalty.md` for fees and penalties, `epoch-boundaries.md` and `canonical-updates.md` for epochs and consensus records, `staking/` for the validator lifecycle, and `evm-compatibility.md` for precompiles and block header semantics.
+A new page must also be added to `docs/src/SUMMARY.md` or it will not appear in the book.
 
 ## TN-Contracts Submodule
 
