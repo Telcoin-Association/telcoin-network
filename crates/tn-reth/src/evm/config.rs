@@ -50,6 +50,7 @@ use reth_primitives::{BlockTy, HeaderTy};
 use reth_revm::{
     context::{BlockEnv, CfgEnv},
     context_interface::block::BlobExcessGasAndPrice,
+    primitives::hardfork::SpecId,
 };
 use std::sync::Arc;
 use tn_types::{
@@ -103,6 +104,19 @@ impl TnEvmConfig {
     pub const fn chain_spec(&self) -> &Arc<ChainSpec> {
         self.executor_factory.spec()
     }
+
+    /// Build the spec-derived `CfgEnv` both env constructors share.
+    ///
+    /// Gas params must stay spec-derived: revm's EIP-7702 intrinsic charge re-derives its gas
+    /// table from spec (`calculate_initial_tx_gas`, revm cfg/gas.rs:147) and ignores
+    /// `cfg.gas_params`, while the penalty basis in `evm/handler.rs` reads `cfg.gas_params()`.
+    /// Routing both constructors through this one builder keeps the two derivations coupled by
+    /// construction, pinned by `evm_env_gas_params_match_spec_derived_table`.
+    fn spec_derived_cfg_env(&self, spec: SpecId) -> CfgEnv {
+        CfgEnv::new()
+            .with_chain_id(self.chain_spec().chain().id())
+            .with_spec_and_mainnet_gas_params(spec)
+    }
 }
 
 // reth-evm
@@ -130,9 +144,7 @@ impl ConfigureEvm for TnEvmConfig {
         let spec = reth_evm_ethereum::revm_spec(self.chain_spec(), header);
 
         // configure evm env based on parent block
-        let mut cfg_env = CfgEnv::new()
-            .with_chain_id(self.chain_spec().chain().id())
-            .with_spec_and_mainnet_gas_params(spec);
+        let mut cfg_env = self.spec_derived_cfg_env(spec);
 
         let blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
         if let Some(blob_params) = &blob_params {
@@ -174,9 +186,7 @@ impl ConfigureEvm for TnEvmConfig {
         );
 
         // configure evm env based on parent block
-        let mut cfg = CfgEnv::new()
-            .with_chain_id(self.chain_spec().chain().id())
-            .with_spec_and_mainnet_gas_params(spec_id);
+        let mut cfg = self.spec_derived_cfg_env(spec_id);
 
         let blob_params = self.chain_spec().blob_params_at_timestamp(payload.timestamp);
         if let Some(blob_params) = &blob_params {
@@ -260,7 +270,10 @@ impl ConfigureEvm for TnEvmConfig {
 mod tests {
     use super::*;
     use reth_evm::{Evm as _, EvmFactory as _};
-    use reth_revm::{bytecode::Bytecode, context::TxEnv, db::InMemoryDB, state::AccountInfo};
+    use reth_revm::{
+        bytecode::Bytecode, context::TxEnv, context_interface::cfg::GasParams, db::InMemoryDB,
+        state::AccountInfo,
+    };
     use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv as _;
     use tn_types::{Address, Block, Bytes, ExecHeader, TxKind};
 
@@ -380,5 +393,37 @@ mod tests {
         // malformed header: any other length errors instead of panicking
         let block = block_with_extra(Bytes::from_static(b"bad"));
         assert!(config.context_for_block(&block).is_err());
+    }
+
+    /// The 7702 penalty basis in `evm/handler.rs` reads `cfg.gas_params()`, while revm charges
+    /// the intrinsic from `GasParams::new_spec(cfg.spec)` (`calculate_initial_tx_gas`, revm
+    /// `cfg/gas.rs:147`). Those are independent derivations, so pin that every `CfgEnv` TN
+    /// constructs keeps them in agreement — a desync would have the handler subtract an intrinsic
+    /// revm never charged. The pin exercises `evm_env`; `next_evm_env` (the block-production
+    /// path) is covered by construction, since both constructors build their `CfgEnv` through
+    /// `spec_derived_cfg_env`.
+    #[test]
+    fn evm_env_gas_params_match_spec_derived_table() {
+        let chain: ChainSpec = tn_types::test_genesis().into();
+        let config = TnEvmConfig::new(Arc::new(chain), GasAccumulator::default());
+
+        // timestamp 0 on the default header: every TN chain spec activates Prague at 0
+        let header = ExecHeader::default();
+        let cfg_env = config.evm_env(&header).expect("evm env").cfg_env;
+
+        // guard against a vacuous pass: both tables agree trivially on a pre-Prague spec, where
+        // the per-empty-account cost is 0 and the handler's subtraction is a no-op
+        assert_eq!(
+            cfg_env.gas_params.tx_eip7702_per_empty_account_cost(),
+            25_000,
+            "fixture must resolve a spec with a live eip-7702 gas table"
+        );
+
+        assert_eq!(
+            cfg_env.gas_params.table(),
+            GasParams::new_spec(cfg_env.spec).table(),
+            "TN cfg must keep gas params coupled to spec: revm's EIP-7702 intrinsic charge \
+             re-derives its table from spec and ignores cfg.gas_params"
+        );
     }
 }

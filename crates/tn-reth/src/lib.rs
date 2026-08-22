@@ -148,6 +148,11 @@ pub use evm::{
     grantMintRoleCall, hasMintRoleCall, mintCall, revokeMintRoleCall, totalSupplyCall,
     BLS_G1_PRECOMPILE_ADDRESS, TELCOIN_PRECOMPILE_ADDRESS,
 };
+/// Test-gated re-export so integration and property tests exercise the real penalty/refund
+/// split the EVM handler applies to unused gas, and the EIP-7623 floor clamp it feeds that
+/// split.
+#[cfg(any(test, feature = "test-utils"))]
+pub use evm::{effective_auth_intrinsic, gas_penalty_and_refund};
 pub use forward::{ForwardTargetPolicy, WorkerRpcForwarder};
 pub use metrics::report_db_metrics;
 pub use types::*;
