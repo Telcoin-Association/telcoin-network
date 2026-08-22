@@ -16,7 +16,7 @@
 //!   distribution happens via the worker batch protocol, and observer nodes forward RPC submissions
 //!   to committee validators over JSON-RPC (see `forward.rs`) — never via devp2p gossip.
 //! - The per-sender slot default is 256 (`TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER` in `src/cli.rs`,
-//!   seeded process-wide by `init_txpool_defaults`) instead of reth's 16.
+//!   seeded process-wide by `init_reth_defaults`) instead of reth's 16.
 //! - Blob (EIP-4844) transactions are unsupported in batches: the batch builder strips them via
 //!   [`TxPool::remove_eip4844_txs`] (removes descendants and deletes sidecars from the blob store),
 //!   and every canonical pool update — `process_canon_state_update` here and the batch builder's
@@ -32,8 +32,8 @@ use reth_chainspec::ChainSpec;
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
-    providers::BlockchainProvider, CanonStateNotification, CanonStateSubscriptions as _, Chain,
-    ChangedAccount,
+    providers::BlockchainProvider, AccountReader as _, CanonStateNotification,
+    CanonStateSubscriptions as _, Chain, ChangedAccount,
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
@@ -48,7 +48,7 @@ use reth_transaction_pool::{
 use std::{sync::Arc, time::Instant};
 use tn_types::{
     Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned,
-    TxHash, MIN_PROTOCOL_BASE_FEE,
+    TxHash, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -83,12 +83,24 @@ pub trait TxPool {
     /// Remove transactions whose EIP-2718 type is outside the executable allowlist from the
     /// pool, along with their descendants.
     fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>);
+    /// Return the canonical balance of `address` as of the latest committed block.
+    ///
+    /// Used to build the optimistic per-sender balance in a post-mining pool update. A missing
+    /// account (or a read error) yields [`U256::ZERO`], which is the conservative choice: it can
+    /// only keep a sender's remaining transactions parked, never promote an unfunded one, and the
+    /// engine's authoritative canonical update corrects it within the same consensus round.
+    fn get_account_balance(&self, address: Address) -> U256;
 }
 
 /// A telcoin network transaction pool.
+///
+/// The second field is a handle to the blockchain provider, retained so the pool can read a
+/// sender's canonical balance when constructing optimistic pool updates after mining a batch
+/// (see [`TxPool::get_account_balance`]).
 #[derive(Clone, Debug)]
 pub struct WorkerTxPool(
     EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>,
+    BlockchainProvider<TelcoinNode>,
 );
 
 impl From<WorkerTxPool>
@@ -128,6 +140,11 @@ impl WorkerTxPool {
         .no_eip4844()
         .no_eip7702()
         .kzg_settings(EnvKzgSettings::Default)
+        // Apply the operator's `--rpc.txfeecap`. The validator checks it only for
+        // transactions it treats as local (`LocalTransactionConfig::is_local`); raw
+        // RPC submissions are External, so `crate::rpc_fee_cap` guards those at the
+        // RPC boundary (issue #1160).
+        .set_tx_fee_cap(node_config.rpc.rpc_tx_fee_cap)
         .with_local_transactions_config(pool_config.local_transactions_config.clone())
         .with_additional_tasks(node_config.txpool.additional_validation_tasks)
         .build_with_tasks(task_spawner.clone(), blob_store.clone());
@@ -160,7 +177,7 @@ impl WorkerTxPool {
         */
 
         let mut state_stream = blockchain_provider.canonical_state_stream();
-        let this = Self(transaction_pool);
+        let this = Self(transaction_pool, blockchain_provider.clone());
         let txn_pool_clone = this.clone();
         // Update the txn pool as the canonical tip changes.
         task_spawner.spawn_critical_task("canonical txn pool", async move {
@@ -351,6 +368,15 @@ impl TxPool for WorkerTxPool {
 
     fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>) {
         self.0.remove_transactions_and_descendants(txs);
+    }
+
+    fn get_account_balance(&self, address: Address) -> U256 {
+        self.1
+            .basic_account(&address)
+            .ok()
+            .flatten()
+            .map(|account| account.balance)
+            .unwrap_or(U256::ZERO)
     }
 }
 
@@ -604,6 +630,40 @@ mod tests {
             assert!(result.is_ok());
         }
         assert_eq!(pool.pool_size().pending, 3);
+    }
+
+    #[tokio::test]
+    async fn test_validator_applies_tx_fee_cap_to_local_transactions() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        // 1,000 wei cap: a 21,000-gas transfer at 7 wei/gas costs at most 147,000 wei.
+        let rpc_args = reth::args::RpcServerArgs { rpc_tx_fee_cap: 1_000, ..Default::default() };
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            rpc_args,
+        )
+        .unwrap();
+        let pool = reth_env.init_txn_pool().unwrap();
+
+        let mut tx_factory = TransactionFactory::new();
+        let tx = tx_factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let pooled = tx.try_into_pooled().unwrap().try_into_recovered().unwrap();
+        let err = pool
+            .add_transaction_local(EthPooledTransaction::from_pooled(pooled))
+            .await
+            .expect_err("local transaction over the cap is refused by the validator");
+        assert!(format!("{err:?}").contains("ExceedsFeeCap"), "unexpected error: {err:?}");
     }
 
     #[test]

@@ -48,7 +48,7 @@ const THRESHOLD_SQUARED: u128 = 10_u128.pow(16);
 /// | 420,000    | 21,000   | 5%      | 399,000     | 99,750      | 25%               |
 /// | 1,000,000  | 21,000   | 2.1%    | 979,000     | 610,993     | 62.4%             |
 /// | 5,000,000  | 21,000   | 0.42%   | 4,979,000   | 4,569,546   | 91.8%             |
-/// | 10,000,000 | 21,000   | 0.21%   | 9,979,000   | 9,564,282   | 95.6%             |
+/// | 10,000,000 | 21,000   | 0.21%   | 9,979,000   | 9,564,282   | 95.8%             |
 /// | 30,000,000 | 21,000   | 0.07%   | 29,979,000  | 29,560,762  | 98.6%             |
 pub fn calculate_gas_penalty(gas_limit: u64, gas_used: u64) -> u64 {
     // skip penalty for small transactions
@@ -70,7 +70,9 @@ pub fn calculate_gas_penalty(gas_limit: u64, gas_used: u64) -> u64 {
     }
 
     // calculate inefficiency (how far below 10% we are)
-    let unused_gas = gas_limit_u128 - gas_used_u128;
+    // saturating_sub: the threshold guard above guarantees gas_used < gas_limit here, but this
+    // consensus path must not depend on that non-local invariant to avoid underflow
+    let unused_gas = gas_limit_u128.saturating_sub(gas_used_u128);
     let inefficiency_scaled = THRESHOLD - usage_ratio_scaled;
     // square values then calculate penalty
     let inefficiency_squared = inefficiency_scaled.pow(2);
@@ -198,5 +200,30 @@ mod tests {
         // test with gas limit just above threshold
         let penalty = calculate_gas_penalty(210_001, 10_000);
         assert_eq!(penalty, 54_876, "Should have penalty above minimum threshold");
+    }
+
+    /// Pin the usage-ratio guard for overspent inputs.
+    ///
+    /// Any `gas_used >= gas_limit` puts the usage ratio at or above the 10% threshold, so the
+    /// guard returns zero before the subtraction at the top of the penalty math. This test
+    /// holds that door shut: a change that weakens the guard turns an overspent input into an
+    /// underflow at `inefficiency_scaled` in a consensus path.
+    #[test]
+    fn test_gas_used_above_limit_no_penalty() {
+        // gas used just above the limit
+        assert_eq!(calculate_gas_penalty(300_000, 300_001), 0, "overspent by one unit");
+
+        // gas used at exactly the limit (100% usage)
+        assert_eq!(calculate_gas_penalty(300_000, 300_000), 0, "full usage");
+
+        // gas used at double the limit
+        assert_eq!(calculate_gas_penalty(1_000_000, 2_000_000), 0, "overspent 2x");
+
+        // extreme overspend does not underflow or wrap
+        assert_eq!(
+            calculate_gas_penalty(MIN_GAS_LIMIT_THRESHOLD + 1, u64::MAX),
+            0,
+            "extreme overspend"
+        );
     }
 }

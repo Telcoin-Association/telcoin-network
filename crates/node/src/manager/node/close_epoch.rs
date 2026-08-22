@@ -115,6 +115,26 @@ async fn remove_tmp_export(tmp_dir: &Path, epoch: Epoch) {
     }
 }
 
+/// Hand every transaction in `batch` back to its worker's mempool.
+///
+/// This is the CVV recovery shape: the pool feeds the batch builder, so the transactions
+/// re-enter the normal build/seal/retry loop instead of being dropped. A transaction whose
+/// bytes no longer recover, or that the pool refuses, is dropped exactly as before: at epoch
+/// close there is no better destination for it.
+async fn repool_batch_txns(pools: &[tn_reth::WorkerTxPool], batch: &tn_types::Batch) {
+    use futures::StreamExt as _;
+    let pool = pools.get(usize::from(batch.worker_id));
+    futures::stream::iter(batch.transactions())
+        .filter_map(|tx_bytes| async move { recover_raw_transaction(tx_bytes).ok() })
+        .for_each(|recovered| async {
+            let _ = futures::future::OptionFuture::from(
+                pool.map(|pool| pool.add_recovered_transaction_external(recovered)),
+            )
+            .await;
+        })
+        .await;
+}
+
 impl<P, DB> EpochManager<P, DB>
 where
     P: TelcoinDirs + Clone + 'static,
@@ -160,17 +180,18 @@ where
                     // This is most likely because of epoch changes but could be caused by a restart as
                     // well.
                     if is_cvv {
-                        for tx_bytes in batch.transactions() {
-                            // Put txn back into the mempool.
-                            if let Ok(recovered) = recover_raw_transaction(tx_bytes) {
-                                if let Some(pool) = pools.get(batch.worker_id as usize) {
-                                    let _ = pool.add_recovered_transaction_external(recovered).await;
-                                }
-                            }
-                        }
+                        // Put the txns back into the mempool.
+                        repool_batch_txns(&pools, &batch).await;
                     } else {
                         // If we are not a CVV then go ahead and disburse the txns from the batch directly.
-                        let _ = worker.disburse_txns(batch.seal(digest)).await;
+                        // A refused disbursal (issue #1132) means no forward task owns these
+                        // transactions, and the table that held them was cleared above, so fall
+                        // back to the CVV shape and let the batch builder repackage them
+                        // (issue #1145).
+                        let disbursed = worker.disburse_txns(batch.clone().seal(digest)).await;
+                        if disbursed.is_err() {
+                            repool_batch_txns(&pools, &batch).await;
+                        }
                     }
                 }
                 Ok(())

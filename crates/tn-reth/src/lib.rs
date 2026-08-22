@@ -129,13 +129,14 @@ pub mod error;
 mod evm;
 pub mod forward;
 mod metrics;
+mod rpc_fee_cap;
 pub mod rpc_server_args;
 pub mod snapshot;
 pub mod system_calls;
 mod types;
 pub mod worker;
 pub use cli::{
-    init_txpool_defaults, RethCommand, RethConfig, TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
+    init_reth_defaults, RethCommand, RethConfig, TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
 };
 pub use env::*;
 #[cfg(feature = "faucet")]

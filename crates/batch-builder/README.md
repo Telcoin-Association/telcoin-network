@@ -59,21 +59,24 @@ This allows the batch builder to immediately loop and build the next batch from 
 
 The pool receives updates from **two independent sources**:
 
-1. **Batch builder** (`lib.rs` → `update_canonical_state()`): Called immediately after quorum. Provides an early, optimistic update with mined transaction hashes and nonce advances. Uses `U256::MAX` for balances (see below).
+1. **Batch builder** (`lib.rs` → `update_canonical_state()`): Called immediately after quorum. Provides an early, optimistic update with mined transaction hashes and nonce advances. Carries each sender's real canonical balance (see below).
 
 2. **Canonical pool task** (`txn_pool.rs` → `process_canon_state_update()`): A separate background task subscribed to the engine's canonical state stream. Called after the engine executes the committed batches and produces a new canonical block. Provides authoritative nonce, balance, and mined transaction data derived from actual EVM execution.
 
 Both call `on_canonical_state_change()` on the underlying Reth pool. The engine's update overwrites the batch builder's optimistic state with the real post-execution values.
 
-### Why `U256::MAX` for Balance
+### Which Balance the Optimistic Update Carries
 
 The batch builder does not execute transactions and cannot know the post-execution balance.
-The balance field in `ChangedAccount` is set to `U256::MAX` for the following reasons:
+The balance field in `ChangedAccount` is set to the sender's **real canonical balance minus the cost of the transactions just mined for that sender** (balance read via `TxPool::get_account_balance`), not `U256::MAX`.
 
-- **Pre-execution balance is equally wrong.** After mining 8 transactions that each transfer value, the sender's real balance is lower than the pre-execution balance. Neither `U256::MAX` nor the pre-execution balance reflects reality — only the post-execution balance does, which requires EVM execution.
-- **No spam vector.** New transactions entering the pool are validated against the real on-chain balance by Reth's `TransactionValidationTaskExecutor`. The `changed_accounts` balance only affects whether the pool *demotes existing* transactions after mining — it does not bypass entry validation.
-- **Short persistence window.** The `U256::MAX` balance only persists until the engine's canonical update arrives (same consensus round), which overwrites it with the real post-execution balance.
-- **Prevents unnecessary demotion.** Using a lower balance could cause the pool to evict transactions that are actually valid, degrading throughput for legitimate senders.
+- **`U256::MAX` is an amplification vector.** The optimistic balance decides whether the pool *promotes existing* parked transactions after mining. With `U256::MAX`, a sender's queued insufficient-funds transactions all look affordable, so the pool promotes them and the batch builder packs them into the next batch built inside the optimistic window — before the engine's canonical update corrects the balance. Peer batch validation is purely structural, so that follow-up batch reaches quorum, is gossiped and stored, and is then skipped for free at execution. A funded attacker pays for roughly one transaction per sender but forces the network to certify and store up to `TN_TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER - 1` extra invalid transactions per sender.
+- **Debiting the just-mined cost stops the burst.** Because the mined transactions' cost is subtracted from the reported balance, a sender that cannot actually fund its remaining transactions keeps them parked. The immediate amplification the issue's PoC relies on — queue many transactions, mine one, watch the rest promote into the very next batch — no longer occurs.
+- **Residual (known limitation).** The balance is re-derived from the last committed canonical balance on every in-window rebuild and does not accumulate debits across successive rebuilds before the engine's canonical update lands. A drip-fed sender can therefore still have on the order of one transaction promoted per rebuild until the canonical update corrects the balance. Fully closing this requires tracking cumulative optimistic spend across rebuilds, or a state-aware check on the follow-up batch path (directions 3 and 4 in issue #1158); both are larger design choices deferred to the maintainers.
+- **Entry validation is unaffected.** New transactions entering the pool are still validated against the real on-chain balance by Reth's `TransactionValidationTaskExecutor`. The `changed_accounts` balance only affects promotion/demotion of transactions already in the pool.
+- **Short persistence window.** The optimistic balance only persists until the engine's canonical update arrives (same consensus round), which overwrites it with the real post-execution balance.
+- **No unnecessary demotion for legitimate senders.** A sender whose remaining transactions are affordable at their real balance keeps them in `pending`; only genuinely underfunded transactions stay parked, which is correct.
+- **Conservative on read failure.** A missing account or a state-read error yields `U256::ZERO`, which can only keep transactions parked (never promote an unfunded one); the engine's authoritative update corrects it the same round.
 
 ## Security Considerations
 
