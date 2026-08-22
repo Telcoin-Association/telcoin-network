@@ -14,52 +14,70 @@ All Ethereum hardfork rules through Prague/Pectra are active.
 
 The sections below cover the areas where TN diverges from mainnet Ethereum behavior.
 
-### TEL Precompile: Native ERC-20 Interface
+### Custom Precompiles
 
-The most significant difference is the **TEL precompile** at address `0x7e1`. This precompile gives the native TEL token a full ERC-20 interface, making TEL simultaneously the chain's gas token and a standard ERC-20.
+TN registers two additional precompiles beyond the standard Ethereum set: a TEL token-issuance precompile at `0x7e1` and a BLS12-381 signature verifier at `0xb151`. The standard precompiles (`0x01`-`0x0a` etc.) are unchanged.
+
+### TEL Precompile: Token Issuance
+
+The **TEL precompile** at address `0x00000000000000000000000000000000000007e1` owns the native token's supply lifecycle: minting, claiming, and burning, plus a `totalSupply()` view.
+
+> [!WARNING]
+> The precompile is **not** an ERC-20 contract. An earlier design exposed `transfer`, `approve`, `transferFrom`, `permit`, `balanceOf`, and the other ERC-20/EIP-2612 selectors at `0x7e1`; that surface has been removed. Calling any of them now reverts with `Unknown function selector`. Do not configure `0x7e1` as a token contract in wallets, bridges, or indexers.
 
 #### What This Means
 
-On Ethereum, the native asset (ETH) has no ERC-20 interface. Protocols that need an ERC-20 representation of ETH must use a wrapper contract like WETH. On TN, this is unnecessary because TEL is natively accessible as an ERC-20 at `0x7e1`.
+TEL **is** the chain's native asset. Balances are native account balances, and moving TEL between accounts is an ordinary value transfer (`CALL` with value) — exactly like moving ETH on Ethereum, and equivalent to what an ERC-20 `transfer` would have done. Allowances, permits, and other ERC-20 semantics are user-space concerns: protocols that need an ERC-20 representation of TEL wrap it, just as ETH is wrapped into WETH. A canonical wrapper, **WTEL**, is deployed at `0x239c9fa0a4bfb9b71304e20c094738debfd7e2b0`.
 
-Calling `balanceOf(address)` on the precompile returns the address's **native account balance**. A native TEL transfer (via `CALL` with value) and an ERC-20 `transfer()` call to `0x7e1` both modify the same underlying balance.
+Only issuance authority and the supply counter require protocol-level state, so those are all the precompile exposes.
 
-#### Supported Interfaces
+#### Interface
 
-**ERC-20 (full standard)**
+| Function | Access | Gas | Behavior |
+| -------- | ------ | --- | -------- |
+| `mint(uint256 amount)` | Governance only | 41,000 | Creates a pending mint under a **7-day timelock**. A second `mint` overwrites the pending amount (minting 0 cancels) |
+| `claim(address recipient)` | Governance only | 25,000 | After the timelock expires: credits `recipient`'s native balance, increments `totalSupply`, clears the pending slots |
+| `burn(uint256 amount)` | Governance only | 8,000 | Destroys tokens held by the precompile's own account and decrements `totalSupply`. The only payable selector |
+| `totalSupply()` | Any caller | 2,100 | Returns the current circulating supply. Callable from `STATICCALL` |
 
-| Function                                  | Behavior                                                  |
-| ----------------------------------------- | --------------------------------------------------------- |
-| `name()`                                  | Returns `"Telcoin"`                                       |
-| `symbol()`                                | Returns `"TEL"`                                           |
-| `decimals()`                              | Returns `18`                                              |
-| `totalSupply()`                           | Returns current circulating supply                        |
-| `balanceOf(address)`                      | Returns native account balance                            |
-| `transfer(address, uint256)`              | Moves native balance; reverts on transfer to `address(0)` |
-| `approve(address, uint256)`               | Sets allowance; overwrites any existing value             |
-| `allowance(address, address)`             | Returns current allowance                                 |
-| `transferFrom(address, address, uint256)` | Transfers on behalf of owner using allowance              |
+On testnet builds compiled with the `faucet` feature, `mint` becomes an instant `mint(address recipient, uint256 amount)` with no timelock, and governance can delegate minting via `grantMintRole(address)` / `revokeMintRole(address)` / `hasMintRole(address)`. Mainnet binaries are never built with this feature.
 
-**EIP-2612 (permit)**
-
-The precompile supports gasless approvals via `permit(owner, spender, value, deadline, v, r, s)`. This allows off-chain signatures to set allowances without requiring the token holder to submit a transaction.
-
-* `permit()` — set allowance via EIP-712 typed signature
-* `nonces(address)` — monotonic nonce for replay protection
-* `DOMAIN_SEPARATOR()` — EIP-712 domain hash (chain-aware)
+Governance is the on-chain governance safe at `0x00000000000000000000000000000000000007a0`.
 
 #### Notable Behaviors
 
-* **Infinite allowance:** If allowance is set to `type(uint256).max`, `transferFrom` does not decrement it. This saves gas on repeated transfers from the same spender.
-* **No transfers to zero address:** Both `transfer()` and `transferFrom()` revert if the recipient is `address(0)`.
-* **Standard events:** The precompile emits `Transfer` and `Approval` events per the ERC-20 specification. However, native TEL transfers (via `CALL` with value) do **not** emit `Transfer` events — only ERC-20 calls through `0x7e1` do.
+* **`STATICCALL` write protection:** inside a static frame only the read-only selectors are served (`totalSupply`, plus `hasMintRole` on faucet builds); every state-mutating selector is refused with `static call: state mutation not permitted`.
+* **Non-payable by default:** every selector except `burn` rejects nonzero call value with `call value: selector is not payable`, so stray TEL cannot be stranded at the precompile.
+* **Events:** `Mint(recipient, amount, unlockTimestamp)`, `Claim(recipient, amount)`, `Burn(amount)`, plus ERC-20-style `Transfer` events from `address(0)` on claim/faucet-mint and to `address(0)` on burn. Ordinary native TEL transfers do **not** emit `Transfer` events.
+* **Supply accounting:** `totalSupply` changes only via `claim` and `burn`. It does not track native balance movement such as gas fees or validator rewards.
 
-#### Implications for Bridge Integrations
+#### Implications for Integrations
 
-* TEL can be bridged as an ERC-20 without wrapping. Use address `0x7e1` as the token contract.
-* `balanceOf` reflects the exact native balance, including gas refunds and validator rewards.
-* Standard `approve` + `transferFrom` patterns work as expected.
-* `permit()` is available for gasless approval flows.
+* Wallets and explorers should treat TEL as the **native asset** (like ETH), never as a token at `0x7e1`.
+* Bridges and DeFi protocols that need ERC-20 semantics should integrate **WTEL**, exactly as they would WETH on Ethereum.
+* Indexers tracking supply should watch the precompile's `Mint`/`Claim`/`Burn`/`Transfer` events; ordinary TEL movement is visible as native value transfers in transaction traces, not as log events.
+
+### BLS Precompile: Signature Verification
+
+The **BLS precompile** at address `0x000000000000000000000000000000000000b151` verifies BLS12-381 signatures using the same `blst` (`min_sig`) implementation the consensus layer uses to produce them, so on-chain verification can never diverge from what validators sign. Its ABI matches `IBlsG1.sol` in tn-contracts.
+
+#### Interface
+
+```
+blsVerify(bytes signature, bytes pubkey, bytes message) → bool
+```
+
+* `signature` — 48-byte **compressed G1** point.
+* `pubkey` — 96-byte **compressed G2** point.
+* `message` — raw bytes, at most 4,096 bytes; hash-to-curve with the protocol's domain-separation tag happens inside the verifier.
+
+These are the protocol's own compressed encodings — the identical bytes validators submit as proof-of-possession signatures to `stake`/`delegateStake`. Only exact 48/96-byte compressed encodings are accepted; uncompressed points are rejected.
+
+#### Behavior
+
+* Returns ABI-encoded `true`/`false`. Malformed points, wrong lengths, and failed verifications all return `false` — the precompile never reverts on bad cryptographic input, matching `BlsG1.blsVerify`'s boolean contract.
+* Callable from `STATICCALL` (it is a pure view): `ConsensusRegistry` reaches it that way to verify validator proof-of-possession on staking.
+* **Gas:** 150,000 base plus 12 per 32-byte word of the message (rounded up).
 
 ### Fee Distribution
 
@@ -144,7 +162,8 @@ nonce = (epoch << 32) | round
 | EVM opcodes          | Standard                             | Standard (identical)          |
 | Gas costs            | Standard                             | Standard (identical)          |
 | Transaction types    | Legacy, EIP-2930, EIP-1559, EIP-4844 | Legacy, EIP-2930, EIP-1559    |
-| Native asset ERC-20  | Requires WETH wrapper                | Built-in at `0x7e1`           |
+| Native asset ERC-20  | Requires WETH wrapper                | Requires WTEL wrapper         |
+| Custom precompiles   | None                                 | TEL issuance at `0x7e1`, BLS verify at `0xb151` |
 | Base fee destination | Burned                               | Base-fee address (governance) |
 | Blob transactions    | Supported                            | Not used                      |
 | Contract languages   | Solidity, Vyper, etc.                | Same                          |
