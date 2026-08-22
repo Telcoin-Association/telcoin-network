@@ -1,5 +1,7 @@
 # eth\_getUncleByBlockHashAndIndex
 
+Telcoin Network's consensus produces no uncle blocks, so this method always returns `null`. It is served for Ethereum API compatibility.
+
 #### Parameters
 
 `DATA`, 32 Bytes - Hash of a block.
@@ -44,6 +46,11 @@ curl https://rpc.adiri.tel \
 #### Result
 
 ```
+{
+  "id":1,
+  "jsonrpc": "2.0",
+  "result": null
+}
 ```
 
 [source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getunclebyblockhashandindex)

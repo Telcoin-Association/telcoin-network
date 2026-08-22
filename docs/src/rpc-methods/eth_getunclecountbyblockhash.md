@@ -1,5 +1,7 @@
 # eth\_getUncleCountByBlockHash
 
+Telcoin Network's consensus produces no uncle blocks, so this method returns `0x0` for every existing block (`null` when the block is not found). It is served for Ethereum API compatibility.
+
 #### Parameters
 
 `DATA`, 32 Bytes - Hash of a block
@@ -22,6 +24,11 @@ curl https://rpc.adiri.tel \
 #### Result
 
 ```
+{
+  "id":1,
+  "jsonrpc": "2.0",
+  "result": "0x0"
+}
 ```
 
 [source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getunclecountbyblockhash)

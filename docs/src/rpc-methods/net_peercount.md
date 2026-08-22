@@ -29,4 +29,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#net_version)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#net_peercount)

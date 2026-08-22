@@ -1,5 +1,7 @@
 # eth\_getTransactionByHash
 
+#### Parameters
+
 `DATA`, 32 Bytes - Hash of a transaction
 
 #### Returns

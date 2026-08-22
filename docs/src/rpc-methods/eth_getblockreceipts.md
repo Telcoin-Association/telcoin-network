@@ -6,27 +6,22 @@
 
 #### Returns
 
-`result`: `OBJECT` - Block object or `null` when there is no corresponding block.
+`result`: `Array` - Array of receipt objects for every transaction in the block, or `null` when there is no corresponding block. Each receipt has the following fields:
 
-* `number`: `QUANTITY` - Hexadecimal of the block number. `null` when its pending block.
-* `hash`: `DATA`, 32 Bytes - Hash of the block. `null` when its pending block.
-* `parentHash`: `DATA`, 32 Bytes - Hash of the parent block.
-* `nonce`: `DATA`, 8 Bytes - Hash of the generated proof-of-work. `null` when its pending block.
-* `sha3Uncles`: `DATA`, 32 Bytes - SHA3 of the uncles data in the block.
-* `logsBloom`: `DATA`, 256 Bytes - The bloom filter for the logs of the block. `null` when its pending block.
-* `transactionsRoot`: `DATA`, 32 Bytes - The root of the transaction trie of the block.
-* `stateRoot`: `DATA`, 32 Bytes - The root of the final state trie of the block.
-* `receiptsRoot`: `DATA`, 32 Bytes - The root of the receipts trie of the block.
-* `miner`: `DATA`, 20 Bytes - The address of the beneficiary to whom the mining rewards were given.
-* `difficulty`: `QUANTITY` - Hexadecimal of the difficulty for this block.
-* `totalDifficulty`: `QUANTITY` - Hexadecimal of the total difficulty of the chain until this block.
-* `extraData`: `DATA` - The "extra data" field of this block.
-* `size`: `QUANTITY` - Hexadecimal size of this block in bytes.
-* `gasLimit`: `QUANTITY` - Hexadecimal of the maximum gas allowed in this block.
-* `gasUsed`: `QUANTITY` - Hexadecimal of the total used gas by all transactions in this block.
-* `timestamp`: `QUANTITY` - Hexadecimal of the unix timestamp for when the block was collated.
-* `transactions`: `Array` - Array of transaction objects, or 32 Bytes transaction hashes depending on the last given parameter.
-* `uncles`: `Array` - Array of uncle hashes.
+* `transactionHash`: `DATA`, 32 Bytes - Hash of the transaction.
+* `transactionIndex`: `QUANTITY` - Hexadecimal of the transactions index position in the block.
+* `blockHash`: `DATA`, 32 Bytes - Hash of the block where this transaction was in.
+* `blockNumber`: `QUANTITY` - Hexadecimal block number where this transaction was in.
+* `from`: `DATA`, 20 Bytes - Address of the sender.
+* `to`: `DATA`, 20 Bytes - Address of the receiver. `null` when its a contract creation transaction.
+* `cumulativeGasUsed`: `QUANTITY` - Hexadecimal of the total amount of gas used when this transaction was executed in the block.
+* `effectiveGasPrice`: `QUANTITY` - Hexadecimal of the sum of the base fee and tip paid per unit of gas.
+* `gasUsed`: `QUANTITY` - Hexadecimal of the amount of gas used by this specific transaction alone.
+* `contractAddress`: `DATA`, 20 Bytes - The contract address created, if the transaction was a contract creation, otherwise `null`.
+* `logs`: `Array` - Array of log objects, which this transaction generated.
+* `logsBloom`: `DATA`, 256 Bytes - Bloom filter for light clients to quickly retrieve related logs.
+* `status`: `QUANTITY` - Either `0x1` (success) or `0x0` (failure).
+* `type`: `QUANTITY` - Hexadecimal of the transaction type, `0x0` for legacy transactions, `0x1` for access list types, `0x2` for dynamic fees.
 
 #### Example
 
@@ -43,6 +38,9 @@ curl https://rpc.adiri.tel \
 
 ```
 {
+  "jsonrpc": "2.0",
+  "result": [
+    {
       "transactionHash": "0x82756da4e315a0135c3a10bf056af829e9c0270c3fd2127791dd2498cf577111",
       "transactionIndex": "0x0",
       "blockHash": "0x8e69cf10fe1b0dbb7213406f58ea99904b685532d7c3604d3e1be9684bda6d4f",

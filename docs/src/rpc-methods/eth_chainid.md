@@ -23,7 +23,7 @@ curl https://rpc.adiri.tel \
 
 ```
 {
-  "id":67,
+  "id":62,
   "jsonrpc": "2.0",
   "result": "0x7e1"
 }

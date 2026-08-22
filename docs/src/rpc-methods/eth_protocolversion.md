@@ -6,7 +6,7 @@
 
 #### Returns
 
-`QUANTITY` - Hexadecimal of the current Telcoin Network protocol version
+`QUANTITY` - Hexadecimal of the current Telcoin Network protocol version. Telcoin Network nodes currently report protocol version `1`.
 
 #### Example
 
@@ -25,7 +25,7 @@ curl https://rpc.adiri.tel \
 {
   "id":67,
   "jsonrpc": "2.0",
-  "result": "0x5"
+  "result": "0x1"
 }
 ```
 
