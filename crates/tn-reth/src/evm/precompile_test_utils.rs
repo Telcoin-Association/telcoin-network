@@ -221,6 +221,21 @@ impl TestEnv {
         calldata: Vec<u8>,
         gas_limit: u64,
     ) -> TestResult {
+        self.exec_value_to(caller, target, calldata, gas_limit, U256::ZERO)
+    }
+
+    /// Execute a transaction targeting `target` with the given gas limit and attached call value.
+    ///
+    /// Automatically increments the caller's nonce. Nonzero `value` exercises the precompile
+    /// dispatcher's payability gate.
+    pub fn exec_value_to(
+        &mut self,
+        caller: Address,
+        target: Address,
+        calldata: Vec<u8>,
+        gas_limit: u64,
+        value: U256,
+    ) -> TestResult {
         let nonce = self.nonces.entry(caller).or_insert(0);
         self.evm.ctx.set_tx(
             TxEnv::builder()
@@ -229,6 +244,7 @@ impl TestEnv {
                 .data(calldata.into())
                 .gas_limit(gas_limit)
                 .nonce(*nonce)
+                .value(value)
                 .build()
                 .unwrap(),
         );
@@ -236,6 +252,19 @@ impl TestEnv {
         // use mainnet handler with default gas to 0 for simpler test logic
         // pipeline tests use TN tools and account for gas usage
         MainnetHandler::default().run(&mut self.evm)
+    }
+
+    /// Execute a precompile call with the given gas limit and attached call value.
+    ///
+    /// [`exec`](Self::exec) with `value` wei attached; targets [`TELCOIN_PRECOMPILE_ADDRESS`].
+    pub fn exec_with_value(
+        &mut self,
+        caller: Address,
+        calldata: Vec<u8>,
+        gas_limit: u64,
+        value: U256,
+    ) -> TestResult {
+        self.exec_value_to(caller, TELCOIN_PRECOMPILE_ADDRESS, calldata, gas_limit, value)
     }
 
     /// Execute a precompile call with the default gas limit (100,000).

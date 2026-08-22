@@ -11,7 +11,9 @@ authors = [
 publish = false
 
 [dependencies]
-jsonrpsee = { workspace = true }
+# `server` + `macros` back the `--rpc.txfeecap` guard's method overrides (`rpc_fee_cap`).
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 tn-config = { workspace = true }
 tn-types = { workspace = true }
@@ -72,9 +74,6 @@ reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
 
 [dev-dependencies]
-# `server` + `macros` give the tests `RpcModule`/`rpc_params!` for calls through the
-# production RPC registration.
-jsonrpsee = { workspace = true, features = ["server", "macros"] }
 metrics-util = { workspace = true }
 serde_yaml = { workspace = true }
 tn-types = { workspace = true, features = ["test-utils"] }

@@ -163,7 +163,7 @@ impl ExecutionNodeInner {
             transaction_pool.clone(),
             network.clone(),
             tn_ext.into_rpc(),
-        );
+        )?;
 
         info!(target: "tn::execution", "tn rpc extension successfully merged");
 

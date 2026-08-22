@@ -304,6 +304,7 @@ impl PrimaryResponse {
             | PrimaryNetworkError::UnknownConsensusOutput(_)
             | PrimaryNetworkError::Timeout(_)
             | PrimaryNetworkError::ConsensusChainError(_)
+            | PrimaryNetworkError::InvalidEpochVote(_, _, _)
             | PrimaryNetworkError::InvalidEpochRequest => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }
