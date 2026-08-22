@@ -3,11 +3,14 @@
 //!
 //! TN-specific pool behavior worth knowing:
 //!
-//! - [`WorkerTxPool::new`] spawns a CRITICAL task consuming the provider's
-//!   `canonical_state_stream()`, applying each `Commit` notification to the pool (mined
-//!   transactions removed, changed accounts refreshed). A `Reorg` notification is skipped with a
-//!   warning: TN never reorgs — consensus output only extends the canonical chain — and aborting
-//!   the critical task would take down the whole node.
+//! - [`WorkerTxPool::new`] spawns a CRITICAL task consuming the provider's raw canonical-state
+//!   broadcast subscription, applying each `Commit` notification to the pool (mined transactions
+//!   removed, changed accounts refreshed). A `Reorg` notification is skipped with a warning: TN
+//!   never reorgs (consensus output only extends the canonical chain) and aborting the critical
+//!   task would take down the whole node. The task subscribes to the raw receiver rather than
+//!   `canonical_state_stream()` (whose wrapper silently swallows broadcast lag) so it can observe
+//!   `Lagged`, mark every pool sender dirty, and reload canonical account state in bounded chunks,
+//!   discarding transactions mined in the lost rounds (issue #1236).
 //! - [`TxPool::get_pending_base_fee`] currently returns `MIN_PROTOCOL_BASE_FEE` (7 wei)
 //!   unconditionally; issue 114 tracks computing a real per-round base fee. Both callers (the task
 //!   above and the batch builder's maintenance path) use it only as the fallback when a tip header
@@ -23,6 +26,7 @@
 //!   equivalent — passes `pending_block_blob_fee: Some(u128::MAX)`, pricing all blob transactions
 //!   out of the pending set.
 
+use alloy::primitives::map::AddressSet;
 use futures::StreamExt as _;
 use reth::transaction_pool::{
     blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
@@ -50,11 +54,23 @@ use tn_types::{
     Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned,
     TxHash, MIN_PROTOCOL_BASE_FEE, U256,
 };
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, info, trace, warn};
 
-use crate::{error::TnRethResult, evm::TnEvmConfig, traits::TelcoinNode, PoolTxn, PoolTxnId};
+use crate::{
+    error::TnRethResult, evm::TnEvmConfig, metrics::RETH_METRICS, traits::TelcoinNode, PoolTxn,
+    PoolTxnId,
+};
 
 pub use reth_primitives_traits::InMemorySize as TxnSize;
+
+/// Upper bound on canonical account reads per maintenance-loop iteration while recovering
+/// from canonical-state broadcast lag (reth's `max_reload_accounts` analogue).
+///
+/// Lag means the loop is already behind, so recovery must not stall it further: each
+/// iteration reloads at most this many dirty senders and carries the rest to the next
+/// iteration, which arrives at consensus-round rate.
+const MAX_RELOAD_ACCOUNTS: usize = 100;
 
 /// Generate a new pooled transaction from an eth transaction and id.
 ///
@@ -112,8 +128,24 @@ impl From<WorkerTxPool>
 }
 
 impl WorkerTxPool {
-    /// Create a new instance of `Self`.
+    /// Create a new instance of `Self` and spawn its canonical-state maintenance task.
     pub fn new(
+        node_config: &NodeConfig<ChainSpec>,
+        task_spawner: &TaskSpawner,
+        blockchain_provider: &BlockchainProvider<TelcoinNode>,
+        evm_config: &TnEvmConfig,
+    ) -> eyre::Result<Self> {
+        let this = Self::build(node_config, task_spawner, blockchain_provider, evm_config)?;
+        this.spawn_maintenance_task(task_spawner, blockchain_provider);
+        Ok(this)
+    }
+
+    /// Construct the pool without spawning the canonical-state maintenance task.
+    ///
+    /// Kept separate from [`WorkerTxPool::new`] so tests can reproduce a pool that missed
+    /// canonical updates (the drifted state the maintenance task's lag handling recovers
+    /// from) without racing a live subscription (see issue #1236).
+    pub(crate) fn build(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<TelcoinNode>,
@@ -176,32 +208,139 @@ impl WorkerTxPool {
         );
         */
 
-        let mut state_stream = blockchain_provider.canonical_state_stream();
-        let this = Self(transaction_pool, blockchain_provider.clone());
-        let txn_pool_clone = this.clone();
+        Ok(Self(transaction_pool, blockchain_provider.clone()))
+    }
+
+    /// Spawn the CRITICAL task that applies canonical-state updates to the pool.
+    ///
+    /// Subscribes to the raw broadcast receiver rather than `canonical_state_stream()`: the
+    /// stream wrapper maps broadcast lag to a debug log and skips ahead, so a consumer that
+    /// falls more than the channel capacity (256 in reth v1.11.3) behind loses `Commit`
+    /// notifications without ever observing the gap: mined transactions stay pending and
+    /// sender snapshots go stale, permanently, because later notifications carry only their
+    /// own rounds (issue #1236). Wrapping the receiver in a [`BroadcastStream`] keeps the
+    /// `Stream` shape but surfaces `Lagged` as an error item, so the task can mark every
+    /// pool sender dirty and reload canonical account state in bounded chunks, mirroring
+    /// reth's `maintain_transaction_pool` drift recovery.
+    fn spawn_maintenance_task(
+        &self,
+        task_spawner: &TaskSpawner,
+        blockchain_provider: &BlockchainProvider<TelcoinNode>,
+    ) {
+        let mut state_stream =
+            BroadcastStream::new(blockchain_provider.subscribe_to_canonical_state());
+        let txn_pool_clone = self.clone();
         // Update the txn pool as the canonical tip changes.
         task_spawner.spawn_critical_task("canonical txn pool", async move {
+            let mut dirty_addresses = AddressSet::default();
             while let Some(update) = state_stream.next().await {
-                match update {
-                    CanonStateNotification::Commit { new } => {
-                        txn_pool_clone.process_canon_state_update(new);
-                    }
-                    // TN never reorgs: consensus output only extends the canonical chain, so a
-                    // Reorg notification here is a bug upstream. Skip it rather than panic —
-                    // this runs inside a critical task, and aborting it would take down the
-                    // whole node over a pool-maintenance miss.
-                    _ => warn!(
-                        target: "txpool",
-                        "unexpected canonical state notification (TN never reorgs); skipping \
-                         transaction pool update"
-                    ),
-                }
+                let newly_dirty = update
+                    .map(|notification| {
+                        txn_pool_clone.apply_canon_notification(notification);
+                        AddressSet::default()
+                    })
+                    .unwrap_or_else(|BroadcastStreamRecvError::Lagged(missed)| {
+                        txn_pool_clone.mark_drifted(missed)
+                    });
+                dirty_addresses = txn_pool_clone.reload_dirty_accounts(
+                    dirty_addresses.into_iter().chain(newly_dirty).collect(),
+                    MAX_RELOAD_ACCOUNTS,
+                );
             }
             Err(TaskError::from_message(
                 "canonical txn pool task ended because state_stream closed",
             ))
         });
-        Ok(this)
+    }
+
+    /// Apply one canonical-state notification to the pool.
+    fn apply_canon_notification(&self, notification: CanonStateNotification) {
+        match notification {
+            CanonStateNotification::Commit { new } => self.process_canon_state_update(new),
+            // TN never reorgs: consensus output only extends the canonical chain, so a
+            // Reorg notification here is a bug upstream. Skip it rather than panic . . .
+            // this runs inside a critical task, and aborting it would take down the
+            // whole node over a pool-maintenance miss.
+            CanonStateNotification::Reorg { .. } => warn!(
+                target: "txpool",
+                "unexpected canonical state notification (TN never reorgs); skipping \
+                 transaction pool update"
+            ),
+        }
+    }
+
+    /// Record a canonical-state broadcast lag event and return the sender set to resync.
+    ///
+    /// The skipped `Commit`s are gone from the broadcast channel, so their mined
+    /// transactions and changed accounts can never be replayed: treat every sender with
+    /// transactions in the pool as dirty, exactly like reth's
+    /// `MaintainedPoolState::Drifted`.
+    fn mark_drifted(&self, missed: u64) -> AddressSet {
+        warn!(
+            target: "txpool",
+            missed,
+            "canonical state notifications lost to broadcast lag; resyncing pool sender \
+             accounts from canonical state"
+        );
+        RETH_METRICS.canon_state_lagged_total.increment(1);
+        self.0.unique_senders()
+    }
+
+    /// Reload up to `max_reload` dirty sender accounts from canonical state, apply them to
+    /// the pool, and return the addresses still awaiting reload.
+    ///
+    /// Applying the loaded accounts via `update_accounts` refreshes each sender's
+    /// nonce/balance snapshot and discards pool transactions whose nonce is below the
+    /// canonical account nonce, i.e. the transactions mined in the lost rounds. The
+    /// per-call bound keeps the maintenance loop responsive during recovery (see
+    /// [`MAX_RELOAD_ACCOUNTS`]); addresses whose state read fails stay dirty and are
+    /// retried on a later iteration.
+    ///
+    /// The reload reads the LATEST canonical state while older retained notifications may
+    /// still be queued behind the `Lagged` marker. Draining those can transiently re-apply
+    /// an older snapshot for a sender, but the drain's own tail restores exact state: the
+    /// backlog's final `Commit` is authoritative for every sender it touches, and senders
+    /// touched only in the lost rounds are never overwritten by the backlog at all.
+    /// Discarded transactions cannot be resurrected by the transient regression.
+    fn reload_dirty_accounts(&self, dirty: AddressSet, max_reload: usize) -> AddressSet {
+        let mut pending = dirty.into_iter();
+        let chunk: Vec<Address> = pending.by_ref().take(max_reload).collect();
+        let loaded: Vec<Result<ChangedAccount, Address>> =
+            chunk.into_iter().map(|address| self.load_changed_account(address)).collect();
+        let accounts: Vec<ChangedAccount> =
+            loaded.iter().filter_map(|result| result.as_ref().ok().copied()).collect();
+        if !accounts.is_empty() {
+            self.0.update_accounts(accounts);
+        }
+        pending.chain(loaded.iter().filter_map(|result| result.as_ref().err().copied())).collect()
+    }
+
+    /// Read `address`'s canonical account and shape it as a [`ChangedAccount`] for the pool.
+    ///
+    /// A missing account maps to [`ChangedAccount::empty`] (nonce 0, zero balance), matching
+    /// reth's `load_accounts`; a provider read error returns the address so the caller keeps
+    /// it dirty and retries.
+    fn load_changed_account(&self, address: Address) -> Result<ChangedAccount, Address> {
+        self.1
+            .basic_account(&address)
+            .map(|maybe_account| {
+                maybe_account
+                    .map(|account| ChangedAccount {
+                        address,
+                        nonce: account.nonce,
+                        balance: account.balance,
+                    })
+                    .unwrap_or_else(|| ChangedAccount::empty(address))
+            })
+            .map_err(|error| {
+                debug!(
+                    target: "txpool",
+                    ?address,
+                    ?error,
+                    "failed to reload account state for pool resync"
+                );
+                address
+            })
     }
 
     /// update pool to remove mined transactions
@@ -469,7 +608,14 @@ pub fn recover_pooled_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_utils::TransactionFactory, RethChainSpec, RethEnv};
+    use crate::{
+        payload::TNPayload,
+        test_utils::{
+            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
+            TransactionFactory,
+        },
+        RethChainSpec, RethEnv,
+    };
     use rand::{rngs::StdRng, SeedableRng as _};
     use reth_chainspec::EthChainSpec as _;
     use std::sync::Arc;
@@ -630,6 +776,88 @@ mod tests {
             assert!(result.is_ok());
         }
         assert_eq!(pool.pool_size().pending, 3);
+    }
+
+    /// Issue #1236: after a canonical-state broadcast lag, the drift resync reloads sender
+    /// accounts from canonical state and discards transactions mined in the lost rounds.
+    ///
+    /// The pool is built WITHOUT its maintenance task, then a block that mines the pool's
+    /// transaction is committed to the canonical chain. This reproduces exactly the state a
+    /// lagged worker is left in: the mined transaction still pending and the sender snapshot
+    /// stale. The pre-resync assertion is the negative control proving the drift is real;
+    /// the resync must then clear it.
+    #[tokio::test]
+    async fn test_lag_resync_discards_transactions_mined_in_lost_rounds() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut tx_factory = TransactionFactory::new_random();
+        let genesis = test_genesis().extend_accounts([(
+            tx_factory.address(),
+            GenesisAccount::default().with_balance(U256::MAX),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance().unwrap();
+
+        let tx = tx_factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let hash = *tx.hash();
+        let encoded = tx.encoded_2718();
+        let recovered = recover_raw_transaction(&encoded).unwrap();
+        pool.add_recovered_transaction_external(recovered).await.unwrap();
+        assert_eq!(pool.pool_size().pending, 1);
+
+        // commit a canonical block that mines the transaction; with no maintenance task
+        // subscribed, the pool never sees the notification . . . the lag scenario
+        let output = consensus_output_for_tests(1, 0, 1, false);
+        let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![encoded]).unwrap();
+
+        // the block must actually mine the transaction (canonical nonce advanced), or the
+        // resync below would pass vacuously
+        let account = pool.load_changed_account(tx_factory.address()).unwrap();
+        assert_eq!(account.nonce, 1, "test block must mine the transaction");
+        // negative control: the pool is drifted, the mined transaction is still pending
+        assert_eq!(pool.pool_size().pending, 1);
+
+        // the lag path: mark drifted and reload the dirty senders
+        let dirty = pool.mark_drifted(1);
+        let remaining = pool.reload_dirty_accounts(dirty, MAX_RELOAD_ACCOUNTS);
+
+        assert!(remaining.is_empty());
+        assert_eq!(pool.pool_size().pending, 0);
+        assert!(pool.get(&hash).is_none());
+    }
+
+    /// The resync reload is bounded: each call reloads at most `max_reload` addresses and
+    /// returns the rest, so a large sender set drains across maintenance-loop iterations
+    /// instead of stalling one.
+    #[tokio::test]
+    async fn test_reload_dirty_accounts_is_bounded() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .unwrap();
+        let pool = reth_env.init_txn_pool_without_maintenance().unwrap();
+
+        let dirty: AddressSet = (1u8..=3).map(Address::repeat_byte).collect();
+
+        let after_one = pool.reload_dirty_accounts(dirty, 1);
+        assert_eq!(after_one.len(), 2);
+        let after_two = pool.reload_dirty_accounts(after_one, 1);
+        assert_eq!(after_two.len(), 1);
+        let after_three = pool.reload_dirty_accounts(after_two, 1);
+        assert!(after_three.is_empty());
     }
 
     #[tokio::test]
