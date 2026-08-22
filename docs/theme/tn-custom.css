@@ -1,0 +1,759 @@
+/* Telcoin Network — GitBook-style restyle on top of the stock mdBook 0.5.4 css.
+   Loaded via [output.html] additional-css AFTER variables/general/chrome, so
+   equal-specificity rules here win. Color/metric tokens live in css/variables.css. */
+
+/* ------------------------------------------------------------------ */
+/* Typography                                                          */
+/* ------------------------------------------------------------------ */
+
+html,
+body {
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+}
+
+.content h1,
+.content h2,
+.content h3,
+.content h4,
+.content h5,
+.content h6 {
+    font-weight: 600;
+    line-height: 1.25;
+}
+
+.content h1 {
+    font-size: 3.2rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.15;
+}
+
+.content h2 {
+    font-size: 2.2rem;
+    letter-spacing: -0.01em;
+    border: none;
+}
+
+.content h3 {
+    font-size: 1.8rem;
+}
+
+.content h4 {
+    font-size: 1.6rem;
+}
+
+.content p,
+.content ol,
+.content ul {
+    line-height: 1.65em;
+}
+
+.content a {
+    color: var(--links);
+}
+
+.content a:hover {
+    color: var(--tn-link-hover);
+}
+
+/* Suppress the stock `»` marker on :target headings… */
+h1:target::before,
+h2:target::before,
+h3:target::before,
+h4:target::before,
+h5:target::before,
+h6:target::before,
+dt:target::before {
+    content: none;
+}
+
+/* …and show a GitBook-style `#` on heading hover instead. */
+.content .header:hover::after {
+    content: " #";
+    color: var(--sidebar-active);
+    font-weight: 400;
+}
+
+/* ------------------------------------------------------------------ */
+/* Header (menu bar)                                                   */
+/* ------------------------------------------------------------------ */
+
+#mdbook-menu-bar {
+    position: -webkit-sticky !important;
+    position: sticky !important;
+    top: 0 !important;
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    height: var(--menu-bar-height);
+    background-color: var(--tn-header-bg);
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    border-block-end: 1px solid var(--tn-border);
+}
+
+#mdbook-menu-bar.bordered {
+    border-block-end-color: var(--tn-border);
+}
+
+#mdbook-menu-bar-hover-placeholder {
+    /* The always-sticky header does not need the hover placeholder. */
+    height: 0;
+}
+
+/* Hide the stock theme popup UI; tn-custom.js drives the hidden buttons.
+   Never remove these elements from index.hbs — book.js requires them. */
+#mdbook-theme-toggle,
+#mdbook-theme-list {
+    display: none !important;
+}
+
+/* Logo pair (E3): light logo by default, dark logo under .navy. */
+.menu-title.tn-logo-title {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    flex: 1;
+    min-width: 0;
+    margin: 0 8px;
+    line-height: normal;
+    cursor: pointer;
+}
+
+.tn-logo-link {
+    display: inline-flex;
+    align-items: center;
+}
+
+.tn-logo {
+    display: block;
+    height: 26px;
+    width: auto;
+}
+
+.tn-logo-dark {
+    display: none;
+}
+
+.navy .tn-logo-light {
+    display: none;
+}
+
+.navy .tn-logo-dark {
+    display: block;
+}
+
+/* No-JS mirror: follow the OS scheme for the logo swap as well. */
+@media (prefers-color-scheme: dark) {
+    html:not(.js) .tn-logo-light {
+        display: none;
+    }
+
+    html:not(.js) .tn-logo-dark {
+        display: block;
+    }
+}
+
+.right-buttons {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 12px;
+}
+
+.right-buttons a {
+    display: inline-flex;
+    align-items: center;
+}
+
+/* ------------------------------------------------------------------ */
+/* Search pill (E2) + floating search panel                            */
+/* ------------------------------------------------------------------ */
+
+#mdbook-menu-bar .tn-search-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 34px;
+    line-height: 34px;
+    padding: 0 12px;
+    border: 1px solid var(--tn-border);
+    border-radius: 999px;
+    background: var(--tn-surface);
+    color: var(--tn-muted);
+    font-family: inherit;
+    font-size: 1.35rem;
+    cursor: pointer;
+}
+
+#mdbook-menu-bar .tn-search-pill:hover {
+    border-color: var(--sidebar-active);
+    color: var(--fg);
+}
+
+.tn-search-label {
+    font-weight: 500;
+}
+
+.tn-search-kbd {
+    font-family: var(--mono-font);
+    font-size: 1.05rem;
+    line-height: 1.5;
+    padding: 1px 6px;
+    border: 1px solid var(--tn-border);
+    border-radius: 5px;
+    background: var(--bg);
+    box-shadow: none;
+    color: var(--tn-muted);
+}
+
+/* Floating search panel under the header. */
+#mdbook-search-wrapper {
+    position: fixed;
+    top: calc(var(--menu-bar-height) + 12px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(640px, calc(100vw - 32px));
+    z-index: 300;
+    padding: 12px;
+    background: var(--bg);
+    border: 1px solid var(--tn-border);
+    border-radius: 12px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.22);
+}
+
+#mdbook-searchbar {
+    width: 100%;
+    margin: 0;
+    padding: 10px 14px;
+    border: 1px solid var(--tn-border);
+    border-radius: 8px;
+    background: var(--tn-surface);
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 1.5rem;
+}
+
+#mdbook-searchbar:focus,
+#mdbook-searchbar.active {
+    outline: none;
+    border-color: var(--sidebar-active);
+    box-shadow: 0 0 0 3px rgba(55, 174, 255, 0.18);
+}
+
+.searchresults-outer {
+    margin: 8px 0 0;
+    border-block-end: none;
+    max-height: min(52vh, 480px);
+    overflow-y: auto;
+}
+
+.searchresults-header {
+    padding: 8px 4px 4px;
+    font-size: 1.15rem;
+    font-weight: 500;
+}
+
+ul#mdbook-searchresults {
+    margin: 4px 0 0;
+}
+
+ul#mdbook-searchresults li {
+    padding: 8px 10px;
+    border-radius: 8px;
+    margin: 2px 0;
+    font-size: 1.4rem;
+}
+
+ul#mdbook-searchresults li.focus {
+    background-color: var(--tn-surface-2);
+}
+
+ul#mdbook-searchresults em {
+    font-style: normal;
+    background: var(--search-mark-bg);
+    border-radius: 2px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Theme switch (E4)                                                   */
+/* ------------------------------------------------------------------ */
+
+.tn-theme-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 3px;
+    border: 1px solid var(--tn-border);
+    border-radius: 999px;
+    background: var(--tn-surface);
+}
+
+.tn-theme-choice {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--tn-muted);
+    cursor: pointer;
+}
+
+.tn-theme-choice:hover {
+    color: var(--fg);
+}
+
+.tn-theme-choice[aria-checked="true"] {
+    background: var(--bg);
+    color: var(--sidebar-active);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
+}
+
+/* Without JS the switch cannot work; the no-JS palette follows the OS.
+   The search pill is also JS-driven (stock hides .left-buttons buttons only,
+   and E2 moved the search toggle into .right-buttons). */
+html:not(.js) .tn-theme-switch,
+html:not(.js) .right-buttons button {
+    display: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* Sidebar                                                             */
+/* ------------------------------------------------------------------ */
+
+.sidebar {
+    font-size: 1.4rem;
+    border-inline-end: 1px solid var(--tn-border);
+}
+
+.sidebar .sidebar-scrollbox {
+    padding: 12px 12px 32px;
+    scrollbar-width: thin;
+}
+
+.sidebar .sidebar-scrollbox::-webkit-scrollbar {
+    width: 6px;
+}
+
+.chapter {
+    line-height: 1.6em;
+}
+
+.chapter li.chapter-item {
+    margin-block-start: 2px;
+    line-height: 1.45em;
+}
+
+.chapter .chapter-link-wrapper {
+    align-items: center;
+    border-radius: 8px;
+}
+
+.chapter li a {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 10px;
+    border-radius: 8px;
+    color: var(--sidebar-fg);
+    font-weight: 500;
+}
+
+.chapter li a:hover {
+    background: var(--tn-surface-2);
+    color: var(--fg);
+    text-decoration: none;
+}
+
+.chapter li a.active {
+    /* 10% brand tint behind the active pill. */
+    background: rgba(55, 174, 255, 0.10);
+    background: color-mix(in srgb, var(--sidebar-active) 10%, transparent);
+    color: var(--sidebar-active);
+    font-weight: 600;
+}
+
+.chapter-fold-toggle {
+    padding: 0 8px;
+    color: var(--sidebar-fg);
+}
+
+.chapter li.part-title {
+    margin: 20px 10px 4px;
+    text-transform: uppercase;
+    font-size: 1.1rem;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+    color: var(--tn-muted);
+}
+
+.section {
+    padding-inline-start: 12px;
+    line-height: 1.6em;
+}
+
+/* ------------------------------------------------------------------ */
+/* Code                                                                */
+/* ------------------------------------------------------------------ */
+
+.content code {
+    font-family: var(--mono-font);
+}
+
+.content :not(pre) > code {
+    background: var(--tn-code-bg);
+    border: 1px solid var(--tn-border);
+    border-radius: 6px;
+    padding: 0.1em 0.35em;
+}
+
+.content :not(pre) > code.hljs {
+    background: var(--tn-code-bg);
+}
+
+.content pre {
+    margin: 20px 0;
+}
+
+.content pre > code {
+    background: var(--tn-code-bg) !important;
+    border: 1px solid var(--tn-border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    line-height: 1.6;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tables                                                              */
+/* ------------------------------------------------------------------ */
+
+.content table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    border: 1px solid var(--tn-border);
+    border-radius: 8px;
+    overflow: hidden;
+    margin: 20px 0;
+    font-size: 1.4rem;
+}
+
+.content table td,
+.content table th {
+    border: none;
+    border-block-start: 1px solid var(--tn-border);
+    padding: 8px 16px;
+    text-align: start;
+}
+
+.content table td:not(:first-child),
+.content table th:not(:first-child) {
+    border-inline-start: 1px solid var(--tn-border);
+}
+
+.content table thead th {
+    border-block-start: none;
+    background: var(--tn-surface);
+    font-weight: 600;
+    font-size: 1.3rem;
+}
+
+.content table tbody tr:nth-child(2n) {
+    background: transparent;
+}
+
+/* ------------------------------------------------------------------ */
+/* Blockquotes and admonitions                                         */
+/* ------------------------------------------------------------------ */
+
+/* Plain quotes: hairline left bar, muted text (GitBook style). */
+blockquote:not(.blockquote-tag) {
+    background: transparent;
+    border-block-start: none;
+    border-block-end: none;
+    border-inline-start: 3px solid var(--tn-border);
+    color: var(--tn-muted);
+    padding: 0 20px;
+}
+
+/* Admonition cards emitted by mdBook 0.5 for > [!NOTE] etc. */
+.content .blockquote-tag {
+    border-radius: 8px;
+    padding: 14px 18px 10px;
+    margin: 20px 0;
+}
+
+.content .blockquote-tag-note {
+    background-color: rgba(55, 174, 255, 0.09);
+    background-color: color-mix(in srgb, var(--blockquote-note-color) 9%, transparent);
+}
+
+.content .blockquote-tag-tip {
+    background-color: rgba(2, 195, 154, 0.09);
+    background-color: color-mix(in srgb, var(--blockquote-tip-color) 9%, transparent);
+}
+
+.content .blockquote-tag-important {
+    background-color: rgba(20, 200, 255, 0.09);
+    background-color: color-mix(in srgb, var(--blockquote-important-color) 9%, transparent);
+}
+
+.content .blockquote-tag-warning {
+    background-color: rgba(255, 186, 0, 0.10);
+    background-color: color-mix(in srgb, var(--blockquote-warning-color) 10%, transparent);
+}
+
+.content .blockquote-tag-caution {
+    background-color: rgba(219, 34, 42, 0.09);
+    background-color: color-mix(in srgb, var(--blockquote-caution-color) 9%, transparent);
+}
+
+/* Title colors: darkened in light mode for AA contrast on the tinted card
+   (tokens flip to lightened values under .navy). */
+.blockquote-tag-note > .blockquote-tag-title {
+    color: var(--tn-adm-note-title);
+}
+
+.blockquote-tag-tip > .blockquote-tag-title {
+    color: var(--tn-adm-tip-title);
+}
+
+.blockquote-tag-important > .blockquote-tag-title {
+    color: var(--tn-adm-important-title);
+}
+
+.blockquote-tag-warning > .blockquote-tag-title {
+    color: var(--tn-adm-warning-title);
+}
+
+.blockquote-tag-caution > .blockquote-tag-title {
+    color: var(--tn-adm-caution-title);
+}
+
+/* ------------------------------------------------------------------ */
+/* Prev / next cards (E5)                                              */
+/* ------------------------------------------------------------------ */
+
+.nav-wide-wrapper {
+    display: none !important;
+}
+
+.nav-wrapper {
+    display: flex !important;
+    gap: 16px;
+    max-width: var(--content-max-width);
+    margin: 48px auto 8px;
+}
+
+.nav-wrapper::after,
+.nav-wrapper > div[style] {
+    display: none;
+}
+
+.mobile-nav-chapters {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    float: none !important;
+    width: auto;
+    min-width: 0;
+    padding: 14px 16px;
+    background: var(--bg);
+    border: 1px solid var(--tn-border);
+    border-radius: 8px;
+    font-size: 1.4rem;
+    text-align: start;
+    color: var(--tn-muted);
+    right: auto;
+}
+
+.mobile-nav-chapters:hover {
+    border-color: var(--sidebar-active);
+    text-decoration: none;
+}
+
+.mobile-nav-chapters.next {
+    justify-content: flex-end;
+    text-align: end;
+}
+
+.tn-nav-text {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+}
+
+.tn-nav-dir {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 1.2rem;
+    color: var(--tn-muted);
+}
+
+.mobile-nav-chapters.next .tn-nav-dir {
+    justify-content: flex-end;
+}
+
+.tn-nav-title {
+    color: var(--fg);
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.mobile-nav-chapters:hover .tn-nav-title {
+    color: var(--sidebar-active);
+}
+
+@media only screen and (max-width: 560px) {
+    .nav-wrapper {
+        flex-direction: column;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Right rail — "On this page" (built by tn-custom.js)                 */
+/* ------------------------------------------------------------------ */
+
+#tn-page-toc {
+    display: none;
+}
+
+@media only screen and (min-width: 1280px) {
+    #mdbook-content {
+        padding-inline-end: 264px;
+    }
+
+    #tn-page-toc {
+        display: block;
+        position: fixed;
+        top: calc(var(--menu-bar-height) + 40px);
+        right: 24px;
+        width: 216px;
+        max-height: calc(100vh - var(--menu-bar-height) - 88px);
+        overflow-y: auto;
+        font-size: 1.3rem;
+        scrollbar-width: thin;
+    }
+}
+
+#tn-page-toc .tn-toc-title {
+    margin: 0 0 8px;
+    text-transform: uppercase;
+    font-size: 1.1rem;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+    color: var(--tn-muted);
+}
+
+#tn-page-toc ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    border-inline-start: 1px solid var(--tn-border);
+}
+
+#tn-page-toc li a {
+    display: block;
+    padding: 4px 12px;
+    margin-inline-start: -1px;
+    border-inline-start: 2px solid transparent;
+    color: var(--tn-muted);
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#tn-page-toc li.tn-toc-h3 a {
+    padding-inline-start: 26px;
+}
+
+#tn-page-toc li a:hover {
+    color: var(--fg);
+}
+
+#tn-page-toc li a.active {
+    color: var(--sidebar-active);
+    border-inline-start-color: var(--sidebar-active);
+}
+
+/* ------------------------------------------------------------------ */
+/* Responsive + print                                                  */
+/* ------------------------------------------------------------------ */
+
+@media only screen and (max-width: 767px) {
+    .tn-search-label,
+    .tn-search-kbd {
+        display: none;
+    }
+
+    /* GitBook mobile keeps logo + search + theme only; the print, repository
+       and edit links are desktop chrome and starve the wordmark of width. */
+    .right-buttons > a {
+        display: none;
+    }
+
+    .tn-logo {
+        height: 22px;
+    }
+
+    .right-buttons {
+        gap: 4px;
+        margin: 0 8px;
+    }
+
+    .content h1 {
+        font-size: 2.6rem;
+    }
+}
+
+@media print {
+    .tn-theme-switch,
+    #mdbook-menu-bar .tn-search-pill,
+    #tn-page-toc {
+        display: none !important;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Visual-pass fixes (orchestrator screenshot review)                  */
+/* ------------------------------------------------------------------ */
+
+/* Stock pairs a -menu-bar-height pull on .page with the 64px sticky
+   hover-placeholder spacer; with the always-sticky in-flow header and a
+   zero-height placeholder, that pull hides every page's H1 under the bar. */
+.page {
+    margin-block-start: 0 !important;
+}
+
+/* GitBook has no sidebar resize affordance; drop the dot-grid handle. */
+.sidebar .sidebar-resize-handle {
+    display: none !important;
+}
+
+/* Long RPC method names: wrap inside the pill instead of clipping. */
+.chapter li a {
+    overflow-wrap: anywhere;
+}
+
+/* Keep the full wordmark visible inside the bar on narrow viewports: the
+   stock .menu-title clips overflow, so the link and img must shrink with the
+   flex slot instead of being cropped. */
+.tn-logo-link {
+    max-width: 100%;
+}
+
+.tn-logo {
+    max-width: 100%;
+    object-fit: contain;
+    object-position: left center;
+}
