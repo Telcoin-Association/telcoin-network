@@ -1,7 +1,3 @@
----
-description: Returns the chain ID used for signing replay-protected transactions.
----
-
 # eth\_chainId
 
 #### Parameters
@@ -33,4 +29,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_chainid)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_chainid)

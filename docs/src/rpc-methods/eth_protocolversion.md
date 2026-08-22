@@ -1,7 +1,3 @@
----
-description: Returns the current Telcoin Network protocol version.
----
-
 # eth\_protocolVersion
 
 #### Parameters
@@ -33,4 +29,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_protocolversion)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_protocolversion)

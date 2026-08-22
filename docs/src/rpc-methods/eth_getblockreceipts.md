@@ -1,10 +1,3 @@
----
-description: >-
-  Returns all transaction receipts for a given block, the amount of gas used,
-  and any event logs that might have been produced by a smart contract during
-  the transaction.
----
-
 # eth\_getBlockReceipts
 
 #### Parameters
@@ -84,4 +77,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://docs.infura.io/api/networks/ethereum/json-rpc-methods/eth\_getblockreceipts)
+[source](https://docs.infura.io/api/networks/ethereum/json-rpc-methods/eth_getblockreceipts)

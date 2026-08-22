@@ -1,6 +1,6 @@
 # eth\_getFilterChanges
 
-Polling method for a filter, which returns an array of logs which occurred since last poll. Filter must be created by calling either [eth\_newFilter](eth\_newfilter.md) or [eth\_newBlockFilter](eth\_newblockfilter.md).
+Polling method for a filter, which returns an array of logs which occurred since last poll. Filter must be created by calling either [eth\_newFilter](eth_newfilter.md) or [eth\_newBlockFilter](eth_newblockfilter.md).
 
 #### Parameters
 
@@ -84,4 +84,4 @@ curl https://rpc.adiri.tel \
     }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_getfilterchanges)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getfilterchanges)

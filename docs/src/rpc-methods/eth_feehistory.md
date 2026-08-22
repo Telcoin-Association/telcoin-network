@@ -1,7 +1,3 @@
----
-description: Returns historical gas information, allowing you to track trends over time.
----
-
 # eth\_feeHistory
 
 #### Parameters
@@ -31,8 +27,8 @@ curl https://rpc.adiri.tel \
  -X POST \
  -H "Content-Type: application/json" \
  --data '{"jsonrpc":"2.0","method":"eth_feeHistory","params":[
-         "0x5", 
-         "latest", 
+         "0x5",
+         "latest",
          [20, 30]],"id":1}'
 ```
 
@@ -53,4 +49,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://docs.infura.io/api/networks/ethereum/json-rpc-methods/eth\_feehistory)
+[source](https://docs.infura.io/api/networks/ethereum/json-rpc-methods/eth_feehistory)

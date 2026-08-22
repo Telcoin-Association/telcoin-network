@@ -1,9 +1,3 @@
----
-description: >-
-  Two key technologies, Narwhal and Bullshark, contribute to Telcoin Network's
-  consensus layer.
----
-
 # Consensus Layer
 
 Incorporating Bullshark, an asynchronous consensus mechanism, into the blockchain architecture alongside Narwhal's DAG-based mempool represents a forward-thinking approach to distributed ledger technology. Bullshark distinguishes itself by being the first Directed Acyclic Graph (DAG) based asynchronous Byzantine Atomic Broadcast protocol, optimizing for common synchronous cases while ensuring robustness in asynchronous environments.

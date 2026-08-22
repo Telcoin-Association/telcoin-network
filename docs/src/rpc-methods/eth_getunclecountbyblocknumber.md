@@ -1,9 +1,3 @@
----
-description: >-
-  Returns the number of uncles in a block from a block matching the given block
-  number.
----
-
 # eth\_getUncleCountByBlockNumber
 
 #### Parameters
@@ -30,4 +24,4 @@ curl https://rpc.adiri.tel \
 ```
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_getunclecountbyblocknumber)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getunclecountbyblocknumber)

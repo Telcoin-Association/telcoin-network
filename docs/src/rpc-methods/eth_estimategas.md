@@ -14,7 +14,7 @@ Generates and returns an estimate of how much gas is necessary to allow the tran
 
 `maxPriorityFeePerGas`: `QUANTITY` - (optional) Hexadecimal value of the `gasPrice` , in Wei, provided by the sender. The default is `0`. used only in non-EIP-1559 transactions.
 
-`maxFeePerGas`: `QUANTITY` - (optional) Hexadecimal of the maximum total fee (base fee + priority fee), in Wei, the sender is willing to pay per gas. If used, must specify `maxPriorityFeePerGas` .&#x20;
+`maxFeePerGas`: `QUANTITY` - (optional) Hexadecimal of the maximum total fee (base fee + priority fee), in Wei, the sender is willing to pay per gas. If used, must specify `maxPriorityFeePerGas` .
 
 `value`: `QUANTITY` - (optional) Hexadecimal of the value sent with this transaction.
 
@@ -37,8 +37,8 @@ curl https://rpc.adiri.tel \
  -X POST \
  -H "Content-Type: application/json" \
  --data '{"jsonrpc":"2.0","method":"eth_estimateGas","params":[{
-        "from": "0x9cE564c7d09f88E7d8233Cdd3A4d7AC42aBFf3aC", 
-        "to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567", 
+        "from": "0x9cE564c7d09f88E7d8233Cdd3A4d7AC42aBFf3aC",
+        "to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
         "value": "0x0"}],"id":1}'
 ```
 
@@ -52,4 +52,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_estimategas)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_estimategas)

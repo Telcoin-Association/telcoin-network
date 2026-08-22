@@ -1,10 +1,3 @@
----
-description: >-
-  The primary goal is to incentivize validators to run more nodes, directly
-  growing the size and resilience of the network. Every design decision flows
-  from this objective.
----
-
 # Why Membership Model
 
 ### Why This Approach

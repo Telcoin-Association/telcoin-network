@@ -29,4 +29,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_newblockfilter)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_newblockfilter)

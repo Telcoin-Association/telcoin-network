@@ -1,7 +1,3 @@
----
-description: Returns a list of addresses owned by client
----
-
 # eth\_accounts
 
 #### Parameters
@@ -33,4 +29,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_accounts)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_accounts)

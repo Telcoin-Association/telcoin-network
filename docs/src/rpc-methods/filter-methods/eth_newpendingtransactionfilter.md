@@ -1,6 +1,6 @@
 # eth\_newPendingTransactionFilter
 
-Creates a filter in the node, to notify when new pending transactions arrive. To check if the state has changed, call [eth\_getFilterChanges](eth\_getfilterchanges.md).
+Creates a filter in the node, to notify when new pending transactions arrive. To check if the state has changed, call [eth\_getFilterChanges](eth_getfilterchanges.md).
 
 #### Parameters
 
@@ -31,4 +31,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_newpendingtransactionfilter)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_newpendingtransactionfilter)

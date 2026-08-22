@@ -11,5 +11,3 @@ The two greatest costs to committee validators are computation during EVM execut
 In addition to transaction fees, the leader of the consensus block receives the reward for the round. Telcoin Association governance specifies the amount of block rewards per leader per epoch by updating the consensus registry on-chain. The amount of TEL per block reward is adjustable so rewards can adjust based on overall transaction volume.
 
 One current limitation of the protocol allows for the possibility of duplicate transactions within competing batches from different validators. The first executed batch that contains this transaction receives the priority fees if there are any. However, basefees and block rewards remain the same.
-
-<br>

@@ -1,7 +1,3 @@
----
-description: This page provides information regarding Telcoin Stablecoin contracts
----
-
 # Stablecoin Contracts
 
 More information can be found on [github](https://github.com/telcoin/telcoin-contracts/tree/main/contracts/stablecoin).

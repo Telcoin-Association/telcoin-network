@@ -1,9 +1,3 @@
----
-description: >-
-  Returns information about a transaction by block hash and transaction index
-  position.
----
-
 # eth\_getTransactionByBlockHashAndIndex
 
 #### Parameters
@@ -35,14 +29,15 @@ description: >-
 
 #### Request
 
-<pre><code><strong>curl https://rpc.adiri.tel \
-</strong> -X POST \
+```
+curl https://rpc.adiri.tel \
+ -X POST \
  -H "Content-Type: application/json" \
  --data '{"jsonrpc":"2.0","method":"eth_getTransactionByBlockHashAndIndex","params":[
         "0x3874ed915e305246b75c0d388827f2d23df451ac901c07618154bcf03e5ac519",
         "0x0"]
         ,"id":1}'
-</code></pre>
+```
 
 #### Result
 
@@ -71,9 +66,4 @@ description: >-
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_gettransactionbyblockhashandindex)
-
-
-
-
-
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_gettransactionbyblockhashandindex)

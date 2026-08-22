@@ -8,13 +8,13 @@ Creates an [EIP-2930](https://eips.ethereum.org/EIPS/eip-2930) access list that 
 
 `to`: `DATA`, 20 bytes - The address the transaction is directed to.
 
-`gas`: `QUANTITY` - (optional) Hexadecimal value of the gas provided for the transaction execution.&#x20;
+`gas`: `QUANTITY` - (optional) Hexadecimal value of the gas provided for the transaction execution.
 
 `gasPrice`: `QUANTITY` - (optional) Hexadecimal value of the `gasPrice` , in Wei, provided by the sender. The default is `0`. used only in non-EIP-1559 transactions.
 
 `maxPriorityFeePerGas`: `QUANTITY` - (optional) Hexadecimal of the maximum fee, in Wei, the sender is willing to pay per gas above the base fee. If used, must specify `maxFeePerGas` .
 
-`maxFeePerGas`: `QUANTITY` - (optional) Hexadecimal of the maximum total fee (base fee + priority fee), in Wei, the sender is willing to pay per gas. If used, must specify `maxPriorityFeePerGas` .&#x20;
+`maxFeePerGas`: `QUANTITY` - (optional) Hexadecimal of the maximum total fee (base fee + priority fee), in Wei, the sender is willing to pay per gas. If used, must specify `maxPriorityFeePerGas` .
 
 `value`: `QUANTITY` - Hexadecimal of the value sent with this transaction.
 
@@ -42,8 +42,8 @@ curl https://rpc.adiri.tel \
  -X POST \
  -H "Content-Type: application/json" \
  --data '{"jsonrpc":"2.0","method":"eth_createAccessList","params":[{
-        "from": "0xaeA8F8f781326bfE6A7683C2BD48Dd6AA4d3Ba63", 
-        "data": "0x608060806080608155"}, 
+        "from": "0xaeA8F8f781326bfE6A7683C2BD48Dd6AA4d3Ba63",
+        "data": "0x608060806080608155"},
         "finalized"],"id":1}'
 ```
 
@@ -57,4 +57,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://docs.infura.io/api/networks/ethereum/json-rpc-methods/eth\_createaccesslist)
+[source](https://docs.infura.io/api/networks/ethereum/json-rpc-methods/eth_createaccesslist)

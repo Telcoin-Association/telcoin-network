@@ -1,15 +1,8 @@
----
-description: >-
-  So far we have looked at reading blockchain data directly from the blockchain
-  by calling RPC nodes using HTTP requests. We've also seen how to decode
-  responses. Much of this can be abstracted away.
----
-
 # Libraries
 
 ## Ethers.js
 
-[Ethers.js](https://docs.ethers.org/v6/) is a library which abstracts away many of the complexities associated with interacting with EVM blockchains.&#x20;
+[Ethers.js](https://docs.ethers.org/v6/) is a library which abstracts away many of the complexities associated with interacting with EVM blockchains.
 
 Here we will run through the eth\_call example in two different ways, this time using ethers.js.
 
@@ -41,7 +34,7 @@ We create a provider instance with the line:
 const provider = new ethers.JsonRpcProvider("https://rpc.adiri.tel");
 ```
 
-&#x20;This establishes the connection to the RPC node and gives us an object on which we can call ethers functions.
+ This establishes the connection to the RPC node and gives us an object on which we can call ethers functions.
 
 #### Simple use
 
@@ -110,9 +103,9 @@ In the above 3 lines we:
 2. Read the data stored within the ABI.json file
 3. convert the read data to JSON format for use with ethers.
 
-#### Creating the Contract Object&#x20;
+#### Creating the Contract Object
 
-We now have all the components required to create an ethers `Contract` object which we can do in the following way:&#x20;
+We now have all the components required to create an ethers `Contract` object which we can do in the following way:
 
 ```typescript
 // Create the contract instance with the provider
@@ -123,7 +116,7 @@ We now have all the components required to create an ethers `Contract` object wh
   );
 ```
 
-&#x20;Here we have provided the contract address, ABI and provider to create a new instance of a `Contract` object which we save to the variable named `contract`.  More information can be found in the [relevant section](https://docs.ethers.org/v6/api/contract/#Contract) of the documentation.
+ Here we have provided the contract address, ABI and provider to create a new instance of a `Contract` object which we save to the variable named `contract`.  More information can be found in the [relevant section](https://docs.ethers.org/v6/api/contract/#Contract) of the documentation.
 
 All that is left is for us to use the contract. We can do this easily by calling the function names as they appear on the smart contract. In our case, we know the token inherits from the ERC 20 token standard. It will therefore have a getter function named name() (this is the one we have been calling up to now). To get the name of the token we write:
 
@@ -184,7 +177,7 @@ The script should return:
 Contract Name: Telcoin AUD
 ```
 
-Note the string has been automatically converted from hexadecimal.&#x20;
+Note the string has been automatically converted from hexadecimal.
 
 #### Reading Decimals
 

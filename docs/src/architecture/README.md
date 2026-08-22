@@ -1,9 +1,3 @@
----
-description: >-
-  Telcoin Network is a scalable, secure and efficient blockchain. Here's how
-  we've managed it.
----
-
 # Architecture
 
 ### Key Components

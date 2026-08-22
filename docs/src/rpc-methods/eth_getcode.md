@@ -1,7 +1,3 @@
----
-description: Returns code at a given address.
----
-
 # eth\_getCode
 
 #### Parameters
@@ -35,4 +31,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_getcode)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getcode)

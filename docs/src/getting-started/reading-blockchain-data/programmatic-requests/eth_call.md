@@ -1,22 +1,16 @@
----
-description: >-
-  Let's cover a slightly tougher RPC call which will introduce some more
-  blockchain concepts.
----
-
 # eth\_call
 
-Here we demonstrate how to use `eth_call` using TypeScript scripts.&#x20;
+Here we demonstrate how to use `eth_call` using TypeScript scripts.
 
 ### Method Parameters
 
-From the [RPC method reference](../../../rpc-methods/eth\_call.md) we see `eth_call` takes a number of arguments, some of which are optional. These are recreated below:&#x20;
+From the [RPC method reference](../../../rpc-methods/eth_call.md) we see `eth_call` takes a number of arguments, some of which are optional. These are recreated below:
 
 `Object` - The transaction call object:
 
 * `from`: `DATA`, 20 bytes - (optional) The address the transaction is sent from.
 * `to`: `DATA`, 20 bytes - The address the transaction is directed to.
-* `gas`: `QUANTITY` - (optional) Hexadecimal value of the gas provided for the transaction execution.&#x20;
+* `gas`: `QUANTITY` - (optional) Hexadecimal value of the gas provided for the transaction execution.
 * `eth_call` consumes zero gas, but this parameter may be needed by some executions.
 * `gasPrice`: `QUANTITY` - (optional) Hexadecimal value of the `gasPrice` used for each paid gas.
 * `maxPriorityFeePerGas`: `QUANTITY` - Hexadecimal maximum fee, in Wei, the sender is willing to pay per gas above the base fee.
@@ -26,7 +20,7 @@ From the [RPC method reference](../../../rpc-methods/eth\_call.md) we see `eth_c
 
 `block parameter`: `QUANTITY|TAG` \[_Required_] - Hexadecimal block number, or one of the string tags `latest`, `earliest`, `safe`, or `finalized`. See the [default block parameter](https://ethereum.org/en/developers/docs/apis/json-rpc/#default-block).
 
-From this description, we can see we are expected to pass two variables:&#x20;
+From this description, we can see we are expected to pass two variables:
 
 * an object, comprised of some or all of the keys within it (e.g. `from`, `to`), and their associated values.
 * the `block parameter`
@@ -37,13 +31,13 @@ For this example, we will only use `eth_call` to read some data. As reading stat
 
 Thus, we only need to provide values for:
 
-* &#x20;`to`, the address of the contract with which we wish to interact.
-* `data`,  the information specifying the manner in which we interact with the contract.&#x20;
+*  `to`, the address of the contract with which we wish to interact.
+* `data`,  the information specifying the manner in which we interact with the contract.
 * `block parameter`, the block we would like to read from.
 
 ### Updating Request Script
 
-We can begin by amending our code from the [previous example](eth\_blocknumber.md#building-the-script) to prepare for this new method call.
+We can begin by amending our code from the [previous example](eth_blocknumber.md#building-the-script) to prepare for this new method call.
 
 Previously, our script was:
 
@@ -70,7 +64,7 @@ async function fetchData() {
 fetchData();
 ```
 
-As we will still be using axios, calling the same URL and using the same protocol (JSON), most of our script remains the same as before. The only changes occur in the `data` variable, where we want to use the `eth_call` method instead of `eth_blockNumber`, and we will need to pass some information into `params`.&#x20;
+As we will still be using axios, calling the same URL and using the same protocol (JSON), most of our script remains the same as before. The only changes occur in the `data` variable, where we want to use the `eth_call` method instead of `eth_blockNumber`, and we will need to pass some information into `params`.
 
 Let's start by making these changes to the `data` variable. The new data variable will be of the form:
 
@@ -95,15 +89,15 @@ For this example, we will consider the Telcoin AUD token which has contract addr
 
 ### Function Selector
 
-Telcoin stablecoins are modified ERC-20 tokens. For this example we will use the ERC-20 getter function 'name()' to demonstrate the use of eth\_call.&#x20;
+Telcoin stablecoins are modified ERC-20 tokens. For this example we will use the ERC-20 getter function 'name()' to demonstrate the use of eth\_call.
 
 Since we know 'name()' is a function on the smart contract, and we see it takes no arguments, we can pass this into the data field of our parameters object. There is one slight caveat - the EVM will not understand the function call 'name()', but will only accept the '0x' prefixed first four bytes (8 characters in hexadecimal) of the Keccak-256 hash of name(). These 5 bytes ('0x' + four bytes) are known as the _function selector_. Let's run through this:
 
-The function selector for `name()` can be computed from its signature (`"name()"`), which hashes to:&#x20;
+The function selector for `name()` can be computed from its signature (`"name()"`), which hashes to:
 
 `06fdde0383f15d582d1a74511486c9ddf862a882fb7904b3d9fe9b8b8e58a796`
 
-(This can be computed using an online Keccak-256 hash calculator such as [this one](https://emn178.github.io/online-tools/keccak\_256.html)). Taking the first 4 bytes (8 characters) gives:
+(This can be computed using an online Keccak-256 hash calculator such as [this one](https://emn178.github.io/online-tools/keccak_256.html)). Taking the first 4 bytes (8 characters) gives:
 
 `06fdde03`
 
@@ -111,7 +105,7 @@ and adding the '0x' prefix gives:
 
 `0x06fdde03`
 
-This is the string we place in the data field.&#x20;
+This is the string we place in the data field.
 
 ### Updated Data Variable
 
@@ -219,11 +213,10 @@ The next 32 bytes, `000000000000000000000000000000000000000000000000000000000000
 
 #### Actual data
 
-Reading 11 bytes (22 characters) from byte 64 (the next byte along) gives: `54656c636f696e20415544`. This can be converted directly from hex to a string using an online tool such as [this one](https://string-functions.com/hex-string.aspx). It translates to 'Telcoin AUD', exactly as expected!&#x20;
+Reading 11 bytes (22 characters) from byte 64 (the next byte along) gives: `54656c636f696e20415544`. This can be converted directly from hex to a string using an online tool such as [this one](https://string-functions.com/hex-string.aspx). It translates to 'Telcoin AUD', exactly as expected!
 
 The remaining zeroes in the response are just padding to ensure each section of data is 32 bytes long.
 
 ### Conclusion
 
 And there we have it! We've learned to use scripts to query more advanced data straight from the blockchain with very few dependencies. We've also learned how to decode data we receive from RPC nodes.
-

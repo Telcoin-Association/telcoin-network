@@ -1,7 +1,3 @@
----
-description: Returns an object with data about the sync status or false.
----
-
 # eth\_syncing
 
 #### Parameters
@@ -49,4 +45,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_syncing)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_syncing)

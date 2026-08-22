@@ -1,7 +1,3 @@
----
-description: Returns the number of transactions sent from an address.
----
-
 # eth\_getTransactionCount
 
 #### Parameters
@@ -23,7 +19,7 @@ curl https://rpc.adiri.tel \
  -X POST \
  -H "Content-Type: application/json" \
  --data '{"jsonrpc":"2.0","method":"eth_getTransactionCount","params":[
-        "0x3da87b1c3743bd2da60df2ef1bc6f26ef9da6086", 
+        "0x3da87b1c3743bd2da60df2ef1bc6f26ef9da6086",
         "latest"],"id":1}'
 ```
 
@@ -37,4 +33,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_gettransactioncount)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_gettransactioncount)

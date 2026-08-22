@@ -1,9 +1,3 @@
----
-description: >-
-  How Telcoin (TEL) started as an ERC-20 on Ethereum and is used as the native
-  token on Telcoin Network.
----
-
 # Native Token
 
 ### Overview
@@ -100,7 +94,7 @@ One idea for TN to safeguard the protocol from early exploits tanking TEL is to 
 
 > This proposed mechanism revolves around recoverable wrapper tokens. Users can wrap their ERC-20 asset by locking them in the recoverable wrapper token contract in order to receive an equal number of wrapper tokens in return. Wrapping the tokens protects users from thefts, and still maintains most of the utility found in the token’s base form. One core difference, however, is that recoverable wrapper tokens can be recovered back to the sender within a certain time window post-transaction (say, 24 hours). Consequently, each user will have two distinct balances of the token: a settled balance (non-recoverable) and an unsettled balance (recoverable). Only settled tokens may be unwrapped back into their base form.
 >
-> Building beyond the thesis put forth in the ERC20R paper, we present multiple configuration sets, or ways to implement and design a recoverable wrapper token, each with their own use cases and attributes. For instance, one version is an arbitrated wrapper appropriate for a targeted, designated ecosystem with a trusted governance. Another version offers more of a cancellable send button, where transactions simply take a longer, custom period of time to settle than the chain’s finality. Different configuration sets can still be interoperable with each other, as long as they conform to a shared interface. We provide the IERC20R contract as this interface.&#x20;
+> Building beyond the thesis put forth in the ERC20R paper, we present multiple configuration sets, or ways to implement and design a recoverable wrapper token, each with their own use cases and attributes. For instance, one version is an arbitrated wrapper appropriate for a targeted, designated ecosystem with a trusted governance. Another version offers more of a cancellable send button, where transactions simply take a longer, custom period of time to settle than the chain’s finality. Different configuration sets can still be interoperable with each other, as long as they conform to a shared interface. We provide the IERC20R contract as this interface.
 
 The bridged version of TEL on Telcoin Network would initially be deposited as wTEL then immediately swapped and withdrawn to the user’s account. However, when users initialize a deposit to wTEL they maintain an “unsettled balance” (recoverable) until a certain amount of time has passed.
 

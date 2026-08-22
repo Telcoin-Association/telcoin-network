@@ -1,14 +1,7 @@
----
-description: >-
-  This page lists the different Telcoin Networks and their respective public RPC
-  endpoints.
----
-
 # Networks and RPC Endpoints
 
-{% hint style="info" %}
-The public RPC URLs listed below are rate limited and do not support websocket connections. If such functionality is required, please reach out to the team.
-{% endhint %}
+> [!NOTE]
+> The public RPC URLs listed below are rate limited and do not support websocket connections. If such functionality is required, please reach out to the team.
 
 ## Adiri Testnet
 
@@ -24,7 +17,4 @@ The public RPC endpoint at https://rpc.adiri.tel uses a load balancer and is pri
 
 Developers should prefer to connect directly with a node when running scripts or multiple consecutive transactions. Finality happens after a few seconds (up to 10s on the current testnet), and some nodes may not have updated state until then.
 
-Developers should use [Chainlist](https://chainlist.org/?testnets=true\&search=adiri) (include testnets and search "adiri") for an up-to-date list of supported RPC nodes for public use. For more developer questions, please email support@telcoin.org.
-
-
-
+Developers should use [Chainlist](https://chainlist.org/?testnets=true&search=adiri) (include testnets and search "adiri") for an up-to-date list of supported RPC nodes for public use. For more developer questions, please email support@telcoin.org.

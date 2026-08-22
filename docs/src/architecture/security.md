@@ -1,9 +1,3 @@
----
-description: >-
-  Telcoin Network boasts a number of security features. The features and
-  architecture that enable them is outlined on this page.
----
-
 # Security
 
 ### Security Features
@@ -24,13 +18,13 @@ Telcoin Network is run by a set of distinct validators run by Global Systems for
 
 #### Keys
 
-A transaction on the Telcoin Network is only valid if signed with the private key which controls the assets operated on by the transaction. This private key must be kept safe by the user and never shared with other parties. This ensures that even an adversarial validator cannot control assets not owned by them.&#x20;
+A transaction on the Telcoin Network is only valid if signed with the private key which controls the assets operated on by the transaction. This private key must be kept safe by the user and never shared with other parties. This ensures that even an adversarial validator cannot control assets not owned by them.
 
 Each private key corresponds to a public address to which assets can be sent. Sending assets to a specific address automatically creates that address. It is therefore as though all possible addresses exist from the genesis block.
 
 #### Smart Contracts
 
-The behaviour of all non native assets on Telcoin Network is defined by a smart contract. Telcoin Network has a few built in system contracts, but also enables anyone to write and deploy their own smart contracts.&#x20;
+The behaviour of all non native assets on Telcoin Network is defined by a smart contract. Telcoin Network has a few built in system contracts, but also enables anyone to write and deploy their own smart contracts.
 
 This permissionless property enables huge innovation but requires more care to be taken by users; It is recommended users only interact with smart contracts they trust, have been audited by individuals they trust, and they understand the logic of. Smart contracts are immutable, allowing them to be audited by third parties and enabling greater degrees of trust.
 

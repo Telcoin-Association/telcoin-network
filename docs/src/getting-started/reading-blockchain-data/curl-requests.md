@@ -1,10 +1,6 @@
----
-description: We can query the blockchain instantly using cURL (Client URL) requests
----
-
 # cURL requests
 
-Certain nodes running the Telcoin Network have a Remote Procedure Call (RPC) endpoint. These endpoints are a type of Application Programming Interface (API) which allows users to execute a procedure ( a piece of code) on the network as if it occurred locally.&#x20;
+Certain nodes running the Telcoin Network have a Remote Procedure Call (RPC) endpoint. These endpoints are a type of Application Programming Interface (API) which allows users to execute a procedure ( a piece of code) on the network as if it occurred locally.
 
 RPCs have a few key components:
 
@@ -16,13 +12,12 @@ RPCs have a few key components:
 
 cURL is a command-line tool used to transfer data to and from a server using various protocols, including HTTP, HTTPS, FTP, and more. In the context of RPC, cURL can be used to send HTTP POST requests to an RPC server and receive responses. This is what we will demonstrate here.
 
-{% hint style="warning" %}
-All commands throughout the documentation will be focused on use with Unix-like (e.g. macOS, WSL2) systems.
-{% endhint %}
+> [!WARNING]
+> All commands throughout the documentation will be focused on use with Unix-like (e.g. macOS, WSL2) systems.
 
 ### eth\_blockNumber
 
-The [eth\_blockNumber](../../rpc-methods/eth\_blocknumber.md) method is one of the simplest RPC calls to make. From the [documentation](curl-requests.md#eth\_blocknumber) we see it takes no arguments (parameters) - the 'parameters' section shows `None`, and it returns one value representing the current block number of the network.
+The [eth\_blockNumber](../../rpc-methods/eth_blocknumber.md) method is one of the simplest RPC calls to make. From the [documentation](curl-requests.md#eth_blocknumber) we see it takes no arguments (parameters) - the 'parameters' section shows `None`, and it returns one value representing the current block number of the network.
 
 #### Request
 
@@ -62,11 +57,8 @@ The response should look something like:
 }
 ```
 
-Note:&#x20;
+Note:
 
 * `"jsonrpc": "2.0"`: Confirms the JSON-RPC protocol version.
 * `"result": "0x7328cb"`: The hexadecimal value of the current block number.
 * `"id": 83`: The ID of the request, matching the one sent.
-
-
-

@@ -1,7 +1,3 @@
----
-description: Returns an array of all logs matching filter with given id.
----
-
 # eth\_getFilterLogs
 
 #### Parameters
@@ -82,4 +78,4 @@ curl https://rpc.adiri.tel \
     }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_getfilterlogs)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getfilterlogs)

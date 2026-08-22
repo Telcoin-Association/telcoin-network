@@ -1,9 +1,3 @@
----
-description: >-
-  As a simple example, we can use TypeScript and axios (A typescript library for
-  making API requests) to query the current block number.
----
-
 # eth\_blockNumber
 
 #### Building the Script
@@ -64,7 +58,7 @@ const data = {
 
 This creates an object named `data` where we include the data for our request. This layout is standard for JSON-RPC requests within Ethereum Virtual Machine (EVM) based networks (of which Telcoin Network is one). The individual fields are:
 
-* `jsonrpc`: Specifies the JSON-RPC protocol version, which is `2.0` for EVM requests.&#x20;
+* `jsonrpc`: Specifies the JSON-RPC protocol version, which is `2.0` for EVM requests.
 * `method`: Indicates the JSON-RPC method being called, `eth_blockNumber` in this case. This method returns the number of the most recent block.
 * `params`: An array of parameters to be passed to the method. As `eth_blockNumber` takes no input arguments, parameters is left as an empty list.
 * `id`: A unique identifier for the request. This is used to match responses with requests when multiple JSON-RPC calls are made asynchronously. This can be set to any integer.
@@ -88,7 +82,7 @@ This is the main function to fetch the desired data. Note that it is labelled as
 
 The main thing this does is use `axios.post` to make a POST request to the RPC URL. It sends the `data` object we created earlier and includes the `headers`. This is all required because that's just how HTTP requests work!
 
-Upon running the line `const response = await axios.post(rpcUrl, data, { headers })`, axios posts the content to the RPC node and immediately receives a [promise](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global\_Objects/Promise). This response will eventually resolve to the response of the HTTP request. The `await` keyword pauses execution of the script until the promise resolves and returns the desired information. This requested information, which in our case is the blocknumber, is saved to a variable named `response`.
+Upon running the line `const response = await axios.post(rpcUrl, data, { headers })`, axios posts the content to the RPC node and immediately receives a [promise](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise). This response will eventually resolve to the response of the HTTP request. The `await` keyword pauses execution of the script until the promise resolves and returns the desired information. This requested information, which in our case is the blocknumber, is saved to a variable named `response`.
 
 `response` is another object containing a number of key-value pairs. Of these keys, we are interested in the `data` key, so we access this directly using `response.data`. This is then printed to the console (or terminal in our case).
 

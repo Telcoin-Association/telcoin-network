@@ -1,7 +1,3 @@
----
-description: Returns number of peers currently connected to the client.
----
-
 # net\_peerCount
 
 #### Parameters
@@ -33,4 +29,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#net\_version)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#net_version)

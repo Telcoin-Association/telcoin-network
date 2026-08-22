@@ -19,6 +19,5 @@ Windows users are strongly advised to use WSL2. Start with these [instructions o
 
 WSL2 gives a linux style environment and avoids some compatibility issues with Windows systems.
 
-{% hint style="warning" %}
-All commands throughout the documentation will be focused on use with Unix-like (e.g. WSL2) systems.
-{% endhint %}
+> [!WARNING]
+> All commands throughout the documentation will be focused on use with Unix-like (e.g. WSL2) systems.

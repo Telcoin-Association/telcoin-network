@@ -1,7 +1,3 @@
----
-description: Returns the information about a transaction requested by transaction hash.
----
-
 # eth\_getTransactionByHash
 
 `DATA`, 32 Bytes - Hash of a transaction
@@ -63,4 +59,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_gettransactionbyhash)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_gettransactionbyhash)

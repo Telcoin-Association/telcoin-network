@@ -1,7 +1,3 @@
----
-description: Returns an estimate of the current price per gas in wei.
----
-
 # eth\_gasPrice
 
 #### Parameters
@@ -33,4 +29,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_gasprice)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_gasprice)

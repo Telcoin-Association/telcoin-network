@@ -1,7 +1,3 @@
----
-description: Hardware requirements for full validator nodes.
----
-
 # Hardware Requirements
 
 ## Validator Node
@@ -28,9 +24,9 @@ Operators are required to submit detailed specifications of their intended node 
 
 ### Memory
 
-**Minimum**: 128 GB DDR4/DDR5 ECC Registered DIMM (highest MT/s possible)&#x20;
+**Minimum**: 128 GB DDR4/DDR5 ECC Registered DIMM (highest MT/s possible)
 
-**Recommended**: 128 GB or higher (highest MT/s possible)&#x20;
+**Recommended**: 128 GB or higher (highest MT/s possible)
 
 ### Storage
 
@@ -40,7 +36,7 @@ Operators are required to submit detailed specifications of their intended node 
 
 ### Networking
 
-**Network Connectivity Minimum**: 1000 Mb/s sustained internet bandwidth, 1-Gigabit Ethernet interface&#x20;
+**Network Connectivity Minimum**: 1000 Mb/s sustained internet bandwidth, 1-Gigabit Ethernet interface
 
 **Recommended**: 1000+ Mb/s sustained internet bandwidth, 10-Gigabit interface
 
@@ -103,4 +99,3 @@ TLC drives typically support 1,000-3,000 P/E (program/erase) cycles, offering 3-
 ### Blockchain-Specific Requirements
 
 For Telcoin Network nodes, storage drives face continuous write operations when processing incoming transactions, validating new blocks, maintaining state databases, and recording blockchain history. While QLC drives offer upfront cost savings, the performance limitations and shorter lifespan ultimately make TLC drives the more cost-effective and reliable choice for maintaining node stability and network performance over time.
-

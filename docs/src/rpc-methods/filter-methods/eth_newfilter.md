@@ -1,6 +1,6 @@
 # eth\_newFilter
 
-Creates a filter object, based on filter options, to notify when the state changes (logs). To check if the state has changed, call [eth\_getFilterChanges](eth\_getfilterchanges.md).
+Creates a filter object, based on filter options, to notify when the state changes (logs). To check if the state has changed, call [eth\_getFilterChanges](eth_getfilterchanges.md).
 
 **A note on specifying topic filters:** Topics are order-dependent. A transaction with a log with topics \[A, B] will be matched by the following topic filters:
 
@@ -55,4 +55,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_newfilter)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_newfilter)

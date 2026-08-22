@@ -1,9 +1,3 @@
----
-description: >-
-  Returns the account and storage values, including the Merkle proof, of the
-  specified account.
----
-
 # eth\_getProof
 
 #### Parameters
@@ -54,4 +48,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://docs.infura.io/api/networks/ethereum/json-rpc-methods/eth\_getproof)
+[source](https://docs.infura.io/api/networks/ethereum/json-rpc-methods/eth_getproof)

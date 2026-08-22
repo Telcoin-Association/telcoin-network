@@ -1,7 +1,3 @@
----
-description: Returns information about a uncle of a block by hash and uncle index position.
----
-
 # eth\_getUncleByBlockHashAndIndex
 
 #### Parameters
@@ -50,4 +46,4 @@ curl https://rpc.adiri.tel \
 ```
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_getunclebyblockhashandindex)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getunclebyblockhashandindex)

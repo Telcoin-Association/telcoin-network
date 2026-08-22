@@ -1,16 +1,10 @@
----
-description: >-
-  Build scripts using Axios or Requests, still calling read RPC methods but
-  using more involved methods, e.g. eth_call
----
-
 # Programmatic Requests
 
 We can also write a simple script to make cURL requests. This will allow us to build around the RPC responses. This will make it easier to call different endpoints with different arguments and handle data that we receive from the RPC calls.
 
 First, let's set up the typescript project.
 
-1. check node and npm (node package manager) versions:&#x20;
+1. check node and npm (node package manager) versions:
 
 In your terminal, enter:
 
@@ -19,7 +13,7 @@ node --version
 npm --version
 ```
 
-It should give something like:&#x20;
+It should give something like:
 
 ```
 v18.17.1

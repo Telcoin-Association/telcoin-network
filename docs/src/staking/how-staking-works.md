@@ -1,9 +1,3 @@
----
-description: >-
-  Validators stake TEL on Telcoin Network consensus registry to participate in
-  consensus and earn block rewards.
----
-
 # How Staking Works
 
 ### Stake Versions

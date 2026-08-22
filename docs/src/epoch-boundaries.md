@@ -1,10 +1,3 @@
----
-description: >-
-  Epochs are relatively short-lived periods of time where random validators are
-  assigned to committees to attest blocks. The boundary is where one epoch
-  starts and another epoch ends.
----
-
 # Epoch Boundaries
 
 ### Overview

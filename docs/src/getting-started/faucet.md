@@ -29,8 +29,8 @@ Open your wallet, and you should see the testnet tokens with an increased balanc
 You will be prompted to add the new network information. Enter the following details:
 
 * **Network Name**: Telcoin Network
-* **RPC URLs**:&#x20;
-  * https://adiri.tel&#x20;
+* **RPC URLs**:
+  * https://adiri.tel
   * https://rpc.adiri.tel
   * https://node1.telcoin.network
   * https://node2.telcoin.network
@@ -47,5 +47,3 @@ You will be prompted to add the new network information. Enter the following det
 * Developers sending multiple transactions in a row should connect to an RPC node directly using: https://node1.telcoin.network, https://node2.telcoin.network, or https://node3.telcoin.network
 
 If you encounter any issues or need further assistance, feel free to email us at support@telcoin.org
-
-<br>

@@ -1,18 +1,11 @@
----
-description: >-
-  Calculates an Ethereum specific signature with: sign(keccak256("\x19Ethereum
-  Signed Message:\n" + len(message) + message))).
----
-
 # eth\_sign (todo)
 
-{% hint style="warning" %}
-**Only for node operators**
-
-The `eth_sign` JSON-RPC method requires a signature from the specified account. As nodes do not store user private keys, they cannot sign user transactions.&#x20;
-
-Nodes can sign their own transactions but must unlock their account before doing so.
-{% endhint %}
+> [!WARNING]
+> **Only for node operators**
+>
+> The `eth_sign` JSON-RPC method requires a signature from the specified account. As nodes do not store user private keys, they cannot sign user transactions.
+>
+> Nodes can sign their own transactions but must unlock their account before doing so.
 
 #### Parameters
 
@@ -45,4 +38,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_sign)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_sign)

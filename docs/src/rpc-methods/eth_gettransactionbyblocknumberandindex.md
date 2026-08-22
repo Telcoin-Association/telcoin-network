@@ -1,9 +1,3 @@
----
-description: >-
-  Returns information about a transaction by block number and transaction index
-  position.
----
-
 # eth\_getTransactionByBlockNumberAndIndex
 
 #### Parameters
@@ -71,4 +65,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_gettransactionbyblocknumberandindex)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_gettransactionbyblocknumberandindex)

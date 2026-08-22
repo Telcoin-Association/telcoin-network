@@ -1,14 +1,9 @@
----
-description: Reading data is the simplest form of blockchain interaction.
----
-
 # Reading Blockchain Data
 
-Since blockchains only require payment (gas) to change their state, reading from a blockchain is completely free.&#x20;
+Since blockchains only require payment (gas) to change their state, reading from a blockchain is completely free.
 
-{% hint style="info" %}
-'State' is the term used to describe the values of all variables stored within the blockchain.
-{% endhint %}
+> [!NOTE]
+> 'State' is the term used to describe the values of all variables stored within the blockchain.
 
 When we read from the blockchain, we simply observe the state of the blockchain, and do not change it. We are therefore not required to pay any gas fees for this action.
 

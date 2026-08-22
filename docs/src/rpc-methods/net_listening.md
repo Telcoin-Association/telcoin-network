@@ -1,7 +1,3 @@
----
-description: Returns true if client is actively listening for network connections.
----
-
 # net\_listening
 
 #### Parameters
@@ -27,10 +23,10 @@ curl https://rpc.adiri.tel \
 
 ```
 {
-    "id":67, 
-    "jsonrpc":"2.0", 
+    "id":67,
+    "jsonrpc":"2.0",
     "result":true
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#net\_listening)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#net_listening)

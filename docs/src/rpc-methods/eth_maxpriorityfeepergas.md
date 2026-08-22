@@ -1,9 +1,3 @@
----
-description: >-
-  Returns an estimate of how much priority fee, in wei, you need to be included
-  in a block.
----
-
 # eth\_maxPriorityFeePerGas
 
 #### Parameters
@@ -35,4 +29,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://docs.infura.io/api/networks/ethereum/json-rpc-methods/eth\_maxpriorityfeepergas)
+[source](https://docs.infura.io/api/networks/ethereum/json-rpc-methods/eth_maxpriorityfeepergas)

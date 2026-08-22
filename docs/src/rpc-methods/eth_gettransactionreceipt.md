@@ -1,7 +1,3 @@
----
-description: Returns the receipt of a transaction by transaction hash.
----
-
 # eth\_getTransactionReceipt
 
 #### Parameters
@@ -10,7 +6,7 @@ description: Returns the receipt of a transaction by transaction hash.
 
 #### Returns
 
-&#x20;`Object` - A transaction receipt object, or `null` when no receipt was found:
+ `Object` - A transaction receipt object, or `null` when no receipt was found:
 
 * `transactionHash`: `DATA`, 32 Bytes - Hash of the transaction.
 * `transactionIndex`: `QUANTITY` - Hexadecimal of the transactions index position in the block.
@@ -141,4 +137,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_gettransactionreceipt)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_gettransactionreceipt)

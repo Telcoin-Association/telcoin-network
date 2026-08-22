@@ -1,6 +1,6 @@
 # eth\_uninstallFilter
 
-Uninstalls a filter with given id. Should always be called when watch is no longer needed. Additionally Filters timeout when they aren't requested with [eth\_getFilterChanges](eth\_getfilterchanges.md) for a period of time.
+Uninstalls a filter with given id. Should always be called when watch is no longer needed. Additionally Filters timeout when they aren't requested with [eth\_getFilterChanges](eth_getfilterchanges.md) for a period of time.
 
 #### Parameters
 
@@ -31,4 +31,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_uninstallfilter)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_uninstallfilter)

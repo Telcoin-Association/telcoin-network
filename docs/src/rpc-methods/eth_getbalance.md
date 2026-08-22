@@ -1,7 +1,3 @@
----
-description: Returns the balance of the account of given address.
----
-
 # eth\_getBalance
 
 #### Parameters
@@ -35,4 +31,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_getbalance)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getbalance)

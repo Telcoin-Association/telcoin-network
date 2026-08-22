@@ -18,7 +18,7 @@
   * [Faucet](getting-started/faucet.md)
   * [Hardware Requirements](getting-started/hardware-requirements.md)
 * [Networks and RPC Endpoints](networks-and-rpc-endpoints.md)
-* [RPC Methods](<README (1).md>)
+* [RPC Methods](rpc-methods/README.md)
   * [eth\_accounts](rpc-methods/eth_accounts.md)
   * [eth\_blockNumber](rpc-methods/eth_blocknumber.md)
   * [eth\_call](rpc-methods/eth_call.md)
@@ -75,6 +75,6 @@
 * [Epoch Boundaries](epoch-boundaries.md)
 * [Canonical Updates](canonical-updates.md)
 
-## FAQs
+# FAQs
 
 * [Economic Incentives and Rewards](faqs/economic-incentives-and-rewards.md)

@@ -1,18 +1,11 @@
----
-description: >-
-  Creates new message call transaction or a contract creation, if the data field
-  contains code, and signs it using the account specified in from.
----
-
 # eth\_sendTransaction (to do)
 
-{% hint style="warning" %}
-**Only for node operators**
-
-The `eth_sendTransaction` JSON-RPC method requires a signature from the specified account. As nodes do not store user private keys, they cannot sign user transactions.&#x20;
-
-Nodes can sign their own transactions but must unlock their account before doing so.
-{% endhint %}
+> [!WARNING]
+> **Only for node operators**
+>
+> The `eth_sendTransaction` JSON-RPC method requires a signature from the specified account. As nodes do not store user private keys, they cannot sign user transactions.
+>
+> Nodes can sign their own transactions but must unlock their account before doing so.
 
 #### Parameters
 
@@ -30,7 +23,7 @@ Nodes can sign their own transactions but must unlock their account before doing
 
 `DATA`, 32 Bytes - The transaction hash, or the zero hash if the transaction is not yet available.
 
-Use [eth\_getTransactionReceipt](eth\_gettransactionreceipt.md) to get the contract address, after the transaction was mined, when you created a contract.
+Use [eth\_getTransactionReceipt](eth_gettransactionreceipt.md) to get the contract address, after the transaction was mined, when you created a contract.
 
 #### Example
 
@@ -61,4 +54,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_sendtransaction)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_sendtransaction)

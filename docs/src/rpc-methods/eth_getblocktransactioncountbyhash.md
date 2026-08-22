@@ -1,9 +1,3 @@
----
-description: >-
-  Returns the number of transactions in a block from a block matching the given
-  block hash.
----
-
 # eth\_getBlockTransactionCountByHash
 
 #### Parameters
@@ -35,4 +29,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_getblocktransactioncountbyhash)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getblocktransactioncountbyhash)

@@ -1,7 +1,3 @@
----
-description: Why Adiri Testnet?
----
-
 # Adiri
 
 The name "Adiri" for testnet is inspired by two rich sources of meaning: the intriguing region on Saturn's moon Titan, and the peaceful paradise from Melanesian mythology.

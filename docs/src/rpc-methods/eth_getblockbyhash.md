@@ -1,7 +1,3 @@
----
-description: Returns information about a block by hash.
----
-
 # eth\_getBlockByHash
 
 #### Parameters
@@ -79,4 +75,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_getblockbyhash)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_getblockbyhash)

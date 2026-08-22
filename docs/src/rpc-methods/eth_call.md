@@ -1,10 +1,3 @@
----
-description: >-
-  Executes a new message call immediately without creating a transaction on the
-  block chain. Often used for executing read-only smart contract functions, for
-  example the balanceOf for an ERC-20 contract
----
-
 # eth\_call
 
 #### Parameters
@@ -13,7 +6,7 @@ description: >-
 
 * `from`: `DATA`, 20 bytes - (optional) The address the transaction is sent from.
 * `to`: `DATA`, 20 bytes - The address the transaction is directed to.
-* `gas`: `QUANTITY` - (optional) Hexadecimal value of the gas provided for the transaction execution.&#x20;
+* `gas`: `QUANTITY` - (optional) Hexadecimal value of the gas provided for the transaction execution.
 * `eth_call` consumes zero gas, but this parameter may be needed by some executions.
 * `gasPrice`: `QUANTITY` - (optional) Hexadecimal value of the `gasPrice` used for each paid gas.
 * `maxPriorityFeePerGas`: `QUANTITY` - Hexadecimal maximum fee, in Wei, the sender is willing to pay per gas above the base fee.
@@ -54,4 +47,4 @@ curl https://rpc.adiri.tel \
 }
 ```
 
-[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth\_call)
+[source](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_call)

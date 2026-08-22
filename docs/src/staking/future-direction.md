@@ -1,7 +1,3 @@
----
-description: Staking was designed to be flexible and grow with the protocl.
----
-
 # Future Direction
 
 ### Validator Scalability Limits

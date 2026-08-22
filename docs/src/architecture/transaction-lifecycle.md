@@ -1,9 +1,3 @@
----
-description: >-
-  Transactions go through a series of steps before being written to the Telcoin
-  Network. These are outlined here.
----
-
 # Transaction lifecycle
 
 1. Transaction creation - A user creates a transaction. This is typically done through a wallet interface or decentralized application (dApp) user interface. An example may be transferring TEL to another user. The user will use the user interface off the dapp or wallet to signal their intentions. They will then sign their transaction using their private key (most likely through their wallet). The signed transaction is now immutable and ready to be sent to a validator.

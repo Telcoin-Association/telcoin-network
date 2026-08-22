@@ -1,9 +1,3 @@
----
-description: >-
-  This guide covers the process for node operators to stake and activate a
-  validator node on Telcoin Network.
----
-
 # How to Stake
 
 ### Overview
