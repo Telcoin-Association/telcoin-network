@@ -171,19 +171,53 @@
     // The sidebar pill (.chapter-link-wrapper) is the full clickable row, but
     // the page link is an inner <a>; a click landing on the pill's padding or
     // the gap beside the fold toggle would otherwise do nothing. Forward those
-    // to the row's page link. Real <a> targets (the link itself, or the fold
-    // toggle) keep their native behavior.
+    // to the row's page link. Clicks on the fold toggle keep their native
+    // behavior. On the row for the page the reader is already on, navigating
+    // again is useless — clicking anywhere on that row (the link included)
+    // folds/unfolds its section instead.
     document.addEventListener('click', function (e) {
         if (!e.target || !e.target.closest) {
             return;
         }
         var wrapper = e.target.closest('.chapter-link-wrapper');
-        if (!wrapper || e.target.closest('a')) {
+        if (!wrapper) {
+            return;
+        }
+        var clicked = e.target.closest('a');
+        if (clicked && clicked.classList.contains('chapter-fold-toggle')) {
             return;
         }
         var link = wrapper.querySelector('a[href]:not(.chapter-fold-toggle)');
+        var toggle = wrapper.querySelector('a.chapter-fold-toggle');
+        if (link && toggle && link.classList.contains('active')) {
+            e.preventDefault();
+            toggle.click();
+            return;
+        }
+        if (clicked) {
+            return;
+        }
         if (link) {
             link.click();
+        }
+    });
+})();
+
+(function tnSidebarKeepOpen() {
+    // Companion to TN-EDIT E6 in index.hbs: below 1080px the sidebar is an
+    // overlay and stock closes it on every page load. Record open/closed in
+    // sessionStorage whenever the user toggles it, so the inline script can
+    // restore an open sidebar after in-book navigation. Session-scoped on
+    // purpose: a fresh visit still starts with the overlay closed.
+    var checkbox = document.getElementById('mdbook-sidebar-toggle-anchor');
+    if (!checkbox) {
+        return;
+    }
+    checkbox.addEventListener('change', function () {
+        try {
+            sessionStorage.setItem('tn-sidebar-open', checkbox.checked ? '1' : '0');
+        } catch (e) {
+            // Storage unavailable: navigation falls back to stock behavior.
         }
     });
 })();

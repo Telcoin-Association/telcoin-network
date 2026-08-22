@@ -118,8 +118,14 @@
                 try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
                 sidebar = sidebar || 'visible';
             } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+                // TN-EDIT E6: stock forces the overlay sidebar closed on every page load below
+                // 1080px, so following a nav link shut the menu. A session flag (written by
+                // tn-custom.js when the user opens/closes the sidebar) keeps it open across
+                // in-book navigation; first visits still start hidden.
+                let keepOpen = null;
+                try { keepOpen = sessionStorage.getItem('tn-sidebar-open'); } catch(e) { }
+                sidebar = keepOpen === '1' ? 'visible' : 'hidden';
+                sidebar_toggle.checked = sidebar === 'visible';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
@@ -159,20 +165,22 @@
                             <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
                             <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
                         </ul>
-                        <!-- TN-EDIT E2: search toggle moved to .right-buttons as a GitBook-style pill. -->
+                        <!-- TN-EDIT E2: search toggle moved to .right-buttons as a rounded search pill. -->
                     </div>
 
-                    <!-- TN-EDIT E3: home-linked logo pair replaces the text title; the light/dark
-                         logo swap is handled in tn-custom.css. Keeps class "menu-title" for book.js. -->
+                    <!-- TN-EDIT E3: home-linked logo replaces the text title; the light/dark wordmark
+                         swap and the small-screen badge swap are handled in tn-custom.css. Keeps
+                         class "menu-title" for book.js. -->
                     <h1 class="menu-title tn-logo-title">
                         <a class="tn-logo-link" href="{{ path_to_root }}index.html" aria-label="Telcoin Network home">
                             <img class="tn-logo tn-logo-light" src="{{ path_to_root }}assets/tn-light.svg" alt="Telcoin Network">
                             <img class="tn-logo tn-logo-dark" src="{{ path_to_root }}assets/tn-dark.svg" alt="" aria-hidden="true">
+                            <img class="tn-logo tn-logo-badge" src="{{ path_to_root }}assets/tel-badge.svg" alt="" aria-hidden="true">
                         </a>
                     </h1>
 
                     <div class="right-buttons">
-                        <!-- TN-EDIT E2: GitBook-style search pill (same id/handlers as the stock toggle). -->
+                        <!-- TN-EDIT E2: search pill (same id/handlers as the stock toggle). -->
                         {{#if search_enabled}}
                         <button id="mdbook-search-toggle" class="icon-button tn-search-pill" type="button" title="Search" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
                             {{fa "solid" "magnifying-glass"}}
@@ -247,7 +255,7 @@
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                        <!-- TN-EDIT E5: prev/next become GitBook-style cards (direction label + page
+                        <!-- TN-EDIT E5: prev/next become navigation cards (direction label + page
                              title). The stock wide side arrows (.nav-wide-wrapper) are hidden in CSS. -->
                         {{#if previous}}
                             <a rel="prev" href="{{ path_to_root }}{{previous.link}}" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
