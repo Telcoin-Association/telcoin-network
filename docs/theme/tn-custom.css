@@ -816,9 +816,9 @@ html,
 body {
     /* Plain relative URLs: this file is emitted at book/theme/, the images at
        book/assets/ (src assets are copied verbatim and never hash-renamed). */
-    cursor: url("../assets/tel-cursor-32.png") 4 4, default;
+    cursor: url("../assets/tel-cursor-24.png") 3 3, default;
     cursor: image-set(
-            url("../assets/tel-cursor-32.png") 1x,
-            url("../assets/tel-cursor-64.png") 2x
-        ) 4 4, default;
+            url("../assets/tel-cursor-24.png") 1x,
+            url("../assets/tel-cursor-48.png") 2x
+        ) 3 3, default;
 }
