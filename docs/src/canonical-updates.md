@@ -42,7 +42,7 @@ A `CommittedSubDag` contains:
 Every certificate carries an aggregated BLS signature from the quorum of validators that endorsed it. These signatures serve two purposes:
 
 1. **Verification** — any node can verify a certificate's authenticity against the known committee without re-executing transactions
-2. **Randomness** — at epoch boundaries, `keccak256(aggregated BLS signature)` from the leader certificate provides deterministic randomness for committee shuffling (see [Epoch Boundaries](epoch-boundaries.md))
+2. **Randomness** — at epoch boundaries, committee shuffling is seeded by the epoch seed chain: each committed leader header carries a deterministic BLS seed signature, and every commit folds it into a running hash across the epoch (see [Epoch Boundaries](epoch-boundaries.md))
 
 Certificates can be verified _directly_ (checked against the current committee) or _indirectly_ (verified through a chain of trust from a previously verified certificate).
 

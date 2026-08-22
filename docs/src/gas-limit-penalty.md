@@ -6,7 +6,7 @@ Telcoin Network uses a consensus-first architecture: transactions are ordered by
 
 This creates a denial-of-service vector. A malicious or careless user can set an extremely high gas limit on a cheap transaction, consuming most of a batch's capacity while using almost none of it. The batch ends up nearly empty in terms of useful work, but no other transactions could fit.
 
-To counter this, TN applies a **quadratic penalty** on transactions whose gas limit is grossly inflated relative to their actual usage. The penalty deducts a portion of the unused gas refund and redirects it to the governance address. This economically disincentivizes gas limit inflation without affecting well-estimated transactions.
+To counter this, TN applies a **quadratic penalty** on transactions whose gas limit is grossly inflated relative to their actual usage. The penalty deducts a portion of the unused gas refund and redirects it to the chain's base-fee address for governance processing. This economically disincentivizes gas limit inflation without affecting well-estimated transactions.
 
 ### How It Works
 
@@ -24,7 +24,7 @@ In plain terms:
 
 * At **9.9% usage**, the penalty is negligible
 * At **5% usage**, roughly 25% of unused gas is penalized
-* At **2% usage**, roughly 62% of unused gas is penalized
+* At **2% usage**, roughly 64% of unused gas is penalized
 * At **0.1% usage**, over 95% of unused gas is penalized
 
 The quadratic curve means the penalty ramps up gently near the threshold and steeply for extreme over-estimation, targeting the worst offenders while leaving borderline cases mostly unaffected.
@@ -43,7 +43,7 @@ Where:
 
 * `gas_used` is the actual gas consumed (before EVM refunds like SSTORE clearing)
 * `gas_limit` is the gas limit declared by the sender
-* `unused_gas = gas_limit - gas_used` (after EVM refunds)
+* `unused_gas = gas_limit - gas_used` (computed from the same pre-refund `gas_used`)
 * The result is clamped so the penalty never exceeds `unused_gas`
 
 **Note on EVM refunds:** The penalty calculation uses pre-refund gas (actual execution cost) to determine the usage ratio, so SSTORE refunds do not artificially inflate the penalty. The standard EVM refund is still applied when computing the user's gas reimbursement.
@@ -55,8 +55,8 @@ When a transaction executes on TN, fees are distributed as follows:
 | Fee Component      | Recipient                  | Description                                     |
 | ------------------ | -------------------------- | ----------------------------------------------- |
 | Priority fee (tip) | Batch producer (validator) | `(effective_gas_price - base_fee) * gas_used`   |
-| Base fee           | Governance address         | `base_fee * gas_used`                           |
-| Gas limit penalty  | Governance address         | Quadratic penalty on unused gas (if applicable) |
+| Base fee           | Base-fee address           | `base_fee * gas_used`                           |
+| Gas limit penalty  | Base-fee address           | Quadratic penalty on unused gas (if applicable) |
 | Remainder          | Refunded to sender         | Unused gas minus any penalty                    |
 
 The penalty is deducted from what would otherwise be refunded to the transaction sender. It does not increase the total fee paid beyond the sender's declared `gas_limit * effective_gas_price` -- it only reduces the refund.
@@ -87,7 +87,7 @@ The penalty is deducted from what would otherwise be refunded to the transaction
 | Penalty threshold             | Usage below 10% of gas limit                         |
 | Scaling                       | Quadratic (gentle near threshold, steep at extremes) |
 | Minimum gas limit for penalty | > 210,000                                            |
-| Penalty destination           | Governance address                                   |
+| Penalty destination           | Base-fee address (for governance processing)         |
 | Maximum penalty               | Cannot exceed unused gas                             |
 | Safe multiplier               | Up to 10x estimated gas = zero penalty               |
 

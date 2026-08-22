@@ -10,7 +10,7 @@ Telcoin Network (TN) implements an EIP-1559-style base fee mechanism adapted for
 
 **Epochs, not blocks:** TN consensus operates in epochs. Each epoch consists of multiple batches (analogous to blocks) produced by workers. The base fee is fixed for the duration of an epoch and only adjusts at epoch boundaries.
 
-**Gas target:** Each epoch has a defined gas target representing the ideal gas consumption across all batches. This target functions identically to Ethereum's block gas and is the point at which the base fee remains unchanged.
+**Gas target:** Each epoch has a defined gas target representing the ideal gas consumption across all batches. This target functions identically to Ethereum's block gas target and is the point at which the base fee remains unchanged.
 
 **Uniform pricing within an epoch:** All transactions within a given epoch are priced at the same `base_fee_per_gas`, regardless of when during the epoch they are submitted. There is no intra-epoch fee variance.
 
@@ -40,7 +40,7 @@ Where `MAX_CHANGE_DENOMINATOR` bounds the maximum rate of change per epoch (the 
 
 1. **Fee estimation:** Because the base fee is constant within an epoch, a single `eth_gasPrice` or `eth_getBaseFee` call gives you the exact base fee for all transactions until the current epoch ends. There is no block-to-block volatility to account for within an epoch.
 2. **Fee predictability:** The maximum base fee increase between consecutive epochs is bounded by the EIP-1559 max change denominator. Fee spikes are smoothed across epoch boundaries rather than block boundaries, which generally provides more stable pricing over short time horizons.
-3. **Transaction pricing:** TN transactions use the same `maxFeePerGas` / `maxPriorityFeePerGas` fields as Ethereum EIP-1559 transactions. The `base_fee_per_gas` portion is burned (and an equivalent amount minted to governance), and the priority fee goes to the batch producer.
+3. **Transaction pricing:** TN transactions use the same `maxFeePerGas` / `maxPriorityFeePerGas` fields as Ethereum EIP-1559 transactions. The `base_fee_per_gas` portion is not burned -- it is credited to the chain's base-fee address for governance processing -- and the priority fee goes to the batch producer.
 4. **Epoch transitions:** If a transaction is submitted near an epoch boundary and lands in the next epoch, it will be priced at the new epoch's base fee. Standard EIP-1559 `maxFeePerGas` protections apply: the transaction will not execute if the new base fee exceeds the sender's `maxFeePerGas`.
 
 ### Summary
