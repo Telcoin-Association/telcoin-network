@@ -17,7 +17,7 @@ use crate::archive::{
 use super::{
     crc::add_crc32,
     data_file::DataFile,
-    data_file_mmap::{MmapDataFile, MmapFileOptions, WriteMode},
+    data_file_mmap::{MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
 };
 use std::{
     fmt::Debug,
@@ -211,7 +211,13 @@ impl FileBackend {
                 Ok(Box::new(file))
             }
             FileBackend::Mmap => {
-                let opts = MmapFileOptions { write_mode: WriteMode::Random, ..Default::default() };
+                // The digest index does point lookups over fixed-offset hash buckets — random
+                // access with no benefit from readahead — so hint `MADV_RANDOM`.
+                let opts = MmapFileOptions {
+                    write_mode: WriteMode::Random,
+                    access: MmapAccess::Random,
+                    ..Default::default()
+                };
                 Ok(Box::new(MmapDataFile::open_with(path, read_only, opts)?))
             }
         }

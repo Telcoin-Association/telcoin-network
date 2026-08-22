@@ -39,7 +39,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use memmap2::{Mmap, MmapMut};
@@ -74,7 +74,21 @@ pub enum WriteMode {
     Random,
 }
 
-/// Options controlling the mmap-backed file's allocation, growth, and write placement.
+/// Access-pattern hint applied to the mapping via `madvise` (best-effort; unix only, and a failed
+/// hint is non-fatal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MmapAccess {
+    /// No hint — keep the kernel's default readahead. The default.
+    #[default]
+    Normal,
+    /// `MADV_SEQUENTIAL`: expect sequential access (aggressive readahead) — for scan-heavy files.
+    Sequential,
+    /// `MADV_RANDOM`: expect random access (suppress readahead) — for point-lookup-heavy files
+    /// such as the digest index's hash buckets.
+    Random,
+}
+
+/// Options controlling the mmap-backed file's allocation, growth, write placement, and access hint.
 #[derive(Debug, Clone, Copy)]
 pub struct MmapFileOptions {
     /// Bytes the file is first grown to on the first write; growth is geometric from here.
@@ -86,6 +100,8 @@ pub struct MmapFileOptions {
     pub grow_mode: GrowMode,
     /// Append vs random-overwrite write placement (see [`WriteMode`]).
     pub write_mode: WriteMode,
+    /// Access-pattern `madvise` hint for the mapping (see [`MmapAccess`]).
+    pub access: MmapAccess,
 }
 
 impl Default for MmapFileOptions {
@@ -95,6 +111,7 @@ impl Default for MmapFileOptions {
             max_map_size: DEFAULT_MAX_MAP_SIZE,
             grow_mode: GrowMode::Reopen,
             write_mode: WriteMode::Append,
+            access: MmapAccess::Normal,
         }
     }
 }
@@ -129,6 +146,12 @@ pub struct MmapDataFile {
     /// first. `AtomicBool` (not `Cell`) so the file stays `Sync`, letting a pack hold it
     /// behind a `Send + Sync` trait object.
     remap_needed: AtomicBool,
+    /// High-water offset already `msync`'d to the backing store. The `WriteMode::Append` sync fast
+    /// path flushes only the newly-written tail `[flushed_end, end)` instead of re-scanning the
+    /// whole mapping each sync. Only meaningful for append (in-place `Random` writes can land
+    /// below this offset, so that mode always flushes the full `[0, end)` range). `AtomicU64`
+    /// for the same `Sync`-through-`&self`-`sync_all` reason as `remap_needed`.
+    flushed_end: AtomicU64,
     opts: MmapFileOptions,
 }
 
@@ -173,7 +196,7 @@ impl MmapDataFile {
             (Backing::Rw(map), orig_len)
         };
 
-        Ok(Self {
+        let df = Self {
             file,
             path: path.to_owned(),
             backing,
@@ -183,8 +206,12 @@ impl MmapDataFile {
             read_only,
             remove_on_drop: false,
             remap_needed: AtomicBool::new(false),
+            // Existing content is already durable on disk, so the sync fast path starts here.
+            flushed_end: AtomicU64::new(orig_len),
             opts,
-        })
+        };
+        df.advise_backing();
+        Ok(df)
     }
 
     /// Path to this file.
@@ -266,6 +293,28 @@ impl MmapDataFile {
         cap
     }
 
+    /// Apply the configured [`MmapAccess`] `madvise` hint to the current mapping. Best-effort: a
+    /// failed hint is logged and ignored, and it is a no-op for `Normal`, an empty mapping, or a
+    /// non-unix target.
+    fn advise_backing(&self) {
+        #[cfg(unix)]
+        {
+            let advice = match self.opts.access {
+                MmapAccess::Normal => return,
+                MmapAccess::Sequential => memmap2::Advice::Sequential,
+                MmapAccess::Random => memmap2::Advice::Random,
+            };
+            let res = match &self.backing {
+                Backing::Rw(map) => map.advise(advice),
+                Backing::Ro(map) => map.advise(advice),
+                Backing::Empty => return,
+            };
+            if let Err(e) = res {
+                tracing::trace!("MmapDataFile: madvise failed (non-fatal): {e}");
+            }
+        }
+    }
+
     /// Drop the current mapping, resize the physical file to `new_len`, and re-map it (leaving it
     /// unmapped when `new_len == 0`). Never holds a mapping past EOF.
     fn remap(&mut self, new_len: u64) -> io::Result<()> {
@@ -279,6 +328,7 @@ impl MmapDataFile {
         let map = unsafe { MmapMut::map_mut(&self.file)? };
         self.backing = Backing::Rw(map);
         self.capacity = new_len;
+        self.advise_backing();
         Ok(())
     }
 
@@ -287,6 +337,9 @@ impl MmapDataFile {
     fn grow_to(&mut self, new_cap: u64) -> io::Result<()> {
         self.remap(new_cap)?;
         self.file.sync_all()?;
+        // The fsync just persisted every dirty page (and the size), so all data `[0, end)` is now
+        // durable; advance the append sync watermark so the next flush only covers new writes.
+        self.flushed_end.store(self.end, Ordering::Relaxed);
         Ok(())
     }
 
@@ -325,6 +378,10 @@ impl MmapDataFile {
         self.remap(len)?;
         self.end = len;
         self.remap_needed.store(false, Ordering::Relaxed);
+        // Bytes past `len` are gone; clamp the watermark so a later append below the old high-water
+        // is still flushed (bytes still present under `len` stay durable).
+        let fe = self.flushed_end.load(Ordering::Relaxed).min(len);
+        self.flushed_end.store(fe, Ordering::Relaxed);
         if self.seek_pos > len {
             self.seek_pos = len;
         }
@@ -341,6 +398,8 @@ impl MmapDataFile {
                     // Flush dirty pages so the cloned handle observes current data.
                     map.flush_range(0, self.end as usize)?;
                 }
+                // The whole `[0, end)` region was just flushed durably.
+                self.flushed_end.store(self.end, Ordering::Relaxed);
             }
             // Truncate away the capacity padding. `File::set_len` takes `&self`; the existing map
             // still spans the old capacity but `[end, capacity)` is never touched (reads are
@@ -352,16 +411,41 @@ impl MmapDataFile {
         self.file.try_clone()
     }
 
-    /// Default durability barrier: `msync` the written region. Cheaper than `fsync` and sufficient
-    /// for data within the already-fsync'd file size (size extensions fsync in the grow path).
-    pub fn sync_all(&self) -> io::Result<()> {
+    /// `msync` the dirty region to the backing store. For [`WriteMode::Append`] this is only the
+    /// tail written since the last durable flush (`[flushed_end, end)`); for [`WriteMode::Random`]
+    /// it is the whole `[0, end)` range, since an in-place overwrite can land anywhere. `sync`
+    /// picks a durable `MS_SYNC` (which then advances the append watermark) over a fire-and-forget
+    /// `MS_ASYNC`.
+    fn flush_dirty(&self, sync: bool) -> io::Result<()> {
         if self.read_only || self.end == 0 {
             return Ok(());
         }
-        if let Backing::Rw(map) = &self.backing {
-            map.flush_range(0, self.end as usize)?;
+        let Backing::Rw(map) = &self.backing else {
+            return Ok(());
+        };
+        let start = match self.opts.write_mode {
+            WriteMode::Append => self.flushed_end.load(Ordering::Relaxed).min(self.end),
+            WriteMode::Random => 0,
+        };
+        if start >= self.end {
+            return Ok(());
+        }
+        let len = (self.end - start) as usize;
+        if sync {
+            map.flush_range(start as usize, len)?;
+            // The tail is now durable; the next append-mode flush can start from here.
+            self.flushed_end.store(self.end, Ordering::Relaxed);
+        } else {
+            map.flush_async_range(start as usize, len)?;
         }
         Ok(())
+    }
+
+    /// Default durability barrier: `msync` the region written since the last sync. Cheaper than
+    /// `fsync` and sufficient for data within the already-fsync'd file size (size extensions fsync
+    /// in the grow path).
+    pub fn sync_all(&self) -> io::Result<()> {
+        self.flush_dirty(true)
     }
 
     /// Full, slow disk sync: `msync` then `fsync`, additionally persisting the file's
@@ -370,11 +454,7 @@ impl MmapDataFile {
         if self.read_only {
             return Ok(());
         }
-        if self.end > 0 {
-            if let Backing::Rw(map) = &self.backing {
-                map.flush_range(0, self.end as usize)?;
-            }
-        }
+        self.flush_dirty(true)?;
         self.file.sync_all()
     }
 
@@ -400,6 +480,7 @@ impl MmapDataFile {
         }
         self.capacity = disk_len;
         self.end = disk_len;
+        self.advise_backing();
         Ok(())
     }
 
@@ -510,12 +591,7 @@ impl Write for MmapDataFile {
     /// Page-cache visibility for a separate reader, without a durability barrier (matches the
     /// buffered `DataFile`'s `flush`: the data is out of our hands but not necessarily on disk).
     fn flush(&mut self) -> io::Result<()> {
-        if !self.read_only && self.end > 0 {
-            if let Backing::Rw(map) = &self.backing {
-                map.flush_async_range(0, self.end as usize)?;
-            }
-        }
-        Ok(())
+        self.flush_dirty(false)
     }
 }
 
@@ -535,13 +611,9 @@ impl Drop for MmapDataFile {
         }
         // Clean close: msync, then truncate away the padding and fsync so the on-disk file is
         // exactly `end` bytes and durable — a reopen sees the same bytes a buffered DataFile would.
-        if self.end > 0 {
-            if let Backing::Rw(map) = &self.backing {
-                if let Err(e) = map.flush_range(0, self.end as usize) {
-                    if !std::thread::panicking() {
-                        tracing::error!("MmapDataFile: failed to msync on drop: {e}");
-                    }
-                }
+        if let Err(e) = self.flush_dirty(true) {
+            if !std::thread::panicking() {
+                tracing::error!("MmapDataFile: failed to msync on drop: {e}");
             }
         }
         self.backing = Backing::Empty; // unmap before truncating
@@ -574,6 +646,7 @@ mod tests {
             max_map_size: 128,
             grow_mode: GrowMode::Reopen,
             write_mode: WriteMode::Append,
+            access: MmapAccess::Normal,
         }
     }
 
@@ -583,6 +656,7 @@ mod tests {
             max_map_size: 128,
             grow_mode: GrowMode::Reopen,
             write_mode: WriteMode::Random,
+            access: MmapAccess::Random,
         }
     }
 
@@ -862,6 +936,7 @@ mod tests {
             max_map_size: 128,
             grow_mode: GrowMode::Segment,
             write_mode: WriteMode::Append,
+            access: MmapAccess::Normal,
         };
         let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
         // Fits within the first mapping (<= max_map_size).
@@ -889,5 +964,35 @@ mod tests {
         // The physical file is at least the logical length (padding may make it larger until
         // close).
         assert!(std::fs::metadata(&path).expect("meta").len() >= 300);
+    }
+
+    /// The append `msync` watermark must never drop earlier-synced data. Sync, append past the
+    /// watermark and sync again, then append once more and let only the clean-close `Drop` flush
+    /// it (crossing growth boundaries throughout) — every byte must survive a reopen.
+    #[test]
+    fn incremental_append_sync_persists_all() {
+        let tmp = TempDir::with_prefix("mmap_df_incremental_sync").expect("temp dir");
+        let path = tmp.path().join("data");
+        let a = pattern(300); // crosses the tiny growth boundary
+        let b = pattern(150);
+        let c = pattern(90);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&a).expect("write a");
+            df.sync_all().expect("sync a");
+            // Append past the synced watermark, then flush only the new tail.
+            df.write_all(&b).expect("write b");
+            df.sync_all().expect("sync b");
+            // A final append left for the clean-close Drop to flush.
+            df.write_all(&c).expect("write c");
+        } // Drop flushes the remaining tail, truncates the padding, and fsyncs.
+        let total = a.len() + b.len() + c.len();
+        let mut df = MmapDataFile::open(&path, true).expect("reopen ro");
+        assert_eq!(df.len(), total as u64);
+        let mut all = vec![0u8; total];
+        df.read_exact(&mut all).expect("read all");
+        assert_eq!(&all[..a.len()], &a[..], "first synced segment");
+        assert_eq!(&all[a.len()..a.len() + b.len()], &b[..], "tail synced after watermark");
+        assert_eq!(&all[a.len() + b.len()..], &c[..], "segment flushed only by Drop");
     }
 }

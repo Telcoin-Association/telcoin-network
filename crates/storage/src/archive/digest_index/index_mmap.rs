@@ -357,13 +357,6 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         Ok(out)
     }
 
-    /// Write a fully-formed bucket buffer (CRC already stamped by the caller) back at `bucket_pos`.
-    fn write_bucket(&mut self, bucket_pos: u64, buf: &[u8]) -> Result<(), AppendError> {
-        self.hdx_file.seek(SeekFrom::Start(bucket_pos)).map_err(AppendError::WriteDataError)?;
-        self.hdx_file.write_all(buf).map_err(AppendError::WriteDataError)?;
-        Ok(())
-    }
-
     /// Save the (hash, position) tuple into `buffer`, appending an overflow record to the odx log
     /// when the bucket is full. On a duplicate key the existing entry is overwritten in place.
     fn save_to_bucket_buffer(
@@ -450,12 +443,28 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         self.modulus = (self.buckets() + 1).next_power_of_two();
         let split_pos = self.bucket_pos(split_bucket);
         let new_pos = self.bucket_pos(new_bucket);
-        // Make sure we have zeroed space for the new bucket.
-        self.write_bucket(new_pos, &vec![0_u8; Self::BUCKET_SIZE])?;
 
-        // Gather the split bucket's elements with only shared borrows so the writes below can take
-        // `&mut self`.
+        // Gather the split bucket's elements (shared borrows) BEFORE clearing either bucket, then
+        // redistribute into two freshly-zeroed buckets — mirroring the original `HdxIndex` split,
+        // which builds fresh buffers. The split bucket must be cleared too: if it kept its old
+        // contents, the elements that move to `new_bucket` would linger here as stale duplicates,
+        // and a later re-split would re-collect them, hash them into a third bucket, and trip the
+        // guard below (they are never consulted by lookups, so the only visible symptom is that
+        // panic plus unbounded overflow-chain growth).
         let elements = self.collect_bucket_elements(split_bucket)?;
+
+        // Clear both buckets before redistributing: the split bucket in place, and the newly
+        // appended bucket (whose write also extends the file to make room for it).
+        if let Some(buffer) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
+            buffer.fill(0);
+        } else {
+            return Err(AppendError::ReadOnly);
+        }
+        if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
+            buffer.fill(0);
+        } else {
+            return Err(AppendError::ReadOnly);
+        }
 
         for (hash, rec_pos) in elements {
             let bucket = self.hash_to_bucket(hash.as_slice());
@@ -477,8 +486,6 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
             add_crc32(buffer);
         }
-        //self.write_bucket(split_pos, &buffer)?;
-        //self.write_bucket(new_pos, &buffer2)?;
         Ok(())
     }
 
