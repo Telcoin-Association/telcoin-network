@@ -71,6 +71,7 @@
   * [Future Direction](staking/future-direction.md)
 * [Basefees](basefees.md)
 * [Gas Limit Penalty](gas-limit-penalty.md)
+  * [Gas Over-Reservation Penalty](gas-penalty.md)
 * [EVM Compatibility](evm-compatibility.md)
 * [Epoch Boundaries](epoch-boundaries.md)
 * [Canonical Updates](canonical-updates.md)

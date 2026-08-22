@@ -160,7 +160,7 @@ Telcoin Network charges a gas penalty when a transaction sets a gas limit far ab
 The penalty is zero when the gas limit is at or below 210,000, or when the transaction uses at least 10 percent of its limit.
 Below that, the penalty grows quadratically and is deducted from the unused-gas refund, then credited to the chain's base-fee address.
 Transaction receipts do not show the penalty.
-See [docs/gas-penalty.md](docs/gas-penalty.md) for the formula, examples, and how wallets and integrators can detect the charge.
+See [docs/src/gas-penalty.md](docs/src/gas-penalty.md) for the formula, examples, and how wallets and integrators can detect the charge.
 
 ## TN-Contracts Submodule
 

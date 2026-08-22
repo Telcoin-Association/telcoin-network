@@ -90,3 +90,5 @@ The penalty is deducted from what would otherwise be refunded to the transaction
 | Penalty destination           | Governance address                                   |
 | Maximum penalty               | Cannot exceed unused gas                             |
 | Safe multiplier               | Up to 10x estimated gas = zero penalty               |
+
+For the exact formula, worked examples, and guidance for wallets and integrators on detecting the charge, see [Gas Over-Reservation Penalty](gas-penalty.md).
