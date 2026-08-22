@@ -166,3 +166,24 @@
     window.addEventListener('hashchange', requestUpdate);
     update();
 })();
+
+(function tnSidebarRowClick() {
+    // The sidebar pill (.chapter-link-wrapper) is the full clickable row, but
+    // the page link is an inner <a>; a click landing on the pill's padding or
+    // the gap beside the fold toggle would otherwise do nothing. Forward those
+    // to the row's page link. Real <a> targets (the link itself, or the fold
+    // toggle) keep their native behavior.
+    document.addEventListener('click', function (e) {
+        if (!e.target || !e.target.closest) {
+            return;
+        }
+        var wrapper = e.target.closest('.chapter-link-wrapper');
+        if (!wrapper || e.target.closest('a')) {
+            return;
+        }
+        var link = wrapper.querySelector('a[href]:not(.chapter-fold-toggle)');
+        if (link) {
+            link.click();
+        }
+    });
+})();

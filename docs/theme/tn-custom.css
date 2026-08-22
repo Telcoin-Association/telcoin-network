@@ -358,6 +358,11 @@ html:not(.js) .right-buttons button {
     gap: 4px;
     padding: 6px 6px 6px 10px;
     border-radius: 8px;
+    /* The wrapper is the li's full row band (the li itself adds only margin
+       and, when expanded, the nested child list). Pointer + the click
+       forwarder in tn-custom.js make the entire row act as the link, padding
+       included. */
+    cursor: pointer;
 }
 
 .chapter .chapter-link-wrapper:hover {
