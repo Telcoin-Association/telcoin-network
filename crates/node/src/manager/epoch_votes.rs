@@ -130,6 +130,10 @@ async fn manage_epoch_votes(
                                 }
                             }
                         } else if vote.epoch_hash != epoch_hash {
+                            // Defense-in-depth: the primary gossip handler now only forwards votes
+                            // whose digest matches the record it holds, so this branch is not
+                            // reached in normal operation (a forked local record instead recovers
+                            // via the epoch-cert download path below).
                             // Track votes for alternative epoch records — remove key so
                             // a validator can only vote once (correct or alt), no equivocation.
                             if committee_keys.remove(&vote.public_key) {

@@ -15,8 +15,10 @@
 //! work the forwarder sheds to stay within its own bounds:
 //! `tn_reth.forwarded_batches_shed_total` and `tn_reth.forwarded_txns_abandoned_total`. Two more
 //! count the delivery feedback added for issue #1145:
-//! `tn_reth.forward_endpoints_demoted_total` and `tn_reth.forwarded_txns_requeued_total`. See
-//! [`ForwarderMetrics`] for per-series semantics.
+//! `tn_reth.forward_endpoints_demoted_total` and `tn_reth.forwarded_txns_requeued_total`. One
+//! further series, `tn_reth.forwarded_rejections_overridden_total`, is an integrity signal
+//! rather than a loss: it counts validator verdicts that contradicted each other on one
+//! forwarded transaction (issue #1167). See [`ForwarderMetrics`] for per-series semantics.
 //!
 //! [`report_db_metrics`] additionally samples reth database metrics as a pre-scrape hook.
 //!
@@ -129,6 +131,7 @@ const FORWARD_ENDPOINTS_DEMOTED: &str = "tn_reth.forward_endpoints_demoted_total
 const FORWARDED_TXNS_REQUEUED: &str = "tn_reth.forwarded_txns_requeued_total";
 const FORWARDED_TXNS_QUEUED: &str = "tn_reth.forwarded_txns_queued_total";
 const FORWARDED_TXNS_DROPPED: &str = "tn_reth.forwarded_txns_dropped_total";
+const FORWARDED_REJECTIONS_OVERRIDDEN: &str = "tn_reth.forwarded_rejections_overridden_total";
 
 /// Why the forwarding pipeline gave up on a forward attempt it had accepted.
 ///
@@ -158,9 +161,13 @@ pub(crate) enum ForwardDropReason {
     /// transaction-level twin of `tn_reth.forwarded_batches_shed_total`, so shed batches also
     /// subtract from the queued denominator.
     BatchShed,
-    /// A validator's RPC returned a considered rejection (bad nonce, underpriced, invalid).
-    /// Not alertable on its own: the rejection would repeat at every validator, the same way
-    /// `tn_reth.invalid_txs_skipped_total` is expected traffic at execution.
+    /// A validator's RPC returned a considered rejection (bad nonce, underpriced, invalid)
+    /// that stood: a second validator confirmed it, or no further validator was reachable to
+    /// contradict it (issue #1167). Not alertable on its own: an honest rejection repeats at
+    /// every validator, the same way `tn_reth.invalid_txs_skipped_total` is expected traffic
+    /// at execution. A rejection a later delivery contradicted is not counted here - the
+    /// transaction was delivered, and the contradiction is surfaced on
+    /// `tn_reth.forwarded_rejections_overridden_total`.
     Rejected,
     /// The whole fallback chain was tried inside the transaction's budget and no validator
     /// accepted the connection or answered in time. Alertable on a sustained rate: the
@@ -202,8 +209,12 @@ impl ForwardDropReason {
 /// they read against. Forwarding is best-effort, so shedding is a correct outcome rather
 /// than an error - but it is an *absorbed* failure, invisible until it is not, which is
 /// exactly the category that needs to show up somewhere other than a `warn!` line. Transactions
-/// counted here were accepted by this node's RPC and not handed to a validator by that
+/// counted here were accepted by this node's RPC and not delivered to a validator by that
 /// attempt; [`ForwardDropReason`] documents which drops are final and which go back to the pool.
+///
+/// The overridden series is different in kind: it counts validator verdicts that contradicted
+/// each other on one transaction, which is an integrity signal about the committee rather than
+/// a resource decision by this node (issue #1167).
 ///
 /// Associated functions rather than instance handles, matching the epoch manager's
 /// `record_provider_fault_retry`: the emission sites are inside a spawned task that holds no
@@ -212,9 +223,9 @@ impl ForwardDropReason {
 pub(crate) struct ForwarderMetrics;
 
 impl ForwarderMetrics {
-    /// Register every forwarder series (shed, abandoned, demoted, requeued, queued, and one
-    /// dropped series per [`ForwardDropReason`]) with the current recorder without recording
-    /// an event.
+    /// Register every forwarder series (shed, abandoned, demoted, requeued, queued, one
+    /// dropped series per [`ForwardDropReason`], and the rejection-overridden series) with the
+    /// current recorder without recording an event.
     ///
     /// Called from `WorkerRpcForwarder::new`, which runs at epoch start, long after the CLI
     /// installs the global recorder. The reason to register eagerly is the same one [`init`]
@@ -231,6 +242,7 @@ impl ForwarderMetrics {
         ForwardDropReason::ALL.iter().for_each(|reason| {
             metrics::counter!(FORWARDED_TXNS_DROPPED, "reason" => reason.label()).increment(0);
         });
+        metrics::counter!(FORWARDED_REJECTIONS_OVERRIDDEN).increment(0);
     }
 
     /// Count one sealed batch dropped without being forwarded because every forward permit was
@@ -285,6 +297,19 @@ impl ForwarderMetrics {
     /// here were accepted by this node's RPC and never delivered to a validator.
     pub(crate) fn record_txns_dropped(reason: ForwardDropReason, count: u64) {
         metrics::counter!(FORWARDED_TXNS_DROPPED, "reason" => reason.label()).increment(count);
+    }
+
+    /// Count one considered rejection that a later validator contradicted by accepting the
+    /// same transaction (issue #1167).
+    ///
+    /// Alertable on a sustained rate. Honest validators share consensus state, so their
+    /// verdicts on one transaction should agree; a rejection followed by an acceptance means
+    /// the rejecting validator answered from divergent state or lied. A rare blip can be an
+    /// honest race (the sender's account state moved between the two calls); a sustained rate,
+    /// or any rate whose `rejected_by` log lines point at one validator, is a byzantine
+    /// signal.
+    pub(crate) fn record_rejection_overridden() {
+        metrics::counter!(FORWARDED_REJECTIONS_OVERRIDDEN).increment(1);
     }
 }
 

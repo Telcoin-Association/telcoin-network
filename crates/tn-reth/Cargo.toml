@@ -11,7 +11,9 @@ authors = [
 publish = false
 
 [dependencies]
-jsonrpsee = { workspace = true }
+# `server` + `macros` back the `--rpc.txfeecap` guard's method overrides (`rpc_fee_cap`).
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 tn-config = { workspace = true }
 tn-types = { workspace = true }

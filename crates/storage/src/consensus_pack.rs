@@ -949,10 +949,14 @@ impl Inner {
             false,
         )
         .map_err(OpenError::IndexFileOpen)?;
-        let mut parent_digest = if epoch == 0 {
-            ConsensusHeader::default().digest()
+        let mut parent_digest_expectation = if epoch == 0 {
+            // Don't worry about consensus block 1 in epoch 0, if it is invalid other verifications
+            // will fail (for instance epoch 0 final state will not verify). This can be set but
+            // doing so forces fork aware code here and verification will fail with an invalid value
+            // either way.
+            HeaderExpectation::None
         } else {
-            previous_epoch.final_consensus.hash
+            HeaderExpectation::Parent(previous_epoch.final_consensus.hash)
         };
         let mut pack =
             Self { data, consensus_pos_idx, consensus_digests, batch_digests, epoch_meta };
@@ -966,7 +970,7 @@ impl Inner {
                     &mut stream_iter,
                     timeout,
                     &pack.epoch_meta.committee,
-                    HeaderExpectation::Parent(parent_digest),
+                    parent_digest_expectation,
                 )
                 .await
                 {
@@ -979,7 +983,7 @@ impl Inner {
                     &mut stream_iter,
                     timeout,
                     &pack.epoch_meta.committee,
-                    HeaderExpectation::Parent(parent_digest),
+                    parent_digest_expectation,
                 )
                 .await
                 {
@@ -995,7 +999,7 @@ impl Inner {
                     final_consensus_number,
                 ));
             }
-            parent_digest = output.digest();
+            parent_digest_expectation = HeaderExpectation::Parent(output.digest());
             pack.save_consensus_output(&output)?;
         }
         Ok(pack)
@@ -2081,7 +2085,9 @@ pub(crate) mod test {
     /// Build a [`ConsensusOutput`] whose single leader header references `num_batches` unique
     /// batches, standing in for a deep sub-DAG that exceeds the old fixed reconstruction cap
     /// but stays within the committee-derived bound.
-    fn make_wide_test_output(
+    ///
+    /// Reused by `pack_bench` as the single output-width knob for the observation benchmark.
+    pub(crate) fn make_wide_test_output(
         committee: &Committee,
         chain: Arc<RethChainSpec>,
         number: u64,

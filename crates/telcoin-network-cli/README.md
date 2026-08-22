@@ -388,7 +388,7 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 | `--rpc.max-connections`                  | `500`         | Max concurrent RPC connections           |
 | `--rpc.max-tracing-requests`             | CPU-dependent | Max concurrent tracing requests          |
 | `--rpc.gascap`                           | Reth default  | Max gas for `eth_call`                   |
-| `--rpc.txfeecap`                         | `1.0` (ETH)   | Max transaction fee via RPC (0 = no cap) |
+| `--rpc.txfeecap`                         | `0` (no cap)  | Max transaction fee via RPC (0 = no cap) |
 
 ### available RPC modules
 
