@@ -329,6 +329,40 @@ where
                 (previous.into_iter().collect(), next)
             };
 
+        // A mid-epoch on-chain ejection mutates the CURRENT epoch's validator array in place,
+        // so the pinned entry read above returns the previous epoch's post-ejection (shrunken)
+        // committee. The ejected member's boundary traffic is still in flight, though: its final
+        // epoch-close vote is authored moments before the shrink lands and re-propagates into
+        // this epoch. `spawn_primary_network_for_epoch` derives both the boundary-publisher
+        // allowlist and the peer manager's penalty-exemption slots from this set, so leaving the
+        // ejected member out has `verify_gossip` rejecting that vote as `UnauthorizedAuthor` and
+        // every peer applying `Penalty::Fatal`: the honest, just-ejected node is permanently
+        // banned network-wide and cannot degrade to a following observer (issue #1244). Restore
+        // the pre-shrink membership from the sealed record chain: epoch N-2's record carries
+        // epoch N-1's committee as it stood at N-1's start (`next_committee`), before any
+        // mid-epoch ejection. Epochs 0 and 1 have no grandparent record (epoch 0's committee is
+        // genesis-configured), so an ejection inside epoch 0 stays out of scope here.
+        //
+        // A missing grandparent record is a corrupt datadir for `resolve_prior_epoch_record`,
+        // but this widening is network hygiene, not a consensus input: fail open (no widening)
+        // and let the stricter path own the halt.
+        let previous_committee_keys = if entered >= 2 {
+            let grandparent = self.consensus_chain.epochs().record_by_epoch(entered - 2).await;
+            if grandparent.is_none() {
+                warn!(
+                    target: "epoch-manager",
+                    entered,
+                    missing_record = entered - 2,
+                    "grandparent epoch record missing or unreadable (record_by_epoch collapses \
+                     storage errors to None); cannot restore pre-shrink members to the boundary \
+                     gossip window"
+                );
+            }
+            widen_previous_committee_with_preshrink(previous_committee_keys, grandparent.as_ref())
+        } else {
+            previous_committee_keys
+        };
+
         let consensus_config = self
             .configure_consensus(network_config, committee, next_committee_keys, prior_epoch_record)
             .await?;
@@ -1022,6 +1056,42 @@ async fn resolve_prior_epoch_record(
     Ok((rec, digest))
 }
 
+/// Restore mid-epoch-ejected members of the previous epoch to its committee-key set.
+///
+/// `grandparent_record` is epoch N-2's sealed record when entering epoch N; its `next_committee`
+/// is epoch N-1's committee as it stood at N-1's start, before any mid-epoch on-chain ejection
+/// shrank the registry's array in place. The union is everyone who operated as a committee member
+/// at any point during epoch N-1: exactly the population whose boundary gossip (epoch-close
+/// votes, the epoch's final consensus output) is still in flight when epoch N's network comes up,
+/// and therefore the population `verify_gossip` and the peer manager's penalty exemption must not
+/// treat as never-committee strangers (issue #1244).
+///
+/// Scope: the returned set feeds ONLY the network layer (gossip publisher authorization and
+/// penalty-exemption slots). Quorum and voting always resolve through the epoch's
+/// `ConsensusConfig` committee, and the epoch-vote handler checks authorship against the sealed
+/// record's (post-shrink) committee, so an ejected member regains no consensus authority. The
+/// grace is deliberate and epoch-bounded: like any rotated-out member in the previous slot, the
+/// restored member is also unbanned and score-primed by `update_committees` for this one epoch,
+/// then ages out of the window at the next boundary.
+fn widen_previous_committee_with_preshrink(
+    onchain_previous: HashSet<BlsPublicKey>,
+    grandparent_record: Option<&EpochRecord>,
+) -> HashSet<BlsPublicKey> {
+    let preshrink: HashSet<BlsPublicKey> = grandparent_record
+        .map(|record| record.next_committee.iter().copied().collect())
+        .unwrap_or_default();
+    let ejected: Vec<BlsPublicKey> = preshrink.difference(&onchain_previous).copied().collect();
+    if !ejected.is_empty() {
+        warn!(
+            target: "epoch-manager",
+            ?ejected,
+            "previous committee shrank mid-epoch: keeping the ejected member(s) in the boundary \
+             gossip window so their in-flight epoch-close traffic is not fatally penalized"
+        );
+    }
+    onchain_previous.into_iter().chain(ejected).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,6 +1141,53 @@ mod tests {
         assert_eq!(rec.committee, committee);
         assert_eq!(rec.next_committee, committee);
         assert_eq!(anchor, EpochDigest::default(), "epoch 0 anchors on the default digest");
+    }
+
+    /// A member in the grandparent record's `next_committee` but missing from the on-chain
+    /// (post-ejection) previous-committee read is restored to the boundary window, alongside
+    /// every on-chain member (issue #1244).
+    #[test]
+    fn widen_restores_mid_epoch_ejected_member() {
+        let keys = resolve_test_keys(4);
+        let onchain: HashSet<BlsPublicKey> = keys.iter().copied().take(3).collect();
+        let record = EpochRecord { epoch: 1, next_committee: keys.clone(), ..Default::default() };
+        let widened = widen_previous_committee_with_preshrink(onchain, Some(&record));
+        assert_eq!(widened.len(), 4, "the ejected member is restored");
+        assert!(keys.iter().all(|key| widened.contains(key)));
+    }
+
+    /// Without a grandparent record the on-chain read passes through unchanged.
+    #[test]
+    fn widen_without_grandparent_is_identity() {
+        let keys = resolve_test_keys(3);
+        let onchain: HashSet<BlsPublicKey> = keys.iter().copied().collect();
+        let widened = widen_previous_committee_with_preshrink(onchain.clone(), None);
+        assert_eq!(widened, onchain);
+    }
+
+    /// The result is the UNION: an on-chain member absent from the grandparent record survives
+    /// alongside the restored member, pinning the direction of the merge.
+    #[test]
+    fn widen_keeps_onchain_only_members() {
+        let keys = resolve_test_keys(5);
+        let record_committee: Vec<BlsPublicKey> = keys.iter().copied().take(4).collect();
+        let onchain: HashSet<BlsPublicKey> =
+            keys.iter().copied().take(3).chain(keys.iter().copied().skip(4)).collect();
+        let record =
+            EpochRecord { epoch: 1, next_committee: record_committee, ..Default::default() };
+        let widened = widen_previous_committee_with_preshrink(onchain, Some(&record));
+        assert_eq!(widened.len(), 5, "union keeps both sides");
+        assert!(keys.iter().all(|key| widened.contains(key)));
+    }
+
+    /// When no mid-epoch shrink happened (record and chain agree) the set is unchanged.
+    #[test]
+    fn widen_no_shrink_is_identity() {
+        let keys = resolve_test_keys(4);
+        let onchain: HashSet<BlsPublicKey> = keys.iter().copied().collect();
+        let record = EpochRecord { epoch: 1, next_committee: keys, ..Default::default() };
+        let widened = widen_previous_committee_with_preshrink(onchain.clone(), Some(&record));
+        assert_eq!(widened, onchain);
     }
 
     /// A self-sealed prior record stored WITHOUT a certificate still releases the seed anchor (the

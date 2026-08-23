@@ -186,7 +186,8 @@ where
     ///
     /// These components are short-lived: they exist only for the current epoch and are torn
     /// down at its close. The node mode is (re)identified first, and the previous epoch's
-    /// committee keys — resolved by `run_epoch`'s batched read pinned to `epoch_start_header` —
+    /// committee keys — resolved by `run_epoch`'s batched read pinned to `epoch_start_header`,
+    /// widened with any members ejected on-chain mid-previous-epoch (issue #1244) —
     /// are threaded in so peers from the outgoing committee are not banned during the handover.
     /// `initial_epoch` is threaded down to gate the one-time per-process network setup (see
     /// [`init_network_for_epoch`]).
@@ -582,7 +583,10 @@ where
         // `update_committees` (the previous/current/next slots, issue #715), so the
         // propagation-authorization window and the penalty-exemption window agree rather than
         // dropping gossip from a peer the scoring layer already trusts. Never-committee peers are
-        // still excluded. Built here, before the committee sets are moved into
+        // still excluded. The previous slot includes members ejected on-chain mid-previous-epoch
+        // (`widen_previous_committee_with_preshrink`): their final epoch-close vote is exactly
+        // such in-flight boundary traffic, and excluding them fatally bans an honest node at the
+        // boundary (issue #1244). Built here, before the committee sets are moved into
         // `init_network_for_epoch`. See issues #898 and #912.
         let boundary_publishers: HashSet<BlsPublicKey> = previous_committee_keys
             .iter()
