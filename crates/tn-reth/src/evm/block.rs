@@ -99,7 +99,7 @@ use crate::{
     system_calls::{
         decode_worker_fee_configs, log_registry_event,
         ConsensusRegistry::{self, RewardInfo, ValidatorStatus},
-        WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS,
+        RegistryEvents, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS,
     },
     SYSTEM_ADDRESS,
 };
@@ -258,22 +258,27 @@ pub(crate) struct TNBlockExecutor<Evm, Spec, R: ReceiptBuilder> {
 
 /// Surface the logs a successful system call emitted, off-consensus.
 ///
-/// A system call produces no receipt, so the `ConsensusRegistry` lifecycle events its
-/// `onlySystemCall` paths emit (`NewEpoch`, `ValidatorActivated`, `ValidatorExited`,
-/// `ValidatorSlashed`, `ValidatorRetired`, `NextCommitteeSizeUpdated`, ...) are otherwise visible
-/// only in the `trace!(?res)` dump. Each log from [`CONSENSUS_REGISTRY_ADDRESS`] is decoded into
-/// its typed event and emitted at `info!` by [`log_registry_event`], named, so an operator's log
-/// shows every epoch boundary, activation, exit, slash, and retirement. A registry log whose
-/// topic the binding does not know, and any log from another contract (the `WorkerConfigs`
-/// writes emit `WorkerConfigUpdated`), are emitted raw at `debug!` with address, topics, and
-/// data: never dropped, never promoted to a line that looks decoded.
+/// A system call produces no receipt (see [`TNBlockExecutor::transact_and_commit_system_call`],
+/// which owns that constraint), so the `ConsensusRegistry` lifecycle events its `onlySystemCall`
+/// paths emit are otherwise visible only in the `trace!(?res)` dump. Each log from
+/// [`CONSENSUS_REGISTRY_ADDRESS`] is decoded into its typed event and emitted at `info!` by
+/// [`log_registry_event`], named, so an operator's log shows every epoch boundary, activation,
+/// exit, slash, and retirement.
+///
+/// Decoding goes through [`RegistryEvents`], generated from the compiled artifact, so it covers
+/// the registry's whole event ABI rather than the subset the call surface curates — including the
+/// inherited ERC-721 `Transfer` that a slash-to-zero ejection's NFT burn emits, which is named
+/// here rather than falling through as an unknown topic. A registry log whose topic even that
+/// binding does not know (a redeployed contract this build predates), and any log from another
+/// contract (the `WorkerConfigs` writes emit `WorkerConfigUpdated`), are emitted raw at `debug!`
+/// with address, topics, and data: never dropped, never promoted to a line that looks decoded.
 ///
 /// Observational only: reads the logs, writes nothing. Epoch boundaries are rare and emit a
 /// bounded handful of events (one per activation/exit plus `NewEpoch`), so `info!` does not flood
 /// the log, and a non-closing block never reaches this function.
 fn surface_system_call_logs(description: &str, logs: &[Log]) {
     logs.iter().map(classify_system_call_log).for_each(|classified| match classified {
-        SystemCallLog::Registry(event) => log_registry_event(description, event),
+        SystemCallLog::Registry(log, event) => log_registry_event(description, log, &event),
         SystemCallLog::UnknownRegistryTopic(log, error) => debug!(
             target: "engine",
             %error,
@@ -296,21 +301,24 @@ fn surface_system_call_logs(description: &str, logs: &[Log]) {
 /// Split out of the emitting function so the classification is testable without a tracing
 /// subscriber: the variant decides which log line fires, and the decoded payload rides inside it.
 enum SystemCallLog<'a> {
-    /// A log from [`CONSENSUS_REGISTRY_ADDRESS`] that decoded into a bound registry event.
-    Registry(ConsensusRegistry::ConsensusRegistryEvents),
-    /// A log from [`CONSENSUS_REGISTRY_ADDRESS`] whose topic the `sol!` binding does not know,
-    /// with the decode error.
+    /// A log from [`CONSENSUS_REGISTRY_ADDRESS`] that decoded into a bound registry event, paired
+    /// with the raw log it came from. [`log_registry_event`] names the event by looking its
+    /// topic-0 up in the artifact's selector table, so the source log rides along rather than
+    /// being re-encoded to recover a hash the caller already has.
+    Registry(&'a Log, RegistryEvents),
+    /// A log from [`CONSENSUS_REGISTRY_ADDRESS`] whose topic the artifact binding does not know,
+    /// with the decode error. Reachable only against a registry deployment newer than this build.
     UnknownRegistryTopic(&'a Log, alloy::sol_types::Error),
     /// A log from any other contract.
     Foreign(&'a Log),
 }
 
-/// Classify one system-call log: a registry log is decoded through the `sol!` events binding,
-/// every other log passes through untouched.
+/// Classify one system-call log: a registry log is decoded through the artifact-generated events
+/// binding, every other log passes through untouched.
 fn classify_system_call_log(log: &Log) -> SystemCallLog<'_> {
     if log.address == CONSENSUS_REGISTRY_ADDRESS {
-        ConsensusRegistry::ConsensusRegistryEvents::decode_log(log)
-            .map(|decoded| SystemCallLog::Registry(decoded.data))
+        RegistryEvents::decode_log(log)
+            .map(|decoded| SystemCallLog::Registry(log, decoded.data))
             .unwrap_or_else(|error| SystemCallLog::UnknownRegistryTopic(log, error))
     } else {
         SystemCallLog::Foreign(log)
@@ -366,11 +374,9 @@ where
     /// No receipt is built for a system call, matching Ethereum: the logs it emits reach neither
     /// the receipts root, the header `logs_bloom`, nor `eth_getLogs`, and they must not, since
     /// adding them would change `receipts_root` and be a hard fork. The success arm instead hands
-    /// them to [`surface_system_call_logs`], which decodes the registry's lifecycle events and
-    /// emits them node-side at `info!`, the only place an operator sees a `NewEpoch`,
-    /// `ValidatorActivated`, `ValidatorExited`, or `ValidatorSlashed`. That path is observational
-    /// only and runs after the result is known good; it touches neither `res.state` nor the gas
-    /// accounting.
+    /// them to [`surface_system_call_logs`], which is where the node-side `info!` lines and their
+    /// rationale live. That path is observational only and runs after the result is known good;
+    /// it touches neither `res.state` nor the gas accounting.
     fn transact_and_commit_system_call(
         &mut self,
         contract: Address,
@@ -2061,13 +2067,13 @@ mod tests {
     /// Pins the classification the off-consensus log surfacing in
     /// `transact_and_commit_system_call` depends on: a real `concludeEpoch` system call against
     /// the deployed registry, run on a side-effect-free EVM at the genesis tip, must emit a log
-    /// that [`classify_system_call_log`] routes to `SystemCallLog::Registry(NewEpoch)` carrying
-    /// the decoded next epoch id and committee, and no log that falls through as
+    /// that [`classify_system_call_log`] routes to `SystemCallLog::Registry(_, NewEpoch)`
+    /// carrying the decoded next epoch id and committee, and no log that falls through as
     /// `UnknownRegistryTopic` or `Foreign`. The unit test in `system_calls.rs` round-trips a
-    /// hand-built log through the binding; this one runs the contract's own emit, so a topic
-    /// drift between the Solidity `NewEpoch(EpochInfo)` signature and the `sol!` binding (which
-    /// would silently demote every epoch boundary to the raw "unknown topic" line) fails here
-    /// rather than in an operator's log.
+    /// hand-built log through the binding; this one runs the contract's own emit against the
+    /// deployed bytecode, so a divergence between the artifact this crate compiles against and
+    /// the registry actually deployed in genesis (which would silently demote every epoch
+    /// boundary to the raw "unknown topic" line) fails here rather than in an operator's log.
     ///
     /// Contract note: `concludeEpoch` emits the STARTING committee of the new epoch, which at
     /// genesis is the initial validator set the constructor seeded for epochs 0..=2 in ceremony
@@ -2075,7 +2081,7 @@ mod tests {
     /// equals the sorted `newCommittee` passed in (which the contract files for epoch 3).
     #[tokio::test]
     async fn system_call_logs_classify_to_named_registry_events() -> eyre::Result<()> {
-        use ConsensusRegistry::ConsensusRegistryEvents as E;
+        use crate::system_calls::RegistryEvents as E;
 
         let genesis = test_genesis_with_consensus_registry(4);
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
@@ -2132,7 +2138,7 @@ mod tests {
         let unclassified: Vec<(Address, Vec<B256>)> = logs
             .iter()
             .zip(classified.iter())
-            .filter(|(_, c)| !matches!(c, SystemCallLog::Registry(_)))
+            .filter(|(_, c)| !matches!(c, SystemCallLog::Registry(..)))
             .map(|(log, _)| (log.address, log.topics().to_vec()))
             .collect();
         assert!(
@@ -2143,14 +2149,14 @@ mod tests {
         // (a) the `NewEpoch` for the next epoch carries the decoded id and committee
         let new_epoch_count = classified
             .iter()
-            .filter(|c| matches!(c, SystemCallLog::Registry(E::NewEpoch(_))))
+            .filter(|c| matches!(c, SystemCallLog::Registry(_, E::NewEpoch(_))))
             .count();
         let matching = classified
             .iter()
             .filter(|c| {
                 matches!(
                     c,
-                    SystemCallLog::Registry(E::NewEpoch(e))
+                    SystemCallLog::Registry(_, E::NewEpoch(e))
                         if e.epoch.epochId == expected_epoch_id
                             && e.epoch.committee == new_committee
                 )
