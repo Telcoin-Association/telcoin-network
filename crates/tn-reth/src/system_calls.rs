@@ -12,11 +12,11 @@
 //!   mutators the protocol invokes as system calls in the closing block (`applyIncentives`, then
 //!   `applySlashes`, then `concludeEpoch`). Curated, not exhaustive: it binds what the node calls
 //!   and decodes, in the Rust types the node needs.
-//! - [`registry_abi`] — the registry's log surface, generated from the compiled Foundry artifact
-//!   and therefore covering the contract's WHOLE event ABI, inherited events included. System calls
-//!   build no receipt, so the events the boundary mutators emit are surfaced node-side only:
-//!   [`log_registry_event`] names and emits each one at `info!` from the system-call path in
-//!   `evm/block.rs`.
+//! - `registry_abi` (crate-private; [`RegistryEvents`] is its public face) — the registry's log
+//!   surface, generated from the compiled Foundry artifact and therefore covering the contract's
+//!   WHOLE event ABI, inherited events included. System calls build no receipt, so the events the
+//!   boundary mutators emit are surfaced node-side only: [`log_registry_event`] names and emits
+//!   each one at `info!` from the system-call path in `evm/block.rs`.
 //! - `LegacyConsensusRegistry` — the pre-fork registry's epoch-close surface, frozen so pre-fork
 //!   epoch closes replay byte-identically (see the code-hash gate in `evm/block.rs`).
 //! - `WorkerConfigs` — per-worker base-fee strategy used for base fee adjustment, plus the
@@ -375,12 +375,18 @@ sol!(
 /// flattens Solidity `enum`s to `uint8`, so it yields neither the typed
 /// `ConsensusRegistry::ValidatorStatus` (a JSON-RPC wire type) nor the per-type `serde` derives
 /// the node's epoch state carries.
-// `missing_docs` is allowed for the module, not the crate: `sol!` documents every item it emits
-// except the newtypes it lowers Solidity `enum`s to (`IConsensusRegistry::ValidatorStatus` here),
-// and neither an attribute on the invocation (ignored on macro calls) nor one forwarded through it
-// reaches them. Nothing hand-written belongs in here, so the allow costs no coverage.
-#[allow(missing_docs)]
-pub mod registry_abi {
+/// `pub(crate)` deliberately: the whole artifact expands to ~77 call structs, 48 error types, and
+/// the two bytecode statics, none of which this crate uses and all of which would otherwise become
+/// `tn-reth` public API duplicating the hand-written call surface above. The
+/// [`RegistryEvents`] re-export below is the one supported entry point, and it stays public.
+// Both allows are scoped to the module rather than the crate, and neither can be narrowed further:
+// an attribute on a macro invocation is ignored by rustc, and one forwarded through `sol!` does not
+// reach the items it emits. `missing_docs` covers the newtypes `sol!` lowers Solidity `enum`s to
+// (`IConsensusRegistry::ValidatorStatus` here), the only items it emits undocumented;
+// `unreachable_pub` covers the `pub` items the macro emits inside this now-private module. Nothing
+// hand-written belongs in here, so the allows cost no coverage.
+#[allow(missing_docs, unreachable_pub)]
+pub(crate) mod registry_abi {
     alloy::sol!(
         #[derive(Debug)]
         ConsensusRegistry,
@@ -390,8 +396,9 @@ pub mod registry_abi {
 
 /// Every event the deployed `ConsensusRegistry` can emit, decodable from a log by topic-0.
 ///
-/// Aliased out of [`registry_abi`] so call sites are not three module hops deep; the enum is
-/// the only thing this crate uses from that binding.
+/// Aliased out of the crate-private `registry_abi` so call sites are not three module hops
+/// deep; the enum is the only thing this crate uses from that binding, and this alias is the
+/// only part of it that is public API.
 pub use registry_abi::ConsensusRegistry::ConsensusRegistryEvents as RegistryEvents;
 
 /// Emit one decoded `ConsensusRegistry` event at `info!` under the `engine` target, named.

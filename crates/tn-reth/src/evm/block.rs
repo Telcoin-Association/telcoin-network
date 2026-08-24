@@ -269,13 +269,22 @@ pub(crate) struct TNBlockExecutor<Evm, Spec, R: ReceiptBuilder> {
 /// the registry's whole event ABI rather than the subset the call surface curates — including the
 /// inherited ERC-721 `Transfer` that a slash-to-zero ejection's NFT burn emits, which is named
 /// here rather than falling through as an unknown topic. A registry log whose topic even that
-/// binding does not know (a redeployed contract this build predates), and any log from another
+/// binding does not know (a deployment this build's artifact does not cover, in either direction —
+/// see [`SystemCallLog::UnknownRegistryTopic`]), and any log from another
 /// contract (the `WorkerConfigs` writes emit `WorkerConfigUpdated`), are emitted raw at `debug!`
 /// with address, topics, and data: never dropped, never promoted to a line that looks decoded.
 ///
-/// Observational only: reads the logs, writes nothing. Epoch boundaries are rare and emit a
-/// bounded handful of events (one per activation/exit plus `NewEpoch`), so `info!` does not flood
-/// the log, and a non-closing block never reaches this function.
+/// Observational only: reads the logs, writes nothing, and a non-closing block never reaches this
+/// function. Volume per closing block: `applyIncentives` emits nothing; `concludeEpoch` emits
+/// `NewEpoch` plus one event per queue entry (activation, exit, or stake-version settlement, which
+/// adds up to two) — bounded by the ConsensusNFT supply, not by the committee size;
+/// `migrateValidatorSets` emits exactly one `ValidatorSetsMigrated`, once, at the fork. So `info!`
+/// is not a flood risk today. `applySlashes` is the exception to watch: it adds one
+/// `ValidatorSlashed` per entry and roughly five more per slash-to-zero ejection, and its bound is
+/// the system-call gas cap rather than the validator count, because the slash array is
+/// caller-supplied and the contract does not dedupe it. That is moot while
+/// [`TNBlockExecutor::epoch_boundary_slashes`] returns an empty list, but enabling slashing should
+/// revisit this level rather than assume the bound above.
 fn surface_system_call_logs(description: &str, logs: &[Log]) {
     logs.iter().map(classify_system_call_log).for_each(|classified| match classified {
         SystemCallLog::Registry(log, event) => log_registry_event(description, log, &event),
@@ -307,7 +316,13 @@ enum SystemCallLog<'a> {
     /// being re-encoded to recover a hash the caller already has.
     Registry(&'a Log, RegistryEvents),
     /// A log from [`CONSENSUS_REGISTRY_ADDRESS`] whose topic the artifact binding does not know,
-    /// with the decode error. Reachable only against a registry deployment newer than this build.
+    /// with the decode error. Reachable against any deployment whose event ABI this build's
+    /// artifact does not cover, an OLDER one as readily as a newer one: on an `adiri` build below
+    /// `CONSENSUS_REGISTRY_FORK_EPOCH` the legacy close is what runs at every production epoch
+    /// close today, and it routes its logs through this same classifier. Both pinned deployments
+    /// are covered all the same — the pre-fork registry's 18 events are a byte-identical subset of
+    /// the artifact's 27, so even a pre-fork `NewEpoch` decodes by name. An unknown topic here is
+    /// a genuine fallback, not a sign of a redeploy that never happened.
     UnknownRegistryTopic(&'a Log, alloy::sol_types::Error),
     /// A log from any other contract.
     Foreign(&'a Log),
@@ -2125,9 +2140,8 @@ mod tests {
         let logs = res.result.logs();
         assert!(
             !logs.is_empty(),
-            "concludeEpoch succeeded (gas used {}) but emitted {} logs",
-            res.result.gas_used(),
-            logs.len()
+            "concludeEpoch succeeded (gas used {}) but emitted no logs",
+            res.result.gas_used()
         );
 
         let classified: Vec<SystemCallLog<'_>> =
@@ -2162,13 +2176,126 @@ mod tests {
                 )
             })
             .count();
-        assert!(
-            matching >= 1,
-            "expected NewEpoch(epochId {expected_epoch_id}, committee {new_committee:?}); saw \
-             {new_epoch_count} NewEpoch log(s) among {} log(s), gas used {}",
+        assert_eq!(
+            matching,
+            1,
+            "expected exactly one NewEpoch(epochId {expected_epoch_id}, committee \
+             {new_committee:?}); saw {new_epoch_count} NewEpoch log(s) among {} log(s), gas used {}",
             logs.len(),
             res.result.gas_used()
         );
+
+        Ok(())
+    }
+
+    /// The sibling pin for the inherited half of the log surface: a slash-to-zero ejection's
+    /// ERC-721 `Transfer`, driven by the contract's own `_burn` rather than by a hand-built log.
+    ///
+    /// `applySlashes` with `amount >= balance` takes the ejection branch (`balances[v] > amount`
+    /// is false), which runs `_consensusBurn` → `_burnConsensusNFT` → OpenZeppelin's ERC-721
+    /// `_burn`, so the burn `Transfer(validator, 0x0, tokenId)` is emitted from
+    /// [`CONSENSUS_REGISTRY_ADDRESS`] on a system-call path — a path that produces no receipt, so
+    /// this log line is the only place it surfaces. The unit test in `system_calls.rs` pins the
+    /// same event from a hand-built log; this one proves the real contract's emit classifies,
+    /// which a binding limited to the registry's OWN events cannot do: it would route the burn to
+    /// `SystemCallLog::UnknownRegistryTopic` and demote every ejection to the raw `debug!` line.
+    ///
+    /// Runs on the same side-effect-free EVM at the genesis tip as the `concludeEpoch` test above.
+    /// Ejecting one of four genesis validators leaves three eligible and three-member epoch-1 and
+    /// epoch-2 committees, which clears the registry's `_checkCommitteeSize` guard, so the whole
+    /// `_consensusBurn` path runs to the burn instead of reverting on committee size.
+    #[tokio::test]
+    async fn system_call_logs_classify_a_slash_ejection_burn_transfer() -> eyre::Result<()> {
+        use crate::system_calls::RegistryEvents as E;
+
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("System Call Burn Log Test");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)?;
+
+        let EpochState { epoch, validators: committee, .. } =
+            reth_env.epoch_state_from_canonical_tip()?;
+        assert_eq!(epoch, 0);
+        assert_eq!(committee.len(), 4, "genesis seeds four Active validators");
+        let victim = committee[0].validatorAddress;
+
+        // side-effect-free EVM at the genesis tip: the call runs, nothing is committed
+        let mut tn_evm = reth_env.tn_evm(chain.sealed_genesis_header().hash())?;
+
+        // read the outstanding stake-backed balance rather than hardcoding the genesis stake: the
+        // registry ejects only when `balances[victim] <= slash.amount`, so this is the exact
+        // threshold amount, and reading it keeps the test correct if the seeded `StakeConfig`
+        // changes
+        let (outstanding, _initial_stake, _rewards) = reth_env
+            .call_consensus_registry::<_, (U256, U256, U256)>(
+                &mut tn_evm,
+                ConsensusRegistry::getBalanceBreakdownCall { validatorAddress: victim }
+                    .abi_encode()
+                    .into(),
+            )?;
+        assert!(outstanding > U256::ZERO, "a genesis validator is staked");
+
+        let calldata = ConsensusRegistry::applySlashesCall {
+            slashes: vec![ConsensusRegistry::Slash {
+                validatorAddress: victim,
+                amount: outstanding,
+            }],
+        }
+        .abi_encode()
+        .into();
+        let res =
+            tn_evm.transact_system_call(SYSTEM_ADDRESS, CONSENSUS_REGISTRY_ADDRESS, calldata)?;
+
+        // (a) the call succeeded, so the ejection actually ran
+        assert!(
+            res.result.is_success(),
+            "applySlashes at genesis must succeed, got {:?}",
+            res.result
+        );
+        let logs = res.result.logs();
+        assert!(
+            !logs.is_empty(),
+            "applySlashes succeeded (gas used {}) but emitted no logs",
+            res.result.gas_used()
+        );
+
+        let classified: Vec<SystemCallLog<'_>> =
+            logs.iter().map(classify_system_call_log).collect();
+
+        // (b) every log the ejection emits decodes to a named registry event: nothing falls
+        // through as an unknown topic or as a foreign contract's log
+        let unclassified: Vec<(Address, Vec<B256>)> = logs
+            .iter()
+            .zip(classified.iter())
+            .filter(|(_, c)| !matches!(c, SystemCallLog::Registry(..)))
+            .map(|(log, _)| (log.address, log.topics().to_vec()))
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "logs that did not decode to a registry event (address, topics): {unclassified:?}"
+        );
+
+        // (c) exactly one of them is the NFT burn: a token sent to the zero address
+        let burns: Vec<(Address, U256)> = classified
+            .iter()
+            .filter_map(|c| match c {
+                SystemCallLog::Registry(_, E::Transfer(t)) if t.to == Address::ZERO => {
+                    Some((t.from, t.tokenId))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            burns.len(),
+            1,
+            "expected exactly one ERC-721 burn Transfer(_, 0x0, _); saw {burns:?} among {} \
+             classified log(s), gas used {}",
+            logs.len(),
+            res.result.gas_used()
+        );
+        assert_eq!(burns[0].0, victim, "the burned consensus NFT was the slashed validator's");
 
         Ok(())
     }
