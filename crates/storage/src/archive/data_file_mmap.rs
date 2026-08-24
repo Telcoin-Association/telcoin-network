@@ -366,6 +366,28 @@ impl MmapDataFile {
         self.grow_to(new_cap)
     }
 
+    /// Ensure the logical length is at least `new_len`, extending the mapping (growing capacity
+    /// geometrically if needed) so `[end, new_len)` becomes addressable for `slice`/`slice_mut`.
+    /// The extended region reads as zeros — fresh file growth is zero-filled and the capacity
+    /// padding past `end` is never written — so callers can treat it as freshly-zeroed space. Never
+    /// shrinks. Unlike [`Self::set_len`], growth is geometric (a remap only when a step crosses the
+    /// current capacity), so repeated one-record extensions (e.g. the digest index adding a bucket
+    /// per split) do not remap every call.
+    pub fn ensure_len(&mut self, new_len: u64) -> io::Result<()> {
+        if new_len <= self.end {
+            return Ok(());
+        }
+        if self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::ReadOnlyFilesystem,
+                "file not open for write",
+            ));
+        }
+        self.ensure_capacity(new_len)?;
+        self.end = new_len;
+        Ok(())
+    }
+
     /// Truncate or extend the logical (and physical) file to `len`. Used by the pack heal/truncate
     /// path; leaves the physical file exactly `len` bytes.
     pub fn set_len(&mut self, len: u64) -> io::Result<()> {

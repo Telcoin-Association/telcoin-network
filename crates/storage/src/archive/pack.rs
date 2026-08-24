@@ -70,6 +70,17 @@ pub trait PackFileIo: Read + Write + Seek + Send + Sync + Debug {
     /// None if outside the file range or unsupported (should fall back on normal Read trait in that
     /// case).
     fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]>;
+    /// Ensure the logical length is at least `new_len`, zero-extending if needed (never shrinks) so
+    /// the extended range becomes addressable for `slice`/`slice_mut`. The default extends via
+    /// [`set_len`](Self::set_len); the mmap backend overrides it with geometric growth so repeated
+    /// one-record extensions (e.g. the digest index adding a bucket per split) do not remap each
+    /// call.
+    fn ensure_len(&mut self, new_len: u64) -> io::Result<()> {
+        if new_len > self.len() {
+            self.set_len(new_len)?;
+        }
+        Ok(())
+    }
 }
 
 impl PackFileIo for DataFile {
@@ -129,6 +140,9 @@ impl PackFileIo for MmapDataFile {
     }
     fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]> {
         MmapDataFile::slice_mut(self, offset, len)
+    }
+    fn ensure_len(&mut self, new_len: u64) -> io::Result<()> {
+        MmapDataFile::ensure_len(self, new_len)
     }
 }
 

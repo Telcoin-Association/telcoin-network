@@ -453,13 +453,17 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         // panic plus unbounded overflow-chain growth).
         let elements = self.collect_bucket_elements(split_bucket)?;
 
-        // Clear both buckets before redistributing: the split bucket in place, and the newly
-        // appended bucket (whose write also extends the file to make room for it).
+        // Clear both buckets before redistributing. The split bucket is already within the logical
+        // end, so zero it in place. The new bucket lies at/after the current end (buckets are
+        // contiguous), so first extend the mapping to make room for it: `ensure_len` grows
+        // geometrically and zero-extends, so `slice_mut(new_pos, ..)` is then in-bounds and the
+        // fresh region is already an empty bucket (the fill below is a cheap defensive memset).
         if let Some(buffer) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
             buffer.fill(0);
         } else {
             return Err(AppendError::ReadOnly);
         }
+        self.hdx_file.ensure_len(new_pos + Self::BUCKET_SIZE as u64)?;
         if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
             buffer.fill(0);
         } else {
