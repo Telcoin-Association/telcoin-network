@@ -20,6 +20,9 @@ pub mod certificate_pack;
 pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
+/// A background-thread-free, drop-in twin of `ConsensusPack` used to measure the per-op overhead of
+/// the pack's background thread in `pack_bench` (see `consensus_pack_direct.rs`).
+pub mod consensus_pack_direct;
 /// On-demand comparative benchmark harness across the `Database` backends (see `db_bench.rs`).
 #[cfg(test)]
 mod db_bench;

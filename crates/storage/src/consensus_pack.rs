@@ -420,24 +420,7 @@ impl ConsensusPack {
         } else {
             return Err(PackError::SendFailed);
         };
-        let cursor = Cursor::new(bytes);
-        let reader = BufReader::new(cursor);
-        match self.version {
-            0 => {
-                bytes_to_output_legacy(
-                    reader,
-                    self.compression,
-                    Duration::from_secs(5),
-                    &self.committee,
-                )
-                .await
-            }
-            1 => {
-                bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee)
-                    .await
-            }
-            _ => Err(PackError::InvalidVersion(PACK_VERSION, self.version)),
-        }
+        decode_output_bytes(bytes, self.version, self.compression, &self.committee).await
     }
 
     /// Decode pack-file `bytes` (as produced by [`Self::get_consensus_output_bytes`] / streamed via
@@ -474,51 +457,12 @@ impl ConsensusPack {
     /// Load and return the pack file bytes for consensus output form this epoch.
     pub async fn get_consensus_output_bytes(&self, number: u64) -> Result<Vec<u8>, PackError> {
         let (tx, rx) = oneshot::channel();
-        let mut bytes = if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
+        let bytes = if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
             rx.await.map_err(|_| PackError::ReceiveFailed)?
         } else {
             Err(PackError::SendFailed)
         }?;
-        match self.version {
-            0 => {
-                let cursor = Cursor::new(bytes.clone());
-                let reader = BufReader::new(cursor);
-                let out = bytes_to_output_legacy(
-                    reader,
-                    self.compression,
-                    Duration::from_secs(5),
-                    &self.committee,
-                )
-                .await?;
-                let batches = collect_batches(&out);
-                let header: ConsensusHeader = out.into();
-                bytes.clear();
-                let mut value_buffer = Vec::new();
-                let mut compress_buffer = Vec::new();
-                // Re-encode as PackRecord-wrapped records (header first) to match the on-disk v1
-                // format the consumer decodes; the raw v1 serve path (below) returns these same
-                // PackRecord records straight from the pack file.
-                write_value(
-                    &PackRecord::Consensus(Box::new(header)),
-                    &mut bytes,
-                    &mut value_buffer,
-                    &mut compress_buffer,
-                    PackCompression::ZStd,
-                )?;
-                for (_, batch) in batches.into_iter() {
-                    write_value(
-                        &PackRecord::Batch(batch),
-                        &mut bytes,
-                        &mut value_buffer,
-                        &mut compress_buffer,
-                        PackCompression::ZStd,
-                    )?;
-                }
-                Ok(bytes)
-            }
-            1 => Ok(bytes),
-            _ => Err(PackError::InvalidVersion(PACK_VERSION, self.version)),
-        }
+        serve_output_bytes(bytes, self.version, self.compression, &self.committee).await
     }
 
     /// Return the byte offset in the data file just past the end of the consensus output for
@@ -670,7 +614,7 @@ impl ConsensusPack {
 pub const DATA_NAME: &str = Inner::DATA_NAME;
 
 #[derive(Debug)]
-struct Inner {
+pub(crate) struct Inner {
     data: Pack<PackRecord>,
     /// Positional index pointing to the first byte of ConsensusHeader, the first byte of the first
     /// Batch and the byte past the end of the ConsensusHeader at a position. In short the first
@@ -779,8 +723,18 @@ impl Inner {
     }
 
     /// Return the version of the underlying data pack file.
-    fn version(&self) -> u16 {
+    pub(crate) fn version(&self) -> u16 {
         self.data.version()
+    }
+
+    /// Compression codec of the underlying data pack file.
+    pub(crate) fn compression(&self) -> PackCompression {
+        self.data.header().compression()
+    }
+
+    /// The epoch metadata (committee + epoch) persisted in this pack.
+    pub(crate) fn epoch_meta(&self) -> &EpochMeta {
+        &self.epoch_meta
     }
 
     /// Open a PDX index file and return the open index.
@@ -833,7 +787,7 @@ impl Inner {
 
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
-    fn open_append<P: AsRef<Path>>(
+    pub(crate) fn open_append<P: AsRef<Path>>(
         path: P,
         previous_epoch: &EpochRecord,
         committee: Committee,
@@ -895,7 +849,7 @@ impl Inner {
     }
 
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
-    fn open_append_exists<P: AsRef<Path>>(
+    pub(crate) fn open_append_exists<P: AsRef<Path>>(
         path: P,
         epoch: Epoch,
         backend: FileBackend,
@@ -929,7 +883,7 @@ impl Inner {
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
-    fn open_static<P: AsRef<Path>>(
+    pub(crate) fn open_static<P: AsRef<Path>>(
         path: P,
         epoch: Epoch,
         backend: FileBackend,
@@ -965,7 +919,7 @@ impl Inner {
     }
 
     /// Create a new set of epoch static files to write consensus output into.
-    async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
+    pub(crate) async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
@@ -1082,7 +1036,10 @@ impl Inner {
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
     /// Returns the number of bytes the encoded ConsensusOutput takes in the pack file.
-    fn save_consensus_output(&mut self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
+    pub(crate) fn save_consensus_output(
+        &mut self,
+        consensus: &ConsensusOutput,
+    ) -> Result<u64, PackError> {
         let consensus_number = consensus.number();
         // Adjusted consensus index for this pack file.
         let consensus_idx = consensus_number.saturating_sub(self.epoch_meta.start_consensus_number);
@@ -1136,13 +1093,13 @@ impl Inner {
     }
 
     /// True if consensus header by digest is found by digest.
-    fn contains_consensus_header_number(&self, number: u64) -> bool {
+    pub(crate) fn contains_consensus_header_number(&self, number: u64) -> bool {
         number >= self.epoch_meta.start_consensus_number
             && number < self.consensus_pos_idx.len() as u64 + self.epoch_meta.start_consensus_number
     }
 
     /// True if consensus header is found by digest.
-    fn contains_consensus_header(&mut self, digest: ConsensusHeaderDigest) -> bool {
+    pub(crate) fn contains_consensus_header(&mut self, digest: ConsensusHeaderDigest) -> bool {
         // This is a bit more complicated (the pos file_len check) because in a very rare
         // case of repairing a damaged pack we might have something in the index not in the
         // pack file (yet).
@@ -1162,7 +1119,7 @@ impl Inner {
     /// hardening. Under the epoch-gated seed-signature serde, pre-fork packs stay decodable and
     /// the logged arms should never fire - they are the difference between a loud signal and
     /// silent chain corruption for every future format change.
-    fn consensus_header_by_digest(
+    pub(crate) fn consensus_header_by_digest(
         &mut self,
         digest: ConsensusHeaderDigest,
     ) -> Option<ConsensusHeader> {
@@ -1206,7 +1163,10 @@ impl Inner {
     }
 
     /// Retrieve a consensus header by number.
-    fn consensus_header_by_number(&mut self, number: u64) -> Result<ConsensusHeader, PackError> {
+    pub(crate) fn consensus_header_by_number(
+        &mut self,
+        number: u64,
+    ) -> Result<ConsensusHeader, PackError> {
         if number < self.epoch_meta.start_consensus_number {
             return Err(PackError::ConsensusNumberTooLow);
         }
@@ -1221,7 +1181,7 @@ impl Inner {
         self.data.fetch(pos)?.into_consensus()
     }
 
-    fn persist(&mut self) -> Result<(), PackError> {
+    pub(crate) fn persist(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
             self.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
             self.consensus_pos_idx.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
@@ -1232,7 +1192,7 @@ impl Inner {
     }
 
     // Inner method (sibling of Inner::persist, consensus_pack.rs:1051) — flush only, no syncs:
-    fn flush_data(&mut self) -> Result<(), PackError> {
+    pub(crate) fn flush_data(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
             self.data.flush().map_err(|e| PackError::PersistError(e.to_string()))?;
         }
@@ -1240,7 +1200,7 @@ impl Inner {
     }
 
     /// Read and return all the bytes for consensus number (all batches and the consensus header).
-    fn bytes_for_consensus(&mut self, number: u64) -> Result<Vec<u8>, PackError> {
+    pub(crate) fn bytes_for_consensus(&mut self, number: u64) -> Result<Vec<u8>, PackError> {
         // Validate the range like consensus_header_by_number; without this a number below
         // start_consensus_number would saturate to index 0 and silently return the epoch's
         // first output instead of an error.
@@ -1264,7 +1224,7 @@ impl Inner {
 
     /// Return the byte offset in the data file just past the end of the consensus output for
     /// `number` (the `output_end` of its index entry). Range-checked like `bytes_for_consensus`.
-    fn output_end_for_consensus(&mut self, number: u64) -> Result<u64, PackError> {
+    pub(crate) fn output_end_for_consensus(&mut self, number: u64) -> Result<u64, PackError> {
         if number < self.epoch_meta.start_consensus_number {
             return Err(PackError::ConsensusNumberTooLow);
         }
@@ -1287,7 +1247,7 @@ impl Inner {
     /// header's sub-dag as the epoch seed chain anchor, and an absent anchor means "start a fresh
     /// chain", so collapsing an error into `None` would silently re-root the chain and fork
     /// execution permanently.
-    fn latest_consensus_header(&mut self) -> Result<Option<ConsensusHeader>, PackError> {
+    pub(crate) fn latest_consensus_header(&mut self) -> Result<Option<ConsensusHeader>, PackError> {
         if self.consensus_pos_idx.is_empty() {
             return Ok(None);
         }
@@ -1296,7 +1256,9 @@ impl Inner {
         self.consensus_header_by_number(latest_number).map(Some)
     }
 
-    fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
+    pub(crate) fn read_last_committed(
+        &mut self,
+    ) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
         let mut res = HashMap::new();
         let iter = self.consensus_pos_idx.rev_iter(50)?;
         for pos in iter {
@@ -1315,7 +1277,7 @@ impl Inner {
         Ok(res)
     }
 
-    fn read_latest_commit_with_final_reputation_scores(
+    pub(crate) fn read_latest_commit_with_final_reputation_scores(
         &mut self,
     ) -> Result<Option<CommittedSubDag>, PackError> {
         let iter = self.consensus_pos_idx.rev_iter(1000)?;
@@ -1336,7 +1298,7 @@ impl Inner {
     }
 
     /// True if the pack contains the batch for digest.
-    fn contains_batch(&mut self, digest: BlockHash) -> bool {
+    pub(crate) fn contains_batch(&mut self, digest: BlockHash) -> bool {
         // This is a bit more complicated (the pos file_len check) because in a very rare
         // case of repairing a damaged pack we might have something in the index not in the
         // pack file (yet).
@@ -1348,7 +1310,7 @@ impl Inner {
     }
 
     /// Return the Batch for digest if found.
-    fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
+    pub(crate) fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
         let pos = self.batch_digests.load(digest).ok()?;
         // This is not strickly needed, the fetch below will fail if
         // we try to read past the end of the file but this potentially
@@ -1368,7 +1330,7 @@ impl Inner {
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
-    fn count_leaders(
+    pub(crate) fn count_leaders(
         &mut self,
         last_executed_round: Round,
         rewards_counter: &RewardsCounter,
@@ -1545,6 +1507,74 @@ fn check_header_expectation(
         HeaderExpectation::Parent(expected) => {
             (header.parent_hash == expected).then_some(()).ok_or(PackError::InvalidConsensusChain)
         }
+    }
+}
+
+/// Decode raw pack-file `bytes` for one consensus output into a [`ConsensusOutput`], dispatching on
+/// the pack data `version` (v0 legacy vs v1 header-first) and using the pack's `compression` and
+/// `committee`. Shared by the threaded [`ConsensusPack`] and the direct
+/// [`ConsensusPackDirect`](crate::consensus_pack_direct::ConsensusPackDirect) so both decode
+/// identically.
+pub(crate) async fn decode_output_bytes(
+    bytes: Vec<u8>,
+    version: u16,
+    compression: PackCompression,
+    committee: &Committee,
+) -> Result<ConsensusOutput, PackError> {
+    let cursor = Cursor::new(bytes);
+    let reader = BufReader::new(cursor);
+    match version {
+        0 => bytes_to_output_legacy(reader, compression, Duration::from_secs(5), committee).await,
+        1 => bytes_to_output(reader, compression, Duration::from_secs(5), committee).await,
+        _ => Err(PackError::InvalidVersion(PACK_VERSION, version)),
+    }
+}
+
+/// Produce the v1 (header-first) pack-record bytes served to peers for one consensus output from the
+/// raw `bytes` read out of the data file: a passthrough for v1, or a re-encode of a v0 legacy output
+/// into v1 records (header first, then batches). Uses the pack's `version`/`compression`/`committee`.
+/// Shared by both pack front-ends.
+pub(crate) async fn serve_output_bytes(
+    mut bytes: Vec<u8>,
+    version: u16,
+    compression: PackCompression,
+    committee: &Committee,
+) -> Result<Vec<u8>, PackError> {
+    match version {
+        0 => {
+            let cursor = Cursor::new(bytes.clone());
+            let reader = BufReader::new(cursor);
+            let out =
+                bytes_to_output_legacy(reader, compression, Duration::from_secs(5), committee)
+                    .await?;
+            let batches = collect_batches(&out);
+            let header: ConsensusHeader = out.into();
+            bytes.clear();
+            let mut value_buffer = Vec::new();
+            let mut compress_buffer = Vec::new();
+            // Re-encode as PackRecord-wrapped records (header first) to match the on-disk v1
+            // format the consumer decodes; the raw v1 serve path returns these same PackRecord
+            // records straight from the pack file.
+            write_value(
+                &PackRecord::Consensus(Box::new(header)),
+                &mut bytes,
+                &mut value_buffer,
+                &mut compress_buffer,
+                PackCompression::ZStd,
+            )?;
+            for (_, batch) in batches.into_iter() {
+                write_value(
+                    &PackRecord::Batch(batch),
+                    &mut bytes,
+                    &mut value_buffer,
+                    &mut compress_buffer,
+                    PackCompression::ZStd,
+                )?;
+            }
+            Ok(bytes)
+        }
+        1 => Ok(bytes),
+        _ => Err(PackError::InvalidVersion(PACK_VERSION, version)),
     }
 }
 
