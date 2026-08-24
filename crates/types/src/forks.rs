@@ -282,6 +282,120 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
     })
 }
 
+/// First epoch whose executed blocks derive `mix_hash` (EVM `PREVRANDAO`) from the epoch
+/// seed chain instead of the transaction-dependent `output_digest ^ batch_digest` (#1247).
+///
+/// Both XORed digests commit to transaction bytes and transaction ordering, so a committing
+/// leader can enumerate otherwise-valid payload constructions after the causal DAG is known
+/// and publish the one whose `PREVRANDAO` favors it. From this epoch onward the value is
+/// `keccak256(domain || seed chain value || consensus block number || batch index)` (see
+/// [`ConsensusOutput::prev_randao`](crate::ConsensusOutput::prev_randao)): every input is
+/// pinned by the committed order and the digest-pinned seed chain, so payload construction
+/// cannot generate new candidates.
+///
+/// `Epoch::MAX` is the dormant placeholder of the standard two-step hard-fork rule (the
+/// same sequence [`SEED_SIGNATURE_FORK_EPOCH`] followed): deploy this gate-capable build
+/// fleet-wide first (safe indefinitely while dormant on adiri), then land the epoch-setting
+/// PR fleet-wide before the fork epoch begins. The rollout PR MUST set a value at or above
+/// the live adiri epoch plus deployment margin, and at or above
+/// [`SEED_SIGNATURE_FORK_EPOCH`]: [`prevrandao_seed_active`] additionally requires
+/// [`seed_signature_active`], so a lower value silently stays dormant until the seed fork
+/// fires instead of hashing the forkable legacy leader-aggregate seed (#1032).
+///
+/// Pre-fork epochs keep the XOR derivation byte-identical so replaying already-executed
+/// history reproduces the same headers. Non-adiri builds carry no such history and are
+/// active from genesis, exactly as with the seed-signature fork (like
+/// [`SEED_SIGNATURE_FORK_EPOCH`], this constant does not exist there).
+#[cfg(feature = "adiri")]
+pub const PREVRANDAO_FORK_EPOCH: Epoch = Epoch::MAX;
+
+/// Compile-time enforcement of the rollout-order contract documented on
+/// [`PREVRANDAO_FORK_EPOCH`]: a rollout PR that sets the PREVRANDAO fork below the seed
+/// fork fails to compile instead of shipping a gate that silently stays dormant until the
+/// seed fork fires.
+#[cfg(feature = "adiri")]
+#[expect(
+    clippy::absurd_extreme_comparisons,
+    reason = "always true only while PREVRANDAO_FORK_EPOCH is the `Epoch::MAX` placeholder; \
+              once the rollout PR lowers the constant the comparison becomes live and this \
+              expectation flags itself for removal"
+)]
+const _: () = assert!(PREVRANDAO_FORK_EPOCH >= SEED_SIGNATURE_FORK_EPOCH);
+
+/// Whether executed blocks of `epoch` derive `PREVRANDAO` from the epoch seed chain (#1247).
+///
+/// Callers MUST pass the epoch carried inside the output being executed (the committing
+/// leader's epoch), never node-local committee state, so historical outputs keep their
+/// historical derivation during replay.
+///
+/// Requires [`seed_signature_active`] as a fail-closed conjunct: the new derivation hashes
+/// the sub-dag `randomness`, which is the digest-pinned epoch seed chain value only once the
+/// seed fork is active. If an override or a future fork schedule orders the two forks the
+/// other way, the gate stays on the legacy XOR (the status quo) instead of promoting the
+/// forkable legacy leader-aggregate seed into `PREVRANDAO`.
+#[inline]
+pub fn prevrandao_seed_active(epoch: Epoch) -> bool {
+    seed_signature_active(epoch) && prevrandao_fork_point_active(epoch)
+}
+
+/// This build's effective PREVRANDAO fork point (any `test-utils` override applied),
+/// without the [`seed_signature_active`] conjunct [`prevrandao_seed_active`] enforces.
+#[inline]
+fn prevrandao_fork_point_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "test-utils")]
+    {
+        prevrandao_fork_epoch_override()
+            .map_or_else(|| prevrandao_build_fork_active(epoch), |fork| epoch >= fork)
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        prevrandao_build_fork_active(epoch)
+    }
+}
+
+/// This build's compile-time PREVRANDAO fork point, with no test override applied.
+///
+/// Same contract as [`build_fork_active`]: adiri (testnet, which carries pre-fork executed
+/// history) is dormant before [`PREVRANDAO_FORK_EPOCH`] and active from it; every other
+/// build is active from genesis.
+#[inline]
+const fn prevrandao_build_fork_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "adiri")]
+    #[expect(
+        clippy::absurd_extreme_comparisons,
+        reason = "PREVRANDAO_FORK_EPOCH is an `Epoch::MAX` placeholder; `>=` (not `==`) is \
+                  the gate the future epoch-setting PR relies on, and this expectation flags \
+                  itself for removal once that PR lowers the constant"
+    )]
+    {
+        epoch >= PREVRANDAO_FORK_EPOCH
+    }
+    #[cfg(not(feature = "adiri"))]
+    {
+        let _ = epoch;
+        true
+    }
+}
+
+/// Test-only override of the effective PREVRANDAO fork epoch, read once from
+/// `TN_PREVRANDAO_FORK_EPOCH` (`4294967295` for "never fires", `0` for "active from
+/// genesis", both subject to the [`seed_signature_active`] conjunct).
+///
+/// An environment variable for the same reason as [`seed_signature_fork_epoch_override`]:
+/// e2e tests drive real node processes spawned via `TN_BIN_PATH`, which share no memory
+/// with the harness, so a process-global setter would silently reach only in-process tests.
+/// Compiled out entirely without `test-utils`, so a production binary keeps the
+/// compile-time constant and cannot be repointed at runtime by its environment. An
+/// unparseable value is ignored rather than defaulted, leaving the build's own fork point
+/// in force.
+#[cfg(feature = "test-utils")]
+pub fn prevrandao_fork_epoch_override() -> Option<Epoch> {
+    static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TN_PREVRANDAO_FORK_EPOCH").ok().and_then(|raw| raw.trim().parse().ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +501,64 @@ mod tests {
                 seed_signature_active(epoch),
                 build_fork_active(epoch),
                 "an unset override must not shift the gate at epoch {epoch}",
+            );
+        });
+    }
+
+    /// Pin the PREVRANDAO gate to the rollout contract this build actually implements,
+    /// mirroring [`build_fork_gate_matches_this_builds_rollout_contract`]: non-adiri builds
+    /// are active from genesis, adiri stays dormant before [`PREVRANDAO_FORK_EPOCH`] and
+    /// fires from it (`>=`, not `>`).
+    ///
+    /// Asserts against [`prevrandao_build_fork_active`], the override-free decision, so the
+    /// result does not depend on whether `test-utils` was unified into this build.
+    #[test]
+    fn prevrandao_build_fork_gate_matches_this_builds_rollout_contract() {
+        #[cfg(not(feature = "adiri"))]
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert!(
+                prevrandao_build_fork_active(epoch),
+                "non-adiri builds carry no pre-fork executed history and are active from \
+                 genesis; epoch {epoch} must be post-fork",
+            );
+        });
+        #[cfg(feature = "adiri")]
+        {
+            [0, 1, 2, PREVRANDAO_FORK_EPOCH - 1].into_iter().for_each(|epoch| {
+                assert!(
+                    !prevrandao_build_fork_active(epoch),
+                    "adiri stays dormant before PREVRANDAO_FORK_EPOCH; epoch {epoch} must \
+                     be pre-fork",
+                );
+            });
+            [PREVRANDAO_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+                assert!(
+                    prevrandao_build_fork_active(epoch),
+                    "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
+                     {epoch} must be post-fork",
+                );
+            });
+        }
+    }
+
+    /// With no `TN_PREVRANDAO_FORK_EPOCH` in the environment, the test override must be
+    /// completely inert: the fork point answers exactly as the compile-time contract does.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn prevrandao_override_is_inert_when_unset() {
+        // The override latches in a process-wide `OnceLock`, so a harness launched WITH the
+        // variable set cannot observe the unset behaviour. Fail loudly rather than assert a
+        // property this process cannot hold; a silent skip here would read as a pass.
+        assert!(
+            prevrandao_fork_epoch_override().is_none(),
+            "this test requires a process without TN_PREVRANDAO_FORK_EPOCH set; the \
+             override is OnceLock-latched, so run the unset case in its own process",
+        );
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert_eq!(
+                prevrandao_fork_point_active(epoch),
+                prevrandao_build_fork_active(epoch),
+                "an unset override must not shift the fork point at epoch {epoch}",
             );
         });
     }
