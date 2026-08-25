@@ -102,20 +102,24 @@ trait BenchPack: Sized {
         backend: FileBackend,
     ) -> Result<Self, PackError>;
 
-    async fn save_consensus_output(&self, output: ConsensusOutput) -> Result<u64, PackError>;
-    async fn persist(&self) -> Result<(), PackError>;
-    async fn consensus_header_by_number(&self, number: u64) -> Result<ConsensusHeader, PackError>;
-    async fn get_consensus_output(&self, number: u64) -> Result<ConsensusOutput, PackError>;
-    async fn get_consensus_output_bytes(&self, number: u64) -> Result<Vec<u8>, PackError>;
+    async fn save_consensus_output(&mut self, output: ConsensusOutput) -> Result<u64, PackError>;
+    async fn persist(&mut self) -> Result<(), PackError>;
+    async fn consensus_header_by_number(
+        &mut self,
+        number: u64,
+    ) -> Result<ConsensusHeader, PackError>;
+    async fn get_consensus_output(&mut self, number: u64) -> Result<ConsensusOutput, PackError>;
+    async fn get_consensus_output_bytes(&mut self, number: u64) -> Result<Vec<u8>, PackError>;
     async fn consensus_header_by_digest(
-        &self,
+        &mut self,
         digest: ConsensusHeaderDigest,
     ) -> Option<ConsensusHeader>;
-    async fn batch(&self, digest: BlockHash) -> Option<Batch>;
-    async fn read_last_committed(&self)
-        -> Result<HashMap<AuthorityIdentifier, Round>, PackError>;
-    async fn latest_consensus_header(&self) -> Result<Option<ConsensusHeader>, PackError>;
-    async fn consensus_output_end(&self, number: u64) -> Result<u64, PackError>;
+    async fn batch(&mut self, digest: BlockHash) -> Option<Batch>;
+    async fn read_last_committed(
+        &mut self,
+    ) -> Result<HashMap<AuthorityIdentifier, Round>, PackError>;
+    async fn latest_consensus_header(&mut self) -> Result<Option<ConsensusHeader>, PackError>;
+    async fn consensus_output_end(&mut self, number: u64) -> Result<u64, PackError>;
 }
 
 /// Forward every `BenchPack` method to the inherent method of the same name (UFCS avoids resolving
@@ -159,52 +163,52 @@ macro_rules! impl_bench_pack {
                 .await
             }
             async fn save_consensus_output(
-                &self,
+                &mut self,
                 output: ConsensusOutput,
             ) -> Result<u64, PackError> {
                 <$ty>::save_consensus_output(self, output).await
             }
-            async fn persist(&self) -> Result<(), PackError> {
+            async fn persist(&mut self) -> Result<(), PackError> {
                 <$ty>::persist(self).await
             }
             async fn consensus_header_by_number(
-                &self,
+                &mut self,
                 number: u64,
             ) -> Result<ConsensusHeader, PackError> {
                 <$ty>::consensus_header_by_number(self, number).await
             }
             async fn get_consensus_output(
-                &self,
+                &mut self,
                 number: u64,
             ) -> Result<ConsensusOutput, PackError> {
                 <$ty>::get_consensus_output(self, number).await
             }
             async fn get_consensus_output_bytes(
-                &self,
+                &mut self,
                 number: u64,
             ) -> Result<Vec<u8>, PackError> {
                 <$ty>::get_consensus_output_bytes(self, number).await
             }
             async fn consensus_header_by_digest(
-                &self,
+                &mut self,
                 digest: ConsensusHeaderDigest,
             ) -> Option<ConsensusHeader> {
                 <$ty>::consensus_header_by_digest(self, digest).await
             }
-            async fn batch(&self, digest: BlockHash) -> Option<Batch> {
+            async fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
                 <$ty>::batch(self, digest).await
             }
             async fn read_last_committed(
-                &self,
+                &mut self,
             ) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
                 <$ty>::read_last_committed(self).await
             }
             async fn latest_consensus_header(
-                &self,
+                &mut self,
             ) -> Result<Option<ConsensusHeader>, PackError> {
                 <$ty>::latest_consensus_header(self).await
             }
-            async fn consensus_output_end(&self, number: u64) -> Result<u64, PackError> {
+            async fn consensus_output_end(&mut self, number: u64) -> Result<u64, PackError> {
                 <$ty>::consensus_output_end(self, number).await
             }
         }
@@ -280,7 +284,7 @@ async fn populate<P: BenchPack>(
     outputs: &[ConsensusOutput],
 ) -> (P, TempDir) {
     let dir = TempDir::with_prefix("pack_bench_read").expect("temp dir");
-    let pack = P::open_append_with_backend(
+    let mut pack = P::open_append_with_backend(
         dir.path(),
         fx.previous_epoch.clone(),
         fx.committee.clone(),
@@ -302,7 +306,7 @@ async fn bench_save_seq<P: BenchPack>(
     outputs: &[ConsensusOutput],
 ) -> Duration {
     let dir = TempDir::with_prefix("pack_bench_save").expect("temp dir");
-    let pack = P::open_append_with_backend(
+    let mut pack = P::open_append_with_backend(
         dir.path(),
         fx.previous_epoch.clone(),
         fx.committee.clone(),
@@ -326,7 +330,7 @@ async fn bench_save_durable<P: BenchPack>(
     outputs: &[ConsensusOutput],
 ) -> Duration {
     let dir = TempDir::with_prefix("pack_bench_durable").expect("temp dir");
-    let pack = P::open_append_with_backend(
+    let mut pack = P::open_append_with_backend(
         dir.path(),
         fx.previous_epoch.clone(),
         fx.committee.clone(),
@@ -342,14 +346,14 @@ async fn bench_save_durable<P: BenchPack>(
 }
 
 /// One bulk `persist()` flushing all the un-persisted saves left by [`populate`].
-async fn bench_persist<P: BenchPack>(pack: &P) -> Duration {
+async fn bench_persist<P: BenchPack>(pack: &mut P) -> Duration {
     let start = Instant::now();
     pack.persist().await.expect("persist");
     start.elapsed()
 }
 
 /// Random-access read of every header by number (index lookup + fetch + decode).
-async fn bench_header_by_number<P: BenchPack>(pack: &P) -> Duration {
+async fn bench_header_by_number<P: BenchPack>(pack: &mut P) -> Duration {
     let start = Instant::now();
     for number in 1..=NUM_OUTPUTS {
         pack.consensus_header_by_number(number).await.expect("header by number");
@@ -358,7 +362,7 @@ async fn bench_header_by_number<P: BenchPack>(pack: &P) -> Duration {
 }
 
 /// Full decode of every output (range read + decode incl. all batches).
-async fn bench_full_output<P: BenchPack>(pack: &P) -> Duration {
+async fn bench_full_output<P: BenchPack>(pack: &mut P) -> Duration {
     let start = Instant::now();
     for number in 1..=NUM_OUTPUTS {
         pack.get_consensus_output(number).await.expect("full output");
@@ -367,7 +371,7 @@ async fn bench_full_output<P: BenchPack>(pack: &P) -> Duration {
 }
 
 /// Raw pack-file bytes for every output (the serve-to-peer path: range read, no decode).
-async fn bench_output_bytes<P: BenchPack>(pack: &P) -> Duration {
+async fn bench_output_bytes<P: BenchPack>(pack: &mut P) -> Duration {
     let start = Instant::now();
     for number in 1..=NUM_OUTPUTS {
         pack.get_consensus_output_bytes(number).await.expect("output bytes");
@@ -377,7 +381,7 @@ async fn bench_output_bytes<P: BenchPack>(pack: &P) -> Duration {
 
 /// Digest-keyed header lookups over every header digest (the consensus digest index).
 async fn bench_header_by_digest<P: BenchPack>(
-    pack: &P,
+    pack: &mut P,
     digests: &[ConsensusHeaderDigest],
 ) -> Duration {
     let start = Instant::now();
@@ -388,7 +392,7 @@ async fn bench_header_by_digest<P: BenchPack>(
 }
 
 /// Digest-keyed batch lookups over a bounded sample (the batch digest index).
-async fn bench_batch_by_digest<P: BenchPack>(pack: &P, digests: &[BlockHash]) -> Duration {
+async fn bench_batch_by_digest<P: BenchPack>(pack: &mut P, digests: &[BlockHash]) -> Duration {
     let start = Instant::now();
     for digest in digests {
         pack.batch(*digest).await.expect("batch by digest");
@@ -397,14 +401,14 @@ async fn bench_batch_by_digest<P: BenchPack>(pack: &P, digests: &[BlockHash]) ->
 }
 
 /// The reverse-scan behind `read_last_committed`.
-async fn bench_read_last_committed<P: BenchPack>(pack: &P) -> Duration {
+async fn bench_read_last_committed<P: BenchPack>(pack: &mut P) -> Duration {
     let start = Instant::now();
     pack.read_last_committed().await.expect("read last committed");
     start.elapsed()
 }
 
 /// Single index-tail read of the latest header.
-async fn bench_latest_header<P: BenchPack>(pack: &P) -> Duration {
+async fn bench_latest_header<P: BenchPack>(pack: &mut P) -> Duration {
     let start = Instant::now();
     pack.latest_consensus_header().await.expect("latest header");
     start.elapsed()
@@ -412,7 +416,7 @@ async fn bench_latest_header<P: BenchPack>(pack: &P) -> Duration {
 
 /// Partial catch-up serve: resolve the prefix byte offset for the mid output, then read `[0, end)`
 /// of the data file (mirrors `get_partial_epoch_stream`).
-async fn bench_prefix_stream<P: BenchPack>(pack: &P, data_path: &Path) -> Duration {
+async fn bench_prefix_stream<P: BenchPack>(pack: &mut P, data_path: &Path) -> Duration {
     let mid = NUM_OUTPUTS / 2;
     let start = Instant::now();
     let end = pack.consensus_output_end(mid).await.expect("output end");
@@ -443,7 +447,7 @@ async fn bench_stream_import<P: BenchPack>(
     let dir = TempDir::with_prefix("pack_bench_import").expect("temp dir");
     let stream = tokio::fs::File::open(data_path).await.expect("open data file").take(end);
     let start = Instant::now();
-    let pack = P::stream_import_with_backend(
+    let mut pack = P::stream_import_with_backend(
         dir.path(),
         stream,
         fx.committee.epoch(),
@@ -463,7 +467,7 @@ async fn bench_stream_import<P: BenchPack>(
 /// Cold-open the finished pack read-only, touching the index (the pack-cache-miss open cost).
 async fn bench_reopen_static<P: BenchPack>(path: &Path, epoch: Epoch, backend: FileBackend) -> Duration {
     let start = Instant::now();
-    let pack = P::open_static_with_backend(path, epoch, backend).expect("open static");
+    let mut pack = P::open_static_with_backend(path, epoch, backend).expect("open static");
     pack.latest_consensus_header().await.expect("latest after reopen");
     start.elapsed()
 }
@@ -487,24 +491,24 @@ async fn run_battery<P: BenchPack>(fx: &Fixtures, backend: FileBackend, width: u
     let save_durable = bench_save_durable::<P>(fx, backend, &outputs).await;
 
     // One populated pack shared by the read/stream battery.
-    let (pack, dir) = populate::<P>(fx, backend, &outputs).await;
+    let (mut pack, dir) = populate::<P>(fx, backend, &outputs).await;
     let data_path = fx.data_path(dir.path());
 
     // Bulk-persist first so the un-persisted saves are flushed for the direct-file stream reads.
-    let persist = bench_persist(&pack).await;
+    let persist = bench_persist(&mut pack).await;
     // Real data length (past the last output). For mmap this excludes the open pack's capacity
     // padding, so it is comparable to the buffered backend and bounds the stream reads below.
     let data_len =
         pack.consensus_output_end(NUM_OUTPUTS).await.expect("output end for data length");
 
-    let header_by_number = bench_header_by_number(&pack).await;
-    let full_output = bench_full_output(&pack).await;
-    let output_bytes = bench_output_bytes(&pack).await;
-    let header_by_digest = bench_header_by_digest(&pack, &header_digests).await;
-    let batch_by_digest = bench_batch_by_digest(&pack, &batch_digests).await;
-    let read_last_committed = bench_read_last_committed(&pack).await;
-    let latest_header = bench_latest_header(&pack).await;
-    let prefix_stream = bench_prefix_stream(&pack, &data_path).await;
+    let header_by_number = bench_header_by_number(&mut pack).await;
+    let full_output = bench_full_output(&mut pack).await;
+    let output_bytes = bench_output_bytes(&mut pack).await;
+    let header_by_digest = bench_header_by_digest(&mut pack, &header_digests).await;
+    let batch_by_digest = bench_batch_by_digest(&mut pack, &batch_digests).await;
+    let read_last_committed = bench_read_last_committed(&mut pack).await;
+    let latest_header = bench_latest_header(&mut pack).await;
+    let prefix_stream = bench_prefix_stream(&mut pack, &data_path).await;
     let full_stream = bench_full_stream(&data_path, data_len).await;
     let stream_import = bench_stream_import::<P>(fx, backend, &data_path, data_len).await;
 
@@ -555,41 +559,67 @@ impl Report {
     }
 
     fn print(&self) {
+        // Columns are pushed 4 per width block (buf-thr, buf-dir, mmap-thr, mmap-dir); a vertical
+        // rail after every block and a rule between row groups make a single row easy to follow
+        // across all 12 columns.
+        const GROUP: usize = 4;
         let label_w =
             self.order.iter().map(|s| s.len()).max().unwrap_or(0).max("bytes/output".len());
         let cell_w = 14usize;
+        let n = self.columns.len();
+        // Total printed width, including the 2-char " │" rails between blocks.
+        let rails = n.saturating_sub(1) / GROUP;
+        let total_w = label_w + n * (cell_w + 1) + rails * 2;
+        let rule = "─".repeat(total_w);
 
-        println!("\n=== consensus pack-file benchmark: background thread (thr) vs direct IO (dir), buffered (fsync) vs mmap (msync) (ms) ===");
-        println!("legend: columns are {{backend}}-{{transport}} x{{batches/output}}; transport thr = background thread + channel, dir = inline calls (no thread); thr - dir per row is the thread/channel overhead. save_durable adds a persist() barrier per output; test batches carry 1 tx each.");
-
-        // header
-        print!("{:<label_w$}", "benchmark", label_w = label_w);
-        for (name, _) in &self.columns {
-            print!(" {:>cell_w$}", name, cell_w = cell_w);
-        }
-        println!();
-
-        // timed rows
-        for (row, label) in self.order.iter().enumerate() {
-            print!("{:<label_w$}", label, label_w = label_w);
-            for (_, col) in &self.columns {
-                let ms = col.rows[row].1.as_secs_f64() * 1000.0;
-                print!(" {:>cell_w$}", format!("{ms:.2}"), cell_w = cell_w);
+        /// Print one row: left label then the cells, with a `│` rail between width-blocks.
+        fn print_row(label: &str, cells: &[String], label_w: usize, cell_w: usize, group: usize) {
+            print!("{label:<label_w$}");
+            for (i, cell) in cells.iter().enumerate() {
+                print!(" {cell:>cell_w$}");
+                if (i + 1) % group == 0 && i + 1 < cells.len() {
+                    print!(" │");
+                }
             }
             println!();
         }
 
+        // Row labels after which to draw a horizontal separator (the write / persist / read / stream
+        // / lifecycle groups from the module docs).
+        const GROUP_SEP_AFTER: &[&str] =
+            &["save_durable", "persist bulk", "latest_header", "stream_import"];
+
+        println!("\n=== consensus pack-file benchmark: background thread (thr) vs direct IO (dir), buffered (fsync) vs mmap (msync) (ms) ===");
+        println!("legend: columns are {{backend}}-{{transport}} x{{batches/output}}; thr = background thread + channel, dir = inline &mut calls (no thread, no lock — the pure direct-IO baseline); thr - dir per row is the thread/channel overhead. Vertical rails group the 4 columns of each width; horizontal rules group the rows. save_durable adds a persist() barrier per output; test batches carry 1 tx each.");
+
+        // header + underline rule
+        let headers: Vec<String> = self.columns.iter().map(|(name, _)| name.clone()).collect();
+        print_row("benchmark", &headers, label_w, cell_w, GROUP);
+        println!("{rule}");
+
+        // timed rows, with a rule between logical groups
+        for (row, &label) in self.order.iter().enumerate() {
+            let cells: Vec<String> = self
+                .columns
+                .iter()
+                .map(|(_, col)| format!("{:.2}", col.rows[row].1.as_secs_f64() * 1000.0))
+                .collect();
+            print_row(label, &cells, label_w, cell_w, GROUP);
+            if GROUP_SEP_AFTER.contains(&label) {
+                println!("{rule}");
+            }
+        }
+
         // observational footer: pack size per column
-        print!("{:<label_w$}", "data MiB", label_w = label_w);
-        for (_, col) in &self.columns {
-            let mib = col.data_len as f64 / (1024.0 * 1024.0);
-            print!(" {:>cell_w$}", format!("{mib:.2}"), cell_w = cell_w);
-        }
-        println!();
-        print!("{:<label_w$}", "bytes/output", label_w = label_w);
-        for (_, col) in &self.columns {
-            print!(" {:>cell_w$}", col.data_len / NUM_OUTPUTS, cell_w = cell_w);
-        }
+        let mib: Vec<String> = self
+            .columns
+            .iter()
+            .map(|(_, col)| format!("{:.2}", col.data_len as f64 / (1024.0 * 1024.0)))
+            .collect();
+        print_row("data MiB", &mib, label_w, cell_w, GROUP);
+        let bytes_per_output: Vec<String> =
+            self.columns.iter().map(|(_, col)| (col.data_len / NUM_OUTPUTS).to_string()).collect();
+        print_row("bytes/output", &bytes_per_output, label_w, cell_w, GROUP);
         println!("\n({NUM_OUTPUTS} outputs per column)\n");
     }
 }

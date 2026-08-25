@@ -1,31 +1,25 @@
-//! A background-thread-free, drop-in twin of [`ConsensusPack`](crate::consensus_pack::ConsensusPack).
+//! A background-thread-free, lock-free twin of [`ConsensusPack`](crate::consensus_pack::ConsensusPack).
 //!
 //! [`ConsensusPack`](crate::consensus_pack::ConsensusPack) runs one OS thread per pack: every public
 //! `async fn` sends a message over an mpsc channel and awaits a `oneshot` reply while a background
-//! thread performs the IO. [`ConsensusPackDirect`] holds the same [`Inner`] state behind an
-//! `Arc<Mutex<..>>` and makes every call **inline on the caller's task** — no channel, no thread, no
-//! context switch. The two front-ends share the exact same `Inner` IO and the same decode helpers
-//! ([`decode_output_bytes`]/[`serve_output_bytes`]), so it exists to isolate the background-thread
-//! overhead in [`crate::pack_bench`]: a per-op timing delta between the two is the thread/channel
-//! cost. Not used in production.
+//! thread performs the IO. [`ConsensusPackDirect`] **owns [`Inner`] directly** and makes every call
+//! **inline on the caller's task** — no channel, no thread, no context switch, and (unlike a shared
+//! handle) no lock or atomic in the path. It is the pure direct-IO baseline for
+//! [`crate::pack_bench`]: the two front-ends share the exact same `Inner` IO and decode helpers
+//! ([`decode_output_bytes`]/[`serve_output_bytes`]), so a per-op timing delta between them is purely
+//! the background-thread/channel cost.
 //!
-//! The lock is only ever held for the synchronous `Inner` call and is dropped before any `.await`,
-//! so no lock is held across a suspension point.
+//! Because there is no interior mutability, the state-touching methods take `&mut self` (rather than
+//! `ConsensusPack`'s `&self`). That is deliberately a benchmark-only API — it removes even an
+//! uncontended lock from the measured path. Not used in production.
 
-// Methods mirror `ConsensusPack`'s `async fn` signatures for drop-in fidelity even though the direct
-// implementation does no `.await` of its own (it calls `Inner` inline), so allow the pedantic lint
-// about async fns without an await.
+// Methods mirror `ConsensusPack`'s `async fn` signatures for API fidelity even though the direct
+// implementation does no `.await` of its own for the synchronous `Inner` calls, so allow the
+// pedantic lint about async fns without an await.
 #![allow(clippy::unused_async)]
 
-use std::{
-    collections::HashMap,
-    io::Cursor,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, io::Cursor, path::PathBuf, time::Duration};
 
-use parking_lot::Mutex;
 use tn_types::{
     gas_accumulator::RewardsCounter, AuthorityIdentifier, Batch, BlockHash, CommittedSubDag,
     Committee, ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord, Round,
@@ -40,13 +34,14 @@ use crate::{
     },
 };
 
-/// A [`ConsensusPack`](crate::consensus_pack::ConsensusPack) that performs all its IO directly
-/// (inline on the caller's task) instead of on a background thread. Same public API and behaviour;
-/// used to measure the background-thread/channel overhead (see the module docs).
-#[derive(Debug, Clone)]
+/// A [`ConsensusPack`](crate::consensus_pack::ConsensusPack) that performs all its IO directly and
+/// inline (owning [`Inner`], no background thread and no lock). Same behaviour and (almost) the same
+/// API, except state-touching methods take `&mut self`; used as the lock-free baseline for measuring
+/// the background-thread/channel overhead (see the module docs).
+#[derive(Debug)]
 pub struct ConsensusPackDirect {
-    /// The real pack state, shared (`Arc`) and mutable (`Mutex`) — no background thread owns it.
-    inner: Arc<Mutex<Inner>>,
+    /// The real pack state, owned outright — no background thread, no `Arc`/`Mutex`.
+    inner: Inner,
     epoch: Epoch,
     committee: Committee,
     compression: PackCompression,
@@ -174,14 +169,7 @@ impl ConsensusPackDirect {
         is_static: bool,
         version: u16,
     ) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(inner)),
-            epoch,
-            committee,
-            compression,
-            is_static,
-            version,
-        }
+        Self { inner, epoch, committee, compression, is_static, version }
     }
 
     /// Is this packfile static — i.e. complete and read only.
@@ -196,15 +184,18 @@ impl ConsensusPackDirect {
 
     /// Save all batches and the consensus header from `consensus`, returning the bytes it took.
     pub async fn save_consensus_output(
-        &self,
+        &mut self,
         consensus: ConsensusOutput,
     ) -> Result<u64, PackError> {
-        self.inner.lock().save_consensus_output(&consensus)
+        self.inner.save_consensus_output(&consensus)
     }
 
     /// Load and return the consensus output for `number` from this epoch.
-    pub async fn get_consensus_output(&self, number: u64) -> Result<ConsensusOutput, PackError> {
-        let bytes = { self.inner.lock().bytes_for_consensus(number)? };
+    pub async fn get_consensus_output(
+        &mut self,
+        number: u64,
+    ) -> Result<ConsensusOutput, PackError> {
+        let bytes = self.inner.bytes_for_consensus(number)?;
         decode_output_bytes(bytes, self.version, self.compression, &self.committee).await
     }
 
@@ -233,97 +224,98 @@ impl ConsensusPackDirect {
     }
 
     /// Load and return the raw pack-file bytes for `number` (the serve-to-peer path).
-    pub async fn get_consensus_output_bytes(&self, number: u64) -> Result<Vec<u8>, PackError> {
-        let bytes = { self.inner.lock().bytes_for_consensus(number)? };
+    pub async fn get_consensus_output_bytes(&mut self, number: u64) -> Result<Vec<u8>, PackError> {
+        let bytes = self.inner.bytes_for_consensus(number)?;
         serve_output_bytes(bytes, self.version, self.compression, &self.committee).await
     }
 
     /// Byte offset just past the end of the consensus output for `number`.
-    pub async fn consensus_output_end(&self, number: u64) -> Result<u64, PackError> {
-        self.inner.lock().output_end_for_consensus(number)
+    pub async fn consensus_output_end(&mut self, number: u64) -> Result<u64, PackError> {
+        self.inner.output_end_for_consensus(number)
     }
 
     /// True if the pack contains a consensus header for `number`.
-    pub async fn contains_consensus_header_number(&self, number: u64) -> Result<bool, PackError> {
-        Ok(self.inner.lock().contains_consensus_header_number(number))
+    pub async fn contains_consensus_header_number(
+        &mut self,
+        number: u64,
+    ) -> Result<bool, PackError> {
+        Ok(self.inner.contains_consensus_header_number(number))
     }
 
     /// True if the pack contains the consensus header for `digest`.
-    pub async fn contains_consensus_header(&self, digest: ConsensusHeaderDigest) -> bool {
-        self.inner.lock().contains_consensus_header(digest)
+    pub async fn contains_consensus_header(&mut self, digest: ConsensusHeaderDigest) -> bool {
+        self.inner.contains_consensus_header(digest)
     }
 
     /// Retrieve a consensus header by digest.
     pub async fn consensus_header_by_digest(
-        &self,
+        &mut self,
         digest: ConsensusHeaderDigest,
     ) -> Option<ConsensusHeader> {
-        self.inner.lock().consensus_header_by_digest(digest)
+        self.inner.consensus_header_by_digest(digest)
     }
 
     /// Retrieve a consensus header by number.
     pub async fn consensus_header_by_number(
-        &self,
+        &mut self,
         number: u64,
     ) -> Result<ConsensusHeader, PackError> {
-        self.inner.lock().consensus_header_by_number(number)
+        self.inner.consensus_header_by_number(number)
     }
 
     /// Flush and durably persist all buffered writes.
-    pub async fn persist(&self) -> Result<(), PackError> {
-        self.inner.lock().persist()
+    pub async fn persist(&mut self) -> Result<(), PackError> {
+        self.inner.persist()
     }
 
     /// Make buffered writes visible to a separate reader without a durability barrier.
-    pub async fn flush_data(&self) -> Result<(), PackError> {
-        self.inner.lock().flush_data()
+    pub async fn flush_data(&mut self) -> Result<(), PackError> {
+        self.inner.flush_data()
     }
 
     /// Read the last committed rounds for authorities from the epoch.
     pub async fn read_last_committed(
-        &self,
+        &mut self,
     ) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
-        self.inner.lock().read_last_committed()
+        self.inner.read_last_committed()
     }
 
     /// Read the latest commit sub-dag whose reputation scores are marked final, if any.
     pub async fn read_latest_commit_with_final_reputation_scores(
-        &self,
+        &mut self,
     ) -> Result<Option<CommittedSubDag>, PackError> {
-        self.inner.lock().read_latest_commit_with_final_reputation_scores()
+        self.inner.read_latest_commit_with_final_reputation_scores()
     }
 
     /// Return the latest consensus header by reading directly from the pack index.
-    pub async fn latest_consensus_header(&self) -> Result<Option<ConsensusHeader>, PackError> {
-        self.inner.lock().latest_consensus_header()
+    pub async fn latest_consensus_header(&mut self) -> Result<Option<ConsensusHeader>, PackError> {
+        self.inner.latest_consensus_header()
     }
 
     /// True if the pack contains the batch for `digest`.
-    pub async fn contains_batch(&self, digest: BlockHash) -> bool {
-        self.inner.lock().contains_batch(digest)
+    pub async fn contains_batch(&mut self, digest: BlockHash) -> bool {
+        self.inner.contains_batch(digest)
     }
 
     /// Return the batch for `digest` if found.
-    pub async fn batch(&self, digest: BlockHash) -> Option<Batch> {
-        self.inner.lock().batch(digest)
+    pub async fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
+        self.inner.batch(digest)
     }
 
     /// Count leaders (into `rewards_counter`) lower than `last_executed_round`.
     pub async fn count_leaders(
-        &self,
+        &mut self,
         last_executed_round: Round,
         rewards_counter: RewardsCounter,
     ) -> Result<(), PackError> {
-        self.inner.lock().count_leaders(last_executed_round, &rewards_counter)
+        self.inner.count_leaders(last_executed_round, &rewards_counter)
     }
 }
 
 impl Drop for ConsensusPackDirect {
     fn drop(&mut self) {
-        // Mirror ConsensusPack: the last live handle persists on close. Underlying Pack/index Drops
-        // also flush, so this is best-effort (errors — e.g. on a read-only pack — are ignored).
-        if Arc::strong_count(&self.inner) == 1 {
-            let _ = self.inner.lock().persist();
-        }
+        // Mirror ConsensusPack: persist on close. Underlying Pack/index Drops also flush, so this is
+        // best-effort (errors — e.g. on a read-only pack — are ignored).
+        let _ = self.inner.persist();
     }
 }
