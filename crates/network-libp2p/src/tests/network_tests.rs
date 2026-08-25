@@ -1493,16 +1493,19 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
         let mut goodbye_tx = Some(goodbye_tx);
         loop {
             if let SwarmEvent::Behaviour(request_response::Event::Message {
-                message: request_response::Message::Request { request, channel, .. },
+                message:
+                    request_response::Message::Request {
+                        request: TestWorkerRequest::PeerExchange(map),
+                        channel,
+                        ..
+                    },
                 ..
             }) = raw_swarm.select_next_some().await
             {
-                if let TestWorkerRequest::PeerExchange(map) = request {
-                    let ack = TestWorkerResponse::from(PeerExchangeMap::default());
-                    let _ = raw_swarm.behaviour_mut().send_response(channel, ack);
-                    if let Some(tx) = goodbye_tx.take() {
-                        let _ = tx.send(map);
-                    }
+                let ack = TestWorkerResponse::from(PeerExchangeMap::default());
+                let _ = raw_swarm.behaviour_mut().send_response(channel, ack);
+                if let Some(tx) = goodbye_tx.take() {
+                    let _ = tx.send(map);
                 }
             }
         }
