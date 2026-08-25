@@ -403,6 +403,119 @@ pub fn multi_workers_fork_epoch_override() -> Option<Epoch> {
     })
 }
 
+#[cfg(feature = "adiri")]
+/// First epoch whose committed sub-DAGs order same-round certificates by the leader-seeded
+/// tie-break in `order_dag` (#1260).
+///
+/// Within a round, the legacy commit order is the DFS discovery order, which is derived from
+/// the digest-ordered parent sets of the sub-DAG. A header digest is a blake3 hash over
+/// proposer-controlled fields (the `payload` insertion order and `created_at`), so a Byzantine
+/// proposer can grind its own digest to steer its certificate toward either end of its round,
+/// and that order reaches execution with no re-sort. Post-fork, `order_dag` keys the
+/// intra-round order on `blake3(leader_digest || certificate_digest)` instead: no proposer
+/// other than the leader knows that digest when it builds its own header, so a non-leader
+/// position cannot be ground in advance, while the order stays a pure function of committed
+/// data that every honest node derives identically. The schedule-determined leader keeps a
+/// residual grind over its own sub-DAG's permutations on its own turn; `order_dag`'s
+/// `leader_seeded_key` documents why that residual is accepted.
+///
+/// The gate ([`leader_seeded_ordering_active`]) always reads the epoch carried inside the
+/// committed leader, never node-local committee state, so replay of a historical commit
+/// reproduces the historical execution sequence.
+///
+/// PLACEHOLDER: `u32::MAX` practically never fires. Set a concrete future epoch in a dedicated
+/// epoch-setting PR only after every validator and observer runs a gate-capable build. The full
+/// fork schedule is logged at startup so operators can diff it across the fleet; a compile-time
+/// constant that differs between binaries has no other in-protocol detection.
+///
+/// Rollout sequence (standard hard-fork rule): deploy the gate-capable build fleet-wide first
+/// (safe indefinitely while dormant, since the legacy order stays in force for every epoch
+/// below the constant), then land the epoch-setting PR fleet-wide before the fork epoch
+/// begins. A straggler still on an old build past the boundary orders the same certificates
+/// differently, executes them in a different sequence, and forks away from the upgraded fleet
+/// at its next commit. That divergence is loud (its executed state stops matching the fleet's)
+/// but it is a fork, not a decode error, so the fleet must be fully upgraded before the epoch
+/// is armed.
+///
+/// Non-adiri builds (mainnet) have no dormant period: the seeded order is active from genesis
+/// and this constant does not exist there.
+pub const LEADER_SEEDED_ORDERING_FORK_EPOCH: Epoch = u32::MAX;
+
+/// Whether the committed sub-DAG of a leader of `epoch` orders same-round certificates by the
+/// leader-seeded tie-break `blake3(leader_digest || certificate_digest)` instead of the legacy
+/// DFS discovery order (#1260).
+///
+/// Gates the linearization in `order_dag`. Callers MUST pass the epoch carried inside the
+/// committed leader (`leader.epoch()`), never `Committee::epoch()` or other node-local state,
+/// so that a replayed historical commit keeps its historical order.
+///
+/// Adiri builds activate at [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]; all other builds are active
+/// from genesis (mainnet never produced a legacy-ordered commit). Under `test-utils`, an
+/// explicit `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH` override takes precedence over both (see
+/// [`leader_seeded_ordering_fork_epoch_override`]), so a test states the fork point it means
+/// rather than inheriting whichever one its feature set happens to select.
+#[inline]
+pub fn leader_seeded_ordering_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "test-utils")]
+    {
+        leader_seeded_ordering_fork_epoch_override()
+            .map_or_else(|| leader_seeded_ordering_build_fork_active(epoch), |fork| epoch >= fork)
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        leader_seeded_ordering_build_fork_active(epoch)
+    }
+}
+
+/// This build's compile-time fork point for the leader-seeded-ordering fork, with no test
+/// override applied.
+///
+/// Spelled out in full rather than sharing another gate's helper because the forks arm
+/// independently and must never be tied to one constant.
+///
+/// Unchanged from [`LEADER_SEEDED_ORDERING_FORK_EPOCH`]'s documented contract: adiri (testnet,
+/// which carries legacy-ordered commits in its history) stays dormant until the constant is
+/// lowered, and every other build is active from genesis.
+#[inline]
+const fn leader_seeded_ordering_build_fork_active(epoch: Epoch) -> bool {
+    #[cfg(feature = "adiri")]
+    #[expect(
+        clippy::absurd_extreme_comparisons,
+        reason = "LEADER_SEEDED_ORDERING_FORK_EPOCH is a `u32::MAX` placeholder; `>=` (not \
+                  `==`) is the gate the future epoch-setting PR relies on, and this expectation \
+                  flags itself for removal once that PR lowers the constant"
+    )]
+    {
+        epoch >= LEADER_SEEDED_ORDERING_FORK_EPOCH
+    }
+    #[cfg(not(feature = "adiri"))]
+    {
+        let _ = epoch;
+        true
+    }
+}
+
+/// Test-only override of the effective leader-seeded-ordering fork epoch, read once from
+/// `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH` (`4294967295` for "never fires", `0` for "active
+/// from genesis").
+///
+/// An environment variable rather than a process-global setter because e2e tests drive real
+/// node processes spawned via `TN_BIN_PATH`, which share no memory with the harness: a static
+/// would silently reach only the in-process tests.
+///
+/// Compiled out entirely without `test-utils`, so a production binary keeps the compile-time
+/// constant and cannot be repointed at runtime by its environment. An unparseable value is
+/// ignored rather than defaulted, leaving the build's own fork point in force.
+#[cfg(feature = "test-utils")]
+pub fn leader_seeded_ordering_fork_epoch_override() -> Option<Epoch> {
+    static OVERRIDE: std::sync::OnceLock<Option<Epoch>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TN_LEADER_SEEDED_ORDERING_FORK_EPOCH")
+            .ok()
+            .and_then(|raw| raw.trim().parse().ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +682,73 @@ mod tests {
             assert_eq!(
                 multi_workers_fork_active(epoch),
                 multi_workers_build_fork_active(epoch),
+                "an unset override must not shift the gate at epoch {epoch}",
+            );
+        });
+    }
+
+    /// Pin the leader-seeded-ordering gate to the rollout contract this build actually
+    /// implements.
+    ///
+    /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`]
+    /// states for the seed-signature gate: "dormant while the constant is `u32::MAX`" holds
+    /// only under `adiri`. Every other build, including the default one that produces both the
+    /// shipped node binary and the e2e binary, is active from genesis, so epoch 0 already
+    /// orders sub-DAGs with the leader-seeded tie-break there.
+    ///
+    /// Asserts against [`leader_seeded_ordering_build_fork_active`], the override-free
+    /// decision, so the result does not depend on whether `test-utils` was unified into this
+    /// build. The grid is derived from the constant, so arming the fork does not require
+    /// editing this test.
+    #[test]
+    fn leader_seeded_ordering_build_fork_gate_matches_this_builds_rollout_contract() {
+        #[cfg(not(feature = "adiri"))]
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert!(
+                leader_seeded_ordering_build_fork_active(epoch),
+                "non-adiri builds never produced a legacy-ordered commit and are active from \
+                 genesis; epoch {epoch} must be post-fork",
+            );
+        });
+        #[cfg(feature = "adiri")]
+        {
+            [0, 1, 2, LEADER_SEEDED_ORDERING_FORK_EPOCH.saturating_sub(1)]
+                .into_iter()
+                .filter(|epoch| *epoch < LEADER_SEEDED_ORDERING_FORK_EPOCH)
+                .for_each(|epoch| {
+                    assert!(
+                        !leader_seeded_ordering_build_fork_active(epoch),
+                        "adiri stays dormant before LEADER_SEEDED_ORDERING_FORK_EPOCH; epoch \
+                         {epoch} must be pre-fork",
+                    );
+                });
+            [LEADER_SEEDED_ORDERING_FORK_EPOCH, u32::MAX].into_iter().for_each(|epoch| {
+                assert!(
+                    leader_seeded_ordering_build_fork_active(epoch),
+                    "the gate must fire from the fork epoch onward (`>=`, not `>`); epoch \
+                     {epoch} must be post-fork",
+                );
+            });
+        }
+    }
+
+    /// With no `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH` in the environment, the test override
+    /// must be completely inert: the gate answers exactly as the compile-time contract does.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn leader_seeded_ordering_override_is_inert_when_unset() {
+        // The override latches in a process-wide `OnceLock`, so a harness launched WITH the
+        // variable set cannot observe the unset behaviour. Fail loudly rather than assert a
+        // property this process cannot hold; a silent skip here would read as a pass.
+        assert!(
+            leader_seeded_ordering_fork_epoch_override().is_none(),
+            "this test requires a process without TN_LEADER_SEEDED_ORDERING_FORK_EPOCH set; \
+             the override is OnceLock-latched, so run the unset case in its own process",
+        );
+        [0, 1, 2, u32::MAX].into_iter().for_each(|epoch| {
+            assert_eq!(
+                leader_seeded_ordering_active(epoch),
+                leader_seeded_ordering_build_fork_active(epoch),
                 "an unset override must not shift the gate at epoch {epoch}",
             );
         });

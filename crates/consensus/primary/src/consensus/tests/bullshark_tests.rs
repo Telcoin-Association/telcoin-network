@@ -16,9 +16,9 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
-    AuthorityIdentifier, ConsensusHeaderDigest, ConsensusNumHash, EpochDigest, EpochRecord,
-    ExecHeader, Header, SealedHeader, ShutdownNotifier, TaskManager, TnReceiver, TnSender, B256,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    forks, AuthorityIdentifier, ConsensusHeaderDigest, ConsensusNumHash, EpochDigest, EpochRecord,
+    ExecHeader, Header, HeaderDigest, SealedHeader, ShutdownNotifier, TaskManager, TnReceiver,
+    TnSender, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use tracing::info;
 
@@ -1528,4 +1528,192 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
     }
 
     assert!(committed);
+}
+
+/// Reports whether this process runs the post-fork branch of `order_dag`. Without the `adiri`
+/// feature the gate is active for every epoch, so on the default test build the four tests
+/// below always run in full. On an `adiri` feature-unified build (or with a high
+/// `TN_LEADER_SEEDED_ORDERING_FORK_EPOCH` latched, once per process) the fork is correctly
+/// dormant, so the tests skip with a loud note instead of failing on a build where the seeded
+/// branch cannot be observed.
+fn seeded_branch_active() -> bool {
+    let active = forks::leader_seeded_ordering_active(0);
+    if !active {
+        eprintln!(
+            "skipping leader-seeded ordering assertions: the fork is dormant in this build \
+             (adiri feature unified, or TN_LEADER_SEEDED_ORDERING_FORK_EPOCH latched high)"
+        );
+    }
+    active
+}
+
+/// Builds an optimal DAG for rounds 1..=6 over the default four-authority committee and returns
+/// the populated consensus state.
+///
+/// Certificate digests are random per process run (mock payloads embed random transactions), so
+/// the tests below assert structural and statistical properties rather than exact sequences.
+fn seeded_ordering_state() -> ConsensusState {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _next_parents) =
+        make_optimal_certificates(&committee, 1..=6, &genesis, &ids);
+
+    let gc_depth = 50;
+    let mut state = ConsensusState::new(gc_depth);
+    certificates.iter().for_each(|certificate| {
+        state.try_insert(certificate).unwrap();
+    });
+    state
+}
+
+/// Returns two distinct round-6 certificates that stand in as alternative leaders over the same
+/// sub-DAG: an optimal DAG makes every certificate of rounds 1..=5 reachable from either one.
+fn two_round_6_leaders(state: &ConsensusState) -> (Certificate, Certificate) {
+    let mut candidates = state
+        .dag
+        .get(&6)
+        .expect("round 6 exists in the populated DAG")
+        .values()
+        .map(|(_digest, certificate)| certificate.clone());
+    let first = candidates.next().expect("at least one round 6 certificate");
+    let second = candidates.next().expect("at least two round 6 certificates");
+    assert_ne!(first.digest(), second.digest(), "leaders must be distinct");
+    (first, second)
+}
+
+/// Groups a commit sequence into per-round digest sequences, preserving the emitted order.
+fn digests_by_round(ordered: &[Certificate]) -> HashMap<Round, Vec<HeaderDigest>> {
+    ordered.iter().fold(HashMap::new(), |mut acc, certificate| {
+        acc.entry(certificate.round()).or_default().push(certificate.digest());
+        acc
+    })
+}
+
+/// Post-fork `order_dag` invariants (#1260): rounds never decrease, the leader is the final
+/// certificate, and the leader-seeded tie-break only permutes certificates within their round,
+/// so per-round membership is exactly what the legacy round-only sort would emit.
+#[tokio::test]
+async fn order_dag_seeded_sort_preserves_rounds_and_membership() {
+    // GIVEN a build where the seeded branch is observable (skip with a note otherwise)
+    if seeded_branch_active() {
+        let state = seeded_ordering_state();
+        let (leader, _other) = two_round_6_leaders(&state);
+
+        // WHEN
+        let ordered = utils::order_dag(&leader, &state);
+
+        // THEN the leader sorts last and rounds are non-decreasing
+        assert_eq!(ordered.last().expect("commit is non-empty").digest(), leader.digest());
+        ordered.iter().zip(ordered.iter().skip(1)).for_each(|(previous, next)| {
+            assert!(previous.round() <= next.round(), "rounds must be non-decreasing");
+        });
+
+        // AND per-round membership equals the sub-DAG: every certificate of rounds 1..=5
+        // exactly once, plus the leader alone at round 6. The seeded sort may only permute
+        // within a round.
+        let by_round = digests_by_round(&ordered);
+        let committee_size = state.dag.get(&1).expect("round 1 exists").len();
+        (1..=5).for_each(|round| {
+            let expected = state
+                .dag
+                .get(&round)
+                .expect("round exists in the DAG")
+                .values()
+                .map(|(digest, _certificate)| *digest)
+                .collect::<BTreeSet<_>>();
+            let committed = by_round.get(&round).expect("round appears in the commit");
+            let actual = committed.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected, "round {round} membership must match the DAG");
+            assert_eq!(committed.len(), expected.len(), "round {round} has no duplicates");
+        });
+        assert_eq!(by_round.get(&6).expect("leader round appears"), &vec![leader.digest()]);
+        assert_eq!(ordered.len(), 5 * committee_size + 1, "five full rounds plus the leader");
+    }
+}
+
+/// The seeded order is a pure function of the leader and the DAG: two `order_dag` calls with
+/// the same leader emit the identical sequence, so every honest node derives the same commit.
+#[tokio::test]
+async fn order_dag_seeded_sort_is_deterministic() {
+    // GIVEN a build where the seeded branch is observable (skip with a note otherwise)
+    if seeded_branch_active() {
+        let state = seeded_ordering_state();
+        let (leader, _other) = two_round_6_leaders(&state);
+
+        // WHEN
+        let first: Vec<_> = utils::order_dag(&leader, &state).iter().map(|x| x.digest()).collect();
+        let second: Vec<_> = utils::order_dag(&leader, &state).iter().map(|x| x.digest()).collect();
+
+        // THEN
+        assert_eq!(first, second, "repeated calls must agree digest for digest");
+    }
+}
+
+/// The intra-round order is keyed on the committed leader's digest (#1260): two distinct
+/// round-6 leaders over the same optimal sub-DAG commit the same certificates for rounds 1..=5
+/// but disagree on at least one round's permutation. This is the anti-grinding property: a
+/// proposer cannot steer its position without knowing the future leader.
+///
+/// Statistical, not absolute: modelling blake3 as a random oracle, two independent leader keys
+/// induce independent orders on each four-certificate round, so all five rounds coincide with
+/// probability at most (1 / 24)^5, under 2e-7 per run.
+#[tokio::test]
+async fn order_dag_seeded_sort_depends_on_the_leader() {
+    // GIVEN a build where the seeded branch is observable (skip with a note otherwise)
+    if seeded_branch_active() {
+        let state = seeded_ordering_state();
+        let (leader_a, leader_b) = two_round_6_leaders(&state);
+
+        // WHEN ordering the shared rounds 1..=5 under each leader (round 6 holds only the
+        // leader itself, so it is excluded from the comparison)
+        let below_leader = |leader: &Certificate| {
+            utils::order_dag(leader, &state)
+                .iter()
+                .filter(|x| x.round() <= 5)
+                .map(|x| x.digest())
+                .collect::<Vec<_>>()
+        };
+        let order_a = below_leader(&leader_a);
+        let order_b = below_leader(&leader_b);
+
+        // THEN both commits carry the same certificates
+        assert_eq!(
+            order_a.iter().copied().collect::<BTreeSet<_>>(),
+            order_b.iter().copied().collect::<BTreeSet<_>>(),
+            "both leaders must commit the same sub-DAG"
+        );
+        // AND the leader digest reseeds the intra-round permutation
+        assert_ne!(order_a, order_b, "distinct leaders must produce distinct intra-round orders");
+    }
+}
+
+/// The seeded order does not reduce to ascending certificate-digest order: a certificate's
+/// position is not a monotone function of its own digest, so grinding toward a small or large
+/// digest buys no particular slot (#1260).
+///
+/// Statistical, not absolute: the seeded permutation matches digest-ascending order on all five
+/// four-certificate rounds with probability at most (1 / 24)^5, under 2e-7 per run, modelling
+/// blake3 as a random oracle over this run's random fixture digests.
+#[tokio::test]
+async fn order_dag_seeded_sort_is_not_digest_ascending() {
+    // GIVEN a build where the seeded branch is observable (skip with a note otherwise)
+    if seeded_branch_active() {
+        let state = seeded_ordering_state();
+        let (leader, _other) = two_round_6_leaders(&state);
+
+        // WHEN
+        let by_round = digests_by_round(&utils::order_dag(&leader, &state));
+
+        // THEN at least one round's seeded order differs from its digest-ascending order
+        let any_round_differs = (1..=5).any(|round| {
+            let seeded = by_round.get(&round).expect("round appears in the commit");
+            let ascending =
+                seeded.iter().copied().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+            *seeded != ascending
+        });
+        assert!(any_round_differs, "seeded order must not equal ascending digest order");
+    }
 }
