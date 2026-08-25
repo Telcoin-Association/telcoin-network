@@ -25,12 +25,11 @@
 
 use futures::StreamExt as _;
 use reth::transaction_pool::{
-    blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, EthTransactionPool,
-    TransactionValidationTaskExecutor,
+    blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, TransactionValidationTaskExecutor,
 };
 use reth_chainspec::ChainSpec;
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
-use reth_primitives_traits::SignerRecoverable;
+use reth_primitives_traits::{SealedBlock as RethSealedBlock, SignerRecoverable};
 use reth_provider::{
     providers::BlockchainProvider, AccountReader as _, CanonStateNotification,
     CanonStateSubscriptions as _, Chain, ChangedAccount,
@@ -39,16 +38,17 @@ use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_trans
 use reth_transaction_pool::{
     error::{
         Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
-        PoolError,
+        PoolError, PoolTransactionError,
     },
-    AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, EthPooledTransaction,
-    PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
-    TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
+    AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, CoinbaseTipOrdering,
+    EthPooledTransaction, EthTransactionValidator, Pool, PoolSize, PoolTransaction, PoolUpdateKind,
+    TransactionEvents, TransactionOrigin, TransactionPool as _, TransactionPoolExt as _,
+    TransactionValidationOutcome, TransactionValidator, ValidPoolTransaction,
 };
 use std::{sync::Arc, time::Instant};
 use tn_types::{
-    Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned,
-    TxHash, MIN_PROTOCOL_BASE_FEE, U256,
+    max_tx_authorizations, Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner,
+    TransactionSigned, TransactionTrait, TxHash, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -92,22 +92,256 @@ pub trait TxPool {
     fn get_account_balance(&self, address: Address) -> U256;
 }
 
+/// The worker's concrete reth pool type: reth's `Pool` over the eth validator wrapped in
+/// [`TnPoolValidator`].
+///
+/// Reth's `EthTransactionPool` alias hard-codes the validator to `EthTransactionValidator`,
+/// so once the validator is wrapped the pool type must be spelled out here instead.
+pub type TnEthTransactionPool = Pool<
+    TransactionValidationTaskExecutor<
+        TnPoolValidator<
+            EthTransactionValidator<
+                BlockchainProvider<TelcoinNode>,
+                EthPooledTransaction,
+                TnEvmConfig,
+            >,
+        >,
+    >,
+    CoinbaseTipOrdering<EthPooledTransaction>,
+    DiskFileBlobStore,
+>;
+
 /// A telcoin network transaction pool.
 ///
 /// The second field is a handle to the blockchain provider, retained so the pool can read a
 /// sender's canonical balance when constructing optimistic pool updates after mining a batch
 /// (see [`TxPool::get_account_balance`]).
 #[derive(Clone, Debug)]
-pub struct WorkerTxPool(
-    EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>,
-    BlockchainProvider<TelcoinNode>,
-);
+pub struct WorkerTxPool(TnEthTransactionPool, BlockchainProvider<TelcoinNode>);
 
-impl From<WorkerTxPool>
-    for EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>
-{
+impl From<WorkerTxPool> for TnEthTransactionPool {
     fn from(value: WorkerTxPool) -> Self {
         value.0
+    }
+}
+
+/// Pool rejection for an EIP-7702 transaction whose authorization list is longer than
+/// [`max_tx_authorizations`].
+///
+/// Upstream reth owns [`InvalidPoolTransactionError`] and none of its variants describe an
+/// over-long authorization list ([`Eip7702PoolTransactionError::MissingEip7702AuthorizationList`]
+/// is the inverse case), so this TN type rides in [`InvalidPoolTransactionError::Other`]
+/// instead of borrowing a wrong-semantics upstream kind.
+#[derive(Debug, thiserror::Error)]
+#[error("EIP-7702 authorization list length {len} exceeds maximum {max}")]
+pub struct AuthorizationListLengthExceeded {
+    /// Number of authorization tuples the transaction declares.
+    len: usize,
+    /// The enforced cap, [`max_tx_authorizations`] at epoch 0.
+    max: u64,
+}
+
+/// Error outcome for a survivor the inner validator returned no outcome for.
+///
+/// Reachable only if the wrapped validator violates its one-outcome-per-input contract;
+/// [`TnPoolValidator::validate_transactions`] degrades loudly with this error instead of
+/// silently dropping the transaction's outcome.
+#[derive(Debug, thiserror::Error)]
+#[error("inner transaction validator returned no outcome for this transaction")]
+struct MissingInnerValidationOutcome;
+
+impl PoolTransactionError for AuthorizationListLengthExceeded {
+    /// `true`: the bound is static, so the transaction can never become valid and belongs
+    /// nowhere near the pool. The flag only feeds devp2p peer reputation, which TN does not
+    /// run (see [`new_pool_txn`]: `propagate` is always `false`), so it cannot penalize a
+    /// local RPC submitter; reth surfaces the rejection to the submitter as a plain
+    /// invalid-transaction RPC error either way.
+    fn is_bad_transaction(&self) -> bool {
+        true
+    }
+
+    /// Expose the concrete type so callers can downcast the boxed error.
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Result of [`TnPoolValidator`]'s pre-admission screen on one transaction.
+///
+/// A dedicated enum rather than `Result`: both arms carry payload the caller moves out of,
+/// and the two-phase batched merge in `validate_transactions` reads better over named arms.
+enum Screened<Tx: PoolTransaction> {
+    /// The transaction failed the screen; the rejection outcome is final.
+    Rejected(TransactionValidationOutcome<Tx>),
+    /// The transaction passed the screen and goes to the inner validator.
+    Admitted(TransactionOrigin, Tx),
+}
+
+/// Pre-admission wrap around reth's transaction validator that bounds the EIP-7702
+/// authorization-list length before any per-tuple work runs.
+///
+/// Reth's `EthTransactionValidator` recovers every authorization tuple's signer during
+/// validation, before the sender has paid any fee, so a padded list buys ~1,200 unpaid ECDSA
+/// recoveries per transaction. This wrap reads the list length first and rejects an over-cap
+/// transaction without calling the inner validator: the length read pre-empts the per-tuple
+/// recovery work.
+///
+/// The cap is [`max_tx_authorizations`] at epoch 0: the cap is epoch-uniform today, and the
+/// batch validator enforces the epoch-precise bound. An over-cap transaction can never
+/// execute (see [`max_tx_authorizations`] for the derivation), so the screen rejects only
+/// garbage.
+///
+/// The empty-list case is deliberately NOT rejected here: the inner eth validator already
+/// returns [`Eip7702PoolTransactionError::MissingEip7702AuthorizationList`] for it and
+/// callers may match on that kind.
+#[derive(Debug)]
+pub struct TnPoolValidator<V> {
+    /// The wrapped validator, delegated to for every transaction that passes the screen.
+    inner: V,
+}
+
+impl<V> TnPoolValidator<V> {
+    /// Wrap `inner` with the TN authorization-list length screen.
+    pub fn new(inner: V) -> Self {
+        Self { inner }
+    }
+}
+
+impl<V> TnPoolValidator<V>
+where
+    V: TransactionValidator,
+    V::Transaction: TransactionTrait,
+{
+    /// Screen one transaction against the authorization-list cap.
+    ///
+    /// A non-7702 transaction reports no authorization list and always passes. A list
+    /// length that does not fit `u64` is over any cap and rejects.
+    fn screen(
+        &self,
+        origin: TransactionOrigin,
+        transaction: V::Transaction,
+    ) -> Screened<V::Transaction> {
+        let max = max_tx_authorizations(0);
+        let len = transaction.authorization_list().map_or(0, |list| list.len());
+        let over_cap = u64::try_from(len).map_or(true, |len| len > max);
+        if over_cap {
+            Screened::Rejected(TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::Other(Box::new(AuthorizationListLengthExceeded {
+                    len,
+                    max,
+                })),
+            ))
+        } else {
+            Screened::Admitted(origin, transaction)
+        }
+    }
+}
+
+impl<V> TransactionValidator for TnPoolValidator<V>
+where
+    V: TransactionValidator,
+    V::Transaction: TransactionTrait,
+{
+    type Transaction = V::Transaction;
+    type Block = V::Block;
+
+    /// Screen, then delegate. The cap check runs before the inner validator, so an over-cap
+    /// transaction costs one length read, never the inner validator's state reads or its
+    /// per-tuple authority recovery.
+    async fn validate_transaction(
+        &self,
+        origin: TransactionOrigin,
+        transaction: Self::Transaction,
+    ) -> TransactionValidationOutcome<Self::Transaction> {
+        match self.screen(origin, transaction) {
+            Screened::Rejected(outcome) => outcome,
+            Screened::Admitted(origin, transaction) => {
+                self.inner.validate_transaction(origin, transaction).await
+            }
+        }
+    }
+
+    /// Batched validation with the screen applied per transaction.
+    ///
+    /// The wrapped `EthTransactionValidator` overrides this method with a batched path
+    /// (`validate_batch`) that shares one state-provider handle across the whole slice.
+    /// This override preserves it: screen every transaction, send the survivors to the
+    /// inner batched call, and merge the outcomes back in the original input order, since
+    /// callers rely on positional correspondence.
+    async fn validate_transactions(
+        &self,
+        transactions: impl IntoIterator<Item = (TransactionOrigin, Self::Transaction), IntoIter: Send>
+            + Send,
+    ) -> Vec<TransactionValidationOutcome<Self::Transaction>> {
+        // One slot per input position: `Some` holds a screen rejection, `None` marks a
+        // survivor whose outcome comes from the inner batched call.
+        let (slots, survivors) = transactions
+            .into_iter()
+            .map(|(origin, transaction)| self.screen(origin, transaction))
+            .fold((Vec::new(), Vec::new()), |(mut slots, mut survivors), item| match item {
+                Screened::Rejected(outcome) => {
+                    slots.push(Some(outcome));
+                    (slots, survivors)
+                }
+                Screened::Admitted(origin, transaction) => {
+                    slots.push(None);
+                    survivors.push((origin, transaction));
+                    (slots, survivors)
+                }
+            });
+        // Capture the survivor hashes before the inner call consumes the transactions, so a
+        // missing inner outcome can still be reported against the right transaction.
+        let survivor_hashes: Vec<TxHash> =
+            survivors.iter().map(|(_, transaction)| *transaction.hash()).collect();
+        let inner_outcomes = self.inner.validate_transactions(survivors).await;
+        // The inner call must return exactly one outcome per survivor in order; filling each
+        // `None` slot with the next inner outcome restores the original positions. The count
+        // is an upstream contract this wrapper cannot enforce, so a mismatch degrades loudly
+        // (a warning plus an explicit `Error` outcome per unmatched slot) instead of silently
+        // dropping outcomes or misattributing them to the wrong transaction.
+        if inner_outcomes.len() != survivor_hashes.len() {
+            warn!(
+                target: "txpool",
+                expected = survivor_hashes.len(),
+                got = inner_outcomes.len(),
+                "inner validator returned a mismatched outcome count; padding with errors"
+            );
+        }
+        let mut inner_outcomes = inner_outcomes.into_iter();
+        let mut remaining_hashes = survivor_hashes.into_iter();
+        slots
+            .into_iter()
+            .map(|slot| {
+                slot.unwrap_or_else(|| {
+                    // One hash per `None` slot by construction; the zero-hash fallback is
+                    // unreachable and only keeps this arm total.
+                    let hash = remaining_hashes.next().unwrap_or_default();
+                    inner_outcomes.next().unwrap_or_else(|| {
+                        TransactionValidationOutcome::Error(
+                            hash,
+                            Box::new(MissingInnerValidationOutcome),
+                        )
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Same-origin batched validation; routes through [`Self::validate_transactions`] so
+    /// the screen and the inner batched path both apply.
+    async fn validate_transactions_with_origin(
+        &self,
+        origin: TransactionOrigin,
+        transactions: impl IntoIterator<Item = Self::Transaction, IntoIter: Send> + Send,
+    ) -> Vec<TransactionValidationOutcome<Self::Transaction>> {
+        self.validate_transactions(transactions.into_iter().map(move |tx| (origin, tx))).await
+    }
+
+    /// Delegate to the inner validator: the trait default is a no-op, and silently dropping
+    /// the call would freeze the inner validator's fork and tip tracking.
+    fn on_new_head_block(&self, new_tip_block: &RethSealedBlock<Self::Block>) {
+        self.inner.on_new_head_block(new_tip_block)
     }
 }
 
@@ -150,10 +384,21 @@ impl WorkerTxPool {
         .kzg_settings(EnvKzgSettings::Default)
         .with_local_transactions_config(pool_config.local_transactions_config.clone())
         .with_additional_tasks(node_config.txpool.additional_validation_tasks)
-        .build_with_tasks(task_spawner.clone(), blob_store.clone());
+        .build_with_tasks(task_spawner.clone(), blob_store.clone())
+        // Wrap the eth validator with the TN authorization-list cap screen. `map` takes
+        // the validator out of its `Arc` via `Arc::into_inner(..).unwrap()`, which is safe
+        // only because the executor is freshly built on this line and no clone of it
+        // exists yet.
+        .map(TnPoolValidator::new);
 
-        let transaction_pool =
-            reth_transaction_pool::Pool::eth_pool(validator, blob_store, pool_config);
+        // `Pool::eth_pool` is pinned to the unwrapped `EthTransactionValidator`, so build
+        // the wrapped pool through the generic constructor with the same default ordering.
+        let transaction_pool = Pool::new(
+            validator,
+            CoinbaseTipOrdering::<EthPooledTransaction>::default(),
+            blob_store,
+            pool_config,
+        );
 
         info!(target: "tn::execution", "Transaction pool initialized");
 
@@ -586,6 +831,10 @@ mod tests {
     /// the reason for the outcome. Admission therefore proves the validator's type gate in
     /// [`WorkerTxPool::new`] lets type 0x04 through, matching the batch allowlist
     /// (`tn_types::batch_allowlisted_tx_type`) and TN's execution of set-code transactions.
+    ///
+    /// It also proves the [`TnPoolValidator`] screen admits an in-range authorization list
+    /// (one tuple here) and delegates to the inner validator: rejection at the screen would
+    /// fail the admission assertion below.
     #[tokio::test]
     async fn test_pool_accepts_eip7702_transaction() {
         let tmp_dir = TempDir::new().unwrap();
@@ -605,6 +854,51 @@ mod tests {
         assert_eq!(s.pending, 1);
         assert_eq!(s.blob, 0);
         assert!(pool.get(&hash).is_some());
+    }
+
+    /// The unpaid-ECDSA-amplification bound: the pool rejects an EIP-7702 transaction whose
+    /// authorization list exceeds `tn_types::max_tx_authorizations`, and the rejection
+    /// carries TN's [`AuthorizationListLengthExceeded`] kind, an error only the
+    /// [`TnPoolValidator`] screen produces, so its presence proves the screen fired before
+    /// the inner validator ran. The tuples are dummy-signed (wrong chain id): the screen
+    /// reads only the list length, so no per-tuple work has to succeed for the rejection.
+    #[tokio::test]
+    async fn test_pool_rejects_over_cap_eip7702_authorization_list() {
+        use reth_transaction_pool::error::PoolErrorKind;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut tx_factory = TransactionFactory::new_random();
+        let (chain, reth_env, pool) = funded_pool_for_test(&tx_factory, &tmp_dir, &task_manager);
+
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let cap = usize::try_from(max_tx_authorizations(0)).expect("cap fits usize");
+        let signed = tx_factory.create_eip7702_with_authorizations(
+            chain.chain_id(),
+            1_000_000,
+            gas_price,
+            cap + 1,
+            Bytes::new(),
+        );
+
+        // The call returns a rejection (no panic) and the error kind is TN's own.
+        let result = pool.add_raw_transaction_external(signed).await;
+        let err = result.expect_err("over-cap 7702 txn must be rejected");
+        let PoolErrorKind::InvalidTransaction(InvalidPoolTransactionError::Other(boxed)) =
+            &err.kind
+        else {
+            panic!("expected the TN authorization-list cap rejection, got: {err:?}");
+        };
+        assert!(
+            boxed.as_any().downcast_ref::<AuthorizationListLengthExceeded>().is_some(),
+            "expected AuthorizationListLengthExceeded, got: {boxed:?}"
+        );
+
+        // Nothing entered any sub-pool.
+        let s = pool.pool_size();
+        assert_eq!(s.pending, 0);
+        assert_eq!(s.queued, 0);
+        assert_eq!(s.blob, 0);
     }
 
     #[tokio::test]

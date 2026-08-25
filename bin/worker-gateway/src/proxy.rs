@@ -203,11 +203,16 @@ fn classify_error(err: reqwest::Error) -> GatewayError {
 /// Shallow pre-flight for `eth_sendRawTransaction`.
 ///
 /// Returns `Some((error, id))` only when `body` is a single
-/// `eth_sendRawTransaction` call whose raw transaction cannot be decoded, or
-/// decodes to a type outside the executable allowlist — legacy, EIP-2930,
-/// EIP-1559, and EIP-7702 are accepted; an EIP-4844 blob transaction is not.
-/// Every other request — including batches, other methods, and any
-/// structurally-off submission — returns `None` and is forwarded unchanged.
+/// `eth_sendRawTransaction` call whose raw transaction cannot be decoded,
+/// decodes to a type outside the executable allowlist (legacy, EIP-2930,
+/// EIP-1559, and EIP-7702 are accepted; an EIP-4844 blob transaction is not),
+/// or decodes to an EIP-7702 transaction whose authorization list fails
+/// [`tn_types::batch_allowlisted_authorization_list`] (empty, or longer than
+/// the network's cap; such a transaction can never execute, so this is not a
+/// false rejection). Every other request, including JSON array batches, other
+/// methods, and any structurally-off submission, returns `None` and is
+/// forwarded unchanged; the worker's own pool is the authoritative enforcement
+/// for the elements of a batch.
 ///
 /// The `id` rides along with the rejection because deciding it required parsing
 /// the body: returning it spares the response path a second parse of the same
@@ -245,6 +250,14 @@ fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
         Err(_) => Some((GatewayError::InvalidTransaction, id)),
         Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
             Some((GatewayError::UnsupportedTransactionType, id))
+        }
+        // Epoch 0: the authorization-list cap is epoch-uniform today, and the
+        // screen only front-runs a rejection the worker's own pool issues. If a
+        // future fork makes the cap epoch-varying, this screen must loosen (use
+        // the largest cap across epochs), never tighten, to preserve the
+        // no-false-rejection property documented above.
+        Ok(tx) if !tn_types::batch_allowlisted_authorization_list(&tx, 0) => {
+            Some((GatewayError::InvalidAuthorizationList, id))
         }
         Ok(_) => None,
     }
@@ -331,6 +344,47 @@ mod tests {
         let raw = tx.into_signed(dummy_signature).encoded_2718();
         let raw_hex = format!("0x{}", tn_types::hex::encode(raw));
         assert!(screen_err(&send_raw(&format!("[\"{raw_hex}\"]"))).is_none());
+    }
+
+    #[test]
+    fn over_cap_eip7702_payload_is_rejected() {
+        use tn_types::{
+            Address, Authorization, Encodable2718, EthSignature, SignableTransaction, TxEip7702,
+            U256,
+        };
+
+        // A type-`0x04` transaction whose authorization list exceeds the
+        // network cap can never execute (see
+        // `tn_types::batch_allowlisted_authorization_list`), so the screen
+        // rejects it before the upstream round-trip. Dummy signatures suffice:
+        // the screen reads the list length and never recovers signers.
+        let dummy_signature = EthSignature::new(U256::from(1), U256::from(1), false);
+        let over_cap = usize::try_from(tn_types::max_tx_authorizations(0))
+            .expect("cap fits usize")
+            .checked_add(1)
+            .expect("cap + 1 fits usize");
+        let authorization_list = (0..over_cap)
+            .map(|_| {
+                Authorization { chain_id: U256::from(2017), address: Address::ZERO, nonce: 1 }
+                    .into_signed(dummy_signature)
+            })
+            .collect();
+        let tx = TxEip7702 {
+            chain_id: 2017,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 0,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list,
+            input: Default::default(),
+        };
+        let raw = tx.into_signed(dummy_signature).encoded_2718();
+        let raw_hex = format!("0x{}", tn_types::hex::encode(raw));
+        let err = screen_err(&send_raw(&format!("[\"{raw_hex}\"]")));
+        assert!(matches!(err, Some(GatewayError::InvalidAuthorizationList)));
     }
 
     #[test]

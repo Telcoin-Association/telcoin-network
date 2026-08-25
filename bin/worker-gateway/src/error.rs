@@ -45,6 +45,9 @@ mod code {
     /// An `eth_sendRawTransaction` payload decoded to a transaction type
     /// outside the network's allowlist (legacy, EIP-2930, EIP-1559, EIP-7702).
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
+    /// An `eth_sendRawTransaction` payload decoded to an EIP-7702 transaction
+    /// whose authorization list is empty or longer than the network's cap.
+    pub(super) const INVALID_AUTHORIZATION_LIST: i32 = -32009;
     /// The request body could not be read. This is the spec-defined
     /// "Invalid Request" code, not a gateway-range code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
@@ -73,6 +76,10 @@ pub(crate) enum GatewayError {
     /// An `eth_sendRawTransaction` payload decoded to a transaction type
     /// outside the network's allowlist (legacy, EIP-2930, EIP-1559, EIP-7702).
     UnsupportedTransactionType,
+    /// An `eth_sendRawTransaction` payload decoded to an EIP-7702 transaction
+    /// whose authorization list is empty or longer than the network's cap, so
+    /// no batch could ever carry it.
+    InvalidAuthorizationList,
     /// The request body could not be read (e.g. the client aborted mid-body).
     UnreadableBody,
 }
@@ -88,7 +95,9 @@ impl GatewayError {
             Self::LoopDetected => StatusCode::LOOP_DETECTED,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-            Self::InvalidTransaction | Self::UnsupportedTransactionType => StatusCode::BAD_REQUEST,
+            Self::InvalidTransaction
+            | Self::UnsupportedTransactionType
+            | Self::InvalidAuthorizationList => StatusCode::BAD_REQUEST,
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
         }
     }
@@ -105,6 +114,7 @@ impl GatewayError {
             Self::RateLimited => code::RATE_LIMITED,
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
             Self::UnsupportedTransactionType => code::UNSUPPORTED_TRANSACTION_TYPE,
+            Self::InvalidAuthorizationList => code::INVALID_AUTHORIZATION_LIST,
             Self::UnreadableBody => code::INVALID_REQUEST,
         }
     }
@@ -126,6 +136,9 @@ impl GatewayError {
                 "unsupported transaction type: only legacy, EIP-2930, EIP-1559, and EIP-7702 \
                  transactions are accepted"
             }
+            Self::InvalidAuthorizationList => {
+                "EIP-7702 authorization list length is outside the accepted range"
+            }
             Self::UnreadableBody => "request body could not be read",
         }
     }
@@ -145,6 +158,7 @@ impl GatewayError {
             Self::RateLimited => "rate_limited",
             Self::InvalidTransaction => "invalid_transaction",
             Self::UnsupportedTransactionType => "unsupported_transaction_type",
+            Self::InvalidAuthorizationList => "invalid_authorization_list",
             Self::UnreadableBody => "unreadable_body",
         }
     }
@@ -454,6 +468,10 @@ mod tests {
             error_response(&GatewayError::UnsupportedTransactionType, b"{}").status(),
             StatusCode::BAD_REQUEST
         );
+        assert_eq!(
+            error_response(&GatewayError::InvalidAuthorizationList, b"{}").status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
@@ -463,6 +481,7 @@ mod tests {
         assert_eq!(GatewayError::RateLimited.code(), -32006);
         assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
         assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
+        assert_eq!(GatewayError::InvalidAuthorizationList.code(), -32009);
     }
 
     #[test]
@@ -482,6 +501,7 @@ mod tests {
             GatewayError::UnsupportedTransactionType.reason(),
             "unsupported_transaction_type"
         );
+        assert_eq!(GatewayError::InvalidAuthorizationList.reason(), "invalid_authorization_list");
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");
     }
 }

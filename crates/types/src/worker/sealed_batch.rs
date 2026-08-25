@@ -204,6 +204,44 @@ pub fn max_batch_size(_epoch: Epoch) -> usize {
     1_000_000
 }
 
+/// Intrinsic gas of the cheapest transaction (EIP-2 base cost, 21,000).
+///
+/// Local mirror of the protocol constant. tn-types must not grow a revm
+/// dependency, so the value lives here with a pinning unit test instead.
+const BASE_TX_GAS: u64 = 21_000;
+
+/// Intrinsic gas charged per EIP-7702 authorization tuple (25,000).
+///
+/// Mirror of `revm_primitives::eip7702::PER_EMPTY_ACCOUNT_COST`. tn-types must
+/// not grow a revm dependency, so the value lives here with a pinning unit
+/// test instead.
+const PER_EMPTY_ACCOUNT_COST: u64 = 25_000;
+
+/// Max EIP-7702 authorization-list length a batch transaction may carry at
+/// `_epoch`. Currently (30,000,000 - 21,000) / 25,000 = 1199.
+///
+/// Derivation: each authorization tuple costs at least
+/// [`PER_EMPTY_ACCOUNT_COST`] intrinsic gas on top of [`BASE_TX_GAS`]. A
+/// type-0x04 transaction with more than this many tuples must either declare
+/// `gas_limit >= 21_000 + 25_000 * N > max_batch_gas` (so no batch can ever
+/// carry it: the batch validator sums declared gas limits against
+/// [`max_batch_gas`]) or under-declare and be rejected by revm's
+/// intrinsic-gas gate (`CallGasCostMoreThanGasLimit`) before any per-tuple
+/// authority recovery. Either way the transaction can never execute, so every
+/// enforcement site that uses this bound rejects only garbage: no valid
+/// transaction is ever refused.
+///
+/// The DoS this bounds: each tuple costs one unpaid ECDSA recovery at pool
+/// admission (reth recovers authorities during validation). The cap bounds
+/// that work to 1199 recoveries per transaction, and enforcement sites check
+/// the list length BEFORE the recovery runs.
+///
+/// The epoch parameter mirrors [`max_batch_gas`] and auto-tracks a future
+/// fork that raises batch gas. Currently epoch-uniform.
+pub fn max_tx_authorizations(_epoch: Epoch) -> u64 {
+    max_batch_gas(_epoch).saturating_sub(BASE_TX_GAS) / PER_EMPTY_ACCOUNT_COST
+}
+
 /// Defines the validation procedure for receiving either a new single transaction (from a client)
 /// of a batch of transactions (from another validator).
 ///
@@ -322,6 +360,22 @@ pub enum BatchValidationError {
     UnsupportedTxType {
         /// The EIP-2718 type byte of the offending transaction.
         tx_type: u8,
+        /// Hash of the offending transaction.
+        hash: BlockHash,
+    },
+    /// The batch contains an EIP-7702 transaction whose authorization-list
+    /// length falls outside `1..=max_tx_authorizations(epoch)`.
+    ///
+    /// An empty list is invalid per EIP-7702 (revm rejects it at execution),
+    /// and a list longer than [`max_tx_authorizations`] can never execute
+    /// inside a batch (see that function's doc comment), so this rejects only
+    /// garbage that would waste certified work.
+    #[error("Proposed batch contains EIP-7702 transaction with authorization list length {len} outside 1..={max}. Tx hash: {hash}")]
+    InvalidAuthorizationList {
+        /// The authorization-list length of the offending transaction.
+        len: usize,
+        /// The maximum length allowed at the batch's epoch.
+        max: u64,
         /// Hash of the offending transaction.
         hash: BlockHash,
     },

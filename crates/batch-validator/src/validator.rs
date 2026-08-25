@@ -3,9 +3,9 @@
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use tn_reth::{recover_raw_transaction, recover_signed_transaction, RethEnv, WorkerTxPool};
 use tn_types::{
-    batch_allowlisted_tx_type, max_batch_gas, max_batch_size, BatchValidation,
-    BatchValidationError, BlockHash, Epoch, SealedBatch, TransactionSigned, TransactionTrait as _,
-    Typed2718 as _, WorkerId,
+    batch_allowlisted_authorization_list, batch_allowlisted_tx_type, max_batch_gas, max_batch_size,
+    max_tx_authorizations, BatchValidation, BatchValidationError, BlockHash, Epoch, SealedBatch,
+    TransactionSigned, TransactionTrait as _, Typed2718 as _, WorkerId,
 };
 
 /// Type convenience for implementing block validation errors.
@@ -72,6 +72,9 @@ impl BatchValidation for BatchValidator {
 
         // validate every tx type is on the executable allowlist
         self.validate_tx_type_allowlist(&decoded_txs)?;
+
+        // validate every EIP-7702 authorization list is within the executable bound
+        self.validate_authorization_lists(&decoded_txs, batch.epoch)?;
 
         // validate gas limit
         // Use the parent timestamp for consistency with the batch builder.
@@ -218,6 +221,36 @@ impl BatchValidator {
         })
     }
 
+    /// Validate every EIP-7702 transaction's authorization-list length is in
+    /// `1..=max_tx_authorizations(epoch)`.
+    ///
+    /// Uses the shared [`batch_allowlisted_authorization_list`] predicate: the
+    /// batch builder, the worker gateway, and the pool wrap enforce the same
+    /// predicate on the producing side, so a compliant producer never emits a
+    /// batch this check rejects. An over-cap list can never execute inside a
+    /// batch (its declared gas limit either exceeds [`max_batch_gas`] or fails
+    /// revm's intrinsic-gas gate; see [`max_tx_authorizations`]), and an empty
+    /// list is invalid per EIP-7702, so this rejects only garbage that would
+    /// waste certified work. The length read runs before any per-tuple
+    /// authority recovery, which bounds the unpaid ECDSA work a padded list
+    /// can demand.
+    fn validate_authorization_lists(
+        &self,
+        transactions: &[TransactionSigned],
+        epoch: Epoch,
+    ) -> BatchValidationResult<()> {
+        transactions.iter().find(|tx| !batch_allowlisted_authorization_list(*tx, epoch)).map_or(
+            Ok(()),
+            |tx| {
+                Err(BatchValidationError::InvalidAuthorizationList {
+                    len: tx.authorization_list().map_or(0, |list| list.len()),
+                    max: max_tx_authorizations(epoch),
+                    hash: *tx.hash(),
+                })
+            },
+        )
+    }
+
     /// Helper function for decoding and recovering transactions.
     fn recover_and_validate(
         tx: &[u8],
@@ -251,8 +284,9 @@ mod tests {
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
     use tn_test_utils::wait_until;
     use tn_types::{
-        max_batch_gas, test_genesis, Address, Batch, Bytes, Encodable2718 as _, FromHex,
-        GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE, U256,
+        max_batch_gas, max_tx_authorizations, test_genesis, Address, Batch, Bytes,
+        Encodable2718 as _, FromHex, GenesisAccount, TaskManager, B256, MIN_PROTOCOL_BASE_FEE,
+        U256,
     };
 
     /// Return the next valid sealed batch
@@ -682,7 +716,8 @@ mod tests {
     /// A well-formed EIP-7702 transaction passes batch validation: the type
     /// allowlist admits `0x04`, and validation is structural (decode, signer
     /// recovery, size/gas/base-fee) — authorization-tuple contents are an
-    /// execution concern, not a validation concern.
+    /// execution concern, not a validation concern. The single-tuple list also
+    /// proves the admit direction of the authorization-list length check.
     #[tokio::test]
     async fn test_valid_tx_eip7702() {
         let tmp_dir = TempDir::new().unwrap();
@@ -697,6 +732,71 @@ mod tests {
             tx_factory.create_eip7702(validator.reth_env.chainspec().chain_id(), None, 7);
 
         // test batch with eip7702 tx
+        batch.transactions = vec![signed_tx.encoded_2718()];
+
+        assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
+    }
+
+    /// A batch carrying an EIP-7702 transaction whose authorization list
+    /// exceeds `max_tx_authorizations` is rejected with
+    /// `InvalidAuthorizationList`. The tuples are dummy-signed with a
+    /// mismatched chain id: batch validation never verifies tuple signatures,
+    /// only the list length, so the check must fire regardless of tuple
+    /// validity.
+    #[tokio::test]
+    async fn test_invalid_batch_over_cap_authorization_list() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        let cap = max_tx_authorizations(batch.epoch);
+        let over_cap = usize::try_from(cap).expect("cap fits in usize") + 1;
+
+        // eip7702 set-code transaction padded one past the cap
+        let mut tx_factory = TransactionFactory::new_random();
+        let signed_tx = tx_factory.create_eip7702_with_authorizations(
+            validator.reth_env.chainspec().chain_id(),
+            1_000_000,
+            7,
+            over_cap,
+            Bytes::new(),
+        );
+
+        batch.transactions = vec![signed_tx.encoded_2718()];
+
+        assert_matches!(
+            validator.validate_batch(batch.clone().seal_slow()),
+            Err(BatchValidationError::InvalidAuthorizationList { len, max, hash: _ })
+                if len == over_cap && max == cap
+        );
+    }
+
+    /// A batch carrying an EIP-7702 transaction with exactly
+    /// `max_tx_authorizations` tuples passes validation: the bound is
+    /// inclusive, and a declared gas limit of `max_batch_gas` still fits the
+    /// batch gas check.
+    #[tokio::test]
+    async fn test_valid_batch_at_cap_authorization_list() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator, .. } =
+            test_tools(tmp_dir.path(), &task_manager).await;
+        let (mut batch, _) = valid_batch.split();
+
+        let cap = usize::try_from(max_tx_authorizations(batch.epoch)).expect("cap fits in usize");
+
+        // eip7702 set-code transaction with exactly the cap
+        let mut tx_factory = TransactionFactory::new_random();
+        let signed_tx = tx_factory.create_eip7702_with_authorizations(
+            validator.reth_env.chainspec().chain_id(),
+            max_batch_gas(batch.epoch),
+            7,
+            cap,
+            Bytes::new(),
+        );
+
         batch.transactions = vec![signed_tx.encoded_2718()];
 
         assert_matches!(validator.validate_batch(batch.clone().seal_slow()), Ok(()));
