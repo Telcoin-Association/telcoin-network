@@ -512,8 +512,13 @@ async fn test_canonical_notification_updates_pool() -> eyre::Result<()> {
     let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
     // spawn blocking for payload_builder::blocking_recv
     let _final_header = tokio::task::spawn_blocking(move || {
-        execute_consensus_output(args, GasAccumulator::default(), engine_update_tx)
-            .expect("output executed")
+        execute_consensus_output(
+            args,
+            GasAccumulator::default(),
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
+        .expect("output executed")
     });
 
     // wait for canonical update to settle the pool before ack

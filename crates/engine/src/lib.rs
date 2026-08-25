@@ -31,8 +31,8 @@ pub use payload_builder::{execute_consensus_output, PERSIST_OUTPUT_ATTEMPTS};
 use std::collections::VecDeque;
 use tn_reth::{payload::BuildArguments, RethEnv};
 use tn_types::{
-    gas_accumulator::GasAccumulator, ConsensusOutput, EngineUpdate, Noticer, SealedHeader,
-    TaskSpawner,
+    gas_accumulator::GasAccumulator, repack_monitor::RepackMonitor, ConsensusOutput, EngineUpdate,
+    Noticer, SealedHeader, TaskSpawner,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -91,6 +91,13 @@ pub struct ExecutorEngine {
     /// Sends (leader_round, consensus_num_hash, `Option<SealedHeader>`) after each
     /// ConsensusOutput is processed.
     engine_update_tx: mpsc::Sender<EngineUpdate>,
+    /// Monitor for cross-producer transaction re-packing (issue #1259). Owned here and cloned
+    /// into each execution task so its rolling window (bounded to the most recent
+    /// `REPACK_WINDOW_OUTPUTS` outputs and `REPACK_WINDOW_MAX_TXS` retained hashes, a few
+    /// megabytes worst case) persists across the outputs this engine executes. A fresh engine
+    /// (an epoch boundary) starts a fresh window, which at worst misses a poach racing across
+    /// the boundary.
+    repack_monitor: RepackMonitor,
 }
 
 impl ExecutorEngine {
@@ -124,6 +131,7 @@ impl ExecutorEngine {
             task_spawner,
             gas_accumulator,
             engine_update_tx,
+            repack_monitor: RepackMonitor::default(),
         }
     }
 
@@ -142,6 +150,7 @@ impl ExecutorEngine {
             let build_args = BuildArguments::new(reth_env, output, parent);
 
             let gas_accumulator = self.gas_accumulator.clone();
+            let repack_monitor = self.repack_monitor.clone();
             let engine_update_tx = self.engine_update_tx.clone();
             // spawn blocking task and return future
             self.task_spawner.spawn_blocking_task(task_name, move || {
@@ -149,7 +158,7 @@ impl ExecutorEngine {
                 // this is safe to call on blocking thread without a semaphore bc it's held in
                 // Self::pending_tesk as a single `Option`
                 let result =
-                    execute_consensus_output(build_args, gas_accumulator, engine_update_tx)
+                    execute_consensus_output(build_args, gas_accumulator, repack_monitor, engine_update_tx)
                         .inspect_err(|e| {
                             error!(target: "engine", ?e, "error executing consensus output");
                         });

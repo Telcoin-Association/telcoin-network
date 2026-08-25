@@ -2731,7 +2731,12 @@ async fn test_partial_output_failure_rolls_back_in_memory_state() -> eyre::Resul
     let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
     let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
     let result = tokio::task::spawn_blocking(move || {
-        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
     })
     .await?;
 
@@ -2850,7 +2855,12 @@ async fn test_persist_output_failure_rolls_back_in_memory_state() -> eyre::Resul
     let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
     let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
     let result = tokio::task::spawn_blocking(move || {
-        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
     })
     .await?;
 
@@ -2983,7 +2993,12 @@ async fn test_late_persist_failure_rolls_back_in_memory_state() -> eyre::Result<
     let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
     let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
     let result = tokio::task::spawn_blocking(move || {
-        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
     })
     .await?;
 
@@ -3114,7 +3129,12 @@ async fn test_repeat_persist_after_static_file_progress_is_terminal() -> eyre::R
     let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
     let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
     let result = tokio::task::spawn_blocking(move || {
-        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
     })
     .await?;
 
@@ -3236,7 +3256,12 @@ async fn test_persist_provider_fault_retry_recovers() -> eyre::Result<()> {
     let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
     let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
     let result = tokio::task::spawn_blocking(move || {
-        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
     })
     .await?;
 
@@ -3350,7 +3375,12 @@ async fn test_post_commit_failure_preserves_committed_head() -> eyre::Result<()>
     // run the output on a blocking task, mirroring the production execution task
     let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
     let result = tokio::task::spawn_blocking(move || {
-        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
     })
     .await?;
 
@@ -3467,7 +3497,12 @@ async fn execute_uneven_output(
     let (engine_update_tx, _engine_update_rx) = tokio::sync::mpsc::channel(64);
     let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header);
     let result = tokio::task::spawn_blocking(move || {
-        execute_consensus_output(args, gas_accumulator, engine_update_tx)
+        execute_consensus_output(
+            args,
+            gas_accumulator,
+            tn_types::repack_monitor::RepackMonitor::default(),
+            engine_update_tx,
+        )
     })
     .await?;
 
@@ -3528,6 +3563,111 @@ async fn test_uneven_batches_and_digests_tolerated_on_early_adiri_epoch() -> eyr
     assert_eq!(canonical_header.number, 1, "the one flattened batch produced one block");
     assert_eq!(reth_env.last_block_number()?, 1, "the block was committed durably");
     assert_eq!(reth_env.last_finalized_block_number()?, 1, "the block was finalized");
+
+    Ok(())
+}
+
+/// Issue #1259: a validator that re-packs another validator's gossiped transactions into its own
+/// batch must be visible to the repack monitor when the output executes.
+///
+/// One output carries two certified batches from two different producer addresses; the second
+/// batch contains one transaction copied from the first. Execution succeeds (the duplicate copy
+/// is skipped by the EVM's transaction-level validation, `tn_reth.invalid_txs_skipped_total`),
+/// and the monitor attributes exactly one cross-producer duplicate to the first-ordered
+/// producer. Note the honest-duplicate caveat: the monitor is telemetry, so the assertion here
+/// is on observation, never on execution outcome.
+#[tokio::test]
+async fn test_cross_producer_repack_flagged_during_execution() -> eyre::Result<()> {
+    let _guard = IT_TEST_GUARD.lock();
+    let tmp_dir = TempDir::new().expect("temp dir");
+
+    // Two batches from two different producers.
+    let chain = test_chain_spec_arc();
+    let mut batches = tn_reth::test_utils::batches(chain.clone(), 2);
+    let genesis = test_genesis_with_consensus_registry(4);
+
+    // The second producer poaches the first transaction of the first producer's batch.
+    let poached_tx =
+        batches.first().expect("two batches").transactions.first().expect("batch has txs").clone();
+    if let Some(second) = batches.get_mut(1) {
+        second.transactions_mut().push(poached_tx);
+    }
+
+    // Seed genesis from both batches so every original transaction executes.
+    let (genesis, _txs_by_block, _signers_by_block) =
+        seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // create execution node components
+    let gas_accumulator = GasAccumulator::new(1); // 1 worker
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.clone()),
+    )?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let leader_id = committee.authorities().first().expect("first authority").id();
+    let victim_producer =
+        committee.authority(&leader_id).expect("authority in committee").execution_address();
+    let poacher_producer = Address::random();
+    gas_accumulator.rewards_counter().set_committee(committee);
+
+    //=== Consensus: one output, two certified batches from two producers
+    let mut leader = Certificate::default();
+    leader.update_header_author_for_test(leader_id);
+    let sub_dag_index = 1;
+    leader.update_header_round_for_test(1);
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+    let mut batches_iter = batches.into_iter();
+    let victim_batch = batches_iter.next().expect("two batches");
+    let poacher_batch = batches_iter.next().expect("two batches");
+    let sub_dag = CommittedSubDag::new(
+        vec![Certificate::default(), leader.clone()],
+        leader,
+        sub_dag_index,
+        ReputationScores::default(),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    let consensus_output = ConsensusOutput::new(
+        sub_dag,
+        ConsensusHeaderDigest::default(),
+        0,
+        false,
+        batch_digests,
+        vec![
+            CertifiedBatch { address: victim_producer, batches: vec![victim_batch] },
+            CertifiedBatch { address: poacher_producer, batches: vec![poacher_batch] },
+        ],
+    );
+
+    //=== drive execution
+    let reth_env = execution_node.get_reth_env().await;
+    let genesis_header = chain.sealed_genesis_header();
+
+    let (engine_update_tx, mut engine_update_rx) = tokio::sync::mpsc::channel(64);
+    let args = BuildArguments::new(reth_env.clone(), consensus_output, genesis_header.clone());
+    let repack_monitor = tn_types::repack_monitor::RepackMonitor::default();
+    let task_monitor = repack_monitor.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        execute_consensus_output(args, gas_accumulator, task_monitor, engine_update_tx)
+    })
+    .await?;
+
+    // The poached duplicate never fails the build: it is skipped at transaction-level
+    // validation, so the output executes both blocks.
+    let final_header = result.expect("output with a poached duplicate still executes");
+    assert_eq!(final_header.number, 2, "both producers' blocks must build");
+    assert!(engine_update_rx.try_recv().is_ok(), "successful output sends an engine update");
+
+    // The monitor flags exactly the one cross-producer duplicate.
+    assert_eq!(
+        repack_monitor.total_repacked(),
+        1,
+        "the poached transaction must be flagged once against the first-ordered producer"
+    );
 
     Ok(())
 }
