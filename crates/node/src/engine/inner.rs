@@ -18,9 +18,10 @@ use tn_reth::{
 };
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    gas_accumulator::GasAccumulator, Address, BatchSender, BatchValidation, BlockHeader,
-    BlsPublicKey, Bytes, ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader,
-    Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, Bytes, ConsensusHeaderDigest,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
+    B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -132,22 +133,25 @@ impl ExecutionNodeInner {
     /// Initialize the worker's transaction pool and public RPC.
     /// Must call this function in accending worker_id order or will panic,
     /// for instance call for worker id 0, then 1, etc.
+    ///
+    /// The pool receives the shared [`BaseFeeContainer`] so canonical updates always charge
+    /// the current epoch's fee (issue #1262).
     pub(super) async fn initialize_worker_components<EP>(
         &mut self,
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
-        base_fee: u64,
+        base_fee: BaseFeeContainer,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
-        let transaction_pool = self.reth_env.init_txn_pool()?;
+        let transaction_pool = self.reth_env.init_txn_pool(base_fee.clone())?;
 
         let network =
             WorkerNetwork::new(self.reth_env.chainspec(), network_handle, self.tn_config.version);
         let mut tx_pool_latest = transaction_pool.block_info();
-        tx_pool_latest.pending_basefee = base_fee;
+        tx_pool_latest.pending_basefee = base_fee.base_fee();
         let last_seen = self.reth_env.finalized_block_hash_number_for_startup()?;
         tx_pool_latest.last_seen_block_hash = last_seen.hash;
         tx_pool_latest.last_seen_block_number = last_seen.number;
@@ -183,7 +187,8 @@ impl ExecutionNodeInner {
     /// but the base fee for the new epoch must still take effect. If the worker's components have
     /// not been initialized, the update is dropped with a warning and forces node shutdown: the
     /// worker's pool would keep charging the previous epoch's base fee, admitting underpriced
-    /// transactions into batches that are rejected by peers.
+    /// transactions that waste space in accepted batches (the batch validator checks only the
+    /// batch-level declared fee, never per-transaction fees).
     pub(super) fn set_worker_base_fee(
         &self,
         worker_id: WorkerId,

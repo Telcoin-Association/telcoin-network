@@ -153,7 +153,10 @@ mod tests {
     use reth_transaction_pool::noop::NoopTransactionPool;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tn_types::{test_genesis, Address, Bytes, Encodable2718 as _, TaskManager, B256, U256};
+    use tn_types::{
+        gas_accumulator::BaseFeeContainer, test_genesis, Address, Bytes, Encodable2718 as _,
+        TaskManager, B256, U256,
+    };
     use url::Url;
 
     /// Build a temp env with the given `--rpc.txfeecap` value (wei) and return the
@@ -179,7 +182,7 @@ mod tests {
             rpc_args,
         )
         .expect("temp chain env");
-        let pool = reth_env.init_txn_pool().expect("txn pool");
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).expect("txn pool");
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let server = reth_env
             .get_rpc_server(pool.clone(), network, RpcModule::new(()))

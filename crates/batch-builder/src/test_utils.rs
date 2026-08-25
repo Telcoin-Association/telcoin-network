@@ -9,10 +9,7 @@ use tn_reth::{
     new_pool_txn, BestTransactions, InvalidPoolTransactionError, PoolTxn, PoolTxnId,
     SenderIdentifiers, TxPool,
 };
-use tn_types::{
-    Address, Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash,
-    MIN_PROTOCOL_BASE_FEE, U256,
-};
+use tn_types::{Address, Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash, U256};
 
 /// Attempt to update batch with accurate header information.
 ///
@@ -41,9 +38,6 @@ pub(crate) struct TestPool {
 impl TxPool for TestPool {
     fn best_transactions(&self) -> tn_reth::BestTxns {
         tn_reth::BestTxns::new_for_test(self.best_transactions_int())
-    }
-    fn get_pending_base_fee(&self) -> u64 {
-        MIN_PROTOCOL_BASE_FEE
     }
     fn remove_eip4844_txs(&mut self, _blobs: Vec<TxHash>) {
         // remove EIP-4844 transactions from the transactions vec and btreemap
