@@ -43,7 +43,8 @@ use tn_test_utils::{wait_until, wait_until_blocking};
 use tn_types::{
     address, get_available_tcp_port, keccak256,
     test_utils::{init_test_tracing, CommandParser},
-    Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount, NodeMode, RpcInfo, U256,
+    Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount, NodeMode, RpcInfo,
+    DEFAULT_WORKER_ID, U256,
 };
 use tokio::{
     runtime::Builder,
@@ -460,7 +461,7 @@ pub(crate) fn start_validator_with_args(
 
 /// Advertise a validator's JSON-RPC endpoint on its worker record.
 ///
-/// The genesis ceremony leaves `p2p_info.worker.rpc` unset, and a non-committee node
+/// The genesis ceremony leaves `p2p_info.workers[0].rpc` unset, and a non-committee node
 /// forwards accepted transactions to whatever endpoints committee validators advertise
 /// (issue #804); with none advertised, each seal is refused with
 /// `BlockSealError::NotValidator` and the transactions stay pending in the node's own
@@ -475,8 +476,12 @@ pub(crate) fn advertise_worker_rpc(
 ) -> eyre::Result<()> {
     let path = base_dir.join(format!("validator-{}", instance + 1)).join("node-info.yaml");
     let mut node_info = Config::load_from_path::<NodeInfo>(&path, ConfigFmt::YAML)?;
-    node_info.p2p_info.worker.rpc =
-        Some(RpcInfo { http: format!("http://127.0.0.1:{rpc_port}").parse()?, ws: None });
+    let rpc = Some(RpcInfo { http: format!("http://127.0.0.1:{rpc_port}").parse()?, ws: None });
+    node_info
+        .p2p_info
+        .worker_mut(DEFAULT_WORKER_ID)
+        .map(|worker| worker.rpc = rpc)
+        .ok_or_else(|| eyre::eyre!("validator-{} node info has no worker 0", instance + 1))?;
     Config::write_to_path(&path, &node_info, ConfigFmt::YAML)?;
     Ok(())
 }

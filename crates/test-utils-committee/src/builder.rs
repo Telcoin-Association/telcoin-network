@@ -8,8 +8,8 @@ use std::{collections::BTreeMap, marker::PhantomData, num::NonZeroUsize};
 use tn_config::{KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, Authority, AuthorityIdentifier, BlsKeypair,
-    BootstrapServer, Committee, Database, Epoch, EpochDigest, Multiaddr, TimestampSec,
-    DEFAULT_WORKER_PORT,
+    BootstrapServer, Committee, Database, Epoch, EpochDigest, Multiaddr, NetworkKeypair, P2pNode,
+    TimestampSec, DEFAULT_WORKER_PORT,
 };
 
 /// The committee builder for tests.
@@ -58,6 +58,15 @@ where
     DB: Database,
     F: Fn() -> DB,
 {
+    /// Set the number of workers every authority runs (defaults to one).
+    ///
+    /// Worker 0 uses the authority's [KeyConfig] worker network key; every further worker
+    /// gets a fresh network keypair, since [KeyConfig] holds a single worker key.
+    pub fn number_of_workers(mut self, number_of_workers: NonZeroUsize) -> Self {
+        self.number_of_workers = number_of_workers;
+        self
+    }
+
     pub fn committee_size(mut self, committee_size: NonZeroUsize) -> Self {
         self.committee_size = committee_size;
         self
@@ -145,13 +154,26 @@ where
             };
             let primary_network_address: Multiaddr =
                 format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
-            let port = if self.randomize_ports {
-                get_available_udp_port(host).unwrap_or(DEFAULT_WORKER_PORT)
-            } else {
-                0
+            let randomize_ports = self.randomize_ports;
+            let worker_address = move || -> Multiaddr {
+                let port = if randomize_ports {
+                    get_available_udp_port(host).unwrap_or(DEFAULT_WORKER_PORT)
+                } else {
+                    0
+                };
+                format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap()
             };
-            let worker_network_address: Multiaddr =
-                format!("/ip4/{host}/udp/{port}/quic-v1").parse().unwrap();
+            // worker 0 carries the key config's worker key; further workers get fresh keys
+            let worker_nodes: Vec<P2pNode> = (0..self.number_of_workers.get())
+                .map(|worker_id| {
+                    let key = if worker_id == 0 {
+                        key_config.worker_network_public_key()
+                    } else {
+                        NetworkKeypair::generate_ed25519().public().into()
+                    };
+                    (worker_address(), key).into()
+                })
+                .collect();
             let authority = Authority::new_for_test(
                 key_config.primary_public_key(),
                 Address::random_with(&mut rng),
@@ -160,7 +182,7 @@ where
                 *authority.protocol_key(),
                 BootstrapServer::new(
                     (primary_network_address, key_config.primary_network_public_key()).into(),
-                    (worker_network_address, key_config.worker_network_public_key()).into(),
+                    worker_nodes,
                 ),
             );
             authorities.insert(
@@ -185,7 +207,8 @@ where
             authorities.into_iter().map(|(k, (_, _, a))| (k, a)).collect(),
             self.epoch,
             bootstrap_servers,
-        );
+        )
+        .with_num_workers(self.number_of_workers);
         let genesis = test_genesis();
         // All the authorities use the same worker cache.
         let authorities: BTreeMap<AuthorityIdentifier, AuthorityFixture<DB>> = committee_info

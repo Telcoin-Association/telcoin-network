@@ -144,19 +144,29 @@ E2E_BIN := $(E2E_TARGET_ROOT)/e2e/telcoin-network
 # seed_signature_override_is_inert_when_unset requires a process WITHOUT the variable.
 TN_SEED_SIGNATURE_FORK_EPOCH ?= 4294967295
 
+# Multi-workers fork epoch for the e2e lanes (#554). Same shape as the seed-signature
+# variable above and armed independently of it: defaults to u32::MAX so the default lanes run
+# the fork DORMANT (legacy single-worker committee layout, what adiri carries on disk);
+# non-adiri builds are otherwise active from genesis. Override for a fork-active lane:
+#   TN_MULTI_WORKERS_FORK_EPOCH=1 make test-epochs
+# Only test-utils builds consult it (tn_types::forks::multi_workers_fork_epoch_override).
+# Set only on name-filtered nextest lines, never a bare --workspace run: tn-types'
+# multi_workers_override_is_inert_when_unset requires a process WITHOUT the variable.
+TN_MULTI_WORKERS_FORK_EPOCH ?= 4294967295
+
 # run restart integration tests
 test-restarts: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # run epoch integration tests (same filter as the public-tests epoch line). The scheduled
 # Durable e2e lane (#1149) runs this and test-restarts with TN_TEST_MDBX_SYNC=durable
 # exported so every spawned node opens MDBX in Durable.
 test-epochs: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
 
 # run e2e tests
 test-e2e: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
@@ -232,8 +242,8 @@ revert-submodule:
 # workspace tests that don't require faucet credentials
 public-tests: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" cargo nextest run --workspace --exclude tn-faucet --no-fail-fast ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # local checks to ensure PR is ready
 pr:

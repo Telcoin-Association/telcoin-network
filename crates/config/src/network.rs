@@ -4,7 +4,7 @@ use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
 use libp2p::kad::K_VALUE;
 use serde::{Deserialize, Serialize};
 use std::{num::NonZeroUsize, time::Duration};
-use tn_types::Round;
+use tn_types::{Round, WorkerId};
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -181,9 +181,12 @@ impl LibP2pConfig {
         format!("tn-epoch-vote-{chain_id}")
     }
 
-    /// Return the worker-batch gossip topic for `chain_id`.
-    pub fn worker_batch_topic(chain_id: u64) -> String {
-        format!("tn-worker-{chain_id}")
+    /// Return the worker-batch gossip topic for worker `worker_id` on `chain_id`.
+    ///
+    /// Every worker has its own batch gossip mesh, so a batch gossiped by worker `k` of one
+    /// validator only reaches worker `k` of the others.
+    pub fn worker_batch_topic(chain_id: u64, worker_id: WorkerId) -> String {
+        format!("tn-worker-{chain_id}-{worker_id}")
     }
 }
 
@@ -668,7 +671,12 @@ hostname: "my-validator"
         assert_eq!(LibP2pConfig::primary_topic(2017), "tn-primary-2017");
         assert_eq!(LibP2pConfig::consensus_output_topic(2017), "tn-consensus-output-2017");
         assert_eq!(LibP2pConfig::epoch_vote_topic(2017), "tn-epoch-vote-2017");
-        assert_eq!(LibP2pConfig::worker_batch_topic(2017), "tn-worker-2017");
+        assert_eq!(LibP2pConfig::worker_batch_topic(2017, 0), "tn-worker-2017-0");
+        // each worker has its own batch mesh
+        assert_ne!(
+            LibP2pConfig::worker_batch_topic(2017, 0),
+            LibP2pConfig::worker_batch_topic(2017, 1)
+        );
         // a different chain id yields a different topic
         assert_ne!(LibP2pConfig::primary_topic(1), LibP2pConfig::primary_topic(2));
     }

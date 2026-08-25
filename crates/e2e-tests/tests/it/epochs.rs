@@ -9,16 +9,26 @@ use super::common::{
 use alloy::providers::{Provider, ProviderBuilder};
 use e2e_tests::NodeEndpoints;
 use rand::{rngs::StdRng, SeedableRng as _};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tn_reth::{
     system_calls::{ConsensusRegistry, CONSENSUS_REGISTRY_ADDRESS},
     test_utils::TransactionFactory,
     RethChainSpec,
 };
+use tn_storage::pack_validate::{validate_pack_file, Verdict};
 use tn_test_utils::wait_until;
-use tn_types::{Address, EpochCertificate, EpochRecord, Genesis};
+use tn_types::{
+    forks::{multi_workers_fork_active, seed_signature_active},
+    keccak256, Address, Epoch, EpochCertificate, EpochRecord, Genesis, B256,
+};
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, info};
 
 const MIN_EPOCHS_TO_TEST: usize = 6;
 // Epoch init creates HDX index files per epoch (open_epoch_pack → new_epoch →
@@ -29,6 +39,23 @@ const MIN_EPOCHS_TO_TEST: usize = 6;
 // constant, because certificate production is a fixed async quorum-voting cost that does
 // not shrink with the epoch cadence.
 const EPOCH_DURATION: u64 = 5;
+
+/// Environment variable selecting the multi-workers fork epoch (#554) for this process and
+/// every node it spawns (`tn_types::forks::multi_workers_fork_epoch_override`).
+const MULTI_WORKERS_FORK_ENV: &str = "TN_MULTI_WORKERS_FORK_EPOCH";
+
+/// Environment variable selecting the seed-signature fork epoch (#1032) for this process and every
+/// node it spawns (`tn_types::forks::seed_signature_fork_epoch_override`).
+const SEED_SIGNATURE_FORK_ENV: &str = "TN_SEED_SIGNATURE_FORK_EPOCH";
+
+/// Multi-workers fork epoch for [`test_epoch_sync_across_multi_workers_fork`].
+///
+/// The kill in [`test_epoch_sync_inner`] happens after `loop_epochs` has watched three boundaries
+/// pass, so the epoch open at that point is at least 3 and the sealed set — which stops two below
+/// it, see [`sealed_epochs`] — always covers epochs 0 and 1. Pinning the fork at 1 therefore
+/// guarantees those sealed packs straddle it: epoch 0 in the legacy single-worker committee
+/// layout, epoch 1 onward in the multi-worker one.
+const CROSS_FORK_EPOCH: Epoch = 1;
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
@@ -278,14 +305,23 @@ async fn assert_tn_registry_endpoints<P: Provider>(provider: &P) -> eyre::Result
     Ok(())
 }
 
+/// Kill one node, advance several epochs without it, restart it against its existing datadir, and
+/// assert it back-fills everything it missed.
+///
+/// Returns the epochs whose pack files were fingerprinted before the kill and revalidated after
+/// the restart (see [`sealed_epochs`]), so a caller can assert what those packs cover.
+///
+/// `test` names the log directory under `test_logs/` for the restarted node, matching the one the
+/// caller used for the initial spawn.
 async fn test_epoch_sync_inner(
     guard: &mut ProcessGuard,
     kill_idx: usize,
     nodes_to_start: &[(&str, Address)],
     committee: &[(&str, Address)],
     temp_path: &Path,
+    test: &str,
     endpoints: &mut Vec<NodeEndpoints>,
-) -> eyre::Result<()> {
+) -> eyre::Result<Range<Epoch>> {
     // create rpc client for node1 default rpc address
     let rpc_url = &endpoints[0].http_url;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
@@ -305,7 +341,7 @@ async fn test_epoch_sync_inner(
 
     // No pre-pad sleep is needed here: loop_epochs polls until the epoch changes.
     // Go through at least 3 epochs.
-    loop_epochs(0, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
+    let epoch_at_kill = loop_epochs(0, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
     // Kill a node
     if let Some(mut taken) = guard.take(kill_idx) {
         super::common::kill_child(&mut taken);
@@ -316,10 +352,22 @@ async fn test_epoch_sync_inner(
     let killed_provider = ProviderBuilder::new().connect_http(killed_url.parse()?);
     assert!(killed_provider.get_chain_id().await.is_err(), "Node not down!");
 
+    // Fingerprint the killed node's sealed packs while its datadir is quiescent: the process is
+    // gone, so nothing is appending to them and nothing has re-imported them yet. Step 8 below
+    // compares against these bytes once the node is back and caught up.
+    let killed_datadir = temp_path.join(committee[kill_idx].0);
+    let sealed = sealed_epochs(epoch_at_kill);
+    let sealed_before = fingerprint_sealed_packs(&killed_datadir, sealed.clone())?;
+    info!(
+        target: "epoch-test",
+        epoch_at_kill,
+        ?sealed,
+        "fingerprinted sealed epoch packs of the killed node",
+    );
+
     loop_epochs(3, 3, &endpoints[0].http_url, EPOCH_DURATION).await?;
     // Restart the node
-    let (mut new_children, mut new_endpoints) =
-        start_nodes(temp_path, nodes_to_start, "epoch_sync", 2)?;
+    let (mut new_children, mut new_endpoints) = start_nodes(temp_path, nodes_to_start, test, 2)?;
     let new_child = new_children.pop().expect("child");
     guard.replace(kill_idx, new_child);
     // Update the endpoint for the restarted node (new dynamic ports)
@@ -332,15 +380,13 @@ async fn test_epoch_sync_inner(
     // after epoch boundaries via quorum voting.
     // TODO issue 375, should use tn_latestConsensusHeader RPC for this when fixed.
     let latest_epoch = current_epoch - 1;
+    // The killed node's certified records, kept so the pack revalidation below can anchor each
+    // sealed pack to its predecessor (see `assert_sealed_packs_unchanged`).
+    let mut killed_epoch_records = BTreeMap::new();
     for (i, ep) in endpoints.iter().enumerate() {
         for epoch in 0..=latest_epoch {
             let val_name = committee[i].0;
-            let file_test = temp_path
-                .join(val_name)
-                .join("consensus-db")
-                .join("epochs")
-                .join(format!("epoch-{epoch}"))
-                .join("data");
+            let file_test = epoch_pack_path(&temp_path.join(val_name), epoch);
             let pack_file_exists = std::fs::exists(file_test).unwrap_or_default();
             assert!(pack_file_exists, "Missing an epoch pack file for {val_name} on epoch {epoch}");
             // A node was killed and restarted earlier in this test, so it must back-fill the
@@ -361,10 +407,237 @@ async fn test_epoch_sync_inner(
                 "final block for {epoch} for {val_name} missing {}",
                 epoch_rec.final_state.number
             ));
+            if i == kill_idx {
+                killed_epoch_records.insert(epoch, epoch_rec);
+            }
         }
     }
 
+    // Existence and a served epoch record say nothing about the bytes on disk, so re-read them:
+    // the restart must not have rewritten history it already had.
+    assert_sealed_packs_unchanged(&killed_datadir, &sealed_before, &killed_epoch_records)?;
+
+    Ok(sealed)
+}
+
+/// The epochs whose pack files must survive a kill and restart byte-for-byte, given the epoch
+/// `loop_epochs` last observed before the node was killed.
+///
+/// Two epochs of margin below `epoch_at_kill`, not one:
+///
+/// - `epoch_at_kill` was open when the node died, so its pack is mid-append. A restarted node
+///   re-requests every epoch whose pack is incomplete (`state_sync::request_epochs`), so the
+///   restart is entitled to replace that one wholesale.
+/// - `epoch_at_kill - 1` is only known sealed on the node whose RPC `loop_epochs` polled. The node
+///   this test kills can still be a beat behind executing that epoch's closing block, and a pack is
+///   flushed when the NEXT epoch opens (`ConsensusChain::new_epoch` persists the outgoing pack).
+///   Killing it inside that window leaves a short pack that the restart legitimately re-imports.
+///
+/// Everything below that closed at least one full epoch before the kill, so it is quiescent on
+/// every node.
+fn sealed_epochs(epoch_at_kill: Epoch) -> Range<Epoch> {
+    0..epoch_at_kill.saturating_sub(1)
+}
+
+/// Path of the consensus pack `data` file for `epoch` inside a node's datadir.
+///
+/// This file alone is the byte stream a syncing peer receives and imports, which is why both the
+/// fingerprint and the offline validator below run against it: the `idx`/`hash` sidecars are
+/// needed to *use* a pack, not to judge it.
+fn epoch_pack_path(datadir: &Path, epoch: Epoch) -> PathBuf {
+    datadir.join("consensus-db").join("epochs").join(format!("epoch-{epoch}")).join("data")
+}
+
+/// Fingerprint the pack file of every epoch in `sealed` under `datadir`.
+fn fingerprint_sealed_packs(
+    datadir: &Path,
+    sealed: Range<Epoch>,
+) -> eyre::Result<BTreeMap<Epoch, B256>> {
+    sealed
+        .map(|epoch| {
+            let path = epoch_pack_path(datadir, epoch);
+            let bytes = std::fs::read(&path)
+                .map_err(|e| eyre::eyre!("reading sealed pack {}: {e}", path.display()))?;
+            Ok((epoch, keccak256(bytes)))
+        })
+        .collect()
+}
+
+/// Assert every pack sealed before the kill survived the restart untouched and still imports.
+///
+/// Two independent checks per epoch:
+///
+/// 1. `validate_pack_file` walks the whole `data` stream applying the integrity rules
+///    `ConsensusPack::stream_import` applies to a pack arriving from a peer, so a pack that passes
+///    here is one a syncing node would accept. `records` supplies the previous epoch's certified
+///    [`EpochRecord`], which additionally turns on the epoch-linkage checks (start consensus
+///    number, genesis exec state, the committee the previous record commits to) and anchors the
+///    first header's `parent_hash`.
+/// 2. Byte equality against the pre-restart fingerprint. This is the load-bearing half: a pack can
+///    be internally valid and still have been rewritten — re-imported from a peer, or healed —
+///    which would mask the regression this pins, that restarting into an existing datadir leaves
+///    closed epochs alone.
+///
+/// Decoding a pack reaches two epoch-gated layouts: the [`tn_types::Committee`] in its `EpochMeta`
+/// record, selected by the committee's own epoch against the multi-workers fork
+/// ([`multi_workers_fork_active`]), and every nested `ConsensusHeader`, selected against the
+/// seed-signature fork ([`seed_signature_active`]). This process therefore has to sit on the same
+/// fork epochs the nodes wrote under for BOTH, which is what [`pin_fork_epochs`] arranges.
+fn assert_sealed_packs_unchanged(
+    datadir: &Path,
+    fingerprints: &BTreeMap<Epoch, B256>,
+    records: &BTreeMap<Epoch, EpochRecord>,
+) -> eyre::Result<()> {
+    for (&epoch, before) in fingerprints {
+        let path = epoch_pack_path(datadir, epoch);
+        // epoch 0 has no predecessor; the validator anchors it on the default consensus header
+        let previous = epoch.checked_sub(1).and_then(|prev| records.get(&prev));
+        let report = validate_pack_file(&path, epoch, previous)
+            .map_err(|e| eyre::eyre!("sealed pack {} did not open: {e}", path.display()))?;
+        eyre::ensure!(
+            report.verdict == Verdict::Valid,
+            "sealed pack {} is invalid after the restart: {:?}",
+            path.display(),
+            report.issues,
+        );
+
+        let after = keccak256(
+            std::fs::read(&path)
+                .map_err(|e| eyre::eyre!("re-reading sealed pack {}: {e}", path.display()))?,
+        );
+        eyre::ensure!(
+            after == *before,
+            "sealed pack {} changed across the restart: {before} -> {after}",
+            path.display(),
+        );
+        info!(
+            target: "epoch-test",
+            epoch,
+            consensus_headers = report.consensus_count,
+            batches = report.batch_count,
+            "sealed epoch pack survived the restart unchanged",
+        );
+    }
     Ok(())
+}
+
+/// Pin every fork epoch this suite's decoding depends on — the multi-workers fork (#554) and
+/// the seed-signature fork (#1032) — for this process and every node it spawns.
+///
+/// Step 8 decodes sealed pack bytes in the harness, and that reaches both gates: the `EpochMeta`'s
+/// [`tn_types::Committee`] is laid out by [`multi_workers_fork_active`] and every nested
+/// `ConsensusHeader` by [`seed_signature_active`]. So the harness has to resolve both to the same
+/// fork points the nodes wrote under. Left alone the two sides disagree the same way for each
+/// fork: `TestBinary::command` forwards `u32::MAX` to a child when the variable is unset, while
+/// this (non-adiri) harness build is active from genesis without it. Writing the variables settles
+/// both sides at once — children inherit them verbatim at spawn, and the harness's own overrides
+/// latch them on first read.
+///
+/// Both forks are pinned, not just the one a given test is about. Pinning only one leaves the other
+/// asymmetric whenever the suite runs outside the Makefile wrapper that exports it, and the
+/// symptom is misleading: children write dormant-layout headers, the harness decodes them as
+/// genesis-active, and step 8 reports a corrupt pack rather than an environment mismatch.
+///
+/// `force_multi_workers` states the multi-workers fork epoch outright, for a test whose
+/// claim is about a specific boundary. `None` — and the seed-signature pin always — inherits
+/// whatever the lane exported, defaulting to the dormant `u32::MAX` that `TestBinary::command`
+/// would have forwarded anyway, so `TN_MULTI_WORKERS_FORK_EPOCH=1 make test-epochs` keeps
+/// meaning what it says.
+///
+/// Call once per test, before the first node spawn and before anything in the process reads either
+/// gate: the overrides are process-wide `OnceLock`s and the environment is process-wide too. That
+/// is sound because nextest runs each test in its own process (`.config/nextest.toml`); under
+/// plain `cargo test` two of these tests in one process would fight over it, and the assertions
+/// below are what turn that into a loud failure instead of a mis-decoded pack.
+fn pin_fork_epochs(force_multi_workers: Option<Epoch>) {
+    // what `TestBinary::command` would forward to a child: the value the lane exported, or the
+    // dormant `u32::MAX` when it exported nothing. an unparseable value normalizes to the same
+    // dormant default the gate would have fallen back to.
+    let lane = |var: &str| -> Epoch {
+        std::env::var(var).ok().and_then(|raw| raw.trim().parse().ok()).unwrap_or(u32::MAX)
+    };
+
+    // one shared helper rather than a block per fork, mirroring `TestBinary::command`, so the two
+    // cannot drift apart in mechanism; they arm independently, so each carries its own gate
+    pin_fork_epoch(
+        MULTI_WORKERS_FORK_ENV,
+        force_multi_workers.unwrap_or_else(|| lane(MULTI_WORKERS_FORK_ENV)),
+        multi_workers_fork_active,
+    );
+    pin_fork_epoch(SEED_SIGNATURE_FORK_ENV, lane(SEED_SIGNATURE_FORK_ENV), seed_signature_active);
+}
+
+/// Write `fork_epoch` to the `var` override and check `gate` reads the same fork point back.
+///
+/// Reading the gate here, rather than leaving it to whatever decodes a pack minutes later, is what
+/// turns an override that latched before this pin into a named failure instead of a corrupt-looking
+/// pack.
+fn pin_fork_epoch(var: &str, fork_epoch: Epoch, gate: impl Fn(Epoch) -> bool) {
+    std::env::set_var(var, fork_epoch.to_string());
+
+    // The gate is `>=`, so it fires at the fork epoch and nowhere below it; both assertions hold
+    // for the dormant pin too, since `u32::MAX >= u32::MAX`.
+    assert!(
+        gate(fork_epoch),
+        "harness gate must be active at the pinned fork epoch {fork_epoch}: {var} latched to \
+         another value before this test pinned it"
+    );
+    if let Some(below) = fork_epoch.checked_sub(1) {
+        assert!(
+            !gate(below),
+            "harness gate must be dormant below the pinned fork epoch {fork_epoch}: {var} latched \
+             to another value before this test pinned it"
+        );
+    }
+    info!(target: "epoch-test", var, fork_epoch, "pinned a fork epoch");
+}
+
+/// Spin up the epoch-sync network and run [`test_epoch_sync_inner`] against it.
+///
+/// `test` names both the temp-dir prefix and the `test_logs/` directory, so callers running the
+/// same scenario under different fork epochs keep separate node logs. Keep it short: every node's
+/// IPC socket path is built under the temp dir, and a unix socket path is capped at ~104 bytes.
+async fn run_epoch_sync_scenario(test: &str) -> eyre::Result<Range<Epoch>> {
+    // create validator and governance wallets for adding new validator later
+    let new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
+    let mut committee = vec![
+        ("validator-1", Address::from_slice(&[0x11; 20])),
+        ("validator-2", Address::from_slice(&[0x22; 20])),
+        ("validator-3", Address::from_slice(&[0x33; 20])),
+        ("validator-4", Address::from_slice(&[0x44; 20])),
+        ("validator-5", Address::from_slice(&[0x55; 20])),
+    ];
+
+    // setup genesis
+    let temp_dir = tempfile::TempDir::with_prefix(test)?;
+    let temp_path = temp_dir.path();
+
+    let governance_wallet =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let _genesis = create_genesis_for_test(
+        temp_path,
+        (NEW_VALIDATOR, new_validator.address()),
+        governance_wallet.address(),
+        &committee,
+        EPOCH_DURATION,
+    )?;
+
+    // start nodes (committee + new validator)
+    committee.push((NEW_VALIDATOR, new_validator.address()));
+    let (procs, mut endpoints) = start_nodes(temp_path, &committee, test, 1)?;
+    // Guard ensures processes are killed on drop (normal return, error, or panic).
+    let mut guard = ProcessGuard::new(procs);
+
+    test_epoch_sync_inner(
+        &mut guard,
+        2,
+        &[("validator-3", Address::from_slice(&[0x33; 20]))],
+        &committee[..],
+        temp_path,
+        test,
+        &mut endpoints,
+    )
+    .await
 }
 
 #[ignore = "only run independently from all other it tests"]
@@ -411,43 +684,41 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
 /// Test that sync works to fill in missing epochs.
 async fn test_epoch_sync() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
-    // create validator and governance wallets for adding new validator later
-    let new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
-    let mut committee = vec![
-        ("validator-1", Address::from_slice(&[0x11; 20])),
-        ("validator-2", Address::from_slice(&[0x22; 20])),
-        ("validator-3", Address::from_slice(&[0x33; 20])),
-        ("validator-4", Address::from_slice(&[0x44; 20])),
-        ("validator-5", Address::from_slice(&[0x55; 20])),
-    ];
+    // whatever fork epochs the lane stated, dormant by default - this test is about sync, not about
+    // either fork, but the harness still decodes pack bytes and must agree with the nodes
+    pin_fork_epochs(None);
 
-    // setup genesis
-    let temp_dir = tempfile::TempDir::with_prefix("epoch_sync")?;
-    let temp_path = temp_dir.path();
+    run_epoch_sync_scenario("epoch_sync").await.map(|_sealed| ())
+}
 
-    let governance_wallet =
-        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
-    let _genesis = create_genesis_for_test(
-        temp_path,
-        (NEW_VALIDATOR, new_validator.address()),
-        governance_wallet.address(),
-        &committee,
-        EPOCH_DURATION,
-    )?;
+#[ignore = "only run independently from all other it tests"]
+#[tokio::test(flavor = "multi_thread")]
+/// Test that an epoch pack archive spanning the multi-workers fork boundary (#554) survives a
+/// restart.
+///
+/// The same kill/restart scenario as [`test_epoch_sync`], with the fork pinned at
+/// [`CROSS_FORK_EPOCH`] so one datadir holds both committee layouts: epoch 0 written in the legacy
+/// single-worker layout, every later epoch in the multi-worker one. The restarted node has to read
+/// its own history back across that boundary to decide which epochs it still needs, and step 8
+/// then decodes both layouts again from the harness.
+async fn test_epoch_sync_across_multi_workers_fork() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    // forced rather than inherited: this test's claim is a crossing at a known multi-workers
+    // epoch, so it states that fork point even when the lane exported a different one. the
+    // seed-signature pin still follows the lane - this test makes no claim about it.
+    pin_fork_epochs(Some(CROSS_FORK_EPOCH));
 
-    // start nodes (committee + new validator)
-    committee.push((NEW_VALIDATOR, new_validator.address()));
-    let (procs, mut endpoints) = start_nodes(temp_path, &committee, "epoch_sync", 1)?;
-    // Guard ensures processes are killed on drop (normal return, error, or panic).
-    let mut guard = ProcessGuard::new(procs);
+    let sealed = run_epoch_sync_scenario("epoch_sync_fork").await?;
 
-    test_epoch_sync_inner(
-        &mut guard,
-        2,
-        &[("validator-3", Address::from_slice(&[0x33; 20]))],
-        &committee[..],
-        temp_path,
-        &mut endpoints,
-    )
-    .await
+    // The revalidated packs span both layouts only if the fork epoch sits strictly inside them.
+    // Assert it rather than trusting the arithmetic in `CROSS_FORK_EPOCH`: a shorter run, or a
+    // wider safety margin in `sealed_epochs`, would otherwise quietly reduce this to the
+    // single-layout test above.
+    assert!(
+        sealed.start < CROSS_FORK_EPOCH && CROSS_FORK_EPOCH < sealed.end,
+        "sealed epochs {sealed:?} do not straddle the multi-workers fork at \
+         {CROSS_FORK_EPOCH}: the restart proved only one committee layout"
+    );
+
+    Ok(())
 }

@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Write, time::Duration};
 use tn_types::{
     get_available_udp_port, test_genesis, Address, BlsPublicKey, BlsSignature, Genesis,
-    NetworkPublicKey, MAINNET_COMMITTEE, MAINNET_GENESIS, MAINNET_PARAMETERS, TESTNET_COMMITTEE,
-    TESTNET_GENESIS, TESTNET_PARAMETERS,
+    NetworkPublicKey, WorkerId, MAINNET_COMMITTEE, MAINNET_GENESIS, MAINNET_PARAMETERS,
+    TESTNET_COMMITTEE, TESTNET_GENESIS, TESTNET_PARAMETERS,
 };
 use tracing::info;
 
@@ -189,10 +189,19 @@ impl Config {
         Ok(())
     }
 
-    /// Update the worker network key.
-    pub fn update_worker_network_key(&mut self, value: NetworkPublicKey) -> eyre::Result<()> {
-        self.node_info.p2p_info.worker.network_key = value;
-        Ok(())
+    /// Update the network key of worker `worker_id`.
+    ///
+    /// Errors if this node runs no worker with that id.
+    pub fn update_worker_network_key(
+        &mut self,
+        worker_id: WorkerId,
+        value: NetworkPublicKey,
+    ) -> eyre::Result<()> {
+        self.node_info
+            .p2p_info
+            .worker_mut(worker_id)
+            .map(|worker| worker.network_key = value)
+            .ok_or_else(|| eyre::eyre!("no worker {worker_id} in node info"))
     }
 
     /// Update the authority execution address.

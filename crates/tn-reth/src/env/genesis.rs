@@ -90,6 +90,45 @@ impl RethEnv {
         task_manager: &TaskManager,
         rewards: Option<GasAccumulator>,
     ) -> eyre::Result<Self> {
+        // `RpcServerArgs::default` reads reth's process-wide RPC-server defaults, and the first
+        // read locks them. Seed before that read so a temp chain built before any command is
+        // parsed does not fix reth's `ipcpath` for the rest of the process (idempotent; the seam
+        // below seeds again before `NodeConfig::default`).
+        init_reth_defaults();
+        // A temp chain parses no CLI, so its IPC path can only be a process-global
+        // default: a fixed path shared by every process on the host. Concurrent test runs
+        // would race to bind it and leave the socket file behind (issue #1165: every test
+        // env bound reth's `/tmp/reth.ipc`). Nothing connects to a temp chain over IPC
+        // (tests that exercise IPC spawn nodes through the CLI with a per-tempdir
+        // `--ipcpath`), so disable the IPC server outright.
+        Self::new_for_temp_chain_with_rpc_args(
+            chain,
+            db_path,
+            task_manager,
+            rewards,
+            RpcServerArgs { ipcdisable: true, ..Default::default() },
+        )
+    }
+
+    /// Create a new temp RethEnv with explicit RPC server args.
+    ///
+    /// Test seam: temp-chain envs otherwise run on `NodeConfig::default()`. Tests that
+    /// exercise flag-driven RPC behavior (for example `--rpc.txfeecap`) inject the
+    /// parsed args here. Production nodes receive their args through `RethConfig`.
+    ///
+    /// The args pass through as given, `ipcdisable` included: [`Self::new_for_temp_chain`]
+    /// disables the IPC server (issue #1165), while a caller here picks its own transports
+    /// (building the RPC modules binds no socket; only [`Self::start_rpc`] does). Callers
+    /// build `rpc` before this runs, so a `Default`-constructed value reads reth's RPC-server
+    /// defaults first; call [`init_reth_defaults`] before building it when the seeded
+    /// `ipcpath` matters.
+    pub(crate) fn new_for_temp_chain_with_rpc_args<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        rewards: Option<GasAccumulator>,
+        rpc: RpcServerArgs,
+    ) -> eyre::Result<Self> {
         /// MDBX map-size ceiling for throwaway temp-chain envs. reth defaults to 8 TB per
         /// environment; `cargo test` runs a test binary as threads in ONE process, so N
         /// concurrent 8 TB virtual reservations exhaust the address space and MDBX aborts
@@ -122,13 +161,8 @@ impl RethEnv {
                 growth_step: Some(TEMP_CHAIN_DB_GROWTH_STEP),
                 ..Default::default()
             },
-            // A temp chain parses no CLI, so its IPC path can only be a process-global
-            // default: a fixed path shared by every process on the host. Concurrent test runs
-            // would race to bind it and leave the socket file behind (issue #1165: every test
-            // env bound reth's `/tmp/reth.ipc`). Nothing connects to a temp chain over IPC
-            // (tests that exercise IPC spawn nodes through the CLI with a per-tempdir
-            // `--ipcpath`), so disable the IPC server outright.
-            rpc: RpcServerArgs { ipcdisable: true, ..Default::default() },
+            // Injected as given: `new_for_temp_chain` passes `ipcdisable: true` (issue #1165).
+            rpc,
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config);
@@ -535,6 +569,29 @@ mod tests {
         let task_manager = TaskManager::new("Temp Chain IPC Test Task Manager");
         let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None)?;
         assert!(reth_env.node_config().rpc.ipcdisable, "temp chain must disable the IPC server");
+        Ok(())
+    }
+
+    /// The injected-args seam passes the args through as given: the fee cap reaches the node
+    /// config, and `ipcdisable` is the caller's (the IPC-off default belongs to
+    /// `new_for_temp_chain` alone, so the fee-cap RPC tests keep their IPC-only module set).
+    #[tokio::test]
+    async fn test_temp_chain_with_rpc_args_passes_args_through() -> eyre::Result<()> {
+        init_reth_defaults();
+        let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Temp Chain RPC Args Test Task Manager");
+        let rpc = RpcServerArgs { rpc_tx_fee_cap: 1_000, ipcdisable: false, ..Default::default() };
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain,
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            rpc,
+        )?;
+        let rpc = &reth_env.node_config().rpc;
+        assert_eq!(rpc.rpc_tx_fee_cap, 1_000, "injected fee cap must reach the node config");
+        assert!(!rpc.ipcdisable, "the seam must not override the caller's ipcdisable");
         Ok(())
     }
 }

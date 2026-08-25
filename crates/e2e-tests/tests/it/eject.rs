@@ -251,12 +251,10 @@ async fn test_validator_ejected_from_future_committee_only() -> eyre::Result<()>
     info!(target: "eject-test", activation_epoch, last_tx_block, "new validator activated");
 
     // 6 eligible validators, committee size stays 5: each shuffle now excludes exactly one
-    assert_eq!(
-        registry.getEligibleValidatorCount().call().await?,
-        U256::from(6),
-        "eligible count must be 6 after activation"
-    );
-    assert_eq!(registry.getNextCommitteeSize().call().await?, 5);
+    let eligible = registry.getEligibleValidatorCount().call().await?;
+    assert_eq!(eligible, U256::from(6), "eligible count must be 6 after activation");
+    let committee_size = registry.getNextCommitteeSize().call().await?;
+    assert_eq!(committee_size, 5);
 
     // scenario-1 baseline for the new validator: staked + active, not retired, full stake
     let newval_addr = new_validator.address();
@@ -269,10 +267,44 @@ async fn test_validator_ejected_from_future_committee_only() -> eyre::Result<()>
     // Find an epoch W (the current epoch) with newval ∉ W, ∉ W+1, ∈ W+2. The earliest committee
     // that can seat the new validator is chosen at the close of the activation epoch, two epochs
     // ahead — before that, ∉ W and ∉ W+1 hold by construction, and each fresh shuffle seats it
-    // with p = 5/6. Five attempts miss with p = (1/6)^5 ≈ 0.01%.
+    // with p = 5/6.
+    //
+    // The sample budget is the smallest n with (excluded/eligible)^n ≤ (1/6)^5 ≈ 0.01%,
+    // derived from the live counts asserted above so the documented miss bound keeps holding
+    // if the fixture ever changes shape (6 eligible and committee size 5 give exactly 5).
+    let (eligible, committee_size) = (
+        u128::try_from(eligible).map_err(|e| eyre::eyre!("eligible count: {e}"))?,
+        u128::from(committee_size),
+    );
+    let excluded = eligible
+        .checked_sub(committee_size)
+        .ok_or_else(|| eyre::eyre!("committee size exceeds eligible count"))?;
+    let sample_budget = (1u32..=20)
+        .find(|&n| {
+            excluded
+                .checked_pow(n)
+                .and_then(|miss| miss.checked_mul(6u128.pow(5)))
+                .zip(eligible.checked_pow(n))
+                .is_some_and(|(scaled_miss, total)| scaled_miss <= total)
+        })
+        .ok_or_else(|| {
+            eyre::eyre!("no budget of ≤ 20 sampled shuffles keeps the miss bound at (1/6)^5")
+        })?;
+
+    // Only a clean (non-straddled) read of W, W+1, W+2 samples a shuffle and spends budget; a
+    // straddled read retries in the fresh epoch for free, so slow RPC round-trips near a
+    // boundary cannot silently shrink the (1/6)^5 bound to (1/6)^(5-k). The iteration cap of
+    // 4x the budget bounds a pathological straddle spin: a straddle needs an epoch boundary
+    // inside one iteration's reads, so even one straddle per sampled epoch fits in 2x and the
+    // cap doubles that headroom; a genuinely stuck chain already fails fast inside
+    // `wait_for_epoch_at_least`.
     let mut candidate = activation_epoch + 1;
     let mut arrangement = None;
-    for _attempt in 0..5 {
+    let mut sampled = 0u32;
+    for _iteration in 0..sample_budget * 4 {
+        if arrangement.is_some() || sampled >= sample_budget {
+            break;
+        }
         let snap = wait_for_epoch_at_least(&provider, candidate).await?;
         let w = snap.epoch_id;
         let in_committee = |vals: &[ConsensusRegistry::ValidatorInfo]| {
@@ -281,22 +313,25 @@ async fn test_validator_ejected_from_future_committee_only() -> eyre::Result<()>
         let c_w = registry.getCommitteeValidators(w).call().await?;
         let c_w1 = registry.getCommitteeValidators(w + 1).call().await?;
         let c_w2 = registry.getCommitteeValidators(w + 2).call().await?;
-        // the three reads must not straddle a boundary
+        // the four reads must not straddle a boundary
         let still = registry.getCurrentEpochInfo().call().await?.epochId;
         if still != w {
             candidate = still;
             continue;
         }
+        sampled += 1;
         let (in_w, in_w1, in_w2) = (in_committee(&c_w), in_committee(&c_w1), in_committee(&c_w2));
-        info!(target: "eject-test", w, in_w, in_w1, in_w2, "arrangement check");
+        info!(target: "eject-test", w, sampled, in_w, in_w1, in_w2, "arrangement check");
         if !in_w && !in_w1 && in_w2 {
             arrangement = Some((w, c_w2.len()));
-            break;
         }
         candidate = w + 1;
     }
     let (w, w2_len_before) = arrangement.ok_or_else(|| {
-        eyre::eyre!("new validator not seated in a future-only committee within 5 epochs")
+        eyre::eyre!(
+            "new validator not seated in a future-only committee after {sampled} sampled \
+             shuffles of the epoch pipeline (budget {sample_budget})"
+        )
     })?;
     assert_eq!(w2_len_before, 5, "future committee must have 5 members before ejection");
 

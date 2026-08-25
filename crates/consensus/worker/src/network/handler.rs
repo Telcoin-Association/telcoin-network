@@ -153,7 +153,8 @@ where
             WorkerGossip::Batch(epoch, batch_hash) => {
                 ensure!(
                     topic.to_string().eq(&tn_config::LibP2pConfig::worker_batch_topic(
-                        self.consensus_config.chain_id()
+                        self.consensus_config.chain_id(),
+                        self.id,
                     )),
                     WorkerNetworkError::InvalidTopic
                 );

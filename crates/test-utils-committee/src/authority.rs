@@ -6,7 +6,7 @@ use tn_config::{Config, ConsensusConfig, KeyConfig, NetworkConfig, Parameters};
 use tn_types::{
     Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, BlsSignature, Certificate,
     Committee, Database, Epoch, EpochDigest, EpochSeedMessage, Genesis, Hash as _, Header,
-    HeaderBuilder, NetworkKeypair, NetworkPublicKey, Round, Vote,
+    HeaderBuilder, NetworkKeypair, NetworkPublicKey, P2pNode, Round, Vote, DEFAULT_WORKER_ID,
 };
 
 /// Fixture representing an validator node within the network.
@@ -142,18 +142,32 @@ impl<DB: Database> AuthorityFixture<DB> {
         // Make sure our keys are correct.
         assert_eq!(&key_config.primary_public_key(), authority.protocol_key());
         assert_eq!(primary_keypair.public(), &key_config.primary_public_key());
-        // Currently only support one worker per node.
-        // If/when this is relaxed then the key_config below will need to change.
-        assert_eq!(number_of_workers.get(), 1);
         let mut config = Config::default_for_test_with_genesis(genesis);
         // overwrite default parameters if provided
         if let Some(overwrite) = parameters {
             config.parameters = overwrite.clone();
         }
+        // The node info defaults to one worker; give the fixture `number_of_workers` entries so
+        // its p2p info matches the committee. Worker 0 keeps the key config's worker key (the
+        // key config holds a single worker key); workers 1.. are the SAME nodes the committee's
+        // bootstrap entry advertises for this authority, so committee and node info agree.
+        let advertised: Vec<P2pNode> = committee
+            .bootstrap_servers()
+            .get(authority.protocol_key())
+            .map(|server| server.workers.iter().skip(1).cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            advertised.len() + 1,
+            number_of_workers.get(),
+            "bootstrap entry must advertise number_of_workers workers"
+        );
+        config.node_info.p2p_info.workers =
+            config.node_info.p2p_info.workers.iter().take(1).cloned().chain(advertised).collect();
         // These key updates don't return errors...
         let _ = config.update_protocol_key(key_config.primary_public_key());
         let _ = config.update_primary_network_key(key_config.primary_network_public_key());
-        let _ = config.update_worker_network_key(key_config.worker_network_public_key());
+        let _ = config
+            .update_worker_network_key(DEFAULT_WORKER_ID, key_config.worker_network_public_key());
 
         let consensus_config = ConsensusConfig::new_with_committee_and_prior_epoch_record_for_test(
             config,
