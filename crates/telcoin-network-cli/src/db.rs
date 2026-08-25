@@ -1152,12 +1152,12 @@ mod tests {
         use tn_types::{BlockNumHash, EpochRecord, ExecHeader, B256};
         let dir = tempfile::tempdir().unwrap();
         let root = B256::from([7u8; 32]);
-        let snapshot = ExecHeader { number: 5, state_root: root, ..Default::default() };
+        let snapshot = ExecHeader { number: 1, state_root: root, ..Default::default() };
         ExecStatePackWriter::create(dir.path(), root, std::slice::from_ref(&snapshot))
             .expect("create pack")
             .finish()
             .expect("finish pack");
-        // Record names a different block number than the pack's meta (block 5), so it cannot match
+        // Record names a different block number than the pack's meta (block 1), so it cannot match
         // regardless of hash.
         let record = EpochRecord {
             epoch: 3,
@@ -1180,7 +1180,7 @@ mod tests {
         use tn_types::{BlockNumHash, EpochRecord, ExecHeader, B256};
         let dir = tempfile::tempdir().unwrap();
         let root = B256::from([7u8; 32]);
-        let snapshot = ExecHeader { number: 5, state_root: root, ..Default::default() };
+        let snapshot = ExecHeader { number: 1, state_root: root, ..Default::default() };
         ExecStatePackWriter::create(dir.path(), root, std::slice::from_ref(&snapshot))
             .expect("create pack")
             .finish()
@@ -1765,7 +1765,7 @@ mod tests {
         // only thing left that can refuse it is the certificate chain.
         let bundle = tempfile::tempdir().expect("bundle");
         let root = B256::from([7u8; 32]);
-        let snapshot = ExecHeader { number: 5, state_root: root, ..Default::default() };
+        let snapshot = ExecHeader { number: 1, state_root: root, ..Default::default() };
         ExecStatePackWriter::create(bundle.path(), root, std::slice::from_ref(&snapshot))
             .expect("create pack")
             .finish()

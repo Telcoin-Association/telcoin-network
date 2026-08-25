@@ -526,15 +526,6 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             Error::ValueTooLarge
         })?;
 
-        if self.num_providers >= self.config.max_provided_keys {
-            // Try to free a slot by evicting fully-expired provider key groups.
-            self.evict_expired_providers();
-        }
-        // Re-check after the eviction attempt; still full is a hard error.
-        (self.num_providers < self.config.max_provided_keys)
-            .then_some(())
-            .ok_or(Error::MaxProvidedKeys)?;
-
         let key = self.key_to_hash(&record.key);
         let kr: KadProviderRecord = record.into();
         let stored = match self.kad_type {
@@ -549,6 +540,23 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         // genuinely new key it is already counted in `num_providers`, so only a missing
         // row bumps the gauge (issue #999).
         let row_exists = stored.is_some();
+
+        // The capacity check applies only to a brand-new key, mirroring `put`'s
+        // `new_record` gate: an overwrite of an existing, already-counted row cannot
+        // grow the table, so a refresh of a key this node already stores (including
+        // its own self-provide) must succeed even when byzantine peers have
+        // saturated the table with other keys (issue #1195).
+        if !row_exists {
+            if self.num_providers >= self.config.max_provided_keys {
+                // Try to free a slot by evicting fully-expired provider key groups.
+                self.evict_expired_providers();
+            }
+            // Re-check after the eviction attempt; still full is a hard error.
+            (self.num_providers < self.config.max_provided_keys)
+                .then_some(())
+                .ok_or(Error::MaxProvidedKeys)?;
+        }
+
         let merged = stored
             .as_deref()
             .and_then(|raw| decode_providers(&key, raw))
@@ -1100,6 +1108,81 @@ mod test {
         assert!(matches!(kad_store_worker.put(rec.clone()), Err(Error::MaxRecords)));
     }
 
+    // ---- issue #1195: the provider capacity check gates only brand-new keys ----
+
+    /// A refresh of an existing provider key is an overwrite, not a new row: it must
+    /// succeed at capacity and leave the count unchanged, while a brand-new key is
+    /// still rejected. Mirrors `test_kad_put_limit`, which locks the same gating for
+    /// `put`.
+    #[test]
+    fn test_kad_add_provider_refresh_allowed_at_capacity() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut kad_store =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        let mut kad_store_worker =
+            KadStore::new(db, PeerId::random(), &key_config, NetworkType::Worker(0));
+        // A small cap keeps the test fast; the gating logic does not depend on the
+        // cap's value.
+        kad_store.config.max_provided_keys = 4;
+        kad_store_worker.config.max_provided_keys = 4;
+
+        // Fill both tables to capacity with distinct live keys, keeping one record
+        // to refresh later.
+        let refresh_rec = live_provider_under(&fresh_record_key());
+        kad_store.add_provider(refresh_rec.clone()).expect("add provider");
+        kad_store_worker.add_provider(refresh_rec.clone()).expect("add provider");
+        (1..4).for_each(|_| {
+            let rec = live_provider_under(&fresh_record_key());
+            kad_store.add_provider(rec.clone()).expect("add provider");
+            kad_store_worker.add_provider(rec).expect("add provider");
+        });
+        assert_eq!(kad_store.num_providers, 4);
+        assert_eq!(kad_store_worker.num_providers, 4);
+
+        // The refresh of an existing key must succeed at capacity (issue #1195: the
+        // node keeps its own provider records live this way).
+        (0..10).for_each(|_| {
+            kad_store.add_provider(refresh_rec.clone()).expect("refresh at capacity");
+            kad_store_worker.add_provider(refresh_rec.clone()).expect("refresh at capacity");
+        });
+        assert_eq!(kad_store.num_providers, 4, "refresh must not change the count");
+        assert_eq!(kad_store_worker.num_providers, 4, "refresh must not change the count");
+
+        // Positive control: a brand-new key is still rejected while full.
+        let new_rec = live_provider_under(&fresh_record_key());
+        assert!(matches!(kad_store.add_provider(new_rec.clone()), Err(Error::MaxProvidedKeys)));
+        assert!(matches!(kad_store_worker.add_provider(new_rec), Err(Error::MaxProvidedKeys)));
+    }
+
+    /// A brand-new key at capacity still triggers the expired-group eviction attempt
+    /// before the hard error: moving the capacity check behind the new-key gate
+    /// (issue #1195) must not lose the eviction. Mirrors
+    /// `test_kad_put_evicts_expired_when_full`.
+    #[test]
+    fn test_kad_add_provider_evicts_expired_when_full() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut kad_store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        kad_store.config.max_provided_keys = 4;
+
+        // Saturate the table with already-expired provider groups.
+        (0..4).for_each(|_| {
+            kad_store
+                .add_provider(expired_provider_under(&fresh_record_key()))
+                .expect("add expired provider");
+        });
+        assert_eq!(kad_store.num_providers, 4);
+
+        // A live record under a brand-new key must succeed: eviction makes room.
+        let fresh_key = fresh_record_key();
+        kad_store.add_provider(live_provider_under(&fresh_key)).expect("eviction must make room");
+        assert_eq!(kad_store.num_providers, 1, "only the fresh row should remain");
+        assert_eq!(kad_store.providers(&fresh_key).len(), 1, "fresh provider retained");
+    }
+
     /// Lock the per-role, chain-namespaced wire-protocol names. These strings are a
     /// peer-compatibility contract: a silent change would prevent peers from
     /// negotiating sessions, and the chain id keeps different chains from ever
@@ -1280,6 +1363,13 @@ mod test {
     fn live_provider_under(key: &RecordKey) -> ProviderRecord {
         let provider = PeerId::random();
         let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
+        ProviderRecord { key: key.clone(), provider, expires, addresses: vec![] }
+    }
+
+    /// A provider record under `key` whose expiry is already in the past.
+    fn expired_provider_under(key: &RecordKey) -> ProviderRecord {
+        let provider = PeerId::random();
+        let expires = Instant::now().checked_sub(Duration::from_secs(60));
         ProviderRecord { key: key.clone(), provider, expires, addresses: vec![] }
     }
 

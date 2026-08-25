@@ -23,10 +23,13 @@ pub struct BatchBuilderOutput {
     pub(crate) batch: Batch,
     /// The transaction hashes mined in this worker's batch.
     pub(crate) mined_transactions: Vec<TxHash>,
-    /// Per-sender nonce updates for the pool after mining.
+    /// Per-sender pool updates applied after mining.
     ///
-    /// Keeps remaining transactions from the same sender in the pending sub-pool
-    /// rather than being demoted to queued due to a perceived nonce gap.
+    /// Each entry advances the sender's nonce past the mined transactions so remaining
+    /// transactions from the same sender stay in the pending sub-pool rather than being demoted
+    /// to queued over a perceived nonce gap. The balance is the sender's real canonical balance
+    /// minus the just-mined cost, so parked insufficient-funds transactions are not spuriously
+    /// promoted (see `build_batch`).
     pub(crate) changed_accounts: Vec<ChangedAccount>,
 }
 
@@ -66,6 +69,7 @@ pub fn build_batch<P: TxPool>(
     let mut blob_transactions = Vec::new();
     let mut unsupported_transactions = Vec::new();
     let mut sender_nonces: HashMap<Address, u64> = HashMap::new();
+    let mut sender_costs: HashMap<Address, U256> = HashMap::new();
 
     // begin loop through sorted "best" transactions in pending pool
     // and execute them to build the block
@@ -125,6 +129,14 @@ pub fn build_batch<P: TxPool>(
         let sender = pool_tx.sender();
         let nonce = pool_tx.nonce();
         sender_nonces.entry(sender).and_modify(|max| *max = (*max).max(nonce)).or_insert(nonce);
+
+        // accumulate the cost of the transactions mined for this sender so the optimistic balance
+        // update below can debit them (see the changed_accounts construction)
+        let cost = *pool_tx.cost();
+        sender_costs
+            .entry(sender)
+            .and_modify(|total| *total = total.saturating_add(cost))
+            .or_insert(cost);
     }
 
     // batch
@@ -137,19 +149,98 @@ pub fn build_batch<P: TxPool>(
     // remove any non-allowlisted transaction types that were submitted
     pool.remove_unsupported_txs(unsupported_transactions);
 
-    // construct changed_accounts for pool nonce updates
+    // construct changed_accounts for the optimistic pool update
     //
-    // NOTE: new transactions entering the pool are sanitized using account balance checks
-    // `balance: U256::MAX` only affects whether the pool demotes accounts after mining the batch
+    // The nonce is advanced past the mined transactions so remaining transactions from the same
+    // sender stay in `pending` rather than being demoted over a perceived nonce gap.
+    //
+    // The balance is the sender's real canonical balance minus the cost of the transactions just
+    // mined for that sender, NOT `U256::MAX`. `U256::MAX` made the pool treat a sender's parked
+    // (insufficient-funds) transactions as affordable and promote them into the next batch built
+    // inside this optimistic window; those transactions are then quorum-certified and gossiped
+    // only to be skipped for free at execution, a griefing/amplification vector (issue #1158).
+    // Debiting the just-mined cost keeps a sender's parked transactions parked when the sender
+    // cannot actually fund them, so the amplification the issue's PoC relies on (queue many
+    // transactions, mine one, watch the rest promote) no longer occurs.
+    //
+    // Residual: the balance is re-derived from the last committed canonical balance on every
+    // in-window rebuild and does not accumulate debits across successive rebuilds before the
+    // engine's canonical update lands, so a drip-fed sender can still have on the order of one
+    // transaction promoted per rebuild. Fully closing that requires tracking cumulative optimistic
+    // spend across rebuilds (or a state-aware check on the follow-up batch path); both are larger
+    // design choices left to the maintainers. See the crate README.
     let changed_accounts: Vec<ChangedAccount> = sender_nonces
         .into_iter()
         .map(|(address, max_nonce)| ChangedAccount {
             address,
             nonce: max_nonce + 1, // next expected nonce
-            balance: U256::MAX,   // corrected by engine's canonical update
+            balance: pool
+                .get_account_balance(address)
+                .saturating_sub(sender_costs.get(&address).copied().unwrap_or(U256::ZERO)),
         })
         .collect();
 
     // return output
     BatchBuilderOutput { batch, mined_transactions, changed_accounts }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::TestPool;
+    use std::sync::Arc;
+    use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
+    use tn_types::{test_genesis, BatchBuilderArgs, Bytes, MIN_PROTOCOL_BASE_FEE, U256};
+
+    /// The optimistic `changed_accounts` update must carry the sender's real balance, not an
+    /// inflated `U256::MAX`. An inflated balance lets the pool promote a sender's parked
+    /// insufficient-funds transactions into the next batch, which is a griefing/amplification
+    /// vector (see the module docs and `crates/batch-builder/README.md`). The nonce must still be
+    /// advanced past the mined transactions so legitimate sequential senders keep flowing.
+    #[test]
+    fn changed_accounts_carry_real_balance_and_advance_nonce() {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut tx_factory = TransactionFactory::new();
+        let sender = tx_factory.address();
+
+        // two sequential transactions (nonces 0 and 1) from the same sender
+        let tx0 = tx_factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            None,
+            U256::from(1),
+            Bytes::new(),
+        );
+        let tx1 = tx_factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            100,
+            None,
+            U256::from(1),
+            Bytes::new(),
+        );
+
+        // the pool reports a large, finite balance for the sender
+        let real_balance = U256::from(1_000_000_000_000_000_000u128);
+        let pool = TestPool::new(&[tx0, tx1]).with_balance(sender, real_balance);
+        // both transactions are mined, so their cost is debited from the optimistic balance
+        let mined_cost = pool.total_cost();
+        assert!(mined_cost > U256::ZERO, "mined transactions must have non-zero cost");
+
+        let args = BatchBuilderArgs { pool, beneficiary: Address::ZERO, epoch: 0 };
+        let BatchBuilderOutput { changed_accounts, .. } =
+            build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+
+        let changed = changed_accounts
+            .iter()
+            .find(|account| account.address == sender)
+            .expect("sender must have a changed_accounts entry after mining");
+
+        // the optimistic balance is the real balance minus the just-mined cost, never U256::MAX
+        assert_eq!(changed.balance, real_balance - mined_cost);
+        assert_ne!(changed.balance, U256::MAX);
+        // the nonce is still advanced past the highest mined nonce (throughput fix preserved)
+        assert_eq!(changed.nonce, 2);
+    }
 }

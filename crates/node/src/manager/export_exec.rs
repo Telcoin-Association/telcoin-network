@@ -27,14 +27,10 @@ use std::{
 
 use eyre::eyre;
 use tn_reth::{snapshot::check_entry_readiness, RethEnv};
-use tn_storage::exec_state_pack::ExecStateStats;
+use tn_storage::exec_state_pack::{ExecStateStats, BLOCKHASH_ANCESTORS};
 use tn_types::{BlockNumHash, ExecHeader, SealedHeader};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, warn};
-
-/// Number of ancestor headers (below the snapshot block) to embed for the EVM `BLOCKHASH` opcode
-/// and the restore-side scaffold window.
-const BLOCKHASH_ANCESTORS: u64 = 256;
 
 /// How many times to re-pin while waiting for the requested block to become the persisted tip.
 const MAX_PIN_ATTEMPTS: usize = 8;
