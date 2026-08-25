@@ -87,7 +87,10 @@ impl WorkerNetworkError {
                     // medium
                     BatchValidationError::InvalidEpoch { .. }
                     | BatchValidationError::InvalidTx4844(_)
-                    | BatchValidationError::UnsupportedTxType { .. } => Some(Penalty::Medium),
+                    | BatchValidationError::UnsupportedTxType { .. }
+                    | BatchValidationError::InvalidAuthorizationList { .. } => {
+                        Some(Penalty::Medium)
+                    }
                     // severe
                     BatchValidationError::RecoverTransaction(_, _) => Some(Penalty::Severe),
                     // fatal

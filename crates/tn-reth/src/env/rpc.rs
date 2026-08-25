@@ -16,17 +16,12 @@ use reth::rpc::{
     builder::{config::RethRpcServerConfig as _, RpcModuleBuilder, RpcServerHandle},
     eth::{EthApi, EthApiBuilder},
 };
-use reth_provider::providers::BlockchainProvider;
 use reth_rpc_eth_api::RpcNodeCore;
 use reth_rpc_eth_types::EthConfig;
-use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 
 use crate::{
-    error::TnRethResult,
-    evm::TnEvmConfig,
-    traits::{TNExecution, TelcoinNode},
-    worker::WorkerNetwork,
-    RethEnv, RpcServer, WorkerTxPool,
+    error::TnRethResult, traits::TNExecution, worker::WorkerNetwork, RethEnv, RpcServer,
+    TnEthTransactionPool, WorkerTxPool,
 };
 
 /// Apply the operator's [`EthConfig`] values to the `eth` API builder.
@@ -73,11 +68,7 @@ impl RethEnv {
         network: WorkerNetwork,
         other: impl Into<Methods>,
     ) -> RpcServer {
-        let transaction_pool: EthTransactionPool<
-            BlockchainProvider<TelcoinNode>,
-            DiskFileBlobStore,
-            TnEvmConfig,
-        > = transaction_pool.into();
+        let transaction_pool: TnEthTransactionPool = transaction_pool.into();
         let tn_execution = Arc::new(TNExecution);
         let rpc_builder = RpcModuleBuilder::default()
             .with_provider(self.inner.blockchain_provider.clone())

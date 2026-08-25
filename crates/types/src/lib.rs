@@ -99,6 +99,28 @@ pub use libp2p::{multiaddr::Protocol, Multiaddr};
 pub fn batch_allowlisted_tx_type<T: Typed2718>(tx: &T) -> bool {
     tx.is_legacy() || tx.is_eip2930() || tx.is_eip1559() || tx.is_eip7702()
 }
+
+/// Whether a transaction's EIP-7702 authorization list is within the batch
+/// executable bound: `true` for any non-7702 transaction; for a type-0x04
+/// transaction, `true` iff the list length is in
+/// `1..=max_tx_authorizations(epoch)`.
+///
+/// One predicate shared by the batch validator, the batch builder, the worker
+/// gateway, and the pool wrap so producers and validators can never disagree
+/// on the bound. See [`max_tx_authorizations`] for the derivation and the
+/// no-false-rejection argument: an over-cap transaction can never execute
+/// inside a batch, so rejecting it refuses only garbage.
+///
+/// The empty list is excluded because EIP-7702 declares an empty
+/// authorization list invalid (revm rejects it at execution; reth's pool
+/// rejects it at admission), so a batch carrying one wastes certified work.
+pub fn batch_allowlisted_authorization_list<T: TransactionTrait>(tx: &T, epoch: Epoch) -> bool {
+    !tx.is_eip7702()
+        || tx.authorization_list().is_some_and(|list| {
+            u64::try_from(list.len())
+                .is_ok_and(|len| (1..=max_tx_authorizations(epoch)).contains(&len))
+        })
+}
 pub use reth_primitives::{
     Account, Block, BlockBody, EthPrimitives, NodePrimitives, PooledTransaction, Receipt,
     Recovered, RecoveredBlock, SealedBlock, SealedHeader, Transaction, TransactionSigned,
@@ -131,5 +153,64 @@ mod allowlist_tests {
                 "type {rejected:#04x} must be rejected"
             );
         }
+    }
+
+    /// Build a type-0x04 transaction carrying `n` dummy-signed authorization
+    /// tuples. The predicate only reads the list length, so dummy signatures
+    /// suffice.
+    fn tx_7702_with_tuples(n: usize) -> TxEip7702 {
+        let dummy_signature = EthSignature::new(U256::from(1), U256::from(1), false);
+        let authorization_list = (0..n)
+            .map(|_| {
+                Authorization { chain_id: U256::from(2017), address: Address::ZERO, nonce: 1 }
+                    .into_signed(dummy_signature)
+            })
+            .collect();
+        TxEip7702 {
+            chain_id: 2017,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 0,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: Default::default(),
+            authorization_list,
+            input: Default::default(),
+        }
+    }
+
+    #[test]
+    fn max_tx_authorizations_is_pinned_to_1199() {
+        // (30,000,000 - 21,000) / 25,000 = 1199. A change here changes what
+        // every enforcement site admits — it must be deliberate.
+        assert_eq!(max_tx_authorizations(0), 1199);
+    }
+
+    #[test]
+    fn authorization_list_predicate_truth_table() {
+        // Non-7702 transactions always pass: the bound applies to type 0x04 only.
+        let non_7702 = TxEip1559 {
+            chain_id: 2017,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 0,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Default::default(),
+        };
+        assert!(batch_allowlisted_authorization_list(&non_7702, 0), "non-7702 must pass");
+
+        // 7702: empty is invalid per EIP-7702, 1..=cap passes, cap+1 fails.
+        let cap = usize::try_from(max_tx_authorizations(0)).expect("cap fits usize");
+        assert!(!batch_allowlisted_authorization_list(&tx_7702_with_tuples(0), 0), "empty list");
+        assert!(batch_allowlisted_authorization_list(&tx_7702_with_tuples(1), 0), "one tuple");
+        assert!(batch_allowlisted_authorization_list(&tx_7702_with_tuples(cap), 0), "at cap");
+        assert!(
+            !batch_allowlisted_authorization_list(&tx_7702_with_tuples(cap + 1), 0),
+            "over cap"
+        );
     }
 }

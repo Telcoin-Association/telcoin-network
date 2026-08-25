@@ -91,19 +91,26 @@ pub fn build_batch<P: TxPool>(
         let tx = pool_tx.to_consensus();
 
         // ignore any transaction type outside the executable allowlist (the
-        // predicate admits legacy, EIP-2930, EIP-1559, and EIP-7702): the batch
-        // validator rejects non-allowlisted batches, so packing one would cost
-        // this node a peer penalty on every vote request. The 4844 arm discards
-        // blob transactions; the else arm is default-deny for any future
-        // decodable type outside the allowlist (no such type exists today)
-        if !tn_types::batch_allowlisted_tx_type(&tx) {
+        // predicate admits legacy, EIP-2930, EIP-1559, and EIP-7702), and the
+        // symmetric bound: an EIP-7702 transaction whose authorization list
+        // falls outside 1..=max_tx_authorizations(epoch). The batch validator
+        // rejects a batch carrying either with a Medium peer penalty, so
+        // packing one would cost this node reputation on every vote request.
+        // The 4844 arm discards blob transactions; the else arm handles the
+        // out-of-bounds authorization list and is default-deny for any future
+        // decodable type outside the allowlist (no such type exists today).
+        // Both feed `remove_unsupported_txs` below so the transaction and its
+        // descendants leave the pool
+        if !tn_types::batch_allowlisted_tx_type(&tx)
+            || !tn_types::batch_allowlisted_authorization_list(&*tx, epoch)
+        {
             if tx.is_eip4844() {
                 best_txs.ignore_eip4844(&pool_tx);
                 debug!(target: "worker::batch_builder", ?pool_tx, "marking eip4844 tx invalid");
                 blob_transactions.push(*tx.hash());
             } else {
                 best_txs.ignore_denylist_type(&pool_tx);
-                debug!(target: "worker::batch_builder", ?pool_tx, "marking non-allowlisted tx type invalid");
+                debug!(target: "worker::batch_builder", ?pool_tx, "marking non-allowlisted or out-of-bounds 7702 tx invalid");
                 unsupported_transactions.push(*tx.hash());
             }
             continue;
@@ -245,5 +252,45 @@ mod tests {
         assert_ne!(changed.balance, U256::MAX);
         // the nonce is still advanced past the highest mined nonce (throughput fix preserved)
         assert_eq!(changed.nonce, 2);
+    }
+
+    /// A type-0x04 transaction whose authorization list exceeds
+    /// `max_tx_authorizations(epoch)` must never be packed: the batch validator
+    /// rejects a batch carrying one with a Medium peer penalty. The builder must
+    /// skip it and evict it from the pool through `remove_unsupported_txs`.
+    #[test]
+    fn over_cap_7702_tx_is_never_packed_and_leaves_the_pool() {
+        let genesis = test_genesis();
+        let chain_id = genesis.config.chain_id;
+        let mut tx_factory = TransactionFactory::new();
+
+        // one tuple past the cap, dummy tuples; the declared gas limit stays under
+        // max_batch_gas(0) so the gas-capacity arm cannot mask the list check
+        let cap = usize::try_from(tn_types::max_tx_authorizations(0)).expect("cap fits usize");
+        let over_cap = tx_factory.create_eip7702_with_authorizations(
+            chain_id,
+            1_000_000,
+            u128::from(MIN_PROTOCOL_BASE_FEE),
+            cap + 1,
+            Bytes::new(),
+        );
+        let hash = *over_cap.hash();
+
+        let pool = TestPool::new(&[over_cap.encoded_2718()]);
+        let removed = pool.removed_unsupported_handle();
+
+        let args = BatchBuilderArgs { pool, beneficiary: Address::ZERO, epoch: 0 };
+        let BatchBuilderOutput { batch, mined_transactions, .. } =
+            build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+
+        // never packed
+        assert!(batch.transactions.is_empty(), "over-cap 7702 tx must not be packed");
+        assert!(mined_transactions.is_empty(), "over-cap 7702 tx must not be mined");
+        // evicted from the pool through remove_unsupported_txs
+        assert_eq!(
+            removed.lock().expect("removed lock").as_slice(),
+            &[hash],
+            "over-cap 7702 tx must leave the pool"
+        );
     }
 }

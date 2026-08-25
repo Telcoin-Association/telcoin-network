@@ -3,7 +3,7 @@
 use crate::{build_batch, BatchBuilderOutput};
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tn_reth::{
     new_pool_txn, BestTransactions, InvalidPoolTransactionError, PoolTxn, PoolTxnId,
@@ -36,6 +36,10 @@ pub(crate) struct TestPool {
     /// Per-sender balances returned by [`TxPool::get_account_balance`]. A sender that is absent
     /// here reports [`U256::MAX`], preserving the behavior of tests that do not exercise balance.
     balances: BTreeMap<Address, U256>,
+    /// Hashes the builder passed to [`TxPool::remove_unsupported_txs`], shared behind an `Arc`
+    /// so a test can keep a handle and observe evictions after the pool moves into
+    /// [`build_batch`].
+    removed_unsupported: Arc<Mutex<Vec<TxHash>>>,
 }
 
 impl TxPool for TestPool {
@@ -50,10 +54,14 @@ impl TxPool for TestPool {
         self.transactions.retain(|tx| !tx.is_eip4844());
         self.by_id.retain(|_, tx| !tx.is_eip4844());
     }
-    fn remove_unsupported_txs(&mut self, _txs: Vec<TxHash>) {
-        // remove non-allowlisted transaction types from the transactions vec and btreemap
-        self.transactions.retain(|tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
-        self.by_id.retain(|_, tx| tn_types::batch_allowlisted_tx_type(&tx.transaction));
+    fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>) {
+        // mirror the real pool: remove exactly the transactions the builder collected
+        // (non-allowlisted types and out-of-bounds 7702 authorization lists) from the
+        // transactions vec and btreemap, and record them for test observation
+        let removed: HashSet<TxHash> = txs.iter().copied().collect();
+        self.transactions.retain(|tx| !removed.contains(tx.hash()));
+        self.by_id.retain(|_, tx| !removed.contains(tx.hash()));
+        self.removed_unsupported.lock().expect("removed_unsupported lock").extend(txs);
     }
     fn get_account_balance(&self, address: Address) -> U256 {
         self.balances.get(&address).copied().unwrap_or(U256::MAX)
@@ -66,6 +74,13 @@ impl TestPool {
     pub(crate) fn with_balance(mut self, address: Address, balance: U256) -> Self {
         self.balances.insert(address, balance);
         self
+    }
+
+    /// Handle to the hashes passed to [`TxPool::remove_unsupported_txs`]. Clone of the pool's
+    /// shared record, so it stays readable after the pool moves into [`build_batch`].
+    #[cfg(test)]
+    pub(crate) fn removed_unsupported_handle(&self) -> Arc<Mutex<Vec<TxHash>>> {
+        self.removed_unsupported.clone()
     }
 
     /// Sum of the pool transactions' costs, used by tests to compute the expected optimistic
@@ -99,7 +114,12 @@ impl TestPool {
                 valid_tx
             })
             .collect();
-        Self { transactions, by_id: by_id.into_iter().collect(), balances: BTreeMap::new() }
+        Self {
+            transactions,
+            by_id: by_id.into_iter().collect(),
+            balances: BTreeMap::new(),
+            removed_unsupported: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     fn best_transactions_int(&self) -> Box<dyn BestTransactions<Item = Arc<PoolTxn>>> {
