@@ -1111,12 +1111,31 @@ impl PeerManager {
 
     /// Process newly discovered peers for potential dial attempts.
     ///
-    /// Only eligible peers are stored for dialing during heartbeat.
+    /// Only eligible peers are stored for dialing during heartbeat. The set is bounded to
+    /// `max_discovery_peers` at insert time, so the bound holds within a heartbeat window
+    /// instead of relying on the next heartbeat to prune overshoot (issue #1252). The bound is
+    /// enforced by merging the newcomers and then randomly evicting down to the cap, never by
+    /// rejecting newcomers: a first-come cap would let whoever fills the set first (or an
+    /// attacker feeding eligible-but-unreachable ids) own the pool and starve fresh kad
+    /// results, while random eviction over the union keeps the pool rotating exactly like the
+    /// heartbeat prune it mirrors. [`Self::process_peer_exchange`] stays fill-to-spare-capacity
+    /// only, which keeps kad-discovered peers prioritized over exchange peers.
     pub(crate) fn process_peers_for_discovery(&mut self, mut peers: Vec<PeerInfo>) {
         peers.retain(|peer| self.eligible_for_discovery(peer));
-        let peers: HashSet<_> = peers.into_iter().map(|info| (info.peer_id, info.addrs)).collect();
         trace!(target: "peer-manager", ?peers, "adding eligible peers to discovery map");
-        self.discovery_peers.extend(peers);
+        self.discovery_peers.extend(peers.into_iter().map(|info| (info.peer_id, info.addrs)));
+
+        // sample down to the cap over old and new entries alike
+        let max_discovery_peers = self.config.max_discovery_peers();
+        let excess = self.discovery_peers.len().saturating_sub(max_discovery_peers);
+        if excess > 0 {
+            let mut rng = rand::rng();
+            let to_remove: Vec<PeerId> =
+                self.discovery_peers.keys().copied().choose_multiple(&mut rng, excess);
+            to_remove.into_iter().for_each(|peer| {
+                self.discovery_peers.remove(&peer);
+            });
+        }
     }
 
     /// Check peer counts and initiate dial attempts to maintain connection targets.

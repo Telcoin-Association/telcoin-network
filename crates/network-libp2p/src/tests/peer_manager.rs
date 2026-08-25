@@ -1687,6 +1687,46 @@ async fn test_process_peers_for_discovery_filters_duplicates() {
     assert_eq!(peer_manager.discovery_peers.remove(&peer_id), Some(vec![addr]));
 }
 
+// Regression (issue #1252): `process_peers_for_discovery` bounds the set to
+// `max_discovery_peers` at insert time, so overshoot never persists until the
+// next heartbeat prune. The bound is enforced by random eviction over old and
+// new entries alike, never by rejecting newcomers, so no first-come occupant
+// can starve fresh kad results out of the pool.
+#[tokio::test]
+async fn test_process_peers_for_discovery_caps_inserts() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let max_discovery = peer_manager.config.max_discovery_peers();
+
+    // flood past the cap in a single batch
+    let flood: Vec<_> = (0..max_discovery + 10)
+        .map(|_| PeerInfo { peer_id: PeerId::random(), addrs: vec![create_multiaddr(None)] })
+        .collect();
+    peer_manager.process_peers_for_discovery(flood);
+
+    // capped at insert time - no transient overshoot
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery);
+
+    // at the cap, another batch still leaves the set exactly at the cap
+    let second_flood: Vec<_> = (0..10)
+        .map(|_| PeerInfo { peer_id: PeerId::random(), addrs: vec![create_multiaddr(None)] })
+        .collect();
+    peer_manager.process_peers_for_discovery(second_flood);
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery);
+
+    // an address update for a tracked peer replaces its entry without growing
+    // the set, and with no excess nothing is evicted
+    let tracked_id = peer_manager.discovery_peers.keys().next().copied();
+    let new_addr = create_multiaddr(None);
+    tracked_id.into_iter().for_each(|tracked_id| {
+        peer_manager.process_peers_for_discovery(vec![PeerInfo {
+            peer_id: tracked_id,
+            addrs: vec![new_addr.clone()],
+        }]);
+        assert_eq!(peer_manager.discovery_peers.len(), max_discovery);
+        assert_eq!(peer_manager.discovery_peers.remove(&tracked_id), Some(vec![new_addr.clone()]));
+    });
+}
+
 // Regression (issue #777 Part B): the node's own peer id must never be added to
 // the discovery feed. A self entry (learned via kad closest-peers or peer
 // exchange) would otherwise be selected for a self-dial during the heartbeat.
