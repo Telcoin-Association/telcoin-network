@@ -228,13 +228,25 @@ All fee handling lives in `TNEvmHandler` (`src/evm/handler.rs`); system calls by
 - **Base fees are credited, not burned.** `reward_beneficiary` sends the priority-fee portion
   (`effective_gas_price - basefee`) × gas used to the block beneficiary and the base-fee portion
   × gas used to the chain's base-fee address for later off-chain processing.
-- **Quadratic gas-limit penalty** (`calculate_gas_penalty` in `src/evm/utils.rs`, referenced from
-  `reimburse_caller`; see issue #424). Because actual gas cannot be known until after consensus,
-  users who submit gas limits far above usage could stuff batches for free. The penalty: zero when
-  `gas_limit <= 210_000` or usage ≥ 10% of the limit; otherwise
-  `penalty = ((10^8 - usage_ratio_scaled)^2 × unused_gas) / 10^16` in deterministic u128 integer
-  math. The penalty is deducted from the caller's unused-gas refund and credited to the base-fee
-  address. Penalty is computed from pre-refund gas so SSTORE refunds don't inflate it.
+- **Quadratic gas-limit penalty** (`gas_penalty_and_refund` over `calculate_gas_penalty` in
+  `src/evm/utils.rs`, called from `reimburse_caller`; see issue #424). Because actual gas cannot be
+  known until after consensus, users who submit gas limits far above usage could stuff batches for
+  free. `calculate_gas_penalty(limit, spent)` is the core rule: zero when `limit <= 210_000` or when
+  `spent` is at least 10% of `limit`; otherwise
+  `penalty = ((10^8 - usage_ratio_scaled)^2 × (limit - spent)) / 10^16` with
+  `usage_ratio_scaled = 10^9 × spent / limit`, in deterministic u128 integer math. It reads
+  pre-refund gas (`gas.spent()`) so SSTORE refunds don't inflate the penalty.
+  `gas_penalty_and_refund` is the wrapper the handler calls: it passes `gas_limit - A` and
+  `gas_spent - A`, where `A` is the EIP-7702 authorization intrinsic (wire tuple count ×
+  `tx_eip7702_per_empty_account_cost()` from the cfg gas params, so 25,000 per tuple at Prague and 0
+  before it). Subtracting `A` from both arguments prices the penalty as if the authorization block
+  did not exist, so a padded authorization list cannot buy `gas.spent()` past the 10% threshold and
+  an honest delegation that estimates exactly pays nothing. The penalty is then capped at
+  post-refund unused gas (`gas_limit - gas_used`) and credited to the base-fee address; the
+  remaining unused gas is refunded to the caller (`refund + penalty + gas_used == gas_limit`).
+  `effective_auth_intrinsic` clamps `A` to `gas_spent - floor_gas` first: the EIP-7623 calldata
+  floor is priced from calldata alone, so when revm rewrites `gas.spent()` to the floor the
+  authorization gas rode along inside it and must not be excused from the basis twice.
   User-facing documentation (formula, examples, detection recipe for wallets and integrators):
   [`docs/gas-penalty.md`](../../docs/gas-penalty.md) at the repo root. Keep the two in sync.
 - **`BASEFEE_ADDRESS` is a process-global `OnceLock`** (`src/lib.rs`), written once by
@@ -399,8 +411,8 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/evm/config.rs` | `TnEvmConfig`: EVM env derivation, difficulty packing, `extra_data` decode for replay. |
 | `src/evm/context.rs` | revm context type aliases and builder traits. |
 | `src/evm/factory.rs` | `TNEvmFactory` / `TNBlockExecutorFactory`; installs TEL + BLS precompiles on every EVM instance. |
-| `src/evm/handler.rs` | `TNEvmHandler`: base-fee crediting and the gas-limit penalty. |
-| `src/evm/utils.rs` | `calculate_gas_penalty`. |
+| `src/evm/handler.rs` | `TNEvmHandler`: base-fee crediting and the gas-limit penalty, including the EIP-7702 authorization-intrinsic exclusion and its EIP-7623 floor clamp. |
+| `src/evm/utils.rs` | `calculate_gas_penalty` (core quadratic rule), `gas_penalty_and_refund` (7702-aware penalty/refund split), `effective_auth_intrinsic` (EIP-7623 floor clamp). |
 | `src/evm/tel_precompile/` | Native TEL issuance at `0x…07e1` (see its README). |
 | `src/evm/bls_precompile/` | BLS12-381 signature verification at `0x…b151`. |
 | `src/forward.rs` | `WorkerRpcForwarder`: observer → committee transaction forwarding. |
