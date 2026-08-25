@@ -543,6 +543,75 @@ async fn test_process_peer_exchange() {
     assert!(peer_manager.next_dial_request().is_none());
 }
 
+/// Helper to build an exchange map of `count` eligible peers, returning the map and its ids.
+fn eligible_exchange_map(
+    count: usize,
+    seed: u8,
+) -> (HashMap<BlsPublicKey, (NetworkPublicKey, HashSet<Multiaddr>)>, HashSet<PeerId>) {
+    let mut rng = StdRng::from_seed([seed; 32]);
+    (0..count).fold(
+        (HashMap::new(), HashSet::new()),
+        |(mut exchange_map, mut exchanged_peers), _| {
+            let bls = *BlsKeypair::generate(&mut rng).public();
+            let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
+            let peer_id: PeerId = net.clone().into();
+            exchanged_peers.insert(peer_id);
+            exchange_map.insert(bls, (net, HashSet::from([create_multiaddr(None)])));
+            (exchange_map, exchanged_peers)
+        },
+    )
+}
+
+#[tokio::test]
+async fn test_process_peer_exchange_bounds_discovery_to_missing_target() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let max_discovery_peers = peer_manager.config.max_discovery_peers();
+
+    // pre-seed some discovery peers so the missing target is smaller than the max
+    let preseeded = 3;
+    let preseeded_peers: HashSet<PeerId> = (0..preseeded)
+        .map(|_| {
+            let peer_id = PeerId::random();
+            peer_manager.discovery_peers.insert(peer_id, vec![create_multiaddr(None)]);
+            peer_id
+        })
+        .collect();
+
+    // build an exchange map with more eligible peers than the missing target
+    let (exchange_map, exchanged_peers) = eligible_exchange_map(max_discovery_peers + 8, 1);
+
+    // process the oversized exchange
+    peer_manager.process_peer_exchange(PeerExchangeMap::from(exchange_map));
+
+    // verify the sample tops up to the max, not to max + preseeded or the full map size
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery_peers);
+
+    // verify the pre-seeded peers survive and exactly the missing target came from the exchange
+    assert!(preseeded_peers.iter().all(|id| peer_manager.discovery_peers.contains_key(id)));
+    let sampled =
+        peer_manager.discovery_peers.keys().filter(|id| exchanged_peers.contains(id)).count();
+    assert_eq!(sampled, max_discovery_peers - preseeded);
+}
+
+#[tokio::test]
+async fn test_process_peer_exchange_skips_when_discovery_full() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let max_discovery_peers = peer_manager.config.max_discovery_peers();
+
+    // fill discovery peers to the max
+    (0..max_discovery_peers).for_each(|_| {
+        peer_manager.discovery_peers.insert(PeerId::random(), vec![create_multiaddr(None)]);
+    });
+
+    // process an exchange with eligible peers
+    let (exchange_map, exchanged_peers) = eligible_exchange_map(5, 2);
+    peer_manager.process_peer_exchange(PeerExchangeMap::from(exchange_map));
+
+    // verify nothing was added from the exchange
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery_peers);
+    assert!(peer_manager.discovery_peers.keys().all(|id| !exchanged_peers.contains(id)));
+}
+
 /// Helper to build a distinct, deterministic multiaddr per index.
 ///
 /// All addresses target the same IP with different ports, the shape of a dial-amplification
