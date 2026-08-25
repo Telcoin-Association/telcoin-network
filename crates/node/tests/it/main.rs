@@ -2765,7 +2765,11 @@ async fn spawn_consensus(
 
     // Set up mock worker.
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    config
+        .local_network(0)
+        .expect("worker 0 local network")
+        .set_primary_to_worker_local_handler(mock_client)
+        .expect("register mock worker client");
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),

@@ -333,6 +333,20 @@ where
             .configure_consensus(network_config, committee, next_committee_keys, prior_epoch_record)
             .await?;
 
+        // Epoch-entry agreement check (issue #556): the committee's worker count sizes the
+        // per-worker `LocalNetwork` seam, while the accumulator was sized from the on-chain
+        // `WorkerConfigs` state read above. Both derive from the same source, so a mismatch
+        // means the views disagree; refuse to start the epoch rather than run with aliased
+        // worker lanes or feed the accumulator ids it would panic on.
+        eyre::ensure!(
+            consensus_config.committee().number_of_workers() == gas_accumulator.num_workers(),
+            "epoch entry: committee carries {} workers but the gas accumulator holds {} slots - \
+             the chain-derived worker count and the committee disagree; refusing to start the \
+             epoch",
+            consensus_config.committee().number_of_workers(),
+            gas_accumulator.num_workers(),
+        );
+
         // The networks need their one-time, per-process setup (start listening, register bootstrap
         // peers) on the first iteration that actually reaches `create_consensus`. This is usually
         // the `Initial` epoch, but the replay above can return early before

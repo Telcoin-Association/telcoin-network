@@ -429,10 +429,7 @@ where
         .await?;
 
         // spawn primary - create node and spawn network
-        let primary =
-            PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync);
-
-        Ok(primary)
+        PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync)
     }
 
     /// Construct the epoch's [`WorkerNode`] and bring up its [`WorkerNetwork`].

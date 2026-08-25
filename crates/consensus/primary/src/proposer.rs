@@ -115,9 +115,19 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     last_parents: Vec<Certificate>,
     /// Holds the certificate of the last leader (if any).
     last_leader: Option<Certificate>,
-    /// Holds the batches' digests waiting to be included in the next header.
-    /// Digests are roughly oldest to newest, and popped in FIFO order from the front.
-    digests: VecDeque<ProposerDigest>,
+    /// Holds the batches' digests waiting to be included in the next header, one FIFO queue
+    /// per worker (issue #556): within a worker digests stay oldest to newest and pop from
+    /// the front, and there is no total order across workers. Header slots are shared across
+    /// the workers that have pending digests so one busy worker cannot starve another's
+    /// lane. `BTreeMap` (not `HashMap`) so slot allocation walks the workers in a stable
+    /// ascending order.
+    digests: BTreeMap<WorkerId, VecDeque<ProposerDigest>>,
+    /// Round-robin cursor for header slot allocation: the worker id the next header's slot
+    /// walk starts from. Advanced past the last lane granted a slot, so when more workers
+    /// have pending digests than a header holds, the rounds resume where the previous
+    /// header stopped instead of restarting at the lowest id (which would permanently
+    /// starve the high-id lanes).
+    next_lane: WorkerId,
     /// Holds the map of proposed previous round headers and their digest messages, to ensure that
     /// all batches' digest included will eventually be re-sent.
     proposed_headers: BTreeMap<Round, Header>,
@@ -231,7 +241,8 @@ impl<DB: Database> Proposer<DB> {
             round: recovered_round,
             last_parents: genesis,
             last_leader: None,
-            digests: VecDeque::with_capacity(2 * config.parameters().max_header_num_of_batches),
+            digests: BTreeMap::new(),
+            next_lane: 0,
             proposed_headers: BTreeMap::new(),
             leader_schedule,
             advance_round: true,
@@ -632,44 +643,43 @@ impl<DB: Database> Proposer<DB> {
 
         // re-insert batches for any proposed header from a round below the current commit
         //
-        // ensure batches are FIFO to re-send them
+        // ensure batches stay FIFO within each worker to re-send them
         //
-        // payloads: oldest -> newest
-        let mut digests_to_resend = VecDeque::new();
+        // payloads: oldest -> newest, partitioned per worker (issue #556)
+        let mut digests_to_resend: BTreeMap<WorkerId, VecDeque<ProposerDigest>> = BTreeMap::new();
         // Oldest to newest rounds.
         let mut retransmit_rounds = Vec::new();
 
-        // loop through proposed headers in order by round
-        for (header_round, header) in &mut self.proposed_headers {
-            // break once headers pass the committed round
-            if *header_round > max_committed_round {
-                break;
-            }
-
-            let mut digests = header
-                .payload()
-                .into_iter()
-                .map(|(k, v)| ProposerDigest { digest: *k, worker_id: *v })
-                .collect();
-
-            // add payloads and system messages from oldest to newest
-            digests_to_resend.append(&mut digests);
-            retransmit_rounds.push(*header_round);
-        }
+        // walk proposed headers in order by round, up to the committed round
+        self.proposed_headers
+            .iter()
+            .take_while(|(header_round, _)| **header_round <= max_committed_round)
+            .for_each(|(header_round, header)| {
+                // add payloads from oldest to newest into each worker's lane
+                header.payload().iter().for_each(|(digest, worker_id)| {
+                    digests_to_resend
+                        .entry(*worker_id)
+                        .or_default()
+                        .push_back(ProposerDigest { digest: *digest, worker_id: *worker_id });
+                });
+                retransmit_rounds.push(*header_round);
+            });
 
         // process rounds that need to be retransmitted
         if !retransmit_rounds.is_empty() {
-            let num_digests_to_resend = digests_to_resend.len();
+            let num_digests_to_resend: usize = digests_to_resend.values().map(VecDeque::len).sum();
 
-            // prepend missing batches from previous round and update `self`
-            digests_to_resend.append(&mut self.digests);
+            // prepend the reproposed batches to each worker's pending queue and update `self`
+            std::mem::take(&mut self.digests).into_iter().for_each(|(worker_id, mut pending)| {
+                digests_to_resend.entry(worker_id).or_default().append(&mut pending);
+            });
             self.digests = digests_to_resend;
 
             // remove the old headers that failed
             // the proposed blocks are included in the next header
-            for round in &retransmit_rounds {
+            retransmit_rounds.iter().for_each(|round| {
                 self.proposed_headers.remove(round);
-            }
+            });
 
             warn!(
                 target: "primary::proposer",
@@ -677,6 +687,49 @@ impl<DB: Database> Proposer<DB> {
                 self.proposed_headers.len()
             );
         }
+    }
+
+    /// Total number of digests pending across all workers.
+    ///
+    /// The `enough_digests` header trigger counts the total, not any single worker's queue.
+    fn pending_digests_len(&self) -> usize {
+        self.digests.values().map(VecDeque::len).sum()
+    }
+
+    /// Select up to `max_header_num_of_batches` digests for the next header.
+    ///
+    /// Header slots are distributed uniformly across the workers with pending digests: rounds
+    /// of one digest per worker in ascending worker-id order, FIFO within each worker, until
+    /// the cap is reached or every queue is empty. A worker's unused share flows to the
+    /// workers that still have digests (issue #556). The walk starts at [`Self::next_lane`]
+    /// and the cursor advances past the last lane served, so slots rotate across headers
+    /// and no lane is excluded permanently when more workers have digests than a header
+    /// holds. With one worker this is exactly the old single-queue FIFO drain.
+    fn drain_digests_for_header(&mut self) -> VecDeque<ProposerDigest> {
+        let queues = &self.digests;
+        let max_depth = queues.values().map(VecDeque::len).max().unwrap_or(0);
+        // Ascending worker ids, rotated to start at the cursor.
+        let lanes: Vec<WorkerId> = queues
+            .range(self.next_lane..)
+            .chain(queues.range(..self.next_lane))
+            .map(|(id, _)| *id)
+            .collect();
+        // One entry per (round, worker) pair with a digest at that queue depth, in slot
+        // order; each worker id appears exactly its queue length before the cap applies.
+        let order: Vec<WorkerId> = (0..max_depth)
+            .flat_map(|depth| {
+                lanes
+                    .iter()
+                    .copied()
+                    .filter(move |id| queues.get(id).is_some_and(|queue| queue.len() > depth))
+            })
+            .take(self.max_header_num_of_batches)
+            .collect();
+        self.next_lane = order.last().map_or(self.next_lane, |last| last.wrapping_add(1));
+        order
+            .into_iter()
+            .filter_map(|worker_id| self.digests.get_mut(&worker_id).and_then(VecDeque::pop_front))
+            .collect()
     }
 
     /// Conditions are met to propose the next header.
@@ -730,8 +783,7 @@ impl<DB: Database> Proposer<DB> {
             // create new header
             None => {
                 // collect values from &mut self for this header
-                let num_of_digests = self.digests.len().min(self.max_header_num_of_batches);
-                let digests: VecDeque<_> = self.digests.drain(..num_of_digests).collect();
+                let digests = self.drain_digests_for_header();
                 let parents = std::mem::take(&mut self.last_parents);
                 let authority_id = self.authority_id.clone();
                 let prior_epoch_record = self.prior_epoch_record;
@@ -845,7 +897,7 @@ impl<DB: Database> Proposer<DB> {
                     // parse message into parts
                     let (ack, digest) = msg.process();
                     let _ = ack.send(());
-                    self.digests.push_back(digest);
+                    self.digests.entry(digest.worker_id).or_default().push_back(digest);
                 }
                 // check for new parent certificates
                 // synchronizer sends collection of certificates when there is quorum (2f+1)
@@ -875,7 +927,7 @@ impl<DB: Database> Proposer<DB> {
                 .app()
                 .metrics()
                 .proposer_pending_digests
-                .set(self.digests.len() as f64);
+                .set(self.pending_digests_len() as f64);
 
             if pending_header.is_some() {
                 // continue the loop, don't try to propose a header since we are already working
@@ -899,7 +951,7 @@ impl<DB: Database> Proposer<DB> {
             //      - this is happy path
             //      - vote for leader or leader already has enough votes to trigger commit
             let enough_parents = !self.last_parents.is_empty();
-            let enough_digests = self.digests.len() >= self.header_num_of_batches_threshold;
+            let enough_digests = self.pending_digests_len() >= self.header_num_of_batches_threshold;
 
             // evaluate conditions for bool value
             let should_create_header = enough_parents
