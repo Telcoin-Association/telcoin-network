@@ -5,7 +5,10 @@
 //! - Mint role grant/revoke semantics
 //! - Supply accounting with faucet mints
 
-use crate::precompile_relays::{CALL_RELAY_BYTECODE, STATICCALL_RELAY_BYTECODE};
+use crate::precompile_relays::{
+    CALLCODE_RELAY_BYTECODE, CALL_RELAY_BYTECODE, DELEGATECALL_RELAY_BYTECODE,
+    STATICCALL_RELAY_BYTECODE,
+};
 use alloy::sol_types::SolCall;
 use proptest::prelude::*;
 use reth_revm::primitives::{address, Address};
@@ -21,6 +24,13 @@ use tn_reth::{
 use tn_types::{Bytes, U256};
 
 const FAUCET: Address = address!("0000000000000000000000000000000000000F00");
+
+/// Address hosting the `DELEGATECALL` relay in [`test_delegatecall_cannot_mint_faucet`].
+///
+/// A fresh address, unlike the `STATICCALL` relays: `DELEGATECALL` preserves the parent frame's
+/// `msg.sender`, so driving this relay from [`GOVERNANCE`] is what presents `caller == GOVERNANCE`
+/// to the precompile together with `target_address == RELAY`.
+const RELAY: Address = address!("dddd0000000000000000000000000000000000d1");
 
 fn new_faucet_env() -> TestEnv {
     let mut env = TestEnv::new();
@@ -248,4 +258,61 @@ fn test_staticcall_still_serves_has_mint_role() {
         env.exec_to(USER, GOVERNANCE, hasMintRoleCall { addr: FAUCET }.abi_encode(), 200_000);
     assert_success(&result);
     assert!(decode_bool(&result), "hasMintRole must remain callable under STATICCALL");
+}
+
+/// A `DELEGATECALL` into `0x7e1` is refused before dispatch, and mints nothing.
+///
+/// This is the build where the direct-call guard closes a live path rather than a latent one. The
+/// faucet `mint(address, uint256)` credits a calldata-chosen recipient, so without the guard any
+/// contract that a mint-role holder chose to `CALL` could `DELEGATECALL` into `0x7e1` with the
+/// role holder's identity inherited as `caller` and mint to an address of its own choosing. The
+/// mainnet counterparts of this test live in `tel_precompile_props.rs`, which `main.rs` compiles
+/// only under `#[cfg(not(feature = "faucet"))]`.
+///
+/// The relay is hosted at [`RELAY`] and driven by [`GOVERNANCE`], which always holds the mint
+/// role. The positive control (a `CALL` relay frame with a governance caller is accepted) is the
+/// first half of [`test_staticcall_cannot_grant_mint_role`].
+#[test]
+fn test_delegatecall_cannot_mint_faucet() {
+    let mut env = new_faucet_env();
+    let recipient_before = env.get_balance(RECIPIENT);
+    let supply_before = env.get_total_supply();
+    env.deploy_code(RELAY, Bytes::from_static(DELEGATECALL_RELAY_BYTECODE));
+
+    let result = env.exec_to(
+        GOVERNANCE,
+        RELAY,
+        mintCall { recipient: RECIPIENT, amount: U256::from(1234) }.abi_encode(),
+        200_000,
+    );
+    assert_success(&result);
+    assert!(!decode_bool(&result), "DELEGATECALL into the faucet mint must be refused");
+    assert_eq!(env.get_balance(RECIPIENT), recipient_before, "recipient must not be credited");
+    assert_eq!(env.get_total_supply(), supply_before, "totalSupply must be unchanged");
+}
+
+/// A `CALLCODE` into `0x7e1` is refused before dispatch, and mints nothing.
+///
+/// `CALLCODE` presents the calling contract itself as `caller`, so the relay is hosted **at**
+/// [`GOVERNANCE`] (as the `STATICCALL` relays are) and driven by [`USER`]: the inner frame then has
+/// a genuine governance `caller` and `target_address == GOVERNANCE`, and is refused all the same.
+/// The `CALL` relay at the same address is accepted in [`test_staticcall_cannot_grant_mint_role`],
+/// so the opcode is the only variable.
+#[test]
+fn test_callcode_cannot_mint_faucet() {
+    let mut env = new_faucet_env();
+    let recipient_before = env.get_balance(RECIPIENT);
+    let supply_before = env.get_total_supply();
+    env.deploy_code(GOVERNANCE, Bytes::from_static(CALLCODE_RELAY_BYTECODE));
+
+    let result = env.exec_to(
+        USER,
+        GOVERNANCE,
+        mintCall { recipient: RECIPIENT, amount: U256::from(1234) }.abi_encode(),
+        200_000,
+    );
+    assert_success(&result);
+    assert!(!decode_bool(&result), "CALLCODE into the faucet mint must be refused");
+    assert_eq!(env.get_balance(RECIPIENT), recipient_before, "recipient must not be credited");
+    assert_eq!(env.get_total_supply(), supply_before, "totalSupply must be unchanged");
 }

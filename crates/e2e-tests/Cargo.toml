@@ -33,6 +33,10 @@ alloy = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
+# `pack_validate` re-runs a node's own epoch pack integrity checks from the harness. `test-utils`
+# is `tn-types/test-utils`, which the fork-epoch overrides live behind: the harness decodes pack
+# bytes itself, so it has to honor the same fork pins it forwards to every spawned node.
+tn-storage = { workspace = true, features = ["test-utils"] }
 tn-test-utils = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }

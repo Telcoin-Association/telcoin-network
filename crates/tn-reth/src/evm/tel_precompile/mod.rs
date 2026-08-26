@@ -7,14 +7,17 @@
 //! precompile.
 //!
 //! The precompile is registered as a [`DynPrecompile`] inside a [`PrecompilesMap`] at
-//! [`TELCOIN_PRECOMPILE_ADDRESS`] (`0x7e1`). Any `CALL`/`STATICCALL` targeting that address is
-//! intercepted and routed to [`telcoin_precompile`] instead of executing bytecode. Bypassing
-//! bytecode execution also bypasses the interpreter's static-call write protection, so
-//! [`telcoin_precompile`] enforces that itself: inside a `STATICCALL` frame it serves the
-//! read-only selectors and refuses every state-mutating one. Payability follows the same
-//! reasoning: the compiled `CALLVALUE` guard a Solidity dispatcher would run never executes
-//! here, so [`telcoin_precompile`] rejects nonzero call value on every selector except the
-//! explicitly payable `burn(uint256)`.
+//! [`TELCOIN_PRECOMPILE_ADDRESS`] (`0x7e1`). Every call frame whose code address is `0x7e1` is
+//! intercepted and routed to [`telcoin_precompile`] instead of executing bytecode. revm keys that
+//! lookup on the frame's `bytecode_address` alone, so `DELEGATECALL` and `CALLCODE` frames reach
+//! the dispatcher as well as `CALL`/`STATICCALL`. Bypassing bytecode execution leaves three frame
+//! properties for [`telcoin_precompile`] to enforce itself. It refuses any frame that did not
+//! reach `0x7e1` by a direct call: under `DELEGATECALL` the `caller` it would authorize is
+//! inherited from the parent frame, while every handler still writes the canonical `0x7e1`
+//! ledger. Inside a `STATICCALL` frame it serves the read-only selectors and refuses every
+//! state-mutating one. And the compiled `CALLVALUE` guard a Solidity dispatcher would run never
+//! executes here, so [`telcoin_precompile`] rejects nonzero call value on every selector except
+//! the explicitly payable `burn(uint256)`.
 //!
 //! # Module structure
 //!
@@ -45,6 +48,8 @@
 //! - **Any account**: can call `totalSupply()` (read-only).
 //! - **Static frames**: regardless of caller, only the read-only selectors (`totalSupply()`, plus
 //!   `hasMintRole` with the faucet feature) are served inside a `STATICCALL`.
+//! - **Indirect frames**: regardless of caller and selector, a `DELEGATECALL` or `CALLCODE` into
+//!   `0x7e1` is refused before dispatch. Only a direct `CALL`/`STATICCALL` reaches a handler.
 //! - **Call value**: only `burn(uint256)` accepts nonzero value, and only when the precompile is
 //!   the actual transfer target (a plain `CALL`): the attached wei tops up the pool that `burn`
 //!   destroys from, and any excess stays in the pool for later burns. Every other value-bearing
@@ -129,12 +134,32 @@ pub fn add_telcoin_precompile(map: &mut PrecompilesMap) {
 /// Rejection emitted when a state-mutating selector is reached inside a `STATICCALL` frame.
 const STATIC_CALL_MUTATION: &str = "static call: state mutation not permitted";
 
+/// Rejection emitted when the precompile is entered through `DELEGATECALL` or `CALLCODE` rather
+/// than by a direct call to its own address.
+const INDIRECT_ENTRY: &str = "telcoin precompile: only a direct call to 0x7e1 is permitted";
+
 /// Rejection emitted when nonzero call value is attached to a selector not named payable.
 const NON_PAYABLE_CALL_VALUE: &str = "call value: selector is not payable";
 
 /// Top-level dispatcher for the Telcoin precompile.
 ///
 /// Extracts the 4-byte selector from calldata and routes to the matching handler.
+///
+/// # Direct-call guard
+///
+/// revm looks a precompile up by the frame's `bytecode_address` alone, so a `DELEGATECALL` or
+/// `CALLCODE` whose code address is `0x7e1` lands here exactly like a plain `CALL`. Under
+/// `DELEGATECALL` the frame's `caller` is inherited from the parent frame: a contract that
+/// governance chose to `CALL`, delegating into `0x7e1`, presents `caller ==
+/// GOVERNANCE_SAFE_ADDRESS`. Every handler below reads and writes the canonical `0x7e1` ledger,
+/// never the delegating contract's storage, so the authorization gates would be trusting a
+/// spoofable identity. The first check therefore refuses any frame that is not a direct call,
+/// through [`PrecompileInput::is_direct_call`] (`target_address == bytecode_address`): a direct
+/// `CALL`/`STATICCALL` sets both to `0x7e1`, whereas `DELEGATECALL`/`CALLCODE` keep the calling
+/// contract's own address as `target_address`. It runs ahead of the calldata length check and of
+/// selector dispatch, so it covers the read-only selectors too: an indirect frame has no legitimate
+/// use of this precompile, and refusing it whole is cheaper to reason about than a per-selector
+/// exemption.
 ///
 /// # Static-call write protection
 ///
@@ -173,11 +198,18 @@ const NON_PAYABLE_CALL_VALUE: &str = "call value: selector is not payable";
 /// value unless it is explicitly named payable, and an unrecognised value-bearing selector
 /// reports [`NON_PAYABLE_CALL_VALUE`] rather than `"Unknown function selector"`. Inside a
 /// `DELEGATECALL` or `CALLCODE` frame [`PrecompileInput::value`] carries the calling frame's
-/// apparent `msg.value` and nothing is transferred to the precompile, so the payable exemption
-/// additionally requires [`PrecompileInput::target_address`] to be the precompile itself:
-/// apparent value never funded the pool, so it cannot authorize a draw from it, and such calls
-/// are rejected like every other value-bearing call.
+/// apparent `msg.value` and nothing is transferred to the precompile. The direct-call guard
+/// above already refuses such frames before dispatch; independently of that guard, the payable
+/// exemption requires [`PrecompileInput::target_address`] to be the precompile itself, so
+/// apparent value that never funded the pool could not authorize a draw from it even if an
+/// indirect frame reached this check.
 fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
+    // Refuse DELEGATECALL/CALLCODE before anything else. See "Direct-call guard" above.
+    input
+        .is_direct_call()
+        .then_some(())
+        .ok_or_else(|| PrecompileError::Other(INDIRECT_ENTRY.into()))?;
+
     if input.data.len() < 4 {
         return Err(PrecompileError::Other("Invalid input: too short".into()));
     }
@@ -339,11 +371,12 @@ mod tests {
     }
 
     #[test]
-    fn test_delegatecall_apparent_value_rejects_burn() {
+    fn test_delegatecall_burn_refused_with_and_without_value() {
         // DELEGATECALL relay that propagates failure: copies calldata, delegatecalls the
         // precompile, and reverts when the inner frame reverts (unlike the flag-popping relay
         // in the integration tests). The precompile sees the relay frame's apparent
-        // `msg.value`, while no wei moves to the precompile address.
+        // `msg.value`, while no wei moves to the precompile address. The direct-call guard
+        // refuses the indirect frame before dispatch, with or without attached value.
         const RELAY_CODE: &[u8] = &[
             0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATASIZE PUSH1 0 PUSH1 0 CALLDATACOPY
             0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, // PUSH1 0 PUSH1 0 CALLDATASIZE PUSH1 0
@@ -361,16 +394,26 @@ mod tests {
         let gov_before = env.get_balance(GOVERNANCE_SAFE_ADDRESS);
         let amount = U256::from(100);
         let calldata = burnCall { amount }.abi_encode();
-        // Apparent value never funds the pool, so the payable exemption does not apply.
+        // Value-bearing: refused. Apparent value never funds the pool, and nothing moves.
         let result =
             env.exec_value_to(GOVERNANCE_SAFE_ADDRESS, RELAY, calldata.clone(), 200_000, amount);
         assert_not_success(&result);
         assert_eq!(env.get_balance(TELCOIN_PRECOMPILE_ADDRESS), pool_before);
         assert_eq!(env.get_balance(GOVERNANCE_SAFE_ADDRESS), gov_before);
-        // Positive control: the zero-value delegatecall burn passes the gate and draws from
+        // Zero-value: refused just the same. The indirect frame never reaches dispatch, so
+        // the pre-funded pool stays untouched.
+        let result = env.exec_value_to(
+            GOVERNANCE_SAFE_ADDRESS,
+            RELAY,
+            calldata.clone(),
+            200_000,
+            U256::ZERO,
+        );
+        assert_not_success(&result);
+        assert_eq!(env.get_balance(TELCOIN_PRECOMPILE_ADDRESS), pool_before);
+        // Positive control: the same burn as a direct call passes the gates and draws from
         // the pre-funded pool.
-        let result =
-            env.exec_value_to(GOVERNANCE_SAFE_ADDRESS, RELAY, calldata, 200_000, U256::ZERO);
+        let result = env.exec(GOVERNANCE_SAFE_ADDRESS, calldata, 200_000);
         assert_success(&result);
         assert_eq!(env.get_balance(TELCOIN_PRECOMPILE_ADDRESS), pool_before - amount);
     }

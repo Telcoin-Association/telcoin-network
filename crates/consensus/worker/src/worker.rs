@@ -65,7 +65,7 @@ pub fn new_worker<DB: Database>(
     info!(target: "worker::worker",
         "Worker {} successfully booted on {}",
         id,
-        consensus_config.config().node_info.p2p_info.worker.network_address
+        consensus_config.worker_address(id).map_or_else(|| "<no address>".to_string(), |addr| addr.to_string())
     );
 
     batch_provider

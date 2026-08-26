@@ -20,7 +20,7 @@ use tn_network_libp2p::{
 };
 use tn_types::{
     encode, max_batch_size, try_decode, Batch, BlockHash, BlsPublicKey, Epoch, RpcInfo,
-    SealedBatch, TaskSpawner,
+    SealedBatch, TaskSpawner, WorkerId,
 };
 use tracing::{debug, warn};
 
@@ -31,6 +31,19 @@ use crate::{
 
 /// Timeout for reading a single sync data frame from a peer. Batches capped at 1MB.
 const BATCH_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for the whole batch-sync read exchange, bounding the sum of the frame
+/// reads rather than each frame on its own.
+///
+/// [`BATCH_STREAM_TIMEOUT`] resets on every frame, so a source that drips one
+/// valid, requested, unique batch just inside each per-frame deadline would
+/// otherwise hold [`WorkerNetworkHandle::read_sync_batches`] for up to
+/// `MAX_BATCH_DIGESTS_PER_REQUEST * BATCH_STREAM_TIMEOUT` (~40 min) per peer,
+/// stalling batch synchronization. This aggregate cap mirrors the responder's
+/// own `SEND_STREAM_TIMEOUT` (200s) whole-send bound, restoring requester and
+/// responder parity, with headroom for network and scheduling jitter so an
+/// honest transfer completes inside it.
+pub(crate) const BATCH_STREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(210);
 
 /// Timeout for the responder's first sync frame (`Ack`/`Deny`) after the request
 /// frame is written. A peer that negotiated the sync protocol but does not answer
@@ -85,13 +98,16 @@ pub struct WorkerNetworkHandle {
     sync_capability: Arc<Mutex<HashMap<BlsPublicKey, bool>>>,
     /// The genesis chain id, used to namespace gossip topics this handle publishes.
     chain_id: u64,
+    /// The id of the worker this handle belongs to, used to select its gossip topics.
+    worker_id: WorkerId,
 }
 
 impl WorkerNetworkHandle {
-    /// Create a new instance of [Self].
+    /// Create a new instance of [Self] for worker `worker_id`.
     pub fn new(
         handle: NetworkHandle<Req, Res>,
         task_spawner: TaskSpawner,
+        worker_id: WorkerId,
         epoch: Epoch,
         chain_id: u64,
     ) -> Self {
@@ -100,8 +116,14 @@ impl WorkerNetworkHandle {
             task_spawner,
             epoch,
             chain_id,
+            worker_id,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Return the id of the worker this handle belongs to.
+    pub fn worker_id(&self) -> WorkerId {
+        self.worker_id
     }
 
     /// Return a reference to the task spawner.
@@ -118,7 +140,10 @@ impl WorkerNetworkHandle {
     pub(crate) async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(self.epoch, batch_digest));
         self.handle
-            .publish(tn_config::LibP2pConfig::worker_batch_topic(self.chain_id), data)
+            .publish(
+                tn_config::LibP2pConfig::worker_batch_topic(self.chain_id, self.worker_id),
+                data,
+            )
             .await?;
         Ok(())
     }
@@ -441,65 +466,79 @@ impl WorkerNetworkHandle {
         let mut batches = Vec::with_capacity(requested_digests.len());
         let mut received_digests = HashSet::with_capacity(requested_digests.len());
 
-        loop {
-            let frame = tokio::time::timeout(
-                BATCH_STREAM_TIMEOUT,
-                read_frame::<_, WorkerSyncRequest>(
-                    stream,
-                    &mut decode_buffer,
-                    &mut compressed_buffer,
-                    max_frame,
-                ),
-            )
-            .await
-            .map_err(|_| {
-                warn!(target: "worker::network", "timeout reading sync batch frame");
-                NetworkError::Timeout
-            })?
-            .map_err(|e| NetworkError::RPCError(format!("failed to read sync frame: {e}")))?;
+        // Read the frame loop under an aggregate deadline so the exchange as a
+        // whole is bounded, not just each frame. Without this, a source that drips
+        // one valid frame just inside every `BATCH_STREAM_TIMEOUT` keeps this loop
+        // alive for `MAX_BATCH_DIGESTS_PER_REQUEST` frames (~40 min). The
+        // per-frame timeout stays as the inner bound; see `BATCH_STREAM_TOTAL_TIMEOUT`.
+        let read_stream = async {
+            loop {
+                let frame = tokio::time::timeout(
+                    BATCH_STREAM_TIMEOUT,
+                    read_frame::<_, WorkerSyncRequest>(
+                        stream,
+                        &mut decode_buffer,
+                        &mut compressed_buffer,
+                        max_frame,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    warn!(target: "worker::network", "timeout reading sync batch frame");
+                    NetworkError::Timeout
+                })?
+                .map_err(|e| NetworkError::RPCError(format!("failed to read sync frame: {e}")))?;
 
-            match frame {
-                SyncFrame::Data(bytes) => {
-                    // running total must not exceed the request
-                    if batches.len() >= requested_digests.len() {
-                        return Err(NetworkError::ProtocolError(format!(
-                            "Peer sent too many batches: expected {}",
-                            requested_digests.len()
-                        )));
-                    }
-                    let batch: Batch = try_decode(&bytes).map_err(|e| {
-                        NetworkError::ProtocolError(format!("failed to decode sync batch: {e}"))
-                    })?;
-                    let batch_digest = batch.digest();
+                match frame {
+                    SyncFrame::Data(bytes) => {
+                        // running total must not exceed the request
+                        if batches.len() >= requested_digests.len() {
+                            return Err(NetworkError::ProtocolError(format!(
+                                "Peer sent too many batches: expected {}",
+                                requested_digests.len()
+                            )));
+                        }
+                        let batch: Batch = try_decode(&bytes).map_err(|e| {
+                            NetworkError::ProtocolError(format!("failed to decode sync batch: {e}"))
+                        })?;
+                        let batch_digest = batch.digest();
 
-                    // validate batch was requested
-                    if !requested_digests.contains(&batch_digest) {
-                        return Err(NetworkError::ProtocolError(format!(
-                            "Peer sent unexpected batch with digest {batch_digest}"
-                        )));
+                        // validate batch was requested
+                        if !requested_digests.contains(&batch_digest) {
+                            return Err(NetworkError::ProtocolError(format!(
+                                "Peer sent unexpected batch with digest {batch_digest}"
+                            )));
+                        }
+                        // validate batch is unique (no duplicates)
+                        if !received_digests.insert(batch_digest) {
+                            return Err(NetworkError::ProtocolError(format!(
+                                "Peer sent duplicate batch with digest {batch_digest}"
+                            )));
+                        }
+                        batches.push((batch_digest, batch));
                     }
-                    // validate batch is unique (no duplicates)
-                    if !received_digests.insert(batch_digest) {
-                        return Err(NetworkError::ProtocolError(format!(
-                            "Peer sent duplicate batch with digest {batch_digest}"
-                        )));
+                    SyncFrame::End => break,
+                    SyncFrame::Err(err) => {
+                        return Err(NetworkError::RPCError(format!(
+                            "peer aborted sync batch stream: {err:?}"
+                        )))
                     }
-                    batches.push((batch_digest, batch));
-                }
-                SyncFrame::End => break,
-                SyncFrame::Err(err) => {
-                    return Err(NetworkError::RPCError(format!(
-                        "peer aborted sync batch stream: {err:?}"
-                    )))
-                }
-                // a well-behaved responder never sends these mid-stream
-                SyncFrame::Ack | SyncFrame::Deny(_) | SyncFrame::Req(_) => {
-                    return Err(NetworkError::ProtocolError(
-                        "unexpected sync frame during batch stream".to_string(),
-                    ))
+                    // a well-behaved responder never sends these mid-stream
+                    SyncFrame::Ack | SyncFrame::Deny(_) | SyncFrame::Req(_) => {
+                        return Err(NetworkError::ProtocolError(
+                            "unexpected sync frame during batch stream".to_string(),
+                        ))
+                    }
                 }
             }
-        }
+
+            Ok::<(), NetworkError>(())
+        };
+
+        tokio::time::timeout(BATCH_STREAM_TOTAL_TIMEOUT, read_stream).await.map_err(|_| {
+            warn!(target: "worker::network", "timeout reading sync batch stream");
+            NetworkError::Timeout
+        })??;
 
         Ok(batches)
     }
@@ -547,6 +586,7 @@ impl WorkerNetworkHandle {
             task_spawner,
             epoch: 0,
             chain_id: 0,
+            worker_id: tn_types::DEFAULT_WORKER_ID,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
         }
     }
