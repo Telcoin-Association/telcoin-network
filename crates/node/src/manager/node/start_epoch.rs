@@ -460,10 +460,12 @@ where
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now (with id 0) - otherwise, loop here
         let worker_id = DEFAULT_WORKER_ID;
-        // u64 snapshot of the worker's base fee, used by both the transaction pool and the batch
-        // validator. Base fee is constant within an epoch, so a snapshot taken at epoch start is
-        // valid for the whole epoch.
-        let base_fee = gas_accumulator.base_fee(worker_id).base_fee();
+        // The worker's shared base-fee container: the RPC server keeps the live handle
+        // (`eth_feeHistory` answers its next-block entry from it). The u64 snapshot below
+        // feeds the transaction pool and the batch validator. Base fee is constant within
+        // an epoch, so a snapshot taken at epoch start is valid for the whole epoch.
+        let base_fee_container = gas_accumulator.base_fee(worker_id);
+        let base_fee = base_fee_container.base_fee();
 
         // update the network handle's task spawner for reporting batches in the epoch
         {
@@ -485,7 +487,7 @@ where
                         worker_id,
                         network_handle.clone(),
                         engine_to_primary,
-                        base_fee,
+                        base_fee_container,
                     )
                     .await?;
             } else {
