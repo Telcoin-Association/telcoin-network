@@ -19,10 +19,11 @@
 //!
 //! The knob that drives pack cost in production is how many batches each consensus output carries —
 //! a shallow leader vs a deep sub-DAG. So the report has a **column per `{backend}-{transport}
-//! x{width}`** (`buf`/`mmap` × `thr`/`dir` × narrow/typical/wide batches per output), with `thr` and
-//! `dir` adjacent per `{backend,width}` so their delta reads off directly. Each column writes
-//! [`NUM_OUTPUTS`] chained outputs built with [`make_wide_test_output`], whose batches are genuinely
-//! distinct across outputs (random transactions). All of the pack's files switch backend (data file
+//! x{width}`** (`buf`/`mmap` × `thr`/`dir` × narrow/typical/wide batches per output), with `thr`
+//! and `dir` adjacent per `{backend,width}` so their delta reads off directly. Each column writes
+//! [`NUM_OUTPUTS`] chained outputs built with [`make_wide_test_output`], whose batches are
+//! genuinely distinct across outputs (random transactions). All of the pack's files switch backend
+//! (data file
 //! + position index + digest index), so the `mmap` columns are a fully-`msync` pack.
 //!
 //! The rows, grouped, capture the real call sites traced through `consensus_pack.rs` /
@@ -46,7 +47,8 @@
 //!
 //! - Test batches carry **one transaction each** — width (batches/output), not batch body size, is
 //!   the lever here. Scale [`NUM_OUTPUTS`] / [`WIDTHS`] up for heavier runs.
-//! - Timings are on a `tempfile` dir — they reflect that filesystem, not a specific production disk.
+//! - Timings are on a `tempfile` dir — they reflect that filesystem, not a specific production
+//!   disk.
 //! - `thr` timings include the background thread's disk IO (the async API awaits its ack); `dir`
 //!   runs the same IO inline behind an uncontended `parking_lot` lock (tens of ns), so `thr − dir`
 //!   isolates the thread/channel round-trip.
@@ -465,7 +467,11 @@ async fn bench_stream_import<P: BenchPack>(
 }
 
 /// Cold-open the finished pack read-only, touching the index (the pack-cache-miss open cost).
-async fn bench_reopen_static<P: BenchPack>(path: &Path, epoch: Epoch, backend: FileBackend) -> Duration {
+async fn bench_reopen_static<P: BenchPack>(
+    path: &Path,
+    epoch: Epoch,
+    backend: FileBackend,
+) -> Duration {
     let start = Instant::now();
     let mut pack = P::open_static_with_backend(path, epoch, backend).expect("open static");
     pack.latest_consensus_header().await.expect("latest after reopen");
@@ -584,8 +590,8 @@ impl Report {
             println!();
         }
 
-        // Row labels after which to draw a horizontal separator (the write / persist / read / stream
-        // / lifecycle groups from the module docs).
+        // Row labels after which to draw a horizontal separator (the write / persist / read /
+        // stream / lifecycle groups from the module docs).
         const GROUP_SEP_AFTER: &[&str] =
             &["save_durable", "persist bulk", "latest_header", "stream_import"];
 
@@ -624,8 +630,8 @@ impl Report {
     }
 }
 
-/// Compare the background-thread [`ConsensusPack`] against the direct [`ConsensusPackDirect`] across
-/// production usage patterns and both file backends.
+/// Compare the background-thread [`ConsensusPack`] against the direct [`ConsensusPackDirect`]
+/// across production usage patterns and both file backends.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
 /// `cargo test -p tn-storage pack_file_bench -- --ignored --nocapture --test-threads 1`.

@@ -1530,10 +1530,10 @@ pub(crate) async fn decode_output_bytes(
     }
 }
 
-/// Produce the v1 (header-first) pack-record bytes served to peers for one consensus output from the
-/// raw `bytes` read out of the data file: a passthrough for v1, or a re-encode of a v0 legacy output
-/// into v1 records (header first, then batches). Uses the pack's `version`/`compression`/`committee`.
-/// Shared by both pack front-ends.
+/// Produce the v1 (header-first) pack-record bytes served to peers for one consensus output from
+/// the raw `bytes` read out of the data file: a passthrough for v1, or a re-encode of a v0 legacy
+/// output into v1 records (header first, then batches). Uses the pack's
+/// `version`/`compression`/`committee`. Shared by both pack front-ends.
 pub(crate) async fn serve_output_bytes(
     mut bytes: Vec<u8>,
     version: u16,

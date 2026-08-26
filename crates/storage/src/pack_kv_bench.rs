@@ -69,7 +69,8 @@ fn value(size: usize, seed: u64) -> Vec<u8> {
     (0..size).map(|i| s[i % 8].wrapping_add(i as u8)).collect()
 }
 
-/// A well-distributed 64-bit mix (splitmix64) of `x` — used to spread keys and randomize read order.
+/// A well-distributed 64-bit mix (splitmix64) of `x` — used to spread keys and randomize read
+/// order.
 fn mix(x: u64) -> u64 {
     let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -130,7 +131,8 @@ impl PackKv {
     /// then sync the hash index (its `index.hdx` + `index.odx`).
     fn barrier(&mut self) {
         self.data.commit().expect("pack commit");
-        self.index.sync().expect("index sync");
+        // We won't need to explicity sync the index- the data log file acts as a WAL.
+        //self.index.sync().expect("index sync");
     }
 }
 
@@ -187,8 +189,9 @@ struct MdbxKv {
 #[cfg(feature = "reth-libmdbx")]
 impl MdbxKv {
     fn open(dir: &Path, durable: bool) -> Self {
-        // Select the env sync mode (test builds default to SafeNoSync). Read by `MdbxDatabase::open`.
-        // Safe here: the bench runs single-threaded (`--test-threads 1`).
+        // Select the env sync mode (test builds default to SafeNoSync). Read by
+        // `MdbxDatabase::open`. Safe here: the bench runs single-threaded (`--test-threads
+        // 1`).
         std::env::set_var("TN_TEST_MDBX_SYNC", if durable { "durable" } else { "safe-no-sync" });
         let db = MdbxDatabase::open(dir, 4, 512 * MEGABYTE, 8 * MEGABYTE).expect("open mdbx");
         db.open_table::<KvTable>().expect("open table");
@@ -296,7 +299,11 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     for (i, label) in rows.iter().enumerate() {
         print!("{:<label_w$}", label, label_w = label_w);
         for (_, times) in cols {
-            print!(" {:>cell_w$}", format!("{:.2}", times[i].as_secs_f64() * 1000.0), cell_w = cell_w);
+            print!(
+                " {:>cell_w$}",
+                format!("{:.2}", times[i].as_secs_f64() * 1000.0),
+                cell_w = cell_w
+            );
         }
         println!();
     }

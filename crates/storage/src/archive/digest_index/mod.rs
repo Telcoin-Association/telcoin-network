@@ -5,6 +5,10 @@
 pub mod bloom;
 pub mod bucket_iter;
 pub mod index;
+/// On-demand benchmark: direct-IO (`HdxIndex`) vs mmap (`HdxIndexMmap`) index (see
+/// `index_bench.rs`).
+#[cfg(test)]
+mod index_bench;
 pub mod index_mmap;
 pub mod odx_header;
 
