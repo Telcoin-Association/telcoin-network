@@ -162,6 +162,7 @@ impl ExecutionNodeInner {
         let server = self.reth_env.get_rpc_server(
             transaction_pool.clone(),
             network.clone(),
+            base_fee,
             tn_ext.into_rpc(),
         )?;
 

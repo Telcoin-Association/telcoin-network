@@ -146,9 +146,11 @@ impl ExecutionNode {
 
     /// Initialize the worker's transaction pool and public RPC.
     ///
-    /// This method should be called on node startup. The pool receives the shared
-    /// [`BaseFeeContainer`] so canonical updates always charge the current epoch's fee
-    /// (issue #1262).
+    /// This method should be called on node startup.
+    ///
+    /// `base_fee` is the worker's shared epoch base-fee container: the pool receives the
+    /// live container so canonical updates always charge the current epoch's fee (issue
+    /// #1262), and the RPC server keeps a handle for `eth_feeHistory`.
     pub async fn initialize_worker_components<EP>(
         &self,
         worker_id: WorkerId,

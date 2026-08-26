@@ -1,0 +1,250 @@
+
+/* Telcoin Network theme tokens.
+   Full replacement of the stock mdBook 0.5.4 variables.css: only the `light` and
+   `navy` themes are shipped (the header switch offers Light / System / Dark).
+   Brand palette: primary #37AEFF, secondary #636B92, accent #14C8FF,
+   error #DB222A, success #02C39A, warning #FFBA00, background #F2F2F5. */
+
+/* Globals */
+
+:root {
+    --sidebar-target-width: 288px;
+    --sidebar-width: min(var(--sidebar-target-width), 80vw);
+    --sidebar-resize-indicator-width: 8px;
+    --sidebar-resize-indicator-space: 2px;
+    --page-padding: 15px;
+    --content-max-width: 768px;
+    --menu-bar-height: 64px;
+    --mono-font: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace, monospace;
+    --code-font-size: 0.875em; /* please adjust the ace font size accordingly in editor.js */
+    --searchbar-margin-block-start: 5px;
+}
+
+/* Themes */
+
+.light, html:not(.js) {
+    --bg: #ffffff;
+    --fg: #191e21;
+
+    --sidebar-bg: #f2f2f5;
+    --sidebar-fg: #636b92;
+    --sidebar-non-existant: #a9aec5;
+    --sidebar-active: #37aeff;
+    --sidebar-spacer: #e3eff9;
+
+    --scrollbar: #c9cdd9;
+
+    --icons: #636b92;
+    --icons-hover: #191e21;
+
+    --links: #37aeff;
+
+    --inline-code-color: #191e21;
+
+    --theme-popup-bg: #ffffff;
+    --theme-popup-border: #e3eff9;
+    --theme-hover: #f2f8fd;
+
+    --quote-bg: #f7fafd;
+    --quote-border: #e3eff9;
+
+    --warning-border: #ffba00;
+
+    --table-border-color: #e3eff9;
+    --table-header-bg: #f2f2f5;
+    --table-alternate-bg: #f7fafd;
+
+    --searchbar-border-color: #e3eff9;
+    --searchbar-bg: #f2f2f5;
+    --searchbar-fg: #191e21;
+    --searchbar-shadow-color: rgba(25, 30, 33, 0.10);
+    --searchresults-header-fg: #636b92;
+    --searchresults-border-color: #e3eff9;
+    --searchresults-li-bg: #f2f8fd;
+    --search-mark-bg: #b7e3ff;
+
+    --color-scheme: light;
+
+    /* Same as `--icons` (#636b92) */
+    --copy-button-filter: invert(44%) sepia(12%) saturate(1050%) hue-rotate(194deg) brightness(92%) contrast(86%);
+    /* Same as `--sidebar-active` (#37aeff) */
+    --copy-button-filter-hover: invert(56%) sepia(61%) saturate(1684%) hue-rotate(184deg) brightness(102%) contrast(101%);
+
+    --footnote-highlight: #37aeff;
+
+    --overlay-bg: rgba(200, 200, 205, 0.4);
+
+    --blockquote-note-color: #37aeff;
+    --blockquote-tip-color: #02c39a;
+    --blockquote-important-color: #14c8ff;
+    --blockquote-warning-color: #ffba00;
+    --blockquote-caution-color: #db222a;
+
+    --sidebar-header-border-color: #37aeff;
+
+    /* TN extension tokens (consumed by tn-custom.css / theme components) */
+    --tn-border: #e3eff9;
+    --tn-surface: #f2f2f5;
+    --tn-surface-2: #f2f8fd;
+    --tn-muted: #636b92;
+    --tn-code-bg: #f2f2f5;
+    --tn-link-hover: #1198e7;
+    --tn-header-bg: rgba(255, 255, 255, 0.85);
+    /* Admonition title colors darkened for AA contrast on the tinted card. */
+    --tn-adm-note-title: #0d6bb8;
+    --tn-adm-tip-title: #017a61;
+    --tn-adm-important-title: #0a7fa6;
+    --tn-adm-warning-title: #8a6500;
+    --tn-adm-caution-title: #b41e24;
+}
+
+.navy {
+    --bg: #1d1d1d;
+    --fg: #faffff;
+
+    --sidebar-bg: #212325;
+    --sidebar-fg: #9ba3c4;
+    --sidebar-non-existant: #5c6273;
+    --sidebar-active: #37aeff;
+    --sidebar-spacer: #282d30;
+
+    --scrollbar: #3a4046;
+
+    --icons: #9ba3c4;
+    --icons-hover: #faffff;
+
+    --links: #37aeff;
+
+    --inline-code-color: #faffff;
+
+    --theme-popup-bg: #212325;
+    --theme-popup-border: #2e373f;
+    --theme-hover: #282d30;
+
+    --quote-bg: #282d30;
+    --quote-border: #2e373f;
+
+    --warning-border: #ffba00;
+
+    --table-border-color: #2e373f;
+    --table-header-bg: #282d30;
+    --table-alternate-bg: #232729;
+
+    --searchbar-border-color: #2e373f;
+    --searchbar-bg: #282d30;
+    --searchbar-fg: #faffff;
+    --searchbar-shadow-color: rgba(0, 0, 0, 0.4);
+    --searchresults-header-fg: #9ba3c4;
+    --searchresults-border-color: #2e373f;
+    --searchresults-li-bg: #2a3136;
+    --search-mark-bg: #1d5f8a;
+
+    --color-scheme: dark;
+
+    /* Same as `--icons` (#9ba3c4) */
+    --copy-button-filter: invert(72%) sepia(11%) saturate(586%) hue-rotate(194deg) brightness(89%) contrast(88%);
+    /* Same as `--sidebar-active` (#37aeff) */
+    --copy-button-filter-hover: invert(56%) sepia(61%) saturate(1684%) hue-rotate(184deg) brightness(102%) contrast(101%);
+
+    --footnote-highlight: #37aeff;
+
+    --overlay-bg: rgba(0, 0, 0, 0.4);
+
+    --blockquote-note-color: #37aeff;
+    --blockquote-tip-color: #02c39a;
+    --blockquote-important-color: #14c8ff;
+    --blockquote-warning-color: #ffba00;
+    --blockquote-caution-color: #f0565d;
+
+    --sidebar-header-border-color: #37aeff;
+
+    /* TN extension tokens (consumed by tn-custom.css / theme components) */
+    --tn-border: #2e373f;
+    --tn-surface: #282d30;
+    --tn-surface-2: #2a3136;
+    --tn-muted: #9ba3c4;
+    --tn-code-bg: #232729;
+    --tn-link-hover: #5fc0ff;
+    --tn-header-bg: rgba(29, 29, 29, 0.85);
+    /* In dark mode the brand colors already clear AA on the tinted card. */
+    --tn-adm-note-title: #6cc4ff;
+    --tn-adm-tip-title: #2fd9b4;
+    --tn-adm-important-title: #4fd4ff;
+    --tn-adm-warning-title: #ffca3d;
+    --tn-adm-caution-title: #f57e83;
+}
+
+/* No-JS fallback: mirror the navy theme when the OS prefers dark. */
+@media (prefers-color-scheme: dark) {
+    html:not(.js) {
+        --bg: #1d1d1d;
+        --fg: #faffff;
+
+        --sidebar-bg: #212325;
+        --sidebar-fg: #9ba3c4;
+        --sidebar-non-existant: #5c6273;
+        --sidebar-active: #37aeff;
+        --sidebar-spacer: #282d30;
+
+        --scrollbar: #3a4046;
+
+        --icons: #9ba3c4;
+        --icons-hover: #faffff;
+
+        --links: #37aeff;
+
+        --inline-code-color: #faffff;
+
+        --theme-popup-bg: #212325;
+        --theme-popup-border: #2e373f;
+        --theme-hover: #282d30;
+
+        --quote-bg: #282d30;
+        --quote-border: #2e373f;
+
+        --warning-border: #ffba00;
+
+        --table-border-color: #2e373f;
+        --table-header-bg: #282d30;
+        --table-alternate-bg: #232729;
+
+        --searchbar-border-color: #2e373f;
+        --searchbar-bg: #282d30;
+        --searchbar-fg: #faffff;
+        --searchbar-shadow-color: rgba(0, 0, 0, 0.4);
+        --searchresults-header-fg: #9ba3c4;
+        --searchresults-border-color: #2e373f;
+        --searchresults-li-bg: #2a3136;
+        --search-mark-bg: #1d5f8a;
+
+        --color-scheme: dark;
+
+        --copy-button-filter: invert(72%) sepia(11%) saturate(586%) hue-rotate(194deg) brightness(89%) contrast(88%);
+        --copy-button-filter-hover: invert(56%) sepia(61%) saturate(1684%) hue-rotate(184deg) brightness(102%) contrast(101%);
+
+        --footnote-highlight: #37aeff;
+
+        --overlay-bg: rgba(0, 0, 0, 0.4);
+
+        --blockquote-note-color: #37aeff;
+        --blockquote-tip-color: #02c39a;
+        --blockquote-important-color: #14c8ff;
+        --blockquote-warning-color: #ffba00;
+        --blockquote-caution-color: #f0565d;
+
+        --sidebar-header-border-color: #37aeff;
+
+        --tn-border: #2e373f;
+        --tn-surface: #282d30;
+        --tn-surface-2: #2a3136;
+        --tn-muted: #9ba3c4;
+        --tn-code-bg: #232729;
+        --tn-link-hover: #5fc0ff;
+        --tn-header-bg: rgba(29, 29, 29, 0.85);
+        --tn-adm-note-title: #6cc4ff;
+        --tn-adm-tip-title: #2fd9b4;
+        --tn-adm-important-title: #4fd4ff;
+        --tn-adm-warning-title: #ffca3d;
+        --tn-adm-caution-title: #f57e83;
+    }
+}
