@@ -2,7 +2,7 @@
 
 This directory implements a **native token-issuance precompile** for the Telcoin (TEL) token. The precompile owns the on-chain mint/claim/burn lifecycle and exposes a single read-only view (`totalSupply`). It does **not** expose an ERC-20 transfer/approve/permit surface — those flows live in user-space contracts and rely on native value transfers, which are equivalent to ERC-20 transfers because TEL balances are native account balances.
 
-The precompile is registered as a `DynPrecompile` inside reth's `PrecompilesMap` at address `0x00000000000000000000000000000000000007e1`. Any `CALL` or `STATICCALL` targeting this address is intercepted by the dispatcher in `mod.rs`, which routes on the 4-byte function selector. Routing is not unconditional for a `STATICCALL`: only the read-only selectors are served in a static frame — `totalSupply`, plus `hasMintRole` under the `faucet` feature — and every state-mutating selector is refused before dispatch. See "`STATICCALL` write protection" under Security considerations.
+The precompile is registered as a `DynPrecompile` inside reth's `PrecompilesMap` at address `0x00000000000000000000000000000000000007e1`. Every call frame whose code address is `0x7e1` is intercepted by the dispatcher in `mod.rs`. revm keys that lookup on the frame's `bytecode_address` alone, so `DELEGATECALL` and `CALLCODE` frames arrive there too; the dispatcher refuses those before doing anything else and serves only a direct `CALL` or `STATICCALL`, on which it routes on the 4-byte function selector (see "Direct-call guard" under Security considerations). Routing is not unconditional for a `STATICCALL`: only the read-only selectors are served in a static frame — `totalSupply`, plus `hasMintRole` under the `faucet` feature — and every state-mutating selector is refused before dispatch. See "`STATICCALL` write protection" under Security considerations.
 
 ## Module map
 
@@ -70,6 +70,7 @@ No pending state, no timelock. Mint roles can be granted/revoked by governance.
 | `grantMintRole` / `revokeMintRole` | Governance only (faucet feature)                   |
 | `hasMintRole` / `totalSupply`      | Any account (read-only)                            |
 | Any selector inside a `STATICCALL` | Read-only only — `totalSupply` (plus `hasMintRole` under `faucet`); mutating selectors refused regardless of caller |
+| Any selector via `DELEGATECALL` / `CALLCODE` | Refused before dispatch, regardless of caller and selector; only a direct `CALL`/`STATICCALL` to `0x7e1` reaches a handler |
 
 Governance is identified by `GOVERNANCE_SAFE_ADDRESS` from `tn-config`.
 
@@ -87,9 +88,18 @@ The rationale is that none of those selectors needed to live at the protocol lev
 
 Shrinking the surface to issuance-only is the actual reason for the deletion; the resulting protocol is simpler and exposes less authority than a full ERC-20 implementation would.
 
-### `DELEGATECALL` semantics under revm
+### Direct-call guard (`DELEGATECALL` / `CALLCODE`)
 
-For completeness: a contract that `DELEGATECALL`s into `0x7e1` runs the precompile's logic, but every `SSTORE` the precompile performs targets the literal address argument it passes — `TELCOIN_PRECOMPILE_ADDRESS` — not the calling contract's storage. The precompile dispatcher routes through `EvmInternals::sstore(TELCOIN_PRECOMPILE_ADDRESS, …)`, and revm's journaled state writes to the address argument verbatim with no `DELEGATECALL`-aware rewrite. A regression test in `crates/tn-reth/tests/it/tel_precompile_props.rs` (`test_delegatecall_writes_target_precompile_storage`) pins this behaviour against future revm upgrades.
+revm dispatches a precompile by the frame's `bytecode_address` alone (`PrecompilesMap::get(&inputs.bytecode_address)`), with no check on the call scheme, so a contract that `DELEGATECALL`s or `CALLCODE`s into `0x7e1` runs the dispatcher just as a `CALL` does. Two things make that frame shape unsafe to serve:
+
+- **The `caller` is not the contract in front of the precompile.** `DELEGATECALL` preserves the parent frame's `msg.sender`, so a contract `A` that governance chose to `CALL` presents `caller == GOVERNANCE_SAFE_ADDRESS` when it delegates into `0x7e1`, and every governance gate passes. (`CALLCODE` presents `A` itself as the caller, so it spoofs nothing on its own, but it is the same indirect frame shape and is refused for the same reason.)
+- **The storage does not follow `DELEGATECALL` semantics.** Every handler passes the literal `TELCOIN_PRECOMPILE_ADDRESS` to `EvmInternals::sstore` / `sload` and the balance helpers, and revm's journaled state writes to that address verbatim with no `DELEGATECALL`-aware rewrite. An indirect frame therefore acts on the **canonical** `0x7e1` ledger, not on the delegating contract's storage as it would against ordinary bytecode.
+
+On mainnet the combination is latent rather than live: `mint` hardcodes governance as the recipient and `claim` reverts on an empty pending slot, so a spoofed governance caller cannot direct funds to itself, and presenting a governance `caller` at all requires governance to execute the transaction (at which point a direct call to `0x7e1` is equally available to it). Under the `faucet` feature it is live: `mint(address, uint256)` credits a calldata-chosen recipient, so any contract a mint-role holder chose to `CALL` could mint to an address of its choosing. Either way the authorization gates were trusting a spoofable identity.
+
+The dispatcher therefore refuses every frame that is not a direct call, as its first check and ahead of selector dispatch: `PrecompileInput::is_direct_call()` (`target_address == bytecode_address`) holds for a direct `CALL`/`STATICCALL`, which set both to `0x7e1`, and fails for `DELEGATECALL`/`CALLCODE`, which keep the calling contract's own address as `target_address`. Read-only selectors are refused too; an indirect frame has no legitimate use of this precompile.
+
+Regression tests reach the precompile through the `DELEGATECALL` and `CALLCODE` relays in `crates/tn-reth/tests/it/precompile_relays.rs`: `test_delegatecall_cannot_reach_precompile`, `test_delegatecall_refuses_read_only_selectors_too` and `test_callcode_cannot_reach_precompile` (mainnet, in `tel_precompile_props.rs`), and `test_delegatecall_cannot_mint_faucet` and `test_callcode_cannot_mint_faucet` (`faucet`, in `tel_precompile_faucet_props.rs`). The `CALL` and `STATICCALL` positive controls in the static-call tests below prove the guard leaves direct calls untouched.
 
 ### `STATICCALL` write protection
 

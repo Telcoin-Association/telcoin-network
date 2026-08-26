@@ -4,6 +4,7 @@
 
 mod certificate_tests;
 mod committee_props;
+mod committee_sweep_tests;
 mod header_sweep_tests;
 mod nesting_tests;
 mod randomness_tests;
