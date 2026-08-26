@@ -407,7 +407,7 @@ mod tests {
     }
 
     /// Build a temp env whose worker base-fee container holds `epoch_fee` and return the
-    /// production-registered `eth_feeHistory`.
+    /// production-registered fee-quote intercepts (`eth_feeHistory`, `eth_blobBaseFee`).
     ///
     /// [`RethEnv::get_rpc_server`] is the only RPC construction path in the node, so a
     /// call through the returned methods exercises the registered handler, not a copy.
@@ -434,7 +434,7 @@ mod tests {
         let server = reth_env
             .get_rpc_server(pool, network, BaseFeeContainer::new(epoch_fee), RpcModule::new(()))
             .expect("rpc server with corrected fee history");
-        server.methods_by(|name| name == "eth_feeHistory")
+        server.methods_by(|name| name == "eth_feeHistory" || name == "eth_blobBaseFee")
     }
 
     /// The next-block `baseFeePerGas` entry at the tip is the worker's epoch base fee,
@@ -475,5 +475,40 @@ mod tests {
             .expect("fee history for the pending tag");
 
         assert_eq!(history.base_fee_per_gas.last().copied(), Some(u128::from(epoch_fee)));
+    }
+
+    /// The blob-fee columns are zeroed (#1231 item 3): the stock delegate quotes the
+    /// 1-wei EIP-4844 minimum from TN's `excess_blob_gas: 0` headers, and TN's pool
+    /// refuses blob transactions at admission (#1159).
+    #[tokio::test]
+    async fn test_fee_history_blob_columns_are_zero() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let methods = fee_history_methods(1_000, &task_manager, &tmp_dir);
+
+        let history: FeeHistory = methods
+            .call("eth_feeHistory", rpc_params![U64::from(1_u64), "latest"])
+            .await
+            .expect("fee history");
+
+        // Shape parity with the gas columns: one returned block plus the next-block
+        // entry. The stock values here are 1 wei, so the zeros are the intercept's.
+        assert_eq!(history.base_fee_per_blob_gas, vec![0, 0]);
+        assert_eq!(history.blob_gas_used_ratio, vec![0.0]);
+    }
+
+    /// `eth_blobBaseFee` answers zero over the production registration (#1231 item 3);
+    /// the stock handler would quote 1 wei from the genesis header's zero excess blob
+    /// gas.
+    #[tokio::test]
+    async fn test_blob_base_fee_is_zero() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let methods = fee_history_methods(1_000, &task_manager, &tmp_dir);
+
+        let fee: U256 =
+            methods.call("eth_blobBaseFee", rpc_params![]).await.expect("blob base fee");
+
+        assert_eq!(fee, U256::ZERO);
     }
 }

@@ -25,11 +25,24 @@
 //! answer self-heals once the block persists. And the container update runs with the
 //! epoch close, so for a short window at an epoch boundary the tip quote (or the
 //! unpersisted-block fallback) can reflect the neighboring epoch's fee until the update
-//! lands or the block persists. All other entries and fields pass through unchanged;
-//! the blob-fee columns are issue #1231 item 3.
+//! lands or the block persists. All other entries and fields pass through unchanged
+//! except the blob-fee columns.
+//!
+//! The blob-fee columns and `eth_blobBaseFee` are issue #1231 item 3. TN refuses
+//! EIP-4844 transactions at pool admission (issue #1159), so there is no blob market to
+//! quote. But TN headers pin `excess_blob_gas` to zero, which the stock handlers quote
+//! as the EIP-4844 minimum of 1 wei: an advertisement of cheap blob space the pool
+//! refuses to sell. Zero is the answer reth itself serves for a chain without blob
+//! fields (pre-Cancun headers take `unwrap_or_default` through the same paths), so the
+//! intercept zeroes `baseFeePerBlobGas` and `blobGasUsedRatio` and answers
+//! `eth_blobBaseFee` with zero.
 
 use crate::RethEnv;
-use alloy::{eips::BlockNumberOrTag, primitives::U64, rpc::types::FeeHistory};
+use alloy::{
+    eips::BlockNumberOrTag,
+    primitives::{U256, U64},
+    rpc::types::FeeHistory,
+};
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_rpc_eth_api::{helpers::EthFees, EthApiTypes};
@@ -49,6 +62,10 @@ pub(crate) trait EpochFeeHistory {
         newest_block: BlockNumberOrTag,
         reward_percentiles: Option<Vec<f64>>,
     ) -> RpcResult<FeeHistory>;
+
+    /// `eth_blobBaseFee`: zero, TN sells no blob space.
+    #[method(name = "blobBaseFee")]
+    async fn blob_base_fee(&self) -> RpcResult<U256>;
 }
 
 /// Epoch-base-fee correction over reth's `EthApi` fee-history method.
@@ -99,6 +116,17 @@ fn overwrite_next_base_fee(history: &mut FeeHistory, next_header_fee: Option<u64
         .for_each(|entry| *entry = corrected);
 }
 
+/// Zero the blob-fee columns: TN has no blob market (module docs).
+///
+/// Both columns keep their delegated lengths, so the response shape stays exactly
+/// reth's (`baseFeePerBlobGas` one longer than `blobGasUsedRatio`). The ratio column is
+/// zero already on TN today (headers record `blob_gas_used` zero); zeroing it here makes
+/// the contract explicit rather than an artifact of header contents.
+fn zero_blob_columns(history: &mut FeeHistory) {
+    history.base_fee_per_blob_gas.iter_mut().for_each(|entry| *entry = 0);
+    history.blob_gas_used_ratio.iter_mut().for_each(|entry| *entry = 0.0);
+}
+
 #[async_trait]
 impl<Api> EpochFeeHistoryServer for FeeHistoryWithEpochBaseFee<Api>
 where
@@ -136,7 +164,16 @@ where
             })
             .and_then(|header| header.base_fee_per_gas);
         overwrite_next_base_fee(&mut history, next_header_fee, self.base_fee.base_fee());
+        zero_blob_columns(&mut history);
         Ok(history)
+    }
+
+    async fn blob_base_fee(&self) -> RpcResult<U256> {
+        // Keep reth's request-trace parity: operators grep this target.
+        tracing::trace!(target: "rpc::eth", "Serving eth_blobBaseFee");
+        // No delegation: the honest answer is a constant, independent of provider
+        // state, so no provider fault can change it.
+        Ok(U256::ZERO)
     }
 }
 
@@ -194,5 +231,17 @@ mod tests {
         let mut subject = history(0, 0, vec![7]);
         overwrite_next_base_fee(&mut subject, None, 1_000);
         assert_eq!(subject.base_fee_per_gas, vec![7]);
+    }
+
+    #[test]
+    fn test_zero_blob_columns_zeroes_both_and_keeps_lengths() {
+        let mut subject = history(0, 1, vec![7, 9]);
+        // The stock delegate's quote for TN headers: the 1-wei EIP-4844 minimum.
+        subject.base_fee_per_blob_gas = vec![1, 1];
+        subject.blob_gas_used_ratio = vec![0.25];
+        zero_blob_columns(&mut subject);
+        assert_eq!(subject.base_fee_per_blob_gas, vec![0, 0]);
+        assert_eq!(subject.blob_gas_used_ratio, vec![0.0]);
+        assert_eq!(subject.base_fee_per_gas, vec![7, 9], "gas fee column stays untouched");
     }
 }
