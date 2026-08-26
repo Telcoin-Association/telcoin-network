@@ -1,14 +1,12 @@
 //! On-demand benchmark comparing the digest-index implementations: the buffered/direct-IO
 //! [`HdxIndex`](super::index::HdxIndex) (raw `File` + in-memory bucket cache) vs the cache-free,
-//! zero-copy memory-mapped [`HdxIndexMmap`](super::index_mmap::HdxIndexMmap). Four columns:
-//! - `hdx-buf`   — `HdxIndex` on the buffered `File` backend (the direct-IO version).
-//! - `hdx-mmap`  — `HdxIndex` on the mmap file backend (same cached logic — isolates the file
+//! zero-copy memory-mapped [`HdxIndexMmap`](super::index_mmap::HdxIndexMmap). Three columns:
+//! - `hdx-buf`  — `HdxIndex` on the buffered `File` backend (the direct-IO version).
+//! - `hdx-mmap` — `HdxIndex` on the mmap file backend (same cached logic — isolates the file
 //!   backend).
-//! - `mmap-cf`   — `HdxIndexMmap` (cache-free, zero-copy; CRC per save + per load).
-//! - `mmap-lazy` — `HdxIndexMmap` with
-//!   [`set_lazy_crc`](super::index_mmap::HdxIndexMmap::set_lazy_crc): per-op CRC is replaced by a
-//!   zeroed "dirty" marker and only the dirty buckets are CRC'd at `sync()` — the WAL/rebuildable
-//!   regime.
+//! - `mmap`     — `HdxIndexMmap`, the cache-free, zero-copy index. It defers CRC: each write zeros
+//!   the bucket's CRC trailer (a "dirty" marker) and only the dirty buckets are CRC'd at `sync()`
+//!   (the WAL/rebuildable regime; reads do not verify a per-op CRC).
 //!
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
 //!
@@ -25,10 +23,10 @@
 //! fixed `insert_dur` probe (K_DUR save+sync pairs).
 //!
 //! Framing: `sync_bulk`/`insert_dur` measure the *index* durability barrier. If the index is not
-//! synced (rebuilt from the data-log WAL on unclean shutdown), those rows are moot and
-//! `mmap-lazy`'s cheap insert/load is what matters — `lazy` moves the CRC off the per-op path to a
-//! targeted `sync` (only the dirty, zero-CRC buckets are CRC'd), so per-op sync (`insert_dur`)
-//! drops sharply while a full-build `sync_bulk` (nearly all buckets dirty) stays roughly the same.
+//! synced (rebuilt from the data-log WAL on unclean shutdown), those rows are moot and `mmap`'s
+//! cheap insert/load is what matters — deferring the CRC off the per-op path to a targeted `sync`
+//! (only the dirty, zero-CRC buckets are CRC'd) makes per-op sync (`insert_dur`) cheap, while a
+//! full-build `sync_bulk` (nearly all buckets dirty) stays roughly the same.
 //!
 //! Caveats: under `#[cfg(test)]` the bloom filter is 64 KB (2 MB in prod), so `load_miss` probes
 //! more buckets than production — both impls share it, so the comparison is fair. `reopen_load` is
@@ -206,16 +204,14 @@ fn open_hdx(header: &DataHeader, dir: &Path, read_only: bool, backend: FileBacke
     .expect("open hdx")
 }
 
-fn open_mmap(header: &DataHeader, dir: &Path, read_only: bool, lazy: bool) -> HdxIndexMmap {
-    let mut idx = HdxIndexMmap::open_hdx_file(
+fn open_mmap(header: &DataHeader, dir: &Path, read_only: bool) -> HdxIndexMmap {
+    HdxIndexMmap::open_hdx_file(
         dir.join("hdx"),
         header,
         BuildHasherDefault::<FxHasher>::default(),
         read_only,
     )
-    .expect("open mmap");
-    idx.set_lazy_crc(lazy);
-    idx
+    .expect("open mmap")
 }
 
 fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
@@ -225,7 +221,7 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     println!(
         "\n=== digest index: direct-IO (HdxIndex) vs mmap (HdxIndexMmap) (ms; lower is better) ==="
     );
-    println!("legend: hdx-buf = buffered File + bucket cache; hdx-mmap = same cache on an mmap file; mmap-cf = cache-free mmap (CRC per op); mmap-lazy = cache-free mmap, per-op CRC replaced by a zeroed dirty marker, only dirty buckets CRC'd at sync (WAL/rebuildable regime). insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. Default N sweep crosses the 400k-bucket buffered cache at 8M. test-cfg bloom is 64 KB; run on Linux/SSD.");
+    println!("legend: hdx-buf = buffered File + bucket cache; hdx-mmap = same cache on an mmap file; mmap = cache-free mmap, per-op CRC replaced by a zeroed dirty marker, only dirty buckets CRC'd at sync (WAL/rebuildable regime; no per-op CRC on read). insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. Default N sweep crosses the 400k-bucket buffered cache at 8M. test-cfg bloom is 64 KB; run on Linux/SSD.");
 
     print!("{:<label_w$}", "benchmark", label_w = label_w);
     for (name, _) in cols {
@@ -246,8 +242,8 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     println!();
 }
 
-/// Compare the direct-IO `HdxIndex` (buffered + mmap file) against the cache-free `HdxIndexMmap`
-/// (eager and lazy CRC), swept across index sizes.
+/// Compare the direct-IO `HdxIndex` (buffered + mmap file) against the cache-free, deferred-CRC
+/// `HdxIndexMmap`, swept across index sizes.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
 /// `cargo test -p tn-storage digest_index_bench -- --ignored --nocapture --test-threads 1`.
@@ -269,10 +265,8 @@ fn digest_index_bench() {
         "hdx-mmap",
         column(|dir, ro| open_hdx(&header, dir, ro, FileBackend::Mmap), &sizes),
     ));
-    println!("  running mmap-cf ...");
-    cols.push(("mmap-cf", column(|dir, ro| open_mmap(&header, dir, ro, false), &sizes)));
-    println!("  running mmap-lazy ...");
-    cols.push(("mmap-lazy", column(|dir, ro| open_mmap(&header, dir, ro, true), &sizes)));
+    println!("  running mmap ...");
+    cols.push(("mmap", column(|dir, ro| open_mmap(&header, dir, ro), &sizes)));
 
     print_table(&rows, &cols);
 }
