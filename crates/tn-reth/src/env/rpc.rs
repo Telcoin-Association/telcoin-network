@@ -7,12 +7,13 @@
 //!
 //! Note: [`RethEnv::get_rpc_server`] swallows a failure to merge the TN-specific module at
 //! `error!` level; the server still starts and serves the standard namespaces with the TN
-//! module missing. The corrected `eth_feeHistory` install (`crate::rpc_fee_history`)
-//! returns an error instead of logging. The correction's coverage is structural: the same
-//! module config drives both the module build and the handler replacement, so every
-//! transport that serves the eth namespace gets the corrected method, and a transport
-//! without the namespace has no fee-history method to correct. The `Result` keeps a
-//! future registration failure from passing silently (issue #1231).
+//! module missing. The corrected `eth_feeHistory` install (`crate::rpc_fee_history`) and
+//! the `--rpc.txfeecap` guard install (`crate::rpc_fee_cap`) return an error instead of
+//! logging. Both installs' coverage is structural: the same module config drives the
+//! module build and each handler replacement, so every transport that serves the eth
+//! namespace gets the corrected and guarded methods, and a transport without the
+//! namespace has no eth methods to correct or guard. The `Result` keeps a future
+//! registration failure from passing silently (issues #1231, #1160).
 
 use std::sync::Arc;
 
@@ -30,6 +31,7 @@ use tn_types::gas_accumulator::BaseFeeContainer;
 use crate::{
     error::TnRethResult,
     evm::TnEvmConfig,
+    rpc_fee_cap::{CappedEthSubmitServer as _, EthSubmitWithCap, TxFeeCapWei},
     rpc_fee_history::{EpochFeeHistoryServer as _, FeeHistoryWithEpochBaseFee},
     traits::{TNExecution, TelcoinNode},
     worker::WorkerNetwork,
@@ -78,9 +80,8 @@ impl RethEnv {
     /// `base_fee` is this worker's shared epoch base-fee container: the corrected
     /// `eth_feeHistory` answers its next-block entry from it (`crate::rpc_fee_history`).
     ///
-    /// Errors when the corrected fee-history method cannot replace the stock handler.
-    /// Returns `eyre::Result` to match the node callers' error context; open #1176
-    /// makes the identical signature change, so the two merge cleanly.
+    /// Errors when the corrected fee-history method or the `--rpc.txfeecap` guard
+    /// (`crate::rpc_fee_cap`) cannot replace the stock eth handlers.
     pub fn get_rpc_server(
         &self,
         transaction_pool: WorkerTxPool,
@@ -119,6 +120,14 @@ impl RethEnv {
         // Ethereum's EIP-1559 schedule, and TN prices the next block from the epoch fee
         // schedule instead (issue #1231).
         let fee_history = FeeHistoryWithEpochBaseFee::new(eth_api.clone(), self.clone(), base_fee);
+        // Guard the eth submission methods with the operator's `--rpc.txfeecap` (issue
+        // #1160). Reth's pool validator only checks the cap for local-treated
+        // transactions, and raw RPC submissions are External, so the guard runs at the
+        // RPC boundary and then delegates to these same reth handlers.
+        let fee_cap_guard = EthSubmitWithCap::new(
+            eth_api.clone(),
+            TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap),
+        );
         let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
         if let Err(e) = server.merge_configured(other) {
             tracing::error!(target: "tn::execution", "Error merging TN rpc module: {e:?}");
@@ -126,6 +135,10 @@ impl RethEnv {
         // Replace `eth_feeHistory` on every transport that exposes the eth namespace. A
         // transport without the namespace serves no fee-history method to correct.
         server.add_or_replace_if_module_configured(RethRpcModule::Eth, fee_history.into_rpc())?;
+        // Replace `eth_sendRawTransaction` / `eth_sendRawTransactionSync` on every
+        // transport that exposes the eth namespace. A transport without the namespace
+        // serves no submission methods, so it needs no guard.
+        server.add_or_replace_if_module_configured(RethRpcModule::Eth, fee_cap_guard.into_rpc())?;
 
         Ok(server)
     }
@@ -141,7 +154,8 @@ impl RethEnv {
 mod tests {
     use super::*;
     use crate::{
-        init_reth_defaults, rpc_server_args::RpcServerArgs as TnRpcServerArgs, RethChainSpec,
+        init_reth_defaults, rpc_server_args::RpcServerArgs as TnRpcServerArgs,
+        test_utils::TransactionFactory, RethChainSpec,
     };
     use alloy::{primitives::U64, rpc::types::FeeHistory};
     use jsonrpsee::{rpc_params, RpcModule};
@@ -152,9 +166,159 @@ mod tests {
         ForwardConfig, GasPriceOracleConfig,
     };
     use reth_transaction_pool::noop::NoopTransactionPool;
+    use std::sync::Arc;
     use tempfile::TempDir;
-    use tn_types::{test_genesis, TaskManager};
+    use tn_types::{test_genesis, Address, Bytes, Encodable2718 as _, TaskManager, B256, U256};
     use url::Url;
+
+    /// Build a temp env with the given `--rpc.txfeecap` value (wei) and return the
+    /// built RPC server's methods plus the pool for assertions.
+    ///
+    /// The returned methods are the production registration: `get_rpc_server` is the
+    /// only RPC construction path in the node, so a call through them exercises the
+    /// same handler an operator's `eth_sendRawTransaction` request reaches. The
+    /// transport selection comes from `rpc_args` (the default serves IPC only).
+    fn rpc_methods_with_cap(
+        cap_wei: u128,
+        rpc_args: reth::args::RpcServerArgs,
+        task_manager: &TaskManager,
+        tmp_dir: &TempDir,
+    ) -> (jsonrpsee::Methods, WorkerTxPool, Arc<RethChainSpec>) {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let rpc_args = reth::args::RpcServerArgs { rpc_tx_fee_cap: cap_wei, ..rpc_args };
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain.clone(),
+            tmp_dir.path(),
+            task_manager,
+            None,
+            rpc_args,
+        )
+        .expect("temp chain env");
+        let pool = reth_env.init_txn_pool().expect("txn pool");
+        let network = WorkerNetwork::new_for_test(reth_env.chainspec());
+        let server = reth_env
+            .get_rpc_server(pool.clone(), network, BaseFeeContainer::default(), RpcModule::new(()))
+            .expect("rpc server with fee-cap guard");
+        (server.methods_by(|name| name.starts_with("eth_send")), pool, chain)
+    }
+
+    #[tokio::test]
+    async fn test_send_raw_transaction_enforces_fee_cap() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        // Cap 200,000 wei: a 21,000-gas transfer at 7 wei/gas costs at most 147,000
+        // wei (under), a 1,000,000-gas budget at 7 wei/gas costs at most 7,000,000
+        // wei (over).
+        let (methods, pool, chain) = rpc_methods_with_cap(
+            200_000,
+            reth::args::RpcServerArgs::default(),
+            &task_manager,
+            &tmp_dir,
+        );
+        let mut tx_factory = TransactionFactory::new();
+
+        let under_cap = tx_factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let accepted: B256 = methods
+            .call("eth_sendRawTransaction", rpc_params![Bytes::from(under_cap.encoded_2718())])
+            .await
+            .expect("under-cap transaction is accepted");
+        assert_eq!(accepted, *under_cap.hash());
+        assert_eq!(pool.pool_size().pending, 1);
+
+        let over_cap = tx_factory.create_eip1559(
+            chain,
+            Some(1_000_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let over_cap_bytes = Bytes::from(over_cap.encoded_2718());
+        let err = methods
+            .call::<_, B256>("eth_sendRawTransaction", rpc_params![over_cap_bytes.clone()])
+            .await
+            .expect_err("over-cap transaction is refused");
+        assert!(
+            err.to_string()
+                .contains("tx fee (7000000 wei) exceeds the configured cap (200000 wei)"),
+            "unexpected error: {err}"
+        );
+        // The refused transaction never reaches the pool.
+        assert_eq!(pool.pool_size().pending, 1);
+        assert!(pool.get(over_cap.hash()).is_none());
+
+        // The sync variant runs the same guard.
+        let err = methods
+            .call::<_, serde_json::Value>("eth_sendRawTransactionSync", rpc_params![over_cap_bytes])
+            .await
+            .expect_err("over-cap transaction is refused on the sync method");
+        assert!(err.to_string().contains("exceeds the configured cap"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_send_raw_transaction_zero_cap_disables_check() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let (methods, pool, chain) =
+            rpc_methods_with_cap(0, reth::args::RpcServerArgs::default(), &task_manager, &tmp_dir);
+        let mut tx_factory = TransactionFactory::new();
+
+        // 7,000,000 wei max fee sails through a disabled cap.
+        let tx = tx_factory.create_eip1559(
+            chain,
+            Some(1_000_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let accepted: B256 = methods
+            .call("eth_sendRawTransaction", rpc_params![Bytes::from(tx.encoded_2718())])
+            .await
+            .expect("zero cap accepts any fee");
+        assert_eq!(accepted, *tx.hash());
+        assert_eq!(pool.pool_size().pending, 1);
+    }
+
+    #[tokio::test]
+    async fn test_http_transport_gets_the_fee_cap_guard() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        // `methods_by` unions transports and keeps the first occurrence, so the
+        // IPC-only default above could mask an HTTP registration that missed the
+        // guard. Serve HTTP alone (IPC disabled) and check its registration
+        // directly: production validators serve the forwarder over HTTP.
+        let rpc_args =
+            reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
+        let (methods, pool, chain) =
+            rpc_methods_with_cap(200_000, rpc_args, &task_manager, &tmp_dir);
+        let mut tx_factory = TransactionFactory::new();
+
+        let over_cap = tx_factory.create_eip1559(
+            chain,
+            Some(1_000_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let err = methods
+            .call::<_, B256>(
+                "eth_sendRawTransaction",
+                rpc_params![Bytes::from(over_cap.encoded_2718())],
+            )
+            .await
+            .expect_err("over-cap transaction is refused on the HTTP registration");
+        assert!(err.to_string().contains("exceeds the configured cap"), "unexpected error: {err}");
+        assert_eq!(pool.pool_size().pending, 0);
+    }
 
     /// Every applied [`EthConfig`] value reaches the [`EthApiBuilder`]: build a builder over
     /// a temp env, apply a config whose asserted fields all differ from the defaults, and

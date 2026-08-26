@@ -129,6 +129,7 @@ pub mod error;
 mod evm;
 pub mod forward;
 mod metrics;
+mod rpc_fee_cap;
 mod rpc_fee_history;
 pub mod rpc_server_args;
 pub mod snapshot;

@@ -18,11 +18,19 @@
 //!   advertisement carries the signed raw transaction bytes in cleartext, readable by any on-path
 //!   observer. (The bytes are already-signed transactions destined for a public mempool, so
 //!   confidentiality is limited to submission timing, not contents.)
-//! - A considered rejection stops the fallback chain. If a validator's RPC rejects the transaction
-//!   itself (bad nonce, underpriced, invalid), no further validators are tried: all validators
-//!   share consensus state, so the rejection would repeat everywhere. Only endpoint-local failures
-//!   (timeout, transport error, full pool, internal error) fall through to the next advertised
-//!   validator, and "already known" counts as delivered.
+//! - A considered rejection stops the fallback chain only once a second validator confirms it. If a
+//!   validator's RPC rejects the transaction itself (bad nonce, invalid, wrong fork), honest
+//!   validators would all repeat the rejection - they share consensus state - but the sender
+//!   routing above makes one validator the sole gatekeeper for its accounts, so a single fabricated
+//!   rejection must not be able to censor an account (issue #1167): the first rejection is held as
+//!   advisory, and a later delivery both overrides it and is surfaced as a byzantine signal
+//!   ([`ForwarderMetrics::record_rejection_overridden`]). Endpoint-local failures (timeout,
+//!   transport error, full pool, internal error, a refusal tied to one validator's own pool
+//!   contents or admission config) fall through to the next advertised validator, and "already
+//!   known" counts as delivered. The symmetric fabrication - a validator that answers success and
+//!   drops the transaction - is still trusted at this boundary: a fabricated success is
+//!   indistinguishable from an honest one here, and catching it would cost redundant delivery or
+//!   inclusion tracking on every honest-path forward (issue #1167 records that trade).
 //! - The dial target is chosen by a committee member, not by this node. The endpoint arrives inside
 //!   a BLS-signed node record, so an arbitrary network peer cannot inject one, but a committee
 //!   member can still advertise any host it likes and every observer will dial it unattended.
@@ -588,8 +596,9 @@ impl WorkerRpcForwarder {
             // still walking stops counting the endpoint at once, and the set doubles as the
             // within-batch skip list, so later transactions here do not re-pay the send
             // timeout against a proven-dead endpoint. A later delivery through the same
-            // endpoint clears both.
-            let mut unreachable_endpoints: BTreeSet<String> = BTreeSet::new();
+            // endpoint clears both. Mutex-wrapped like the held rejection: the walk holds
+            // only a shared reference ([`walk_fallback_chain`]).
+            let unreachable_endpoints: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
             // How many transactions the loop pulled before the batch deadline ended it;
             // everything at and past this index is the abandoned (also undelivered) tail.
             let mut pulled = 0_usize;
@@ -616,95 +625,28 @@ impl WorkerRpcForwarder {
                 // Bound the whole fallback chain for this transaction: even if every advertised
                 // validator accepts the connection but never answers, one transaction cannot cost
                 // more than `FORWARD_TX_BUDGET` before the next transaction proceeds.
-                let chain = timeout(txn_budget, async {
-                    let mut tried = BTreeSet::new();
-                    let mut result = ForwardOutcome::NoEndpointReached;
-                    for key in ordered {
-                        if !tried.insert(key) {
-                            continue;
-                        }
-                        // The filter is the within-batch half of the demotion: an endpoint
-                        // this task already proved dead is not re-dialed for later
-                        // transactions in the same batch.
-                        let Some((endpoint, provider)) = providers
-                            .get(&key)
-                            .filter(|(endpoint, _)| !unreachable_endpoints.contains(endpoint))
-                        else {
-                            continue;
-                        };
-                        // Bound each validator's round-trip: an endpoint that accepts the
-                        // connection but never answers must not stall the whole fallback chain.
-                        let disposition = timeout(
-                            FORWARD_SEND_TIMEOUT,
-                            provider.send_raw_transaction(tx.as_slice()),
-                        )
-                        .await
-                        .map_or_else(
-                            |_elapsed| Disposition::Unreachable("send timed out".to_string()),
-                            |res| res.err().map_or(Disposition::Delivered, classify_error),
-                        );
-
-                        match disposition {
-                            // Delivered, or a considered rejection every validator would repeat:
-                            // either way this transaction is done, so stop the fallback chain.
-                            Disposition::Delivered => {
-                                // A delivery proves the endpoint reachable again: lift any
-                                // demotion this task recorded, locally and in admission, so a
-                                // single earlier blip (one timed-out send against an otherwise
-                                // healthy validator) cannot hold a delivering endpoint out.
-                                if unreachable_endpoints.remove(endpoint) {
-                                    cache
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .unreachable
-                                        .remove(endpoint);
-                                }
-                                result = ForwardOutcome::Delivered;
-                                break;
-                            }
-                            Disposition::Rejected(reason) => {
-                                result = ForwardOutcome::Rejected(reason);
-                                break;
-                            }
-                            // The endpoint gave no verdict: publish the demotion at the
-                            // failure itself, not at task end, so batches sealed while this
-                            // task is still walking already find the endpoint unusable at
-                            // admission and the cooldown runs from the failure (issue #1145).
-                            Disposition::Unreachable(reason) => {
-                                if unreachable_endpoints.insert(endpoint.clone()) {
-                                    cache
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .unreachable
-                                        .insert(endpoint.clone(), Instant::now());
-                                }
-                                debug!(
-                                    target: "worker::forward",
-                                    reason = %reason,
-                                    "validator RPC endpoint was unreachable; trying next"
-                                );
-                            }
-                            // Endpoint-local, but the server answered (full pool, internal
-                            // error, or a node-local refusal): reachable, so not demoted;
-                            // try the next validator.
-                            Disposition::TryNext(reason) => {
-                                debug!(
-                                    target: "worker::forward",
-                                    reason = %reason,
-                                    "validator RPC did not accept the forwarded transaction; trying next"
-                                );
-                            }
-                        }
-                    }
-                    result
-                })
+                // A first rejection the walk has banked escapes the budget through this slot:
+                // cancellation drops the walk and everything in it, and a verdict a validator
+                // already gave must not vanish with it (issue #1167).
+                let held_rejection = Mutex::new(None);
+                let chain = timeout(
+                    txn_budget,
+                    walk_fallback_chain(
+                        tx.as_slice(),
+                        ordered,
+                        &providers,
+                        &held_rejection,
+                        &unreachable_endpoints,
+                        &cache,
+                    ),
+                )
                 .await;
                 // `Err` from the timeout is the budget itself expiring, as opposed to the
                 // chain returning [`ForwardOutcome::NoEndpointReached`] as a verdict; the
                 // tally below needs the two apart, so remember which happened before
                 // collapsing them into one outcome.
                 let budget_expired = chain.is_err();
-                let outcome = chain.unwrap_or(ForwardOutcome::NoEndpointReached);
+                let outcome = expired_walk_outcome(chain, &held_rejection);
 
                 match outcome {
                     ForwardOutcome::Delivered => delivered += 1,
@@ -713,7 +655,7 @@ impl WorkerRpcForwarder {
                         warn!(
                             target: "worker::forward",
                             reason = %reason,
-                            "a validator rejected the forwarded transaction; not retrying other validators"
+                            "the forwarded transaction was rejected; no validator accepted it"
                         )
                     }
                     // A deadline-clamped budget expired mid-chain: the batch budget, not
@@ -787,8 +729,11 @@ impl WorkerRpcForwarder {
             // Report the endpoints this task demoted. Each was already published to admission
             // at its failure; an endpoint that later delivered was cleared again and is not
             // counted here.
-            if !unreachable_endpoints.is_empty() {
-                let demoted = unreachable_endpoints.len();
+            let demoted = unreachable_endpoints
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len();
+            if demoted > 0 {
                 warn!(
                     target: "worker::forward",
                     demoted,
@@ -983,13 +928,206 @@ fn owning_validator(
     committee_slots.get(slot).cloned()
 }
 
+/// Walk one transaction across the `ordered` validators until one delivers it or a second one
+/// confirms a considered rejection.
+///
+/// The advisory-until-confirmed rejection is byzantine hardening (issue #1167). Sender routing
+/// hands every transaction from one account to the same owning validator first, so under a
+/// stop-on-first-verdict rule that one validator's word decided the transaction's fate: a
+/// byzantine owner could fabricate a rejection and censor the account, with no honest validator
+/// ever consulted. A first considered rejection is therefore held rather than returned, and the
+/// walk goes on until a second validator either rejects too - an honest rejection repeats
+/// everywhere, because validators share consensus state - or delivers the transaction, which
+/// overrides the held rejection and is counted and logged as a byzantine signal
+/// ([`ForwarderMetrics::record_rejection_overridden`]). A rejection that reaches the end of the
+/// chain unconfirmed stands: no other validator was reachable to consult, so the one verdict
+/// there is decides. The same rule survives the caller's per-transaction budget cancelling the
+/// walk mid-chain: the held verdict is mirrored into `held`, and [`expired_walk_outcome`] reads
+/// it back rather than letting cancellation erase it. Confirmation raises the collusion a
+/// censoring rejection needs from one validator to two; it is hardening against a single liar,
+/// not a quorum guarantee.
+///
+/// The cost is one extra RPC round-trip per genuinely rejected transaction, which is rare on
+/// this path: every transaction here already passed this observer's own pool validation, so a
+/// considered rejection normally means the state moved (a nonce race), not spam. The symmetric
+/// fabrication - a validator that answers success and drops the transaction - is deliberately
+/// not defended here: a fabricated success is indistinguishable from an honest one at this
+/// boundary, and catching it would cost redundant delivery or inclusion tracking on every
+/// honest-path forward. Issue #1167 records that trade.
+///
+/// The walk also carries the endpoint demotion of issue #1145: an endpoint already recorded in
+/// `unreachable` is skipped, a send that produced no JSON-RPC verdict demotes its endpoint -
+/// into `unreachable` and into the admission side of `cache`, at the failure itself - and a
+/// later delivery through the same endpoint lifts a demotion this batch recorded.
+async fn walk_fallback_chain(
+    tx: &[u8],
+    ordered: impl Iterator<Item = BlsPublicKey>,
+    providers: &BTreeMap<BlsPublicKey, (String, RootProvider)>,
+    held: &Mutex<Option<(BlsPublicKey, String)>>,
+    unreachable: &Mutex<BTreeSet<String>>,
+    cache: &Mutex<EndpointCache>,
+) -> ForwardOutcome {
+    use futures::TryStreamExt as _;
+    // Each advertised validator at most once, in fallback order, with its endpoint and
+    // provider attached. The unreachable filter is the within-batch half of the demotion
+    // (issue #1145): an endpoint this task already proved dead is not re-dialed, and the
+    // filter runs as the stream pulls each target, so it also sees demotions recorded
+    // earlier in this same walk.
+    let mut tried = BTreeSet::new();
+    let targets = ordered
+        .filter(|key| tried.insert(*key))
+        .filter_map(|key| providers.get(&key).map(|(endpoint, provider)| (key, endpoint, provider)))
+        .filter(|(_, endpoint, _)| {
+            !unreachable.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(*endpoint)
+        });
+    // A short-circuiting fold: `Ok` carries the held first rejection (which validator gave it
+    // and why) between attempts, `Err` carries a terminal verdict out of the walk.
+    futures::stream::iter(targets)
+        .map(Ok)
+        .try_fold(
+            None::<(BlsPublicKey, String)>,
+            |pending_rejection, (key, endpoint, provider)| async move {
+                // Bound each validator's round-trip: an endpoint that accepts the connection but
+                // never answers must not stall the whole fallback chain.
+                let disposition = timeout(FORWARD_SEND_TIMEOUT, provider.send_raw_transaction(tx))
+                    .await
+                    .map_or_else(
+                        |_elapsed| Disposition::Unreachable("send timed out".to_string()),
+                        |res| res.err().map_or(Disposition::Delivered, classify_error),
+                    );
+
+                match disposition {
+                    Disposition::Delivered => {
+                        // A delivery proves the endpoint reachable again: lift any demotion this
+                        // task recorded, locally and in admission, so a single earlier blip (one
+                        // timed-out send against an otherwise healthy validator) cannot hold a
+                        // delivering endpoint out (issue #1145).
+                        if unreachable
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(endpoint)
+                        {
+                            cache
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .unreachable
+                                .remove(endpoint);
+                        }
+                        pending_rejection.iter().for_each(|(rejecting, reason)| {
+                        ForwarderMetrics::record_rejection_overridden();
+                        warn!(
+                            target: "worker::forward",
+                            rejected_by = %rejecting,
+                            delivered_by = %key,
+                            reason = %reason,
+                            "one validator rejected a transaction another validator accepted; \
+                             the rejecting validator answered from divergent state or is byzantine"
+                        );
+                    });
+                        Err(ForwardOutcome::Delivered)
+                    }
+                    Disposition::Rejected(reason) => {
+                        // A second considered rejection confirms the held one. The `tried` set
+                        // keeps the two verdicts from distinct validators, which is what a single
+                        // byzantine validator cannot produce alone.
+                        if pending_rejection.is_some() {
+                            Err(ForwardOutcome::Rejected(reason))
+                        } else {
+                            debug!(
+                                target: "worker::forward",
+                                validator = %key,
+                                reason = %reason,
+                                "validator rejected the forwarded transaction; walking on for a \
+                                 second verdict before giving up on it"
+                            );
+                            // Mirror the verdict into `held` so it survives the caller's budget
+                            // cancelling this walk mid-chain (see [`expired_walk_outcome`]).
+                            *held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some((key, reason.clone()));
+                            Ok(Some((key, reason)))
+                        }
+                    }
+                    // Endpoint-local, but the server answered (full pool, internal error, or a
+                    // node-local refusal): reachable, so not demoted, and the transaction's fate
+                    // is unknown here; try the next validator.
+                    Disposition::TryNext(reason) => {
+                        debug!(
+                            target: "worker::forward",
+                            reason = %reason,
+                            "validator RPC did not accept the forwarded transaction; trying next"
+                        );
+                        Ok(pending_rejection)
+                    }
+                    // The endpoint gave no verdict: publish the demotion at the failure itself,
+                    // not at task end, so batches sealed while this task is still walking already
+                    // find the endpoint unusable at admission and the cooldown runs from the
+                    // failure (issue #1145). No verdict is no confirmation either: the held
+                    // rejection, if any, walks on unchanged.
+                    Disposition::Unreachable(reason) => {
+                        if unreachable
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(endpoint.clone())
+                        {
+                            cache
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .unreachable
+                                .insert(endpoint.clone(), Instant::now());
+                        }
+                        debug!(
+                            target: "worker::forward",
+                            reason = %reason,
+                            "validator RPC endpoint was unreachable; trying next"
+                        );
+                        Ok(pending_rejection)
+                    }
+                }
+            },
+        )
+        .await
+        // End of the chain with a held, unconfirmed rejection: report it rather than erase it.
+        .map(|pending_rejection| {
+            pending_rejection.map_or(ForwardOutcome::NoEndpointReached, |(_, reason)| {
+                ForwardOutcome::Rejected(reason)
+            })
+        })
+        .unwrap_or_else(|verdict| verdict)
+}
+
+/// The transaction's outcome once its budget-timed walk resolves.
+///
+/// `Ok` is the walk's own verdict. `Err` means [`FORWARD_TX_BUDGET`] (or the batch deadline's
+/// clamp of it) expired and cancelled the walk mid-chain; a rejection the walk had already
+/// banked in `held` still stands - the same rule as reaching the end of the chain unconfirmed
+/// (issue #1167) - and only a walk cut short with no verdict at all reports
+/// [`ForwardOutcome::NoEndpointReached`]. Without this read-back, a fast rejection followed by
+/// unresponsive fallbacks would be tallied as unreached or abandoned, both defined as "never
+/// handed to a validator", which would be false.
+fn expired_walk_outcome(
+    chain: Result<ForwardOutcome, tokio::time::error::Elapsed>,
+    held: &Mutex<Option<(BlsPublicKey, String)>>,
+) -> ForwardOutcome {
+    chain.unwrap_or_else(|_elapsed| {
+        held.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .map_or(ForwardOutcome::NoEndpointReached, |(_, reason)| {
+                ForwardOutcome::Rejected(reason)
+            })
+    })
+}
+
 /// What to do after one timed attempt to forward a transaction to one validator.
 #[derive(Debug, PartialEq, Eq)]
 enum Disposition {
     /// The validator accepted the transaction, or it was already in a validator's pool.
     Delivered,
     /// The validator returned a considered rejection of the transaction itself (bad nonce,
-    /// invalid, wrong fork). No other validator will accept it either.
+    /// invalid, wrong fork). Honest validators would all repeat it, but one validator's
+    /// verdict alone is not trusted with the transaction's fate (issue #1167): the chain
+    /// holds a first rejection as advisory and walks on until a second validator confirms
+    /// or contradicts it.
     Rejected(String),
     /// This endpoint answered but gave no verdict (a transient full pool, an internal error,
     /// or a refusal tied to this validator's own pool contents or admission config); the
@@ -1007,7 +1145,9 @@ enum Disposition {
 enum ForwardOutcome {
     /// A validator accepted it (or already had it).
     Delivered,
-    /// A validator gave a considered rejection, so the chain was stopped without delivery.
+    /// Two validators independently gave a considered rejection - or one did and no further
+    /// validator was reachable to confirm or contradict it - so the chain stopped without
+    /// delivery.
     Rejected(String),
     /// No advertised validator gave a verdict (all timed out or were unreachable).
     NoEndpointReached,
@@ -1060,6 +1200,7 @@ mod tests {
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rand::{rngs::StdRng, SeedableRng};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tn_types::{BlsKeypair, TaskManager};
 
     /// A forwarder under the shipped default: only public hosts may be dialed.
@@ -1101,61 +1242,139 @@ mod tests {
         Ok(format!("http://{addr}"))
     }
 
-    /// An endpoint that answers every `eth_sendRawTransaction` with success and counts its
-    /// hits.
+    /// JSON-RPC success payload for a scripted endpoint: a well-formed
+    /// `eth_sendRawTransaction` result (a transaction hash), which alloy deserializes as a
+    /// delivery.
+    const DELIVERY_BODY: &str = r#"{"jsonrpc":"2.0","id":__ID__,"result":"0x0000000000000000000000000000000000000000000000000000000000000000"}"#;
+
+    /// JSON-RPC considered-rejection payload: reth's shape for a verdict on the transaction
+    /// itself, which `classify_server_error` maps to [`Disposition::Rejected`].
+    const REJECTION_BODY: &str =
+        r#"{"jsonrpc":"2.0","id":__ID__,"error":{"code":-32000,"message":"nonce too low"}}"#;
+
+    /// JSON-RPC transient-error payload: a full pool is validator-local, so
+    /// `classify_server_error` maps it to [`Disposition::TryNext`].
+    const TRANSIENT_BODY: &str =
+        r#"{"jsonrpc":"2.0","id":__ID__,"error":{"code":-32003,"message":"txpool is full"}}"#;
+
+    /// The `content-length` a request's head promises, `None` when the header is absent.
+    fn content_length(head: &str) -> Option<usize> {
+        head.lines().find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+                    .flatten()
+            })
+        })
+    }
+
+    /// The JSON-RPC id of `request`, `"0"` if none is found.
     ///
-    /// The response echoes the request id, so the provider accepts it as the answer to its
-    /// call, and closes the connection, so every request opens a fresh one and the hit count
-    /// is exact. The count is what the rotation test reads: which endpoint absorbed a
-    /// forward is otherwise invisible from outside the task.
-    fn counting_ok_endpoint() -> eyre::Result<(String, Arc<std::sync::atomic::AtomicUsize>)> {
-        use std::io::{BufRead as _, Read as _, Write as _};
+    /// A canned response must echo the request's id, or alloy treats it as an unsolicited
+    /// message and fails the call as a transport error, which would turn every scripted
+    /// verdict into [`Disposition::TryNext`].
+    fn request_id(request: &str) -> String {
+        request
+            .split_once("\"id\":")
+            .map(|(_, rest)| {
+                rest.trim_start().chars().take_while(char::is_ascii_digit).collect::<String>()
+            })
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| "0".to_string())
+    }
+
+    /// Read one HTTP request off `stream`: headers, then as much body as `content-length`
+    /// promises. Stops with whatever has arrived on connection close or a read error.
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::{io::Read as _, ops::ControlFlow};
+        // At most 64 KiB of request: far above what one `eth_sendRawTransaction` POST needs,
+        // and a hard stop so a runaway peer cannot spin this fixture thread forever.
+        let outcome = (0_usize..64).try_fold(Vec::new(), |raw, _read_attempt| {
+            let mut chunk = [0_u8; 1024];
+            stream.read(&mut chunk).ok().filter(|count| *count > 0).map_or(
+                // EOF or a read error: answer with whatever has arrived.
+                ControlFlow::Break(raw.clone()),
+                |count| {
+                    let grown = [raw.as_slice(), &chunk[..count]].concat();
+                    let text = String::from_utf8_lossy(&grown);
+                    let complete = text.split_once("\r\n\r\n").is_some_and(|(head, body)| {
+                        content_length(head).is_none_or(|length| body.len() >= length)
+                    });
+                    if complete {
+                        ControlFlow::Break(grown)
+                    } else {
+                        ControlFlow::Continue(grown)
+                    }
+                },
+            )
+        });
+        let raw = match outcome {
+            ControlFlow::Break(raw) | ControlFlow::Continue(raw) => raw,
+        };
+        String::from_utf8_lossy(&raw).into_owned()
+    }
+
+    /// Serve one HTTP request on `stream` with the canned JSON-RPC `payload`, echoing the
+    /// request's id, then close the connection.
+    fn serve_one(mut stream: std::net::TcpStream, payload: &str) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let request = read_http_request(&mut stream);
+        let body = payload.replace("__ID__", &request_id(&request));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
+             {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes())
+    }
+
+    /// An endpoint that answers every request with the canned JSON-RPC `payload` and counts
+    /// the requests it serves.
+    ///
+    /// Every response closes its connection, so alloy re-dials per call and `hits` counts
+    /// exactly the `eth_sendRawTransaction` attempts this validator's endpoint received.
+    fn scripted_endpoint(payload: &'static str, hits: Arc<AtomicUsize>) -> eyre::Result<String> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
-        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let recorded = Arc::clone(&hits);
         std::thread::spawn(move || {
             listener.incoming().map_while(Result::ok).for_each(|stream| {
-                recorded.fetch_add(1, Ordering::Relaxed);
-                let mut reader = std::io::BufReader::new(&stream);
-                // The body length arrives in the headers; the fold keeps the last
-                // `content-length` seen and stops at the blank line that ends the headers.
-                let content_length = reader
-                    .by_ref()
-                    .lines()
-                    .map_while(Result::ok)
-                    .take_while(|line| !line.is_empty())
-                    .fold(0_usize, |length, line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|value| value.trim().parse().ok())
-                            .unwrap_or(length)
-                    });
-                let mut body = vec![0_u8; content_length];
-                let id = reader
-                    .read_exact(&mut body)
-                    .ok()
-                    .and_then(|()| String::from_utf8(body).ok())
-                    .and_then(|text| {
-                        text.split("\"id\":").nth(1).map(|rest| {
-                            rest.chars().take_while(char::is_ascii_digit).collect::<String>()
-                        })
-                    })
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or_else(|| "0".to_string());
-                let result = format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":\"0x{}\"}}",
-                    "00".repeat(32)
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
-                     {}\r\nConnection: close\r\n\r\n{result}",
-                    result.len(),
-                );
-                let _sent = (&stream).write_all(response.as_bytes());
+                hits.fetch_add(1, Ordering::SeqCst);
+                let _ = serve_one(stream, payload);
             });
         });
-        Ok((format!("http://{addr}"), hits))
+        Ok(format!("http://{addr}"))
+    }
+
+    /// The provider-map shape the walk takes: each validator key with its endpoint URL and
+    /// provider attached, as [`WorkerRpcForwarder::cached_providers`] builds it.
+    type ScriptedProviders = BTreeMap<BlsPublicKey, (String, RootProvider)>;
+
+    /// Providers for `endpoints`, keyed `test_key(1)`, `test_key(2)`, ... in order, plus the
+    /// matching walk order for [`walk_fallback_chain`].
+    fn scripted_chain(
+        endpoints: &[String],
+    ) -> eyre::Result<(Vec<BlsPublicKey>, ScriptedProviders)> {
+        let keys: Vec<BlsPublicKey> =
+            (1_u8..).zip(endpoints).map(|(seed, _)| test_key(seed)).collect();
+        let providers: Result<BTreeMap<_, _>, _> = keys
+            .iter()
+            .zip(endpoints)
+            .map(|(key, url)| {
+                url.parse()
+                    .map(|parsed: Url| (*key, (parsed.to_string(), RootProvider::new_http(parsed))))
+            })
+            .collect();
+        providers.map(|providers| (keys, providers)).map_err(Into::into)
+    }
+
+    /// An endpoint that answers every `eth_sendRawTransaction` with success and counts its
+    /// hits: [`scripted_endpoint`] with the delivery payload, the shape the rotation test
+    /// reads, since which endpoint absorbed a forward is otherwise invisible from outside
+    /// the task.
+    fn counting_ok_endpoint() -> eyre::Result<(String, Arc<AtomicUsize>)> {
+        let hits = Arc::new(AtomicUsize::new(0));
+        scripted_endpoint(DELIVERY_BODY, Arc::clone(&hits)).map(|url| (url, hits))
     }
 
     /// One recorder capture. [`metrics_util::debugging::Snapshotter::snapshot`] drains the
@@ -1471,6 +1690,159 @@ mod tests {
             elapsed <= FORWARD_BATCH_BUDGET + FORWARD_TX_BUDGET,
             "batch ran {elapsed:?}, past its {FORWARD_BATCH_BUDGET:?} budget"
         );
+        Ok(())
+    }
+
+    /// A first considered rejection no longer decides a transaction's fate on its own: a
+    /// later delivery overrides it, and the override is visible as a counter (issue #1167).
+    ///
+    /// This is the issue's attack: a byzantine owning validator fabricates a rejection to
+    /// censor the sender's account. The fallback validator must still be consulted, and its
+    /// delivery must win.
+    #[test]
+    fn a_lone_rejection_is_overridden_by_a_later_delivery() -> eyre::Result<()> {
+        let owner_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let endpoints = vec![
+            scripted_endpoint(REJECTION_BODY, Arc::clone(&owner_hits))?,
+            scripted_endpoint(DELIVERY_BODY, Arc::clone(&fallback_hits))?,
+        ];
+        let (keys, providers) = scripted_chain(&endpoints)?;
+
+        // A local recorder, with the walk block_on-driven inside its scope: the recorder is
+        // thread-local, so the override counter must be incremented on this thread.
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let outcome = metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().map(|runtime| {
+                runtime.block_on(walk_fallback_chain(
+                    &[0_u8; 32],
+                    keys.iter().cloned(),
+                    &providers,
+                    &Mutex::new(None),
+                    &Mutex::new(BTreeSet::new()),
+                    &Mutex::new(EndpointCache::default()),
+                ))
+            })
+        })?;
+        let snapshot = snapshotter.snapshot().into_vec();
+
+        assert_eq!(outcome, ForwardOutcome::Delivered);
+        assert_eq!(owner_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(counter(&snapshot, "tn_reth.forwarded_rejections_overridden_total"), Some(1));
+        Ok(())
+    }
+
+    /// Two independent considered rejections end the walk without delivery: the second
+    /// verdict is the confirmation, and no validator after it is dialed.
+    ///
+    /// The polarity control for the override test: an accepting validator sits third in the
+    /// order, and a confirmed rejection must stop the walk before reaching it.
+    #[tokio::test]
+    async fn a_second_rejection_confirms_and_stops_the_walk() -> eyre::Result<()> {
+        let untouched_hits = Arc::new(AtomicUsize::new(0));
+        let endpoints = vec![
+            scripted_endpoint(REJECTION_BODY, Arc::new(AtomicUsize::new(0)))?,
+            scripted_endpoint(REJECTION_BODY, Arc::new(AtomicUsize::new(0)))?,
+            scripted_endpoint(DELIVERY_BODY, Arc::clone(&untouched_hits))?,
+        ];
+        let (keys, providers) = scripted_chain(&endpoints)?;
+
+        let outcome = walk_fallback_chain(
+            &[0_u8; 32],
+            keys.iter().cloned(),
+            &providers,
+            &Mutex::new(None),
+            &Mutex::new(BTreeSet::new()),
+            &Mutex::new(EndpointCache::default()),
+        )
+        .await;
+
+        assert_eq!(outcome, ForwardOutcome::Rejected("code -32000: nonce too low".to_string()));
+        assert_eq!(untouched_hits.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// One rejection with nothing after it but an unreachable endpoint: the sole verdict
+    /// stands, and the endpoint-local failure neither confirms nor erases it.
+    #[tokio::test]
+    async fn a_sole_unconfirmed_rejection_still_stands() -> eyre::Result<()> {
+        // A port with nothing behind it: the fallback fails fast as an endpoint problem.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = closed.local_addr()?;
+        drop(closed);
+        let endpoints = vec![
+            scripted_endpoint(REJECTION_BODY, Arc::new(AtomicUsize::new(0)))?,
+            format!("http://{addr}"),
+        ];
+        let (keys, providers) = scripted_chain(&endpoints)?;
+
+        let held = Mutex::new(None);
+        let outcome = walk_fallback_chain(
+            &[0_u8; 32],
+            keys.iter().cloned(),
+            &providers,
+            &held,
+            &Mutex::new(BTreeSet::new()),
+            &Mutex::new(EndpointCache::default()),
+        )
+        .await;
+
+        assert_eq!(outcome, ForwardOutcome::Rejected("code -32000: nonce too low".to_string()));
+        // The verdict was also banked for the caller: a budget cutting this walk short would
+        // read the same rejection back instead of erasing it.
+        assert!(held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|(_, reason)| reason == "code -32000: nonce too low"));
+        Ok(())
+    }
+
+    /// A held advisory rejection survives the per-transaction budget cutting the walk short:
+    /// the caller reads the banked verdict back instead of tallying the transaction as
+    /// unreached or abandoned, both of which claim no validator was ever handed it.
+    #[tokio::test]
+    async fn a_budget_cut_walk_still_reports_the_held_rejection() -> eyre::Result<()> {
+        let held = Mutex::new(Some((test_key(1), "code -32000: nonce too low".to_string())));
+        let cut = timeout(Duration::from_millis(0), std::future::pending::<ForwardOutcome>()).await;
+        eyre::ensure!(cut.is_err(), "a zero-budget timeout must elapse");
+
+        let outcome = expired_walk_outcome(cut, &held);
+
+        assert_eq!(outcome, ForwardOutcome::Rejected("code -32000: nonce too low".to_string()));
+        // The verdict is consumed on read, and the polarity control holds: with nothing
+        // banked, a cut walk reports that no endpoint was reached.
+        let cut = timeout(Duration::from_millis(0), std::future::pending::<ForwardOutcome>()).await;
+        eyre::ensure!(cut.is_err(), "a zero-budget timeout must elapse");
+        assert_eq!(expired_walk_outcome(cut, &held), ForwardOutcome::NoEndpointReached);
+        Ok(())
+    }
+
+    /// A transient validator-local error between the rejection and the delivery is not a
+    /// verdict: it must neither confirm the held rejection nor stop the walk from reaching
+    /// the validator that accepts.
+    #[tokio::test]
+    async fn a_transient_error_does_not_confirm_a_rejection() -> eyre::Result<()> {
+        let endpoints = vec![
+            scripted_endpoint(REJECTION_BODY, Arc::new(AtomicUsize::new(0)))?,
+            scripted_endpoint(TRANSIENT_BODY, Arc::new(AtomicUsize::new(0)))?,
+            scripted_endpoint(DELIVERY_BODY, Arc::new(AtomicUsize::new(0)))?,
+        ];
+        let (keys, providers) = scripted_chain(&endpoints)?;
+
+        let outcome = walk_fallback_chain(
+            &[0_u8; 32],
+            keys.iter().cloned(),
+            &providers,
+            &Mutex::new(None),
+            &Mutex::new(BTreeSet::new()),
+            &Mutex::new(EndpointCache::default()),
+        )
+        .await;
+
+        assert_eq!(outcome, ForwardOutcome::Delivered);
         Ok(())
     }
 

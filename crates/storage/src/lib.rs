@@ -20,6 +20,9 @@ pub mod certificate_pack;
 pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
+/// On-demand comparative benchmark harness across the `Database` backends (see `db_bench.rs`).
+#[cfg(test)]
+mod db_bench;
 pub mod epoch_records;
 pub(crate) mod error_latch;
 pub mod exec_state_pack;
@@ -27,6 +30,9 @@ pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
 pub mod mem_db;
+/// On-demand observation benchmark for consensus pack files (see `pack_bench.rs`).
+#[cfg(test)]
+mod pack_bench;
 pub mod pack_validate;
 pub mod redb;
 

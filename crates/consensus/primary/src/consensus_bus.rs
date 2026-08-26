@@ -620,6 +620,10 @@ impl ConsensusBusApp {
     }
 
     /// New epoch certs as they are recieved.
+    /// Any vote on the channel has been verified:
+    /// - It is for an EpochRecord we generated and is NOT certified yet.
+    /// - It is from a committee member for the epoch (from our EpochRecord).
+    /// - It has a valid signature.
     pub fn new_epoch_votes(&self) -> &impl TnSender<EpochVote> {
         &self.inner.new_epoch_votes
     }
@@ -631,6 +635,10 @@ impl ConsensusBusApp {
     }
 
     /// Provide a subscriber (Receiver) for new_epoch_votes.
+    /// Any vote on the channel has been verified:
+    /// - It is for an EpochRecord we generated and is NOT certified yet.
+    /// - It is from a committee member for the epoch (from our EpochRecord).
+    /// - It has a valid signature.
     pub fn subscribe_new_epoch_votes(&self) -> impl TnReceiver<EpochVote> {
         self.inner.new_epoch_votes.subscribe()
     }

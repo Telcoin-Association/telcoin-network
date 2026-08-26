@@ -68,6 +68,10 @@ enum EpochDbMessage {
     /// Retrieve an [`EpochCertificate`] by its epoch_hash digest without collapsing storage
     /// failures into absence: `Ok(None)` only when no certificate is stored for the digest.
     TryCertByDigest(EpochDigest, oneshot::Sender<Result<Option<EpochCertificate>, FetchError>>),
+    /// Retrieve an [`EpochRecord`] and its certificate (if stored) by epoch number in one turn,
+    /// so the caller pays a single actor round trip instead of a record read followed by a
+    /// separate cert read.
+    EpochByNumber(Epoch, oneshot::Sender<Option<(EpochRecord, Option<EpochCertificate>)>>),
     /// True if the database contains a record for the given epoch number.
     ContainsEpoch(Epoch, oneshot::Sender<bool>),
     /// True if the database contains a dummy record for the given epoch 0.
@@ -155,6 +159,19 @@ fn run_db_loop(
             }
             EpochDbMessage::TryCertByDigest(digest, tx) => {
                 let _ = tx.send(inner.try_cert_by_digest(digest));
+            }
+            EpochDbMessage::EpochByNumber(epoch, tx) => {
+                // Resolve record and cert in one actor turn: an atomic snapshot with no save
+                // interleaving between the two reads. Same failure-collapsing semantics as the
+                // separate `RecordByEpoch`/`CertByDigest` arms.
+                let result = match inner.record_by_epoch(epoch) {
+                    Some(record) => {
+                        let cert = inner.cert_by_digest(record.digest());
+                        Some((record, cert))
+                    }
+                    None => None,
+                };
+                let _ = tx.send(result);
             }
             EpochDbMessage::ContainsEpoch(epoch, tx) => {
                 let _ = tx.send(inner.contains_epoch(epoch));
@@ -812,13 +829,19 @@ impl EpochRecordDb {
     }
 
     /// Retrieve the epoch record and certificate (if available) by epoch number.
+    ///
+    /// One actor round trip: the record and cert are resolved together on the background thread
+    /// (see [`EpochDbMessage::EpochByNumber`]) rather than as two separate lookups.
     pub async fn get_epoch_by_number(
         &self,
         epoch: Epoch,
     ) -> Option<(EpochRecord, Option<EpochCertificate>)> {
-        let record = self.record_by_epoch(epoch).await?;
-        let cert = self.cert_by_digest(record.digest()).await;
-        Some((record, cert))
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(EpochDbMessage::EpochByNumber(epoch, tx)).await.is_ok() {
+            rx.await.unwrap_or(None)
+        } else {
+            None
+        }
     }
 
     /// Scan the historical epochs `0..tip_epoch` and return the first whose certificate (or record)

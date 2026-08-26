@@ -308,6 +308,39 @@ pub async fn sync_num_workers_from_chain(
     gas_accumulator: &GasAccumulator,
     epoch_first_block: u64,
 ) -> eyre::Result<()> {
+    let read_block = epoch_first_block.saturating_sub(1);
+    let num_workers = read_num_workers_at_epoch_entry(reth_env, epoch_first_block).await?;
+
+    let current = gas_accumulator.num_workers();
+    if current != num_workers {
+        info!(
+            target: "epoch-manager",
+            current,
+            on_chain = num_workers,
+            read_block,
+            "syncing GasAccumulator worker count to on-chain WorkerConfigs"
+        );
+    }
+    gas_accumulator.set_num_workers(num_workers);
+    Ok(())
+}
+
+/// Read the on-chain worker count for the epoch whose first block is `epoch_first_block`.
+///
+/// The count is the `WorkerConfigs` state at block `epoch_first_block - 1`, the previous epoch's
+/// closing block (`saturating_sub` makes epoch 0 read genesis state). This is the single read
+/// behind both consumers of the count: [`sync_num_workers_from_chain`] sizes the
+/// [`GasAccumulator`] with it, and the epoch manager stamps it onto the epoch's [`Committee`]
+/// (`Committee::number_of_workers`) so header validation and execution agree on the count.
+///
+/// READ-FAILURE POLICY: both failure classes halt (see [`sync_num_workers_from_chain`]); a
+/// [`Provider`](tn_reth::error::StateReadError::Provider) fault is retried briefly first.
+///
+/// [`Committee`]: tn_types::Committee
+pub(super) async fn read_num_workers_at_epoch_entry(
+    reth_env: &RethEnv,
+    epoch_first_block: u64,
+) -> eyre::Result<usize> {
     // `read_block` is derived from the caller's `epoch_first_block`, so the header resolved here is
     // the pin the retry below threads into every attempt.
     let read_block = epoch_first_block.saturating_sub(1);
@@ -324,19 +357,7 @@ pub async fn sync_num_workers_from_chain(
         .wrap_err_with(|| {
             format!("failed to read WorkerConfigs at block {read_block} while syncing worker count")
         })?;
-
-    let current = gas_accumulator.num_workers();
-    if current != num_workers {
-        info!(
-            target: "epoch-manager",
-            current,
-            on_chain = num_workers,
-            read_block,
-            "syncing GasAccumulator worker count to on-chain WorkerConfigs"
-        );
-    }
-    gas_accumulator.set_num_workers(num_workers);
-    Ok(())
+    Ok(num_workers)
 }
 
 /// Per-worker base fees for an entered epoch, read from the previous epoch's closing block by
@@ -1015,10 +1036,18 @@ where
         // validator's JSON-RPC endpoint via kademlia. validators that did not
         // configure RPC leave the descriptor `None`. fail fast on a misconfigured
         // endpoint rather than advertising something peers will reject.
-        let worker_rpc = self.builder.tn_config.node_info.p2p_info.worker.rpc.clone();
+        let worker_p2p = self
+            .builder
+            .tn_config
+            .node_info
+            .p2p_info
+            .worker(DEFAULT_WORKER_ID)
+            .ok_or_else(|| eyre!("no worker {DEFAULT_WORKER_ID} in node info"))?
+            .clone();
+        let worker_rpc = worker_p2p.rpc;
         if let Some(rpc) = &worker_rpc {
             rpc.validate()
-                .wrap_err("invalid `node_info.p2p_info.worker.rpc` endpoint in node config")?;
+                .wrap_err("invalid `node_info.p2p_info.workers[0].rpc` endpoint in node config")?;
         }
 
         // create long-running network task for worker
@@ -1029,7 +1058,7 @@ where
             self.key_config.clone(),
             self.consensus_db.clone(),
             node_task_spawner.clone(),
-            self.builder.tn_config.node_info.worker_network_address().clone(),
+            worker_p2p.network_address,
             worker_rpc,
         )?;
         let worker_network_handle = worker_network.network_handle();
@@ -1052,6 +1081,7 @@ where
         self.worker_network_handle = Some(WorkerNetworkHandle::new(
             worker_network_handle,
             node_task_spawner.clone(),
+            DEFAULT_WORKER_ID,
             epoch,
             network_config.chain_id(),
         ));

@@ -469,7 +469,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let task_manager = TaskManager::default();
         let handle =
-            WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0);
+            WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
 
         let connected_peers_calls = Arc::new(AtomicUsize::new(0));
         let calls = connected_peers_calls.clone();
