@@ -1010,12 +1010,7 @@ async fn catchup_heals_finality_lag_across_epoch_boundary() -> eyre::Result<()> 
     let output1 = manual_consensus_output(0, 0, 1, false);
     let genesis_header = chain.sealed_genesis_header();
     let payload1 = payload_with_base_fee(genesis_header.clone(), &output1, chain_fee, worker_id);
-    let block1 = reth_env.build_block_from_batch_payload(
-        payload1,
-        &vec![transfer],
-        genesis_header.hash(),
-        &[],
-    )?;
+    let block1 = reth_env.build_block_from_batch_payload(payload1, &vec![transfer])?;
     let block1_header = extend_canonical_chain(&reth_env, block1)?;
     reth_env.finalize_block(block1_header.clone())?;
     assert!(block1_header.gas_used > 0, "block 1's transfer must land for sharp gas assertions");
@@ -1033,12 +1028,7 @@ async fn catchup_heals_finality_lag_across_epoch_boundary() -> eyre::Result<()> 
     );
     let output2 = manual_consensus_output(1, 0, 2, false);
     let payload2 = payload_with_base_fee(block1_header.clone(), &output2, chain_fee, worker_id);
-    let block2 = reth_env.build_block_from_batch_payload(
-        payload2,
-        &vec![transfer2],
-        block1_header.hash(),
-        &[],
-    )?;
+    let block2 = reth_env.build_block_from_batch_payload(payload2, &vec![transfer2])?;
     let block2_header = extend_canonical_chain(&reth_env, block2)?;
     // extend committed the marker atomically with block 2; rewind it to block 1 (database rows
     // + watches) to model a pre-fix database whose separate marker write was lost in a crash
@@ -1083,8 +1073,7 @@ async fn catchup_heals_finality_lag_across_epoch_boundary() -> eyre::Result<()> 
     let no_txs: Vec<Vec<u8>> = vec![];
     let output3 = manual_consensus_output(2, 0, 3, true);
     let payload3 = payload_with_base_fee(block2_header.clone(), &output3, chain_fee, worker_id);
-    let block3 =
-        reth_env.build_block_from_batch_payload(payload3, &no_txs, block2_header.hash(), &[])?;
+    let block3 = reth_env.build_block_from_batch_payload(payload3, &no_txs)?;
     let block3_header = extend_canonical_chain(&reth_env, block3)?;
     // rewind the atomically-committed marker to block 2: the pre-fix lag now crosses the
     // epoch boundary
@@ -1218,8 +1207,7 @@ async fn finalized_marker_commits_atomically_with_blocks() -> eyre::Result<()> {
     let no_txs: Vec<Vec<u8>> = vec![];
     let output = manual_consensus_output(0, 0, 1, false);
     let payload = payload_with_base_fee(genesis_header.clone(), &output, MIN_PROTOCOL_BASE_FEE, 0);
-    let block =
-        reth_env.build_block_from_batch_payload(payload, &no_txs, genesis_header.hash(), &[])?;
+    let block = reth_env.build_block_from_batch_payload(payload, &no_txs)?;
     let block_header = extend_canonical_chain(&reth_env, block)?;
 
     // fresh read-only provider reads: the persisted marker already equals the persisted tip
@@ -1300,12 +1288,7 @@ async fn catchup_errors_on_worker_id_beyond_onchain_count() -> eyre::Result<()> 
     let genesis_header = chain.sealed_genesis_header();
     let output1 = manual_consensus_output(0, 0, 1, false);
     let payload1 = payload_with_base_fee(genesis_header.clone(), &output1, worker0_fee, 0);
-    let block1 = reth_env.build_block_from_batch_payload(
-        payload1,
-        &vec![transfer0],
-        genesis_header.hash(),
-        &[],
-    )?;
+    let block1 = reth_env.build_block_from_batch_payload(payload1, &vec![transfer0])?;
     let block1_header = extend_canonical_chain(&reth_env, block1)?;
 
     // block 2 (epoch 0): worker 1 with one executed transfer - the out-of-range datum.
@@ -1320,12 +1303,7 @@ async fn catchup_errors_on_worker_id_beyond_onchain_count() -> eyre::Result<()> 
     );
     let output2 = manual_consensus_output(0, 0, 2, false);
     let payload2 = payload_with_base_fee(block1_header.clone(), &output2, worker1_fee, 1);
-    let block2 = reth_env.build_block_from_batch_payload(
-        payload2,
-        &vec![transfer1],
-        block1_header.hash(),
-        &[],
-    )?;
+    let block2 = reth_env.build_block_from_batch_payload(payload2, &vec![transfer1])?;
     let block2_header = extend_canonical_chain(&reth_env, block2)?;
     reth_env.finalize_block(block2_header.clone())?;
 
@@ -2057,16 +2035,14 @@ async fn test_entry_reads_idle_worker_fee_from_closing_data() -> eyre::Result<()
     let genesis_header = chain.sealed_genesis_header();
     let output1 = manual_consensus_output(0, 0, 1, false);
     let payload1 = payload_with_base_fee(genesis_header.clone(), &output1, worker1_fee, 1);
-    let block1 =
-        reth_env.build_block_from_batch_payload(payload1, &no_txs, genesis_header.hash(), &[])?;
+    let block1 = reth_env.build_block_from_batch_payload(payload1, &no_txs)?;
     let block1_header = extend_canonical_chain(&reth_env, block1)?;
 
     // block 2: closes epoch 0 (worker 0 at MIN) — its 4th system call writes both workers'
     // next-epoch fees, pricing worker 1 from (worker1_fee, zero gas)
     let output2 = manual_consensus_output(1, 0, 2, true);
     let payload2 = payload_with_base_fee(block1_header.clone(), &output2, MIN_PROTOCOL_BASE_FEE, 0);
-    let block2 =
-        reth_env.build_block_from_batch_payload(payload2, &no_txs, block1_header.hash(), &[])?;
+    let block2 = reth_env.build_block_from_batch_payload(payload2, &no_txs)?;
     let block2_header = extend_canonical_chain(&reth_env, block2)?;
     assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 closed");
 
@@ -2101,15 +2077,13 @@ async fn test_entry_reads_idle_worker_fee_from_closing_data() -> eyre::Result<()
     // block 3 (epoch 1): worker 0 only - worker 1 goes idle
     let output3 = manual_consensus_output(0, 1, 3, false);
     let payload3 = payload_with_base_fee(block2_header.clone(), &output3, MIN_PROTOCOL_BASE_FEE, 0);
-    let block3 =
-        reth_env.build_block_from_batch_payload(payload3, &no_txs, block2_header.hash(), &[])?;
+    let block3 = reth_env.build_block_from_batch_payload(payload3, &no_txs)?;
     let block3_header = extend_canonical_chain(&reth_env, block3)?;
 
     // block 4: closes epoch 1 — prices worker 1 from the READ-SEEDED fee and zero gas
     let output4 = manual_consensus_output(1, 1, 4, true);
     let payload4 = payload_with_base_fee(block3_header.clone(), &output4, MIN_PROTOCOL_BASE_FEE, 0);
-    let block4 =
-        reth_env.build_block_from_batch_payload(payload4, &no_txs, block3_header.hash(), &[])?;
+    let block4 = reth_env.build_block_from_batch_payload(payload4, &no_txs)?;
     let block4_header = extend_canonical_chain(&reth_env, block4)?;
     assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 2, "epoch 1 closed");
 
@@ -2213,16 +2187,14 @@ async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
     let output1 = manual_consensus_output(1, 0, 1, true);
     let payload1 =
         payload_with_base_fee(genesis_header.clone(), &output1, MIN_PROTOCOL_BASE_FEE, 0);
-    let block1 =
-        reth_env.build_block_from_batch_payload(payload1, &no_txs, genesis_header.hash(), &[])?;
+    let block1 = reth_env.build_block_from_batch_payload(payload1, &no_txs)?;
     let block1_header = extend_canonical_chain(&reth_env, block1)?;
     assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 closed");
 
     // block 2 (epoch 1): worker 0 produces at its now-active static fee; worker 1 stays idle
     let output2 = manual_consensus_output(0, 1, 2, false);
     let payload2 = payload_with_base_fee(block1_header.clone(), &output2, WORKER0_FEE, 0);
-    let block2 =
-        reth_env.build_block_from_batch_payload(payload2, &no_txs, block1_header.hash(), &[])?;
+    let block2 = reth_env.build_block_from_batch_payload(payload2, &no_txs)?;
     let block2_header = extend_canonical_chain(&reth_env, block2)?;
     reth_env.finalize_block(block2_header.clone())?;
 
@@ -2250,8 +2222,7 @@ async fn mode_change_reentry_is_idempotent() -> eyre::Result<()> {
     // wait): block 3 extends epoch 1 at the SAME fee - mid-epoch fees are constants
     let output3 = manual_consensus_output(1, 1, 3, false);
     let payload3 = payload_with_base_fee(block2_header.clone(), &output3, WORKER0_FEE, 0);
-    let block3 =
-        reth_env.build_block_from_batch_payload(payload3, &no_txs, block2_header.hash(), &[])?;
+    let block3 = reth_env.build_block_from_batch_payload(payload3, &no_txs)?;
     let block3_header = extend_canonical_chain(&reth_env, block3)?;
     reth_env.finalize_block(block3_header)?;
 
@@ -2368,12 +2339,8 @@ async fn test_boundary_added_worker_data_written_at_creation_close() -> eyre::Re
     let output1 = manual_consensus_output(0, 0, 1, false);
     let payload1 =
         payload_with_base_fee(genesis_header.clone(), &output1, MIN_PROTOCOL_BASE_FEE, 0);
-    let block1 = reth_env.build_block_from_batch_payload(
-        payload1,
-        &vec![set_config_tx, set_count_tx],
-        genesis_header.hash(),
-        &[],
-    )?;
+    let block1 =
+        reth_env.build_block_from_batch_payload(payload1, &vec![set_config_tx, set_count_tx])?;
     let block1_header = extend_canonical_chain(&reth_env, block1)?;
     assert!(block1_header.gas_used > 0, "the governance transactions must have executed");
 
@@ -2388,8 +2355,7 @@ async fn test_boundary_added_worker_data_written_at_creation_close() -> eyre::Re
     let output2 = manual_consensus_output(1, 0, 2, true);
     let no_txs: Vec<Vec<u8>> = vec![];
     let payload2 = payload_with_base_fee(block1_header.clone(), &output2, MIN_PROTOCOL_BASE_FEE, 0);
-    let block2 =
-        reth_env.build_block_from_batch_payload(payload2, &no_txs, block1_header.hash(), &[])?;
+    let block2 = reth_env.build_block_from_batch_payload(payload2, &no_txs)?;
     let block2_header = extend_canonical_chain(&reth_env, block2)?;
     assert_eq!(reth_env.epoch_state_from_canonical_tip()?.epoch, 1, "epoch 0 closed");
 

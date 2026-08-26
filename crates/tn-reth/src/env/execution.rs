@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use alloy::primitives::FixedBytes;
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
-use reth_chain_state::{DeferredTrieData, ExecutedBlock, NewCanonicalChain};
+use reth_chain_state::{ComputedTrieData, ExecutedBlock, NewCanonicalChain};
 use reth_errors::{BlockExecutionError, BlockValidationError};
 use reth_evm::{
     execute::{BlockBuilder as _, BlockBuilderOutcome},
@@ -60,7 +60,7 @@ use reth_provider::{
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase, State};
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use tn_types::{
-    deconstruct_nonce, ConsensusNumHash, EngineUpdate, Round, SealedHeader, TransactionSigned, B256,
+    deconstruct_nonce, ConsensusNumHash, EngineUpdate, Round, SealedHeader, TransactionSigned,
 };
 use tracing::{debug, error, info, warn};
 
@@ -81,12 +81,21 @@ impl RethEnv {
     /// validation (`InvalidTx`, e.g. duplicates across workers' batches) are dropped
     /// deterministically — see the module docs for why dropping is fork-safe. Any
     /// other execution error fails the whole attempt.
+    ///
+    /// The returned block's trie bundle holds only this block's own sorted state and
+    /// trie-update deltas. It never carries the cumulative ancestor overlay, so
+    /// `anchored_trie_input` is `None`. No consumer on the node's path reads that
+    /// overlay: persistence and canonical-chain notifications use the per-block deltas,
+    /// and state roots and RPC proofs over unpersisted blocks assemble their trie input
+    /// from the same per-block deltas in reth's `MemoryOverlayStateProvider`. Building
+    /// the overlay was also not O(1) here: the parent's bundle keeps the overlay `Arc`s
+    /// alive, so reth's parent-reuse fast path (`Arc::make_mut`) deep-copies the whole
+    /// cumulative overlay for every block. One `ConsensusOutput` of `N` blocks with `M`
+    /// state updates each paid `O(N^2 * M)` copy work and transient memory (#1266).
     pub fn build_block_from_batch_payload(
         &self,
         payload: TNPayload,
         transactions: &Vec<Vec<u8>>,
-        anchor_hash: B256,
-        ancestors: &[DeferredTrieData],
     ) -> TnRethResult<ExecutedBlock> {
         let parent_header = payload.parent_header.clone();
         debug!(target: "engine", ?parent_header, "retrieving state for next block");
@@ -185,11 +194,11 @@ impl RethEnv {
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
         let block_execution_output =
             BlockExecutionOutput { result: execution_result, state: db.take_bundle() };
-        let computed_trie_data = DeferredTrieData::sort_and_build_trie_input(
-            Arc::new(hashed_state),
-            Arc::new(trie_updates),
-            anchor_hash,
-            ancestors,
+        let (sorted_hashed_state, sorted_trie_updates) =
+            rayon::join(|| hashed_state.into_sorted(), || trie_updates.into_sorted());
+        let computed_trie_data = ComputedTrieData::without_trie_input(
+            Arc::new(sorted_hashed_state),
+            Arc::new(sorted_trie_updates),
         );
         let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
             Arc::new(block),

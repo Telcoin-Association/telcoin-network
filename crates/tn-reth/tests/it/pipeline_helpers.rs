@@ -255,9 +255,7 @@ impl PipelineTestEnv {
         let payload = TNPayload::new_for_test(self.canonical_header.clone(), &output);
 
         // 3. Build and execute block
-        let anchor_hash = self.canonical_header.hash();
-        let block =
-            self.reth_env.build_block_from_batch_payload(payload, &txs, anchor_hash, &[])?;
+        let block = self.reth_env.build_block_from_batch_payload(payload, &txs)?;
 
         // 4. Update canonical in-memory state
         let canonical_header = block.recovered_block.clone_sealed_header();
@@ -404,4 +402,22 @@ fn consensus_output_for_test(
         VecDeque::new(),
         Vec::new(),
     )
+}
+
+/// A built block retains no cumulative ancestor trie overlay (#1266).
+///
+/// No consumer on the node's path reads `anchored_trie_input`: persistence and
+/// canonical-chain notifications use the per-block sorted deltas, and state roots and
+/// RPC proofs over unpersisted blocks assemble their trie input from those same deltas.
+/// Building the cumulative overlay cost `O(N^2 * M)` copy work and transient memory per
+/// consensus output, because reth's parent-reuse fast path deep-copies it for every
+/// block whose parent bundle is still alive.
+#[test]
+fn test_built_block_retains_no_cumulative_trie_overlay() -> eyre::Result<()> {
+    let mut env = PipelineTestEnv::new();
+    let first = env.execute_block(Vec::new())?;
+    let second = env.execute_block(Vec::new())?;
+    assert!(first.trie_data_handle().wait_cloned().anchored_trie_input.is_none());
+    assert!(second.trie_data_handle().wait_cloned().anchored_trie_input.is_none());
+    Ok(())
 }

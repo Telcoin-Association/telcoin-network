@@ -871,9 +871,7 @@ pub fn execute_payload_and_update_canonical_chain(
     payload: TNPayload,
     transactions: Vec<Vec<u8>>,
 ) -> eyre::Result<ExecutedBlock> {
-    let anchor_hash = payload.parent_header.hash();
-    let block =
-        reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
+    let block = reth_env.build_block_from_batch_payload(payload, &transactions)?;
     // update chain state - normally handled by tn_engine::payload_builder
     let canonical_header = block.recovered_block.clone_sealed_header();
     let canonical_in_memory_state = reth_env.blockchain_provider().canonical_in_memory_state();

@@ -6,8 +6,7 @@ use crate::error::{EngineResult, TnEngineError};
 use tn_reth::{
     error::TnRethError,
     payload::{BuildArguments, TNPayload},
-    CanonicalInMemoryState, DeferredTrieData, ExecutedBlock, NewCanonicalChain, ProviderError,
-    RethEnv,
+    CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, ProviderError, RethEnv,
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, EngineUpdate, Hash as _, SealedHeader, B256,
@@ -96,13 +95,11 @@ pub fn execute_consensus_output(
     // ensure at least 1 block for empty output when close_epoch is true
     let mut executed_blocks = Vec::with_capacity(batches.len().max(1));
     let canonical_in_memory_state = reth_env.canonical_in_memory_state();
-    let anchor_hash = canonical_header.hash();
     // The pre-output canonical tip. Each block eagerly advances the shared in-memory state
     // (see `execute_payload`), but the durable commit happens only after the whole output builds.
     // If a later block fails, the earlier blocks' advance is rolled back to this header so no
     // phantom canonical head survives (see `rollback_in_memory_output`).
     let anchor_header = canonical_header.clone();
-    let mut ancestors: Vec<DeferredTrieData> = Vec::with_capacity(batches.len().max(1));
 
     if batches.is_empty() {
         if !output.close_epoch() {
@@ -171,8 +168,6 @@ pub fn execute_consensus_output(
             &mut executed_blocks,
             &reth_env,
             &canonical_in_memory_state,
-            anchor_hash,
-            &ancestors,
         );
         // On failure, revert the in-memory advance applied by any earlier block of this output so
         // the propagated error never leaves a phantom canonical head observable to RPC. The leader
@@ -181,9 +176,6 @@ pub fn execute_consensus_output(
         canonical_header = executed.inspect_err(|_| {
             rollback_in_memory_output(&canonical_in_memory_state, &anchor_header, &executed_blocks)
         })?;
-        if let Some(last_block) = executed_blocks.last() {
-            ancestors.push(last_block.trie_data_handle());
-        }
     } else {
         // loop and construct blocks from batches with transactions
         for (batch_index, (cert_idx, batch_idx_in_cert)) in batches.into_iter().enumerate() {
@@ -220,8 +212,6 @@ pub fn execute_consensus_output(
                 &mut executed_blocks,
                 &reth_env,
                 &canonical_in_memory_state,
-                anchor_hash,
-                &ancestors,
             );
             // On failure of a later block, revert the in-memory advance applied by the earlier
             // blocks of this output so the propagated (node-halting) error never leaves a phantom
@@ -236,9 +226,6 @@ pub fn execute_consensus_output(
                     &executed_blocks,
                 )
             })?;
-            if let Some(last_block) = executed_blocks.last() {
-                ancestors.push(last_block.trie_data_handle());
-            }
             // Advances gas accounting before durable finalization, safe for the reason documented
             // at the top of this function. `inc_block` skips any block whose `gas_used` is zero, so
             // a restart replay does not inflate the per-worker block count.
@@ -289,12 +276,9 @@ fn execute_payload(
     executed_blocks: &mut Vec<ExecutedBlock>,
     reth_env: &RethEnv,
     canonical_in_memory_state: &CanonicalInMemoryState,
-    anchor_hash: B256,
-    ancestors: &[DeferredTrieData],
 ) -> EngineResult<SealedHeader> {
     // execute
-    let next_canonical_block =
-        reth_env.build_block_from_batch_payload(payload, transactions, anchor_hash, ancestors)?;
+    let next_canonical_block = reth_env.build_block_from_batch_payload(payload, transactions)?;
     debug!(target: "engine", ?next_canonical_block, "block executed");
 
     // update header for next block execution in loop
