@@ -3,7 +3,7 @@
 //!
 //! A node advertises an optional JSON-RPC endpoint to peers over kademlia so
 //! wallets/dapps can discover where to submit transactions. That endpoint lives
-//! in `node_info.p2p_info.worker.rpc` (type `Option<RpcInfo>`). The runtime
+//! in `node_info.p2p_info.workers[0].rpc` (type `Option<RpcInfo>`). The runtime
 //! reads it at node startup, validates it, and hands it to the worker network
 //! for advertisement - this command only populates the config field.
 //!
@@ -20,7 +20,7 @@ use crate::args::clap_url_parser;
 use clap::Args;
 use eyre::WrapErr as _;
 use tn_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo, TelcoinDirs};
-use tn_types::RpcInfo;
+use tn_types::{RpcInfo, DEFAULT_WORKER_ID};
 use tracing::{info, warn};
 use url::Url;
 
@@ -87,8 +87,12 @@ impl SetRpcArgs {
                 },
             )?;
 
+        // the RPC endpoint is advertised on worker 0's record
+        let worker = node_info.p2p_info.worker_mut(DEFAULT_WORKER_ID).ok_or_else(|| {
+            eyre::eyre!("node-info.yaml at {} has no worker 0", dir.node_info_path().display())
+        })?;
         if self.clear {
-            if node_info.p2p_info.worker.rpc.take().is_some() {
+            if worker.rpc.take().is_some() {
                 warn!(target: "tn::keytool", "cleared existing worker RPC endpoint");
             } else {
                 info!(target: "tn::keytool", "no worker RPC endpoint set; nothing to clear");
@@ -97,15 +101,16 @@ impl SetRpcArgs {
             // clap guarantees --http is present unless --clear.
             let rpc = build_worker_rpc(self.http.clone(), self.ws.clone())?
                 .ok_or_else(|| eyre::eyre!("clap requires --http unless --clear"))?;
-            if node_info.p2p_info.worker.rpc.is_some() {
+            if worker.rpc.is_some() {
                 warn!(target: "tn::keytool", "overwriting existing worker RPC endpoint");
             }
-            node_info.p2p_info.worker.rpc = Some(rpc);
+            worker.rpc = Some(rpc);
         }
+        let worker_rpc = worker.rpc.clone();
 
         Config::write_to_path(dir.node_info_path(), &node_info, ConfigFmt::YAML)?;
         println!("OK  node-info.yaml updated: {}", dir.node_info_path().display());
-        match &node_info.p2p_info.worker.rpc {
+        match &worker_rpc {
             Some(rpc) => {
                 println!("    worker rpc http: {}", rpc.http);
                 if let Some(ws) = &rpc.ws {

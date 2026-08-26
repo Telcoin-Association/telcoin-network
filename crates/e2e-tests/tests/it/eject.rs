@@ -778,10 +778,16 @@ async fn test_validator_ejected_from_current_committee_mid_epoch() -> eyre::Resu
 /// The detectors, in order: (a) the restarted node's consensus height re-advances past
 /// everything it could have held at death — commits it can only acquire by verifying the
 /// 5-member committee's certificates — while the fleet is still in epoch E; (b) the E -> E+1
-/// boundary closes on all six nodes; (c) epoch records 0..=E verify on all six nodes with
-/// final-state HASH equality (the record-divergence detector); (d) a transfer submitted through
-/// the RESTARTED node's own RPC confirms, and the burned validator keeps following the chain as
-/// an observer.
+/// boundary closes on the five live nodes; (c) epoch records 0..=E verify on the five live
+/// nodes with final-state HASH equality (the record-divergence detector); (d) a transfer
+/// submitted through the RESTARTED node's own RPC confirms, and record E's certified committee
+/// excludes the burned validator's BLS key.
+///
+/// The burned validator's node stays up as scenario background only. A mid-epoch ejection is an
+/// emergency governance boot: the ejected validator loses all authority, and peers may ban its
+/// node outright when its in-flight epoch-close vote trips the fatal unauthorized-author gossip
+/// penalty at the boundary (#1244). Its post-ejection progress is therefore unspecified, and no
+/// detector reads it.
 async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Result<()> {
     let _permit = acquire_test_permit();
 
@@ -817,7 +823,6 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
     let (procs, mut endpoints) = start_nodes(temp_path, &nodes, "eject_restart", 1)?;
     // Guard ensures processes are killed on drop (normal return, error, or panic).
     let mut guard = ProcessGuard::new(procs);
-    let victim_url = endpoints[4].http_url.clone();
     let rpc_url = endpoints[0].http_url.clone();
 
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
@@ -1041,8 +1046,11 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
     .await?;
     info!(target: "eject-test", epoch = e, "restarted node rejoined consensus mid-epoch");
 
-    // ---- (b) The E -> E+1 boundary closes on ALL SIX nodes ----
-    for (idx, endpoint) in endpoints.iter().enumerate() {
+    // ---- (b) The E -> E+1 boundary closes on the FIVE LIVE nodes ----
+    // The burned validator (index 4) is excluded. Whether it crosses the boundary depends on
+    // whether the certified record E reaches it before its peers ban it (#1244), and the
+    // intended semantics of ejection make no promise either way.
+    for (idx, endpoint) in endpoints.iter().enumerate().filter(|(idx, _)| *idx != 4) {
         assert_epoch_reached(
             &endpoint.http_url,
             e + 1,
@@ -1050,23 +1058,29 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
         )
         .await?;
     }
-    info!(target: "eject-test", epoch = e + 1, "boundary closed on all six nodes");
+    info!(target: "eject-test", epoch = e + 1, "boundary closed on the five live nodes");
 
-    // ---- (c) THE RECORD-DIVERGENCE ASSERT: records 0..=E hash-identical on all six ----
+    // ---- (c) THE RECORD-DIVERGENCE ASSERT: records 0..=E hash-identical on the five live ----
     // `assert_epoch_records_verify` requires every node to serve a CERTIFIED record for every
     // epoch AND to have executed each record's final block with the exact hash the record
     // commits to. An entry view that dropped the ejected leader's rewards row surfaces here:
     // divergent withdrawals in the closing block -> divergent closing-block hash -> divergent
     // record digest, reported as a hash mismatch on the restarted node.
-    assert_epoch_records_verify(&endpoints, 0..=e, RESTART_EPOCH_DURATION * 2).await?;
-    info!(target: "eject-test", epoch = e, "epoch records verify hash-identical on all six nodes");
+    // The burned validator (index 4) is excluded: once banned it cannot fetch records it does
+    // not already hold, so the slices below cover the four committee nodes and the follower.
+    assert_epoch_records_verify(&endpoints[..4], 0..=e, RESTART_EPOCH_DURATION * 2).await?;
+    assert_epoch_records_verify(&endpoints[5..], 0..=e, RESTART_EPOCH_DURATION * 2).await?;
+    info!(
+        target: "eject-test",
+        epoch = e, "epoch records verify hash-identical on the five live nodes"
+    );
 
-    // ---- (d) Liveness through the restarted node; the burned validator keeps following ----
+    // ---- (d) Liveness through the restarted node ----
     // Submit the transfer via the RESTARTED node's own RPC: its pool/batch path must be live
     // again, not merely its sync path.
     let recipient = Address::from_slice(&[0x77; 20]);
     let transfer = governance_wallet.create_eip1559_encoded(
-        chain.clone(),
+        chain,
         None,
         100,
         Some(recipient),
@@ -1080,22 +1094,20 @@ async fn test_committee_member_restarted_mid_epoch_after_ejection() -> eyre::Res
     let tx_block = get_tx_receipt_block(&endpoints[1].http_url, &hash.to_string())?;
     info!(target: "eject-test", tx_block, "post-restart transfer confirmed via the restarted node");
 
-    // under skip-empty-execution no block follows the transfer until the next epoch close, so
-    // give the observer probe below a prompt block
-    let follow_up = governance_wallet.create_eip1559_encoded(
-        chain,
-        None,
-        100,
-        Some(recipient),
-        parse_ether("1")?,
-        Bytes::default(),
+    // ---- Authority revocation: record E's committee excludes the burned validator ----
+    // A mid-epoch ejection is an emergency governance boot (#1244): the ejected validator
+    // loses all authority. The certified record for the burn epoch E is the deterministic
+    // witness: its committee is the post-shrink set, so the victim's BLS key must be absent.
+    // Read it from node 0; the victim's own node is not probed (see the doc comment).
+    let victim_node_info = Config::load_from_path_or_default::<NodeInfo>(
+        temp_path.join(nodes[4].0).join("node-info.yaml").as_path(),
+        ConfigFmt::YAML,
+    )?;
+    let record_e = fetch_verified_epoch_record(&rpc_url, e, RESTART_EPOCH_DURATION * 2).await?;
+    eyre::ensure!(
+        record_e.committee.iter().all(|k| k != &victim_node_info.bls_public_key),
+        "burned validator's BLS key must be absent from record {e}'s committee"
     );
-    let _pending = restarted_provider.send_raw_transaction(&follow_up).await?;
-
-    // the burned validator's node keeps following as an observer: its head advances past the
-    // transfer's block (the follow-up's block arrives within ~1-2s; a dropped follow-up degrades
-    // to the next epoch close and the timeout stays as a hang ceiling)
-    wait_for_head_at_least(&victim_url, tx_block + 1, RESTART_EPOCH_DURATION * 3).await?;
 
     Ok(())
 }
