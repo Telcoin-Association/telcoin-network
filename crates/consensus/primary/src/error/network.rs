@@ -45,6 +45,12 @@ pub(crate) enum PrimaryNetworkError {
     /// Temparily disabled, will be back soon.
     #[error("Peer {0} is not in the committee!")]
     PeerNotInCommittee(Box<BlsPublicKey>),
+    /// Vote for an invalid EpochRecord.
+    /// EpochRecords are deterministic so a vote for an invalid record
+    /// (does not match ours) indicates a bogus vote (or we have forked...).
+    /// Assume it's a bogus vote.
+    #[error("Received a vote for epoch {0}, got {1} but expected {2}")]
+    InvalidEpochVote(Epoch, EpochDigest, EpochDigest),
     /// Unavaliable epoch (either it is invalid or this node does not have it).
     #[error("Unknown epoch record: {0}")]
     UnavailableEpoch(Epoch),
@@ -100,7 +106,8 @@ impl PrimaryNetworkError {
     /// True for the envelope faults [`Self::Decode`] / [`Self::InvalidTopic`] and for the embedded
     /// signed-payload content faults reachable from the gossip handler: [`Self::Certificate`] (a
     /// malformed / unsigned / inquorate / bad-signature certificate), [`Self::InvalidHeader`] (an
-    /// `EpochVote` failing its signature or committee-membership check), and
+    /// `EpochVote` failing its signature or committee-membership check), [`Self::InvalidEpochVote`]
+    /// (an `EpochVote` whose epoch-record digest does not match the one we hold), and
     /// [`Self::UnknownConsensusHeaderCert`] (a `ConsensusResult` with a bad signature). The
     /// remaining arms are transport/local/benign and keep their relayer / no-penalty attribution;
     /// [`Self::PeerNotInCommittee`] is content-determined but already maps to no penalty, so the
@@ -114,6 +121,7 @@ impl PrimaryNetworkError {
             | PrimaryNetworkError::InvalidTopic
             | PrimaryNetworkError::InvalidHeader(_)
             | PrimaryNetworkError::Certificate(_)
+            | PrimaryNetworkError::InvalidEpochVote(_, _, _)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => true,
             PrimaryNetworkError::StdIo(_)
             | PrimaryNetworkError::Storage(_)
@@ -179,6 +187,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             // No penalty so honest sync flows are not banned during catch-up.
             PrimaryNetworkError::UnknownConsensusOutput(_) => None,
             PrimaryNetworkError::InvalidRequest(_)
+            | PrimaryNetworkError::InvalidEpochVote(_, _, _)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_) => Some(Penalty::Mild),
             PrimaryNetworkError::InvalidEpochRequest
             | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),

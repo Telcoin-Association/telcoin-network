@@ -141,7 +141,9 @@ mod tests {
     use crate::{cli::Cli, NoArgs};
     use clap::Parser;
     use tn_config::{Config, ConfigFmt, ConfigTrait, NodeInfo};
-    use tn_types::{hex, verify_proof_of_possession_bls, Address, BlsPublicKey, RpcInfo};
+    use tn_types::{
+        hex, verify_proof_of_possession_bls, Address, BlsPublicKey, RpcInfo, DEFAULT_WORKER_ID,
+    };
     use url::Url;
 
     /// Test that generate keys command works.
@@ -472,7 +474,7 @@ mod tests {
 
         // worker rpc is exactly what we passed in.
         assert_eq!(
-            node_info.p2p_info.worker.rpc,
+            node_info.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc,
             Some(RpcInfo { http, ws: Some(ws) }),
             "worker rpc should match the provided endpoints"
         );
@@ -510,7 +512,7 @@ mod tests {
         )
         .expect("node info loaded");
         assert!(
-            node_info.p2p_info.worker.rpc.is_none(),
+            node_info.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_none(),
             "worker rpc should stay unset without --rpc-http"
         );
     }
@@ -700,7 +702,10 @@ mod tests {
         let before = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
             .expect("node info loaded before set-rpc");
         // the worker starts with no advertised rpc.
-        assert!(before.p2p_info.worker.rpc.is_none(), "worker rpc should start unset");
+        assert!(
+            before.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_none(),
+            "worker rpc should start unset"
+        );
 
         let http = Url::parse("https://validator.example.com:8545/").expect("http url");
         let ws = Url::parse("wss://validator.example.com:8546/").expect("ws url");
@@ -713,7 +718,7 @@ mod tests {
 
         // worker rpc is exactly what we passed in.
         assert_eq!(
-            after.p2p_info.worker.rpc,
+            after.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc,
             Some(RpcInfo { http, ws: Some(ws) }),
             "worker rpc should match the provided endpoints"
         );
@@ -743,14 +748,20 @@ mod tests {
             .expect("set-rpc sets worker rpc");
         let set = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
             .expect("node info loaded after set");
-        assert!(set.p2p_info.worker.rpc.is_some(), "worker rpc should be set before clearing");
+        assert!(
+            set.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_some(),
+            "worker rpc should be set before clearing"
+        );
 
         SetRpcArgs { http: None, ws: None, clear: true }
             .execute(&datadir)
             .expect("set-rpc clears worker rpc");
         let cleared = Config::load_from_path::<NodeInfo>(&node_info_path, ConfigFmt::YAML)
             .expect("node info loaded after clear");
-        assert!(cleared.p2p_info.worker.rpc.is_none(), "worker rpc should be cleared");
+        assert!(
+            cleared.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_none(),
+            "worker rpc should be cleared"
+        );
     }
 
     /// `set-rpc` errors with a "generate keys first" hint when `node-info.yaml`
@@ -795,7 +806,10 @@ mod tests {
             ConfigFmt::YAML,
         )
         .expect("node info still loads");
-        assert!(after.p2p_info.worker.rpc.is_none(), "rejected endpoint must not be persisted");
+        assert!(
+            after.p2p_info.worker(DEFAULT_WORKER_ID).expect("worker 0").rpc.is_none(),
+            "rejected endpoint must not be persisted"
+        );
     }
 
     /// The `set-rpc` clap relations: `--http` is required unless `--clear`, and
