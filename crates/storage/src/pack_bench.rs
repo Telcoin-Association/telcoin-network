@@ -72,7 +72,6 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 use crate::{
     archive::pack::FileBackend,
     consensus_pack::{test::make_wide_test_output, ConsensusPack, PackError, DATA_NAME},
-    consensus_pack_direct::ConsensusPackDirect,
     mem_db::MemDatabase,
 };
 
@@ -218,7 +217,6 @@ macro_rules! impl_bench_pack {
 }
 
 impl_bench_pack!(ConsensusPack);
-impl_bench_pack!(ConsensusPackDirect);
 
 // ---- workload sizing (representative & scalable; this is an on-demand perf test) ----
 
@@ -651,11 +649,6 @@ fn pack_file_bench() {
                 println!("  running battery for {thr} ...");
                 let col = run_battery::<ConsensusPack>(&fx, backend, width).await;
                 report.push(&thr, col);
-
-                let dir = format!("{blabel}-dir x{width}");
-                println!("  running battery for {dir} ...");
-                let col = run_battery::<ConsensusPackDirect>(&fx, backend, width).await;
-                report.push(&dir, col);
             }
         }
         report.print();

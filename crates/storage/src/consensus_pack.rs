@@ -614,7 +614,7 @@ impl ConsensusPack {
 pub const DATA_NAME: &str = Inner::DATA_NAME;
 
 #[derive(Debug)]
-pub(crate) struct Inner {
+struct Inner {
     data: Pack<PackRecord>,
     /// Positional index pointing to the first byte of ConsensusHeader, the first byte of the first
     /// Batch and the byte past the end of the ConsensusHeader at a position. In short the first
@@ -723,18 +723,8 @@ impl Inner {
     }
 
     /// Return the version of the underlying data pack file.
-    pub(crate) fn version(&self) -> u16 {
+    fn version(&self) -> u16 {
         self.data.version()
-    }
-
-    /// Compression codec of the underlying data pack file.
-    pub(crate) fn compression(&self) -> PackCompression {
-        self.data.header().compression()
-    }
-
-    /// The epoch metadata (committee + epoch) persisted in this pack.
-    pub(crate) fn epoch_meta(&self) -> &EpochMeta {
-        &self.epoch_meta
     }
 
     /// Open a PDX index file and return the open index.
@@ -787,7 +777,7 @@ impl Inner {
 
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
-    pub(crate) fn open_append<P: AsRef<Path>>(
+    fn open_append<P: AsRef<Path>>(
         path: P,
         previous_epoch: &EpochRecord,
         committee: Committee,
@@ -849,7 +839,7 @@ impl Inner {
     }
 
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
-    pub(crate) fn open_append_exists<P: AsRef<Path>>(
+    fn open_append_exists<P: AsRef<Path>>(
         path: P,
         epoch: Epoch,
         backend: FileBackend,
@@ -883,7 +873,7 @@ impl Inner {
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
-    pub(crate) fn open_static<P: AsRef<Path>>(
+    fn open_static<P: AsRef<Path>>(
         path: P,
         epoch: Epoch,
         backend: FileBackend,
@@ -919,7 +909,7 @@ impl Inner {
     }
 
     /// Create a new set of epoch static files to write consensus output into.
-    pub(crate) async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
+    async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
@@ -1036,10 +1026,7 @@ impl Inner {
 
     /// Save all the batches and consensus header from the ConsensusOutput the pack file.
     /// Returns the number of bytes the encoded ConsensusOutput takes in the pack file.
-    pub(crate) fn save_consensus_output(
-        &mut self,
-        consensus: &ConsensusOutput,
-    ) -> Result<u64, PackError> {
+    fn save_consensus_output(&mut self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
         let consensus_number = consensus.number();
         // Adjusted consensus index for this pack file.
         let consensus_idx = consensus_number.saturating_sub(self.epoch_meta.start_consensus_number);
@@ -1093,13 +1080,13 @@ impl Inner {
     }
 
     /// True if consensus header by digest is found by digest.
-    pub(crate) fn contains_consensus_header_number(&self, number: u64) -> bool {
+    fn contains_consensus_header_number(&self, number: u64) -> bool {
         number >= self.epoch_meta.start_consensus_number
             && number < self.consensus_pos_idx.len() as u64 + self.epoch_meta.start_consensus_number
     }
 
     /// True if consensus header is found by digest.
-    pub(crate) fn contains_consensus_header(&mut self, digest: ConsensusHeaderDigest) -> bool {
+    fn contains_consensus_header(&mut self, digest: ConsensusHeaderDigest) -> bool {
         // This is a bit more complicated (the pos file_len check) because in a very rare
         // case of repairing a damaged pack we might have something in the index not in the
         // pack file (yet).
@@ -1119,7 +1106,7 @@ impl Inner {
     /// hardening. Under the epoch-gated seed-signature serde, pre-fork packs stay decodable and
     /// the logged arms should never fire - they are the difference between a loud signal and
     /// silent chain corruption for every future format change.
-    pub(crate) fn consensus_header_by_digest(
+    fn consensus_header_by_digest(
         &mut self,
         digest: ConsensusHeaderDigest,
     ) -> Option<ConsensusHeader> {
@@ -1163,10 +1150,7 @@ impl Inner {
     }
 
     /// Retrieve a consensus header by number.
-    pub(crate) fn consensus_header_by_number(
-        &mut self,
-        number: u64,
-    ) -> Result<ConsensusHeader, PackError> {
+    fn consensus_header_by_number(&mut self, number: u64) -> Result<ConsensusHeader, PackError> {
         if number < self.epoch_meta.start_consensus_number {
             return Err(PackError::ConsensusNumberTooLow);
         }
@@ -1181,7 +1165,7 @@ impl Inner {
         self.data.fetch(pos)?.into_consensus()
     }
 
-    pub(crate) fn persist(&mut self) -> Result<(), PackError> {
+    fn persist(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
             self.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
             self.consensus_pos_idx.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
@@ -1192,7 +1176,7 @@ impl Inner {
     }
 
     // Inner method (sibling of Inner::persist, consensus_pack.rs:1051) — flush only, no syncs:
-    pub(crate) fn flush_data(&mut self) -> Result<(), PackError> {
+    fn flush_data(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
             self.data.flush().map_err(|e| PackError::PersistError(e.to_string()))?;
         }
@@ -1200,7 +1184,7 @@ impl Inner {
     }
 
     /// Read and return all the bytes for consensus number (all batches and the consensus header).
-    pub(crate) fn bytes_for_consensus(&mut self, number: u64) -> Result<Vec<u8>, PackError> {
+    fn bytes_for_consensus(&mut self, number: u64) -> Result<Vec<u8>, PackError> {
         // Validate the range like consensus_header_by_number; without this a number below
         // start_consensus_number would saturate to index 0 and silently return the epoch's
         // first output instead of an error.
@@ -1224,7 +1208,7 @@ impl Inner {
 
     /// Return the byte offset in the data file just past the end of the consensus output for
     /// `number` (the `output_end` of its index entry). Range-checked like `bytes_for_consensus`.
-    pub(crate) fn output_end_for_consensus(&mut self, number: u64) -> Result<u64, PackError> {
+    fn output_end_for_consensus(&mut self, number: u64) -> Result<u64, PackError> {
         if number < self.epoch_meta.start_consensus_number {
             return Err(PackError::ConsensusNumberTooLow);
         }
@@ -1247,7 +1231,7 @@ impl Inner {
     /// header's sub-dag as the epoch seed chain anchor, and an absent anchor means "start a fresh
     /// chain", so collapsing an error into `None` would silently re-root the chain and fork
     /// execution permanently.
-    pub(crate) fn latest_consensus_header(&mut self) -> Result<Option<ConsensusHeader>, PackError> {
+    fn latest_consensus_header(&mut self) -> Result<Option<ConsensusHeader>, PackError> {
         if self.consensus_pos_idx.is_empty() {
             return Ok(None);
         }
@@ -1256,9 +1240,7 @@ impl Inner {
         self.consensus_header_by_number(latest_number).map(Some)
     }
 
-    pub(crate) fn read_last_committed(
-        &mut self,
-    ) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
+    fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
         let mut res = HashMap::new();
         let iter = self.consensus_pos_idx.rev_iter(50)?;
         for pos in iter {
@@ -1277,7 +1259,7 @@ impl Inner {
         Ok(res)
     }
 
-    pub(crate) fn read_latest_commit_with_final_reputation_scores(
+    fn read_latest_commit_with_final_reputation_scores(
         &mut self,
     ) -> Result<Option<CommittedSubDag>, PackError> {
         let iter = self.consensus_pos_idx.rev_iter(1000)?;
@@ -1298,7 +1280,7 @@ impl Inner {
     }
 
     /// True if the pack contains the batch for digest.
-    pub(crate) fn contains_batch(&mut self, digest: BlockHash) -> bool {
+    fn contains_batch(&mut self, digest: BlockHash) -> bool {
         // This is a bit more complicated (the pos file_len check) because in a very rare
         // case of repairing a damaged pack we might have something in the index not in the
         // pack file (yet).
@@ -1310,7 +1292,7 @@ impl Inner {
     }
 
     /// Return the Batch for digest if found.
-    pub(crate) fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
+    fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
         let pos = self.batch_digests.load(digest).ok()?;
         // This is not strickly needed, the fetch below will fail if
         // we try to read past the end of the file but this potentially
@@ -1330,7 +1312,7 @@ impl Inner {
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
-    pub(crate) fn count_leaders(
+    fn count_leaders(
         &mut self,
         last_executed_round: Round,
         rewards_counter: &RewardsCounter,
