@@ -18,12 +18,14 @@
 //! Inserts are read-modify-write: the bucket is copied into a pooled scratch buffer, mutated (its
 //! overflow appended to the odx if it fills), stamped with a fresh CRC, and written back at the
 //! bucket's fixed offset. mmap writes are `memcpy` into the page cache; durability still happens
-//! only at [`Index::sync`] (msync), exactly as the buffered index defers to `fsync`.
+//! only at [`Index::sync`] (msync), exactly as the buffered index defers to `fsync`. In lazy-CRC
+//! mode the fresh per-write CRC is replaced by a zeroed trailer (a "dirty" marker) and only the
+//! dirty buckets are CRC'd, in one pass, at `sync()`.
 
 use tn_types::B256;
 
 use crate::archive::{
-    crc::{add_crc32, check_crc},
+    crc::{add_crc32, check_crc, crc_is_zero, crc_state, zero_crc, CrcState},
     data_file::fsync_directory,
     digest_index::{
         bloom::{Bloom, BLOOM_SIZE_BYTES},
@@ -66,14 +68,41 @@ pub struct HdxIndexMmap<
     hasher_builder: S,
     read_only: bool,
     synced: bool,
-    /// WAL/rebuildable mode. When true the per-op CRC is skipped on the hot save/load paths and
-    /// the whole index is CRC'd in one pass at [`Index::sync`] instead — appropriate when the
-    /// index is not the durability source (it is rebuilt from the data-log WAL on unclean
-    /// shutdown), so per-operation integrity is unnecessary. Default `false` (per-op CRC, the
+    /// WAL/rebuildable mode. When true the per-op CRC is skipped on the hot save/load paths: each
+    /// modified bucket instead has its CRC trailer **zeroed** (a "dirty / not-yet-CRC'd" marker),
+    /// and only the dirty buckets are CRC'd — in one pass — at [`Index::sync`]. Appropriate when
+    /// the index is not the durability source (it is rebuilt from the data-log WAL on unclean
+    /// shutdown), so per-operation integrity is unnecessary. The zero marker also lets
+    /// recovery distinguish a dirty bucket (CRC == 0) from a corrupt one (non-zero CRC that
+    /// fails) via [`bucket_crc_scan`](Self::bucket_crc_scan). Default `false` (per-op CRC, the
     /// production regime).
     lazy_crc: bool,
     bloom: Bloom,
     _index_dir: PathBuf,
+}
+
+/// Counts from [`HdxIndexMmap::bucket_crc_scan`] over the main buckets: how many are dirty
+/// (deliberately un-CRC'd — CRC trailer zero) vs corrupt (non-zero CRC that fails to verify). A
+/// clean, synced index reports zero of both; `dirty > 0` means writes were not synced (rebuild from
+/// the WAL), `corrupt > 0` means genuine on-disk corruption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BucketCrcReport {
+    /// Main buckets whose CRC trailer is all-zero (written but not yet CRC'd).
+    pub dirty: u64,
+    /// Main buckets whose non-zero CRC fails to match the payload.
+    pub corrupt: u64,
+}
+
+/// Finish a just-written bucket buffer: stamp a real CRC (eager) or, in `lazy` mode, zero the CRC
+/// trailer to mark the bucket "dirty" (its CRC is deferred to the bulk pass at [`Index::sync`], and
+/// the zero doubles as a dirty-vs-corrupt marker for recovery). Every bucket write ends here, so an
+/// on-disk bucket is always either CRC-valid or explicitly dirty — never a stale mismatch.
+fn stamp_bucket_crc(lazy: bool, buffer: &mut [u8]) {
+    if lazy {
+        zero_crc(buffer);
+    } else {
+        add_crc32(buffer);
+    }
 }
 
 impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
@@ -497,14 +526,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
                 self.save_to_bucket_buffer(hash.as_slice(), rec_pos, new_pos, false)?;
             }
         }
-        // In lazy mode the buckets are CRC'd in bulk at `sync()`, not here.
-        if !self.lazy_crc {
-            if let Some(buffer) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
-                add_crc32(buffer);
-            }
-            if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
-                add_crc32(buffer);
-            }
+        // Eager: stamp a real CRC on both rebuilt buckets. Lazy: mark them dirty (zero CRC) for the
+        // bulk pass at `sync()` — they were just `fill(0)`'d, so this reasserts the dirty marker.
+        let lazy = self.lazy_crc;
+        if let Some(buffer) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
+            stamp_bucket_crc(lazy, buffer);
+        }
+        if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
+            stamp_bucket_crc(lazy, buffer);
         }
         Ok(())
     }
@@ -527,11 +556,11 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         bucket_pos: u64,
     ) -> Result<(), AppendError> {
         self.save_to_bucket_buffer(key, record_pos, bucket_pos, true)?;
-        // In lazy mode the bucket is CRC'd in bulk at `sync()`, not per save.
-        if !self.lazy_crc {
-            if let Some(scratch) = self.hdx_file.slice_mut(bucket_pos, Self::BUCKET_SIZE) {
-                add_crc32(scratch);
-            }
+        // Eager: stamp a real CRC. Lazy: zero the trailer to mark the bucket dirty (CRC'd in bulk
+        // at `sync()`); the zero also lets recovery tell a dirty bucket from a corrupt one.
+        let lazy = self.lazy_crc;
+        if let Some(scratch) = self.hdx_file.slice_mut(bucket_pos, Self::BUCKET_SIZE) {
+            stamp_bucket_crc(lazy, scratch);
         }
         Ok(())
     }
@@ -544,17 +573,40 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         Ok(())
     }
 
-    /// Stamp a fresh CRC on every main bucket. Used by [`lazy_crc`](Self::lazy_crc) mode at
-    /// `sync()`, where per-op CRCs were skipped — one pass here makes the on-disk index
-    /// CRC-valid so a normal (verifying) reopen accepts it. Overflow records in the odx were
+    /// Stamp a fresh CRC on every *dirty* main bucket — one whose CRC trailer is zero
+    /// (`crc_is_zero`), the marker lazy writes leave behind. Used by
+    /// [`lazy_crc`](Self::lazy_crc) mode at `sync()`: this makes the on-disk index CRC-valid
+    /// (so a normal verifying reopen accepts it) while skipping untouched/clean buckets after a
+    /// cheap 4-byte check — no CRC is computed for them. Overflow records in the odx were
     /// already CRC'd when appended.
-    fn crc_all_buckets(&mut self) {
+    fn crc_dirty_buckets(&mut self) {
         for bucket in 0..self.buckets() as u64 {
             let pos = self.bucket_pos(bucket);
             if let Some(buffer) = self.hdx_file.slice_mut(pos, Self::BUCKET_SIZE) {
-                add_crc32(buffer);
+                if crc_is_zero(buffer) {
+                    add_crc32(buffer);
+                }
             }
         }
+    }
+
+    /// Scan every main bucket and classify its CRC trailer (see [`BucketCrcReport`]). Read-only
+    /// (shared slices), so it is the recovery/verification hook: a `(0, 0)` report means the
+    /// on-disk main buckets are all CRC-valid; any `dirty` means writes were not synced
+    /// (rebuild from the data-log WAL); any `corrupt` is genuine corruption. Overflow (odx)
+    /// records are not scanned — they are append-only and always CRC'd when written.
+    pub fn bucket_crc_scan(&self) -> BucketCrcReport {
+        let mut report = BucketCrcReport::default();
+        for bucket in 0..self.buckets() as u64 {
+            if let Some(buffer) = self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE) {
+                match crc_state(buffer) {
+                    CrcState::Valid => {}
+                    CrcState::Dirty => report.dirty += 1,
+                    CrcState::Corrupt => report.corrupt += 1,
+                }
+            }
+        }
+        report
     }
 
     /// Allow direct test of the bloom filter.
@@ -630,10 +682,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex
         if self.read_only {
             Err(CommitError::ReadOnly)
         } else {
-            // Lazy mode skipped the per-op CRC; stamp every bucket now so the on-disk index is
-            // CRC-valid and a normal verifying reopen accepts it.
+            // Lazy mode left modified buckets dirty (zeroed CRC); stamp those now so the on-disk
+            // index is CRC-valid and a normal verifying reopen accepts it.
             if self.lazy_crc {
-                self.crc_all_buckets();
+                self.crc_dirty_buckets();
             }
             self.write_header().map_err(CommitError::IndexFileSync)?;
             self.odx_file.sync_all().map_err(CommitError::IndexFileSync)?;
@@ -853,5 +905,135 @@ mod tests {
         for i in 0..N {
             assert_eq!(idx.load(key(i)).unwrap_or_else(|e| panic!("verify load {i}: {e}")), i);
         }
+    }
+
+    /// The zero-CRC "dirty" sentinel. A freshly-opened index is all-valid; under lazy mode a write
+    /// leaves its bucket dirty (zero CRC) and `sync()` clears it; `bucket_crc_scan` counts them.
+    #[test]
+    fn test_archive_hdx_index_mmap_lazy_crc_dirty_markers() {
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+
+        // Part A: a full lazy build + sync leaves no dirty/corrupt bucket, and reopening on the
+        // verifying path finds every key.
+        let tmp_a = TempDir::with_prefix("test_archive_hdx_lazy_dirty_a").expect("temp dir");
+        const N: u64 = 50_000; // force splits + overflow
+        {
+            let mut idx: HdxIndexMmap = HdxIndexMmap::open_hdx_file(
+                tmp_a.path().join("index.hdx"),
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                false,
+            )
+            .expect("open lazy");
+            idx.set_lazy_crc(true);
+            for i in 0..N {
+                idx.save(key(i), i).unwrap_or_else(|e| panic!("lazy save {i}: {e}"));
+            }
+            idx.sync().expect("sync stamps dirty buckets");
+            assert_eq!(
+                idx.bucket_crc_scan(),
+                BucketCrcReport::default(),
+                "sync must clear every dirty bucket"
+            );
+        }
+        {
+            let mut idx: HdxIndexMmap = HdxIndexMmap::open_hdx_file(
+                tmp_a.path().join("index.hdx"),
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                true,
+            )
+            .expect("reopen verifying");
+            for i in 0..N {
+                assert_eq!(idx.load(key(i)).unwrap_or_else(|e| panic!("verify {i}: {e}")), i);
+            }
+        }
+
+        // Part B: exact dirty targeting on a tiny index (one bucket, no splits). Fresh = all valid;
+        // one write dirties exactly one bucket; sync clears it; rewriting re-dirties it.
+        let tmp_b = TempDir::with_prefix("test_archive_hdx_lazy_dirty_b").expect("temp dir");
+        let mut idx: HdxIndexMmap = HdxIndexMmap::open_hdx_file(
+            tmp_b.path().join("index.hdx"),
+            &data_header,
+            BuildHasherDefault::<FxHasher>::default(),
+            false,
+        )
+        .expect("open lazy tiny");
+        idx.set_lazy_crc(true);
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport::default(),
+            "a fresh index's init buckets all carry a valid (non-zero) CRC"
+        );
+        idx.save(key(0), 0).expect("save one");
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport { dirty: 1, corrupt: 0 },
+            "one write dirties exactly one bucket"
+        );
+        idx.sync().expect("sync one");
+        assert_eq!(idx.bucket_crc_scan(), BucketCrcReport::default(), "sync clears the one dirty");
+        idx.save(key(0), 0).expect("rewrite one");
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport { dirty: 1, corrupt: 0 },
+            "rewriting the key re-dirties exactly its bucket"
+        );
+        idx.sync().expect("resync one");
+        assert_eq!(idx.bucket_crc_scan(), BucketCrcReport::default());
+    }
+
+    /// `crc_state`/`bucket_crc_scan` tell a dirty bucket (zeroed CRC) from a corrupt one (non-zero
+    /// CRC that fails). Build eagerly (all valid), corrupt one bucket's payload (stale CRC =>
+    /// corrupt), then zero another bucket's CRC (=> dirty).
+    #[test]
+    fn test_archive_hdx_index_mmap_crc_state_corrupt_vs_dirty() {
+        use crate::archive::crc::zero_crc;
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_crcstate").expect("temp dir");
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        const N: u64 = 5_000;
+
+        let mut idx: HdxIndexMmap = HdxIndexMmap::open_hdx_file(
+            tmp_dir.path().join("index.hdx"),
+            &data_header,
+            BuildHasherDefault::<FxHasher>::default(),
+            false,
+        )
+        .expect("open");
+        for i in 0..N {
+            idx.save(key(i), i).expect("save");
+        }
+        idx.sync().expect("sync");
+        assert_eq!(idx.bucket_crc_scan(), BucketCrcReport::default(), "eager build is all valid");
+
+        // Corrupt bucket 0's payload but keep its (now stale, non-zero) CRC -> corrupt.
+        let pos0 = idx.bucket_pos(0);
+        {
+            let buf = idx
+                .hdx_file
+                .slice_mut(pos0, HdxIndexMmap::<32>::BUCKET_SIZE)
+                .expect("slice bucket 0");
+            buf[12] ^= 0xFF;
+        }
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport { dirty: 0, corrupt: 1 },
+            "a payload change under a stale CRC reads as corrupt"
+        );
+
+        // Zero bucket 1's CRC -> dirty (bucket 0 stays corrupt).
+        let pos1 = idx.bucket_pos(1);
+        {
+            let buf = idx
+                .hdx_file
+                .slice_mut(pos1, HdxIndexMmap::<32>::BUCKET_SIZE)
+                .expect("slice bucket 1");
+            zero_crc(buf);
+        }
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport { dirty: 1, corrupt: 1 },
+            "a zeroed CRC reads as dirty, independent of the corrupt bucket"
+        );
     }
 }

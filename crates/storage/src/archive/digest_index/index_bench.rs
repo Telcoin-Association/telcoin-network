@@ -6,8 +6,9 @@
 //!   backend).
 //! - `mmap-cf`   — `HdxIndexMmap` (cache-free, zero-copy; CRC per save + per load).
 //! - `mmap-lazy` — `HdxIndexMmap` with
-//!   [`set_lazy_crc`](super::index_mmap::HdxIndexMmap::set_lazy_crc) (per-op CRC skipped; the whole
-//!   index is CRC'd once at `sync()`) — the WAL/rebuildable regime.
+//!   [`set_lazy_crc`](super::index_mmap::HdxIndexMmap::set_lazy_crc): per-op CRC is replaced by a
+//!   zeroed "dirty" marker and only the dirty buckets are CRC'd at `sync()` — the WAL/rebuildable
+//!   regime.
 //!
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
 //!
@@ -25,8 +26,9 @@
 //!
 //! Framing: `sync_bulk`/`insert_dur` measure the *index* durability barrier. If the index is not
 //! synced (rebuilt from the data-log WAL on unclean shutdown), those rows are moot and
-//! `mmap-lazy`'s cheap insert/load is what matters — `lazy` moves the CRC from per-op to a rare
-//! bulk `sync`, so it deliberately *loses* `sync_bulk` and wins insert/read.
+//! `mmap-lazy`'s cheap insert/load is what matters — `lazy` moves the CRC off the per-op path to a
+//! targeted `sync` (only the dirty, zero-CRC buckets are CRC'd), so per-op sync (`insert_dur`)
+//! drops sharply while a full-build `sync_bulk` (nearly all buckets dirty) stays roughly the same.
 //!
 //! Caveats: under `#[cfg(test)]` the bloom filter is 64 KB (2 MB in prod), so `load_miss` probes
 //! more buckets than production — both impls share it, so the comparison is fair. `reopen_load` is
@@ -223,7 +225,7 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     println!(
         "\n=== digest index: direct-IO (HdxIndex) vs mmap (HdxIndexMmap) (ms; lower is better) ==="
     );
-    println!("legend: hdx-buf = buffered File + bucket cache; hdx-mmap = same cache on an mmap file; mmap-cf = cache-free mmap (CRC per op); mmap-lazy = cache-free mmap, per-op CRC deferred to a bulk CRC at sync (WAL/rebuildable regime). insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. Default N sweep crosses the 400k-bucket buffered cache at 8M. test-cfg bloom is 64 KB; run on Linux/SSD.");
+    println!("legend: hdx-buf = buffered File + bucket cache; hdx-mmap = same cache on an mmap file; mmap-cf = cache-free mmap (CRC per op); mmap-lazy = cache-free mmap, per-op CRC replaced by a zeroed dirty marker, only dirty buckets CRC'd at sync (WAL/rebuildable regime). insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. Default N sweep crosses the 400k-bucket buffered cache at 8M. test-cfg bloom is 64 KB; run on Linux/SSD.");
 
     print!("{:<label_w$}", "benchmark", label_w = label_w);
     for (name, _) in cols {
