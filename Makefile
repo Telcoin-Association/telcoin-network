@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs
+.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -22,6 +22,7 @@ help:
 	@echo "  cargo install cargo-nextest --locked   # fast test runner" ;
 	@echo "  cargo install cargo-llvm-cov           # code coverage" ;
 	@echo "  cargo install sccache --locked         # compilation cache (optional)" ;
+	@echo "  cargo install mdbook --version 0.5.4 --locked   # docs site builder" ;
 	@echo ;
 	@echo "make attest" ;
 	@echo "    :::> Run CI locally and submit signed attestation to Adiri testnet." ;
@@ -86,6 +87,12 @@ help:
 	@echo ;
 	@echo "make clean-logs LOG_FILE=path/to/file.log" ;
 	@echo "    :::> Strip ANSI color codes and timestamps from a log file." ;
+	@echo ;
+	@echo "make book" ;
+	@echo "    :::> Build the docs book and open it in the default browser." ;
+	@echo ;
+	@echo "make book-serve" ;
+	@echo "    :::> Serve the docs book at localhost:3000 with live reload." ;
 	@echo ;
 
 # run CI locally and submit attestation githash to on-chain program
@@ -259,3 +266,11 @@ clean-logs:
 		exit 1; \
 	fi
 	sed -i '' -E "s/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+Z //g; s/\x1B\[([0-9]{1,3}(;[0-9]{1,3})*)?[mGK]//g" $(LOG_FILE)
+
+# build the docs book and open it in the default browser
+book:
+	mdbook build docs --open ;
+
+# serve the docs book at localhost:3000 with live reload
+book-serve:
+	mdbook serve docs --open ;
