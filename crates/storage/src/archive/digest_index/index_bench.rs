@@ -1,12 +1,13 @@
-//! On-demand benchmark comparing the two digest-index implementations: the buffered/direct-IO
+//! On-demand benchmark comparing the digest-index implementations: the buffered/direct-IO
 //! [`HdxIndex`](super::index::HdxIndex) (raw `File` + in-memory bucket cache) vs the cache-free,
-//! zero-copy memory-mapped [`HdxIndexMmap`](super::index_mmap::HdxIndexMmap). Both implement the
-//! [`Index`](crate::archive::index::Index) trait and share the on-disk format, so one battery
-//! drives all three columns:
-//! - `hdx-buf`  — `HdxIndex` on the buffered `File` backend (the direct-IO version).
-//! - `hdx-mmap` — `HdxIndex` on the mmap file backend (same cached logic — isolates the file
+//! zero-copy memory-mapped [`HdxIndexMmap`](super::index_mmap::HdxIndexMmap). Four columns:
+//! - `hdx-buf`   — `HdxIndex` on the buffered `File` backend (the direct-IO version).
+//! - `hdx-mmap`  — `HdxIndex` on the mmap file backend (same cached logic — isolates the file
 //!   backend).
-//! - `mmap-cf`  — `HdxIndexMmap` (the cache-free, zero-copy mmap version).
+//! - `mmap-cf`   — `HdxIndexMmap` (cache-free, zero-copy; CRC per save + per load).
+//! - `mmap-lazy` — `HdxIndexMmap` with
+//!   [`set_lazy_crc`](super::index_mmap::HdxIndexMmap::set_lazy_crc) (per-op CRC skipped; the whole
+//!   index is CRC'd once at `sync()`) — the WAL/rebuildable regime.
 //!
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
 //!
@@ -14,14 +15,23 @@
 //! cargo test -p tn-storage digest_index_bench -- --ignored --nocapture --test-threads 1
 //! ```
 //!
-//! Rows: `insert` (N saves, no sync), `sync_bulk` (one `sync()` after the bulk), `insert_dur`
-//! (K_DUR save+sync pairs — 2 barriers each: hdx+odx), `load_hit` / `load_miss` (N random point
-//! lookups, present / absent), `reopen_load` (reopen read-only then N random lookups).
+//! It sweeps a set of index sizes `N` (env `HDX_BENCH_N=200000,2000000` overrides; default
+//! `[200k, 2M, 8M]`). The default's 8M crosses the buffered `CACHED_BUCKETS = 400_000` cache
+//! (~6.4M keys), where the ranking is expected to flip toward the page-cache-backed mmap index —
+//! set a smaller env list if RAM/disk-constrained (the 8M column needs a few GB). Rows per size:
+//! `insert` (N saves, no sync), `sync_bulk` (one `sync()`), `load_hit` / `load_miss` (N random
+//! point lookups, present / absent), `reopen_load` (reopen read-only then N lookups); plus one
+//! fixed `insert_dur` probe (K_DUR save+sync pairs).
+//!
+//! Framing: `sync_bulk`/`insert_dur` measure the *index* durability barrier. If the index is not
+//! synced (rebuilt from the data-log WAL on unclean shutdown), those rows are moot and
+//! `mmap-lazy`'s cheap insert/load is what matters — `lazy` moves the CRC from per-op to a rare
+//! bulk `sync`, so it deliberately *loses* `sync_bulk` and wins insert/read.
 //!
 //! Caveats: under `#[cfg(test)]` the bloom filter is 64 KB (2 MB in prod), so `load_miss` probes
-//! more buckets than production — both impls share it, so the comparison is fair, but absolute miss
-//! numbers are test-mode. `reopen_load` is cold only in-process (the file stays in the OS page
-//! cache). macOS `fsync` is not a full barrier — run on Linux/SSD for the durability rows.
+//! more buckets than production — both impls share it, so the comparison is fair. `reopen_load` is
+//! cold only in-process (the file stays in the OS page cache). macOS `fsync` is not a full barrier
+//! — run on Linux/SSD for the durability rows.
 
 use std::{
     hash::BuildHasherDefault,
@@ -39,11 +49,33 @@ use crate::archive::{
     pack::{DataHeader, FileBackend, PackCompression},
 };
 
-// ---- workload sizing (on-demand; scale up for heavier samples) ----
-/// Insert / lookup count — well past the 1000 initial buckets, so splits + overflow are exercised.
-const N: u64 = 200_000;
-/// Per-op durable inserts (a `sync()` after each — 2 barriers/op; kept modest).
+/// Per-op durable inserts (a `sync()` after each — 2 barriers/op; N-independent, kept modest).
 const K_DUR: u64 = 2_000;
+
+/// Index sizes to sweep — env `HDX_BENCH_N` (comma list) overrides. Default's 8M crosses the
+/// 400k-bucket buffered cache (~6.4M keys); trim via the env if RAM/disk-constrained.
+fn n_sizes() -> Vec<u64> {
+    let parsed: Vec<u64> = std::env::var("HDX_BENCH_N")
+        .ok()
+        .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    if parsed.is_empty() {
+        vec![200_000, 2_000_000, 8_000_000]
+    } else {
+        parsed
+    }
+}
+
+/// Compact size label (`200000` -> `200k`, `8000000` -> `8M`).
+fn fmt_n(n: u64) -> String {
+    if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 && n.is_multiple_of(1_000) {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
 
 /// splitmix64 mix — spreads keys and randomizes lookup order.
 fn mix(x: u64) -> u64 {
@@ -68,12 +100,12 @@ fn timed(f: impl FnOnce()) -> Duration {
     start.elapsed()
 }
 
-/// Run the six-row battery on one index implementation. `open(dir, read_only)` builds the concrete
-/// index. Returns `[insert, sync_bulk, insert_dur, load_hit, load_miss, reopen_load]`.
-fn column<I: Index<B256, u64>>(open: impl Fn(&Path, bool) -> I) -> Vec<Duration> {
-    let keys: Vec<B256> = (0..N).map(key).collect();
-    let miss: Vec<B256> = (N..2 * N).map(key).collect();
-    let order: Vec<usize> = (0..N).map(|m| (mix(m) % N) as usize).collect();
+/// Per-`n` battery: `[insert, sync_bulk, load_hit, load_miss, reopen_load]`. `open(dir, read_only)`
+/// builds the concrete index.
+fn size_battery<I: Index<B256, u64>, F: Fn(&Path, bool) -> I>(open: &F, n: u64) -> [Duration; 5] {
+    let keys: Vec<B256> = (0..n).map(key).collect();
+    let miss: Vec<B256> = (n..2 * n).map(key).collect();
+    let order: Vec<usize> = (0..n).map(|m| (mix(m) % n) as usize).collect();
 
     let dir = TempDir::with_prefix("hdxbench").expect("temp dir");
     let mut idx = open(dir.path(), false);
@@ -93,7 +125,7 @@ fn column<I: Index<B256, u64>>(open: impl Fn(&Path, bool) -> I) -> Vec<Duration>
             }
         }
     });
-    assert_eq!(hits, N as usize, "every existing key must be found");
+    assert_eq!(hits, n as usize, "every existing key must be found");
 
     let mut misses = 0usize;
     let t_miss = timed(|| {
@@ -103,7 +135,7 @@ fn column<I: Index<B256, u64>>(open: impl Fn(&Path, bool) -> I) -> Vec<Duration>
             }
         }
     });
-    assert_eq!(misses, N as usize, "no absent key may be found");
+    assert_eq!(misses, n as usize, "no absent key may be found");
     drop(idx);
 
     // Cold in-process cache: reopen read-only and look the keys up again.
@@ -116,33 +148,82 @@ fn column<I: Index<B256, u64>>(open: impl Fn(&Path, bool) -> I) -> Vec<Duration>
             }
         }
     });
-    assert_eq!(rhits, N as usize, "reopened index must find every key");
+    assert_eq!(rhits, n as usize, "reopened index must find every key");
     drop(ridx);
     drop(dir);
 
-    // Per-op durable inserts on a fresh (small) index.
-    let dir2 = TempDir::with_prefix("hdxbench_dur").expect("temp dir");
-    let mut idx2 = open(dir2.path(), false);
-    let t_dur = timed(|| {
-        for i in 0..K_DUR {
-            idx2.save(key(i), i).expect("save");
-            idx2.sync().expect("sync");
-        }
-    });
-    drop(idx2);
-    drop(dir2);
-
-    vec![t_insert, t_sync, t_dur, t_hit, t_miss, t_reopen]
+    [t_insert, t_sync, t_hit, t_miss, t_reopen]
 }
 
-fn print_table(rows: &[&str], cols: &[(&str, Vec<Duration>)]) {
+/// Fixed per-op durable probe (N-independent): `K_DUR` save+sync pairs on a fresh index.
+fn durable<I: Index<B256, u64>, F: Fn(&Path, bool) -> I>(open: &F) -> Duration {
+    let dir = TempDir::with_prefix("hdxbench_dur").expect("temp dir");
+    let mut idx = open(dir.path(), false);
+    let t = timed(|| {
+        for i in 0..K_DUR {
+            idx.save(key(i), i).expect("save");
+            idx.sync().expect("sync");
+        }
+    });
+    drop(idx);
+    drop(dir);
+    t
+}
+
+/// All rows for one column: `insert_dur`, then per-`n` `[insert, sync_bulk, load_hit, load_miss,
+/// reopen_load]`.
+fn column<I: Index<B256, u64>, F: Fn(&Path, bool) -> I>(open: F, sizes: &[u64]) -> Vec<Duration> {
+    let mut out = vec![durable(&open)];
+    for &n in sizes {
+        out.extend_from_slice(&size_battery(&open, n));
+    }
+    out
+}
+
+fn row_labels(sizes: &[u64]) -> Vec<String> {
+    let mut rows = vec![format!("insert_dur {}", fmt_n(K_DUR))];
+    for &n in sizes {
+        let s = fmt_n(n);
+        rows.push(format!("insert {s}"));
+        rows.push(format!("sync_bulk {s}"));
+        rows.push(format!("load_hit {s}"));
+        rows.push(format!("load_miss {s}"));
+        rows.push(format!("reopen_load {s}"));
+    }
+    rows
+}
+
+fn open_hdx(header: &DataHeader, dir: &Path, read_only: bool, backend: FileBackend) -> HdxIndex {
+    HdxIndex::open_hdx_file_with_backend(
+        dir.join("hdx"),
+        header,
+        BuildHasherDefault::<FxHasher>::default(),
+        read_only,
+        backend,
+    )
+    .expect("open hdx")
+}
+
+fn open_mmap(header: &DataHeader, dir: &Path, read_only: bool, lazy: bool) -> HdxIndexMmap {
+    let mut idx = HdxIndexMmap::open_hdx_file(
+        dir.join("hdx"),
+        header,
+        BuildHasherDefault::<FxHasher>::default(),
+        read_only,
+    )
+    .expect("open mmap");
+    idx.set_lazy_crc(lazy);
+    idx
+}
+
+fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     let label_w = rows.iter().map(|s| s.len()).max().unwrap_or(0).max("benchmark".len());
     let cell_w = 12usize;
 
     println!(
         "\n=== digest index: direct-IO (HdxIndex) vs mmap (HdxIndexMmap) (ms; lower is better) ==="
     );
-    println!("legend: hdx-buf = HdxIndex on buffered File (direct IO + bucket cache); hdx-mmap = HdxIndex on mmap file (same cache, mmap'd); mmap-cf = HdxIndexMmap (cache-free zero-copy). ops per row: insert/load_hit/load_miss/reopen_load = {N}, sync_bulk = 1, insert_dur = {K_DUR} (a sync each = 2 fsync/msync barriers). test-cfg bloom is 64 KB; run on Linux/SSD for the durability rows.");
+    println!("legend: hdx-buf = buffered File + bucket cache; hdx-mmap = same cache on an mmap file; mmap-cf = cache-free mmap (CRC per op); mmap-lazy = cache-free mmap, per-op CRC deferred to a bulk CRC at sync (WAL/rebuildable regime). insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. Default N sweep crosses the 400k-bucket buffered cache at 8M. test-cfg bloom is 64 KB; run on Linux/SSD.");
 
     print!("{:<label_w$}", "benchmark", label_w = label_w);
     for (name, _) in cols {
@@ -163,7 +244,8 @@ fn print_table(rows: &[&str], cols: &[(&str, Vec<Duration>)]) {
     println!();
 }
 
-/// Compare the direct-IO `HdxIndex` (buffered + mmap file) against the cache-free `HdxIndexMmap`.
+/// Compare the direct-IO `HdxIndex` (buffered + mmap file) against the cache-free `HdxIndexMmap`
+/// (eager and lazy CRC), swept across index sizes.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
 /// `cargo test -p tn-storage digest_index_bench -- --ignored --nocapture --test-threads 1`.
@@ -171,52 +253,24 @@ fn print_table(rows: &[&str], cols: &[(&str, Vec<Duration>)]) {
 #[ignore = "on-demand digest-index direct-IO vs mmap comparison; run with --ignored --nocapture --test-threads 1"]
 fn digest_index_bench() {
     let header = DataHeader::new(0, PackCompression::None, 0);
-    let rows = ["insert", "sync_bulk", "insert_dur", "load_hit", "load_miss", "reopen_load"];
+    let sizes = n_sizes();
+    let rows = row_labels(&sizes);
     let mut cols: Vec<(&str, Vec<Duration>)> = Vec::new();
 
     println!("  running hdx-buf ...");
     cols.push((
         "hdx-buf",
-        column::<HdxIndex>(|dir, ro| {
-            HdxIndex::open_hdx_file_with_backend(
-                dir.join("hdx"),
-                &header,
-                BuildHasherDefault::<FxHasher>::default(),
-                ro,
-                FileBackend::Buffered,
-            )
-            .expect("open hdx-buf")
-        }),
+        column(|dir, ro| open_hdx(&header, dir, ro, FileBackend::Buffered), &sizes),
     ));
-
     println!("  running hdx-mmap ...");
     cols.push((
         "hdx-mmap",
-        column::<HdxIndex>(|dir, ro| {
-            HdxIndex::open_hdx_file_with_backend(
-                dir.join("hdx"),
-                &header,
-                BuildHasherDefault::<FxHasher>::default(),
-                ro,
-                FileBackend::Mmap,
-            )
-            .expect("open hdx-mmap")
-        }),
+        column(|dir, ro| open_hdx(&header, dir, ro, FileBackend::Mmap), &sizes),
     ));
-
     println!("  running mmap-cf ...");
-    cols.push((
-        "mmap-cf",
-        column::<HdxIndexMmap>(|dir, ro| {
-            HdxIndexMmap::open_hdx_file(
-                dir.join("hdx"),
-                &header,
-                BuildHasherDefault::<FxHasher>::default(),
-                ro,
-            )
-            .expect("open mmap-cf")
-        }),
-    ));
+    cols.push(("mmap-cf", column(|dir, ro| open_mmap(&header, dir, ro, false), &sizes)));
+    println!("  running mmap-lazy ...");
+    cols.push(("mmap-lazy", column(|dir, ro| open_mmap(&header, dir, ro, true), &sizes)));
 
     print_table(&rows, &cols);
 }

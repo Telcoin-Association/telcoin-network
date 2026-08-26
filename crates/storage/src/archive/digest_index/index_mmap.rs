@@ -66,6 +66,12 @@ pub struct HdxIndexMmap<
     hasher_builder: S,
     read_only: bool,
     synced: bool,
+    /// WAL/rebuildable mode. When true the per-op CRC is skipped on the hot save/load paths and
+    /// the whole index is CRC'd in one pass at [`Index::sync`] instead — appropriate when the
+    /// index is not the durability source (it is rebuilt from the data-log WAL on unclean
+    /// shutdown), so per-operation integrity is unnecessary. Default `false` (per-op CRC, the
+    /// production regime).
+    lazy_crc: bool,
     bloom: Bloom,
     _index_dir: PathBuf,
 }
@@ -178,6 +184,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
             hasher_builder,
             read_only,
             synced: true,
+            lazy_crc: false,
             bloom,
             _index_dir: dir.to_owned(),
         })
@@ -205,6 +212,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
     /// Get the data_file_length field.
     pub fn data_file_length(&self) -> u64 {
         self.header.data_file_length
+    }
+
+    /// Enable/disable [`lazy_crc`](Self::lazy_crc) mode (skip per-op CRC; bulk-CRC at `sync`). Only
+    /// safe when the index is rebuildable from a WAL — see the field docs.
+    pub fn set_lazy_crc(&mut self, lazy: bool) {
+        self.lazy_crc = lazy;
     }
 
     /// Byte offset of `bucket` within the hdx file (after the header and bloom filter).
@@ -289,7 +302,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
         {
             Some(buf) => {
-                if !check_crc(buf) {
+                if !self.lazy_crc && !check_crc(buf) {
                     return Err(FetchError::CrcFailed);
                 }
                 if let Some(pos) = Self::scan_bucket(buf, key) {
@@ -305,7 +318,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
                 Some(buf) => buf,
                 None => return Err(FetchError::CrcFailed),
             };
-            if !check_crc(buf) {
+            if !self.lazy_crc && !check_crc(buf) {
                 return Err(FetchError::CrcFailed);
             }
             if let Some(pos) = Self::scan_bucket(buf, key) {
@@ -331,7 +344,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
         {
             Some(buf) => {
-                if !check_crc(buf) {
+                if !self.lazy_crc && !check_crc(buf) {
                     return Err(AppendError::CrcError);
                 }
                 Self::collect_from_buffer(buf, &mut out, &mut seen);
@@ -344,7 +357,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
                 Some(buf) => buf,
                 None => return Err(AppendError::CrcError),
             };
-            if !check_crc(buf) {
+            if !self.lazy_crc && !check_crc(buf) {
                 return Err(AppendError::CrcError);
             }
             Self::collect_from_buffer(buf, &mut out, &mut seen);
@@ -484,11 +497,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
                 self.save_to_bucket_buffer(hash.as_slice(), rec_pos, new_pos, false)?;
             }
         }
-        if let Some(buffer) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
-            add_crc32(buffer);
-        }
-        if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
-            add_crc32(buffer);
+        // In lazy mode the buckets are CRC'd in bulk at `sync()`, not here.
+        if !self.lazy_crc {
+            if let Some(buffer) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
+                add_crc32(buffer);
+            }
+            if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
+                add_crc32(buffer);
+            }
         }
         Ok(())
     }
@@ -511,8 +527,11 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         bucket_pos: u64,
     ) -> Result<(), AppendError> {
         self.save_to_bucket_buffer(key, record_pos, bucket_pos, true)?;
-        if let Some(scratch) = self.hdx_file.slice_mut(bucket_pos, Self::BUCKET_SIZE) {
-            add_crc32(scratch);
+        // In lazy mode the bucket is CRC'd in bulk at `sync()`, not per save.
+        if !self.lazy_crc {
+            if let Some(scratch) = self.hdx_file.slice_mut(bucket_pos, Self::BUCKET_SIZE) {
+                add_crc32(scratch);
+            }
         }
         Ok(())
     }
@@ -523,6 +542,19 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexMmap<KSIZE, S> {
         self.hdx_file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
         self.hdx_file.write_all(self.bloom.data())?;
         Ok(())
+    }
+
+    /// Stamp a fresh CRC on every main bucket. Used by [`lazy_crc`](Self::lazy_crc) mode at
+    /// `sync()`, where per-op CRCs were skipped — one pass here makes the on-disk index
+    /// CRC-valid so a normal (verifying) reopen accepts it. Overflow records in the odx were
+    /// already CRC'd when appended.
+    fn crc_all_buckets(&mut self) {
+        for bucket in 0..self.buckets() as u64 {
+            let pos = self.bucket_pos(bucket);
+            if let Some(buffer) = self.hdx_file.slice_mut(pos, Self::BUCKET_SIZE) {
+                add_crc32(buffer);
+            }
+        }
     }
 
     /// Allow direct test of the bloom filter.
@@ -598,6 +630,11 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex
         if self.read_only {
             Err(CommitError::ReadOnly)
         } else {
+            // Lazy mode skipped the per-op CRC; stamp every bucket now so the on-disk index is
+            // CRC-valid and a normal verifying reopen accepts it.
+            if self.lazy_crc {
+                self.crc_all_buckets();
+            }
             self.write_header().map_err(CommitError::IndexFileSync)?;
             self.odx_file.sync_all().map_err(CommitError::IndexFileSync)?;
             self.hdx_file.sync_all().map_err(CommitError::IndexFileSync)?;
@@ -772,6 +809,49 @@ mod tests {
             for i in 0..N {
                 assert_eq!(idx.load(key(i)).expect("load via HdxIndexMmap"), i);
             }
+        }
+    }
+
+    /// Lazy-CRC mode skips the per-op CRC (save + load) and stamps every bucket in one pass at
+    /// `sync()`. Build lazily (forcing splits + overflow), read back lazily, `sync()`, then reopen
+    /// on the NORMAL verifying path — the on-disk index must be CRC-valid (every key still
+    /// found).
+    #[test]
+    fn test_archive_hdx_index_mmap_lazy_crc() {
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_lazy").expect("temp dir");
+        let tmp_path = tmp_dir.path();
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        const N: u64 = 50_000; // past the 1000 initial buckets -> splits + overflow
+
+        {
+            let mut idx: HdxIndexMmap = HdxIndexMmap::open_hdx_file(
+                tmp_path.join("index.hdx"),
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                false,
+            )
+            .expect("open lazy");
+            idx.set_lazy_crc(true);
+            for i in 0..N {
+                idx.save(key(i), i).unwrap_or_else(|e| panic!("lazy save {i}: {e}"));
+            }
+            // Lazy reads (CRC check skipped) still find every key.
+            for i in 0..N {
+                assert_eq!(idx.load(key(i)).unwrap_or_else(|e| panic!("lazy load {i}: {e}")), i);
+            }
+            idx.sync().expect("sync stamps CRCs on every bucket");
+        }
+
+        // Reopen on the normal (verifying) path — proves lazy+sync produced a CRC-valid index.
+        let mut idx: HdxIndexMmap = HdxIndexMmap::open_hdx_file(
+            tmp_path.join("index.hdx"),
+            &data_header,
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        )
+        .expect("reopen verifying");
+        for i in 0..N {
+            assert_eq!(idx.load(key(i)).unwrap_or_else(|e| panic!("verify load {i}: {e}")), i);
         }
     }
 }
