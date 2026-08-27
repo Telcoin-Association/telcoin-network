@@ -18,7 +18,7 @@ use tn_reth::{
 };
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    gas_accumulator::{GasAccumulator, WorkerBaseFee},
     Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, Bytes, ConsensusHeaderDigest,
     ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
     B256,
@@ -138,7 +138,7 @@ impl ExecutionNodeInner {
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
-        base_fee: BaseFeeContainer,
+        base_fee: WorkerBaseFee,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
