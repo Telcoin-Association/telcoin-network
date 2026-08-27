@@ -169,8 +169,8 @@ impl ExecutionNodeInner {
 
         info!(target: "tn::execution", "tn rpc extension successfully merged");
 
-        // start the RPC server
-        let rpc_handle = self.reth_env.start_rpc(&server).await?;
+        // start the RPC server on this worker's derived endpoints (issue #1287)
+        let rpc_handle = self.reth_env.start_rpc(&server, worker_id).await?;
 
         // take ownership of worker components
         let components = WorkerComponents::new(rpc_handle, transaction_pool, network);
