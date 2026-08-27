@@ -60,10 +60,7 @@ use futures::{future::OptionFuture, StreamExt};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, Ipv6Addr},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tn_types::{BlsPublicKey, RpcInfo, TaskSpawner, TxnForwarder};
@@ -427,13 +424,6 @@ pub struct WorkerRpcForwarder {
     /// otherwise in no pool and no table. `None` means there is no pool to return them to
     /// (tests); undelivered transactions are then dropped as before, with the same warnings.
     requeue_pool: Option<WorkerTxPool>,
-    /// Rotation counter for the fallback dial order.
-    ///
-    /// Starts at a random per-process value and advances once per spawned forward: see
-    /// [`rotated_fallbacks`] for why the order must differ per node and per forward. Shared
-    /// through the `Arc` by every clone of this forwarder, so the rotation is node-wide like
-    /// the forward cap.
-    fallback_rotation: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for WorkerRpcForwarder {
@@ -461,11 +451,6 @@ impl WorkerRpcForwarder {
             cache: Arc::new(Mutex::new(EndpointCache::default())),
             forwards_in_flight: Arc::new(Semaphore::new(MAX_CONCURRENT_FORWARDS)),
             requeue_pool,
-            // Random, not zero: observers restarted together must not share one rotation
-            // phase, and no committee key can buy a fixed position in the order (issue
-            // #1173). This seeds fairness, not secrecy: predicting it moves no trust
-            // boundary.
-            fallback_rotation: Arc::new(AtomicU64::new(rand::random())),
         }
     }
 
@@ -564,12 +549,15 @@ impl WorkerRpcForwarder {
         providers: BTreeMap<BlsPublicKey, (String, RootProvider)>,
     ) {
         // Fallback order: every usable endpoint, so a transaction whose owning validator has
-        // not advertised (or is unreachable) can still reach the committee. Rotated per
-        // forward, so the redirect load of a downed owner spreads across the committee
-        // instead of landing on the lowest-keyed validator every time (issue #1173).
-        let fallbacks = rotated_fallbacks(
+        // not advertised (or is unreachable) can still reach the committee. Shuffled afresh
+        // per forward, so the redirect load of a downed owner spreads across the committee
+        // and no choice of committee key buys a position anywhere in the walk (issues #1173,
+        // #1277). Per forward, not per transaction: every transaction of one forward walks
+        // the same order, so one account's transactions stay on one fallback validator
+        // within a batch (nonce-gap hygiene), matching the owner routing below.
+        let fallbacks = shuffled_fallbacks(
             providers.keys().cloned().collect(),
-            self.fallback_rotation.fetch_add(1, Ordering::Relaxed),
+            std::iter::repeat_with(rand::random::<u64>),
         );
         let cache = Arc::clone(&self.cache);
         let requeue_pool = self.requeue_pool.clone();
@@ -883,33 +871,33 @@ fn next_txn_budget(deadline: Instant, now: Instant) -> Option<Duration> {
     (!remaining.is_zero()).then(|| remaining.min(FORWARD_TX_BUDGET))
 }
 
-/// The fallback dial order for one spawned forward: `fallbacks` rotated left by `counter`,
-/// reduced modulo the list length.
+/// The fallback dial order for one spawned forward: `fallbacks` sorted by `ranks`, ties (and
+/// any entries past the end of `ranks`) staying in input order.
 ///
-/// Without rotation the order is the raw byte sort of the committee's BLS public keys, the
-/// same on every observer. Every observer then redirects a downed owner's transactions to the
-/// same lowest-keyed reachable validator at the same time, and a validator can grind its BLS
-/// keypair offline so its key sorts first and that position becomes permanent (issue #1173).
-/// The counter starts at a per-process random value, so observers walk different orders and a
-/// ground key buys nothing, and it advances once per spawned forward, so one observer also
-/// spreads consecutive batches. Owner-first routing is unchanged: the owner is dialed ahead
+/// Without a shuffle the order derives from the raw byte sort of the committee's BLS public
+/// keys, which a validator can grind offline. A key that sorts first bought a permanent first
+/// claim on every fallback-routed transaction (issue #1173), and under the per-forward
+/// rotation that replaced the raw sort the relative order was still the key sort, so a ground
+/// key could sit directly behind a chosen predecessor and inherit its redirects whenever that
+/// predecessor was down (issue #1277). Ranking every entry by a fresh random draw per forward
+/// leaves no order structure to grind: first position and every successor are uniform per
+/// forward. Forwarding is a local networking choice on this observer, not a consensus input,
+/// so the nondeterminism is safe. Owner-first routing is unchanged: the owner is dialed ahead
 /// of this list (see [`WorkerRpcForwarder::spawn_forward`]).
-fn rotated_fallbacks(fallbacks: Vec<BlsPublicKey>, counter: u64) -> Vec<BlsPublicKey> {
-    let count = fallbacks.len();
-    let start = rotation_start(counter, count);
-    fallbacks.iter().cycle().skip(start).take(count).cloned().collect()
-}
-
-/// Starting offset into a fallback list of `fallback_count` entries: `counter` reduced modulo
-/// the length. Total for every input: an empty list gets offset zero rather than a division
-/// by zero, and a length past `u64` (impossible on any real target) also degrades to zero
-/// rather than truncating.
-fn rotation_start(counter: u64, fallback_count: usize) -> usize {
-    u64::try_from(fallback_count)
-        .ok()
-        .filter(|count| *count > 0)
-        .and_then(|count| usize::try_from(counter % count).ok())
-        .unwrap_or_default()
+fn shuffled_fallbacks(
+    fallbacks: Vec<BlsPublicKey>,
+    ranks: impl IntoIterator<Item = u64>,
+) -> Vec<BlsPublicKey> {
+    // The index in the sort key is what keeps this total: equal ranks (and a rank stream
+    // shorter than the list, padded here with `u64::MAX`) collapse to input order instead of
+    // dropping entries behind a duplicate map key.
+    let ranked: BTreeMap<(u64, usize), BlsPublicKey> = fallbacks
+        .into_iter()
+        .zip(ranks.into_iter().chain(std::iter::repeat(u64::MAX)))
+        .enumerate()
+        .map(|(index, (key, rank))| ((rank, index), key))
+        .collect();
+    ranked.into_values().collect()
 }
 
 /// Return the BLS key of the committee slot that owns `tx_bytes`, matching the receiver-side
@@ -2175,95 +2163,77 @@ mod tests {
         Ok(())
     }
 
-    /// The rotation offset is the counter reduced modulo the list length, total for every
-    /// input a caller can produce.
+    /// The ranks pick the order, and no entry is ever dropped or duplicated: equal ranks and
+    /// a rank stream shorter than the list both degrade to input order rather than losing
+    /// entries behind a duplicate sort key.
     #[test]
-    fn rotation_start_wraps_and_is_total() {
-        assert_eq!(rotation_start(0, 3), 0);
-        assert_eq!(rotation_start(5, 3), 2);
-        assert_eq!(rotation_start(u64::MAX, 3), 0);
-        assert_eq!(rotation_start(7, 1), 0);
-        // An empty list has no offset to pick: zero, not a division by zero.
-        assert_eq!(rotation_start(9, 0), 0);
-    }
-
-    /// Rotation permutes the fallback list without dropping or duplicating an entry, and a
-    /// full cycle of counters returns to the identity order.
-    #[test]
-    fn rotated_fallbacks_rotates_left_without_losing_entries() {
+    fn shuffled_fallbacks_orders_by_rank_without_losing_entries() {
         let (a, b, c) = (test_key(1), test_key(2), test_key(3));
-        assert_eq!(rotated_fallbacks(vec![a, b, c], 0), vec![a, b, c]);
-        assert_eq!(rotated_fallbacks(vec![a, b, c], 1), vec![b, c, a]);
-        assert_eq!(rotated_fallbacks(vec![a, b, c], 2), vec![c, a, b]);
-        // The cycle closes: three fallbacks, counter three, identity again.
-        assert_eq!(rotated_fallbacks(vec![a, b, c], 3), vec![a, b, c]);
-        assert_eq!(rotated_fallbacks(Vec::new(), 7), Vec::new());
+        assert_eq!(shuffled_fallbacks(vec![a, b, c], [2_u64, 0, 1]), vec![b, c, a]);
+        // Equal ranks: input order, through the index tiebreak.
+        assert_eq!(shuffled_fallbacks(vec![a, b, c], [7_u64, 7, 7]), vec![a, b, c]);
+        // A rank stream shorter than the list ranks the tail last, in input order, instead
+        // of dropping it. `u64::MAX` for the one provided rank makes the padding collide
+        // with a real rank at the same time, and the tiebreak still keeps every entry.
+        assert_eq!(shuffled_fallbacks(vec![a, b, c], [u64::MAX]), vec![a, b, c]);
+        assert_eq!(shuffled_fallbacks(vec![a, b, c], [0_u64]), vec![a, b, c]);
+        assert_eq!(shuffled_fallbacks(Vec::new(), [1_u64, 2]), Vec::<BlsPublicKey>::new());
     }
 
-    /// Consecutive forwards dial a different first fallback: the rotation counter, not the
-    /// key sort, picks where the fallback walk starts, and it advances once per spawned
-    /// forward.
+    /// The fallback dialed first varies across forwards: the shuffle, not the key sort,
+    /// picks where each forward's walk starts.
     ///
-    /// Three counting endpoints, transactions that recover no owner, and the counter pinned
-    /// at zero: four single-transaction batches must land on endpoint one, two, three, then
-    /// one again. Without rotation all four land on the lowest-keyed endpoint.
+    /// Three counting endpoints and 64 single-transaction forwards whose transaction
+    /// recovers no owner. Each forward shuffles afresh, and its one delivery lands on its
+    /// first fallback, so together the dials must reach every endpoint. Without the
+    /// shuffle all 64 land on one endpoint (the lowest-keyed one under the raw sort; one
+    /// fixed per-process pick under the #1173 rotation's random phase). A uniform shuffle
+    /// leaves some endpoint undialed with chance 3 * (2/3)^64, under 2e-11: not a pinned
+    /// counter's certainty, but far below any infrastructure failure rate, and each
+    /// forward holds one instant local dial, so no timing budget couples in either.
     #[tokio::test]
-    async fn spawned_forwards_rotate_the_first_fallback_dialed() -> eyre::Result<()> {
+    async fn spawned_forwards_spread_first_dials_across_fallbacks() -> eyre::Result<()> {
         let (url_one, hits_one) = counting_ok_endpoint()?;
         let (url_two, hits_two) = counting_ok_endpoint()?;
         let (url_three, hits_three) = counting_ok_endpoint()?;
         let manager = TaskManager::default();
         // `AllowPrivate`: the fixture endpoints are loopback sockets, which the shipped
-        // default policy would refuse before the rotation under test was ever reached.
+        // default policy would refuse before the shuffle under test was ever reached.
         let forwarder =
             WorkerRpcForwarder::new(manager.get_spawner(), ForwardTargetPolicy::AllowPrivate, None);
-        forwarder.fallback_rotation.store(0, Ordering::Relaxed);
-        // Pair each sorted committee key with one endpoint: `providers` iterates in key
-        // order, so the sorted pairing makes "which endpoint is fallback N" exact.
-        let sorted: Vec<BlsPublicKey> = [test_key(1), test_key(2), test_key(3)]
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let keys = vec![test_key(1), test_key(2), test_key(3)];
         let urls = [url_one, url_two, url_three];
-        let rpcs = sorted
+        let rpcs = keys
             .iter()
             .zip(urls.iter())
             .map(|(key, url)| test_rpc(url).map(|rpc| (*key, rpc)))
             .collect::<eyre::Result<Vec<_>>>()?;
-        let counts = || {
-            [
-                hits_one.load(Ordering::Relaxed),
-                hits_two.load(Ordering::Relaxed),
-                hits_three.load(Ordering::Relaxed),
-            ]
-        };
 
-        // One batch of one unrecoverable transaction, awaited to completion, then the hit
-        // counts must equal `expected`. No owner is recovered, so the first fallback is the
-        // first dial, and the permit drain is what awaits the spawned task: capacity only
-        // returns when the forward finishes.
-        let settle = |expected: [usize; 3]| {
-            let forwarder = &forwarder;
-            let sorted = &sorted;
-            let rpcs = &rpcs;
-            let counts = &counts;
-            async move {
-                assert!(forwarder.forward_txns(vec![vec![0_u8; 32]], sorted.clone(), rpcs.clone()));
-                let drained = timeout(
-                    Duration::from_secs(30),
-                    Arc::clone(&forwarder.forwards_in_flight).acquire_many_owned(max_permits()),
-                )
-                .await??;
-                drop(drained);
-                assert_eq!(counts(), expected);
-                eyre::Ok(())
-            }
-        };
-        settle([1, 0, 0]).await?;
-        settle([1, 1, 0]).await?;
-        settle([1, 1, 1]).await?;
-        settle([2, 1, 1]).await?;
+        // 64 one-transaction forwards: no owner is recovered from the zeroed bytes, so each
+        // forward's first fallback takes its first (and only) dial. 64 is also
+        // [`MAX_CONCURRENT_FORWARDS`], so even a worst case of all forwards in flight at
+        // once sheds nothing. The permit drain is what awaits the spawned tasks (capacity
+        // only returns when a forward finishes).
+        (0..64).for_each(|_| {
+            assert!(forwarder.forward_txns(vec![vec![0_u8; 32]], keys.clone(), rpcs.clone()));
+        });
+        let drained = timeout(
+            Duration::from_secs(30),
+            Arc::clone(&forwarder.forwards_in_flight).acquire_many_owned(max_permits()),
+        )
+        .await??;
+        drop(drained);
+
+        let counts = [
+            hits_one.load(Ordering::Relaxed),
+            hits_two.load(Ordering::Relaxed),
+            hits_three.load(Ordering::Relaxed),
+        ];
+        assert_eq!(counts.iter().sum::<usize>(), 64, "every delivery stops at one dial");
+        assert!(
+            counts.iter().all(|count| *count > 0),
+            "an endpoint was never dialed first: {counts:?}"
+        );
         Ok(())
     }
 }
