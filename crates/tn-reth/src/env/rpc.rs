@@ -408,7 +408,14 @@ mod tests {
         )?;
         let pool = reth_env.init_txn_pool()?;
         let network = crate::worker::WorkerNetwork::new_for_test(reth_env.chainspec());
-        let server = reth_env.get_rpc_server(pool, network.clone(), RpcModule::new(()))?;
+        // Default per-worker base fee: this test drives `eth_syncing` only, so the epoch
+        // base-fee value is irrelevant (mirrors the builder test's default above).
+        let server = reth_env.get_rpc_server(
+            pool,
+            network.clone(),
+            BaseFeeContainer::default(),
+            RpcModule::new(()),
+        )?;
         let methods = server.methods_by(|name| name == "eth_syncing");
 
         let synced: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;

@@ -10,10 +10,14 @@
 //!    the address space — see the consts inside that fn).
 //! 2. CREATE-deploy `ConsensusRegistry`, then `WorkerConfigs`, from the owner address via
 //!    `transact_pre_genesis_create` (tx nonce 0 with nonce checks disabled, zero gas price).
-//! 3. Merge the transitions and harvest each contract's constructor-written storage from the
-//!    resulting `BundleState`.
-//! 4. Splice each artifact's `deployedBytecode` plus the harvested storage into the real `Genesis`
-//!    alloc at the fixed production addresses.
+//! 3. Merge the transitions and harvest each contract's constructor-written storage AND deployed
+//!    runtime code from the resulting `BundleState`.
+//! 4. Splice the harvested runtime code plus the harvested storage into the real `Genesis` alloc at
+//!    the fixed production addresses. The DEPLOYED code is spliced (not the artifact's compile-time
+//!    `deployedBytecode.object`) because forge zeroes every immutable site in the compile-time code
+//!    and only the CREATE-installed code carries the constructor-patched values (issue #1278: the
+//!    artifact splice shipped `ConsensusRegistry` with its five Solady EIP712 immutables zero,
+//!    breaking spec-conformant `delegateStake` signatures).
 //!
 //! Exactly four accounts are written into genesis:
 //!
@@ -21,11 +25,13 @@
 //!   mirroring the TEL precompile's genesis account. The nonzero code exempts the account from
 //!   EIP-158 state clearing, and any call that bypasses precompile dispatch executes INVALID and
 //!   reverts instead of silently succeeding against an empty account.
-//! - `CONSENSUS_REGISTRY_ADDRESS`: registry runtime code, harvested constructor storage, and a
-//!   balance of `stakeAmount * validator count` backing the genesis validators' stakes.
-//! - `ISSUANCE_ADDRESS`: issuance runtime code only. It is never constructed in the ceremony, so no
-//!   storage (or balance) is spliced for it.
-//! - `WORKER_CONFIGS_ADDRESS`: worker-configs runtime code and harvested constructor storage.
+//! - `CONSENSUS_REGISTRY_ADDRESS`: harvested registry runtime code, harvested constructor storage,
+//!   and a balance of `stakeAmount * validator count` backing the genesis validators' stakes.
+//! - `ISSUANCE_ADDRESS`: issuance runtime code only, from the artifact's compile-time
+//!   `deployedBytecode` (it is never constructed in the ceremony, so no storage or balance is
+//!   spliced for it), gated on the artifact carrying no immutables.
+//! - `WORKER_CONFIGS_ADDRESS`: harvested worker-configs runtime code and harvested constructor
+//!   storage.
 //!
 //! ## Sharp edges
 //!
@@ -38,12 +44,14 @@
 //!   exceeds the 24,576-byte limit, so `limit_contract_code_size` is raised for that one create.
 //!   The `WorkerConfigs` deploy runs with the default limit, and the real genesis splices runtime
 //!   code straight into the alloc, where no CREATE-time size check applies.
-//! - **Two fail-loud gates** protect the splice: the `__$..$__` library-link placeholder check on
+//! - **Three fail-loud gates** protect the splice: the `__$..$__` library-link placeholder check on
 //!   the registry initcode (stale-artifact guard — the registry calls the BLS precompile at a fixed
-//!   address and links no library), and `ensure_pre_genesis_create_success` after each create.
-//!   Without the latter, a constructor Revert/Halt would still ship the contract's runtime code but
-//!   with EMPTY storage, which downstream fail-open reads mask as defaults (e.g. an ownerless,
-//!   zero-worker `WorkerConfigs`).
+//!   address and links no library), `ensure_pre_genesis_create_success` after each create, and
+//!   `ensure_no_immutable_references` before any compile-time artifact splice (currently only
+//!   Issuance). Without the second, a constructor Revert/Halt would still ship the contract's
+//!   runtime code but with EMPTY storage, which downstream fail-open reads mask as defaults (e.g.
+//!   an ownerless, zero-worker `WorkerConfigs`); without the third, a future immutable in a
+//!   compile-time-spliced contract would ship as silent zeros (issue #1278).
 
 use std::{path::Path, sync::Arc};
 
@@ -326,13 +334,32 @@ impl RethEnv {
                      address drift?) or wrote no slots"
                 )
             })?;
-        let registry_runtimecode_binding = Self::fetch_value_from_json_str(
-            CONSENSUS_REGISTRY_JSON,
-            Some("deployedBytecode.object"),
-        )?;
-        let registry_runtimecode_str =
-            registry_runtimecode_binding.as_str().ok_or_eyre("invalid registry json")?;
-        let registry_runtimecode = hex::decode(registry_runtimecode_str)?;
+        // Harvest the runtime code the CREATE actually installed on the tmp chain, NOT the
+        // artifact's compile-time `deployedBytecode.object`. forge zeroes every immutable site
+        // in the compile-time code; only the deployed code carries the constructor-patched
+        // values. Splicing the artifact shipped `ConsensusRegistry` with all five Solady
+        // EIP712 immutables zero, so the live domain separator was built with
+        // `nameHash = versionHash = 0` and spec-conformant EIP-712 signatures were rejected
+        // by `delegateStake` (issue #1278).
+        let harvest_deployed_code = |contract: &str, address: Address| -> eyre::Result<_> {
+            state
+                .get(&address)
+                .and_then(|account| account.info.as_ref())
+                .and_then(|info| {
+                    info.code.clone().or_else(|| contracts.get(&info.code_hash).cloned())
+                })
+                .map(|bytecode| bytecode.original_bytes())
+                .filter(|code| !code.is_empty())
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "pre-genesis ceremony harvested no {contract} runtime code at tmp \
+                         address {address}: constructor deployed elsewhere (nonce-derived \
+                         address drift?) or installed no code"
+                    )
+                })
+        };
+        let registry_runtimecode =
+            harvest_deployed_code("ConsensusRegistry", tmp_registry_address)?;
 
         let tmp_worker_configs_storage: std::collections::BTreeMap<B256, B256> = state
             .get(&tmp_worker_configs_address)
@@ -347,14 +374,13 @@ impl RethEnv {
                      address drift?) or wrote no slots"
                 )
             })?;
-        let worker_configs_runtimecode_binding =
-            Self::fetch_value_from_json_str(WORKER_CONFIGS_JSON, Some("deployedBytecode.object"))?;
-        let worker_configs_runtimecode = hex::decode(
-            worker_configs_runtimecode_binding
-                .as_str()
-                .ok_or_eyre("invalid worker configs json")?,
-        )?;
+        let worker_configs_runtimecode =
+            harvest_deployed_code("WorkerConfigs", tmp_worker_configs_address)?;
 
+        // Issuance is never constructed in the ceremony, so its COMPILE-TIME artifact code is
+        // spliced directly; bail loudly if that artifact ever grows an immutable (which forge
+        // would ship as silent zeros, issue #1278).
+        Self::ensure_no_immutable_references("Issuance", ISSUANCE_JSON)?;
         let issuance_json_binding =
             Self::fetch_value_from_json_str(ISSUANCE_JSON, Some("deployedBytecode.object"))?;
         let issuance_runtimecode =
@@ -372,7 +398,7 @@ impl RethEnv {
                 CONSENSUS_REGISTRY_ADDRESS,
                 GenesisAccount::default()
                     .with_balance(U256::from(total_stake_balance))
-                    .with_code(Some(registry_runtimecode.into()))
+                    .with_code(Some(registry_runtimecode))
                     .with_storage(Some(tmp_registry_storage)),
             ),
             (
@@ -382,7 +408,7 @@ impl RethEnv {
             (
                 WORKER_CONFIGS_ADDRESS,
                 GenesisAccount::default()
-                    .with_code(Some(worker_configs_runtimecode.into()))
+                    .with_code(Some(worker_configs_runtimecode))
                     .with_storage(Some(tmp_worker_configs_storage)),
             ),
         ]);
@@ -413,6 +439,33 @@ impl RethEnv {
                 "{contract} constructor halted during pre-genesis create: {reason:?} (gas used: {gas_used})"
             ),
         }
+    }
+
+    /// Bail when an artifact whose COMPILE-TIME code the ceremony splices carries immutables.
+    ///
+    /// forge zeroes every immutable site in `deployedBytecode.object`; the real values are
+    /// patched into the DEPLOYED code by the constructor at CREATE time. Contracts the
+    /// ceremony deploys on the tmp chain get that deployed code harvested (immutables
+    /// intact), but a contract spliced straight from the artifact would ship all-zero
+    /// immutables without any error (issue #1278: the `ConsensusRegistry` splice zeroed the
+    /// Solady EIP712 cache). A missing `immutableReferences` key counts as empty; a present,
+    /// non-empty map fails the ceremony.
+    fn ensure_no_immutable_references(contract: &str, artifact_json: &str) -> eyre::Result<()> {
+        let json: Value = serde_json::from_str(artifact_json)?;
+        let sites = json
+            .pointer("/deployedBytecode/immutableReferences")
+            .and_then(Value::as_object)
+            .map(|refs| {
+                refs.values().filter_map(Value::as_array).map(|sites| sites.len()).sum::<usize>()
+            })
+            .unwrap_or_default();
+        eyre::ensure!(
+            sites == 0,
+            "{contract} artifact lists {sites} immutable reference site(s) in deployedBytecode; \
+             splicing its compile-time code into genesis would ship every immutable as zero; \
+             deploy it in the pre-genesis ceremony and harvest the deployed code instead"
+        );
+        Ok(())
     }
 
     /// Fetches json info from the given string
@@ -518,6 +571,98 @@ mod tests {
         assert!(
             format!("{err:#}").contains("ConsensusRegistry constructor reverted"),
             "error must name the ConsensusRegistry revert, got: {err:#}"
+        );
+    }
+
+    /// Regression (#1278): genesis must splice the tmp-chain DEPLOYED registry code, so the
+    /// Solady EIP712 immutables are constructor-patched instead of forge-zeroed.
+    ///
+    /// The artifact's `deployedBytecode.immutableReferences` gives the immutable sites. The
+    /// spliced code must (a) match the compile-time code byte-for-byte OUTSIDE those sites
+    /// (same contract, same layout), (b) carry a non-zero value at every site, and (c) carry
+    /// `keccak256("Telcoin StakeManager")` and `keccak256("1")` among the patched segments
+    /// (the `_cachedNameHash`/`_cachedVersionHash` every EIP-712 digest rebuild reads).
+    #[tokio::test]
+    async fn genesis_registry_code_carries_patched_immutables() -> eyre::Result<()> {
+        let genesis = crate::test_utils::test_genesis_with_consensus_registry(4);
+        let code = genesis
+            .alloc
+            .get(&CONSENSUS_REGISTRY_ADDRESS)
+            .and_then(|account| account.code.clone())
+            .ok_or_eyre("genesis must allocate code for the ConsensusRegistry account")?;
+
+        let artifact: Value = serde_json::from_str(CONSENSUS_REGISTRY_JSON)?;
+        let artifact_code = hex::decode(
+            artifact
+                .pointer("/deployedBytecode/object")
+                .and_then(Value::as_str)
+                .ok_or_eyre("artifact must contain deployedBytecode.object")?,
+        )?;
+        let sites: Vec<(usize, usize)> = artifact
+            .pointer("/deployedBytecode/immutableReferences")
+            .and_then(Value::as_object)
+            .map(|refs| {
+                refs.values()
+                    .filter_map(Value::as_array)
+                    .flatten()
+                    .filter_map(|site| {
+                        site.get("start")
+                            .and_then(Value::as_u64)
+                            .zip(site.get("length").and_then(Value::as_u64))
+                            .map(|(start, length)| (start as usize, length as usize))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(sites.len(), 5, "registry artifact must list the 5 Solady EIP712 immutables");
+        assert_eq!(code.len(), artifact_code.len(), "spliced code must be the same contract");
+
+        // (a) identical outside immutable sites
+        let inside_site =
+            |i: usize| sites.iter().any(|(start, length)| i >= *start && i < start + length);
+        let diverges_outside = code
+            .iter()
+            .zip(artifact_code.iter())
+            .enumerate()
+            .any(|(i, (spliced, compiled))| !inside_site(i) && spliced != compiled);
+        assert!(!diverges_outside, "spliced code must differ ONLY at immutable sites");
+
+        // (b) every immutable segment constructor-patched (the artifact ships them all-zero)
+        let segments: Vec<&[u8]> =
+            sites.iter().filter_map(|(start, length)| code.get(*start..start + length)).collect();
+        assert_eq!(segments.len(), sites.len(), "every immutable site must be in range");
+        assert!(
+            segments.iter().all(|segment| segment.iter().any(|byte| *byte != 0)),
+            "every EIP712 immutable must be non-zero in the spliced code"
+        );
+
+        // (c) the domain name/version hashes are among the patched values
+        let name_hash = alloy::primitives::keccak256("Telcoin StakeManager");
+        let version_hash = alloy::primitives::keccak256("1");
+        assert!(
+            segments.iter().any(|segment| *segment == name_hash.as_slice()),
+            "_cachedNameHash must be keccak256(\"Telcoin StakeManager\")"
+        );
+        assert!(
+            segments.iter().any(|segment| *segment == version_hash.as_slice()),
+            "_cachedVersionHash must be keccak256(\"1\")"
+        );
+        Ok(())
+    }
+
+    /// The immutable-reference gate must reject an artifact WITH immutables (the registry's
+    /// compile-time code, the exact splice issue #1278 shipped) and pass the artifacts the
+    /// ceremony still splices compile-time (Issuance carries none).
+    #[test]
+    fn immutable_reference_gate_discriminates_artifacts() {
+        RethEnv::ensure_no_immutable_references("Issuance", ISSUANCE_JSON)
+            .expect("Issuance artifact carries no immutables; the gate must pass it");
+        let err =
+            RethEnv::ensure_no_immutable_references("ConsensusRegistry", CONSENSUS_REGISTRY_JSON)
+                .expect_err("registry artifact carries 5 immutable sites; the gate must reject");
+        assert!(
+            format!("{err:#}").contains("immutable reference"),
+            "error must name the immutable references, got: {err:#}"
         );
     }
 
