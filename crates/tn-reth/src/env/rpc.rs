@@ -603,8 +603,11 @@ mod tests {
         Ok(())
     }
 
-    /// The five TN CLI eth flags survive the TN-args-to-reth-args conversion and land in the
+    /// The TN CLI eth flags survive the TN-args-to-reth-args conversion and land in the
     /// [`EthConfig`] that [`RethEnv::get_rpc_server`] hands to [`apply_eth_config`].
+    ///
+    /// The pending-block assert also pins TN's `none` default against reth's `full`
+    /// (issue #1231): only the conversion carrying TN's field can produce `None` here.
     #[test]
     fn test_tn_rpc_args_reach_eth_config() {
         let args = TnRpcServerArgs {
@@ -622,6 +625,7 @@ mod tests {
         assert_eq!(config.eth_proof_window, 99);
         assert_eq!(config.proof_permits, 7);
         assert_eq!(config.cache.max_blocks, 11);
+        assert_eq!(config.pending_block_kind, PendingBlockKind::None);
     }
 
     /// Build a temp env whose worker base-fee container holds `epoch_fee` and return the
