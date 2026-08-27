@@ -17,6 +17,21 @@
 #   that each PR *head* folded into the group is attested, so walk the group's
 #   first-parent chain and check those.
 #
+#   How a head is recovered from that chain depends on the queue's merge method, and the
+#   two cases are not interchangeable:
+#
+#     MERGE   each queue commit is a merge commit, and its non-first parents are the PR
+#             heads. Read them straight out of the graph.
+#     SQUASH  what main's ruleset actually specifies. Each queue commit is a single-parent
+#             squash of one PR, so there is no second parent to read, and the PR head sha
+#             is not an ancestor of the queue branch at all -- it appears nowhere in this
+#             history. The only surviving signal is the `(#N)` GitHub appends to a squash
+#             subject, so parse those numbers and resolve each to a head sha via the API.
+#
+#   Both are implemented, graph first. Configuring the queue for MERGE or SQUASH therefore
+#   does not silently turn this check into a no-op, which is what happened when only the
+#   graph walk existed and the queue was set to SQUASH.
+#
 #   This is a belt-and-braces check, not the primary one: GitHub requires the branch's
 #   required checks to pass before a PR may enter the queue, and pushing to a queued PR
 #   ejects it, so the PR-event verification above already ran on every head in the group.
@@ -60,15 +75,51 @@ merge_group)
     heads=()
 
     if [[ -n "${base}" && -n "${head}" ]]; then
-        # The queue branch's first-parent chain from head back to base is exactly the
-        # sequence of merge commits the queue created, one per PR in the batch. Each of
-        # those commits' non-first parents are the PR heads. Restricting to
-        # --first-parent is what keeps a contributor's own "merge main into my branch"
-        # commit -- which sits off this chain -- from being mistaken for a PR head.
+        # Graph derivation, for a MERGE-configured queue. The first-parent chain from head
+        # back to base is exactly the sequence of commits the queue created, one per PR in
+        # the batch; under MERGE each is a merge commit whose non-first parents are the PR
+        # heads. Restricting to --first-parent is what keeps a contributor's own "merge
+        # main into my branch" commit -- which sits off this chain -- from being mistaken
+        # for a PR head. Under SQUASH every commit on the chain has a single parent, so
+        # `NF > 2` matches nothing and this yields an empty list.
         mapfile -t heads < <(
             git rev-list --first-parent --parents "${base}..${head}" 2>/dev/null |
                 awk 'NF > 2 { for (i = 3; i <= NF; i++) print $i }' | sort -u
         )
+    fi
+
+    # Subject derivation, for a SQUASH-configured queue -- which is what main uses. Parse
+    # the trailing `(#N)` off each squash subject and ask the API for that PR's head sha.
+    # Anonymous access is rate-limited hard enough to be unreliable, so this wants the
+    # workflow's GITHUB_TOKEN with `pull-requests: read`.
+    if ((${#heads[@]} == 0)) && [[ -n "${base}" && -n "${head}" ]]; then
+        prs=()
+        mapfile -t prs < <(
+            git log --first-parent --format=%s "${base}..${head}" 2>/dev/null |
+                sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p' | sort -un
+        )
+
+        api=(--silent --show-error --fail --max-time 30
+            -H "Accept: application/vnd.github+json"
+            -H "X-GitHub-Api-Version: 2022-11-28")
+        if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+            api+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+        fi
+
+        for pr in ${prs[@]+"${prs[@]}"}; do
+            [[ -n "${pr}" ]] || continue
+            sha=$(
+                curl "${api[@]}" \
+                    "${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY:-}/pulls/${pr}" |
+                    jq -r '.head.sha // empty'
+            )
+            if [[ -n "${sha}" ]]; then
+                echo "  #${pr} -> ${sha}"
+                heads+=("${sha}")
+            else
+                warn "could not resolve the head sha of #${pr}"
+            fi
+        done
     fi
 
     if ((${#heads[@]} == 0)); then
