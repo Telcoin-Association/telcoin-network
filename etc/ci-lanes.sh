@@ -53,8 +53,9 @@ run() {
 }
 
 lane_fmt() {
-    # --all rather than a bare `cargo fmt`: the root manifest is a virtual workspace, and
-    # the members are what need checking.
+    # --all is explicit, not load-bearing today: the root manifest is virtual, so there is
+    # no current package and bare `cargo fmt` already walks the members. It becomes
+    # load-bearing the moment the root gains a [package] section.
     run cargo "+${NIGHTLY}" fmt --all -- --check
     echo "fmt passed"
 }
