@@ -66,7 +66,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     error::{TnRethError, TnRethResult},
-    metrics::RETH_METRICS,
+    metrics::{record_invalid_tx_skipped, InvalidTxSkipReason, RETH_METRICS},
     payload::TNPayload,
     TNPrimitives,
 };
@@ -170,8 +170,8 @@ impl RethEnv {
                     //
                     // it's possible that another worker's batch included this transaction
                     debug!(target: "engine", %error, tx_hash = ?recovered.hash(), "skipping invalid transaction");
-                    // expected in normal operation - see the field docs, this is not an alert
-                    RETH_METRICS.invalid_txs_skipped_total.increment(1);
+                    // expected in normal operation - see the reason docs, this is not an alert
+                    record_invalid_tx_skipped(InvalidTxSkipReason::classify(error.as_ref()));
                     continue;
                 }
                 // this is an error that we should treat as fatal for this attempt
