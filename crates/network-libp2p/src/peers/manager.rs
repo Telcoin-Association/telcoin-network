@@ -139,7 +139,9 @@ pub(crate) struct PeerManager {
     /// [`MAX_PUT_RECORDS_PER_WINDOW`] per [`PUT_RECORD_RATE_WINDOW`] per source, independent of
     /// ban state, so a valid but unbanned self-signed record flood cannot starve the network
     /// task that also relays consensus gossip (GHSA-f6rq-62rr-4h9g). Entries are evicted per
-    /// source in [`Self::register_disconnected`].
+    /// source in [`Self::register_disconnected`] and swept once expired in
+    /// [`Self::sweep_put_record_windows`], so a record that lands after its source's
+    /// `ConnectionClosed` cannot leak an entry (issue #1290).
     put_record_windows: HashMap<PeerId, PutRecordWindow>,
     /// Prometheus metrics for peer lifecycle events.
     pub(super) metrics: PeerManagerMetrics,
@@ -373,6 +375,9 @@ impl PeerManager {
 
         // update timestamps
         self.unban_temp_banned_peers();
+
+        // drop expired put-record rate windows
+        self.sweep_put_record_windows();
 
         // manage discovery peers
         self.discovery_heartbeat();
@@ -673,6 +678,21 @@ impl PeerManager {
         for peer_id in self.temporarily_banned.heartbeat() {
             self.push_event(PeerEvent::Unbanned(peer_id));
         }
+    }
+
+    /// Drop per-source put-record rate windows whose window has expired.
+    ///
+    /// The limiter treats an expired window and a missing window the same way: the next record
+    /// from the source starts a fresh window. The sweep is therefore invisible to
+    /// [`Self::put_record_rate_limited`] and never frees an active flooder, whose window stays
+    /// fresh while it floods. Sweeping by age bounds the map even when the disconnect-time
+    /// eviction misses: kad back-pressure (a `PutRecordRes` parked in `pending_handler_event`)
+    /// can hold a queued inbound `PutRecord` past the source's `ConnectionClosed`, and draining
+    /// it re-inserts a window that no later disconnect removes (issue #1290).
+    fn sweep_put_record_windows(&mut self) {
+        let now = Instant::now();
+        self.put_record_windows
+            .retain(|_, window| now.duration_since(window.started) < PUT_RECORD_RATE_WINDOW);
     }
 
     /// Process peer exchange for peer discovery.
