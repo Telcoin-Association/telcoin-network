@@ -59,4 +59,4 @@ jobs:
           cache-on-failure: "true"
 
       - name: Build to populate cache
-        run: cargo nextest list --locked --workspace --exclude tn-faucet
+        run: cargo nextest list --locked --workspace
