@@ -1,13 +1,11 @@
-//! On-demand benchmark for consensus pack files: **background thread vs direct IO**, on both file
-//! backends.
+//! On-demand benchmark for consensus pack files: **buffered (`fsync`) vs mmap (`msync`)** file
+//! backends, across production usage patterns.
 //!
 //! Pack files are append-only archive files (BCS + per-record ZStd) with position/digest indexes.
-//! The production [`ConsensusPack`] drives them from **one background thread per pack** — every
-//! public `async fn` sends a message over a channel and awaits a `oneshot` reply. Its twin
-//! [`ConsensusPackDirect`] holds the same state behind an `Arc<Mutex<..>>` and does every call
-//! **inline on the caller's task** (no channel, no thread). This harness runs the same battery on
-//! both front-ends and both selectable file backends and prints one side-by-side table, so the
-//! `thr − dir` delta per row is the background-thread/channel overhead.
+//! The production [`ConsensusPack`] drives them from one background thread per pack — every public
+//! `async fn` sends a message over a channel and awaits a `oneshot` reply. This harness runs the
+//! same battery on both selectable file backends and prints one side-by-side table, so each row
+//! reads off the buffered-vs-mmap cost of that operation.
 //!
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
 //!
@@ -15,16 +13,15 @@
 //! cargo test -p tn-storage pack_file_bench -- --ignored --nocapture --test-threads 1
 //! ```
 //!
-//! ## What it models (columns = backend × transport × output width)
+//! ## What it models (columns = backend × output width)
 //!
 //! The knob that drives pack cost in production is how many batches each consensus output carries —
-//! a shallow leader vs a deep sub-DAG. So the report has a **column per `{backend}-{transport}
-//! x{width}`** (`buf`/`mmap` × `thr`/`dir` × narrow/typical/wide batches per output), with `thr`
-//! and `dir` adjacent per `{backend,width}` so their delta reads off directly. Each column writes
-//! [`NUM_OUTPUTS`] chained outputs built with [`make_wide_test_output`], whose batches are
-//! genuinely distinct across outputs (random transactions). All of the pack's files switch backend
-//! (data file
-//! + position index + digest index), so the `mmap` columns are a fully-`msync` pack.
+//! a shallow leader vs a deep sub-DAG. So the report has a **column per `{backend} x{width}`**
+//! (`buf`/`mmap` × narrow/typical/wide batches per output), with the two backends adjacent per
+//! width so their delta reads off directly. Each column writes [`NUM_OUTPUTS`] chained outputs
+//! built with [`make_wide_test_output`], whose batches are genuinely distinct across outputs
+//! (random transactions). All of the pack's files switch backend (data file + position index +
+//! digest index), so the `mmap` columns are a fully-`msync` pack.
 //!
 //! The rows, grouped, capture the real call sites traced through `consensus_pack.rs` /
 //! `consensus.rs` / `state-sync/src/lib.rs`:
@@ -49,9 +46,8 @@
 //!   the lever here. Scale [`NUM_OUTPUTS`] / [`WIDTHS`] up for heavier runs.
 //! - Timings are on a `tempfile` dir — they reflect that filesystem, not a specific production
 //!   disk.
-//! - `thr` timings include the background thread's disk IO (the async API awaits its ack); `dir`
-//!   runs the same IO inline behind an uncontended `parking_lot` lock (tens of ns), so `thr − dir`
-//!   isolates the thread/channel round-trip.
+//! - `buf` uses buffered file IO with `fsync` durability barriers; `mmap` memory-maps the files and
+//!   uses `msync`. Both drive the same production `ConsensusPack` (background thread + channel).
 
 use std::{
     collections::HashMap,
@@ -75,9 +71,9 @@ use crate::{
     mem_db::MemDatabase,
 };
 
-/// The subset of the pack API the battery exercises, so the whole battery can run generically over
-/// the threaded [`ConsensusPack`] and the direct [`ConsensusPackDirect`]. Both impls forward to
-/// their identical inherent methods (static dispatch — no `dyn`).
+/// The subset of the pack API the battery exercises, kept as a small trait so the battery body
+/// stays backend-agnostic. Its one implementation forwards to [`ConsensusPack`]'s inherent methods
+/// (static dispatch — no `dyn`).
 trait BenchPack: Sized {
     fn open_append_with_backend(
         path: &Path,
@@ -482,7 +478,7 @@ struct Column {
     data_len: u64,
 }
 
-/// Run the whole battery for one output width, one file `backend`, and one pack transport `P`.
+/// Run the whole battery for one output width and one file `backend`, over the pack type `P`.
 async fn run_battery<P: BenchPack>(fx: &Fixtures, backend: FileBackend, width: usize) -> Column {
     let outputs = build_outputs(fx, width);
     let header_digests: Vec<ConsensusHeaderDigest> =
@@ -542,7 +538,7 @@ async fn run_battery<P: BenchPack>(fx: &Fixtures, backend: FileBackend, width: u
     }
 }
 
-/// Collects one column per (backend, transport, width) and prints an aligned table (ms).
+/// Collects one column per (backend, width) and prints an aligned table (ms).
 struct Report {
     /// Row labels, captured from the first column and reused for alignment.
     order: Vec<&'static str>,
@@ -563,10 +559,9 @@ impl Report {
     }
 
     fn print(&self) {
-        // Columns are pushed 4 per width block (buf-thr, buf-dir, mmap-thr, mmap-dir); a vertical
-        // rail after every block and a rule between row groups make a single row easy to follow
-        // across all 12 columns.
-        const GROUP: usize = 4;
+        // Columns are pushed 2 per width block (buf, mmap); a vertical rail after every block and a
+        // rule between row groups make a single row easy to follow across all columns.
+        const GROUP: usize = 2;
         let label_w =
             self.order.iter().map(|s| s.len()).max().unwrap_or(0).max("bytes/output".len());
         let cell_w = 14usize;
@@ -593,8 +588,8 @@ impl Report {
         const GROUP_SEP_AFTER: &[&str] =
             &["save_durable", "persist bulk", "latest_header", "stream_import"];
 
-        println!("\n=== consensus pack-file benchmark: background thread (thr) vs direct IO (dir), buffered (fsync) vs mmap (msync) (ms) ===");
-        println!("legend: columns are {{backend}}-{{transport}} x{{batches/output}}; thr = background thread + channel, dir = inline &mut calls (no thread, no lock — the pure direct-IO baseline); thr - dir per row is the thread/channel overhead. Vertical rails group the 4 columns of each width; horizontal rules group the rows. save_durable adds a persist() barrier per output; test batches carry 1 tx each.");
+        println!("\n=== consensus pack-file benchmark: buffered (fsync) vs mmap (msync) file backends (ms) ===");
+        println!("legend: columns are {{backend}} x{{batches/output}}; buf = buffered file IO (fsync), mmap = memory-mapped files (msync); both drive the production ConsensusPack. Vertical rails group the 2 backend columns of each width; horizontal rules group the rows. save_durable adds a persist() barrier per output; test batches carry 1 tx each.");
 
         // header + underline rule
         let headers: Vec<String> = self.columns.iter().map(|(name, _)| name.clone()).collect();
@@ -628,27 +623,27 @@ impl Report {
     }
 }
 
-/// Compare the background-thread [`ConsensusPack`] against the direct [`ConsensusPackDirect`]
-/// across production usage patterns and both file backends.
+/// Compare the buffered (`fsync`) and memory-mapped (`msync`) file backends for the production
+/// [`ConsensusPack`] across its real usage patterns.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
 /// `cargo test -p tn-storage pack_file_bench -- --ignored --nocapture --test-threads 1`.
 #[test]
-#[ignore = "on-demand pack-file thread-vs-direct benchmark; run with --ignored --nocapture --test-threads 1"]
+#[ignore = "on-demand pack-file buffered-vs-mmap benchmark; run with --ignored --nocapture --test-threads 1"]
 fn pack_file_bench() {
     // Mirror `db_bench`: a plain test driving the async pack API on a tokio runtime.
     let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
     runtime.block_on(async {
         let fx = Fixtures::new();
         let mut report = Report::new();
-        // Width-outer, then backend, then transport — so `thr` and `dir` sit adjacent per
-        // {backend, width} for an at-a-glance overhead read.
+        // Width-outer, then backend — so the two backends sit adjacent per width for an
+        // at-a-glance buffered-vs-mmap read.
         for &(_, width) in WIDTHS {
             for (backend, blabel) in [(FileBackend::Buffered, "buf"), (FileBackend::Mmap, "mmap")] {
-                let thr = format!("{blabel}-thr x{width}");
-                println!("  running battery for {thr} ...");
+                let name = format!("{blabel} x{width}");
+                println!("  running battery for {name} ...");
                 let col = run_battery::<ConsensusPack>(&fx, backend, width).await;
-                report.push(&thr, col);
+                report.push(&name, col);
             }
         }
         report.print();

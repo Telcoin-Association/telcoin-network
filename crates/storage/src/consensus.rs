@@ -355,7 +355,7 @@ impl ConsensusChain {
         } else {
             // If we are running already then we should have a pack for the latest epoch so it is
             // Ok to error out here if it is missing. Open it in append mode (not static): this
-            // runs trunc_and_heal to repair a torn write from a hard crash mid-epoch, and leaves
+            // runs recover_pack to repair a torn write from a hard crash mid-epoch, and leaves
             // the pack writable so the node can resume saving outputs for this epoch without
             // waiting for new_epoch to flip a read-only pack to append.
             Arc::new(Mutex::new(ConsensusPack::open_append_exists(
@@ -1797,7 +1797,7 @@ mod test {
     /// A node that crashes mid-epoch can leave the pack's data file longer than its indexes
     /// (a torn write). On restart `ConsensusChain::new` must heal that pack rather than fail to
     /// open, otherwise the node cannot restart. This opens the latest epoch with
-    /// `open_append_exists` (which runs `trunc_and_heal`); the old `open_static` path returned
+    /// `open_append_exists` (which runs `recover_pack`); the old `open_static` path returned
     /// `CorruptPack` here.
     #[tokio::test]
     async fn test_new_heals_torn_write_on_restart() {

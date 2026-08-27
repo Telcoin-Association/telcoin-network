@@ -24,7 +24,7 @@
 //! **exactly `end`** at every point an external consumer can observe it — [`Self::try_clone`] (for
 //! `PackIter`/`raw_iter`, which read to EOF) and `Drop` (clean close) both truncate to `end` —
 //! while our own reads are bounded by `end` and never see the padding. After a crash the file may
-//! be left padded; the pack's CRC + `trunc_and_heal` path truncates it back exactly as it does for
+//! be left padded; the pack's CRC + `recover_pack` path truncates it back exactly as it does for
 //! the buffered `DataFile`.
 //!
 //! ## Durability

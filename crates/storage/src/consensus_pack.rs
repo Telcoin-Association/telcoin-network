@@ -34,7 +34,11 @@ use tracing::{debug, error};
 use crate::archive::{
     data_file::create_dir_synced,
     digest_index::DigestIndex,
-    error::{fetch::FetchError, load_header::LoadHeaderError, open::OpenError},
+    error::{
+        fetch::FetchError,
+        load_header::LoadHeaderError,
+        open::OpenError::{self, DataFileOpen},
+    },
     fxhasher::FxHasher,
     index::Index as _,
     pack::{write_value, DataHeader, FileBackend, Pack, PackCompression, DATA_HEADER_BYTES},
@@ -656,70 +660,157 @@ impl Inner {
         }
     }
 
-    /// Truncate the pack file in order to get back to a clean state.
-    fn trunc_and_heal(
+    /// Rebuild the position and digest indexes from the data-log WAL and, if the log's final record
+    /// is torn, truncate it so the pack is self-consistent again.
+    ///
+    /// Runs on open when [`Self::files_consistent`] fails — either the indexes were not synced (so
+    /// they lag the durable data log) or an unclean shutdown left a torn record at the tail. The
+    /// data log is the source of truth: the indexes are dropped and rebuilt by replaying every
+    /// complete consensus output in insert order (`EpochMeta`, then a `Consensus` header followed
+    /// by its `Batch` records). Each output is finalized only once all of its records have been
+    /// read (the header's sub-dag names exactly how many batches it owns), so a torn *next*
+    /// header keeps the last complete output while a torn *batch* drops just its own
+    /// (incomplete) output. Damage anywhere but the final record cannot be a clean tail and is
+    /// reported as [`PackError::CorruptPack`].
+    ///
+    /// v1 (header-first) format only: `open_static` rejects an inconsistent read-only pack rather
+    /// than healing, so recovery only runs on the writable append opens, which are always current
+    /// format.
+    fn recover_pack<P: AsRef<Path>>(
         data: &mut Pack<PackRecord>,
-        consensus_pos_idx: &mut PositionIndex<IndexPositions>,
-        consensus_digests: &mut DigestIndex,
-        batch_digests: &mut DigestIndex,
-    ) -> Result<(), PackError> {
-        let pack_len = data.file_len();
-        let consensus_final = consensus_digests.data_file_length();
-        let batch_final = batch_digests.data_file_length();
-        if pack_len > consensus_final || pack_len > batch_final {
-            if consensus_final > batch_final && batch_final > DATA_HEADER_BYTES as u64 {
-                data.truncate(batch_final)?;
-            } else if consensus_final > DATA_HEADER_BYTES as u64 {
-                data.truncate(consensus_final)?;
-            }
-            // Note we leave the digest indexes with potentially some missing digests.
-            // This should be OK since they will have to be overwritten with same digests
-            // when they are readded and lookups should handle this.
-            // Alternatively we would need to regen the indexes from scratch or painstakenly
-            // remove digests, both would be expensive operations.
+        base_dir: P,
+        mut consensus_pos_idx: PositionIndex<IndexPositions>,
+        consensus_digests: DigestIndex,
+        batch_digests: DigestIndex,
+        backend: FileBackend,
+    ) -> Result<(PositionIndex<IndexPositions>, DigestIndex, DigestIndex), PackError> {
+        if Self::files_consistent(data, &mut consensus_pos_idx, &consensus_digests, &batch_digests)
+        {
+            return Ok((consensus_pos_idx, consensus_digests, batch_digests));
         }
-        let pack_len = data.file_len();
-        if !consensus_pos_idx.is_empty() {
-            let mut new_pack_len = pack_len;
-            // Make sure we are not indexing any records that no longer exist.
-            // Also make sure we don not have a partial record left on a short file.
-            let start_idx = consensus_pos_idx.len() as u64 - 1;
-            let mut idx = start_idx;
-            loop {
-                if let Ok(last_record) = consensus_pos_idx.load(idx) {
-                    if idx != start_idx {
-                        // Keep the bytes index in sync with the consensus index so the two
-                        // never diverge in length after healing a damaged pack.
-                        consensus_pos_idx.truncate_to_index(idx)?;
-                    }
-                    new_pack_len = last_record.output_end;
-                    if new_pack_len <= pack_len {
-                        break;
-                    }
+        let base_dir = base_dir.as_ref();
+        // The data log is authoritative; discard the (stale/damaged) indexes and start fresh. The
+        // digest indexes are directories (index.hdx + index.odx), so remove the whole directory.
+        consensus_pos_idx.truncate_all()?;
+        drop(consensus_digests);
+        drop(batch_digests);
+        std::fs::remove_dir_all(base_dir.join(Self::CONSENSUS_HASH_NAME))?;
+        std::fs::remove_dir_all(base_dir.join(Self::BATCH_HASH_NAME))?;
+        let (mut consensus_digests, mut batch_digests) =
+            Self::open_digest_indexes(base_dir, data.header(), false, backend)?;
+
+        let mut iter = data.raw_iter().map_err(DataFileOpen)?;
+        // 0-based local index of the output within this pack (mirrors `save_consensus_output`).
+        let mut idx: u64 = 0;
+        // Byte offset just past the last fully-recovered record (the EpochMeta or a complete
+        // output). Anything after it is an incomplete/torn tail and is truncated away at the end.
+        let mut consistent_end = iter.position()?;
+
+        loop {
+            let header_pos = iter.position()?;
+            match iter.next() {
+                // Clean EOF on an output boundary: every complete output has been replayed.
+                None => break,
+                // The leading EpochMeta carries no index data (epoch_meta is already loaded and the
+                // pos index is 0-based); skip it, but keep it in the consistent prefix.
+                Some(Ok(PackRecord::EpochMeta(_))) => {
+                    consistent_end = iter.position()?;
+                    continue;
                 }
-                if idx == 0 {
-                    if idx != start_idx {
-                        consensus_pos_idx.truncate_all()?;
+                Some(Ok(PackRecord::Consensus(consensus_header))) => {
+                    consensus_digests
+                        .save(consensus_header.digest().into(), header_pos)
+                        .map_err(|e| PackError::IndexAppend(format!("consensus {e}")))?;
+                    // The header's sub-dag names exactly the batch records this output owns.
+                    let expected = Self::expected_batch_count(&consensus_header);
+                    let mut torn = false;
+                    for _ in 0..expected {
+                        let batch_pos = iter.position()?;
+                        match iter.next() {
+                            Some(Ok(PackRecord::Batch(batch))) => {
+                                batch_digests
+                                    .save(batch.digest(), batch_pos)
+                                    .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
+                            }
+                            // A non-batch where a batch is required is mid-log corruption.
+                            Some(Ok(_)) => return Err(PackError::CorruptPack),
+                            // Torn/short/short-EOF inside the output: it is incomplete, drop it.
+                            Some(Err(_)) | None => {
+                                torn = true;
+                                break;
+                            }
+                        }
+                    }
+                    if torn {
+                        // The remainder must be a clean torn/zero-padded tail; a record that still
+                        // decodes after the damage means mid-log corruption, not the final record.
+                        if !Self::tail_is_torn(&mut iter) {
+                            return Err(PackError::CorruptPack);
+                        }
+                        break; // consistent_end still marks the end of the last complete output
+                    }
+                    let output_end = iter.position()?;
+                    consensus_pos_idx
+                        .save(idx, IndexPositions::new(header_pos, header_pos, output_end))
+                        .map_err(|e| PackError::IndexAppend(format!("consensus number {e}")))?;
+                    idx += 1;
+                    consistent_end = output_end;
+                }
+                // A torn record where the next output's header would start. The last complete
+                // output is already finalized, so drop only this torn tail —
+                // provided it is the final record (a bit-flip mid-log would leave a
+                // readable record after it, which errors).
+                Some(Err(_)) => {
+                    if !Self::tail_is_torn(&mut iter) {
+                        return Err(PackError::CorruptPack);
                     }
                     break;
                 }
-                idx -= 1;
-            }
-            // Only ever shrink: `truncate` is `set_len`, so a `new_pack_len` above the current
-            // length (an index entry claiming an `output_end` past the data we actually have)
-            // would zero-extend the pack.  Clamp defensively.
-            let new_pack_len = new_pack_len.min(pack_len);
-            if new_pack_len != pack_len {
-                data.truncate(new_pack_len)?;
+                // v1 is header-first, so a batch (or a stray second epoch meta) here is corruption.
+                Some(Ok(_)) => return Err(PackError::CorruptPack),
             }
         }
-        // Reconcile the digest indexes' tracked data file length with the (possibly truncated)
-        // pack so files_consistent holds even if no save follows this heal.  Lookups use the
-        // live pack length, so this only affects the consistency check on a later open.
-        let healed_len = data.file_len();
-        consensus_digests.set_data_file_length(healed_len);
-        batch_digests.set_data_file_length(healed_len);
-        Ok(())
+
+        drop(iter);
+        // Drop any incomplete/torn tail so the log ends exactly at the last complete output.
+        if consistent_end < data.file_len() {
+            data.truncate(consistent_end)?;
+        }
+        // Reconcile the digest indexes' tracked data length with the (possibly truncated) log so
+        // `files_consistent` holds on the next open even if no save follows this recovery.
+        let len = data.file_len();
+        consensus_digests.set_data_file_length(len);
+        batch_digests.set_data_file_length(len);
+        Ok((consensus_pos_idx, consensus_digests, batch_digests))
+    }
+
+    /// Number of batch records the output for `header` owns — the dedup of its sub-dag's payload
+    /// digests, matching what `save_consensus_batches` writes via `collect_batches`. Zero when the
+    /// output references no batches.
+    fn expected_batch_count(header: &ConsensusHeader) -> usize {
+        let mut digests = BTreeSet::new();
+        for cert_header in header.sub_dag.headers() {
+            for (digest, _) in cert_header.payload().iter() {
+                digests.insert(*digest);
+            }
+        }
+        digests.len()
+    }
+
+    /// After recovery hits a damaged record, decide whether the rest of the log is a clean
+    /// torn/zero-padded tail (safe to truncate) or mid-log corruption (an error). A torn tail
+    /// yields only unreadable garbage until EOF; if any later record still decodes then valid
+    /// data survived past the damage, so the damaged record was not the final one.
+    fn tail_is_torn(
+        iter: &mut crate::archive::pack_iter::PackIter<PackRecord, std::fs::File>,
+    ) -> bool {
+        loop {
+            match iter.next() {
+                None => return true,
+                Some(Ok(_)) => return false,
+                Some(Err(_)) => continue,
+            }
+        }
     }
 
     /// Return the version of the underlying data pack file.
@@ -819,7 +910,7 @@ impl Inner {
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
         }
-        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
+        let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
         let (mut consensus_digests, mut batch_digests) =
             Self::open_digest_indexes(&base_dir, data.header(), false, backend)?;
         if !have_pack {
@@ -828,12 +919,14 @@ impl Inner {
             consensus_digests.set_data_file_length(len);
             batch_digests.set_data_file_length(len);
         }
-        // Repair damage.
-        Self::trunc_and_heal(
+        // Rebuild the indexes from the data-log WAL and truncate any torn tail record.
+        let (consensus_pos_idx, consensus_digests, batch_digests) = Self::recover_pack(
             &mut data,
-            &mut consensus_pos_idx,
-            &mut consensus_digests,
-            &mut batch_digests,
+            &base_dir,
+            consensus_pos_idx,
+            consensus_digests,
+            batch_digests,
+            backend,
         )?;
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
@@ -858,16 +951,18 @@ impl Inner {
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| PackError::EpochLoad(e.to_string()))?
             .into_epoch()?;
-        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
-        let (mut consensus_digests, mut batch_digests) =
+        let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
+        let (consensus_digests, batch_digests) =
             Self::open_digest_indexes(&base_dir, data.header(), false, backend)?;
 
-        // Repair damage.
-        Self::trunc_and_heal(
+        // Rebuild the indexes from the data-log WAL and truncate any torn tail record.
+        let (consensus_pos_idx, consensus_digests, batch_digests) = Self::recover_pack(
             &mut data,
-            &mut consensus_pos_idx,
-            &mut consensus_digests,
-            &mut batch_digests,
+            &base_dir,
+            consensus_pos_idx,
+            consensus_digests,
+            batch_digests,
+            backend,
         )?;
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
@@ -1168,9 +1263,9 @@ impl Inner {
     fn persist(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
             self.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
-            self.consensus_pos_idx.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
+            /*XXXXself.consensus_pos_idx.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
             self.consensus_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
-            self.batch_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
+            self.batch_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;*/
         }
         Ok(())
     }
@@ -1494,9 +1589,7 @@ fn check_header_expectation(
 
 /// Decode raw pack-file `bytes` for one consensus output into a [`ConsensusOutput`], dispatching on
 /// the pack data `version` (v0 legacy vs v1 header-first) and using the pack's `compression` and
-/// `committee`. Shared by the threaded [`ConsensusPack`] and the direct
-/// [`ConsensusPackDirect`](crate::consensus_pack_direct::ConsensusPackDirect) so both decode
-/// identically.
+/// `committee`.
 pub(crate) async fn decode_output_bytes(
     bytes: Vec<u8>,
     version: u16,
@@ -3325,8 +3418,9 @@ pub(crate) mod test {
         assert!(pack.get_consensus_output(1).await.is_ok(), "in-range number works");
     }
 
-    /// CP3: a pack healed on open (truncating a damaged tail) but not followed by a save must
-    /// still reconcile the index lengths, so a later read-only open passes the consistency check.
+    /// CP3: a pack recovered on open (rebuilding the indexes from the WAL and truncating a torn
+    /// tail record) but not followed by a save must still reconcile the index lengths, so a
+    /// later read-only open passes the consistency check.
     #[tokio::test]
     async fn test_heal_without_save_then_open_static() {
         let temp_dir = TempDir::with_prefix("test_cp_heal_static").expect("temp dir");
@@ -3373,10 +3467,170 @@ pub(crate) mod test {
 
         // A read-only open runs files_consistent; with the index lengths reconciled during heal
         // this must succeed rather than reporting CorruptPack.
-        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after heal");
-        // The healed pack dropped the damaged 5th output; the first four remain readable.
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after recover");
+        // The recovered pack dropped the incomplete 5th output; the first four remain readable.
         assert!(pack.get_consensus_output(1).await.is_ok());
         assert!(pack.get_consensus_output(4).await.is_ok());
+        assert!(pack.get_consensus_output(5).await.is_err(), "torn 5th output must be dropped");
+    }
+
+    /// Build `n` sequential outputs into a fresh pack at `temp_dir` and persist the data log.
+    async fn build_test_pack(
+        temp_dir: &TempDir,
+        committee: &Committee,
+        chain: &Arc<RethChainSpec>,
+        previous_epoch: &EpochRecord,
+        n: u64,
+    ) {
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open pack");
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..n {
+            let output =
+                make_test_output(committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            pack.save_consensus_output(output).await.expect("save output");
+        }
+        pack.persist().await.expect("persist");
+    }
+
+    /// Recovery rebuilds BOTH indexes purely from the data-log WAL: after the position and digest
+    /// indexes are lost (the "don't sync indexes" regime taken to its limit), reopening replays the
+    /// log so every output is again reachable by number and by digest, and the pack is consistent.
+    #[tokio::test]
+    async fn test_recover_rebuilds_indexes_from_wal() {
+        let temp_dir = TempDir::with_prefix("test_recover_rebuild").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 5).await;
+
+        // Lose the indexes entirely; only the data log survives.
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        for name in ["idx", "hash", "bhash"] {
+            std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove index dir");
+        }
+
+        // Reopen (append) -> files_consistent fails -> recover_pack rebuilds from the log.
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open append rebuilds");
+            pack.persist().await.expect("persist");
+        }
+
+        // Consistent again, and every output is reachable by number and by digest.
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after rebuild");
+        for i in 1..=5u64 {
+            let out = pack.get_consensus_output(i).await.expect("output by number");
+            assert!(
+                pack.contains_consensus_header(out.consensus_header_hash()).await,
+                "consensus digest for output {i} must be indexed"
+            );
+            if let Some(bd) =
+                out.batches().first().and_then(|c| c.batches.first()).map(|b| b.digest())
+            {
+                assert!(
+                    pack.contains_batch(bd).await,
+                    "batch digest for output {i} must be indexed"
+                );
+            }
+        }
+    }
+
+    /// A torn *next* output header (a partial record appended after several complete outputs) is
+    /// dropped without losing the last complete output — recovery finalizes each output before
+    /// reading the next header, so a broken next header only truncates itself.
+    #[tokio::test]
+    async fn test_recover_torn_next_header_keeps_last_output() {
+        use std::io::Write as _;
+        let temp_dir = TempDir::with_prefix("test_recover_torn_header").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // Append a torn next-output header: a size prefix whose payload was never written, so the
+        // next open short-reads it (a torn tail record) rather than seeing a clean EOF.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        {
+            let mut f = OpenOptions::new().append(true).open(&data_path).expect("open data");
+            f.write_all(&1024u32.to_le_bytes()).expect("write torn size prefix");
+        }
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open append recovers");
+            pack.persist().await.expect("persist");
+        }
+
+        let pack =
+            ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after recover");
+        for i in 1..=3u64 {
+            assert!(pack.get_consensus_output(i).await.is_ok(), "output {i} must be preserved");
+        }
+        assert!(
+            pack.get_consensus_output(4).await.is_err(),
+            "no phantom output from the torn header"
+        );
+    }
+
+    /// Corruption of a non-final record (a bit-flip with valid outputs still after it) is not a
+    /// clean torn tail: recovery reports `CorruptPack` rather than silently discarding good data.
+    #[tokio::test]
+    async fn test_recover_mid_log_corruption_errors() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        use crate::consensus_pack::PackError;
+        let temp_dir = TempDir::with_prefix("test_recover_corrupt").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // Corrupt a byte inside output 2's header payload (output 2 begins where output 1 ends).
+        // Staying past the 4-byte record size prefix leaves the framing intact, so output 2's
+        // batches and output 3 still decode AFTER the damage -> provably not the final record.
+        let boundary = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(1).await.expect("output 1 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(boundary + 20)).expect("seek");
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).expect("read");
+            byte[0] ^= 0xFF;
+            f.seek(SeekFrom::Start(boundary + 20)).expect("seek back");
+            f.write_all(&byte).expect("write");
+        }
+        // Force recovery to run by dropping the digest indexes so files_consistent fails.
+        for name in ["hash", "bhash"] {
+            std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove digest dir");
+        }
+
+        let res =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
+        assert!(
+            matches!(res, Err(PackError::CorruptPack)),
+            "mid-log corruption must error, got {res:?}"
+        );
     }
 
     /// `verify_epoch_meta` committee linkage across the shapes a mid-epoch on-chain ejection
