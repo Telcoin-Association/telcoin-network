@@ -13,6 +13,11 @@
 #
 # `CI Success` is the single required check. Keep it that way; adding a second required
 # name means a second workflow that must also learn `merge_group`.
+#
+# The fmt, clippy and test lanes below do not spell out their own commands. They call
+# etc/ci-lanes.sh, which etc/test-and-attest.sh also calls, so what the merge queue
+# enforces and what a maintainer attests locally are the same commands by construction
+# rather than by inspection. Change a lane there, not here.
 name: Pull Request and Merge Queue Checks
 
 on:
@@ -98,6 +103,13 @@ jobs:
     name: verify-on-chain
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # A job-level block replaces the workflow-level one outright, so `contents` is repeated
+    # here. `pull-requests: read` is for the merge_group path only: main's queue squashes,
+    # so the PR head shas are not in the queue branch's history and have to be resolved
+    # from the `(#N)` in each squash subject. Read-only, and still no secrets.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       # Full history on `merge_group` so the group's first-parent chain back to base_sha
       # is walkable; the PR event needs no history at all. GitHub expressions treat 0 as
@@ -116,6 +128,7 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: .github/scripts/verify_attestation.sh
 
   # Format check - no compilation needed, finishes in ~30s
@@ -134,14 +147,19 @@ jobs:
         run: rustup toolchain install $RUST_NIGHTLY -c rustfmt --profile minimal
 
       - name: Check formatting
-        run: cargo +$RUST_NIGHTLY fmt --all -- --check
+        run: ./etc/ci-lanes.sh fmt
 
-  # Clippy - replaces cargo check, catches more issues
+  # Clippy - replaces cargo check, catches more issues.
+  #
+  # Two passes, default features and then --all-features (see etc/ci-lanes.sh for why one
+  # does not cover the other). The two feature sets unify differently, so each pass
+  # compiles its own artifacts and the lane costs roughly twice what a single pass did.
+  # The timeout is sized for both, not one.
   clippy:
     needs: ci-scope
     if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
         with:
@@ -161,7 +179,7 @@ jobs:
           cache-on-failure: "true"
 
       - name: Run clippy
-        run: cargo +$RUST_NIGHTLY clippy --locked --all --all-features -- -D warnings
+        run: ./etc/ci-lanes.sh clippy
 
   # Tests - compile and run with nextest for parallel execution
   test:
@@ -190,15 +208,16 @@ jobs:
           cache-on-failure: "true"
 
       - name: Run tests
-        run: cargo nextest run --locked --workspace --exclude tn-faucet --no-fail-fast --profile ci
+        # `ci` profile: retries = 2, so a flake is less likely to eject a PR from the
+        # queue and force a rebuild of everything behind it. See etc/ci-lanes.sh.
+        env:
+          NEXTEST_PROFILE: ci
+        run: ./etc/ci-lanes.sh test-default
 
   # Adiri feature lane: the adiri-gated suites only compile under the adiri features, so
-  # the default-feature test job above never builds or runs them - the legacy header
-  # wire-format pins and the frozen pre-fork committee vectors in tn-types, the
-  # consensus-registry fork tests in tn-reth, the pre-fork entry-fee pin in tn-node, the
-  # frozen pre-fork consensus-pack fixtures in tn-storage, and the pre-fork genesis
-  # rejection in tn-config. Every crate that forwards `adiri` and has adiri-gated tests
-  # belongs on this line: one left off silently stops testing its pre-fork lane.
+  # the default-feature test job above never builds or runs them. The package and feature
+  # list lives in etc/ci-lanes.sh, next to the note on which packages are deliberately
+  # left off it.
   adiri-test:
     needs: ci-scope
     if: needs.ci-scope.outputs.run_lanes == 'true'
@@ -225,7 +244,9 @@ jobs:
           cache-on-failure: "true"
 
       - name: Run adiri-gated tests
-        run: cargo nextest run --locked -p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-config --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-config/adiri --no-fail-fast --profile ci
+        env:
+          NEXTEST_PROFILE: ci
+        run: ./etc/ci-lanes.sh test-adiri
 
   # Guard: rocksdb (librocksdb-sys, the entire RocksDB C++ engine and the single largest
   # native compile in the tree) must stay out of the default feature graph. It is gated

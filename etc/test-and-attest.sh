@@ -47,9 +47,6 @@ if [[ "${ALREADY_ATTESTED: -1}" == "1" ]]; then
     exit 0
 fi
 
-# nightly toolchain used for fmt/clippy (rustfmt and clippy use nightly-only options)
-NIGHTLY=$(cat rust-nightly)
-
 # Check if cargo-nextest is installed
 if ! cargo nextest --version &> /dev/null; then
     echo "cargo-nextest is not installed."
@@ -111,34 +108,17 @@ fi
 # nothing, so it runs first and fails fast)
 ./etc/archive-mode-guard.sh
 
-# check cargo fmt first
-cargo +$NIGHTLY fmt -- --check
+# fmt, clippy and both unit-test lanes. These live in etc/ci-lanes.sh because
+# .github/workflows/pr.yaml runs the very same file, on `pull_request` and again on
+# `merge_group` against main + this PR. One definition, so the queue cannot end up
+# enforcing something narrower than what gets attested here.
+./etc/ci-lanes.sh fmt
+./etc/ci-lanes.sh clippy
+./etc/ci-lanes.sh test-default
+./etc/ci-lanes.sh test-adiri
 
-echo "fmt passed"
-
-#
-# check clippy
-#
-# default features
-cargo +$NIGHTLY clippy --workspace -- -D warnings
-# all features
-cargo +$NIGHTLY clippy --workspace --all-features -- -D warnings
-
-echo "clippy for workspace: default and all features passed"
-
-#
-# run tests
-#
-# default features
-cargo nextest run --workspace --no-fail-fast
-# adiri-gated suites: the legacy header wire-format pins in tn-types, the consensus-registry
-# fork tests and their determinism oracles in tn-reth, and the pre-fork entry-fee pin in
-# tn-node. These tests only compile under the adiri features. No default-feature run above
-# builds or runs them. With multiple -p flags, cargo requires package-qualified feature
-# names. tn-storage is excluded: two of its consensus_pack tests fail under the adiri
-# features today, independent of this lane.
-cargo nextest run -p tn-types -p tn-reth -p tn-node --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri --no-fail-fast
-# run the e2e restart and epoch tests, they are seperate to avoid any port/node confusion.
+# The e2e suites: the part CI does not run, and the reason this script attests anything at
+# all. They are split into two invocations to avoid any port/node confusion.
 # Prebuild the node binary once into the shared target tree and hand it to the e2e tests via
 # TN_BIN_PATH (mirroring `make test-e2e`), so the ignored suite reuses it instead of cold-building
 # the binary inside the first test, which nextest capture would otherwise hide as a multi-minute hang.
