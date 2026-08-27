@@ -521,6 +521,30 @@ mod tests {
         assert_eq!(config.0.txpool.max_account_slots, RETH_MAX_ACCOUNT_SLOTS_PER_SENDER);
     }
 
+    /// The `--instance` port offsets the CLI README documents, checked against the values reth's
+    /// `adjust_instance_ports` resolves from TN's defaults: instance 1 keeps the defaults, each
+    /// further instance moves HTTP down by one and WebSocket up by two, and the IPC suffix is
+    /// appended to the configured path (`/tmp/tn.ipc-2`, not `/tmp/tn-2.ipc`).
+    ///
+    /// The CLI rejects instance 0 at parse time (`telcoin-network-cli`), so the smallest value
+    /// it can hand this function is 1 and the `instance - 1` below never underflows on that path.
+    #[test]
+    fn instance_port_offsets_match_documented_table() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let resolve = |instance: u16| -> eyre::Result<(u16, u16, String)> {
+            let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+            let reth_command = RethCommand::try_parse_from(["tn-reth"])?;
+            let config =
+                RethConfig::new(reth_command, Some(instance), tmp_dir.path(), false, chain);
+            Ok((config.0.rpc.http_port, config.0.rpc.ws_port, config.0.rpc.ipcpath))
+        };
+
+        assert_eq!(resolve(1)?, (8545, 8546, format!("{DEFAULT_IPC_ENDPOINT}-1")));
+        assert_eq!(resolve(2)?, (8544, 8548, format!("{DEFAULT_IPC_ENDPOINT}-2")));
+        assert_eq!(resolve(3)?, (8543, 8550, format!("{DEFAULT_IPC_ENDPOINT}-3")));
+        Ok(())
+    }
+
     /// Build a config the way `new_for_temp_chain` does, then hand its [`PruningArgs`] to `enable`
     /// so a test can turn on exactly one prune knob.
     ///

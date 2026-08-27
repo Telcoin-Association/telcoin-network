@@ -2068,3 +2068,55 @@ async fn test_discovery_heartbeat_removes_banned_ip_peers() {
     // discovery peer with banned ip should be removed
     assert!(!peer_manager.discovery_peers.contains_key(&discovery_peer));
 }
+
+#[tokio::test]
+async fn test_put_record_rate_limit_trips_after_threshold() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    // the first window's worth of records are accepted
+    (0..MAX_PUT_RECORDS_PER_WINDOW)
+        .for_each(|_| assert!(!peer_manager.put_record_rate_limited(source)));
+
+    // the next record in the same window trips the limit
+    assert!(peer_manager.put_record_rate_limited(source));
+}
+
+#[tokio::test]
+async fn test_put_record_window_resets_after_interval() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    (0..=MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    assert!(peer_manager.put_record_rate_limited(source));
+
+    // age the window past the interval; the next record starts a fresh window and is accepted
+    peer_manager.put_record_windows.get_mut(&source).expect("window exists").started =
+        std::time::Instant::now() - PUT_RECORD_RATE_WINDOW;
+    assert!(!peer_manager.put_record_rate_limited(source));
+}
+
+#[tokio::test]
+async fn test_put_record_window_evicted_on_disconnect() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = register_peer(&mut peer_manager, None);
+
+    assert!(!peer_manager.put_record_rate_limited(source));
+    assert!(peer_manager.put_record_windows.contains_key(&source));
+
+    peer_manager.register_disconnected(&source);
+    assert!(!peer_manager.put_record_windows.contains_key(&source));
+}
+
+#[tokio::test]
+async fn test_put_record_rate_limit_never_applies_to_local_peer() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+
+    // the local id is exempt no matter how many records arrive, and never allocates a window
+    (0..=MAX_PUT_RECORDS_PER_WINDOW)
+        .for_each(|_| assert!(!peer_manager.put_record_rate_limited(local)));
+    assert!(!peer_manager.put_record_windows.contains_key(&local));
+}

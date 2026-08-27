@@ -169,7 +169,7 @@ impl RethEnv {
                     // allow transaction errors (ie - duplicates)
                     //
                     // it's possible that another worker's batch included this transaction
-                    warn!(target: "engine", %error,  "skipping invalid transaction: {:#?}", recovered);
+                    debug!(target: "engine", %error, tx_hash = ?recovered.hash(), "skipping invalid transaction");
                     // expected in normal operation - see the field docs, this is not an alert
                     RETH_METRICS.invalid_txs_skipped_total.increment(1);
                     continue;
