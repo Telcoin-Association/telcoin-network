@@ -408,8 +408,6 @@ mod tests {
         )?;
         let pool = reth_env.init_txn_pool()?;
         let network = crate::worker::WorkerNetwork::new_for_test(reth_env.chainspec());
-        // Default per-worker base fee: this test drives `eth_syncing` only, so the epoch
-        // base-fee value is irrelevant (mirrors the builder test's default above).
         let server = reth_env.get_rpc_server(
             pool,
             network.clone(),

@@ -75,7 +75,11 @@ async fn test_output_to_header() -> eyre::Result<()> {
 
     // Set up mock worker.
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    config
+        .local_network(0)
+        .expect("worker 0 local network")
+        .set_primary_to_worker_local_handler(mock_client)
+        .expect("register mock worker client");
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
@@ -190,7 +194,11 @@ async fn test_executor_output_ordering() -> eyre::Result<()> {
         create_signed_certificates_for_rounds(1..=11, &fixture, &[]);
 
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    config
+        .local_network(0)
+        .expect("worker 0 local network")
+        .set_primary_to_worker_local_handler(mock_client)
+        .expect("register mock worker client");
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
@@ -296,7 +304,11 @@ async fn test_executor_batch_fetching() -> eyre::Result<()> {
 
     let batch_count = batches.len();
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    config
+        .local_network(0)
+        .expect("worker 0 local network")
+        .set_primary_to_worker_local_handler(mock_client)
+        .expect("register mock worker client");
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
@@ -490,7 +502,11 @@ async fn test_duplicate_batch_digest() -> eyre::Result<()> {
 
     // set up mock worker with all batches
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches: all_batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    config
+        .local_network(0)
+        .expect("worker 0 local network")
+        .set_primary_to_worker_local_handler(mock_client)
+        .expect("register mock worker client");
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
@@ -624,7 +640,11 @@ async fn test_subscriber_dup_batch_across_certs() -> eyre::Result<()> {
     .into_iter()
     .collect();
     let mock_client = Arc::new(MockPrimaryToWorkerClient { batches: mock_batches });
-    config.local_network().set_primary_to_worker_local_handler(mock_client);
+    config
+        .local_network(0)
+        .expect("worker 0 local network")
+        .set_primary_to_worker_local_handler(mock_client)
+        .expect("register mock worker client");
 
     // two round 1 certificates from different authorities sharing batch_1
     let authorities: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
