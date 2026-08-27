@@ -11,6 +11,12 @@ SECONDS=0
 
 set -e  # Exit immediately if a command exits with a non-zero status
 
+# Navigate to the project root directory for workspace, .rustfmt.toml, .env, etc. This has
+# to happen before anything reads a repo-relative path, so the script works from any cwd.
+cd "$(dirname "$0")/.."
+
+echo "executing bash script from $(pwd)"
+
 # load environment variables
 source .env
 
@@ -40,11 +46,6 @@ if [[ "${ALREADY_ATTESTED: -1}" == "1" ]]; then
     echo "Nothing to update."
     exit 0
 fi
-
-# Navigate to the project root directory for workspace, .rustfmt.toml, etc.
-cd "$(dirname "$0")/.."
-
-echo "executing bash script from $(pwd)"
 
 # nightly toolchain used for fmt/clippy (rustfmt and clippy use nightly-only options)
 NIGHTLY=$(cat rust-nightly)
@@ -76,6 +77,34 @@ if [ -n "$MODIFIED_TRACKED_FILES" ]; then
     echo "Error: please commit changes before attesting HEAD commit hash."
     echo "$MODIFIED_TRACKED_FILES"
     exit 1
+fi
+
+# Refuse to attest content that is behind main.
+#
+# This matters more, not less, now that main uses a merge queue. The queue re-runs fmt,
+# clippy and the two test lanes against `main + PR`, so a stale branch is caught there for
+# everything CI can afford to run. What the queue can NOT re-run is the e2e suite below --
+# it is the reason this script exists, and it only ever executes here, against whatever
+# this branch happens to be based on. Attesting a branch that is behind main therefore
+# produces the one thing the queue cannot backstop: an e2e result for a combination that
+# is not the combination being merged.
+#
+# Merge or rebase onto main first. Override with ALLOW_STALE_BASE=1 when the drift is
+# provably irrelevant (a docs-only main, say) and you want the hours back.
+BASE_BRANCH="${ATTEST_BASE_BRANCH:-origin/main}"
+git fetch --quiet origin || echo "warning: could not reach origin; ${BASE_BRANCH} may be stale"
+if git rev-parse --verify --quiet "${BASE_BRANCH}" > /dev/null; then
+    if ! git merge-base --is-ancestor "${BASE_BRANCH}" HEAD; then
+        BEHIND=$(git rev-list --count "HEAD..${BASE_BRANCH}")
+        echo "Error: HEAD is missing ${BEHIND} commit(s) from ${BASE_BRANCH}."
+        echo "The e2e suites below only ever run here, so attesting now tests a combination"
+        echo "that is not the one being merged. Merge or rebase onto ${BASE_BRANCH} first."
+        echo "Set ALLOW_STALE_BASE=1 to attest anyway."
+        [ "${ALLOW_STALE_BASE:-0}" = "1" ] || exit 1
+        echo "ALLOW_STALE_BASE=1: attesting a stale base anyway."
+    fi
+else
+    echo "warning: ${BASE_BRANCH} not found; skipping the stale-base check"
 fi
 
 # guard the archive-mode assumption every pinned consensus-registry read depends on (compiles
@@ -158,3 +187,7 @@ TX_HASH=$(echo "$output" | grep 'transactionHash' | grep -v 'logs' | awk '{print
 echo "https://telscan.io/tx/${TX_HASH}"
 echo "Contract state update initiated with commit hash: ${COMMIT_HASH}"
 echo "Script took ${SECONDS}s to complete"
+echo
+echo "This attestation satisfies the 'verify-on-chain' lane on the pull request. When the"
+echo "PR is queued, the merge queue re-runs fmt, clippy and both test lanes against"
+echo "main + this PR; expect that second run and do not force-push while it is queued."

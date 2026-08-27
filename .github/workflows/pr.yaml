@@ -1,13 +1,41 @@
-name: Pull Request Checks
+# Checks that gate a change into main, on both events that can produce one.
+#
+#   `pull_request`  -- the PR in isolation, on the author's head commit.
+#   `merge_group`   -- the merge queue's temporary commit: main, plus this PR, plus every
+#                      PR ahead of it in the batch. This combination has never been
+#                      compiled anywhere, which is the whole point: it is where a semantic
+#                      merge conflict (both sides green, the merge broken) surfaces.
+#
+# Every job below reports under the same check name on both events. That matters: GitHub
+# evaluates the branch's required checks twice -- once on the PR before it may enter the
+# queue, and again on the merge group -- and a required check that never reports on
+# `merge_group` does not fail the queue, it hangs it until the queue timeout ejects the PR.
+#
+# `CI Success` is the single required check. Keep it that way; adding a second required
+# name means a second workflow that must also learn `merge_group`.
+name: Pull Request and Merge Queue Checks
+
 on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, review_requested, ready_for_review]
+  # No `branches:` filter here -- on this event the ref is the queue's temporary
+  # `gh-readonly-queue/main/...` branch, which a `[main]` filter would not match.
+  merge_group:
+    types: [checks_requested]
 
-# Cancel in-progress runs when a new commit is pushed to the same PR
+# Cancel superseded runs on a PR. Never on a merge group: those runs are not superseded
+# (each tests a distinct candidate commit), and a cancelled run reports as a non-success
+# conclusion, which ejects the PR from the queue. `github.head_ref` is empty on
+# `merge_group`, so the group's own ref keys the group and each run gets its own slot.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.merge_group.head_ref || github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Everything here only reads the repository; the attestation lane reads a public RPC and
+# needs no secrets (least privilege, CodeQL actions/missing-workflow-permissions).
+permissions:
+  contents: read
 
 env:
   CARGO_INCREMENTAL: 0
@@ -18,29 +46,84 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  # maintainers test and attest locally
-  skip-maintainers:
+  # Decides whether the compile-and-test lanes run at all.
+  #
+  # On a `pull_request` they are skipped for a draft, and for a maintainer-authored PR --
+  # a maintainer runs a strictly larger suite locally and attests it (etc/test-and-attest.sh),
+  # so re-running a subset of it on GitHub buys nothing.
+  #
+  # Neither reason survives into the merge queue. The queue's commit is main + this PR,
+  # which no local run covered no matter who authored it, so every lane runs there for
+  # every author. That is the coverage the attestation cannot provide and the reason the
+  # queue is worth having. Note this used to hold only by accident: on `merge_group` the
+  # PR-author login is empty, so the maintainer test happened to evaluate false.
+  ci-scope:
+    name: ci-scope
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
-      is_maintainer: ${{ steps.check.outputs.is_maintainer }}
+      run_lanes: ${{ steps.decide.outputs.run_lanes }}
     steps:
-      - uses: actions/checkout@v4
-      - id: check
+      - id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
         run: |
-          MAINTAINERS=("grantkee" "sstanfield" "MavenRain" "Huwonk")
-          if [[ " ${MAINTAINERS[@]} " =~ " ${{ github.event.pull_request.user.login }} " ]]; then
-            echo "is_maintainer=true" >> $GITHUB_OUTPUT
-          else
-            echo "is_maintainer=false" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "merge_group" ]]; then
+            echo "merge queue: running every lane on the merged commit"
+            echo "run_lanes=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          MAINTAINERS=("grantkee" "sstanfield" "MavenRain" "Huwonk")
+          run=true
+          if [[ " ${MAINTAINERS[*]} " == *" ${PR_AUTHOR} "* ]]; then
+            echo "maintainer PR (${PR_AUTHOR}): lanes covered by the local attested run"
+            run=false
+          elif [[ "$PR_DRAFT" == "true" ]]; then
+            echo "draft PR: lanes deferred until ready for review"
+            run=false
+          fi
+          echo "run_lanes=${run}" >> "$GITHUB_OUTPUT"
+
+  # The on-chain attestation gate. Always runs, on both events; the script picks which
+  # commit hash(es) the event makes verifiable. See .github/scripts/verify_attestation.sh.
+  #
+  # This lane deliberately carries no `environment:`. It performs a read-only `cast call`
+  # against a public RPC and uses no secrets, and a deployment environment with protection
+  # rules attached would park the merge queue on a manual approval until it times out.
+  attest:
+    name: verify-on-chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Full history on `merge_group` so the group's first-parent chain back to base_sha
+      # is walkable; the PR event needs no history at all. GitHub expressions treat 0 as
+      # falsy, hence the quoted strings.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ github.event_name == 'merge_group' && '0' || '1' }}
+
+      # install foundry toolchain for casting txs
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Verify attestation on adiri
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: .github/scripts/verify_attestation.sh
 
   # Format check - no compilation needed, finishes in ~30s
   fmt:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -55,11 +138,10 @@ jobs:
 
   # Clippy - replaces cargo check, catches more issues
   clippy:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,11 +165,10 @@ jobs:
 
   # Tests - compile and run with nextest for parallel execution
   test:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -119,11 +200,10 @@ jobs:
   # rejection in tn-config. Every crate that forwards `adiri` and has adiri-gated tests
   # belongs on this line: one left off silently stops testing its pre-fork lane.
   adiri-test:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -152,11 +232,10 @@ jobs:
   # behind the off-by-default `rocksdb` feature; this catches a future reth bump whose
   # default set silently re-introduces it. Resolves the graph only - nothing is compiled.
   rocksdb-gate:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -191,32 +270,60 @@ jobs:
   # behind `NodeConfig::prune_config`.
   # Greps only - nothing is resolved or compiled, so no toolchain or cache is needed.
   archive-mode-gate:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - name: Assert no pruning entry point in the node
         run: ./etc/archive-mode-guard.sh
 
-  # Gate job for branch protection - depends on all checks
+  # The one required status check, for branch protection and for the merge queue.
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: always()
-    needs: [fmt, clippy, test, adiri-test, rocksdb-gate, archive-mode-gate]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, rocksdb-gate, archive-mode-gate]
     steps:
       - name: Check all jobs passed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RESULTS: ${{ toJSON(needs) }}
         run: |
-          if [[ "${{ needs.fmt.result }}" == "failure" || \
-                "${{ needs.clippy.result }}" == "failure" || \
-                "${{ needs.test.result }}" == "failure" || \
-                "${{ needs.adiri-test.result }}" == "failure" || \
-                "${{ needs.rocksdb-gate.result }}" == "failure" || \
-                "${{ needs.archive-mode-gate.result }}" == "failure" ]]; then
+          set -euo pipefail
+          # Allowlist the acceptable conclusions rather than blocklisting `failure`. The
+          # blocklist form let `cancelled` and any future conclusion through, greening the
+          # gate on a job that never produced a result.
+          #
+          # `skipped` is acceptable only on a pull_request, where it is the deliberate
+          # maintainer/draft bypass. In the merge queue nothing may be skipped: a skipped
+          # lane there means the merged commit went untested, which is the one thing the
+          # queue exists to prevent.
+          failed=0
+          while read -r job result; do
+            case "$result" in
+              success)
+                echo "  ok       ${job}"
+                ;;
+              skipped)
+                if [[ "$EVENT_NAME" == "merge_group" ]]; then
+                  echo "::error::${job} was skipped in the merge queue; every lane must run on the merged commit"
+                  failed=1
+                else
+                  echo "  skipped  ${job}"
+                fi
+                ;;
+              *)
+                echo "::error::${job}: ${result}"
+                failed=1
+                ;;
+            esac
+          done < <(jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<<"$RESULTS")
+
+          if [[ "$failed" -ne 0 ]]; then
             echo "One or more checks failed"
             exit 1
           fi
