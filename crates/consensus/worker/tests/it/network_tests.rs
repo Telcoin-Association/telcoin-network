@@ -7,6 +7,7 @@ use tn_network_libp2p::{
     types::{NetworkCommand, NetworkHandle},
     GossipMessage, Penalty, TopicHash,
 };
+use tn_network_types::MockWorkerToPrimary;
 use tn_storage::{mem_db::MemDatabase, tables::NodeBatchesCache};
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
@@ -60,6 +61,14 @@ fn create_test_types_with_chain_id(chain_id: u64) -> TestTypes {
         0,
         chain_id,
     );
+    // The primary registers on each worker's local network in production before any worker
+    // spawns; the report path surfaces a missing handler as an error (issue #556), so the
+    // tests bind a mock in its place.
+    config
+        .local_network(worker_id)
+        .expect("worker 0 local network")
+        .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+        .expect("register mock primary handler");
     let handler = RequestHandler::new(worker_id, batch_validator, config, network_handle);
     TestTypes { committee, handler, task_manager, network_commands_rx }
 }
@@ -79,6 +88,12 @@ fn create_test_types_with_validator(
     let (tx, network_commands_rx) = mpsc::channel(10);
     let network_handle =
         WorkerNetworkHandle::new(NetworkHandle::new(tx), task_manager.get_spawner(), 0, 0, 0);
+    // See `create_test_types_with_chain_id`: the report path needs a bound handler.
+    config
+        .local_network(worker_id)
+        .expect("worker 0 local network")
+        .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+        .expect("register mock primary handler");
     let handler = RequestHandler::new(worker_id, validator, config, network_handle);
     (TestTypes { committee, handler, task_manager, network_commands_rx }, store)
 }

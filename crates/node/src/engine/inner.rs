@@ -145,8 +145,12 @@ impl ExecutionNodeInner {
     {
         let transaction_pool = self.reth_env.init_txn_pool()?;
 
-        let network =
-            WorkerNetwork::new(self.reth_env.chainspec(), network_handle, self.tn_config.version);
+        let network = WorkerNetwork::new(
+            self.reth_env.chainspec(),
+            network_handle,
+            self.tn_config.version,
+            self.reth_env.clone(),
+        );
         let mut tx_pool_latest = transaction_pool.block_info();
         tx_pool_latest.pending_basefee = base_fee.base_fee();
         let last_seen = self.reth_env.finalized_block_hash_number_for_startup()?;
@@ -219,6 +223,14 @@ impl ExecutionNodeInner {
         for worker in &self.workers {
             worker.worker_network().respawn_peer_count(network_handle.clone());
         }
+    }
+
+    /// Push the node's consensus catch-up state into every worker's RPC network shim.
+    ///
+    /// The epoch manager's node-mode watch task drives this on every mode change so the
+    /// stock `eth_syncing` handler answers from live consensus state (issue #1231).
+    pub(super) fn set_workers_syncing(&self, syncing: bool) {
+        self.workers.iter().for_each(|worker| worker.worker_network().set_syncing(syncing));
     }
 
     /// Create a new block validator.

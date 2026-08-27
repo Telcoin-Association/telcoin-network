@@ -396,8 +396,58 @@ mod tests {
         Ok(())
     }
 
-    /// The five TN CLI eth flags survive the TN-args-to-reth-args conversion and land in the
+    /// The stock `eth_syncing` handler answers from the worker shim's sync flag
+    /// (issue #1231).
+    ///
+    /// The call goes through `get_rpc_server`'s production registration, so this exercises
+    /// the same handler an operator's `eth_syncing` request reaches. `SyncStatus::None`
+    /// serializes as `false`; a syncing node answers a sync-progress object.
+    #[tokio::test]
+    async fn test_eth_syncing_answers_from_worker_shim_flag() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        // `new_for_temp_chain` disables every RPC transport (issue #1165), which would
+        // register no eth methods at all; inject reth's default args (IPC module set) so
+        // the production registration is what answers.
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain,
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            reth::args::RpcServerArgs::default(),
+        )?;
+        let pool = reth_env.init_txn_pool()?;
+        let network = crate::worker::WorkerNetwork::new_for_test(reth_env.chainspec());
+        let server = reth_env.get_rpc_server(
+            pool,
+            network.clone(),
+            BaseFeeContainer::default(),
+            RpcModule::new(()),
+        )?;
+        let methods = server.methods_by(|name| name == "eth_syncing");
+
+        let synced: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;
+        assert_eq!(synced, serde_json::Value::Bool(false));
+
+        network.set_syncing(true);
+        let syncing: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;
+        assert!(syncing.is_object(), "syncing answer is a sync-progress object: {syncing}");
+        assert!(syncing.get("currentBlock").is_some(), "sync object names currentBlock");
+        assert_eq!(syncing.get("currentBlock"), syncing.get("highestBlock"));
+
+        network.set_syncing(false);
+        let caught_up: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;
+        assert_eq!(caught_up, serde_json::Value::Bool(false));
+
+        Ok(())
+    }
+
+    /// The TN CLI eth flags survive the TN-args-to-reth-args conversion and land in the
     /// [`EthConfig`] that [`RethEnv::get_rpc_server`] hands to [`apply_eth_config`].
+    ///
+    /// The pending-block assert also pins TN's `none` default against reth's `full`
+    /// (issue #1231): only the conversion carrying TN's field can produce `None` here.
     #[test]
     fn test_tn_rpc_args_reach_eth_config() {
         let args = TnRpcServerArgs {
@@ -415,6 +465,7 @@ mod tests {
         assert_eq!(config.eth_proof_window, 99);
         assert_eq!(config.proof_permits, 7);
         assert_eq!(config.cache.max_blocks, 11);
+        assert_eq!(config.pending_block_kind, PendingBlockKind::None);
     }
 
     /// Build a temp env whose RPC server quotes `worker_id`'s base fee from `accumulator`
