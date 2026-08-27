@@ -18,9 +18,10 @@ use tn_reth::{
 };
 use tn_rpc::{EngineToPrimary, TelcoinNetworkRpcExt, TelcoinNetworkRpcExtApiServer};
 use tn_types::{
-    gas_accumulator::GasAccumulator, Address, BatchSender, BatchValidation, BlockHeader,
-    BlsPublicKey, Bytes, ConsensusHeaderDigest, ConsensusOutput, EngineUpdate, Epoch, ExecHeader,
-    Noticer, SealedHeader, TaskSpawner, WorkerId, B256,
+    gas_accumulator::{BaseFeeContainer, GasAccumulator},
+    Address, BatchSender, BatchValidation, BlockHeader, BlsPublicKey, Bytes, ConsensusHeaderDigest,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
+    B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::mpsc;
@@ -137,17 +138,21 @@ impl ExecutionNodeInner {
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         engine_to_primary: EP,
-        base_fee: u64,
+        base_fee: BaseFeeContainer,
     ) -> eyre::Result<()>
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
         let transaction_pool = self.reth_env.init_txn_pool()?;
 
-        let network =
-            WorkerNetwork::new(self.reth_env.chainspec(), network_handle, self.tn_config.version);
+        let network = WorkerNetwork::new(
+            self.reth_env.chainspec(),
+            network_handle,
+            self.tn_config.version,
+            self.reth_env.clone(),
+        );
         let mut tx_pool_latest = transaction_pool.block_info();
-        tx_pool_latest.pending_basefee = base_fee;
+        tx_pool_latest.pending_basefee = base_fee.base_fee();
         let last_seen = self.reth_env.finalized_block_hash_number_for_startup()?;
         tx_pool_latest.last_seen_block_hash = last_seen.hash;
         tx_pool_latest.last_seen_block_number = last_seen.number;
@@ -158,6 +163,7 @@ impl ExecutionNodeInner {
         let server = self.reth_env.get_rpc_server(
             transaction_pool.clone(),
             network.clone(),
+            base_fee,
             tn_ext.into_rpc(),
         )?;
 
@@ -217,6 +223,14 @@ impl ExecutionNodeInner {
         for worker in &self.workers {
             worker.worker_network().respawn_peer_count(network_handle.clone());
         }
+    }
+
+    /// Push the node's consensus catch-up state into every worker's RPC network shim.
+    ///
+    /// The epoch manager's node-mode watch task drives this on every mode change so the
+    /// stock `eth_syncing` handler answers from live consensus state (issue #1231).
+    pub(super) fn set_workers_syncing(&self, syncing: bool) {
+        self.workers.iter().for_each(|worker| worker.worker_network().set_syncing(syncing));
     }
 
     /// Create a new block validator.

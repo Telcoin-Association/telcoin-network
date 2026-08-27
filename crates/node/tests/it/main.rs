@@ -44,7 +44,8 @@ use tn_test_utils::{
 use tn_types::{
     adiri_genesis,
     gas_accumulator::{
-        compute_next_base_fee_eip1559, next_base_fee_for_config, GasAccumulator, WorkerFeeConfig,
+        compute_next_base_fee_eip1559, next_base_fee_for_config, BaseFeeContainer, GasAccumulator,
+        WorkerFeeConfig,
     },
     Address, Batch, BlockNumHash, BlsPublicKey, BlsSignature, Certificate, CommittedSubDag,
     ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
@@ -286,7 +287,12 @@ async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()
     let base_fee = MIN_PROTOCOL_BASE_FEE + 1234;
 
     execution_node
-        .initialize_worker_components(worker_id, network_handle, NoopEngineToPrimary, base_fee)
+        .initialize_worker_components(
+            worker_id,
+            network_handle,
+            NoopEngineToPrimary,
+            BaseFeeContainer::new(base_fee),
+        )
         .await?;
 
     let pool = execution_node.get_worker_transaction_pool(&worker_id).await?;
