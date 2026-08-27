@@ -9,6 +9,13 @@ suites locally, then writes the HEAD commit hash to the git attestation registry
 (`0xf102928273a399cda6151b8616209af019499c84`). The `verify-on-chain` lane in
 `.github/workflows/pr.yaml` reads that registry back.
 
+The lanes themselves live in **`etc/ci-lanes.sh`**, and both `test-and-attest.sh` and
+`pr.yaml` call it. That is the only reason "the queue runs what was attested" is a fact
+rather than a hope: when the two spelled out their own commands, they had already drifted
+(CI ran clippy under `--all-features` only, and excluded a package deleted long ago). Edit a
+lane there and both callers change together. The e2e suites are deliberately not in that
+file -- anything added to it lands in the merge queue.
+
 ## What the merge queue changes
 
 `main` is merged through a GitHub merge queue. The queue exists because attestation cannot
@@ -36,8 +43,14 @@ event against it. Three consequences worth remembering:
   merged commit has never been compiled anywhere, so every lane runs. `CI Success` treats a
   skipped lane as a failure on `merge_group` for the same reason.
 - **The merge group's commit hash cannot be attested.** GitHub creates it seconds before
-  CI starts, so no local run could have covered it. `verify_attestation.sh` instead walks
-  the group's first-parent chain and verifies the PR *heads* folded into it.
+  CI starts, so no local run could have covered it. `verify_attestation.sh` instead
+  verifies the PR *heads* folded into the group, and how it finds them depends on the
+  queue's merge method. Under `MERGE` each queue commit is a merge whose non-first parents
+  are the heads. Under `SQUASH`, which is what main uses, each queue commit is a
+  single-parent squash and the head shas are not in the queue branch's history at all --
+  the only signal left is the `(#N)` GitHub appends to the squash subject, which the script
+  parses and resolves through the API. Both paths are implemented; changing the queue's
+  merge method will not quietly turn this check into a no-op.
 
 ### Where the coverage gap is
 
@@ -53,19 +66,43 @@ through.
 The workflow changes are not enough on their own. In the `main` ruleset:
 
 1. Enable **Merge queue**.
-2. Set the required status check to **`CI Success`**, and nothing else. In particular
-   remove `verify-on-chain` if it is listed there: it is a job inside `pr.yaml` now, not a
-   separate workflow, and `CI Success` already depends on it.
-3. Keep the queue's **maximum PRs to build** small (1-2) to start. Larger batches mean a
+2. Tick **Allow auto-merge**, under Settings -> General -> Pull Requests. This one is not
+   in the ruleset and does not look related, so it is the one that gets missed: the "Merge
+   when ready" button calls the `enablePullRequestAutoMerge` GraphQL mutation even on a
+   branch that has a queue, and that mutation is gated on this checkbox. With it unticked
+   every attempt to queue a PR fails with *"failed enabling auto-merge for pull request"*,
+   however green the PR is and however many approvals it has.
+3. Add **`CI Success`** as the required status check, and nothing else. In particular do not
+   list `verify-on-chain`: it is a job inside `pr.yaml` now, not a separate workflow, and
+   `CI Success` already depends on it. Without at least one required check the queue has
+   nothing to wait for and merges each entry as soon as it is built, which makes every
+   `merge_group` lane in this workflow decorative.
+4. Keep the queue's **maximum PRs to build** small (1-2) to start. Larger batches mean a
    single bad PR forces a rebuild of everything behind it, and this workspace is expensive
    to compile.
-4. Set the queue's check timeout above the slowest lane. The compile-and-test lanes are
-   capped at 90 minutes each.
+5. Set the queue's check timeout above the slowest lane, which is `clippy` at 150 minutes
+   (two passes, default features and `--all-features`). A timeout below the lane budget
+   ejects PRs for taking exactly as long as they were designed to take.
 
-The old `maintainer-verify.yaml` workflow was folded into `pr.yaml` and deleted. It carried
-`environment: merge-into-main`; the replacement lane deliberately does not. That job reads a
-public RPC and uses no secrets, and if the environment ever gained a protection rule it
-would park the merge queue on a manual approval until the queue timed out.
+### Who can put a PR in the queue
+
+GitHub's own answer is only "anyone with write access", and there is no finer-grained
+setting. The real gate here is the attestation: `CI Success` depends on `verify-on-chain`,
+required checks must pass *before* a PR can be queued, and `verify-on-chain` passes only for
+a commit hash already written to the registry by a holder of the MAINTAINER key. So a
+contributor cannot make their own PR queue-eligible -- a maintainer has to run
+`test-and-attest.sh` against that exact commit first, which is a stronger claim than a
+CODEOWNERS entry makes, and it is why `require_code_owner_review` is not needed in the
+ruleset (there is no CODEOWNERS file for it to consult anyway).
+
+The old `maintainer-verify.yaml` workflow was folded into `pr.yaml` and deleted, along with
+the `merge-into-main` deployment environment it ran in. Nothing in CI references that
+environment now, and the replacement lane deliberately has no `environment:` of its own: it
+reads a public RPC and uses no secrets, and an environment that ever gained a protection
+rule would park the merge queue on a manual approval until the queue timed out. Delete the
+environment itself in Settings -> Environments, and drop the `required_deployments` rule
+from the `main` ruleset -- it currently lists no environments, so it enforces nothing while
+leaving a live switch that would hang the queue if anyone filled it in.
 
 ## Environment
 Attesting devs must have "MAINTAINER" role to update contract state.
