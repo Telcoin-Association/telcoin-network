@@ -422,7 +422,7 @@ mod tests {
         let server = reth_env.get_rpc_server(
             pool,
             network.clone(),
-            BaseFeeContainer::default(),
+            GasAccumulator::new(1).worker_base_fee(0),
             RpcModule::new(()),
         )?;
         let methods = server.methods_by(|name| name == "eth_syncing");
