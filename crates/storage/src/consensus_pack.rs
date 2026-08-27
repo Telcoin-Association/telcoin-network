@@ -213,17 +213,12 @@ impl ConsensusPack {
         previous_epoch: EpochRecord,
         committee: Committee,
     ) -> Result<ConsensusPack, PackError> {
-        Self::open_append_inner(
-            path,
-            previous_epoch,
-            committee,
-            PACK_VERSION,
-            FileBackend::default(),
-        )
+        Self::open_append_inner(path, previous_epoch, committee, PACK_VERSION, FileBackend::Mmap)
     }
 
     /// Like [`Self::open_append`] but selecting the on-disk file `backend` (buffered vs mmap).
-    pub fn open_append_with_backend<P: Into<PathBuf>>(
+    #[cfg(test)]
+    pub(crate) fn open_append_with_backend<P: Into<PathBuf>>(
         path: P,
         previous_epoch: EpochRecord,
         committee: Committee,
@@ -235,13 +230,13 @@ impl ConsensusPack {
     /// Test-only: open an append pack forcing a specific on-disk data version so tests can
     /// construct genuine v0 (legacy, batches-first) pack files.
     #[cfg(test)]
-    pub(crate) fn open_append_version<P: Into<PathBuf>>(
+    fn open_append_version<P: Into<PathBuf>>(
         path: P,
         previous_epoch: EpochRecord,
         committee: Committee,
         version: u16,
     ) -> Result<ConsensusPack, PackError> {
-        Self::open_append_inner(path, previous_epoch, committee, version, FileBackend::default())
+        Self::open_append_inner(path, previous_epoch, committee, version, FileBackend::Mmap)
     }
 
     /// Shared body for [`Self::open_append`] stamping the given on-disk data `version`.
@@ -275,7 +270,7 @@ impl ConsensusPack {
     pub fn open_append_exists<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
-        let inner = Inner::open_append_exists(path.clone(), epoch, FileBackend::default())?;
+        let inner = Inner::open_append_exists(path.clone(), epoch, FileBackend::Mmap)?;
         let version = inner.version();
         let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
@@ -293,11 +288,11 @@ impl ConsensusPack {
 
     /// Open up the static files for previous epoch.  These will be read only.
     pub fn open_static<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
-        Self::open_static_with_backend(path, epoch, FileBackend::default())
+        Self::open_static_with_backend(path, epoch, FileBackend::Mmap)
     }
 
     /// Like [`Self::open_static`] but selecting the on-disk file `backend` (buffered vs mmap).
-    pub fn open_static_with_backend<P: Into<PathBuf>>(
+    pub(crate) fn open_static_with_backend<P: Into<PathBuf>>(
         path: P,
         epoch: Epoch,
         backend: FileBackend,
@@ -336,14 +331,14 @@ impl ConsensusPack {
             previous_epoch,
             final_consensus_number,
             timeout,
-            FileBackend::default(),
+            FileBackend::Mmap,
         )
         .await
     }
 
     /// Like [`Self::stream_import`] but selecting the on-disk file `backend` (buffered vs mmap).
     #[allow(clippy::too_many_arguments)]
-    pub async fn stream_import_with_backend<P: Into<PathBuf>, R: AsyncRead + Unpin>(
+    pub(crate) async fn stream_import_with_backend<P: Into<PathBuf>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
@@ -1263,9 +1258,8 @@ impl Inner {
     fn persist(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
             self.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
-            /*XXXXself.consensus_pos_idx.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
-            self.consensus_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;
-            self.batch_digests.sync().map_err(|e| PackError::PersistError(e.to_string()))?;*/
+            // Note, we don't sync indexes.  The data file acts as a WAL we can use to clean up and
+            // rebuild if we crash and it causes corruption.
         }
         Ok(())
     }

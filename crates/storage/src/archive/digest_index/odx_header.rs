@@ -3,11 +3,12 @@
 use crate::archive::{
     crc::{add_crc32, check_crc},
     data_file::fsync_directory,
+    data_file_mmap::{MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     error::load_header::LoadHeaderError,
     pack::{FileBackend, PackFileIo},
 };
 use std::{
-    io::{Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -29,18 +30,19 @@ pub struct OdxHeader {
 }
 
 impl OdxHeader {
-    /// Open the index overflow file (odx file) and return the open file and header.
-    pub fn open_odx_file<P: AsRef<Path>>(
+    fn open_header<F, P>(
+        file: &mut F,
         version: u16,
         uid: u64,
         appnum: u32,
         path: P,
         read_only: bool,
-        backend: FileBackend,
-    ) -> Result<(Box<dyn PackFileIo>, OdxHeader), LoadHeaderError> {
+    ) -> Result<OdxHeader, LoadHeaderError>
+    where
+        F: Write + Read + Seek + ?Sized,
+        P: AsRef<Path>,
+    {
         let path = path.as_ref();
-        // odx is an append-only overflow log (`append = true`); writes go to EOF via explicit seek.
-        let mut file = backend.open_boxed_random(path, read_only, true)?;
         let file_end = file.seek(SeekFrom::End(0))?;
 
         let header = if file_end == 0 {
@@ -48,7 +50,7 @@ impl OdxHeader {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
             let header = OdxHeader::new(version, uid, appnum, read_only);
-            header.write_header(&mut *file)?;
+            header.write_header(file)?;
             // New odx file was just created and its header written; fsync the parent so the entry
             // is durable.
             if let Some(parent) = path.parent() {
@@ -56,7 +58,7 @@ impl OdxHeader {
             }
             header
         } else {
-            let header = OdxHeader::load_header(&mut *file, read_only)?;
+            let header = OdxHeader::load_header(file, read_only)?;
             // Basic validation of the odx header.
             if header.version() != version {
                 return Err(LoadHeaderError::InvalidIndexVersion);
@@ -69,6 +71,46 @@ impl OdxHeader {
             }
             header
         };
+        Ok(header)
+    }
+
+    /// Open the index overflow file (odx file) and return the open file and header.
+    pub fn open_odx_file<P: AsRef<Path>>(
+        version: u16,
+        uid: u64,
+        appnum: u32,
+        path: P,
+        read_only: bool,
+        backend: FileBackend,
+    ) -> Result<(Box<dyn PackFileIo>, OdxHeader), LoadHeaderError> {
+        let path = path.as_ref();
+        // odx is an append-only overflow log (`append = true`); writes go to EOF via explicit seek.
+        let mut file = backend.open_boxed_random(path, read_only, true)?;
+
+        let header = Self::open_header(&mut file, version, uid, appnum, path, read_only)?;
+        Ok((file, header))
+    }
+
+    /// Open the index overflow file (odx file) and return the open file and header.
+    /// This returns an mmap specific version.
+    pub fn open_odx_file_mmap<P: AsRef<Path>>(
+        version: u16,
+        uid: u64,
+        appnum: u32,
+        path: P,
+        read_only: bool,
+    ) -> Result<(MmapDataFile, OdxHeader), LoadHeaderError> {
+        let path = path.as_ref();
+        // The digest index does point lookups over fixed-offset hash buckets — random
+        // access with no benefit from readahead — so hint `MADV_RANDOM`.
+        let opts = MmapFileOptions {
+            write_mode: WriteMode::Random,
+            access: MmapAccess::Random,
+            ..Default::default()
+        };
+        let mut file = MmapDataFile::open_with(path, read_only, opts)?;
+
+        let header = Self::open_header(&mut file, version, uid, appnum, path, read_only)?;
         Ok((file, header))
     }
 
@@ -81,7 +123,10 @@ impl OdxHeader {
 
     /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
     /// positioned after the header.
-    fn load_header(source: &mut dyn PackFileIo, read_only: bool) -> Result<Self, LoadHeaderError> {
+    fn load_header<F: Read + Seek + ?Sized>(
+        source: &mut F,
+        read_only: bool,
+    ) -> Result<Self, LoadHeaderError> {
         let header_size = MIN_HEADER_SIZE;
         source.rewind()?;
         let mut buffer = vec![0_u8; header_size];
@@ -112,7 +157,7 @@ impl OdxHeader {
     }
 
     /// Write this header to sync at current seek position.
-    fn write_header(&self, sync: &mut dyn PackFileIo) -> Result<(), LoadHeaderError> {
+    fn write_header<F: Write + Seek + ?Sized>(&self, sync: &mut F) -> Result<(), LoadHeaderError> {
         if self.read_only {
             return Err(LoadHeaderError::ReadOnly);
         }

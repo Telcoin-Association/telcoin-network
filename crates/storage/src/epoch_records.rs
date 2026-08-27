@@ -29,7 +29,7 @@ use tracing::{debug, error};
 use crate::{
     archive::{
         data_file::create_dir_synced,
-        digest_index::index::HdxIndex,
+        digest_index::index_directio::HdxIndexDirectIO,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,
@@ -1084,9 +1084,9 @@ struct Inner {
     /// Position index: (epoch - start_epoch) → byte offset in `records`.
     epoch_idx: PositionIndex<u64>,
     /// Hash index: EpochRecord digest → byte offset in `records`.
-    record_digests: HdxIndex,
+    record_digests: HdxIndexDirectIO,
     /// Hash index: EpochCertificate epoch_hash → byte offset in `certs`.
-    cert_digests: HdxIndex,
+    cert_digests: HdxIndexDirectIO,
     /// The first epoch stored in this database.
     start_epoch: Epoch,
     /// Store a dummy record for epoch 0 to allow chain to start.
@@ -1115,7 +1115,7 @@ impl Inner {
     fn heal_records(
         records: &mut Pack<EpochRecord>,
         epoch_idx: &mut PositionIndex<u64>,
-        record_digests: &HdxIndex,
+        record_digests: &HdxIndexDirectIO,
     ) -> Result<(), EpochDbError> {
         let records_len = records.file_len();
         let digest_final = record_digests.data_file_length();
@@ -1152,7 +1152,7 @@ impl Inner {
     /// Truncate the certs file back to a consistent state.
     fn heal_certs(
         certs: &mut Pack<EpochCertificate>,
-        cert_digests: &HdxIndex,
+        cert_digests: &HdxIndexDirectIO,
     ) -> Result<(), EpochDbError> {
         let certs_len = certs.file_len();
         let digest_final = cert_digests.data_file_length();
@@ -1190,7 +1190,7 @@ impl Inner {
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut record_digests = HdxIndex::open_hdx_file(
+        let mut record_digests = HdxIndexDirectIO::open_hdx_file(
             base_dir.join(Self::RECORD_HASH_NAME),
             records.header(),
             builder,
@@ -1198,7 +1198,7 @@ impl Inner {
         )
         .map_err(OpenError::IndexFileOpen)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut cert_digests = HdxIndex::open_hdx_file(
+        let mut cert_digests = HdxIndexDirectIO::open_hdx_file(
             base_dir.join(Self::CERT_HASH_NAME),
             certs.header(),
             builder,

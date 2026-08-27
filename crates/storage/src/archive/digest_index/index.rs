@@ -1,242 +1,65 @@
-//! Contains the Digest Index structure and code.
+//! An mmap-optimized, cache-free twin of [`HdxIndex`](super::index::HdxIndex).
+//!
+//! [`HdxIndexMmap`] is a drop-in for `HdxIndex` — same [`Index`] trait, same public helpers, and
+//! the **same on-disk format** (so their files are cross-compatible) — but it is memory-mapped
+//! only and keeps **no bucket caches**. Where `HdxIndex` copies every bucket into `Vec<u8>`
+//! buffers held in `HashMap`/`VecDeque` caches, this reads bucket bytes **directly from the
+//! mapping** via [`PackFileIo::slice`] (zero-copy) and writes each modified bucket straight back
+//! through the mapping. On the mmap backend the OS page cache already *is* the bucket cache, so
+//! those copies and caches are pure overhead.
+//!
+//! ## Reads (zero-copy)
+//! [`HdxIndexMmap::find_in_bucket`] borrows the target bucket from the hdx mapping, scans it, and —
+//! on a miss — follows the append-only overflow chain by re-slicing the odx mapping one record at a
+//! time. Exactly one shared slice is live at any moment and no slice is ever held across a write,
+//! so a growth/remap (which needs `&mut`) can never invalidate one. Reads do **not** verify a
+//! per-op CRC (see the CRC note below).
+//!
+//! ## Writes (write-through)
+//! Inserts are read-modify-write: the bucket is mutated in place through the mapping (its overflow
+//! appended to the odx if it fills) and written back at the bucket's fixed offset. mmap writes are
+//! `memcpy` into the page cache; durability still happens only at [`Index::sync`] (msync), exactly
+//! as the buffered index defers to `fsync`.
+//!
+//! ## CRC (deferred, WAL/rebuildable)
+//! This index is not the durability source — it is rebuilt from the data-log WAL on an unclean
+//! shutdown — so it does not pay a per-op CRC. Each modified bucket has its 4-byte CRC trailer
+//! **zeroed** (a "dirty / not-yet-CRC'd" marker); [`Index::sync`] then CRCs **only** the dirty
+//! buckets in one pass, leaving a CRC-valid on-disk image. The zero marker also lets recovery tell
+//! a dirty bucket (CRC == 0) from a corrupt one (non-zero CRC that fails) via
+//! [`HdxIndexMmap::bucket_crc_scan`]. Overflow (odx) records are append-only and CRC'd when
+//! written.
 
 use tn_types::B256;
 
 use crate::archive::{
-    crc::{add_crc32, check_crc},
+    crc::{add_crc32, crc_is_zero, crc_state, zero_crc, CrcState},
     data_file::fsync_directory,
+    data_file_mmap::{MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     digest_index::{
         bloom::{Bloom, BLOOM_SIZE_BYTES},
-        bucket_iter::BucketIter,
+        index_directio::{HdxHeader, HdxIndexDirectIO, HEADER_SIZE},
         odx_header::OdxHeader,
     },
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
-    fxhasher::{FxHashMap, FxHasher},
+    fxhasher::FxHasher,
     index::Index,
-    pack::{DataHeader, FileBackend, PackFileIo, DATA_HEADER_BYTES},
+    pack::DataHeader,
 };
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::BTreeSet,
     fs,
     hash::{BuildHasher, BuildHasherDefault},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
-/// Size of a header.
-pub(super) const HEADER_SIZE: usize = 68;
-
-/// Header for an hdx (index) file.  This contains the hash buckets for lookups.
-/// This file is not a log file and the header and buckets will change in place over time.
-/// This data in the file will be followed by a CRC32 checksum value to verify it.
-#[derive(Debug)]
-pub(super) struct HdxHeader {
-    type_id: [u8; 8], // The characters "telcoinx"
-    version: u16,     // Holds the version number
-    uid: u64,         // Unique ID generated on creation
-    appnum: u32,      // Application defined constant
-    pub(super) buckets: u32,
-    bucket_elements: u16,
-    bucket_size: u16,
-    salt: u64,
-    pepper: u64,
-    load_factor: u16,
-    pub(super) values: u64,
-    pub(super) data_file_length: u64,
-}
-
-impl HdxHeader {
-    /// Return a default HdxHeader with any values from data_header overridden.
-    /// This includes the version, uid, appnum, bucket_size and bucket_elements.
-    pub(super) fn from_data_header<const KSIZE: usize, S: BuildHasher + Default>(
-        data_header: &DataHeader,
-        salt: u64,
-        pepper: u64,
-    ) -> Self {
-        Self {
-            type_id: *b"telcoinx",
-            version: data_header.version(),
-            uid: data_header.uid(),
-            appnum: data_header.appnum(),
-            bucket_elements: HdxIndex::<KSIZE, S>::BUCKET_ELEMENTS as u16,
-            bucket_size: HdxIndex::<KSIZE, S>::BUCKET_SIZE as u16,
-            buckets: HdxIndex::<KSIZE, S>::INITIAL_BUCKETS as u32,
-            load_factor: (u16::MAX as f32 * 0.5) as u16,
-            salt,
-            pepper,
-            values: 0,
-            data_file_length: DATA_HEADER_BYTES as u64,
-        }
-    }
-
-    /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
-    /// positioned after the header.
-    pub(super) fn load_header(hdx_file: &mut dyn PackFileIo) -> Result<Self, LoadHeaderError> {
-        hdx_file.rewind()?;
-        let mut buffer = [0_u8; HEADER_SIZE];
-        let mut buf16 = [0_u8; 2];
-        let mut buf32 = [0_u8; 4];
-        let mut buf64 = [0_u8; 8];
-        let mut pos = 0;
-        hdx_file.read_exact(&mut buffer[..])?;
-        if !check_crc(&buffer[..]) {
-            return Err(LoadHeaderError::CrcFailed);
-        }
-        let mut type_id = [0_u8; 8];
-        type_id.copy_from_slice(&buffer[0..8]);
-        pos += 8;
-        if &type_id != b"telcoinx" {
-            return Err(LoadHeaderError::InvalidType);
-        }
-        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
-        let version = u16::from_le_bytes(buf16);
-        pos += 2;
-        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-        let uid = u64::from_le_bytes(buf64);
-        pos += 8;
-        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
-        let appnum = u32::from_le_bytes(buf32);
-        pos += 4;
-        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
-        let buckets = u32::from_le_bytes(buf32);
-        pos += 4;
-        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
-        let bucket_elements = u16::from_le_bytes(buf16);
-        pos += 2;
-        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
-        let bucket_size = u16::from_le_bytes(buf16);
-        pos += 2;
-        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-        let salt = u64::from_le_bytes(buf64);
-        pos += 8;
-        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-        let pepper = u64::from_le_bytes(buf64);
-        pos += 8;
-        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
-        let load_factor = u16::from_le_bytes(buf16);
-        pos += 2;
-        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-        let values = u64::from_le_bytes(buf64);
-        pos += 8;
-        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
-        let data_file_length = u64::from_le_bytes(buf64);
-        let header = Self {
-            type_id,
-            version,
-            uid,
-            appnum,
-            buckets,
-            bucket_elements,
-            bucket_size,
-            salt,
-            pepper,
-            load_factor,
-            values,
-            data_file_length,
-        };
-        Ok(header)
-    }
-
-    /// Write this header to sync at current seek position.
-    pub(super) fn write_header(&mut self, hdx_file: &mut dyn PackFileIo) -> Result<(), io::Error> {
-        hdx_file.rewind()?;
-        let header_size = self.header_size();
-        let mut buffer = vec![0_u8; header_size];
-        let mut pos = 0;
-        buffer[pos..8].copy_from_slice(&self.type_id);
-        pos += 8;
-        buffer[pos..(pos + 2)].copy_from_slice(&self.version.to_le_bytes());
-        pos += 2;
-        buffer[pos..(pos + 8)].copy_from_slice(&self.uid.to_le_bytes());
-        pos += 8;
-        buffer[pos..(pos + 4)].copy_from_slice(&self.appnum.to_le_bytes());
-        pos += 4;
-        buffer[pos..(pos + 4)].copy_from_slice(&self.buckets.to_le_bytes());
-        pos += 4;
-        buffer[pos..(pos + 2)].copy_from_slice(&self.bucket_elements.to_le_bytes());
-        pos += 2;
-        buffer[pos..(pos + 2)].copy_from_slice(&self.bucket_size.to_le_bytes());
-        pos += 2;
-        buffer[pos..(pos + 8)].copy_from_slice(&self.salt.to_le_bytes());
-        pos += 8;
-        buffer[pos..(pos + 8)].copy_from_slice(&self.pepper.to_le_bytes());
-        pos += 8;
-        buffer[pos..(pos + 2)].copy_from_slice(&self.load_factor.to_le_bytes());
-        pos += 2;
-        buffer[pos..(pos + 8)].copy_from_slice(&self.values.to_le_bytes());
-        pos += 8;
-        buffer[pos..(pos + 8)].copy_from_slice(&self.data_file_length.to_le_bytes());
-        add_crc32(&mut buffer[..]);
-        hdx_file.write_all(&buffer[..])?;
-        Ok(())
-    }
-
-    /// Return the size of the HDX header.
-    fn header_size(&self) -> usize {
-        HEADER_SIZE
-    }
-
-    /// Number of buckets in this index file.
-    fn buckets(&self) -> u32 {
-        self.buckets
-    }
-
-    /// Number of elements in each bucket.
-    pub(super) fn bucket_elements(&self) -> u16 {
-        self.bucket_elements
-    }
-
-    /// Size in bytes of a bucket.
-    pub(super) fn bucket_size(&self) -> u16 {
-        self.bucket_size
-    }
-
-    /// Load factor converted to a f32.
-    pub(super) fn load_factor(&self) -> f32 {
-        self.load_factor as f32 / u16::MAX as f32
-    }
-
-    /// Number of elements stored in this DB.
-    fn values(&self) -> u64 {
-        self.values
-    }
-
-    /// File version number.
-    pub(super) fn version(&self) -> u16 {
-        self.version
-    }
-
-    /// Unique ID generated on creation
-    pub(super) fn uid(&self) -> u64 {
-        self.uid
-    }
-
-    /// Application defined constant
-    pub(super) fn appnum(&self) -> u32 {
-        self.appnum
-    }
-
-    /// Return the index salt.
-    pub(super) fn salt(&self) -> u64 {
-        self.salt
-    }
-
-    /// Return the index pepper.
-    pub(super) fn pepper(&self) -> u64 {
-        self.pepper
-    }
-
-    /// How long this index thinks the data file is.
-    fn _data_file_length(&self) -> u64 {
-        self.data_file_length
-    }
-}
-
-/// Header for an hdx (index) file.  This contains the hash buckets for lookups.
-/// This file is not a log file and the header and buckets will change in place over time.
-/// This data in the file will be followed by a CRC32 checksum value to verify it.
+/// A hash digest index (256-bit digest -> u64 record position) that is memory-mapped only and
+/// reads/writes hash buckets directly through the mapping with no in-memory bucket caches.
+///
+/// It is format compatable with the older direct IO version.
 #[derive(Debug)]
 pub struct HdxIndex<
     const KSIZE: usize = 32,
@@ -244,14 +67,12 @@ pub struct HdxIndex<
 > {
     header: HdxHeader,
     modulus: u32,
-    bucket_cache: FxHashMap<u64, Vec<u8>>,
-    dirty_bucket_cache: FxHashMap<u64, Vec<u8>>,
-    /// Maintain a fifo of cached buckets.  This is a simple way to make sure the cache is not the
-    /// entire set of buckets (bounded by disk space).
-    bucket_cache_fifo: VecDeque<u64>,
-    hdx_file: Box<dyn PackFileIo>,
-    // Note, if odx_file is ever replaced in HdxIndex then see bucket_iter for undefined behaviour.
-    pub(crate) odx_file: Box<dyn PackFileIo>,
+    // We require an mmap backed file so use it directly.
+    hdx_file: MmapDataFile,
+    // Note, if odx_file is ever replaced in HdxIndexMmap then any held overflow slice would
+    // dangle; the read paths take a fresh slice per hop and never hold one across a mutation.
+    // We require an mmap backed file so use it directly.
+    odx_file: MmapDataFile,
     capacity: u64,
     hasher_builder: S,
     read_only: bool,
@@ -260,48 +81,37 @@ pub struct HdxIndex<
     _index_dir: PathBuf,
 }
 
-impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
-    /// Each bucket element is a (KSIZE bytes, u64)- (digest, record_pos).
-    pub const BUCKET_ELEMENT_SIZE: usize = KSIZE + 8;
-    /// Number of buckets to allocate in a fresh index.
-    pub const INITIAL_BUCKETS: usize = 1_000;
-    /// Number of elements each bucket can hold before overflowing.
-    pub const BUCKET_ELEMENTS: usize = 32;
-    /// How large (in bytes) is each bucket.
-    pub const BUCKET_SIZE: usize = 16 + (Self::BUCKET_ELEMENT_SIZE * Self::BUCKET_ELEMENTS);
-    /// How many buckets to cache (read) at once.
-    /// At current settings (32 byte keys) this could lead to an 500M bucket cache...
-    /// This should be a large enough limit to never be hit in use but provide a backstop just in
-    /// case.
-    pub const CACHED_BUCKETS: usize = 400_000;
+/// Counts from [`HdxIndexMmap::bucket_crc_scan`] over the main buckets: how many are dirty
+/// (deliberately un-CRC'd — CRC trailer zero) vs corrupt (non-zero CRC that fails to verify). A
+/// clean, synced index reports zero of both; `dirty > 0` means writes were not synced (rebuild from
+/// the WAL), `corrupt > 0` means genuine on-disk corruption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BucketCrcReport {
+    /// Main buckets whose CRC trailer is all-zero (written but not yet CRC'd).
+    pub dirty: u64,
+    /// Main buckets whose non-zero CRC fails to match the payload.
+    pub corrupt: u64,
+}
 
-    /// Open a HDX index file and return the open file and the header.
-    /// Note you MUST supply a stable hasher or the index will not work-
-    /// for instance fxhasher.  The default Rust hasher is NOT stable (i.e.
-    /// it can produce different hashes for the same input on different instances)
+impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
+    /// Bytes of one bucket element: a KSIZE-byte digest plus its u64 record position.
+    const BUCKET_ELEMENT_SIZE: usize = HdxIndexDirectIO::<KSIZE, S>::BUCKET_ELEMENT_SIZE;
+    /// Elements a bucket holds before overflowing to the odx log.
+    const BUCKET_ELEMENTS: usize = HdxIndexDirectIO::<KSIZE, S>::BUCKET_ELEMENTS;
+    /// On-disk size in bytes of one bucket (including its trailing CRC32).
+    const BUCKET_SIZE: usize = HdxIndexDirectIO::<KSIZE, S>::BUCKET_SIZE;
+
+    /// Open (creating if empty) a memory-mapped HDX index in directory `dir`.
+    ///
+    /// Note you MUST supply a stable hasher (e.g. fxhasher); the default Rust hasher is not stable
+    /// across instances and would invalidate the index. This is the mmap-only analogue of
+    /// [`HdxIndex::open_hdx_file`](super::index::HdxIndex::open_hdx_file) and always uses the
+    /// memory-mapped file backend.
     pub fn open_hdx_file<P: AsRef<Path>>(
         dir: P,
         data_header: &DataHeader,
         hasher_builder: S,
         read_only: bool,
-    ) -> Result<HdxIndex<KSIZE, S>, LoadHeaderError> {
-        Self::open_hdx_file_with_backend(
-            dir,
-            data_header,
-            hasher_builder,
-            read_only,
-            FileBackend::default(),
-        )
-    }
-
-    /// Like [`Self::open_hdx_file`] but selecting the on-disk file `backend`: buffered raw [`File`]
-    /// (random-overwrite) or a random-write memory-mapped file.
-    pub fn open_hdx_file_with_backend<P: AsRef<Path>>(
-        dir: P,
-        data_header: &DataHeader,
-        hasher_builder: S,
-        read_only: bool,
-        backend: FileBackend,
     ) -> Result<HdxIndex<KSIZE, S>, LoadHeaderError> {
         let dir = dir.as_ref();
         let dir_created = fs::create_dir(dir).is_ok();
@@ -311,8 +121,15 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 let _ = fsync_directory(parent);
             }
         }
-        // hdx does random-offset overwrites (not append), so `append = false`.
-        let mut hdx_file = backend.open_boxed_random(dir.join("index.hdx"), read_only, false)?;
+
+        // The digest index does point lookups over fixed-offset hash buckets — random
+        // access with no benefit from readahead — so hint `MADV_RANDOM`.
+        let opts = MmapFileOptions {
+            write_mode: WriteMode::Random,
+            access: MmapAccess::Random,
+            ..Default::default()
+        };
+        let mut hdx_file = MmapDataFile::open_with(dir.join("index.hdx"), read_only, opts)?;
         let file_end = hdx_file.seek(SeekFrom::End(0))?;
 
         let (header, bloom) = if file_end == 0 {
@@ -322,7 +139,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let salt = hasher_builder.hash_one(data_header.uid());
             let pepper = hasher_builder.hash_one(salt);
             let mut header = HdxHeader::from_data_header::<KSIZE, S>(data_header, salt, pepper);
-            header.write_header(&mut *hdx_file)?;
+            header.write_header(&mut hdx_file)?;
             let bloom = Bloom::new();
             hdx_file.write_all(bloom.data())?;
             let bucket_size = header.bucket_size() as usize;
@@ -330,9 +147,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             add_crc32(&mut single_bucket[..]);
             // Write buckets in large chunks to avoid 100k individual syscalls.
             // All buckets are identical (zeros + CRC32), so tile a chunk buffer.
-            let chunk_buckets = 1024.min(header.buckets() as usize);
+            let chunk_buckets = 1024.min(header.buckets as usize);
             let chunk = single_bucket.repeat(chunk_buckets);
-            let mut remaining = header.buckets() as usize;
+            let mut remaining = header.buckets as usize;
             while remaining > 0 {
                 let n = chunk_buckets.min(remaining);
                 hdx_file.write_all(&chunk[..n * bucket_size])?;
@@ -343,8 +160,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let _ = fsync_directory(dir);
             (header, bloom)
         } else {
-            let header = HdxHeader::load_header(&mut *hdx_file)?;
-            // Basic validation of the odx header.
+            let header = HdxHeader::load_header(&mut hdx_file)?;
             if header.version() != data_header.version() {
                 return Err(LoadHeaderError::InvalidIndexVersion);
             }
@@ -354,19 +170,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             if header.uid() != data_header.uid() {
                 return Err(LoadHeaderError::InvalidIndexUID);
             }
-            // The on-disk bucket geometry must match this binary's compile-time layout.
-            // Reads size buffers from the header (bucket_size) while the bucket/overflow
-            // iterators index using the compile-time BUCKET_SIZE / BUCKET_ELEMENT_SIZE
-            // (derived from KSIZE and BUCKET_ELEMENTS).  A mismatch would silently corrupt
-            // reads, so reject it up front like the other header fields.
+            // The on-disk bucket geometry must match this binary's compile-time layout, otherwise
+            // the fixed-offset slice reads would silently misinterpret bytes.
             if header.bucket_size() != Self::BUCKET_SIZE as u16
                 || header.bucket_elements() != Self::BUCKET_ELEMENTS as u16
             {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
-            // Check the salt/pepper.  This will make sure you are using the same hasher and it
-            // seems to be stable (not the default Rust hasher for instance) since
-            // changing the hasher would invalidate the index.
+            // Check the salt/pepper to confirm the same (stable) hasher is in use.
             if header.pepper() != hasher_builder.hash_one(header.salt()) {
                 return Err(LoadHeaderError::InvalidHasher);
             }
@@ -375,23 +186,19 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             let bloom: Bloom = bloom_bits.try_into()?;
             (header, bloom)
         };
-        let (odx_file, _odx_header) = OdxHeader::open_odx_file(
+        let (odx_file, _odx_header) = OdxHeader::open_odx_file_mmap(
             header.version(),
             header.uid(),
             header.appnum(),
             dir.join("index.odx"),
             read_only,
-            backend,
         )?;
-        // Don't want buckets and modulus to be the same, so +1
+        // Don't want buckets and modulus to be the same, so +1.
         let modulus = (header.buckets + 1).next_power_of_two();
-        let capacity = header.buckets() as u64 * header.bucket_elements() as u64;
+        let capacity = header.buckets as u64 * header.bucket_elements() as u64;
         Ok(Self {
             header,
             modulus,
-            bucket_cache: FxHashMap::default(),
-            dirty_bucket_cache: FxHashMap::default(),
-            bucket_cache_fifo: VecDeque::default(),
             hdx_file,
             odx_file,
             capacity,
@@ -405,7 +212,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
 
     /// Number of keys hashed in this index.
     pub fn len(&self) -> usize {
-        self.header.values() as usize
+        self.header.values as usize
     }
 
     /// True if there are no keys stored in this index.
@@ -413,9 +220,8 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         self.len() == 0
     }
 
-    /// Set the data_file_length field.
-    /// This can be useful for tracking information about another file but
-    /// does not effect the index.
+    /// Set the data_file_length field. This tracks information about another file but does not
+    /// affect the index.
     pub fn set_data_file_length(&mut self, data_file_length: u64) {
         if self.header.data_file_length != data_file_length {
             self.header.data_file_length = data_file_length;
@@ -424,44 +230,18 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     }
 
     /// Get the data_file_length field.
-    /// This can be useful for tracking information about another file but
-    /// does not effect the index.
     pub fn data_file_length(&self) -> u64 {
         self.header.data_file_length
     }
 
-    /// Save a bucket to the bucket cache.
-    fn add_bucket_to_cache(&mut self, bucket: u64, buffer: Vec<u8>) {
-        // Remove the least recently added buckets from cache until we are below CACHED_BUCKETS.
-        // This is a D-U-M but very simple way to keep memory usage for the cache in check.
-        // Also, it should not actually get used unless something has gone wrong, the default
-        // should be more than enough buckets for single epoch pack file.
-        while self.bucket_cache_fifo.len() >= Self::CACHED_BUCKETS {
-            if let Some(bucket) = self.bucket_cache_fifo.pop_front() {
-                self.bucket_cache.remove(&bucket);
-            }
-        }
-        self.bucket_cache.insert(bucket, buffer);
-        self.bucket_cache_fifo.push_back(bucket);
+    /// Byte offset of `bucket` within the hdx file (after the header and bloom filter).
+    fn bucket_pos(&self, bucket: u64) -> u64 {
+        (HEADER_SIZE + BLOOM_SIZE_BYTES) as u64 + bucket * Self::BUCKET_SIZE as u64
     }
 
-    /// Add buckets to expand capacity.
-    /// Capacity is number of elements per bucket * number of buckets.
-    /// If current length >= capacity * load factor then split buckets until this is not true.
-    fn expand_buckets(&mut self) -> Result<(), AppendError> {
-        while self.header.values >= (self.capacity as f32 * self.header.load_factor()) as u64 {
-            self.split_one_bucket()?;
-            self.capacity = self.buckets() as u64 * self.header.bucket_elements() as u64;
-        }
-        Ok(())
-    }
-
-    /// Write the indexes header and bloom filter to disk.
-    fn write_header(&mut self) -> Result<(), io::Error> {
-        self.header.write_header(&mut *self.hdx_file)?;
-        self.hdx_file.seek(SeekFrom::Start(self.header.header_size() as u64))?;
-        self.hdx_file.write_all(self.bloom.data())?;
-        Ok(())
+    /// Number of buckets in the index.
+    fn buckets(&self) -> u32 {
+        self.header.buckets
     }
 
     /// Increment the buckets count by 1.
@@ -469,74 +249,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         self.header.buckets += 1;
     }
 
-    /// Number of buckets in the index.
-    fn buckets(&self) -> u32 {
-        self.header.buckets()
-    }
-
-    /// Increment the values by 1.
+    /// Increment the values count by 1.
     fn inc_values(&mut self) {
         self.header.values += 1;
     }
 
-    /// Remove a value from a cache, try the dirty buckets then the read cached buckets.
-    fn remove_bucket_cache(&mut self, bucket: u64) -> Option<Vec<u8>> {
-        if let Some(buffer) = self.dirty_bucket_cache.remove(&bucket) {
-            Some(buffer)
-        } else {
-            self.bucket_cache.remove(&bucket)
-        }
-    }
-
-    /// Return the buffer for bucket, if found in cache then remove and return that buffer vs
-    /// allocate.
-    fn remove_bucket(&mut self, bucket: u64) -> Result<Vec<u8>, AppendError> {
-        if let Some(buf) = self.remove_bucket_cache(bucket) {
-            // Get the bucket from the bucket cache.
-            Ok(buf)
-        } else {
-            // Read the bucket from the index and verify (crc32) it.
-            let bucket_size = self.header.bucket_size as usize;
-            let mut buffer = vec![0_u8; bucket_size];
-            let bucket_pos: u64 = (self.header.header_size()
-                + BLOOM_SIZE_BYTES
-                + (bucket as usize * bucket_size)) as u64;
-            {
-                self.hdx_file
-                    .seek(SeekFrom::Start(bucket_pos))
-                    .map_err(AppendError::WriteDataError)?;
-                self.hdx_file.read_exact(&mut buffer[..]).map_err(AppendError::WriteDataError)?;
-                if !check_crc(&buffer[..]) {
-                    return Err(AppendError::CrcError);
-                }
-            }
-            Ok(buffer)
-        }
-    }
-
-    /// Flush (save) the hash bucket cache to disk.
-    fn save_bucket_cache(&mut self) -> Result<(), io::Error> {
-        let bucket_size = self.header.bucket_size as usize;
-        let header_size = self.header.header_size();
-        // Drain into a local buffer first so we can call &mut self helpers below; the heap
-        // buffers are moved (not copied) so this is cheap.
-        let dirty: Vec<(u64, Vec<u8>)> = self.dirty_bucket_cache.drain().collect();
-        for (bucket, mut buffer) in dirty {
-            let bucket_pos: u64 =
-                (header_size + BLOOM_SIZE_BYTES + (bucket as usize * bucket_size)) as u64;
-            add_crc32(&mut buffer[..]);
-            // Seeking and writing past the file end extends it.
-            self.hdx_file.seek(SeekFrom::Start(bucket_pos))?;
-            self.hdx_file.write_all(&buffer[..])?;
-            // Route through the FIFO-bounded cache so the clean cache stays capped at
-            // CACHED_BUCKETS rather than retaining every bucket ever flushed.
-            self.add_bucket_to_cache(bucket, buffer);
-        }
-        self.dirty_bucket_cache.shrink_to_fit();
-        Ok(())
-    }
-
-    /// Return the bucket that will contain hash (if hash is available).
+    /// Return the bucket that will contain hash.
     fn hash_to_bucket(&self, key: &[u8]) -> u64 {
         if key.len() != KSIZE {
             panic!("key wrong size, expected {KSIZE}, got {}", key.len())
@@ -551,119 +269,116 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         }
     }
 
-    /// Add one new bucket to the hash index.
-    /// Buckets are split "in order" determined by the current modulus not based on how full any
-    /// bucket is.
-    fn split_one_bucket(&mut self) -> Result<(), AppendError> {
-        let old_modulus = self.modulus;
-        // This is the bucket that is being split.
-        let split_bucket = (self.buckets() - (old_modulus / 2)) as u64;
-        self.inc_buckets();
-        // This is the newly created bucket that the items in split_bucket will possibly be moved
-        // into.
-        let new_bucket = self.buckets() as u64 - 1;
-        // Don't want buckets and modulus to be the same, so +1
-        self.modulus = (self.buckets() + 1).next_power_of_two();
+    /// Read the overflow-record position stored in the first 8 bytes of a bucket (0 = none).
+    fn read_overflow_pos(buf: &[u8]) -> u64 {
+        let mut b = [0_u8; 8];
+        b.copy_from_slice(&buf[0..8]);
+        u64::from_le_bytes(b)
+    }
 
-        let bucket_size = self.header.bucket_size() as usize;
-        let mut buffer = vec![0; bucket_size];
-        let mut buffer2 = vec![0; bucket_size];
+    /// Number of elements currently stored in a bucket buffer.
+    fn bucket_elements(buf: &[u8]) -> usize {
+        let mut b = [0_u8; 4];
+        b.copy_from_slice(&buf[8..12]);
+        u32::from_le_bytes(b) as usize
+    }
 
-        let mut _t_buf = None;
-        let mut iter = if let Ok(buffer) = self.remove_bucket(split_bucket) {
-            _t_buf = Some(buffer);
-            BucketIter::new(_t_buf.as_ref().expect("not None"))
-        } else {
-            BucketIter::new_empty()
-        };
-        // Make sure we only keep the first (most recent) key if we find duplicates.
-        let mut rec_hashes = BTreeSet::new();
-        while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
-            let hash = B256::from_slice(rec_hash);
-            if !rec_hashes.contains(&hash) {
-                let bucket = self.hash_to_bucket(rec_hash);
-                if bucket != split_bucket && bucket != new_bucket {
-                    panic!(
-                        "got bucket {}, expected {} or {}, mod {}",
-                        bucket,
-                        split_bucket,
-                        self.buckets() - 1,
-                        self.modulus
-                    );
+    /// Scan a single bucket buffer for `key`, returning its stored record position if present.
+    fn scan_bucket(buf: &[u8], key: &[u8]) -> Option<u64> {
+        for i in 0..Self::bucket_elements(buf) {
+            let pos = 12 + i * Self::BUCKET_ELEMENT_SIZE;
+            if &buf[pos..pos + KSIZE] == key {
+                let mut p = [0_u8; 8];
+                p.copy_from_slice(&buf[pos + KSIZE..pos + KSIZE + 8]);
+                return Some(u64::from_le_bytes(p));
+            }
+        }
+        None
+    }
+
+    /// Push every not-yet-seen `(digest, position)` element of a bucket buffer into `out`.
+    fn collect_from_buffer(buf: &[u8], out: &mut Vec<(B256, u64)>, seen: &mut BTreeSet<B256>) {
+        for i in 0..Self::bucket_elements(buf) {
+            let pos = 12 + i * Self::BUCKET_ELEMENT_SIZE;
+            let hash = B256::from_slice(&buf[pos..pos + KSIZE]);
+            if seen.insert(hash) {
+                let mut p = [0_u8; 8];
+                p.copy_from_slice(&buf[pos + KSIZE..pos + KSIZE + 8]);
+                out.push((hash, u64::from_le_bytes(p)));
+            }
+        }
+    }
+
+    /// Look up `key`, reading bucket bytes zero-copy from the mappings (main bucket in the hdx,
+    /// then the append-only overflow chain in the odx). Only one shared slice is live at a time.
+    fn find_in_bucket(&self, bucket: u64, key: &[u8]) -> Result<Option<u64>, FetchError> {
+        // Scan the in-place (main) bucket directly from the hdx mapping.
+        let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
+        {
+            Some(buf) => {
+                if let Some(pos) = Self::scan_bucket(buf, key) {
+                    return Ok(Some(pos));
                 }
-                if bucket == split_bucket {
-                    self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer, false)?;
-                } else {
-                    self.save_to_bucket_buffer(rec_hash, rec_pos, &mut buffer2, false)?;
-                }
-                rec_hashes.insert(hash);
+                Self::read_overflow_pos(buf)
             }
-        }
-        if iter.crc_failure() {
-            return Err(AppendError::CrcError);
-        }
-        drop(iter);
-        self.dirty_bucket_cache.insert(split_bucket, buffer);
-        self.dirty_bucket_cache.insert(new_bucket, buffer2);
-        Ok(())
-    }
-
-    /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    fn save_to_bucket(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
-        let bucket = self.hash_to_bucket(key);
-        let mut buffer = self.remove_bucket(bucket)?;
-
-        let result = self.save_to_bucket_buffer(key, record_pos, &mut buffer[..], true);
-        // Need to make sure the bucket goes into the cache even on error.
-        self.dirty_bucket_cache.insert(bucket, buffer);
-        result
-    }
-
-    /// Fetch the value stored at key.  Will return an error if not found.
-    fn fetch_position(&mut self, key: &[u8]) -> Result<u64, FetchError> {
-        let bucket = self.hash_to_bucket(key);
-
-        let mut result = None;
-        let mut t_buf = None;
-        let t_buf_dirty = self.dirty_bucket_cache.contains_key(&bucket);
-        let mut iter = if let Ok(buffer) = self.remove_bucket(bucket) {
-            t_buf = Some(buffer);
-            BucketIter::new(t_buf.as_ref().expect("not None"))
-        } else {
-            BucketIter::new_empty()
+            None => return Ok(None),
         };
-        while let Some((rec_hash, rec_pos)) = self.next_bucket_element(&mut iter) {
-            if key == rec_hash {
-                result = Some(rec_pos);
-                break;
+        // Follow the append-only overflow chain, one zero-copy slice per hop.
+        while overflow_pos > 0 {
+            let buf = match self.odx_file.slice(overflow_pos, Self::BUCKET_SIZE) {
+                Some(buf) => buf,
+                None => return Err(FetchError::CrcFailed),
+            };
+            if let Some(pos) = Self::scan_bucket(buf, key) {
+                return Ok(Some(pos));
             }
-        }
-        let crc_failure = iter.crc_failure();
-        drop(iter);
-        if let Some(buffer) = t_buf.take() {
-            // Make sure we return this to the cache especially if dirty.
-            if t_buf_dirty {
-                self.dirty_bucket_cache.insert(bucket, buffer);
-            } else {
-                self.add_bucket_to_cache(bucket, buffer);
+            let next = Self::read_overflow_pos(buf);
+            // A non-terminal link must point strictly backwards (the log is append-only); anything
+            // else is corruption, so bail rather than loop forever.
+            if next != 0 && next >= overflow_pos {
+                return Err(FetchError::CrcFailed);
             }
+            overflow_pos = next;
         }
-        if let Some(result) = result {
-            Ok(result)
-        } else if crc_failure {
-            Err(FetchError::CrcFailed)
-        } else {
-            Err(FetchError::NotFound)
-        }
+        Ok(None)
     }
 
-    /// Save the (hash, position) tuple to the bucket.  Handles overflow records.
-    /// If this produces an Error then buffer will contain the same data.
+    /// Collect every unique `(digest, position)` of `bucket` (main bucket + overflow chain) into an
+    /// owned vector, keeping the first (most recent) entry per digest. Uses only shared borrows so
+    /// the caller can then take `&mut self` to rewrite the buckets.
+    fn collect_bucket_elements(&self, bucket: u64) -> Result<Vec<(B256, u64)>, AppendError> {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut overflow_pos = match self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE)
+        {
+            Some(buf) => {
+                Self::collect_from_buffer(buf, &mut out, &mut seen);
+                Self::read_overflow_pos(buf)
+            }
+            None => return Ok(out),
+        };
+        while overflow_pos > 0 {
+            let buf = match self.odx_file.slice(overflow_pos, Self::BUCKET_SIZE) {
+                Some(buf) => buf,
+                None => return Err(AppendError::CrcError),
+            };
+            Self::collect_from_buffer(buf, &mut out, &mut seen);
+            let next = Self::read_overflow_pos(buf);
+            if next != 0 && next >= overflow_pos {
+                return Err(AppendError::CrcError);
+            }
+            overflow_pos = next;
+        }
+        Ok(out)
+    }
+
+    /// Save the (hash, position) tuple into `buffer`, appending an overflow record to the odx log
+    /// when the bucket is full. On a duplicate key the existing entry is overwritten in place.
     fn save_to_bucket_buffer(
         &mut self,
         key: &[u8],
         record_pos: u64,
-        buffer: &mut [u8],
+        bucket_pos: u64,
         inc_values: bool,
     ) -> Result<(), AppendError> {
         fn read_u32(buffer: &[u8], pos: &mut usize) -> u32 {
@@ -673,25 +388,22 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             u32::from_le_bytes(buf32)
         }
 
-        let mut pos = 8; // Skip over overflow_pos
+        let Some(buffer) = self.hdx_file.slice_mut(bucket_pos, Self::BUCKET_SIZE) else {
+            return Err(AppendError::ReadOnly);
+        };
+        let mut pos = 8; // Skip over overflow_pos.
         let elements = read_u32(buffer, &mut pos);
         if elements >= self.header.bucket_elements() as u32 {
-            // Current bucket is full so overflow.
-            // First, save bucket as an overflow record and add to the fresh bucket.
-            // Note if this is a duplicate then the old record will remain in the overflow
-            // but will be "shadowed" by the more recent entry added now.
+            // Current bucket is full so overflow: save the full bucket as an overflow record and
+            // start a fresh bucket that points to it. A duplicate remains in the overflow but is
+            // shadowed by the more recent entry added now.
             let overflow_pos =
                 self.odx_file.seek(SeekFrom::End(0)).map_err(AppendError::WriteDataError)?;
             add_crc32(buffer);
-            // Write the old buffer into the data file as an overflow record.
             self.odx_file.write_all(buffer).map_err(AppendError::WriteDataError)?;
-            // clear buffer and reset to 0.
             buffer.fill(0);
-            // Copy the position of the overflow record into the first u64.
             buffer[0..8].copy_from_slice(&overflow_pos.to_le_bytes());
             buffer[8..12].copy_from_slice(&1_u32.to_le_bytes());
-            // First element will be the hash and position being saved (rest of new bucket is
-            // empty).
             buffer[12..(12 + KSIZE)].copy_from_slice(key);
             buffer[(12 + KSIZE)..(20 + KSIZE)].copy_from_slice(&record_pos.to_le_bytes());
         } else if elements == 0 {
@@ -704,7 +416,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 let mut pos = 12 + (element as usize * Self::BUCKET_ELEMENT_SIZE);
                 let rec_key = &buffer[pos..(pos + KSIZE)];
                 if rec_key == key {
-                    // We just overwrite a duplicate.
+                    // Overwrite a duplicate.
                     pos += KSIZE;
                     buffer[pos..pos + 8].copy_from_slice(&record_pos.to_le_bytes());
                     return Ok(());
@@ -712,7 +424,6 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             }
             let new_elements: u32 = elements + 1;
             buffer[8..12].copy_from_slice(&new_elements.to_le_bytes());
-            // Seek to the element we found, insert hash and position into it.
             let mut pos = 12 + (elements as usize * Self::BUCKET_ELEMENT_SIZE);
             buffer[pos..(pos + KSIZE)].copy_from_slice(key);
             pos += KSIZE;
@@ -722,6 +433,144 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             self.inc_values();
         }
         Ok(())
+    }
+
+    /// Add buckets to expand capacity: while the load factor is exceeded, split one bucket.
+    fn expand_buckets(&mut self) -> Result<(), AppendError> {
+        while self.header.values >= (self.capacity as f32 * self.header.load_factor()) as u64 {
+            self.split_one_bucket()?;
+            self.capacity = self.buckets() as u64 * self.header.bucket_elements() as u64;
+        }
+        Ok(())
+    }
+
+    /// Split one bucket (in modulus order) into itself plus a newly appended bucket, rehashing and
+    /// redistributing its elements. The split bucket is overwritten in place; the new bucket is
+    /// written at the current file end (which the random-write mmap extends).
+    fn split_one_bucket(&mut self) -> Result<(), AppendError> {
+        let old_modulus = self.modulus;
+        // The bucket being split.
+        let split_bucket = (self.buckets() - (old_modulus / 2)) as u64;
+        self.inc_buckets();
+        // The newly created bucket that some of split_bucket's items may move into.
+        let new_bucket = self.buckets() as u64 - 1;
+        // Don't want buckets and modulus to be the same, so +1.
+        self.modulus = (self.buckets() + 1).next_power_of_two();
+        let split_pos = self.bucket_pos(split_bucket);
+        let new_pos = self.bucket_pos(new_bucket);
+
+        // Gather the split bucket's elements (shared borrows) BEFORE clearing either bucket, then
+        // redistribute into two freshly-zeroed buckets — mirroring the original `HdxIndex` split,
+        // which builds fresh buffers. The split bucket must be cleared too: if it kept its old
+        // contents, the elements that move to `new_bucket` would linger here as stale duplicates,
+        // and a later re-split would re-collect them, hash them into a third bucket, and trip the
+        // guard below (they are never consulted by lookups, so the only visible symptom is that
+        // panic plus unbounded overflow-chain growth).
+        let elements = self.collect_bucket_elements(split_bucket)?;
+
+        // Clear both buckets before redistributing. The split bucket is already within the logical
+        // end, so zero it in place. The new bucket lies at/after the current end (buckets are
+        // contiguous), so first extend the mapping to make room for it: `ensure_len` grows
+        // geometrically and zero-extends, so `slice_mut(new_pos, ..)` is then in-bounds and the
+        // fresh region is already an empty bucket (the fill below is a cheap defensive memset).
+        if let Some(buffer) = self.hdx_file.slice_mut(split_pos, Self::BUCKET_SIZE) {
+            // Note this will zero the CRC as well (we want that- marks it "dirty").
+            buffer.fill(0);
+        } else {
+            return Err(AppendError::ReadOnly);
+        }
+        self.hdx_file.ensure_len(new_pos + Self::BUCKET_SIZE as u64)?;
+        if let Some(buffer) = self.hdx_file.slice_mut(new_pos, Self::BUCKET_SIZE) {
+            // Note this will zero the CRC as well (we want that- marks it "dirty").
+            buffer.fill(0);
+        } else {
+            return Err(AppendError::ReadOnly);
+        }
+
+        for (hash, rec_pos) in elements {
+            let bucket = self.hash_to_bucket(hash.as_slice());
+            if bucket != split_bucket && bucket != new_bucket {
+                panic!(
+                    "got bucket {}, expected {} or {}, mod {}",
+                    bucket, split_bucket, new_bucket, self.modulus
+                );
+            }
+            if bucket == split_bucket {
+                self.save_to_bucket_buffer(hash.as_slice(), rec_pos, split_pos, false)?;
+            } else {
+                self.save_to_bucket_buffer(hash.as_slice(), rec_pos, new_pos, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Save the (hash, position) tuple to its bucket, reading and rewriting the bucket through the
+    /// mapping (write-through, no cache).
+    fn save_to_bucket(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
+        let bucket = self.hash_to_bucket(key);
+        let bucket_pos = self.bucket_pos(bucket);
+        self.save_to_bucket_inner(key, record_pos, bucket_pos)
+    }
+
+    /// Read-modify-write body of [`Self::save_to_bucket`], operating on a caller-owned `scratch`
+    /// buffer (never `self.scratch`, to avoid a `&mut self` + `&mut self.scratch` overlap). On any
+    /// error the on-disk bucket is left untouched.
+    fn save_to_bucket_inner(
+        &mut self,
+        key: &[u8],
+        record_pos: u64,
+        bucket_pos: u64,
+    ) -> Result<(), AppendError> {
+        self.save_to_bucket_buffer(key, record_pos, bucket_pos, true)?;
+        // Zero the trailer to mark the bucket dirty (CRC'd in bulk at `sync()`); the zero also lets
+        // recovery tell a dirty bucket from a corrupt one.
+        if let Some(scratch) = self.hdx_file.slice_mut(bucket_pos, Self::BUCKET_SIZE) {
+            zero_crc(scratch);
+        }
+        Ok(())
+    }
+
+    /// Write the index's header and bloom filter to disk.
+    fn write_header(&mut self) -> Result<(), io::Error> {
+        self.header.write_header(&mut self.hdx_file)?;
+        self.hdx_file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+        self.hdx_file.write_all(self.bloom.data())?;
+        Ok(())
+    }
+
+    /// Stamp a fresh CRC on every *dirty* main bucket — one whose CRC trailer is zero
+    /// (`crc_is_zero`), the marker each write leaves behind. Called by [`Index::sync`]: this makes
+    /// the on-disk index CRC-valid (so a later reopen + [`Self::bucket_crc_scan`] sees it clean)
+    /// while skipping untouched/clean buckets after a cheap 4-byte check — no CRC is computed for
+    /// them. Overflow records in the odx were already CRC'd when appended.
+    fn crc_dirty_buckets(&mut self) {
+        for bucket in 0..self.buckets() as u64 {
+            let pos = self.bucket_pos(bucket);
+            if let Some(buffer) = self.hdx_file.slice_mut(pos, Self::BUCKET_SIZE) {
+                if crc_is_zero(buffer) {
+                    add_crc32(buffer);
+                }
+            }
+        }
+    }
+
+    /// Scan every main bucket and classify its CRC trailer (see [`BucketCrcReport`]). Read-only
+    /// (shared slices), so it is the recovery/verification hook: a `(0, 0)` report means the
+    /// on-disk main buckets are all CRC-valid; any `dirty` means writes were not synced
+    /// (rebuild from the data-log WAL); any `corrupt` is genuine corruption. Overflow (odx)
+    /// records are not scanned — they are append-only and always CRC'd when written.
+    pub fn bucket_crc_scan(&self) -> BucketCrcReport {
+        let mut report = BucketCrcReport::default();
+        for bucket in 0..self.buckets() as u64 {
+            if let Some(buffer) = self.hdx_file.slice(self.bucket_pos(bucket), Self::BUCKET_SIZE) {
+                match crc_state(buffer) {
+                    CrcState::Valid => {}
+                    CrcState::Dirty => report.dirty += 1,
+                    CrcState::Corrupt => report.corrupt += 1,
+                }
+            }
+        }
+        report
     }
 
     /// Allow direct test of the bloom filter.
@@ -735,34 +584,30 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
     fn drop(&mut self) {
         if !self.read_only && !self.synced {
             if !std::thread::panicking() {
-                tracing::warn!("HdxIndex dropped with unsynced data - caller should call sync()");
-            }
-            if let Err(e) = self.save_bucket_cache() {
-                if !std::thread::panicking() {
-                    tracing::error!("HdxIndex: failed to flush bucket cache on drop: {e}");
-                }
+                tracing::warn!(
+                    "HdxIndexMmap dropped with unsynced data - caller should call sync()"
+                );
             }
             if let Err(e) = self.write_header() {
                 if !std::thread::panicking() {
-                    tracing::error!("HdxIndex: failed to write header on drop: {e}");
+                    tracing::error!("HdxIndexMmap: failed to write header on drop: {e}");
                 }
             }
             if let Err(e) = self.hdx_file.flush() {
                 if !std::thread::panicking() {
-                    tracing::error!("HdxIndex: failed to flush file on drop: {e}");
+                    tracing::error!("HdxIndexMmap: failed to flush file on drop: {e}");
                 }
             }
-            // Sync the overflow log before the index, mirroring sync().  The hdx buckets
-            // reference odx overflow records by position; if the hdx is durable but the odx
-            // tail is lost, those positions dangle.
+            // Sync the overflow log before the index: hdx buckets reference odx overflow records by
+            // position, so if the hdx is durable but the odx tail is lost, those positions dangle.
             if let Err(e) = self.odx_file.sync_all() {
                 if !std::thread::panicking() {
-                    tracing::error!("HdxIndex: failed to sync overflow file on drop: {e}");
+                    tracing::error!("HdxIndexMmap: failed to sync overflow file on drop: {e}");
                 }
             }
             if let Err(e) = self.hdx_file.sync_all() {
                 if !std::thread::panicking() {
-                    tracing::error!("HdxIndex: failed to sync file on drop: {e}");
+                    tracing::error!("HdxIndexMmap: failed to sync file on drop: {e}");
                 }
             }
         }
@@ -775,7 +620,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex
             Err(AppendError::ReadOnly)
         } else {
             self.synced = false;
-            // Make sure we have resonable capacity first.
+            // Make sure we have reasonable capacity first.
             self.expand_buckets()?;
             // Add to our bloom filter for quick lookups.
             self.bloom.accrue(key);
@@ -788,7 +633,11 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex
         if !self.bloom.contains(key) {
             Err(FetchError::NotFound)
         } else {
-            self.fetch_position(key.as_slice())
+            let bucket = self.hash_to_bucket(key.as_slice());
+            match self.find_in_bucket(bucket, key.as_slice())? {
+                Some(pos) => Ok(pos),
+                None => Err(FetchError::NotFound),
+            }
         }
     }
 
@@ -797,7 +646,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex
         if self.read_only {
             Err(CommitError::ReadOnly)
         } else {
-            self.save_bucket_cache().map_err(CommitError::IndexFileSync)?;
+            // Writes left modified buckets dirty (zeroed CRC); stamp those now so the on-disk index
+            // is CRC-valid (a clean `bucket_crc_scan` on reopen).
+            self.crc_dirty_buckets();
             self.write_header().map_err(CommitError::IndexFileSync)?;
             self.odx_file.sync_all().map_err(CommitError::IndexFileSync)?;
             self.hdx_file.sync_all().map_err(CommitError::IndexFileSync)?;
@@ -813,90 +664,31 @@ mod tests {
     use tn_types::DefaultHashFunction;
 
     use super::*;
+    use crate::archive::{digest_index::index_directio::HdxIndexDirectIO, pack::FileBackend};
 
-    #[test]
-    fn test_archive_hdx_index() {
-        let tmp_dir = TempDir::with_prefix("test_archive_hdx_index").expect("temp dir");
-        let tmp_path = tmp_dir.path();
-        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
-        let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut idx: HdxIndex =
-            HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
-                .expect("hdx file");
-        for i in 0..1_000_000 {
-            let mut hasher = DefaultHashFunction::new();
-            hasher.update(&format!("idx-{i}").into_bytes());
-            let hash = B256::from_slice(hasher.finalize().as_bytes());
-            idx.save(hash, i).unwrap_or_else(|e| panic!("add to index {i}: {e}"));
-        }
-        for i in 0..1_000_000 {
-            let mut hasher = DefaultHashFunction::new();
-            hasher.update(&format!("idx-{i}").into_bytes());
-            let hash = B256::from_slice(hasher.finalize().as_bytes());
-            assert!(idx.test_bloom_contains(hash));
-            assert_eq!(idx.load(hash).unwrap_or_else(|e| panic!("load idx {i}: {e}")), i);
-        }
-        drop(idx);
-
-        // Verify inder when opened for write.
-        // Add some more values as well.
-        let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut idx: HdxIndex =
-            HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
-                .expect("hdx file");
-        for i in 0..1_000_000 {
-            let mut hasher = DefaultHashFunction::new();
-            hasher.update(&format!("idx-{i}").into_bytes());
-            let hash = B256::from_slice(hasher.finalize().as_bytes());
-            assert!(idx.test_bloom_contains(hash));
-            assert_eq!(idx.load(hash).expect("load idx"), i);
-        }
-        for i in 1_000_000..1_001_000 {
-            let mut hasher = DefaultHashFunction::new();
-            hasher.update(&format!("idx-{i}").into_bytes());
-            let hash = B256::from_slice(hasher.finalize().as_bytes());
-            idx.save(hash, i).expect("add to index");
-        }
-        drop(idx);
-
-        // Verify index when opened read only.
-        let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut idx: HdxIndex =
-            HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, true)
-                .expect("hdx file");
-        for i in 0..1_001_000 {
-            let mut hasher = DefaultHashFunction::new();
-            hasher.update(&format!("idx-{i}").into_bytes());
-            let hash = B256::from_slice(hasher.finalize().as_bytes());
-            assert!(idx.test_bloom_contains(hash));
-            assert_eq!(idx.load(hash).expect("load idx"), i);
-        }
+    fn key(i: u64) -> B256 {
+        let mut hasher = DefaultHashFunction::new();
+        hasher.update(&format!("idx-{i}").into_bytes());
+        B256::from_slice(hasher.finalize().as_bytes())
     }
 
-    /// The same lifecycle on the memory-mapped **random-write** backend: fill (forcing bucket
-    /// splits, i.e. random-offset overwrites + file growth), look up, reopen for append and add
-    /// more, then reopen read-only and re-verify every key. Exercises the mmap hdx (overwrite) and
-    /// odx (append) paths.
+    /// Full lifecycle on the memory-mapped, cache-free index: fill (forcing bucket splits, i.e.
+    /// random-offset overwrites + file growth) and look up, reopen for append and add more, then
+    /// reopen read-only and re-verify every key.
     #[test]
-    fn test_archive_hdx_index_mmap_backend() {
-        let tmp_dir = TempDir::with_prefix("test_archive_hdx_mmap").expect("temp dir");
+    fn test_archive_hdx_index_mmap() {
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_index_mmap").expect("temp dir");
         let tmp_path = tmp_dir.path();
         let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
-        let key = |i: u64| {
-            let mut hasher = DefaultHashFunction::new();
-            hasher.update(&format!("idx-{i}").into_bytes());
-            B256::from_slice(hasher.finalize().as_bytes())
-        };
         // Enough to blow past the 1000 initial buckets (× 32 elements) and force splits.
         const N: u64 = 50_000;
         const MORE: u64 = N + 1_000;
         let open = |read_only: bool| -> HdxIndex {
-            HdxIndex::open_hdx_file_with_backend(
+            HdxIndex::open_hdx_file(
                 tmp_path.join("index.hdx"),
                 &data_header,
                 BuildHasherDefault::<FxHasher>::default(),
                 read_only,
-                FileBackend::Mmap,
             )
             .expect("hdx mmap")
         };
@@ -907,10 +699,11 @@ mod tests {
                 idx.save(key(i), i).unwrap_or_else(|e| panic!("save {i}: {e}"));
             }
             for i in 0..N {
+                assert!(idx.test_bloom_contains(key(i)));
                 assert_eq!(idx.load(key(i)).unwrap_or_else(|e| panic!("load {i}: {e}")), i);
             }
-        }
-        // Reopen for append on the mmap backend, add more, verify old + new, sync.
+        } // drop flushes the unsynced data
+          // Reopen for append, add more, verify old + new, sync.
         {
             let mut idx = open(false);
             for i in N..MORE {
@@ -921,32 +714,27 @@ mod tests {
             }
             idx.sync().expect("sync");
         }
-        // Reopen read-only on the mmap backend and re-verify everything.
+        // Reopen read-only and re-verify everything.
         let mut idx = open(true);
         for i in 0..MORE {
             assert_eq!(idx.load(key(i)).expect("load ro"), i);
         }
     }
 
-    // Reopening an index whose on-disk bucket geometry does not match this binary's
-    // compile-time layout must fail rather than silently misread.  A different KSIZE
-    // produces a different BUCKET_SIZE, which is exactly the mismatch we guard against.
+    /// Reopening with a bucket geometry that does not match this binary's compile-time layout must
+    /// fail rather than silently misread. A different KSIZE produces a different BUCKET_SIZE.
     #[test]
-    fn test_archive_hdx_index_geometry_mismatch() {
-        let tmp_dir = TempDir::with_prefix("test_archive_hdx_geometry").expect("temp dir");
+    fn test_archive_hdx_index_mmap_geometry_mismatch() {
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_mmap_geometry").expect("temp dir");
         let tmp_path = tmp_dir.path();
         let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
 
-        // Create an index with the default 32-byte keys.
         {
             let builder = BuildHasherDefault::<FxHasher>::default();
             let mut idx: HdxIndex =
                 HdxIndex::open_hdx_file(tmp_path.join("index.hdx"), &data_header, builder, false)
                     .expect("hdx file");
-            let mut hasher = DefaultHashFunction::new();
-            hasher.update(b"idx-0");
-            let hash = B256::from_slice(hasher.finalize().as_bytes());
-            idx.save(hash, 1).expect("add to index");
+            idx.save(key(0), 1).expect("add to index");
             idx.sync().expect("sync");
         }
 
@@ -957,6 +745,201 @@ mod tests {
         assert!(
             matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
             "expected InvalidIndexGeometry, got {res:?}"
+        );
+    }
+
+    /// The on-disk format is identical to `HdxIndex`: a file written by `HdxIndexMmap` reads back
+    /// correctly through the original `HdxIndex` (on the mmap backend), and vice versa — a file
+    /// written by `HdxIndex` on the buffered backend reads back through `HdxIndexMmap`.
+    #[test]
+    fn test_archive_hdx_cross_compat() {
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_cross").expect("temp dir");
+        let tmp_path = tmp_dir.path();
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        // Force some splits + overflow so both the hdx and odx paths are exercised.
+        const N: u64 = 20_000;
+
+        // (a) mmap writer -> HdxIndex (mmap backend) reader.
+        let dir_a = tmp_path.join("a.hdx");
+        {
+            let mut idx: HdxIndex = HdxIndex::open_hdx_file(
+                &dir_a,
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                false,
+            )
+            .expect("mmap writer");
+            for i in 0..N {
+                idx.save(key(i), i).expect("save");
+            }
+            idx.sync().expect("sync");
+        }
+        {
+            let mut idx: HdxIndexDirectIO = HdxIndexDirectIO::open_hdx_file_with_backend(
+                &dir_a,
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                true,
+                FileBackend::Mmap,
+            )
+            .expect("HdxIndex reader");
+            for i in 0..N {
+                assert_eq!(idx.load(key(i)).expect("load via HdxIndex"), i);
+            }
+        }
+
+        // (b) HdxIndex (buffered backend) writer -> mmap reader.
+        let dir_b = tmp_path.join("b.hdx");
+        {
+            let mut idx: HdxIndexDirectIO = HdxIndexDirectIO::open_hdx_file_with_backend(
+                &dir_b,
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                false,
+                FileBackend::Buffered,
+            )
+            .expect("buffered writer");
+            for i in 0..N {
+                idx.save(key(i), i).expect("save");
+            }
+            idx.sync().expect("sync");
+        }
+        {
+            let mut idx: HdxIndex = HdxIndex::open_hdx_file(
+                &dir_b,
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                true,
+            )
+            .expect("mmap reader");
+            for i in 0..N {
+                assert_eq!(idx.load(key(i)).expect("load via HdxIndexMmap"), i);
+            }
+        }
+    }
+
+    /// The zero-CRC "dirty" sentinel. A freshly-opened index is all-valid; a write leaves its
+    /// bucket dirty (zero CRC) and `sync()` clears it; `bucket_crc_scan` counts dirty/corrupt
+    /// buckets.
+    #[test]
+    fn test_archive_hdx_index_mmap_dirty_markers() {
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+
+        // Part A: a full build + sync leaves no dirty/corrupt bucket, and reopening finds every
+        // key.
+        let tmp_a = TempDir::with_prefix("test_archive_hdx_dirty_a").expect("temp dir");
+        const N: u64 = 50_000; // force splits + overflow
+        {
+            let mut idx: HdxIndex = HdxIndex::open_hdx_file(
+                tmp_a.path().join("index.hdx"),
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                false,
+            )
+            .expect("open");
+            for i in 0..N {
+                idx.save(key(i), i).unwrap_or_else(|e| panic!("save {i}: {e}"));
+            }
+            idx.sync().expect("sync stamps dirty buckets");
+            assert_eq!(
+                idx.bucket_crc_scan(),
+                BucketCrcReport::default(),
+                "sync must clear every dirty bucket"
+            );
+        }
+        {
+            let mut idx: HdxIndex = HdxIndex::open_hdx_file(
+                tmp_a.path().join("index.hdx"),
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                true,
+            )
+            .expect("reopen");
+            for i in 0..N {
+                assert_eq!(idx.load(key(i)).unwrap_or_else(|e| panic!("verify {i}: {e}")), i);
+            }
+        }
+
+        // Part B: exact dirty targeting on a tiny index (one bucket, no splits). Fresh = all valid;
+        // one write dirties exactly one bucket; sync clears it; rewriting re-dirties it.
+        let tmp_b = TempDir::with_prefix("test_archive_hdx_dirty_b").expect("temp dir");
+        let mut idx: HdxIndex = HdxIndex::open_hdx_file(
+            tmp_b.path().join("index.hdx"),
+            &data_header,
+            BuildHasherDefault::<FxHasher>::default(),
+            false,
+        )
+        .expect("open tiny");
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport::default(),
+            "a fresh index's init buckets all carry a valid (non-zero) CRC"
+        );
+        idx.save(key(0), 0).expect("save one");
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport { dirty: 1, corrupt: 0 },
+            "one write dirties exactly one bucket"
+        );
+        idx.sync().expect("sync one");
+        assert_eq!(idx.bucket_crc_scan(), BucketCrcReport::default(), "sync clears the one dirty");
+        idx.save(key(0), 0).expect("rewrite one");
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport { dirty: 1, corrupt: 0 },
+            "rewriting the key re-dirties exactly its bucket"
+        );
+        idx.sync().expect("resync one");
+        assert_eq!(idx.bucket_crc_scan(), BucketCrcReport::default());
+    }
+
+    /// `crc_state`/`bucket_crc_scan` tell a dirty bucket (zeroed CRC) from a corrupt one (non-zero
+    /// CRC that fails). Build eagerly (all valid), corrupt one bucket's payload (stale CRC =>
+    /// corrupt), then zero another bucket's CRC (=> dirty).
+    #[test]
+    fn test_archive_hdx_index_mmap_crc_state_corrupt_vs_dirty() {
+        use crate::archive::crc::zero_crc;
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_crcstate").expect("temp dir");
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        const N: u64 = 5_000;
+
+        let mut idx: HdxIndex = HdxIndex::open_hdx_file(
+            tmp_dir.path().join("index.hdx"),
+            &data_header,
+            BuildHasherDefault::<FxHasher>::default(),
+            false,
+        )
+        .expect("open");
+        for i in 0..N {
+            idx.save(key(i), i).expect("save");
+        }
+        idx.sync().expect("sync");
+        assert_eq!(idx.bucket_crc_scan(), BucketCrcReport::default(), "eager build is all valid");
+
+        // Corrupt bucket 0's payload but keep its (now stale, non-zero) CRC -> corrupt.
+        let pos0 = idx.bucket_pos(0);
+        {
+            let buf =
+                idx.hdx_file.slice_mut(pos0, HdxIndex::<32>::BUCKET_SIZE).expect("slice bucket 0");
+            buf[12] ^= 0xFF;
+        }
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport { dirty: 0, corrupt: 1 },
+            "a payload change under a stale CRC reads as corrupt"
+        );
+
+        // Zero bucket 1's CRC -> dirty (bucket 0 stays corrupt).
+        let pos1 = idx.bucket_pos(1);
+        {
+            let buf =
+                idx.hdx_file.slice_mut(pos1, HdxIndex::<32>::BUCKET_SIZE).expect("slice bucket 1");
+            zero_crc(buf);
+        }
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport { dirty: 1, corrupt: 1 },
+            "a zeroed CRC reads as dirty, independent of the corrupt bucket"
         );
     }
 }

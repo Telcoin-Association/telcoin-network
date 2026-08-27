@@ -32,9 +32,9 @@ use std::{
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FileBackend {
     /// Buffered syscall IO ([`DataFile`]); durability barrier is `fsync`.
-    #[default]
     Buffered,
     /// Memory-mapped IO ([`MmapDataFile`]); default durability barrier is `msync`.
+    #[default]
     Mmap,
 }
 

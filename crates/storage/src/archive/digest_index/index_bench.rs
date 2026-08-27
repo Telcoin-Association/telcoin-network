@@ -42,7 +42,7 @@ use std::{
 use tempfile::TempDir;
 use tn_types::B256;
 
-use super::{index::HdxIndex, index_mmap::HdxIndexMmap};
+use super::{index::HdxIndex, index_directio::HdxIndexDirectIO};
 use crate::archive::{
     fxhasher::FxHasher,
     index::Index,
@@ -193,8 +193,13 @@ fn row_labels(sizes: &[u64]) -> Vec<String> {
     rows
 }
 
-fn open_hdx(header: &DataHeader, dir: &Path, read_only: bool, backend: FileBackend) -> HdxIndex {
-    HdxIndex::open_hdx_file_with_backend(
+fn open_hdx(
+    header: &DataHeader,
+    dir: &Path,
+    read_only: bool,
+    backend: FileBackend,
+) -> HdxIndexDirectIO {
+    HdxIndexDirectIO::open_hdx_file_with_backend(
         dir.join("hdx"),
         header,
         BuildHasherDefault::<FxHasher>::default(),
@@ -204,8 +209,8 @@ fn open_hdx(header: &DataHeader, dir: &Path, read_only: bool, backend: FileBacke
     .expect("open hdx")
 }
 
-fn open_mmap(header: &DataHeader, dir: &Path, read_only: bool) -> HdxIndexMmap {
-    HdxIndexMmap::open_hdx_file(
+fn open_mmap(header: &DataHeader, dir: &Path, read_only: bool) -> HdxIndex {
+    HdxIndex::open_hdx_file(
         dir.join("hdx"),
         header,
         BuildHasherDefault::<FxHasher>::default(),

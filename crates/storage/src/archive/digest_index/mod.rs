@@ -9,7 +9,7 @@ pub mod index;
 /// `index_bench.rs`).
 #[cfg(test)]
 mod index_bench;
-pub mod index_mmap;
+pub mod index_directio;
 pub mod odx_header;
 
 use std::{
@@ -28,7 +28,7 @@ use crate::archive::{
     pack::{DataHeader, FileBackend},
 };
 
-use self::{index::HdxIndex, index_mmap::HdxIndexMmap};
+use self::{index::HdxIndex, index_directio::HdxIndexDirectIO};
 
 /// A digest index (256-bit digest -> u64 record position) whose on-disk file backend is chosen at
 /// open time.
@@ -49,9 +49,9 @@ pub enum DigestIndex<
     S: BuildHasher + Default = BuildHasherDefault<FxHasher>,
 > {
     /// Buffered backend (the default): [`HdxIndex`] on a raw random-access `File`.
-    Buffered(HdxIndex<KSIZE, S>),
+    Buffered(HdxIndexDirectIO<KSIZE, S>),
     /// Memory-mapped, cache-free backend: [`HdxIndexMmap`].
-    Mmap(HdxIndexMmap<KSIZE, S>),
+    Mmap(HdxIndex<KSIZE, S>),
 }
 
 impl<const KSIZE: usize, S: BuildHasher + Default> DigestIndex<KSIZE, S> {
@@ -67,14 +67,16 @@ impl<const KSIZE: usize, S: BuildHasher + Default> DigestIndex<KSIZE, S> {
         backend: FileBackend,
     ) -> Result<Self, LoadHeaderError> {
         match backend {
-            FileBackend::Buffered => Ok(Self::Buffered(HdxIndex::open_hdx_file_with_backend(
-                dir,
-                data_header,
-                hasher_builder,
-                read_only,
-                FileBackend::Buffered,
-            )?)),
-            FileBackend::Mmap => Ok(Self::Mmap(HdxIndexMmap::open_hdx_file(
+            FileBackend::Buffered => {
+                Ok(Self::Buffered(HdxIndexDirectIO::open_hdx_file_with_backend(
+                    dir,
+                    data_header,
+                    hasher_builder,
+                    read_only,
+                    FileBackend::Buffered,
+                )?))
+            }
+            FileBackend::Mmap => Ok(Self::Mmap(HdxIndex::open_hdx_file(
                 dir,
                 data_header,
                 hasher_builder,

@@ -2,7 +2,9 @@
 //! buckets to accessed without worrying about underlying structure or files.
 //! NOTE: This is ONLY appropriate for use by the index.
 
-use crate::archive::{crc::check_crc, digest_index::index::HdxIndex, pack::PackFileIo};
+use crate::archive::{
+    crc::check_crc, digest_index::index_directio::HdxIndexDirectIO, pack::PackFileIo,
+};
 use std::{hash::BuildHasher, io::SeekFrom};
 
 /// Iterates over the (hash, record_position) values contained in a bucket.
@@ -85,7 +87,7 @@ impl<'bucket> BucketIter<'bucket> {
     ) -> (&[u8], u64) {
         let mut buf64 = [0_u8; 8];
         // 12- 8 bytes for overflow position and 4 for the elements in the bucket.
-        let mut pos = 12 + (bucket_pos * HdxIndex::<KSIZE, S>::BUCKET_ELEMENT_SIZE);
+        let mut pos = 12 + (bucket_pos * HdxIndexDirectIO::<KSIZE, S>::BUCKET_ELEMENT_SIZE);
         let key_pos = pos;
         pos += KSIZE;
         buf64.copy_from_slice(&self.buffer()[pos..(pos + 8)]);
@@ -99,7 +101,7 @@ impl<'bucket> BucketIter<'bucket> {
         odx_file: &mut dyn PackFileIo,
     ) -> Option<()> {
         // Make sure the overflow buffer is the correct size and zeroed when extended.
-        self.overflow_buffer.resize(HdxIndex::<KSIZE, S>::BUCKET_SIZE, 0);
+        self.overflow_buffer.resize(HdxIndexDirectIO::<KSIZE, S>::BUCKET_SIZE, 0);
         // For reading u64 values, needs an array.
         let mut buf64 = [0_u8; 8];
         // Position of the record we are about to read; the overflow log is append-only so
@@ -132,7 +134,7 @@ impl<'bucket> BucketIter<'bucket> {
     }
 }
 
-impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
+impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndexDirectIO<KSIZE, S> {
     /// Advance and return the next key/position for the bucket defined by BucketIter.
     /// This will handle overflow buckets as well.
     pub(crate) fn next_bucket_element<'s>(
