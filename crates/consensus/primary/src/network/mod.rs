@@ -33,7 +33,7 @@ use tn_storage::{
 use tn_types::{
     encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest, ConsensusOutput,
     ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
-    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote,
+    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, WorkerId,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
@@ -1562,29 +1562,51 @@ where
 }
 
 /// Defines how the network receiver handles incoming workers messages.
+///
+/// One instance is bound to each worker's `LocalNetwork` with that worker's id: the binding is
+/// what establishes the reporting worker's identity. A message whose stamped id disagrees with
+/// the instance it arrived on is rejected before it reaches the proposer's digest channel or
+/// the payload store, so a mis-wired (or, once workers are remote, misbehaving) worker cannot
+/// impersonate another worker's lane.
 #[derive(Clone)]
 pub(super) struct WorkerReceiverHandler<DB> {
+    /// The worker id this instance is bound to.
+    worker_id: WorkerId,
     consensus_bus: ConsensusBus,
     payload_store: DB,
 }
 
 impl<DB: PayloadStore> WorkerReceiverHandler<DB> {
-    /// Create a new instance of Self.
-    pub(crate) fn new(consensus_bus: ConsensusBus, payload_store: DB) -> Self {
-        Self { consensus_bus, payload_store }
+    /// Create a new instance of Self bound to `worker_id`.
+    pub(crate) fn new(worker_id: WorkerId, consensus_bus: ConsensusBus, payload_store: DB) -> Self {
+        Self { worker_id, consensus_bus, payload_store }
+    }
+
+    /// Reject a message stamped with a different worker id than this instance is bound to.
+    fn check_worker_id(&self, message_worker_id: WorkerId) -> eyre::Result<()> {
+        if message_worker_id == self.worker_id {
+            Ok(())
+        } else {
+            Err(eyre::eyre!(
+                "message stamped with worker id {message_worker_id} arrived on the local network \
+                 instance bound to worker id {}",
+                self.worker_id
+            ))
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl<DB: Database> WorkerToPrimaryClient for WorkerReceiverHandler<DB> {
     async fn report_own_batch(&self, message: WorkerOwnBatchMessage) -> eyre::Result<()> {
+        self.check_worker_id(message.worker_id())?;
         let (tx_ack, rx_ack) = oneshot::channel();
         let response = self
             .consensus_bus
             .our_digests()
             .send(OurDigestMessage {
-                digest: message.digest,
-                worker_id: message.worker_id,
+                digest: message.digest(),
+                worker_id: message.worker_id(),
                 ack_channel: tx_ack,
             })
             .await?;
@@ -1596,7 +1618,8 @@ impl<DB: Database> WorkerToPrimaryClient for WorkerReceiverHandler<DB> {
     }
 
     async fn report_others_batch(&self, message: WorkerOthersBatchMessage) -> eyre::Result<()> {
-        self.payload_store.write_payload(&message.digest, &message.worker_id)?;
+        self.check_worker_id(message.worker_id())?;
+        self.payload_store.write_payload(&message.digest(), &message.worker_id())?;
         Ok(())
     }
 }

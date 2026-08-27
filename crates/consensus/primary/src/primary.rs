@@ -32,7 +32,7 @@ impl<DB: Database> Primary<DB> {
         consensus_bus: &ConsensusBus,
         primary_network: PrimaryNetworkHandle,
         state_sync: StateSynchronizer<DB>,
-    ) -> Self {
+    ) -> eyre::Result<Self> {
         // Write the parameters to the logs.
         config.parameters().tracing();
 
@@ -42,14 +42,18 @@ impl<DB: Database> Primary<DB> {
             config.authority().as_ref().map(|a| a.protocol_key().encode_base58()),
         );
 
-        let worker_receiver_handler =
-            WorkerReceiverHandler::new(consensus_bus.clone(), config.node_storage().clone());
+        // Register as the worker-to-primary handler on every worker's local network, each
+        // handler bound to that instance's worker id so the seam establishes the reporting
+        // worker's identity instead of trusting the message's self-stamped id.
+        config.local_networks().try_for_each(|(worker_id, local_network)| {
+            local_network.set_worker_to_primary_local_handler(Arc::new(WorkerReceiverHandler::new(
+                worker_id,
+                consensus_bus.clone(),
+                config.node_storage().clone(),
+            )))
+        })?;
 
-        config
-            .local_network()
-            .set_worker_to_primary_local_handler(Arc::new(worker_receiver_handler));
-
-        Self { primary_network, state_sync }
+        Ok(Self { primary_network, state_sync })
     }
 
     /// Spawns the primary.

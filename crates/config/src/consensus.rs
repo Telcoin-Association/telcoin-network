@@ -3,7 +3,7 @@ use crate::{
     Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, Parameters, TelcoinDirs,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 use tn_network_types::local::LocalNetwork;
@@ -22,7 +22,12 @@ struct ConsensusConfigInner<DB> {
     node_storage: DB,
     key_config: KeyConfig,
     authority: Option<Authority>,
-    local_network: LocalNetwork,
+    /// One [`LocalNetwork`] per worker id, keyed by the committee's worker ids.
+    ///
+    /// Each worker communicates with the primary over its own instance: this is the seam for
+    /// future process separation. Sized from [`Committee::number_of_workers`], the chain-derived
+    /// count, so the key set cannot drift from the committee the config carries.
+    local_networks: BTreeMap<WorkerId, LocalNetwork>,
     network_config: NetworkConfig,
     genesis: HashMap<HeaderDigest, Certificate>,
     /// Digest of the previous epoch's `EpochRecord` ([`EpochDigest::default`] for epoch 0).
@@ -189,7 +194,10 @@ where
         // peer penalty routes the config through the running swarm.
         network_config.peer_config().score_config.validate()?;
 
-        let local_network = LocalNetwork::new(key_config.primary_public_key());
+        let local_networks = committee
+            .worker_ids()
+            .map(|worker_id| (worker_id, LocalNetwork::new(key_config.primary_public_key())))
+            .collect();
 
         let primary_public_key = key_config.primary_public_key();
         let authority = committee.authority_by_key(&primary_public_key);
@@ -208,7 +216,7 @@ where
                 node_storage,
                 key_config,
                 authority,
-                local_network,
+                local_networks,
                 network_config,
                 genesis,
                 prior_epoch_record,
@@ -292,12 +300,26 @@ where
         &self.inner.config.parameters
     }
 
-    /// Returns a reference to the local network configuration.
+    /// Returns a reference to the given worker's local network.
     ///
     /// Contains network identity and local networking setup information.
-    /// This is how Primary <-> Workers communicate.
-    pub fn local_network(&self) -> &LocalNetwork {
-        &self.inner.local_network
+    /// This is how the Primary and worker `worker_id` communicate.
+    ///
+    /// Total over any input: `None` for an id outside the committee's worker set. Callers must
+    /// surface the miss (this accessor is reached with peer-supplied ids), never fall back to
+    /// another worker's instance.
+    pub fn local_network(&self, worker_id: WorkerId) -> Option<&LocalNetwork> {
+        self.inner.local_networks.get(&worker_id)
+    }
+
+    /// Returns every worker's local network with its id, in ascending worker-id order.
+    ///
+    /// The primary registers its worker-to-primary handler on each instance through this.
+    pub fn local_networks(&self) -> impl Iterator<Item = (WorkerId, &LocalNetwork)> {
+        self.inner
+            .local_networks
+            .iter()
+            .map(|(worker_id, local_network)| (*worker_id, local_network))
     }
 
     /// Returns a reference to the network configuration.
