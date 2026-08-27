@@ -9,7 +9,7 @@ mod peer;
 mod score;
 mod status;
 mod types;
-pub(crate) use manager::PeerManager;
+pub(crate) use manager::{PeerManager, PutRecordRate};
 pub(crate) use types::PeerEvent;
 pub use types::{PeerExchangeMap, Penalty};
 // the per-peer address cap also bounds the addresses a signed record may advertise

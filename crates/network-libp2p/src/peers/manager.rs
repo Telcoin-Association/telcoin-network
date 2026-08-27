@@ -37,14 +37,37 @@ mod peer_manager;
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Maximum inbound kad `PutRecord` messages accepted from a single source per
-/// [`PUT_RECORD_RATE_WINDOW`] before the source is rate limited.
+/// [`PUT_RECORD_RATE_WINDOW`] before records from the source are shed.
 ///
-/// Honest inbound sits far below this. A source refreshes its own record on the kad
-/// republication cadence (`kad_publication_interval`, 12h by default) and the libp2p
-/// replication interval (~1h), so even a post-restart burst is a small handful of records
-/// per minute. A source sustaining more than this in a rolling minute is not explainable by
-/// that cadence and is treated as a flood (GHSA-f6rq-62rr-4h9g).
+/// This is the starvation bound: it caps the BLS verify + store write work one source can
+/// place on the network task (~30 verifies per source-minute). Exceeding it sheds records
+/// without penalizing the source, because honest traffic can cross this line.
+///
+/// Sized against kad *replication* fan-in, not against a source republishing its own
+/// record. On every `record_replication_interval` tick (`kad_replication_interval`, 1h by
+/// default) libp2p-kad re-puts every stored record whose publisher is **not** the local
+/// node (`libp2p-kad::jobs::PutRecordJob::poll`), one iterative query per record, each
+/// fanning out to the `replication_factor` (20) closest peers. The count one target sees
+/// from one source per tick is therefore
+///
+///     N * min(1, replication_factor / R)
+///
+/// where `N` is the source's stored-record count (~one row per node seen, capped by
+/// `MemoryStoreConfig::max_records` = 1024) and `R` is the peer set the source's lookup
+/// reaches. With healthy routing (`R >= replication_factor`) this is ~20 and Poisson
+/// distributed; when a source's reach is small (bootstrap, partition heal, post-restart)
+/// it degrades toward `N`.
 const MAX_PUT_RECORDS_PER_WINDOW: usize = 30;
+
+/// Sustained inbound rate above which a source is scored, not merely shed.
+///
+/// Deliberately far above [`MAX_PUT_RECORDS_PER_WINDOW`]: shedding a redundant record
+/// costs nothing (kad re-replicates hourly, so the same record arrives from up to
+/// `replication_factor` other peers), whereas penalizing an honest source walks it to a
+/// temporary ban. Honest replication fan-in also scales with network size (see above). A
+/// source exceeding this is treated as a flood and penalized, at most once per window
+/// (GHSA-f6rq-62rr-4h9g).
+const PUT_RECORD_PENALTY_THRESHOLD: usize = 512;
 
 /// Per-source inbound kad `PutRecord` rate window.
 struct PutRecordWindow {
@@ -52,6 +75,21 @@ struct PutRecordWindow {
     count: usize,
     /// When the current window started.
     started: Instant,
+    /// Whether a penalty was already assessed for this window (one per window, not per
+    /// message).
+    penalized: bool,
+}
+
+/// Outcome of recording an inbound kad `PutRecord` against the per-source window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PutRecordRate {
+    /// Under the shed threshold: process the record.
+    Allowed,
+    /// Over the shed threshold: drop the record without penalizing the source.
+    Shed,
+    /// Over the penalty threshold and not yet penalized this window: drop the record and
+    /// penalize the source once.
+    Flooding,
 }
 
 /// The type to manage peers.
@@ -908,31 +946,43 @@ impl PeerManager {
         self.cache_known_peer(bls_key, info);
     }
 
-    /// Record an inbound kad `PutRecord` from `source` and report whether it exceeds the
+    /// Record an inbound kad `PutRecord` from `source` and classify it against the
     /// per-source rate.
     ///
-    /// Counts one message per call in a [`PUT_RECORD_RATE_WINDOW`] sliding window and reports
-    /// `true` once a source passes [`MAX_PUT_RECORDS_PER_WINDOW`] within the current window, so the
-    /// caller can drop the record before the expensive signature verify and store write. The local
-    /// node's own id is never limited. Mirrors the inbound-stream rate limiter in the stream
-    /// behaviour.
-    pub(crate) fn put_record_rate_limited(&mut self, source: PeerId) -> bool {
+    /// Counts one message per call in a [`PUT_RECORD_RATE_WINDOW`] sliding window. A source
+    /// past [`MAX_PUT_RECORDS_PER_WINDOW`] has its records shed before the expensive
+    /// signature verify and store write; only a source past
+    /// [`PUT_RECORD_PENALTY_THRESHOLD`] is flagged for a penalty, at most once per window.
+    /// The local node's own id is never limited. Mirrors the inbound-stream rate limiter in
+    /// the stream behaviour. Shed and flood outcomes each bump the rate-limit metric.
+    pub(crate) fn put_record_rate_limited(&mut self, source: PeerId) -> PutRecordRate {
         if self.is_local_peer(&source) {
-            false
+            PutRecordRate::Allowed
         } else {
             let now = Instant::now();
-            let window = self
-                .put_record_windows
-                .entry(source)
-                .or_insert(PutRecordWindow { count: 0, started: now });
+            let window = self.put_record_windows.entry(source).or_insert(PutRecordWindow {
+                count: 0,
+                started: now,
+                penalized: false,
+            });
             let window_expired = now.duration_since(window.started) >= PUT_RECORD_RATE_WINDOW;
             if window_expired {
                 window.count = 1;
                 window.started = now;
+                window.penalized = false;
             } else {
                 window.count += 1;
             }
-            window.count > MAX_PUT_RECORDS_PER_WINDOW
+            let rate = match () {
+                _ if window.count <= MAX_PUT_RECORDS_PER_WINDOW => PutRecordRate::Allowed,
+                _ if window.count > PUT_RECORD_PENALTY_THRESHOLD && !window.penalized => {
+                    window.penalized = true;
+                    PutRecordRate::Flooding
+                }
+                _ => PutRecordRate::Shed,
+            };
+            self.metrics.record_put_record_rate_limited(&rate);
+            rate
         }
     }
 
