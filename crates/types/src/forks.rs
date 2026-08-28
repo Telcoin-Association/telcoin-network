@@ -690,6 +690,25 @@ mod tests {
         });
     }
 
+    /// The fail-closed conjunct documented on [`prevrandao_seed_active`]: a seed-inactive epoch
+    /// must stay on the legacy XOR even where the PREVRANDAO fork point itself is active, so the
+    /// hash never folds the forkable legacy leader-aggregate seed.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn prevrandao_seed_active_is_closed_by_the_seed_conjunct() {
+        [0, 1, SEED_SIGNATURE_FORK_EPOCH - 1].into_iter().for_each(|epoch| {
+            assert!(
+                !seed_signature_active(epoch),
+                "epoch {epoch} must be seed-dormant for this test to mean anything",
+            );
+            assert!(
+                !prevrandao_seed_active(epoch),
+                "epoch {epoch} is seed-dormant, so the PREVRANDAO gate must stay closed \
+                 regardless of the fork point",
+            );
+        });
+    }
+
     /// Pin the multi-workers gate to the rollout contract this build actually implements.
     ///
     /// Carries the same asymmetry [`build_fork_gate_matches_this_builds_rollout_contract`] states

@@ -650,6 +650,25 @@ mod tests {
         )
     }
 
+    /// The keeper below derives both grid points from the constant, which only stays meaningful
+    /// while an epoch below it exists.
+    #[cfg(feature = "adiri")]
+    const _: () = assert!(crate::forks::PREVRANDAO_FORK_EPOCH != 0);
+
+    /// Build an output whose leader header carries `epoch`, so the fork arm is selected by the
+    /// committing leader's epoch rather than by this build's feature set.
+    fn output_at_epoch(epoch: Epoch, number: u64, digests: Vec<BlockHash>) -> ConsensusOutput {
+        let leader = crate::HeaderBuilder::default().epoch(epoch).build();
+        ConsensusOutput::new(
+            CommittedSubDag::new_with_headers_for_test(vec![leader]),
+            ConsensusHeaderDigest::default(),
+            number,
+            false,
+            digests.into(),
+            Vec::new(),
+        )
+    }
+
     /// Pin the exact post-fork byte layout: keccak256 of the versioned domain tag, the seed
     /// chain value, then the consensus block number and batch index as little-endian u64s.
     #[test]
@@ -733,5 +752,68 @@ mod tests {
             let header: B256 = output.digest().into();
             assert_eq!(empty, header, "a zero batch digest must reduce to the header digest");
         }
+    }
+
+    /// THE boundary keeper for #1247: the arm switch must happen AT `PREVRANDAO_FORK_EPOCH`.
+    /// Both epochs derive from the constant, so an arming PR retargets this with no edit here.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn prev_randao_switches_arms_at_the_prevrandao_fork_epoch() {
+        let post_fork = crate::forks::PREVRANDAO_FORK_EPOCH;
+        let pre_fork = post_fork - 1;
+        // anti-vacuity tripwire, mirroring `committee_sweep_tests.rs`: an ambient override or an
+        // armed fork would make both sides land on the same arm and pass for the wrong reason
+        assert!(
+            !crate::forks::prevrandao_seed_active(pre_fork),
+            "epoch {pre_fork} must be pre-fork for this keeper to mean anything; is \
+             TN_PREVRANDAO_FORK_EPOCH set in the environment?"
+        );
+        assert!(
+            crate::forks::prevrandao_seed_active(post_fork),
+            "epoch {post_fork} must be post-fork; is TN_PREVRANDAO_FORK_EPOCH set, or has the \
+             seed fork been ordered after the PREVRANDAO fork?"
+        );
+
+        let digest = BlockHash::repeat_byte(0x55);
+        let legacy = output_at_epoch(pre_fork, 11, vec![digest]);
+        let seeded = output_at_epoch(post_fork, 11, vec![digest]);
+
+        let legacy_header: B256 = legacy.digest().into();
+        assert_eq!(
+            legacy.prev_randao(0, digest),
+            legacy_header ^ digest,
+            "PREVRANDAO_FORK_EPOCH - 1 must replay the legacy XOR byte-identically",
+        );
+        assert_eq!(
+            seeded.prev_randao(0, digest),
+            seeded_prev_randao(seeded.committee_shuffle_seed(), 11, 0),
+            "the gate must fire from PREVRANDAO_FORK_EPOCH onward (`>=`, not `>`)",
+        );
+        assert_ne!(
+            legacy.prev_randao(0, digest),
+            seeded.prev_randao(0, digest),
+            "the two arms must actually produce different values at the boundary",
+        );
+    }
+
+    /// The always-active counterpart (non-adiri): no dormant epoch exists to switch from, so this
+    /// states that every epoch takes the seeded arm rather than asserting a switch vacuously.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn prev_randao_takes_the_seeded_arm_at_every_epoch_without_adiri() {
+        [0u32, 1, 383, Epoch::MAX].into_iter().for_each(|epoch| {
+            let digest = BlockHash::repeat_byte(0x55);
+            let output = output_at_epoch(epoch, 11, vec![digest]);
+            assert!(
+                crate::forks::prevrandao_seed_active(epoch),
+                "non-adiri builds are active from genesis; epoch {epoch} must be post-fork. is \
+                 TN_PREVRANDAO_FORK_EPOCH or TN_SEED_SIGNATURE_FORK_EPOCH set in the environment?"
+            );
+            assert_eq!(
+                output.prev_randao(0, digest),
+                seeded_prev_randao(output.committee_shuffle_seed(), 11, 0),
+                "epoch {epoch} must use the seeded derivation",
+            );
+        });
     }
 }
