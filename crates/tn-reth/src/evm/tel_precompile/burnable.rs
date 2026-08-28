@@ -367,12 +367,13 @@ pub(super) fn handle_burn(
 ) -> PrecompileResult {
     /// Flat charge for destroying tokens held by the precompile.
     ///
-    /// A cold `load_account` of the precompile itself (`2_600`), a cold `SLOAD` plus warm
-    /// `nonzero -> nonzero` `SSTORE` of the supply slot (`2_100 + 2_900`), the `Burn` and
-    /// `Transfer` logs (`1_006 + 1_756`), and — on a value-funded burn only — the inbound
-    /// `Transfer` mirroring the top-up (`1_756`): `12_118` total. At `8_000` this covers `0.66x`
-    /// of the worst case, so `burn` is **undercharged** by `4_118` relative to equivalent
-    /// Solidity. Burning is governance-only, so the subsidy is not reachable by untrusted
+    /// A warm `load_account` of the precompile itself (`100`: revm pre-warms every registered
+    /// precompile address, so `0x7e1` is never cold), a cold `SLOAD` plus warm `nonzero ->
+    /// nonzero` `SSTORE` of the supply slot (`2_100 + 2_900`), and the `Burn` and `Transfer` logs
+    /// (`1_006 + 1_756`): `7_862` for a zero-value burn, which the flat `8_000` covers in full
+    /// (`1.02x`). A value-funded burn adds the inbound `Transfer` mirroring the top-up (`1_756`)
+    /// for `9_618`, and is therefore **undercharged** by `1_618` (`0.83x`) relative to equivalent
+    /// Solidity. Burning is governance-only, so that subsidy is not reachable by untrusted
     /// callers.
     ///
     /// Derived in this module's `README.md`, "Gas costs" / "`burn`".
@@ -406,8 +407,13 @@ pub(super) fn handle_burn(
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT, new_supply)
         .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
 
-    // Emit Transfer(caller, precompile, value) — mirrors the EVM's own silent value transfer
-    // that funded this burn, keeping the event log a complete account of the pool's balance.
+    // Emit Transfer(caller, precompile, value) — mirrors the EVM's own silent value transfer that
+    // funded this burn, keeping the event log a complete account of the pool's balance across
+    // every path that runs precompile code. One inlet stays outside those paths: under EIP-6780 a
+    // `SELFDESTRUCT` naming 0x7e1 as beneficiary still transfers its balance (only the account
+    // deletion was removed), crediting the pool with no log and no frame here to observe it. An
+    // indexer should reconcile against the account's native balance rather than treat this log
+    // stream as closed.
     if !value.is_zero() {
         let funding_log = reth_revm::primitives::Log::new(
             TELCOIN_PRECOMPILE_ADDRESS,

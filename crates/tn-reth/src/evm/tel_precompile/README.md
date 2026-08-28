@@ -114,7 +114,9 @@ Four regression tests pin both directions, reaching the precompile through the `
 
 ### Rejection semantics: halt, not revert
 
-Every rejection the precompile issues — the `STATICCALL` refusal above, the `call value: selector is not payable` refusal, an unrecognised selector, and each handler's own gas-limit precheck, `unauthorized`, calldata-length, and arithmetic errors — is a `PrecompileError`. revm maps `PrecompileError::OutOfGas`, which is what the `gas_limit < GAS_COST` precheck in each handler returns, to `InstructionResult::PrecompileOOG`, and every other variant to `InstructionResult::PrecompileError` (`revm-handler`'s `precompile_provider.rs`). Both are a **halt**, not a revert, and a halt consumes every unit of gas the frame was given: unspent gas is returned only for results that are `is_ok_or_revert()`, and neither halt is.
+Every rejection the precompile issues — the `STATICCALL` refusal above, the `call value: selector is not payable` refusal, an unrecognised selector, and each handler's own gas-limit precheck, `unauthorized`, calldata-length, and arithmetic errors — is a `PrecompileError`. The provider that runs `0x7e1` is `alloy-evm`'s `PrecompilesMap` — `add_telcoin_precompile` registers into that map, and the factory names it as the EVM's `Precompiles` type — so `PrecompilesMap::run` (`alloy-evm`'s `precompiles.rs`) is what maps `PrecompileError::OutOfGas`, which is what the `gas_limit < GAS_COST` precheck in each handler returns, to `InstructionResult::PrecompileOOG`, and every other variant to `InstructionResult::PrecompileError`. Both are a **halt**, not a revert, and a halt consumes every unit of gas the frame was given: unspent gas is returned only for results that are `is_ok_or_revert()`, and neither halt is.
+
+Which provider runs is load-bearing rather than a citation detail. revm's own `EthPrecompiles` makes the identical split, but it additionally stashes the error string for a call at journal depth 1, which `revm-handler`'s `post_execution.rs` promotes to `HaltReason::PrecompileErrorWithContext(message)`. `PrecompilesMap` stashes nothing, so a rejected top-level call here halts with the bare `HaltReason::PrecompileError` and surfaces no reason on the receipt at all — which is what the unit tests in `mod.rs` assert, and what makes the "the halt carries no message" claim in `docs/src/evm-compatibility.md` true.
 
 So a rejected call is not a cheap failure:
 
@@ -141,6 +143,8 @@ Token holdings are native account balances, so any direct value transfer (e.g., 
 
 One movement into the precompile does have an event: `burn` is payable, and the wei it receives arrives through the EVM's own transfer, which emits nothing. `handle_burn` therefore emits `Transfer(caller, 0x7e1, msg.value)` before the burn events whenever the call carries value, so an indexer reconstructing TEL as an ERC-20 from these logs never sees the pool pay out wei it was not seen receiving. The mirror reports the attached value, which may exceed the burned amount — the excess stays in the pool and is destroyed by a later `burn`.
 
+That mirror makes the log stream a complete account of the pool's balance across every path that runs precompile code, which is not the same as every path. `SELFDESTRUCT` remains a logless inlet: under EIP-6780 (active from genesis, `cancunTime: 0`) the beneficiary credit still happens — only the account deletion was removed — so a contract self-destructing to `0x7e1` tops the pool up with no log and no precompile frame to observe it, and a later `burn` of that wei emits an outbound `Transfer` for wei nothing was seen sending. The precompile cannot see such a credit, so there is nothing to emit; an indexer should reconcile against the account's native balance rather than treat the log stream as closed.
+
 ### Total supply accounting
 
 `totalSupply` is only updated by `claim` (increment) and `burn` (decrement). It does **not** account for native balance changes outside the precompile (e.g., gas fees, coinbase rewards). The genesis value must be set correctly at chain initialization.
@@ -152,7 +156,7 @@ The genesis account at `0x7e1` is `nonce: "0x0"`, `balance: "0x0"`, `code: "0xfe
 - It keeps the account non-empty, so EIP-158 state clearing never prunes it. An account with zero nonce, zero balance, and no code is deleted at the end of any block that touches it, which would silently wipe the `totalSupply` slot at slot 100 and every pending mint. The precompile's balance legitimately drains to zero after a `burn` of the whole pool, so this is a reachable state, not a theoretical one.
 - It makes a call that bypasses precompile dispatch fail rather than succeed against an EOA. With no code, `0x7e1` is an EOA and a plain call to it returns success; `INVALID` halts the frame instead. The constant's own doc also notes that reth skips calls to accounts with no bytecode, which the code field avoids.
 
-Anything that seeds state under `0x7e1` — a faucet mint role, for example — must extend this account rather than replace it; dropping the `code` field reintroduces the pruning bug. `faucet_mint_role_slot` in `mod.rs` carries the same warning, and the in-memory harness gives its precompile account the identical shape so tests that burn the pool empty exercise the production account shape (`crates/tn-reth/src/evm/precompile_test_utils.rs:75`, `:139-155`).
+Anything that seeds state under `0x7e1` — a faucet mint role, for example — must extend this account rather than replace it; dropping the `code` field reintroduces the pruning bug. `faucet_mint_role_slot` in `mod.rs` carries the same warning, and the in-memory harness gives its precompile account the identical shape — reading the same `PRECOMPILE_GENESIS_BYTECODE` rather than restating the byte — so tests that burn the pool empty exercise the production account shape (`TestEnv::new_with_balances` in `crates/tn-reth/src/evm/precompile_test_utils.rs`).
 
 ## Gas costs
 
@@ -217,19 +221,21 @@ Native-balance mutations (`balance_incr` / `balance_decr` in `claim`, `burn`, an
 
 ### `burn` — 8,000 gas
 
-| Operation                     | Access                | Gas        |
-| ----------------------------- | --------------------- | ---------- |
-| load_account(precompile)      | cold                  | 2,600      |
-| SLOAD totalSupply             | cold                  | 2,100      |
-| SSTORE totalSupply            | warm, nonzero→nonzero | 2,900      |
-| LOG3 (inbound Transfer, 32 B) | value-funded only     | 1,756      |
-| LOG1 (Burn, 32 B)             | —                     | 1,006      |
-| LOG3 (Transfer, 32 B)         | —                     | 1,756      |
-| **Total**                     |                       | **12,118** |
+| Operation                     | Access                       | Gas       |
+| ----------------------------- | ---------------------------- | --------- |
+| load_account(precompile)      | warm (pre-warmed precompile) | 100       |
+| SLOAD totalSupply             | cold                         | 2,100     |
+| SSTORE totalSupply            | warm, nonzero→nonzero        | 2,900     |
+| LOG3 (inbound Transfer, 32 B) | value-funded only            | 1,756     |
+| LOG1 (Burn, 32 B)             | —                            | 1,006     |
+| LOG3 (Transfer, 32 B)         | —                            | 1,756     |
+| **Total**                     |                              | **9,618** |
 
-**Status: Undercharged** — 0.66× headroom. Gas constant is 4,118 below worst-case EVM cost. A
-zero-value burn skips the inbound `Transfer` and costs 10,362 (0.77× headroom). Burning is
-governance-only, so the subsidy is not reachable by untrusted callers.
+**Status: Undercharged on a value-funded burn only** — 0.83× headroom, 1,618 below worst case. A
+zero-value burn skips the inbound `Transfer`, costs 7,862, and is fully covered (1.02×). This is
+the one table whose `load_account` targets the precompile's own account rather than a recipient:
+revm pre-warms every registered precompile address before any frame runs, so `0x7e1` is never cold
+here. Burning is governance-only, so the subsidy is not reachable by untrusted callers.
 
 ### `mint` (faucet) — 30,000 gas
 

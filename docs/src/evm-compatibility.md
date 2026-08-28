@@ -63,6 +63,7 @@ Governance is the on-chain governance safe at `0x0000000000000000000000000000000
 * Bridges and DeFi protocols that need ERC-20 semantics should integrate **WTEL**, exactly as they would WETH on Ethereum.
 * Indexers tracking supply should watch the precompile's `Mint`/`Claim`/`Burn`/`Transfer` events; ordinary TEL movement is visible as native value transfers in transaction traces, not as log events.
 * Indexers that reconstruct TEL as an ERC-20 balance sheet from those `Transfer` logs must credit the inbound `Transfer(caller, 0x7e1, msg.value)` on a value-funded burn. It exists for exactly this audience: skip it and the precompile's balance drifts negative, because tokens leave a pool they were never seen entering.
+* Even with that log credited, the `Transfer` stream is a complete account of the precompile's balance only across paths that run precompile code. `SELFDESTRUCT` naming `0x7e1` as its beneficiary still transfers the balance under EIP-6780 — only the account deletion was removed — and does so with no log and no precompile frame, so the precompile cannot mirror it. Reconcile against `0x7e1`'s native balance rather than treating the log stream as closed.
 
 ### BLS Precompile: Signature Verification
 

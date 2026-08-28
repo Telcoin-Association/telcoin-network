@@ -210,16 +210,27 @@ const NON_PAYABLE_CALL_VALUE: &str = "call value: selector is not payable";
 ///
 /// Every rejection here — the static-call refusal, the payability refusal, an unrecognised
 /// selector, and each handler's own gas-limit precheck, `unauthorized`, decode, and arithmetic
-/// errors — returns [`PrecompileError`]. revm splits that into two instruction results: the
+/// errors — returns [`PrecompileError`]. The provider that runs it is `alloy-evm`'s
+/// `PrecompilesMap`: [`add_telcoin_precompile`] registers into that map and the factory names it
+/// as the EVM's `Precompiles` type, so `PrecompilesMap::run` (`alloy-evm`'s `precompiles.rs`) is
+/// what splits the error into two instruction results, keyed on `PrecompileError::is_oog`. The
 /// `gas_limit < GAS_COST` precheck each handler runs returns `PrecompileError::OutOfGas`, which
-/// maps to `InstructionResult::PrecompileOOG`, and every other variant maps to
-/// `InstructionResult::PrecompileError` (`revm-handler`'s `precompile_provider.rs`, keyed on
-/// `PrecompileError::is_oog`). Both are a **halt**, not a revert, and a halt consumes all the gas
-/// the frame was given. revm returns the unspent remainder only for results that are
-/// `is_ok_or_revert()` (`revm-handler`'s `insert_call_outcome` for a sub-call,
+/// maps to `InstructionResult::PrecompileOOG`; every other variant maps to
+/// `InstructionResult::PrecompileError`. Both are a **halt**, not a revert, and a halt consumes
+/// all the gas the frame was given. revm returns the unspent remainder only for results that are
+/// `is_ok_or_revert()` (`revm-handler`'s `EthFrame::return_result` for a sub-call,
 /// `last_frame_result` for the top level), and neither halt is, so a rejected sub-call loses the
 /// entire 63/64 it was forwarded and a rejected top-level transaction is charged its full
 /// `gas_limit`.
+///
+/// Which provider runs is load-bearing rather than a citation detail. revm's own `EthPrecompiles`
+/// makes the identical `is_oog` split, but it additionally stashes the error string for a call at
+/// journal depth 1, which `revm-handler`'s `post_execution.rs` promotes to
+/// `HaltReason::PrecompileErrorWithContext(message)`. `PrecompilesMap` stashes nothing, so a
+/// rejected top-level call here halts with the bare `HaltReason::PrecompileError` and surfaces no
+/// reason on the receipt at all. That is what the bare-variant assertions in this module's tests
+/// pin, and what makes the "the halt carries no message" claim in
+/// `docs/src/evm-compatibility.md` true.
 ///
 /// For callers this is a cliff rather than a soft failure. A contract that forwards `msg.value`
 /// into [`TELCOIN_PRECOMPILE_ADDRESS`] and inspects the returned boolean does get `false` — a
@@ -315,6 +326,9 @@ mod tests {
     fn test_input_too_short() {
         let mut env = TestEnv::new();
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, vec![0xAB, 0xCD]);
+        // The *bare* variant is what pins the provider: revm's `EthPrecompiles` would report
+        // `PrecompileErrorWithContext` at this depth, `alloy-evm`'s `PrecompilesMap` reports no
+        // reason at all. A dependency bump that swapped them fails here rather than mysteriously.
         assert_eq!(
             assert_halt_consuming_all_gas(&result, DEFAULT_GAS_LIMIT),
             &HaltReason::PrecompileError
@@ -421,7 +435,7 @@ mod tests {
         let result = env.exec_with_value(
             GOVERNANCE_SAFE_ADDRESS,
             burnCall { amount }.abi_encode(),
-            100_000,
+            DEFAULT_GAS_LIMIT,
             value,
         );
         let logs = extract_logs(&result);
@@ -464,7 +478,7 @@ mod tests {
         let result = env.exec_with_value(
             GOVERNANCE_SAFE_ADDRESS,
             burnCall { amount: U256::from(100) }.abi_encode(),
-            100_000,
+            DEFAULT_GAS_LIMIT,
             U256::ZERO,
         );
         let logs = extract_logs(&result);
@@ -588,43 +602,9 @@ mod tests {
 
     #[test]
     fn test_rejected_sub_call_loses_the_gas_it_was_forwarded() {
-        /// Runtime bytecode that measures what a rejected sub-call costs its caller.
-        ///
-        /// Reads `GAS` on either side of a plain `CALL` into `0x7e1` that forwards everything
-        /// available, and returns three words: the gas the frame held before the call, the
-        /// call's success flag, and the gas it held after. Nothing propagates the inner
-        /// failure, so this frame returns normally and the three words reach the transaction
-        /// output.
-        ///
-        /// Disassembly:
-        /// ```text
-        ///   CALLDATASIZE; PUSH1 0; PUSH1 0; CALLDATACOPY   // mem[0..csize] = calldata
-        ///   GAS                                            // gas before
-        ///   PUSH1 0; PUSH1 0; CALLDATASIZE; PUSH1 0;       // retSize, retOffset, argsSize,
-        ///                                                  // argsOffset
-        ///   PUSH1 0; PUSH2 0x07e1; GAS; CALL               // value, address, gas
-        ///   GAS                                            // gas after
-        ///   PUSH1 0x40; MSTORE                             // mem[64] = gas after
-        ///   PUSH1 0x20; MSTORE                             // mem[32] = success flag
-        ///   PUSH1 0x00; MSTORE                             // mem[0]  = gas before
-        ///   PUSH1 0x60; PUSH1 0; RETURN                    // return those three words
-        /// ```
-        const PROBE_CODE: &[u8] = &[
-            0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
-            0x5a, // GAS -> gas before
-            0x60, 0x00, 0x60, 0x00, // retSize = 0, retOffset = 0
-            0x36, 0x60, 0x00, // argsSize = CALLDATASIZE, argsOffset = 0
-            0x60, 0x00, // value = 0
-            0x61, 0x07, 0xe1, 0x5a, 0xf1, // PUSH2 0x07e1; GAS; CALL
-            0x5a, // GAS -> gas after
-            0x60, 0x40, 0x52, // MSTORE(0x40, gas after)
-            0x60, 0x20, 0x52, // MSTORE(0x20, success flag)
-            0x60, 0x00, 0x52, // MSTORE(0x00, gas before)
-            0x60, 0x60, 0x60, 0x00, 0xf3, // RETURN(0, 0x60)
-        ];
         const PROBE: Address = address!("5555555000000000000000000000000000000005");
         let mut env = TestEnv::new();
-        env.deploy_code(PROBE, PROBE_CODE.into());
+        env.deploy_code(PROBE, gas_probe_code(ProbeCall::Call));
         let mut unknown = vec![0xDE, 0xAD, 0xBE, 0xEF];
         unknown.extend_from_slice(&[0u8; 32]);
 
@@ -651,24 +631,9 @@ mod tests {
         // `test_delegatecall_burn_refused_with_and_without_value` reverts on failure, which
         // erases the evidence.
 
-        /// The `CALL` gas probe with the `value` operand dropped and `DELEGATECALL` (`0xf4`) in
-        /// place of `CALL` (`0xf1`); `DELEGATECALL` takes six stack operands rather than seven.
-        /// Returns the same three words.
-        const PROBE_CODE: &[u8] = &[
-            0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
-            0x5a, // GAS -> gas before
-            0x60, 0x00, 0x60, 0x00, // retSize = 0, retOffset = 0
-            0x36, 0x60, 0x00, // argsSize = CALLDATASIZE, argsOffset = 0
-            0x61, 0x07, 0xe1, 0x5a, 0xf4, // PUSH2 0x07e1; GAS; DELEGATECALL
-            0x5a, // GAS -> gas after
-            0x60, 0x40, 0x52, // MSTORE(0x40, gas after)
-            0x60, 0x20, 0x52, // MSTORE(0x20, success flag)
-            0x60, 0x00, 0x52, // MSTORE(0x00, gas before)
-            0x60, 0x60, 0x60, 0x00, 0xf3, // RETURN(0, 0x60)
-        ];
         const PROBE: Address = address!("6666666000000000000000000000000000000006");
         let mut env = TestEnv::new();
-        env.deploy_code(PROBE, PROBE_CODE.into());
+        env.deploy_code(PROBE, gas_probe_code(ProbeCall::DelegateCall));
 
         // `totalSupply` would be served by a direct call and needs no authorization, so the only
         // thing refusing this frame is the indirect-entry guard.
@@ -683,23 +648,9 @@ mod tests {
         // precedent the payability refusal was matched to, so its gas semantics are worth
         // pinning rather than assuming.
 
-        /// The `DELEGATECALL` gas probe with `STATICCALL` (`0xfa`) in place of `DELEGATECALL`
-        /// (`0xf4`); the two take the same six stack operands. Returns the same three words.
-        const PROBE_CODE: &[u8] = &[
-            0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
-            0x5a, // GAS -> gas before
-            0x60, 0x00, 0x60, 0x00, // retSize = 0, retOffset = 0
-            0x36, 0x60, 0x00, // argsSize = CALLDATASIZE, argsOffset = 0
-            0x61, 0x07, 0xe1, 0x5a, 0xfa, // PUSH2 0x07e1; GAS; STATICCALL
-            0x5a, // GAS -> gas after
-            0x60, 0x40, 0x52, // MSTORE(0x40, gas after)
-            0x60, 0x20, 0x52, // MSTORE(0x20, success flag)
-            0x60, 0x00, 0x52, // MSTORE(0x00, gas before)
-            0x60, 0x60, 0x60, 0x00, 0xf3, // RETURN(0, 0x60)
-        ];
         const PROBE: Address = address!("7777777000000000000000000000000000000007");
         let mut env = TestEnv::new();
-        env.deploy_code(PROBE, PROBE_CODE.into());
+        env.deploy_code(PROBE, gas_probe_code(ProbeCall::StaticCall));
 
         // `burn` mutates, so the static gate refuses it before dispatch — ahead of the handler's
         // own authorization check, which would also have refused this caller.
