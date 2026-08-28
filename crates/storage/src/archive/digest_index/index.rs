@@ -37,8 +37,7 @@ use tn_types::B256;
 
 use crate::archive::{
     crc::{add_crc32, check_crc, crc_is_zero, crc_state, zero_crc, CrcState},
-    data_file::fsync_directory,
-    data_file_mmap::{MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
+    data_file::{fsync_directory, MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     digest_index::{
         bloom::{Bloom, BLOOM_SIZE_BYTES},
         odx_header::OdxHeader,

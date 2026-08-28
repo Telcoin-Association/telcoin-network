@@ -1,11 +1,11 @@
-//! On-demand benchmark for consensus pack files: **buffered (`fsync`) vs mmap (`msync`)** file
-//! backends, across production usage patterns.
+//! On-demand performance-regression benchmark for the memory-mapped consensus pack file, across
+//! production usage patterns.
 //!
 //! Pack files are append-only archive files (BCS + per-record ZStd) with position/digest indexes.
 //! The production [`ConsensusPack`] drives them from one background thread per pack — every public
-//! `async fn` sends a message over a channel and awaits a `oneshot` reply. This harness runs the
-//! same battery on both selectable file backends and prints one side-by-side table, so each row
-//! reads off the buffered-vs-mmap cost of that operation.
+//! `async fn` sends a message over a channel and awaits a `oneshot` reply. This harness runs a
+//! battery of those operations and prints one column per output width, so runs can be compared over
+//! time to catch regressions.
 //!
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
 //!
@@ -13,15 +13,14 @@
 //! cargo test -p tn-storage pack_file_bench -- --ignored --nocapture --test-threads 1
 //! ```
 //!
-//! ## What it models (columns = backend × output width)
+//! ## What it models (columns = output width)
 //!
 //! The knob that drives pack cost in production is how many batches each consensus output carries —
-//! a shallow leader vs a deep sub-DAG. So the report has a **column per `{backend} x{width}`**
-//! (`buf`/`mmap` × narrow/typical/wide batches per output), with the two backends adjacent per
-//! width so their delta reads off directly. Each column writes [`NUM_OUTPUTS`] chained outputs
-//! built with [`make_wide_test_output`], whose batches are genuinely distinct across outputs
-//! (random transactions). All of the pack's files switch backend (data file + position index +
-//! digest index), so the `mmap` columns are a fully-`msync` pack.
+//! a shallow leader vs a deep sub-DAG. So the report has a **column per `x{width}`** (narrow /
+//! typical / wide batches per output). Each column writes [`NUM_OUTPUTS`] chained outputs built
+//! with [`make_wide_test_output`], whose batches are genuinely distinct across outputs (random
+//! transactions). Every one of the pack's files (data + position index + digest index) is
+//! memory-mapped, so the whole pack is `msync`-durable.
 //!
 //! The rows, grouped, capture the real call sites traced through `consensus_pack.rs` /
 //! `consensus.rs` / `state-sync/src/lib.rs`:
@@ -46,8 +45,8 @@
 //!   the lever here. Scale [`NUM_OUTPUTS`] / [`WIDTHS`] up for heavier runs.
 //! - Timings are on a `tempfile` dir — they reflect that filesystem, not a specific production
 //!   disk.
-//! - `buf` uses buffered file IO with `fsync` durability barriers; `mmap` memory-maps the files and
-//!   uses `msync`. Both drive the same production `ConsensusPack` (background thread + channel).
+//! - Every pack file is memory-mapped and uses `msync` durability barriers, driving the production
+//!   `ConsensusPack` (background thread + channel).
 
 use std::{
     collections::HashMap,
@@ -66,7 +65,6 @@ use tn_types::{
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::{
-    archive::pack::FileBackend,
     consensus_pack::{test::make_wide_test_output, ConsensusPack, PackError, DATA_NAME},
     mem_db::MemDatabase,
 };
@@ -75,28 +73,21 @@ use crate::{
 /// stays backend-agnostic. Its one implementation forwards to [`ConsensusPack`]'s inherent methods
 /// (static dispatch — no `dyn`).
 trait BenchPack: Sized {
-    fn open_append_with_backend(
+    fn open_append(
         path: &Path,
         previous_epoch: EpochRecord,
         committee: Committee,
-        backend: FileBackend,
     ) -> Result<Self, PackError>;
 
-    fn open_static_with_backend(
-        path: &Path,
-        epoch: Epoch,
-        backend: FileBackend,
-    ) -> Result<Self, PackError>;
+    fn open_static(path: &Path, epoch: Epoch) -> Result<Self, PackError>;
 
-    #[allow(clippy::too_many_arguments)]
-    async fn stream_import_with_backend<R: AsyncRead + Unpin>(
+    async fn stream_import<R: AsyncRead + Unpin>(
         path: &Path,
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
         final_consensus_number: u64,
         timeout: Duration,
-        backend: FileBackend,
     ) -> Result<Self, PackError>;
 
     async fn save_consensus_output(&mut self, output: ConsensusOutput) -> Result<u64, PackError>;
@@ -124,38 +115,31 @@ trait BenchPack: Sized {
 macro_rules! impl_bench_pack {
     ($ty:ty) => {
         impl BenchPack for $ty {
-            fn open_append_with_backend(
+            fn open_append(
                 path: &Path,
                 previous_epoch: EpochRecord,
                 committee: Committee,
-                backend: FileBackend,
             ) -> Result<Self, PackError> {
-                <$ty>::open_append_with_backend(path, previous_epoch, committee, backend)
+                <$ty>::open_append(path, previous_epoch, committee)
             }
-            fn open_static_with_backend(
-                path: &Path,
-                epoch: Epoch,
-                backend: FileBackend,
-            ) -> Result<Self, PackError> {
-                <$ty>::open_static_with_backend(path, epoch, backend)
+            fn open_static(path: &Path, epoch: Epoch) -> Result<Self, PackError> {
+                <$ty>::open_static(path, epoch)
             }
-            async fn stream_import_with_backend<R: AsyncRead + Unpin>(
+            async fn stream_import<R: AsyncRead + Unpin>(
                 path: &Path,
                 stream: R,
                 epoch: Epoch,
                 previous_epoch: &EpochRecord,
                 final_consensus_number: u64,
                 timeout: Duration,
-                backend: FileBackend,
             ) -> Result<Self, PackError> {
-                <$ty>::stream_import_with_backend(
+                <$ty>::stream_import(
                     path,
                     stream,
                     epoch,
                     previous_epoch,
                     final_consensus_number,
                     timeout,
-                    backend,
                 )
                 .await
             }
@@ -274,19 +258,10 @@ fn build_outputs(fx: &Fixtures, width: usize) -> Vec<ConsensusOutput> {
 
 /// Open a fresh append pack and save every output, un-persisted (setup for the read/stream
 /// battery).
-async fn populate<P: BenchPack>(
-    fx: &Fixtures,
-    backend: FileBackend,
-    outputs: &[ConsensusOutput],
-) -> (P, TempDir) {
+async fn populate<P: BenchPack>(fx: &Fixtures, outputs: &[ConsensusOutput]) -> (P, TempDir) {
     let dir = TempDir::with_prefix("pack_bench_read").expect("temp dir");
-    let mut pack = P::open_append_with_backend(
-        dir.path(),
-        fx.previous_epoch.clone(),
-        fx.committee.clone(),
-        backend,
-    )
-    .expect("open pack");
+    let mut pack = P::open_append(dir.path(), fx.previous_epoch.clone(), fx.committee.clone())
+        .expect("open pack");
     for output in outputs {
         pack.save_consensus_output(output.clone()).await.expect("save");
     }
@@ -296,19 +271,10 @@ async fn populate<P: BenchPack>(
 // ---- the battery: each returns the timed duration for its measured region ----
 
 /// Save every output append-only, no durability barrier (the executor hot-path write).
-async fn bench_save_seq<P: BenchPack>(
-    fx: &Fixtures,
-    backend: FileBackend,
-    outputs: &[ConsensusOutput],
-) -> Duration {
+async fn bench_save_seq<P: BenchPack>(fx: &Fixtures, outputs: &[ConsensusOutput]) -> Duration {
     let dir = TempDir::with_prefix("pack_bench_save").expect("temp dir");
-    let mut pack = P::open_append_with_backend(
-        dir.path(),
-        fx.previous_epoch.clone(),
-        fx.committee.clone(),
-        backend,
-    )
-    .expect("open pack");
+    let mut pack = P::open_append(dir.path(), fx.previous_epoch.clone(), fx.committee.clone())
+        .expect("open pack");
     let start = Instant::now();
     for output in outputs {
         pack.save_consensus_output(output.clone()).await.expect("save");
@@ -320,19 +286,10 @@ async fn bench_save_seq<P: BenchPack>(
 
 /// Save every output, each followed by a `persist()` barrier (state-sync save + persist). The delta
 /// vs [`bench_save_seq`] is the per-output durability cost.
-async fn bench_save_durable<P: BenchPack>(
-    fx: &Fixtures,
-    backend: FileBackend,
-    outputs: &[ConsensusOutput],
-) -> Duration {
+async fn bench_save_durable<P: BenchPack>(fx: &Fixtures, outputs: &[ConsensusOutput]) -> Duration {
     let dir = TempDir::with_prefix("pack_bench_durable").expect("temp dir");
-    let mut pack = P::open_append_with_backend(
-        dir.path(),
-        fx.previous_epoch.clone(),
-        fx.committee.clone(),
-        backend,
-    )
-    .expect("open pack");
+    let mut pack = P::open_append(dir.path(), fx.previous_epoch.clone(), fx.committee.clone())
+        .expect("open pack");
     let start = Instant::now();
     for output in outputs {
         pack.save_consensus_output(output.clone()).await.expect("save");
@@ -434,23 +391,17 @@ async fn bench_full_stream(data_path: &Path, end: u64) -> Duration {
 
 /// Receive side of state sync: replay a whole epoch's data into a fresh pack. The source is bounded
 /// to `end` (the real data length) so an open mmap pack's capacity padding is not streamed.
-async fn bench_stream_import<P: BenchPack>(
-    fx: &Fixtures,
-    backend: FileBackend,
-    data_path: &Path,
-    end: u64,
-) -> Duration {
+async fn bench_stream_import<P: BenchPack>(fx: &Fixtures, data_path: &Path, end: u64) -> Duration {
     let dir = TempDir::with_prefix("pack_bench_import").expect("temp dir");
     let stream = tokio::fs::File::open(data_path).await.expect("open data file").take(end);
     let start = Instant::now();
-    let mut pack = P::stream_import_with_backend(
+    let mut pack = P::stream_import(
         dir.path(),
         stream,
         fx.committee.epoch(),
         &fx.previous_epoch,
         NUM_OUTPUTS,
         IMPORT_TIMEOUT,
-        backend,
     )
     .await
     .expect("stream import");
@@ -461,13 +412,9 @@ async fn bench_stream_import<P: BenchPack>(
 }
 
 /// Cold-open the finished pack read-only, touching the index (the pack-cache-miss open cost).
-async fn bench_reopen_static<P: BenchPack>(
-    path: &Path,
-    epoch: Epoch,
-    backend: FileBackend,
-) -> Duration {
+async fn bench_reopen_static<P: BenchPack>(path: &Path, epoch: Epoch) -> Duration {
     let start = Instant::now();
-    let mut pack = P::open_static_with_backend(path, epoch, backend).expect("open static");
+    let mut pack = P::open_static(path, epoch).expect("open static");
     pack.latest_consensus_header().await.expect("latest after reopen");
     start.elapsed()
 }
@@ -478,8 +425,8 @@ struct Column {
     data_len: u64,
 }
 
-/// Run the whole battery for one output width and one file `backend`, over the pack type `P`.
-async fn run_battery<P: BenchPack>(fx: &Fixtures, backend: FileBackend, width: usize) -> Column {
+/// Run the whole battery for one output width, over the pack type `P`.
+async fn run_battery<P: BenchPack>(fx: &Fixtures, width: usize) -> Column {
     let outputs = build_outputs(fx, width);
     let header_digests: Vec<ConsensusHeaderDigest> =
         outputs.iter().map(|o| o.consensus_header_hash()).collect();
@@ -487,17 +434,17 @@ async fn run_battery<P: BenchPack>(fx: &Fixtures, backend: FileBackend, width: u
         outputs.iter().flat_map(|o| o.batch_digests().iter().copied()).take(BATCH_SAMPLE).collect();
 
     // Writes each build (and drop) their own pack.
-    let save_seq = bench_save_seq::<P>(fx, backend, &outputs).await;
-    let save_durable = bench_save_durable::<P>(fx, backend, &outputs).await;
+    let save_seq = bench_save_seq::<P>(fx, &outputs).await;
+    let save_durable = bench_save_durable::<P>(fx, &outputs).await;
 
     // One populated pack shared by the read/stream battery.
-    let (mut pack, dir) = populate::<P>(fx, backend, &outputs).await;
+    let (mut pack, dir) = populate::<P>(fx, &outputs).await;
     let data_path = fx.data_path(dir.path());
 
     // Bulk-persist first so the un-persisted saves are flushed for the direct-file stream reads.
     let persist = bench_persist(&mut pack).await;
-    // Real data length (past the last output). For mmap this excludes the open pack's capacity
-    // padding, so it is comparable to the buffered backend and bounds the stream reads below.
+    // Real data length (past the last output). This excludes the open pack's capacity padding and
+    // bounds the stream reads below.
     let data_len =
         pack.consensus_output_end(NUM_OUTPUTS).await.expect("output end for data length");
 
@@ -510,11 +457,11 @@ async fn run_battery<P: BenchPack>(fx: &Fixtures, backend: FileBackend, width: u
     let latest_header = bench_latest_header(&mut pack).await;
     let prefix_stream = bench_prefix_stream(&mut pack, &data_path).await;
     let full_stream = bench_full_stream(&data_path, data_len).await;
-    let stream_import = bench_stream_import::<P>(fx, backend, &data_path, data_len).await;
+    let stream_import = bench_stream_import::<P>(fx, &data_path, data_len).await;
 
     // Reopen read-only after the writer is gone (index load / cache-miss open).
     drop(pack);
-    let reopen_static = bench_reopen_static::<P>(dir.path(), fx.committee.epoch(), backend).await;
+    let reopen_static = bench_reopen_static::<P>(dir.path(), fx.committee.epoch()).await;
     drop(dir);
 
     Column {
@@ -538,7 +485,7 @@ async fn run_battery<P: BenchPack>(fx: &Fixtures, backend: FileBackend, width: u
     }
 }
 
-/// Collects one column per (backend, width) and prints an aligned table (ms).
+/// Collects one column per output width and prints an aligned table (ms).
 struct Report {
     /// Row labels, captured from the first column and reused for alignment.
     order: Vec<&'static str>,
@@ -588,8 +535,10 @@ impl Report {
         const GROUP_SEP_AFTER: &[&str] =
             &["save_durable", "persist bulk", "latest_header", "stream_import"];
 
-        println!("\n=== consensus pack-file benchmark: buffered (fsync) vs mmap (msync) file backends (ms) ===");
-        println!("legend: columns are {{backend}} x{{batches/output}}; buf = buffered file IO (fsync), mmap = memory-mapped files (msync); both drive the production ConsensusPack. Vertical rails group the 2 backend columns of each width; horizontal rules group the rows. save_durable adds a persist() barrier per output; test batches carry 1 tx each.");
+        println!(
+            "\n=== consensus pack-file benchmark: memory-mapped (msync) ConsensusPack (ms) ==="
+        );
+        println!("legend: columns are mmap x{{batches/output}} — the memory-mapped production ConsensusPack at each output width. Vertical rails group columns; horizontal rules group the rows. save_durable adds a persist() barrier per output; test batches carry 1 tx each.");
 
         // header + underline rule
         let headers: Vec<String> = self.columns.iter().map(|(name, _)| name.clone()).collect();
@@ -623,28 +572,25 @@ impl Report {
     }
 }
 
-/// Compare the buffered (`fsync`) and memory-mapped (`msync`) file backends for the production
-/// [`ConsensusPack`] across its real usage patterns.
+/// Benchmark the memory-mapped (`msync`) production [`ConsensusPack`] across its real usage
+/// patterns, as a regression baseline.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
 /// `cargo test -p tn-storage pack_file_bench -- --ignored --nocapture --test-threads 1`.
 #[test]
-#[ignore = "on-demand pack-file buffered-vs-mmap benchmark; run with --ignored --nocapture --test-threads 1"]
+#[ignore = "on-demand pack-file (mmap) regression benchmark; run with --ignored --nocapture --test-threads 1"]
 fn pack_file_bench() {
     // Mirror `db_bench`: a plain test driving the async pack API on a tokio runtime.
     let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
     runtime.block_on(async {
         let fx = Fixtures::new();
         let mut report = Report::new();
-        // Width-outer, then backend — so the two backends sit adjacent per width for an
-        // at-a-glance buffered-vs-mmap read.
+        // One column per output width, all on the memory-mapped file backend.
         for &(_, width) in WIDTHS {
-            for (backend, blabel) in [(FileBackend::Buffered, "buf"), (FileBackend::Mmap, "mmap")] {
-                let name = format!("{blabel} x{width}");
-                println!("  running battery for {name} ...");
-                let col = run_battery::<ConsensusPack>(&fx, backend, width).await;
-                report.push(&name, col);
-            }
+            let name = format!("mmap x{width}");
+            println!("  running battery for {name} ...");
+            let col = run_battery::<ConsensusPack>(&fx, width).await;
+            report.push(&name, col);
         }
         report.print();
     });

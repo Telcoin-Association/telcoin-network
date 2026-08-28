@@ -2,8 +2,7 @@
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::fsync_directory,
-    data_file_mmap::{MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
+    data_file::{fsync_directory, MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     error::load_header::LoadHeaderError,
 };
 use std::{

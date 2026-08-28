@@ -14,11 +14,7 @@ use crate::archive::{
     pack_iter::{PackIter, MAX_RECORD_SIZE},
 };
 
-use super::{
-    crc::add_crc32,
-    data_file::DataFile,
-    data_file_mmap::{MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
-};
+use super::{crc::add_crc32, data_file::MmapDataFile};
 use std::{
     fmt::Debug,
     fs::{self, File},
@@ -27,216 +23,6 @@ use std::{
     marker::PhantomData,
     path::Path,
 };
-
-/// Selectable on-disk file backend for a [`Pack`]'s append-only data (and position-index) file.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum FileBackend {
-    /// Buffered syscall IO ([`DataFile`]); durability barrier is `fsync`.
-    Buffered,
-    /// Memory-mapped IO ([`MmapDataFile`]); default durability barrier is `msync`.
-    #[default]
-    Mmap,
-}
-
-/// The append-only file operations a [`Pack`] (and the position index) need, abstracted over the
-/// buffered ([`DataFile`]) and memory-mapped ([`MmapDataFile`]) backends. Both concrete types
-/// already provide every method; this trait just lets a pack hold either behind a `Box<dyn
-/// PackFileIo>` without changing `Pack`'s type. Methods forward via UFCS to the inherent
-/// implementations.
-pub trait PackFileIo: Read + Write + Seek + Send + Sync + Debug {
-    /// Logical length (bytes of real data) — also the append position.
-    fn len(&self) -> u64;
-    /// True if the file has no data.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    /// Bytes of real data on disk.
-    fn data_file_end(&self) -> u64;
-    /// Truncate or extend the file to `len`.
-    fn set_len(&mut self, len: u64) -> io::Result<()>;
-    /// Clone the underlying file handle; reads the exact logical bytes to EOF.
-    fn try_clone(&self) -> io::Result<File>;
-    /// Durability barrier (`fsync` for buffered, `msync` for mmap).
-    fn sync_all(&self) -> io::Result<()>;
-    /// Path to the file.
-    fn path(&self) -> &Path;
-    /// Rename the underlying file.
-    fn rename(&mut self, path: &Path) -> Result<(), RenameError>;
-    /// If the underlying Io suports it (mmap) return the slice from offset of len bytes.
-    /// None if outside the file range or unsupported (should fall back on normal Read trait in that
-    /// case).
-    fn slice(&self, offset: u64, len: usize) -> Option<&[u8]>;
-    /// If the underlying Io suports it (mmap) return the slice from offset of len bytes.
-    /// None if outside the file range or unsupported (should fall back on normal Read trait in that
-    /// case).
-    fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]>;
-    /// Ensure the logical length is at least `new_len`, zero-extending if needed (never shrinks) so
-    /// the extended range becomes addressable for `slice`/`slice_mut`. The default extends via
-    /// [`set_len`](Self::set_len); the mmap backend overrides it with geometric growth so repeated
-    /// one-record extensions (e.g. the digest index adding a bucket per split) do not remap each
-    /// call.
-    fn ensure_len(&mut self, new_len: u64) -> io::Result<()> {
-        if new_len > self.len() {
-            self.set_len(new_len)?;
-        }
-        Ok(())
-    }
-}
-
-impl PackFileIo for DataFile {
-    fn len(&self) -> u64 {
-        DataFile::len(self)
-    }
-    fn data_file_end(&self) -> u64 {
-        DataFile::data_file_end(self)
-    }
-    fn set_len(&mut self, len: u64) -> io::Result<()> {
-        DataFile::set_len(self, len)
-    }
-    fn try_clone(&self) -> io::Result<File> {
-        DataFile::try_clone(self)
-    }
-    fn sync_all(&self) -> io::Result<()> {
-        DataFile::sync_all(self)
-    }
-    fn path(&self) -> &Path {
-        DataFile::path(self)
-    }
-    fn rename(&mut self, path: &Path) -> Result<(), RenameError> {
-        DataFile::rename(self, path)
-    }
-    fn slice(&self, _offset: u64, _len: usize) -> Option<&[u8]> {
-        None
-    }
-    fn slice_mut(&mut self, _offset: u64, _len: usize) -> Option<&mut [u8]> {
-        None
-    }
-}
-
-impl PackFileIo for MmapDataFile {
-    fn len(&self) -> u64 {
-        MmapDataFile::len(self)
-    }
-    fn data_file_end(&self) -> u64 {
-        MmapDataFile::data_file_end(self)
-    }
-    fn set_len(&mut self, len: u64) -> io::Result<()> {
-        MmapDataFile::set_len(self, len)
-    }
-    fn try_clone(&self) -> io::Result<File> {
-        MmapDataFile::try_clone(self)
-    }
-    fn sync_all(&self) -> io::Result<()> {
-        MmapDataFile::sync_all(self)
-    }
-    fn path(&self) -> &Path {
-        MmapDataFile::path(self)
-    }
-    fn rename(&mut self, path: &Path) -> Result<(), RenameError> {
-        MmapDataFile::rename(self, path)
-    }
-    fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
-        MmapDataFile::slice(self, offset, len)
-    }
-    fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]> {
-        MmapDataFile::slice_mut(self, offset, len)
-    }
-    fn ensure_len(&mut self, new_len: u64) -> io::Result<()> {
-        MmapDataFile::ensure_len(self, new_len)
-    }
-}
-
-/// Raw [`File`] as a `PackFileIo`, for the **non-mmap** digest index (whose hash buckets are
-/// overwritten in place — random-write semantics we deliberately keep out of the append-only
-/// `DataFile`). The digest index only uses `Read`/`Write`/`Seek`/`sync_all`; `path`/`rename` are
-/// not meaningful for a bare `File` (it tracks no path) and are never called on the digest files.
-impl PackFileIo for File {
-    fn len(&self) -> u64 {
-        File::metadata(self).map(|m| m.len()).unwrap_or(0)
-    }
-    fn data_file_end(&self) -> u64 {
-        File::metadata(self).map(|m| m.len()).unwrap_or(0)
-    }
-    fn set_len(&mut self, len: u64) -> io::Result<()> {
-        File::set_len(self, len)
-    }
-    fn try_clone(&self) -> io::Result<File> {
-        File::try_clone(self)
-    }
-    fn sync_all(&self) -> io::Result<()> {
-        File::sync_all(self)
-    }
-    fn path(&self) -> &Path {
-        Path::new("")
-    }
-    fn rename(&mut self, _path: &Path) -> Result<(), RenameError> {
-        Err(RenameError::RenameIO(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "rename is not supported for the raw File backend",
-        )))
-    }
-    fn slice(&self, _offset: u64, _len: usize) -> Option<&[u8]> {
-        None
-    }
-    fn slice_mut(&mut self, _offset: u64, _len: usize) -> Option<&mut [u8]> {
-        None
-    }
-}
-
-impl FileBackend {
-    /// Open `path` on this backend, boxed as a [`PackFileIo`]. Shared by the pack data file and the
-    /// position index (append-only).
-    pub fn open_boxed<P: AsRef<Path>>(
-        self,
-        path: P,
-        read_only: bool,
-    ) -> io::Result<Box<dyn PackFileIo>> {
-        match self {
-            FileBackend::Buffered => Ok(Box::new(DataFile::open(path, read_only)?)),
-            FileBackend::Mmap => Ok(Box::new(MmapDataFile::open(path, read_only)?)),
-        }
-    }
-
-    /// Open `path` for **random-access overwrite** IO, boxed as a [`PackFileIo`] — for the digest
-    /// index. `Buffered` uses a raw [`File`]; `Mmap` uses a random-write [`MmapDataFile`]. `append`
-    /// picks the raw-`File` open mode for the buffered case (hdx: random-overwrite; odx: append);
-    /// the mmap case drives its position explicitly via `seek`, so `append` is ignored there.
-    pub fn open_boxed_random<P: AsRef<Path>>(
-        self,
-        path: P,
-        read_only: bool,
-        append: bool,
-    ) -> io::Result<Box<dyn PackFileIo>> {
-        match self {
-            FileBackend::Buffered => {
-                let path = path.as_ref();
-                let file = if read_only {
-                    fs::OpenOptions::new().read(true).write(false).open(path)?
-                } else if append {
-                    fs::OpenOptions::new().read(true).append(true).create(true).open(path)?
-                } else {
-                    fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(false)
-                        .open(path)?
-                };
-                Ok(Box::new(file))
-            }
-            FileBackend::Mmap => {
-                // The digest index does point lookups over fixed-offset hash buckets — random
-                // access with no benefit from readahead — so hint `MADV_RANDOM`.
-                let opts = MmapFileOptions {
-                    write_mode: WriteMode::Random,
-                    access: MmapAccess::Random,
-                    ..Default::default()
-                };
-                Ok(Box::new(MmapDataFile::open_with(path, read_only, opts)?))
-            }
-        }
-    }
-}
 
 /// An instance of a DB.
 /// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
@@ -252,7 +38,8 @@ impl<V> Pack<V>
 where
     V: Debug + Serialize + DeserializeOwned,
 {
-    /// Open a new or reopen an existing database on the default (buffered) file backend.
+    /// Open a new or reopen an existing database. The data file is memory-mapped
+    /// ([`MmapDataFile`]).
     pub fn open<P: AsRef<Path>>(
         path: P,
         uid_idx: u64,
@@ -260,28 +47,7 @@ where
         compression: PackCompression,
         version: u16,
     ) -> Result<Self, OpenError> {
-        Self::open_with_backend(
-            path,
-            uid_idx,
-            read_only,
-            compression,
-            version,
-            FileBackend::default(),
-        )
-    }
-
-    /// Open a new or reopen an existing database on the chosen file `backend`.
-    pub fn open_with_backend<P: AsRef<Path>>(
-        path: P,
-        uid_idx: u64,
-        read_only: bool,
-        compression: PackCompression,
-        version: u16,
-        backend: FileBackend,
-    ) -> Result<Self, OpenError> {
-        Ok(Self {
-            inner: PackInner::open(path, uid_idx, read_only, compression, version, backend)?,
-        })
+        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression, version)? })
     }
 
     /// Length of the Pack file.
@@ -412,7 +178,7 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     header: DataHeader,
-    data_file: Box<dyn PackFileIo>,
+    data_file: MmapDataFile,
     value_buffer: Vec<u8>,
     /// Used as a second buffer for compress and decompress operations on records.
     compression_buffer: Vec<u8>,
@@ -443,17 +209,16 @@ impl<V> PackInner<V>
 where
     V: Debug + Serialize + DeserializeOwned,
 {
-    /// Open a new or reopen an existing database on the chosen file `backend`.
+    /// Open a new or reopen an existing database.
     fn open<P: AsRef<Path>>(
         path: P,
         uid_idx: u64,
         read_only: bool,
         compression: PackCompression,
         version: u16,
-        backend: FileBackend,
     ) -> Result<Self, OpenError> {
         let (data_file, header) =
-            Self::open_data_file(path, uid_idx, read_only, compression, version, backend)
+            Self::open_data_file(path, uid_idx, read_only, compression, version)
                 .map_err(OpenError::DataFileOpen)?;
         Ok(Self {
             header,
@@ -474,7 +239,7 @@ where
         self.data_file.len()
     }
 
-    /// Reconcile the physical file to the logical length via the backend's `try_clone` (which
+    /// Reconcile the physical file to the logical length via the data file's `try_clone` (which
     /// flushes `[0, end)` and truncates any capacity padding, exactly as a clean close does). The
     /// cloned handle is dropped — only the reconciliation side effect is wanted.
     fn reconcile_len(&self) -> io::Result<()> {
@@ -528,7 +293,7 @@ where
 
         write_value(
             value,
-            &mut *self.data_file,
+            &mut self.data_file,
             &mut self.value_buffer,
             &mut self.compression_buffer,
             self.header.compression,
@@ -624,28 +389,16 @@ where
         ro: bool,
         compression: PackCompression,
         version: u16,
-        backend: FileBackend,
-    ) -> Result<(Box<dyn PackFileIo>, DataHeader), LoadHeaderError> {
-        // Open the concrete file and initialize its header before boxing, so `DataHeader`'s generic
-        // `Read/Write + Seek` IO runs on a sized type and needs no change.
-        match backend {
-            FileBackend::Buffered => {
-                let mut data_file = DataFile::open(path, ro)?;
-                let header = Self::init_header(&mut data_file, uid_idx, compression, version)?;
-                Ok((Box::new(data_file), header))
-            }
-            FileBackend::Mmap => {
-                let mut data_file = MmapDataFile::open(path, ro)?;
-                let header = Self::init_header(&mut data_file, uid_idx, compression, version)?;
-                Ok((Box::new(data_file), header))
-            }
-        }
+    ) -> Result<(MmapDataFile, DataHeader), LoadHeaderError> {
+        let mut data_file = MmapDataFile::open(path, ro)?;
+        let header = Self::init_header(&mut data_file, uid_idx, compression, version)?;
+        Ok((data_file, header))
     }
 
     /// Write a fresh [`DataHeader`] to an empty file, or load and validate an existing one, then
-    /// flush. Runs on the concrete file `F` (before it is boxed as `dyn PackFileIo`).
-    fn init_header<F: PackFileIo>(
-        data_file: &mut F,
+    /// flush.
+    fn init_header(
+        data_file: &mut MmapDataFile,
         uid_idx: u64,
         compression: PackCompression,
         version: u16,

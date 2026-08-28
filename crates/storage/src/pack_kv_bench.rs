@@ -1,4 +1,4 @@
-//! On-demand raw-KV benchmark: **pack files (buffered + mmap) vs MDBX**.
+//! On-demand raw-KV benchmark: **the memory-mapped pack file vs MDBX**.
 //!
 //! Gauges whether a "pack file + added features" store could replace MDBX on raw point-KV
 //! performance. It pits a minimal pack-file KV — the existing append-only data log
@@ -13,8 +13,8 @@
 //! ```
 //!
 //! ## Columns
-//! - `pack-buf` / `pack-mmap` — the pack KV with the *data log* on the buffered (`fsync`) vs
-//!   memory-mapped (`msync`) file backend. The hash index is always the mmap `HdxIndex`.
+//! - `pack` — the memory-mapped (`msync`) pack KV: append-only data log keyed by the mmap
+//!   `HdxIndex`.
 //! - `mdbx-durable` — MDBX with real fsync-on-commit (via `TN_TEST_MDBX_SYNC=durable`, set by the
 //!   bench). This is the apples-to-apples durability comparison.
 //! - `mdbx-nosync` — MDBX in `SafeNoSync` (the `#[cfg(test)]` default): commits without fsync, for
@@ -31,7 +31,7 @@
 //! - Pack gives O(1) point KV but **no ordered range scan / cursor** and no cross-key atomic
 //!   transaction — features MDBX has that a replacement would need to add. This bench measures only
 //!   the point-KV subset. Values use `PackCompression::None`.
-//! - MDBX is itself mmap-backed, so `mdbx-durable` fsyncs its own mmap; `pack-mmap` uses `msync`.
+//! - MDBX is itself mmap-backed, so `mdbx-durable` fsyncs its own mmap; `pack` uses `msync`.
 
 use std::{
     hash::BuildHasherDefault,
@@ -46,7 +46,7 @@ use crate::archive::{
     digest_index::HdxIndex,
     fxhasher::FxHasher,
     index::Index as _,
-    pack::{FileBackend, Pack, PackCompression},
+    pack::{Pack, PackCompression},
 };
 
 #[cfg(feature = "reth-libmdbx")]
@@ -106,16 +106,10 @@ struct PackKv {
 }
 
 impl PackKv {
-    fn open(dir: &Path, backend: FileBackend) -> Self {
-        let data = Pack::<Vec<u8>>::open_with_backend(
-            dir.join("data"),
-            0,
-            false,
-            PackCompression::None,
-            PACK_VERSION,
-            backend,
-        )
-        .expect("open pack data");
+    fn open(dir: &Path) -> Self {
+        let data =
+            Pack::<Vec<u8>>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)
+                .expect("open pack data");
         let index = HdxIndex::open_hdx_file(
             dir.join("idx"),
             data.header(),
@@ -126,7 +120,7 @@ impl PackKv {
         Self { data, index }
     }
 
-    /// Durably persist everything written so far: `fsync` (buffered) / `msync` (mmap) the data log,
+    /// Durably persist everything written so far: `msync` the data log,
     /// then sync the hash index (its `index.hdx` + `index.odx`).
     fn barrier(&mut self) {
         self.data.commit().expect("pack commit");
@@ -288,7 +282,7 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     let cell_w = 13usize;
 
     println!("\n=== pack-file KV vs MDBX (ms; lower is better) ===");
-    println!("legend: pack-buf/pack-mmap = append-log + hash digest index (fsync/msync barrier); mdbx-durable = fsync-on-commit, mdbx-nosync = SafeNoSync (no fsync). write_bulk = {N_BULK} inserts + ONE barrier; write_each_dur = {N_EACH} inserts, a barrier EACH; read_rand = {N_READ} random point-gets. NOTE: a pack barrier syncs 3 files (data+hdx+odx) vs MDBX's one env commit; pack has no ordered scan / cross-key txn.");
+    println!("legend: pack = memory-mapped append-log + hash digest index (msync barrier); mdbx-durable = fsync-on-commit, mdbx-nosync = SafeNoSync (no fsync). write_bulk = {N_BULK} inserts + ONE barrier; write_each_dur = {N_EACH} inserts, a barrier EACH; read_rand = {N_READ} random point-gets. NOTE: a pack barrier syncs 3 files (data+hdx+odx) vs MDBX's one env commit; pack has no ordered scan / cross-key txn.");
 
     print!("{:<label_w$}", "benchmark", label_w = label_w);
     for (name, _) in cols {
@@ -309,7 +303,7 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     println!();
 }
 
-/// Compare the pack-file KV (buffered + mmap) against MDBX (durable + nosync) on raw point-KV.
+/// Compare the memory-mapped pack-file KV against MDBX (durable + nosync) on raw point-KV.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
 /// `cargo test -p tn-storage pack_vs_mdbx_bench -- --ignored --nocapture --test-threads 1`.
@@ -319,10 +313,8 @@ fn pack_vs_mdbx_bench() {
     let rows = row_labels();
     let mut cols: Vec<(&str, Vec<Duration>)> = Vec::new();
 
-    println!("  running pack-buf ...");
-    cols.push(("pack-buf", column(|p| PackKv::open(p, FileBackend::Buffered))));
-    println!("  running pack-mmap ...");
-    cols.push(("pack-mmap", column(|p| PackKv::open(p, FileBackend::Mmap))));
+    println!("  running pack ...");
+    cols.push(("pack", column(PackKv::open)));
 
     #[cfg(feature = "reth-libmdbx")]
     {

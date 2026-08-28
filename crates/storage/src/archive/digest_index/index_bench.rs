@@ -43,8 +43,8 @@ use crate::archive::{
 /// Per-op durable inserts (a `sync()` after each — 2 barriers/op; N-independent, kept modest).
 const K_DUR: u64 = 2_000;
 
-/// Index sizes to sweep — env `HDX_BENCH_N` (comma list) overrides. Default's 8M crosses the
-/// 400k-bucket buffered cache (~6.4M keys); trim via the env if RAM/disk-constrained.
+/// Index sizes to sweep — env `HDX_BENCH_N` (comma list) overrides. The default's 8M size needs a
+/// few GB; trim via the env if RAM/disk-constrained.
 fn n_sizes() -> Vec<u64> {
     let parsed: Vec<u64> = std::env::var("HDX_BENCH_N")
         .ok()
