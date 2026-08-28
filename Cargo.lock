@@ -11942,6 +11942,7 @@ dependencies = [
  "tn-types",
  "tn-worker",
  "tokio",
+ "tokio-stream",
  "tracing",
  "url",
 ]
