@@ -305,7 +305,9 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// Pre-fork epochs keep the XOR derivation byte-identical so replaying already-executed
 /// history reproduces the same headers. Non-adiri builds carry no such history and are
 /// active from genesis, exactly as with the seed-signature fork (like
-/// [`SEED_SIGNATURE_FORK_EPOCH`], this constant does not exist there).
+/// [`SEED_SIGNATURE_FORK_EPOCH`], this constant does not exist there). The full fork
+/// schedule is logged at startup so operators can diff it across the fleet; a compile-time
+/// constant that differs between binaries has no other in-protocol detection.
 #[cfg(feature = "adiri")]
 pub const PREVRANDAO_FORK_EPOCH: Epoch = Epoch::MAX;
 
