@@ -313,6 +313,42 @@ impl RethEnv {
             runtime,
         )?;
 
+        // Reconcile the storage backends before anything reads or writes through the factory.
+        // `persist_executed_output` (env/execution.rs) commits through reth's non-atomic
+        // multi-backend commit: static files finalize, RocksDB commits, then MDBX commits last.
+        // A crash inside that window durably leaves static files and/or RocksDB one block ahead
+        // of the MDBX tip. `check_consistency` heals exactly that direction in place: it prunes
+        // the leading backends down to the MDBX stage checkpoints, which `save_blocks` advances
+        // inside the same MDBX transaction as the blocks. Without this call the divergence is
+        // permanent: every restart re-persists the same block into static files that already
+        // hold it, `save_blocks` fails with `UnexpectedStaticFileBlockNumber`, and the engine's
+        // `retryable_persist_fault` correctly treats that as terminal (issue #1238).
+        //
+        // A returned unwind target is the opposite divergence: MDBX committed past a backend
+        // that lost data. The commit ordering cannot produce that state; only corruption or
+        // manual datadir changes can. Reth's launcher heals it by running an unwind pipeline,
+        // but TN has no stage pipeline to unwind MDBX, so refuse to start instead of serving a
+        // datadir whose backends disagree.
+        //
+        // If TN ever adopts reth's storage v2 settings, re-verify snapshot-restored datadirs
+        // against this check first: v2 adds checked segments (transaction senders) that the
+        // restore scaffold must leave exactly at the stage checkpoints, or startup refuses here.
+        let (rocksdb_unwind, static_file_unwind) = provider_factory.check_consistency()?;
+        [("RocksDB", rocksdb_unwind), ("the static files", static_file_unwind)]
+            .into_iter()
+            .filter_map(|(backend, target)| {
+                target.map(|block| format!("{backend} (unwind target {block})"))
+            })
+            .reduce(|left, right| format!("{left}, {right}"))
+            .map_or(Ok(()), |lagging| {
+                Err(eyre::eyre!(
+                    "storage consistency check found the database ahead of {lagging}. Startup \
+                     cannot heal this direction: the backend lost data, which indicates \
+                     corruption or manual datadir changes. Restore the datadir from a snapshot \
+                     or backup before restarting"
+                ))
+            })?;
+
         // Initialize genesis if needed
         let genesis_hash = init_genesis(&provider_factory)?;
         debug!(target: "tn::execution", chain=%node_config.chain.chain, ?genesis_hash, "Initialized genesis");
@@ -419,5 +455,120 @@ impl RethEnv {
     /// pool) use it so their tasks run under the node's task manager.
     pub fn get_task_spawner(&self) -> &TaskSpawner {
         &self.inner.task_spawner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        payload::TNPayload,
+        test_utils::{
+            consensus_output_for_tests, execute_payload_and_update_canonical_chain,
+            test_genesis_with_consensus_registry,
+        },
+    };
+    use reth_provider::{
+        DatabaseProviderFactory as _, StageCheckpointReader as _, StaticFileProviderFactory as _,
+        StaticFileSegment, StaticFileWriter as _,
+    };
+    use reth_stages_types::StageId;
+    use tempfile::TempDir;
+    use tn_types::TaskManager;
+
+    /// Regression test for issue #1238: startup must reconcile static files left AHEAD of the
+    /// database by a crash inside `persist_executed_output`'s commit window.
+    ///
+    /// `persist_executed_output` (env/execution.rs) commits through reth's non-atomic
+    /// multi-backend commit: the static-file writers finalize first, the MDBX transaction
+    /// commits last. A crash between the two durably leaves the headers static file one block
+    /// ahead of the MDBX tip. Without `check_consistency` in `init_provider_factory` that
+    /// divergence was permanent: every restart re-persisted the same block into static files
+    /// that already hold it, `save_blocks` failed with
+    /// `ProviderError::UnexpectedStaticFileBlockNumber`, and the engine's
+    /// `retryable_persist_fault` correctly treated that as terminal: a crash loop.
+    ///
+    /// The test persists block 1 through the production path, then reproduces the crash window
+    /// for block 2 by hand: `save_blocks` appends block 2 to both backends, ONLY the headers
+    /// static-file writer commits, and the MDBX transaction is dropped uncommitted. On disk the
+    /// headers static file is durably at 2 while MDBX is at 1, exactly the post-crash state.
+    /// A "restart" (a second `RethEnv` over the same datadir) must then (a) construct Ok,
+    /// (b) heal the headers static-file tip back to 1 (`check_consistency` prunes the leading
+    /// static files down to the MDBX stage checkpoints), and (c) accept block 2 again through
+    /// the normal persist path.
+    #[tokio::test]
+    async fn test_startup_heals_static_files_ahead_of_database() -> eyre::Result<()> {
+        let genesis = test_genesis_with_consensus_registry(4);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp = TempDir::new().expect("create temp dir");
+        let tm1 = TaskManager::new("consistency check env1");
+        let env1 = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm1, None)?;
+
+        // block 1: execute + durably persist through the production path
+        let output1 = consensus_output_for_tests(2, 0, 1, false);
+        let payload1 = TNPayload::new_for_test(chain.sealed_genesis_header(), &output1);
+        let block1 = execute_payload_and_update_canonical_chain(&env1, payload1, vec![])?;
+        let header1 = block1.recovered_block.clone_sealed_header();
+        assert_eq!(env1.last_block_number()?, 1, "block 1 must be committed");
+
+        // block 2: build it, then simulate the crash inside the commit window. save_blocks
+        // appends block 2 to the static-file writers and the MDBX transaction; committing ONLY
+        // the headers static-file writer and then dropping the provider (aborting the MDBX
+        // transaction) leaves the headers static file durably at 2 while MDBX stays at 1.
+        let output2 = consensus_output_for_tests(2, 0, 2, false);
+        let payload2 = TNPayload::new_for_test(header1.clone(), &output2);
+        let anchor_hash = payload2.parent_header.hash();
+        let no_txs: Vec<Vec<u8>> = Vec::new();
+        let block2 = env1.build_block_from_batch_payload(payload2, &no_txs, anchor_hash, &[])?;
+        {
+            let provider_rw = env1.blockchain_provider().database_provider_rw()?;
+            provider_rw.save_blocks(vec![block2], reth_provider::SaveBlocksMode::Full)?;
+            let sf = provider_rw.static_file_provider();
+            sf.latest_writer(StaticFileSegment::Headers)?.commit()?;
+            // drop WITHOUT provider_rw.commit(): the MDBX transaction aborts
+            drop(provider_rw);
+        }
+        assert_eq!(
+            env1.blockchain_provider()
+                .static_file_provider()
+                .get_highest_static_file_block(StaticFileSegment::Headers),
+            Some(2),
+            "crash window must leave the headers static file durably at 2"
+        );
+        // the MDBX-side oracle is the Headers stage checkpoint: it is exactly what
+        // `check_consistency` compares the static-file tip against, and unlike
+        // `last_block_number` (which resolves through the headers static file, now at 2) it
+        // only moves when the MDBX transaction commits
+        let headers_checkpoint = env1
+            .blockchain_provider()
+            .database_provider_ro()?
+            .get_stage_checkpoint(StageId::Headers)?
+            .map_or(0, |checkpoint| checkpoint.block_number);
+        assert_eq!(headers_checkpoint, 1, "the Headers checkpoint must still be 1 after the abort");
+        drop(env1);
+        drop(tm1);
+
+        // "restart": reopen the same datadir; (a) construction must succeed
+        let tm2 = TaskManager::new("consistency check env2");
+        let env2 = RethEnv::new_for_temp_chain(chain, tmp.path(), &tm2, None)?;
+
+        // (b) startup healed the headers static-file tip back to the MDBX tip
+        assert_eq!(
+            env2.blockchain_provider()
+                .static_file_provider()
+                .get_highest_static_file_block(StaticFileSegment::Headers),
+            Some(1),
+            "check_consistency must prune the headers static file back to the MDBX tip"
+        );
+        assert_eq!(env2.last_block_number()?, 1, "the committed tip must read 1 after the heal");
+
+        // (c) block 2 re-persists cleanly through the production path, the exact step that
+        // crash-looped with `UnexpectedStaticFileBlockNumber` before the fix
+        let output2 = consensus_output_for_tests(2, 0, 2, false);
+        let payload2 = TNPayload::new_for_test(header1, &output2);
+        execute_payload_and_update_canonical_chain(&env2, payload2, vec![])?;
+        assert_eq!(env2.last_block_number()?, 2, "block 2 must commit after the heal");
+
+        Ok(())
     }
 }
