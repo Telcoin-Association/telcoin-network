@@ -75,7 +75,7 @@ jobs:
       # `--locked` discipline of pr.yaml), so the timed suite steps below are compile-free.
       # TN_TEST_MDBX_SYNC is scoped to the suite steps, not exported job-wide: a build needs
       # no override, and a future "variable must be unset" test (the
-      # TN_SEED_SIGNATURE_FORK_EPOCH pattern in the Makefile) must not inherit it.
+      # TN_*_FORK_EPOCH pattern in the Makefile) must not inherit it.
       - name: Build node binary and test binaries (untimed)
         run: |
           cargo fetch --locked
