@@ -50,7 +50,7 @@ use reth_transaction_pool::{
     PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents, TransactionOrigin,
     TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
 };
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 use tn_types::{
     Address, EnvKzgSettings, Recovered, SealedBlock, TaskError, TaskSpawner, TransactionSigned,
     TxHash, MIN_PROTOCOL_BASE_FEE, U256,
@@ -100,20 +100,29 @@ pub trait TxPool {
     /// Remove transactions whose EIP-2718 type is outside the executable allowlist from the
     /// pool, along with their descendants.
     fn remove_unsupported_txs(&mut self, txs: Vec<TxHash>);
-    /// Return the canonical balance of `address` as of the latest committed block.
+    /// Return the canonical balances of `addresses` as of the latest committed block.
     ///
-    /// Used to build the optimistic per-sender balance in a post-mining pool update. A missing
-    /// account (or a read error) yields [`U256::ZERO`], which is the conservative choice: it can
-    /// only keep a sender's remaining transactions parked, never promote an unfunded one, and the
-    /// engine's authoritative canonical update corrects it within the same consensus round.
-    fn get_account_balance(&self, address: Address) -> U256;
+    /// Used to build the optimistic per-sender balances in a post-mining pool update. The
+    /// accessor is batched so implementations can acquire ONE state provider for the whole set:
+    /// a per-address `BlockchainProvider::basic_account` call builds a fresh
+    /// `ConsistentProvider` -- an MDBX read transaction plus a `MemoryOverlayStateProvider` over
+    /// the in-memory canonical blocks -- and a batch bounded only by the 30M-gas/1MB limits can
+    /// hold ~1,400 distinct senders, i.e. ~1,400 repetitions of that setup per build.
+    ///
+    /// The result holds an entry for every requested address. A missing account (or a read
+    /// error) yields [`U256::ZERO`], which is the conservative choice: it can only keep a
+    /// sender's remaining transactions parked, never promote an unfunded one, and the engine's
+    /// authoritative canonical update corrects it within the same consensus round. A failure to
+    /// acquire the state provider itself degrades the WHOLE set to that conservative zero, so
+    /// implementations log it before degrading.
+    fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256>;
 }
 
 /// A telcoin network transaction pool.
 ///
-/// The second field is a handle to the blockchain provider, retained so the pool can read a
-/// sender's canonical balance when constructing optimistic pool updates after mining a batch
-/// (see [`TxPool::get_account_balance`]).
+/// The second field is a handle to the blockchain provider, retained so the pool can read
+/// senders' canonical balances when constructing optimistic pool updates after mining a batch
+/// (see [`TxPool::get_account_balances`]).
 #[derive(Clone, Debug)]
 pub struct WorkerTxPool(
     EthTransactionPool<BlockchainProvider<TelcoinNode>, DiskFileBlobStore, TnEvmConfig>,
@@ -578,13 +587,33 @@ impl TxPool for WorkerTxPool {
         self.0.remove_transactions_and_descendants(txs);
     }
 
-    fn get_account_balance(&self, address: Address) -> U256 {
-        self.1
-            .basic_account(&address)
-            .ok()
-            .flatten()
-            .map(|account| account.balance)
-            .unwrap_or(U256::ZERO)
+    fn get_account_balances(&self, addresses: &[Address]) -> HashMap<Address, U256> {
+        // one state provider (one MDBX read transaction + memory overlay) for the whole set;
+        // a failure to acquire it reports the documented conservative zero for every address,
+        // so it is logged loudly rather than degrading silently
+        let provider = self
+            .1
+            .latest()
+            .inspect_err(|error| {
+                warn!(
+                    target: "txpool",
+                    ?error,
+                    num_addresses = addresses.len(),
+                    "failed to acquire state provider; reporting zero balance for all senders"
+                );
+            })
+            .ok();
+        addresses
+            .iter()
+            .map(|address| {
+                let balance = provider
+                    .as_ref()
+                    .and_then(|state| state.basic_account(address).ok().flatten())
+                    .map(|account| account.balance)
+                    .unwrap_or(U256::ZERO);
+                (*address, balance)
+            })
+            .collect()
     }
 }
 

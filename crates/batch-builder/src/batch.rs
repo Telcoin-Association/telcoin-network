@@ -169,13 +169,21 @@ pub fn build_batch<P: TxPool>(
     // transaction promoted per rebuild. Fully closing that requires tracking cumulative optimistic
     // spend across rebuilds (or a state-aware check on the follow-up batch path); both are larger
     // design choices left to the maintainers. See the crate README.
+    //
+    // The balances are read through one batched call so the pool acquires a single state
+    // provider for the whole sender set instead of one MDBX read transaction per sender
+    // (issue #1303).
+    let senders: Vec<Address> = sender_nonces.keys().copied().collect();
+    let sender_balances = pool.get_account_balances(&senders);
     let changed_accounts: Vec<ChangedAccount> = sender_nonces
         .into_iter()
         .map(|(address, max_nonce)| ChangedAccount {
             address,
             nonce: max_nonce + 1, // next expected nonce
-            balance: pool
-                .get_account_balance(address)
+            balance: sender_balances
+                .get(&address)
+                .copied()
+                .unwrap_or(U256::ZERO)
                 .saturating_sub(sender_costs.get(&address).copied().unwrap_or(U256::ZERO)),
         })
         .collect();
