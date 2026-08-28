@@ -37,7 +37,8 @@ use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{
     providers::BlockchainProvider, AccountReader as _, CanonStateNotification,
-    CanonStateSubscriptions as _, Chain, ChangedAccount,
+    CanonStateSubscriptions as _, Chain, ChangedAccount, StateProviderBox,
+    StateProviderFactory as _,
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
@@ -242,10 +243,32 @@ impl WorkerTxPool {
                     .unwrap_or_else(|BroadcastStreamRecvError::Lagged(missed)| {
                         txn_pool_clone.mark_drifted(missed)
                     });
-                dirty_addresses = txn_pool_clone.reload_dirty_accounts(
-                    dirty_addresses.into_iter().chain(newly_dirty).collect(),
-                    MAX_RELOAD_ACCOUNTS,
-                );
+                let to_reload: AddressSet =
+                    dirty_addresses.into_iter().chain(newly_dirty).collect();
+                dirty_addresses = if to_reload.is_empty() {
+                    to_reload
+                } else {
+                    // The reload is synchronous MDBX I/O. Run it on the blocking pool so it
+                    // never occupies one of the async worker threads this runtime also uses
+                    // for consensus and networking (reth offloads the same work:
+                    // `maintain_transaction_pool` runs under `spawn_blocking_task`).
+                    let pool = txn_pool_clone.clone();
+                    let retained = to_reload.clone();
+                    tokio::task::spawn_blocking(move || {
+                        pool.reload_dirty_accounts(to_reload, MAX_RELOAD_ACCOUNTS)
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        // the blocking task was dropped or panicked: keep every sender
+                        // dirty so the next notification retries the reload
+                        warn!(
+                            target: "txpool",
+                            ?error,
+                            "dirty-account reload task failed; retrying next round"
+                        );
+                        retained
+                    })
+                };
             }
             Err(TaskError::from_message(
                 "canonical txn pool task ended because state_stream closed",
@@ -283,6 +306,7 @@ impl WorkerTxPool {
              accounts from canonical state"
         );
         RETH_METRICS.canon_state_lagged_total.increment(1);
+        RETH_METRICS.canon_state_notifications_missed_total.increment(missed);
         self.0.unique_senders()
     }
 
@@ -305,23 +329,68 @@ impl WorkerTxPool {
     fn reload_dirty_accounts(&self, dirty: AddressSet, max_reload: usize) -> AddressSet {
         let mut pending = dirty.into_iter();
         let chunk: Vec<Address> = pending.by_ref().take(max_reload).collect();
-        let loaded: Vec<Result<ChangedAccount, Address>> =
-            chunk.into_iter().map(|address| self.load_changed_account(address)).collect();
-        let accounts: Vec<ChangedAccount> =
-            loaded.iter().filter_map(|result| result.as_ref().ok().copied()).collect();
-        if !accounts.is_empty() {
-            self.0.update_accounts(accounts);
+        if chunk.is_empty() {
+            pending.collect()
+        } else {
+            // Acquire ONE state provider for the whole chunk, like reth's `load_accounts`.
+            // `BlockchainProvider::basic_account` builds a fresh `ConsistentProvider` on
+            // every call - an MDBX read transaction plus a `MemoryOverlayStateProvider`
+            // over the in-memory canonical blocks - so a per-address read would repeat
+            // that setup `max_reload` times per iteration.
+            let loaded: Vec<Result<ChangedAccount, Address>> = self
+                .1
+                .latest()
+                .map(|state| {
+                    chunk
+                        .iter()
+                        .map(|address| Self::load_changed_account(&state, *address))
+                        .collect()
+                })
+                .unwrap_or_else(|error| {
+                    debug!(
+                        target: "txpool",
+                        ?error,
+                        "failed to acquire canonical state for pool resync"
+                    );
+                    // nothing was reloaded: every chunk address stays dirty and is
+                    // retried on a later iteration
+                    chunk.iter().map(|address| Err(*address)).collect()
+                });
+            let accounts: Vec<ChangedAccount> =
+                loaded.iter().filter_map(|result| result.as_ref().ok().copied()).collect();
+            if !accounts.is_empty() {
+                self.0.update_accounts(accounts);
+            }
+            let failures: Vec<Address> =
+                loaded.iter().filter_map(|result| result.as_ref().err().copied()).collect();
+            if !failures.is_empty() {
+                RETH_METRICS
+                    .canon_state_resync_read_failures_total
+                    .increment(u64::try_from(failures.len()).unwrap_or(u64::MAX));
+                // one aggregated warn per iteration; the per-address debug in
+                // `load_changed_account` carries each address and `ProviderError`
+                warn!(
+                    target: "txpool",
+                    failed = failures.len(),
+                    "canonical account reads failed during pool resync; senders stay \
+                     dirty for retry"
+                );
+            }
+            pending.chain(failures).collect()
         }
-        pending.chain(loaded.iter().filter_map(|result| result.as_ref().err().copied())).collect()
     }
 
-    /// Read `address`'s canonical account and shape it as a [`ChangedAccount`] for the pool.
+    /// Read `address`'s canonical account from `state` and shape it as a [`ChangedAccount`]
+    /// for the pool.
     ///
     /// A missing account maps to [`ChangedAccount::empty`] (nonce 0, zero balance), matching
     /// reth's `load_accounts`; a provider read error returns the address so the caller keeps
     /// it dirty and retries.
-    fn load_changed_account(&self, address: Address) -> Result<ChangedAccount, Address> {
-        self.1
+    fn load_changed_account(
+        state: &StateProviderBox,
+        address: Address,
+    ) -> Result<ChangedAccount, Address> {
+        state
             .basic_account(&address)
             .map(|maybe_account| {
                 maybe_account
@@ -823,7 +892,8 @@ mod tests {
 
         // the block must actually mine the transaction (canonical nonce advanced), or the
         // resync below would pass vacuously
-        let account = pool.load_changed_account(tx_factory.address()).unwrap();
+        let state = pool.1.latest().unwrap();
+        let account = WorkerTxPool::load_changed_account(&state, tx_factory.address()).unwrap();
         assert_eq!(account.nonce, 1, "test block must mine the transaction");
         // negative control: the pool is drifted, the mined transaction is still pending
         assert_eq!(pool.pool_size().pending, 1);
