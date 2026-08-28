@@ -209,13 +209,17 @@ const NON_PAYABLE_CALL_VALUE: &str = "call value: selector is not payable";
 /// # Rejection gas semantics
 ///
 /// Every rejection here — the static-call refusal, the payability refusal, an unrecognised
-/// selector, and each handler's own `unauthorized` / decode / arithmetic error — returns
-/// [`PrecompileError`], which revm turns into `InstructionResult::PrecompileError`: a **halt**,
-/// not a revert. A halt consumes all the gas the frame was given. revm returns the unspent
-/// remainder only for results that are `is_ok_or_revert()` (`revm-handler`'s
-/// `insert_call_outcome` for a sub-call, `last_frame_result` for the top level), and a precompile
-/// error is neither, so a rejected sub-call loses the entire 63/64 it was forwarded and a
-/// rejected top-level transaction is charged its full `gas_limit`.
+/// selector, and each handler's own gas-limit precheck, `unauthorized`, decode, and arithmetic
+/// errors — returns [`PrecompileError`]. revm splits that into two instruction results: the
+/// `gas_limit < GAS_COST` precheck each handler runs returns `PrecompileError::OutOfGas`, which
+/// maps to `InstructionResult::PrecompileOOG`, and every other variant maps to
+/// `InstructionResult::PrecompileError` (`revm-handler`'s `precompile_provider.rs`, keyed on
+/// `PrecompileError::is_oog`). Both are a **halt**, not a revert, and a halt consumes all the gas
+/// the frame was given. revm returns the unspent remainder only for results that are
+/// `is_ok_or_revert()` (`revm-handler`'s `insert_call_outcome` for a sub-call,
+/// `last_frame_result` for the top level), and neither halt is, so a rejected sub-call loses the
+/// entire 63/64 it was forwarded and a rejected top-level transaction is charged its full
+/// `gas_limit`.
 ///
 /// For callers this is a cliff rather than a soft failure. A contract that forwards `msg.value`
 /// into [`TELCOIN_PRECOMPILE_ADDRESS`] and inspects the returned boolean does get `false` — a

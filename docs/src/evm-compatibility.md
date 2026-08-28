@@ -18,6 +18,8 @@ The sections below cover the areas where TN diverges from mainnet Ethereum behav
 
 TN registers two additional precompiles beyond the standard Ethereum set: a TEL token-issuance precompile at `0x7e1` and a BLS12-381 signature verifier at `0xb151`. The standard precompiles (`0x01`-`0x0a` etc.) are unchanged.
 
+Both custom addresses hold a single `0xfe` (`INVALID`) byte of code in genesis, so `eth_getCode` returns `0xfe` for them, not `0x`. Tooling that infers "not a contract" from empty code will be wrong about these two addresses. The nonzero code is there for two reasons: it keeps the accounts non-empty, which exempts them from EIP-158 state clearing (an account holding only storage counts as empty and would be deleted, wiping the TEL supply counter), and it makes any call that bypasses precompile dispatch fail on the invalid instruction instead of succeeding against an EOA.
+
 ### TEL Precompile: Token Issuance
 
 The **TEL precompile** at address `0x00000000000000000000000000000000000007e1` owns the native token's supply lifecycle: minting, claiming, and burning, plus a `totalSupply()` view.
@@ -37,8 +39,10 @@ Only issuance authority and the supply counter require protocol-level state, so 
 | -------- | ------ | --- | -------- |
 | `mint(uint256 amount)` | Governance only | 41,000 | Creates a pending mint under a **7-day timelock**. A second `mint` overwrites the pending amount (minting 0 cancels) |
 | `claim(address recipient)` | Governance only | 25,000 | After the timelock expires: credits `recipient`'s native balance, increments `totalSupply`, clears the pending slots |
-| `burn(uint256 amount)` | Governance only | 8,000 | Destroys tokens held by the precompile's own account and decrements `totalSupply`. The only payable selector |
+| `burn(uint256 amount)` | Governance only | 8,000 | Destroys `amount` from the precompile's own balance and decrements `totalSupply`. The only payable selector: attached value funds the pool it draws from |
 | `totalSupply()` | Any caller | 2,100 | Returns the current circulating supply. Callable from `STATICCALL` |
+
+`burn` is the chain's only payable inlet at `0x7e1`, and like every other issuance selector it is governance-gated. The EVM credits `msg.value` to the precompile account before the handler runs, so attaching value tops up the pool the burn destroys from. Calling `burn(amount)` with `msg.value == amount` funds and burns in a single transaction. Any excess stays in the precompile's balance for a later burn: it is not refunded, and no selector ever pays balance back out. The genesis account starts at zero balance, a plain value send with empty calldata is refused, and every other selector rejects nonzero value, so a governance `burn` is the only way an ordinary call can add TEL to the pool.
 
 On testnet builds compiled with the `faucet` feature, `mint` becomes an instant `mint(address recipient, uint256 amount)` with no timelock, and governance can delegate minting via `grantMintRole(address)` / `revokeMintRole(address)` / `hasMintRole(address)`. Mainnet binaries are never built with this feature.
 
@@ -46,9 +50,11 @@ Governance is the on-chain governance safe at `0x0000000000000000000000000000000
 
 #### Notable Behaviors
 
+* **Direct calls only:** `DELEGATECALL` and `CALLCODE` into `0x7e1` still reach the precompile, because revm looks a precompile up by the frame's code address alone. The dispatcher refuses them with `telcoin precompile: only a direct call to 0x7e1 is permitted`. Under `DELEGATECALL` the caller identity the access gates would check is inherited from the parent frame, while the handlers still read and write the canonical `0x7e1` ledger, so authorizing such a frame would mean trusting a spoofable address. The check runs before the calldata length check and before selector dispatch, so read-only selectors are refused through those opcodes too. Only a plain `CALL` or `STATICCALL` reaches a handler.
 * **`STATICCALL` write protection:** inside a static frame only the read-only selectors are served (`totalSupply`, plus `hasMintRole` on faucet builds); every state-mutating selector is refused with `static call: state mutation not permitted`.
 * **Non-payable by default:** every selector except `burn` rejects nonzero call value with `call value: selector is not payable`, so stray TEL cannot be stranded at the precompile.
-* **Events:** `Mint(recipient, amount, unlockTimestamp)`, `Claim(recipient, amount)`, `Burn(amount)`, plus ERC-20-style `Transfer` events from `address(0)` on claim/faucet-mint and to `address(0)` on burn. Ordinary native TEL transfers do **not** emit `Transfer` events.
+* **Rejections consume all gas:** every refusal above, plus every `unauthorized`, decode, or arithmetic failure inside a handler, is a **halt**, not a revert. revm returns unspent gas only for calls that succeed or revert, and a precompile error is neither. A rejected sub-call therefore loses every unit of gas it was forwarded. Under EIP-150's default forwarding that is 63/64 of the caller's remaining gas, leaving the calling frame only the 1/64 it withheld. A rejected top-level transaction is charged its full `gas_limit`. The zero such a call pushes on the stack (`false` to a Solidity caller) is not a result to branch on: the gas needed to act on it has already been spent. Probing `0x7e1` with a value-carrying call to see what it does costs the whole gas budget. Satisfy the direct-call, access, static, and payability rules up front rather than planning to recover from a refusal. Neither form surfaces the reason: the call returns no data, and the halt carries no message, so a caller cannot tell from the receipt which rule it broke.
+* **Events:** `Mint(recipient, amount, unlockTimestamp)`, `Claim(recipient, amount)`, `Burn(amount)`, plus ERC-20-style `Transfer` events: from `address(0)` on claim and faucet-mint, to `address(0)` on burn, and, when a burn is funded with call value, an inbound `Transfer(caller, 0x7e1, msg.value)` that mirrors the value transfer the EVM performs silently. That inbound log is the one `Transfer` where neither leg is `address(0)`, and its data field carries the attached value, not the burned amount; the two need not match. A value-funded burn emits three logs in this order: `Transfer(caller -> 0x7e1, msg.value)`, `Burn(amount)`, `Transfer(0x7e1 -> address(0), amount)`. Ordinary native TEL transfers do **not** emit `Transfer` events.
 * **Supply accounting:** `totalSupply` changes only via `claim` and `burn`. It does not track native balance movement such as gas fees or validator rewards.
 
 #### Implications for Integrations
@@ -56,6 +62,7 @@ Governance is the on-chain governance safe at `0x0000000000000000000000000000000
 * Wallets and explorers should treat TEL as the **native asset** (like ETH), never as a token at `0x7e1`.
 * Bridges and DeFi protocols that need ERC-20 semantics should integrate **WTEL**, exactly as they would WETH on Ethereum.
 * Indexers tracking supply should watch the precompile's `Mint`/`Claim`/`Burn`/`Transfer` events; ordinary TEL movement is visible as native value transfers in transaction traces, not as log events.
+* Indexers that reconstruct TEL as an ERC-20 balance sheet from those `Transfer` logs must credit the inbound `Transfer(caller, 0x7e1, msg.value)` on a value-funded burn. It exists for exactly this audience: skip it and the precompile's balance drifts negative, because tokens leave a pool they were never seen entering.
 
 ### BLS Precompile: Signature Verification
 
@@ -163,7 +170,7 @@ nonce = (epoch << 32) | round
 | Gas costs            | Standard                             | Standard (identical)          |
 | Transaction types    | Legacy, EIP-2930, EIP-1559, EIP-4844 | Legacy, EIP-2930, EIP-1559    |
 | Native asset ERC-20  | Requires WETH wrapper                | Requires WTEL wrapper         |
-| Custom precompiles   | None                                 | TEL issuance at `0x7e1`, BLS verify at `0xb151` |
+| Custom precompiles   | None                                 | TEL issuance at `0x7e1`, BLS verify at `0xb151` (both report `0xfe` code) |
 | Base fee destination | Burned                               | Base-fee address (governance) |
 | Blob transactions    | Supported                            | Not used                      |
 | Contract languages   | Solidity, Vyper, etc.                | Same                          |

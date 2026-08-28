@@ -4,7 +4,12 @@
 //! 1. **`mint(uint256)`** — governance creates a pending mint with a 7-day timelock.
 //! 2. **`claim(address)`** — only governance can finalize the mint after the timelock expires,
 //!    crediting governance safe's native balance and incrementing `totalSupply`.
-//! 3. **`burn(uint256)`** — governance destroys tokens held by the precompile account.
+//! 3. **`burn(uint256)`** — governance destroys tokens held by the precompile account. `burn` is
+//!    the one payable selector: the EVM credits attached `msg.value` to the precompile before the
+//!    handler runs, topping up the pool the burn draws from, so `msg.value == amount` funds and
+//!    burns in one transaction and any excess stays in the pool for a later `burn`. That transfer
+//!    happens inside the EVM and emits nothing, so the handler mirrors it as an inbound
+//!    `Transfer(caller, precompile, msg.value)` log ahead of the burn events.
 //!
 //! The timelock provides a safety window for governance to cancel malicious mints before
 //! tokens enter circulation. A second `mint` call **overwrites** any pending mint, which
