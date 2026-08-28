@@ -429,10 +429,7 @@ where
         .await?;
 
         // spawn primary - create node and spawn network
-        let primary =
-            PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync);
-
-        Ok(primary)
+        PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync)
     }
 
     /// Construct the epoch's [`WorkerNode`] and bring up its [`WorkerNetwork`].
@@ -460,10 +457,12 @@ where
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now (with id 0) - otherwise, loop here
         let worker_id = DEFAULT_WORKER_ID;
-        // u64 snapshot of the worker's base fee, used by both the transaction pool and the batch
-        // validator. Base fee is constant within an epoch, so a snapshot taken at epoch start is
-        // valid for the whole epoch.
-        let base_fee = gas_accumulator.base_fee(worker_id).base_fee();
+        // The worker's shared base-fee container: the RPC server keeps the live handle
+        // (`eth_feeHistory` answers its next-block entry from it). The u64 snapshot below
+        // feeds the transaction pool and the batch validator. Base fee is constant within
+        // an epoch, so a snapshot taken at epoch start is valid for the whole epoch.
+        let base_fee_container = gas_accumulator.base_fee(worker_id);
+        let base_fee = base_fee_container.base_fee();
 
         // update the network handle's task spawner for reporting batches in the epoch
         {
@@ -485,7 +484,7 @@ where
                         worker_id,
                         network_handle.clone(),
                         engine_to_primary,
-                        base_fee,
+                        base_fee_container,
                     )
                     .await?;
             } else {
@@ -499,6 +498,24 @@ where
         // On the init path above the pool was created with this value; this call additionally
         // covers the respawn path, where initialization is skipped.
         engine.set_worker_base_fee(worker_id, base_fee).await?;
+
+        // Mirror the node's consensus catch-up state into every worker's RPC network shim
+        // so the stock `eth_syncing` handler stops reporting a catching-up node as fully
+        // synced (issue #1231). Epoch-scoped like the shim's peer-count task: it dies with
+        // this epoch's task manager and is respawned here on rollover, re-reading the mode
+        // `identify_node_mode` published for the epoch.
+        let engine_for_sync_status = engine.clone();
+        let mut rx_node_mode = self.consensus_bus.node_mode().subscribe();
+        epoch_task_spawner.spawn_task("Worker RPC Sync Status", async move {
+            loop {
+                let syncing = node_mode_is_syncing(*rx_node_mode.borrow_and_update());
+                engine_for_sync_status.set_workers_syncing(syncing).await;
+                if rx_node_mode.changed().await.is_err() {
+                    // The watch sender dropped: consensus is shutting down, end cleanly.
+                    break Ok(());
+                }
+            }
+        });
 
         let network_handle = self
             .worker_network_handle
@@ -1048,6 +1065,22 @@ impl ReplayResult {
     }
 }
 
+/// Whether this [`NodeMode`] means the node is catching up on consensus output rather than
+/// serving a current view (issue #1231).
+///
+/// `CvvInactive` is the demoted catch-up mode: the node is streaming missed consensus output
+/// to rejoin the committee, so its RPC `latest` view is stale. `CvvActive` is optimistic-current
+/// by definition (the node is demoted when that turns out false), and `Observer` follows
+/// consensus output continuously with no behind/caught-up signal today; both answer
+/// not-syncing. Written as an exhaustive match so a new [`NodeMode`] variant fails to compile
+/// until this decision is made for it.
+fn node_mode_is_syncing(mode: NodeMode) -> bool {
+    match mode {
+        NodeMode::CvvInactive => true,
+        NodeMode::CvvActive | NodeMode::Observer => false,
+    }
+}
+
 /// Whether a node in this [`NodeMode`] should subscribe to the worker batch-digest gossip topic.
 ///
 /// Only nodes that consume individual current-epoch batches benefit: a committee validator
@@ -1107,7 +1140,9 @@ fn check_committee_worker_count(epoch: Epoch, num_workers: NonZeroUsize) -> eyre
 
 #[cfg(test)]
 mod tests {
-    use super::{check_committee_worker_count, should_subscribe_batch_topic, NodeMode};
+    use super::{
+        check_committee_worker_count, node_mode_is_syncing, should_subscribe_batch_topic, NodeMode,
+    };
     use std::num::NonZeroUsize;
 
     /// An active committee validator prefetches batches for the vote path.
@@ -1127,6 +1162,14 @@ mod tests {
     #[test]
     fn observer_does_not_subscribe_to_batch_topic() {
         assert!(!should_subscribe_batch_topic(NodeMode::Observer));
+    }
+
+    /// Only the demoted catch-up mode reports syncing over `eth_syncing` (issue #1231).
+    #[test]
+    fn only_inactive_cvv_reports_syncing() {
+        assert!(node_mode_is_syncing(NodeMode::CvvInactive));
+        assert!(!node_mode_is_syncing(NodeMode::CvvActive));
+        assert!(!node_mode_is_syncing(NodeMode::Observer));
     }
 
     /// One worker is representable in both committee layouts, so entry never blocks on it.

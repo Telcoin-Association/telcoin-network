@@ -33,7 +33,8 @@
 //! in the database. Durability is NOT all-or-nothing, though: `save_blocks` also
 //! appends to the process-wide static-file writers, and that progress is fsynced
 //! outside the transaction, so a fault after the append leaves the writers advanced
-//! for reth's startup consistency check to reconcile on restart. Read that method's
+//! for reth's startup consistency check (run by `RethEnv::init_provider_factory`,
+//! issue #1238) to reconcile on restart. Read that method's
 //! error contract before retrying it. Only after that commit
 //! does [`RethEnv::announce_executed_output`] report the new tip over the engine
 //! update channel (`blocking_send`) and then broadcast the canonical-state
@@ -169,7 +170,7 @@ impl RethEnv {
                     // allow transaction errors (ie - duplicates)
                     //
                     // it's possible that another worker's batch included this transaction
-                    warn!(target: "engine", %error,  "skipping invalid transaction: {:#?}", recovered);
+                    debug!(target: "engine", %error, tx_hash = ?recovered.hash(), "skipping invalid transaction");
                     // expected in normal operation - see the field docs, this is not an alert
                     RETH_METRICS.invalid_txs_skipped_total.increment(1);
                     continue;
@@ -244,7 +245,9 @@ impl RethEnv {
     /// itself) aborts the database transaction but leaves the static-file writer
     /// advanced, so a repeat call trips over it with
     /// `ProviderError::UnexpectedStaticFileBlockNumber`; reth's startup consistency
-    /// check reconciles the divergence on restart. Callers retrying this method must
+    /// check, which `RethEnv::init_provider_factory` runs on every construction
+    /// (issue #1238), reconciles the divergence on restart. Callers retrying this
+    /// method must
     /// treat that error as terminal (see the engine's `persist_output_with_retry`).
     /// Post-commit reporting lives in [`Self::announce_executed_output`] so the commit
     /// boundary is a function boundary rather than an error-classification exercise

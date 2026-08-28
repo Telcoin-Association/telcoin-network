@@ -5,10 +5,10 @@ This page is for transaction senders, wallet developers, and integrators.
 It explains when the penalty applies, how much it costs, where the funds go, and how to detect it.
 
 Contributor documentation lives in the "Fee economics" section of
-[`crates/tn-reth/README.md`](../crates/tn-reth/README.md).
+[`crates/tn-reth/README.md`](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/tn-reth/README.md).
 The implementation lives in
-[`crates/tn-reth/src/evm/utils.rs`](../crates/tn-reth/src/evm/utils.rs) and
-[`crates/tn-reth/src/evm/handler.rs`](../crates/tn-reth/src/evm/handler.rs).
+[`crates/tn-reth/src/evm/utils.rs`](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/tn-reth/src/evm/utils.rs) and
+[`crates/tn-reth/src/evm/handler.rs`](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/tn-reth/src/evm/handler.rs).
 
 ## Why the penalty exists
 

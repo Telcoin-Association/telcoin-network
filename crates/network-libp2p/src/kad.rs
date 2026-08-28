@@ -1,6 +1,6 @@
 //! Module with kademlia specific extensions, like a persistant store.
 
-use crate::types::NetworkType;
+use crate::{consensus::MAX_ADVERTISED_MULTIADDRS, types::NetworkType};
 use libp2p::{
     kad::{
         store::{Error, MemoryStoreConfig, RecordStore},
@@ -510,6 +510,22 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn add_provider(&mut self, record: ProviderRecord) -> libp2p::kad::store::Result<()> {
+        // Reject a record that advertises an implausible number of addresses. A legitimate
+        // provider carries at most a few addresses, so a large list is only an attempt to
+        // write attacker-controlled bytes into the consensus database (issue #1185). This
+        // mirrors the `MAX_ADVERTISED_MULTIADDRS` cap on the signed `NodeRecord` path; the
+        // sibling caps here (`max_providers_per_key`, `max_provided_keys`) bound different
+        // axes and do not limit the address list inside one record.
+        (record.addresses.len() <= MAX_ADVERTISED_MULTIADDRS).then_some(()).ok_or_else(|| {
+            warn!(
+                target: "network-kad",
+                count = record.addresses.len(),
+                max = MAX_ADVERTISED_MULTIADDRS,
+                "provider record rejected: address count exceeds cap"
+            );
+            Error::ValueTooLarge
+        })?;
+
         let key = self.key_to_hash(&record.key);
         let kr: KadProviderRecord = record.into();
         let stored = match self.kad_type {
@@ -1466,5 +1482,70 @@ mod test {
         assert!(store.providers(&corrupt_key).is_empty(), "worker read skips corrupt row");
         assert_eq!(store.scrub_corrupt_providers(), 1, "worker scrub purges corrupt row");
         assert_eq!(store.num_providers, 0, "worker count reflects the purge");
+    }
+
+    // ---- issue #1185: a provider record's address list is capped ----
+
+    /// A live provider record under `key` that carries `count` distinct addresses.
+    fn provider_with_addresses(key: &RecordKey, count: usize) -> ProviderRecord {
+        let provider = PeerId::random();
+        let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
+        let addresses = (0..count)
+            .map(|i| format!("/ip4/127.0.0.1/tcp/{}", 1000 + i).parse().expect("valid multiaddr"))
+            .collect();
+        ProviderRecord { key: key.clone(), provider, expires, addresses }
+    }
+
+    /// One address over the cap: `add_provider` must reject the record with
+    /// `ValueTooLarge` and leave the store untouched. Without the cap, each
+    /// `AddProvider` request could write an attacker-sized address list into the
+    /// consensus database.
+    #[test]
+    fn test_kad_add_provider_rejects_oversized_address_list() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+
+        let key = fresh_record_key();
+        let rec = provider_with_addresses(&key, MAX_ADVERTISED_MULTIADDRS + 1);
+        assert!(matches!(store.add_provider(rec), Err(Error::ValueTooLarge)));
+        assert_eq!(store.num_providers, 0, "rejected record must not bump the provider count");
+        assert!(store.providers(&key).is_empty(), "rejected record must not be stored");
+    }
+
+    /// A record at exactly the cap is legitimate and must be admitted with its full
+    /// address list intact (positive control for the rejection test).
+    #[test]
+    fn test_kad_add_provider_admits_address_list_at_cap() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+
+        let key = fresh_record_key();
+        let rec = provider_with_addresses(&key, MAX_ADVERTISED_MULTIADDRS);
+        store.add_provider(rec.clone()).expect("record at the cap is admitted");
+        assert_eq!(store.num_providers, 1);
+        let got = store.providers(&key);
+        assert_eq!(got.len(), 1, "record at the cap is stored");
+        assert_eq!(got[0].addresses.len(), MAX_ADVERTISED_MULTIADDRS, "address list kept intact");
+        assert_eq!(got[0].provider, rec.provider);
+    }
+
+    /// The cap guards the shared entry point, so the worker table is covered by the
+    /// same check: an oversized record is rejected there too.
+    #[test]
+    fn test_kad_add_provider_worker_rejects_oversized_address_list() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Worker(0));
+
+        let key = fresh_record_key();
+        let rec = provider_with_addresses(&key, MAX_ADVERTISED_MULTIADDRS + 1);
+        assert!(matches!(store.add_provider(rec), Err(Error::ValueTooLarge)));
+        assert_eq!(store.num_providers, 0, "rejected record must not bump the provider count");
+        assert!(store.providers(&key).is_empty(), "rejected record must not be stored");
     }
 }

@@ -11801,6 +11801,7 @@ dependencies = [
  "rustversion",
  "serde",
  "tn-types",
+ "tokio",
  "tracing",
 ]
 
@@ -11941,6 +11942,7 @@ dependencies = [
  "tn-types",
  "tn-worker",
  "tokio",
+ "tokio-stream",
  "tracing",
  "url",
 ]

@@ -116,12 +116,12 @@ impl<CDB: ConsensusDatabase> PrimaryNode<CDB> {
         consensus_bus: ConsensusBus,
         network: PrimaryNetworkHandle,
         state_sync: StateSynchronizer<CDB>,
-    ) -> PrimaryNode<CDB> {
-        let primary = Primary::new(consensus_config.clone(), &consensus_bus, network, state_sync);
+    ) -> eyre::Result<PrimaryNode<CDB>> {
+        let primary = Primary::new(consensus_config.clone(), &consensus_bus, network, state_sync)?;
 
         let inner = PrimaryNodeInner { consensus_config, consensus_bus, primary };
 
-        Self { internal: Arc::new(RwLock::new(inner)) }
+        Ok(Self { internal: Arc::new(RwLock::new(inner)) })
     }
 
     pub async fn start(
