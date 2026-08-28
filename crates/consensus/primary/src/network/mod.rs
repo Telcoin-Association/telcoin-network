@@ -1480,7 +1480,10 @@ where
             .and_then(Result::ok);
             let Some(request) = request else {
                 warn!(target: "primary::network", %peer, "no readable sync request frame");
-                let _ = stream.close().await;
+                // bound the best-effort close for parity with the shed and
+                // unexpected-frame paths: the held admission permit must free
+                // promptly even if the connection's send buffer is backed up.
+                let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, stream.close()).await;
                 return Ok(());
             };
 

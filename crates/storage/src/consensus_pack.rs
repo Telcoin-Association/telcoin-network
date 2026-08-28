@@ -818,8 +818,38 @@ impl Inner {
         Ok((consensus_digests, batch_digests))
     }
 
+    /// True when the data file ends inside its own first record and no consensus output is
+    /// indexed, i.e. the pack carries a torn [`EpochMeta`] with nothing reachable behind it.
+    ///
+    /// Two independent witnesses, because neither is sufficient alone:
+    ///
+    /// * [`Pack::record_size`] validates the size prefix and the record crc without decompressing,
+    ///   so `UnexpectedEof` there means the first record is not fully on disk. That is distinct
+    ///   from a complete record failing its crc or its decode, and because the data file is a
+    ///   sequential append-only log, a file that stops inside record zero cannot hold a record
+    ///   after it.
+    /// * The size prefix has no checksum of its own, so a flipped bit could inflate the record's
+    ///   extent past EOF and mimic a tear on a pack that really does hold data.  The position index
+    ///   settles it: every consensus read resolves through it, so an empty one means no output was
+    ///   ever committed here.
+    fn first_record_is_dataless_tear(
+        data: &mut Pack<PackRecord>,
+        consensus_pos_idx: &PositionIndex<IndexPositions>,
+    ) -> bool {
+        let ends_inside_first_record = matches!(
+            data.record_size(DATA_HEADER_BYTES as u64),
+            Err(FetchError::IO(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        );
+        ends_inside_first_record && consensus_pos_idx.is_empty()
+    }
+
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
+    ///
+    /// A data file holding record bytes must begin with a readable [`EpochMeta`] matching this
+    /// epoch.  An unreadable first record fails the open rather than appending a second meta,
+    /// except for the one window that is provably dataless -- a tear inside the meta itself with
+    /// nothing indexed behind it -- which truncates back to the header and rewrites the meta.
     fn open_append<P: AsRef<Path>>(
         path: P,
         previous_epoch: &EpochRecord,
@@ -843,23 +873,83 @@ impl Inner {
             genesis_consensus: previous_epoch.final_consensus,
         };
 
-        if let Ok(meta) = data.fetch(DATA_HEADER_BYTES as u64) {
-            let meta = meta.into_epoch()?;
-            if epoch_meta != meta {
-                return Err(PackError::InvalidEpoch(
-                    epoch,
-                    format!("open append has unexpected meta data, expected {epoch_meta:?} got {meta:?}"),
-                ));
+        // Opened ahead of the meta check: the torn-record heal below needs the position index as
+        // an independent witness of whether any consensus output was ever committed here.
+        let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
+
+        // Set on every branch that writes a fresh meta at the data header.  Either way the pack
+        // is byte-for-byte a freshly created one, so it needs the same index initialization.
+        let mut wrote_fresh_meta = false;
+
+        // Discriminate a missing meta by length, not by fetch error kind: fetch reports a read
+        // at EOF as an io error, the same class as a torn or corrupt record, so record bytes
+        // past the header mean the first record must load as a matching meta.
+        let pack_len = data.file_len();
+        if pack_len > DATA_HEADER_BYTES as u64 {
+            match data.fetch(DATA_HEADER_BYTES as u64) {
+                Ok(record) => {
+                    let meta = record.into_epoch()?;
+                    if epoch_meta != meta {
+                        return Err(PackError::InvalidEpoch(
+                            epoch,
+                            format!("open append has unexpected meta data, expected {epoch_meta:?} got {meta:?}"),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    // A complete-but-corrupt first record keeps failing the open: trunc_and_heal
+                    // only repairs the tail, and records behind the meta stay addressable through
+                    // the indexes, so discarding them here would be silent data loss.  Only the
+                    // provably dataless tear self-heals, matching the header-only branch below.
+                    if !Self::first_record_is_dataless_tear(&mut data, &consensus_pos_idx) {
+                        return Err(PackError::EpochLoad(format!(
+                            "epoch {epoch} pack {} ({pack_len} bytes): first record (the epoch \
+                             meta) is unreadable: {e}. The pack cannot be opened by any path. \
+                             Inspect it with `telcoin-network db validate {}`; if it holds no \
+                             output worth recovering, stop the node and remove that one \
+                             `epoch-{epoch}` directory so the epoch is rebuilt on restart. Do NOT \
+                             delete the chain-data directories (`db`, `static_files`, \
+                             `consensus-db`)",
+                            pack_file.display(),
+                            base_dir.display(),
+                        )));
+                    }
+                    // The old meta is unreadable, so it cannot be compared against: the
+                    // rewritten one is whatever this caller supplied.  Log the committee it is
+                    // being rebuilt from so a drifted epoch-start snapshot is traceable.
+                    tracing::warn!(
+                        target: "consensus_pack",
+                        epoch,
+                        path = ?pack_file,
+                        len = pack_len,
+                        committee_size = epoch_meta.committee.size(),
+                        start_consensus_number,
+                        "first pack record (the epoch meta) is torn and nothing is indexed \
+                         behind it; truncating to the data header and rewriting the meta from \
+                         the caller's previous_epoch + committee"
+                    );
+                    data.truncate(DATA_HEADER_BYTES as u64)
+                        .map_err(|e| PackError::IO(Arc::new(e)))?;
+                    data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
+                        .map_err(|e| PackError::Append(e.to_string()))?;
+                    wrote_fresh_meta = true;
+                }
             }
         } else {
+            // Header-only file: brand new, or a crash landed between the header write and the
+            // meta append.  Either way appending the meta initializes the pack.
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
+            wrote_fresh_meta = true;
         }
-        let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
         let (mut consensus_digests, mut batch_digests) =
             Self::open_digest_indexes(&base_dir, data.header(), false)?;
-        if !have_pack {
-            // If this is a new DB then update the file lengths in indexes after create.
+        if !have_pack || wrote_fresh_meta {
+            // If this is a new DB then update the file lengths in indexes after create.  A pack
+            // whose meta was just rewritten at the data header counts as new: the indexes still
+            // carry the length from before the damage, and leaving that stale would make
+            // trunc_and_heal cut the meta we just wrote back down to it whenever the rewritten
+            // meta is the longer one -- returning a live pack with a torn first record.
             let len = data.file_len();
             consensus_digests.set_data_file_length(len);
             batch_digests.set_data_file_length(len);
@@ -878,17 +968,25 @@ impl Inner {
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
     fn open_append_exists<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
+        let pack_file = base_dir.join(Self::DATA_NAME);
 
         let mut data = Pack::<PackRecord>::open(
-            base_dir.join(Self::DATA_NAME),
+            &pack_file,
             epoch as u64,
             false,
             PackCompression::ZStd,
             PACK_VERSION,
         )?;
+        // No remediation hint here: unlike open_append this door does not create the epoch
+        // directory, so removing it would leave the node unable to start at all.
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
-            .map_err(|e| PackError::EpochLoad(e.to_string()))?
+            .map_err(|e| {
+                PackError::EpochLoad(format!(
+                    "epoch {epoch} pack {}: first record (the epoch meta) is unreadable: {e}",
+                    pack_file.display(),
+                ))
+            })?
             .into_epoch()?;
         let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
         let (consensus_digests, batch_digests) =
@@ -908,9 +1006,10 @@ impl Inner {
     /// Open up the static files for previous epoch.  These will be read only.
     fn open_static<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
+        let pack_file = base_dir.join(Self::DATA_NAME);
 
         let mut data = Pack::<PackRecord>::open(
-            base_dir.join(Self::DATA_NAME),
+            &pack_file,
             epoch as u64,
             true,
             PackCompression::ZStd,
@@ -918,7 +1017,12 @@ impl Inner {
         )?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
-            .map_err(|e| PackError::EpochLoad(e.to_string()))?
+            .map_err(|e| {
+                PackError::EpochLoad(format!(
+                    "epoch {epoch} pack {}: first record (the epoch meta) is unreadable: {e}",
+                    pack_file.display(),
+                ))
+            })?
             .into_epoch()?;
         let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), true)?;
         let (consensus_digests, batch_digests) =
@@ -2184,6 +2288,7 @@ pub(crate) mod test {
         collections::VecDeque,
         fs::{File, OpenOptions},
         io::{Seek as _, SeekFrom},
+        num::NonZeroUsize,
         sync::Arc,
         time::Duration,
     };
@@ -2198,8 +2303,8 @@ pub(crate) mod test {
     };
 
     use crate::{
-        archive::pack::PackCompression,
-        consensus_pack::{max_batches_per_output, ConsensusPack, Inner, PACK_VERSION},
+        archive::pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+        consensus_pack::{max_batches_per_output, ConsensusPack, Inner, PackRecord, PACK_VERSION},
         mem_db::MemDatabase,
     };
 
@@ -3591,6 +3696,384 @@ pub(crate) mod test {
             matches!(res, Err(PackError::CorruptPack)),
             "mid-log corruption must error, got {res:?}"
         );
+    }
+
+    /// A pack whose first record (the epoch meta) is corrupt must fail `open_append` with
+    /// `EpochLoad` instead of treating the unreadable record as absent and appending a second
+    /// meta after it.  The flipped byte leaves a *complete* record on disk, so the tear heal
+    /// does not apply: the file continues past the meta and those records stay addressable.
+    #[tokio::test]
+    async fn test_open_append_rejects_corrupt_first_record() {
+        let temp_dir = TempDir::with_prefix("test_cp_corrupt_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
+            let mut parent = ConsensusHeader::default().digest();
+            for i in 0..3 {
+                let output =
+                    make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+                parent = output.digest();
+                pack.save_consensus_output(output).await.unwrap();
+            }
+            pack.persist().await.expect("persist");
+        }
+
+        // Flip one byte inside the meta record's value; the record crc covers it, so the
+        // meta fetch itself fails rather than decoding to different values.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut bytes = std::fs::read(&data_path).expect("read data");
+        bytes[DATA_HEADER_BYTES + 6] ^= 0xff;
+        std::fs::write(&data_path, &bytes).expect("write data");
+        let len_before = bytes.len() as u64;
+
+        let result = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone());
+        assert!(
+            matches!(result, Err(super::PackError::EpochLoad(_))),
+            "expected EpochLoad, got {result:?}"
+        );
+        let len_after = std::fs::metadata(&data_path).expect("metadata").len();
+        assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// A pack whose first record is torn (a crash mid meta append left only part of the size
+    /// prefix) with nothing indexed behind it is the one recoverable window: `open_append`
+    /// truncates back to the data header and rewrites the meta, exactly as the header-only
+    /// branch does one instant earlier.  Nothing reachable is lost -- the meta is rebuilt from
+    /// `previous_epoch` + `committee`.
+    #[tokio::test]
+    async fn test_open_append_heals_dataless_torn_first_record() {
+        let temp_dir = TempDir::with_prefix("test_cp_torn_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        let clean_len = {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
+            pack.persist().await.expect("persist");
+            let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+            std::fs::metadata(&data_path).expect("metadata").len()
+        };
+
+        // Tear the meta record mid size-prefix: record bytes exist past the header, but the
+        // first record cannot be read and no output was ever committed behind it.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let torn_len = DATA_HEADER_BYTES as u64 + 2;
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.set_len(torn_len).expect("truncate");
+        }
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("torn meta with no data behind it must heal");
+            // The healed pack is writable: the rewritten meta put it back in service.
+            let parent = ConsensusHeader::default().digest();
+            let output = make_test_output(&committee, 0, chain.clone(), 1, parent);
+            pack.save_consensus_output(output).await.unwrap();
+            pack.persist().await.expect("persist after heal");
+        }
+
+        // The torn bytes were dropped rather than appended after, so the meta sits at the data
+        // header again and the pack grew past its clean meta-only length by the saved output.
+        let healed_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(
+            healed_len > clean_len,
+            "healed pack ({healed_len}) must hold the meta plus the new output (clean meta-only \
+             was {clean_len})"
+        );
+
+        // Both read-only doors agree the recovered pack is sound.
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after heal");
+        let output = pack.get_consensus_output(1).await.expect("read output through static open");
+        assert_eq!(output.number(), 1, "static read must return the output saved after the heal");
+    }
+
+    /// The heal above must stay narrow.  A first record whose size prefix has been corrupted to
+    /// run past EOF looks torn, but the position index still holds committed outputs behind it,
+    /// so `open_append` must fail closed rather than truncate real consensus data away.
+    #[tokio::test]
+    async fn test_open_append_rejects_torn_first_record_with_indexed_outputs() {
+        let temp_dir = TempDir::with_prefix("test_cp_torn_with_data").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
+            let mut parent = ConsensusHeader::default().digest();
+            for i in 0..3 {
+                let output =
+                    make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+                parent = output.digest();
+                pack.save_consensus_output(output).await.unwrap();
+            }
+            pack.persist().await.expect("persist");
+        }
+
+        // Inflate the meta record's size prefix so its declared extent runs past EOF: the record
+        // reads as torn even though three outputs sit behind it, fully addressable through the
+        // position index.  The value stays under MAX_RECORD_SIZE so the read reaches EOF rather
+        // than tripping the size guard.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut bytes = std::fs::read(&data_path).expect("read data");
+        let len_before = bytes.len() as u64;
+        let inflated = len_before as u32;
+        bytes[DATA_HEADER_BYTES..DATA_HEADER_BYTES + 4].copy_from_slice(&inflated.to_le_bytes());
+        std::fs::write(&data_path, &bytes).expect("write data");
+
+        let result = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone());
+        assert!(
+            matches!(result, Err(super::PackError::EpochLoad(_))),
+            "expected EpochLoad, got {result:?}"
+        );
+        let len_after = std::fs::metadata(&data_path).expect("metadata").len();
+        assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// The heal rebuilds the pack from its data header, so the digest indexes must be
+    /// reinitialized with it.  Left carrying the length from before the tear, `trunc_and_heal`
+    /// would cut the meta just written back down to that stale length whenever the rewritten
+    /// meta is the longer one, leaving the pack torn again and re-healing on every restart.
+    #[tokio::test]
+    async fn test_heal_reinitializes_index_lengths_for_a_longer_meta() {
+        let temp_dir = TempDir::with_prefix("test_cp_heal_longer_meta").expect("temp dir");
+        let small = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(4).expect("nonzero"))
+            .build();
+        let small_committee = small.committee();
+        let prev_small = test_previous_epoch(&small_committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                prev_small.clone(),
+                small_committee.clone(),
+            )
+            .expect("open pack");
+            pack.persist().await.expect("persist");
+        }
+
+        // Tear the meta, leaving the digest indexes synced to the pre-tear length.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let small_len = std::fs::metadata(&data_path).expect("metadata").len();
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.set_len(DATA_HEADER_BYTES as u64 + 2).expect("truncate");
+        }
+
+        // Reopen with a larger committee so the rewritten meta is longer than the stale length.
+        let big = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(10).expect("nonzero"))
+            .build();
+        let big_committee = big.committee();
+        let prev_big = test_previous_epoch(&big_committee);
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                prev_big.clone(),
+                big_committee.clone(),
+            )
+            .expect("heal with a longer meta");
+            pack.persist().await.expect("persist after heal");
+        }
+
+        // The healed pack must hold the whole new meta, not a copy truncated to the old length.
+        let healed_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(
+            healed_len > small_len,
+            "healed pack ({healed_len}) was cut back to the stale index length ({small_len})"
+        );
+
+        // open_static both runs files_consistent and re-reads the meta, so it is the gate that
+        // catches a meta left torn by a stale-length truncate.
+        ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("healed pack must open read-only with a readable meta");
+    }
+
+    /// Same stale-index hazard as above, but landing in the header-only branch: the data file
+    /// is rolled back to exactly `DATA_HEADER_BYTES` while the digest indexes keep their larger
+    /// pre-damage length.  That branch writes a fresh meta too, so it needs the same index
+    /// reinitialization -- without it `trunc_and_heal` cuts the new meta down to the stale
+    /// length and hands back a live pack whose first record is torn.
+    #[tokio::test]
+    async fn test_header_only_reinitializes_index_lengths_for_a_longer_meta() {
+        let temp_dir = TempDir::with_prefix("test_cp_header_only_longer").expect("temp dir");
+        let small = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(4).expect("nonzero"))
+            .build();
+        let small_committee = small.committee();
+        let prev_small = test_previous_epoch(&small_committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                prev_small.clone(),
+                small_committee.clone(),
+            )
+            .expect("open pack");
+            pack.persist().await.expect("persist");
+        }
+
+        // Roll the data file back to exactly the header, leaving the digest indexes synced to
+        // the pre-damage length.  This lands in the header-only branch, not the tear heal.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let small_len = std::fs::metadata(&data_path).expect("metadata").len();
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.set_len(DATA_HEADER_BYTES as u64).expect("truncate");
+        }
+
+        let big = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(10).expect("nonzero"))
+            .build();
+        let big_committee = big.committee();
+        let prev_big = test_previous_epoch(&big_committee);
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                prev_big.clone(),
+                big_committee.clone(),
+            )
+            .expect("header-only reopen with a longer meta");
+            pack.persist().await.expect("persist after reopen");
+        }
+
+        let healed_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(
+            healed_len > small_len,
+            "rewritten meta ({healed_len}) was cut back to the stale index length ({small_len})"
+        );
+        ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("pack must open read-only with a readable meta");
+    }
+
+    /// The other half of the narrowing: an empty position index alone is not licence to
+    /// truncate.  This meta record is whole on disk and merely fails its crc, which is
+    /// corruption at rest rather than an interrupted append, so `open_append` must fail closed
+    /// even though nothing is indexed behind it.
+    #[tokio::test]
+    async fn test_open_append_rejects_corrupt_first_record_without_outputs() {
+        let temp_dir = TempDir::with_prefix("test_cp_corrupt_no_data").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
+            pack.persist().await.expect("persist");
+        }
+
+        // Flip a byte inside the meta value.  The record is complete -- size prefix and crc
+        // suffix are both present -- so this reads as corruption, not as a tear.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut bytes = std::fs::read(&data_path).expect("read data");
+        bytes[DATA_HEADER_BYTES + 6] ^= 0xff;
+        std::fs::write(&data_path, &bytes).expect("write data");
+        let len_before = bytes.len() as u64;
+
+        let result = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone());
+        assert!(
+            matches!(result, Err(super::PackError::EpochLoad(_))),
+            "expected EpochLoad, got {result:?}"
+        );
+        let len_after = std::fs::metadata(&data_path).expect("metadata").len();
+        assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// The crash window "data header written, meta never appended" must stay recoverable:
+    /// `open_append` on a header-only data file appends the meta and the pack works from
+    /// then on.
+    #[tokio::test]
+    async fn test_open_append_appends_meta_to_header_only_file() {
+        let temp_dir = TempDir::with_prefix("test_cp_header_only").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Write only the data header, the state a crash right after pack creation leaves.
+        let base_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&base_dir).expect("create epoch dir");
+        let data_path = base_dir.join(Inner::DATA_NAME);
+        {
+            let mut raw: Pack<PackRecord> =
+                Pack::open(&data_path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("raw pack");
+            raw.commit().expect("commit header");
+        }
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("metadata").len(),
+            DATA_HEADER_BYTES as u64,
+            "setup must produce a header-only data file"
+        );
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open append on header-only file");
+            let parent = ConsensusHeader::default().digest();
+            let output = make_test_output(&committee, 0, chain.clone(), 1, parent);
+            pack.save_consensus_output(output).await.unwrap();
+            pack.persist().await.expect("persist");
+        }
+        assert!(
+            std::fs::metadata(&data_path).expect("metadata").len() > DATA_HEADER_BYTES as u64,
+            "meta must have been appended"
+        );
+
+        // Reopening finds the appended meta and compares clean: recovering the crash window
+        // is idempotent.
+        {
+            let pack =
+                ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+                    .expect("reopen append");
+            assert!(pack.get_consensus_output(1).await.is_ok());
+            pack.persist().await.expect("persist after reopen");
+        }
+
+        // The append reopen heals through `trunc_and_heal`; `open_static` is the door that runs
+        // `files_consistent`, so a read-only reopen pins the recovered pack for read-only
+        // consumers too.
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("open static after header-only recovery");
+        let output = pack
+            .get_consensus_output(1)
+            .await
+            .expect("recovered output reads back through the static path");
+        assert_eq!(output.number(), 1, "static read must return the recovered output");
     }
 
     /// `verify_epoch_meta` committee linkage across the shapes a mid-epoch on-chain ejection

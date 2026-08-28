@@ -6,7 +6,6 @@
 //! record-position hash index over an `index.hdx` bucket file plus an `index.odx` overflow log.
 
 pub mod bloom;
-//mod hdx_header;
 pub mod index;
 /// On-demand benchmark used to detect [`HdxIndex`] performance regressions (see `index_bench.rs`).
 #[cfg(test)]
