@@ -293,6 +293,16 @@ impl ConsensusOutput {
     /// legacy XOR commit to transaction bytes and let a committing leader enumerate
     /// candidate `PREVRANDAO` values by re-cutting the payload it proposes.
     ///
+    /// What this does NOT close is last-actor bias, the same residual
+    /// [`EpochSeedChainValue`](crate::EpochSeedChainValue) documents and accepts. The seed
+    /// chain value of a commit is computable by that commit's leader before it broadcasts,
+    /// and the block number and batch index are known to it too, so the committing leader
+    /// knows every `PREVRANDAO` its commit will produce and can withhold the proposal if it
+    /// dislikes them, forfeiting the commit. What changes is the cost: the leader gets one
+    /// propose-or-withhold coin flip per commit instead of unbounded free re-draws from
+    /// re-cutting the payload. Contracts requiring unbiasable randomness MUST NOT use
+    /// `PREVRANDAO` alone; use a commit-reveal or an external beacon.
+    ///
     /// Pre-fork, the legacy derivation is preserved byte-identically for replay: the
     /// consensus header digest XOR `batch_digest`. The empty epoch-closing block passes
     /// [`B256::ZERO`], which reduces the XOR to the bare consensus header digest, exactly

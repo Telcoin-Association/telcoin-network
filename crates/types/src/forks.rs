@@ -293,6 +293,10 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// pinned by the committed order and the digest-pinned seed chain, so payload construction
 /// cannot generate new candidates.
 ///
+/// This narrows grinding to the single propose-or-withhold choice the committing leader
+/// always has; it does not make `PREVRANDAO` unbiasable. See
+/// [`EpochSeedChainValue`](crate::EpochSeedChainValue) on accepted last-actor bias.
+///
 /// `Epoch::MAX` is the dormant placeholder of the standard two-step hard-fork rule (the
 /// same sequence [`SEED_SIGNATURE_FORK_EPOCH`] followed): deploy this gate-capable build
 /// fleet-wide first (safe indefinitely while dormant on adiri), then land the epoch-setting

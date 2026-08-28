@@ -92,6 +92,11 @@
 //! replay caveat and the `block.body.withdrawals` reconstruction follow-up). The RNG draw order
 //! inside the shuffle is consensus-critical: any refactor that reorders the draws selects a
 //! different committee.
+//!
+//! From the PREVRANDAO fork epoch onward the same epoch seed chain value also feeds each block's
+//! `mix_hash` (the EVM's `PREVRANDAO`, derived per block by `ConsensusOutput::prev_randao`). It
+//! carries the same accepted last-actor bias: the committing leader can compute it before
+//! broadcasting, so it is not unbiasable randomness.
 
 use crate::{
     error::{TnRethError, TnRethResult},
