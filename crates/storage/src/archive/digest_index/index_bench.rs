@@ -1,12 +1,13 @@
 //! On-demand benchmark comparing the digest-index implementations: the buffered/direct-IO
-//! [`HdxIndex`](super::index::HdxIndex) (raw `File` + in-memory bucket cache) vs the cache-free,
-//! zero-copy memory-mapped [`HdxIndexMmap`](super::index_mmap::HdxIndexMmap). Three columns:
-//! - `hdx-buf`  — `HdxIndex` on the buffered `File` backend (the direct-IO version).
-//! - `hdx-mmap` — `HdxIndex` on the mmap file backend (same cached logic — isolates the file
-//!   backend).
-//! - `mmap`     — `HdxIndexMmap`, the cache-free, zero-copy index. It defers CRC: each write zeros
-//!   the bucket's CRC trailer (a "dirty" marker) and only the dirty buckets are CRC'd at `sync()`
-//!   (the WAL/rebuildable regime; reads do not verify a per-op CRC).
+//! [`HdxIndexDirectIO`](super::index_directio::HdxIndexDirectIO) (raw `File` + in-memory bucket
+//! cache) vs the cache-free, zero-copy memory-mapped [`HdxIndex`](super::index::HdxIndex). Three
+//! columns:
+//! - `hdx-buf`  — `HdxIndexDirectIO` on the buffered `File` backend (the direct-IO version).
+//! - `hdx-mmap` — `HdxIndexDirectIO` on the mmap file backend (same cached logic — isolates the
+//!   file backend).
+//! - `mmap`     — `HdxIndex`, the cache-free, zero-copy index. It defers CRC: each write zeros the
+//!   bucket's CRC trailer (a "dirty" marker) and only the dirty buckets are CRC'd at `sync()` (the
+//!   WAL/rebuildable regime; reads do not verify a per-op CRC).
 //!
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
 //!
@@ -224,7 +225,7 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     let cell_w = 12usize;
 
     println!(
-        "\n=== digest index: direct-IO (HdxIndex) vs mmap (HdxIndexMmap) (ms; lower is better) ==="
+        "\n=== digest index: direct-IO (HdxIndexDirectIO) vs mmap (HdxIndex) (ms; lower is better) ==="
     );
     println!("legend: hdx-buf = buffered File + bucket cache; hdx-mmap = same cache on an mmap file; mmap = cache-free mmap, per-op CRC replaced by a zeroed dirty marker, only dirty buckets CRC'd at sync (WAL/rebuildable regime; no per-op CRC on read). insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. Default N sweep crosses the 400k-bucket buffered cache at 8M. test-cfg bloom is 64 KB; run on Linux/SSD.");
 
@@ -247,8 +248,8 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     println!();
 }
 
-/// Compare the direct-IO `HdxIndex` (buffered + mmap file) against the cache-free, deferred-CRC
-/// `HdxIndexMmap`, swept across index sizes.
+/// Compare the direct-IO `HdxIndexDirectIO` (buffered + mmap file) against the cache-free,
+/// deferred-CRC `HdxIndex`, swept across index sizes.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
 /// `cargo test -p tn-storage digest_index_bench -- --ignored --nocapture --test-threads 1`.

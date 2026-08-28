@@ -848,8 +848,8 @@ impl Inner {
 
     /// Open (creating if empty) both of an epoch's digest indexes on the chosen file `backend`,
     /// returning `(consensus_digests, batch_digests)`. The backend flows from the pack open, so a
-    /// buffered pack gets buffered (`HdxIndex`) digest indexes and an mmap pack gets cache-free
-    /// mmap (`HdxIndexMmap`) ones; both share the same on-disk format.
+    /// buffered pack gets buffered (`HdxIndexDirectIO`) digest indexes and an mmap pack gets
+    /// cache-free mmap (`HdxIndex`) ones; both share the same on-disk format.
     fn open_digest_indexes(
         base_dir: &Path,
         data_header: &DataHeader,

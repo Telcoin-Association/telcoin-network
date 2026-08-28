@@ -5,7 +5,7 @@
 pub mod bloom;
 pub mod bucket_iter;
 pub mod index;
-/// On-demand benchmark: direct-IO (`HdxIndex`) vs mmap (`HdxIndexMmap`) index (see
+/// On-demand benchmark: direct-IO (`HdxIndexDirectIO`) vs mmap (`HdxIndex`) index (see
 /// `index_bench.rs`).
 #[cfg(test)]
 mod index_bench;
@@ -36,10 +36,10 @@ use self::{index::HdxIndex, index_directio::HdxIndexDirectIO};
 /// Both variants share the exact same on-disk format, so a directory written by one opens with the
 /// other; this enum just lets a caller hold either behind one type, driven by the pack's
 /// [`FileBackend`]:
-/// - [`Buffered`](Self::Buffered): [`HdxIndex`] on a raw random-access `File`, with an in-memory
-///   bucket cache. The default, and the long-standing production path.
-/// - [`Mmap`](Self::Mmap): the cache-free, memory-mapped [`HdxIndexMmap`], which reads and writes
-///   hash buckets directly through the mapping.
+/// - [`Buffered`](Self::Buffered): [`HdxIndexDirectIO`] on a raw random-access `File`, with an
+///   in-memory bucket cache — the original direct-IO path.
+/// - [`Mmap`](Self::Mmap): the cache-free, memory-mapped [`HdxIndex`] (the default), which reads
+///   and writes hash buckets directly through the mapping.
 ///
 /// Dispatch is a single `match` (no vtable), so the hot [`Index::load`] path pays no dynamic-call
 /// cost over using either type directly.
@@ -48,9 +48,9 @@ pub enum DigestIndex<
     const KSIZE: usize = 32,
     S: BuildHasher + Default = BuildHasherDefault<FxHasher>,
 > {
-    /// Buffered backend (the default): [`HdxIndex`] on a raw random-access `File`.
+    /// Buffered/direct-IO backend: [`HdxIndexDirectIO`] on a raw random-access `File`.
     Buffered(HdxIndexDirectIO<KSIZE, S>),
-    /// Memory-mapped, cache-free backend: [`HdxIndexMmap`].
+    /// Memory-mapped, cache-free backend (the default): [`HdxIndex`].
     Mmap(HdxIndex<KSIZE, S>),
 }
 

@@ -596,8 +596,9 @@ impl ConsensusChain {
                             && epoch_final_hash == last_header.digest()
                         {
                             // The mmap data-file backend zero-pads the physical file past the
-                            // logical `end` (the mapping must be >= the file). Reconcile it to `end`
-                            // (flush pending writes, then truncate the padding, as a clean close
+                            // logical `end` (the mapping must be >= the file). Reconcile it to
+                            // `end` (flush pending writes, then
+                            // truncate the padding, as a clean close
                             // does) so the raw read-to-EOF below yields exactly `[0, end)` and not
                             // trailing zero-padding the receiver cannot decode.
                             pack.reconcile_data_len().await?;

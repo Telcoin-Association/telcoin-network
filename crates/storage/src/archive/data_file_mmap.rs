@@ -470,6 +470,25 @@ impl MmapDataFile {
         self.flush_dirty(true)
     }
 
+    /// `msync` an explicit byte range (clamped to `[0, end)`). Used to *sequence* a durability
+    /// barrier: flush the bulk of the file with [`Self::sync_all`], then flush a small commit
+    /// region (e.g. the header page) with this so it lands durably last. No-op when read-only,
+    /// empty, or unmapped.
+    pub fn sync_range(&self, start: u64, len: u64) -> io::Result<()> {
+        if self.read_only || self.end == 0 || len == 0 {
+            return Ok(());
+        }
+        let Backing::Rw(map) = &self.backing else {
+            return Ok(());
+        };
+        let start = start.min(self.end);
+        let end = start.saturating_add(len).min(self.end);
+        if start >= end {
+            return Ok(());
+        }
+        map.flush_range(start as usize, (end - start) as usize)
+    }
+
     /// Full, slow disk sync: `msync` then `fsync`, additionally persisting the file's
     /// size/metadata. See the module docs for the macOS `F_FULLFSYNC` caveat.
     pub fn sync_disk(&self) -> io::Result<()> {

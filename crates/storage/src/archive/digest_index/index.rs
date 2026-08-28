@@ -1,16 +1,16 @@
-//! An mmap-optimized, cache-free twin of [`HdxIndex`](super::index::HdxIndex).
+//! The memory-mapped, cache-free digest index — the default backend for a pack's hash indexes.
 //!
-//! [`HdxIndexMmap`] is a drop-in for `HdxIndex` — same [`Index`] trait, same public helpers, and
-//! the **same on-disk format** (so their files are cross-compatible) — but it is memory-mapped
-//! only and keeps **no bucket caches**. Where `HdxIndex` copies every bucket into `Vec<u8>`
-//! buffers held in `HashMap`/`VecDeque` caches, this reads bucket bytes **directly from the
-//! mapping** via [`PackFileIo::slice`] (zero-copy) and writes each modified bucket straight back
-//! through the mapping. On the mmap backend the OS page cache already *is* the bucket cache, so
-//! those copies and caches are pure overhead.
+//! [`HdxIndex`] implements the [`Index`] trait over two memory-mapped files (the `hdx` buckets and
+//! the `odx` overflow log) and keeps **no bucket caches**. Its buffered/direct-IO sibling
+//! [`HdxIndexDirectIO`](super::index_directio::HdxIndexDirectIO) copies every bucket into `Vec<u8>`
+//! buffers held in `HashMap`/`VecDeque` caches; this one instead reads bucket bytes **directly from
+//! the mapping** (zero-copy) and writes each modified bucket straight back through it. On an mmap
+//! file the OS page cache already *is* the bucket cache, so those extra copies are pure overhead.
+//! Both share the **same on-disk format**, so their files are cross-compatible.
 //!
 //! ## Reads (zero-copy)
-//! [`HdxIndexMmap::find_in_bucket`] borrows the target bucket from the hdx mapping, scans it, and —
-//! on a miss — follows the append-only overflow chain by re-slicing the odx mapping one record at a
+//! [`HdxIndex::find_in_bucket`] borrows the target bucket from the hdx mapping, scans it, and — on
+//! a miss — follows the append-only overflow chain by re-slicing the odx mapping one record at a
 //! time. Exactly one shared slice is live at any moment and no slice is ever held across a write,
 //! so a growth/remap (which needs `&mut`) can never invalidate one. Reads do **not** verify a
 //! per-op CRC (see the CRC note below).
@@ -18,8 +18,7 @@
 //! ## Writes (write-through)
 //! Inserts are read-modify-write: the bucket is mutated in place through the mapping (its overflow
 //! appended to the odx if it fills) and written back at the bucket's fixed offset. mmap writes are
-//! `memcpy` into the page cache; durability still happens only at [`Index::sync`] (msync), exactly
-//! as the buffered index defers to `fsync`.
+//! `memcpy` into the page cache; durability happens at [`Index::sync`] / on drop.
 //!
 //! ## CRC (deferred, WAL/rebuildable)
 //! This index is not the durability source — it is rebuilt from the data-log WAL on an unclean
@@ -27,8 +26,14 @@
 //! **zeroed** (a "dirty / not-yet-CRC'd" marker); [`Index::sync`] then CRCs **only** the dirty
 //! buckets in one pass, leaving a CRC-valid on-disk image. The zero marker also lets recovery tell
 //! a dirty bucket (CRC == 0) from a corrupt one (non-zero CRC that fails) via
-//! [`HdxIndexMmap::bucket_crc_scan`]. Overflow (odx) records are append-only and CRC'd when
-//! written.
+//! [`HdxIndex::bucket_crc_scan`]. Overflow (odx) records are append-only and CRC'd when written.
+//!
+//! ## Crash consistency (ordered commit)
+//! The header carries `data_file_length`, which `files_consistent` compares against the data log to
+//! decide clean-vs-rebuild. [`Index::sync`] (via `ordered_sync`) writes that marker **last**: the
+//! bloom + buckets are made durable first, then the header page is msync'd on its own. A crash
+//! before that final step leaves the previous, smaller `data_file_length` on disk, so recovery
+//! rebuilds from the WAL rather than trusting a torn index.
 
 use tn_types::B256;
 
@@ -69,7 +74,7 @@ pub struct HdxIndex<
     modulus: u32,
     // We require an mmap backed file so use it directly.
     hdx_file: MmapDataFile,
-    // Note, if odx_file is ever replaced in HdxIndexMmap then any held overflow slice would
+    // Note, if odx_file is ever replaced in HdxIndex then any held overflow slice would
     // dangle; the read paths take a fresh slice per hop and never hold one across a mutation.
     // We require an mmap backed file so use it directly.
     odx_file: MmapDataFile,
@@ -81,7 +86,7 @@ pub struct HdxIndex<
     _index_dir: PathBuf,
 }
 
-/// Counts from [`HdxIndexMmap::bucket_crc_scan`] over the main buckets: how many are dirty
+/// Counts from [`HdxIndex::bucket_crc_scan`] over the main buckets: how many are dirty
 /// (deliberately un-CRC'd — CRC trailer zero) vs corrupt (non-zero CRC that fails to verify). A
 /// clean, synced index reports zero of both; `dirty > 0` means writes were not synced (rebuild from
 /// the WAL), `corrupt > 0` means genuine on-disk corruption.
@@ -256,9 +261,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
 
     /// Return the bucket that will contain hash.
     fn hash_to_bucket(&self, key: &[u8]) -> u64 {
-        if key.len() != KSIZE {
-            panic!("key wrong size, expected {KSIZE}, got {}", key.len())
-        }
+        debug_assert_eq!(key.len(), KSIZE, "key wrong size, expected {KSIZE}, got {}", key.len());
         let hash = self.hasher_builder.hash_one(key);
         let modulus = self.modulus as u64;
         let bucket = hash % modulus;
@@ -490,10 +493,10 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         for (hash, rec_pos) in elements {
             let bucket = self.hash_to_bucket(hash.as_slice());
             if bucket != split_bucket && bucket != new_bucket {
-                panic!(
-                    "got bucket {}, expected {} or {}, mod {}",
-                    bucket, split_bucket, new_bucket, self.modulus
-                );
+                // A rehash landing outside the split pair means the on-disk index is corrupt. Fail
+                // the save (the pack rebuilds from the WAL) rather than panicking the pack's worker
+                // thread and wedging every later request.
+                return Err(AppendError::CrcError);
             }
             if bucket == split_bucket {
                 self.save_to_bucket_buffer(hash.as_slice(), rec_pos, split_pos, false)?;
@@ -530,11 +533,46 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         Ok(())
     }
 
-    /// Write the index's header and bloom filter to disk.
-    fn write_header(&mut self) -> Result<(), io::Error> {
-        self.header.write_header(&mut self.hdx_file)?;
+    /// Write the bloom filter to its fixed region (immediately after the header). Split out from
+    /// the header write so [`Self::ordered_sync`] can make the bloom durable *before*
+    /// publishing the header, which carries the `data_file_length` commit marker.
+    fn write_bloom(&mut self) -> Result<(), io::Error> {
         self.hdx_file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
         self.hdx_file.write_all(self.bloom.data())?;
+        Ok(())
+    }
+
+    /// Write the index header (offset 0). It carries `data_file_length` — the length
+    /// `files_consistent` compares against the data log to decide clean-vs-rebuild.
+    fn write_header_only(&mut self) -> Result<(), io::Error> {
+        self.header.write_header(&mut self.hdx_file)?;
+        Ok(())
+    }
+
+    /// Durably flush the index with the `data_file_length` commit marker written LAST.
+    ///
+    /// `files_consistent` trusts the on-disk `data_file_length`: if it matches the data log's
+    /// length the index is assumed complete and WAL recovery is skipped. That is only safe if,
+    /// whenever `data_file_length` is durable, the buckets + bloom it accounts for are durable
+    /// too. So the order matters: stamp bucket CRCs, write the bloom, make the overflow log
+    /// then the bloom+buckets durable, and only then publish the header and msync its page on
+    /// its own. A crash before that final msync leaves the *previous* (smaller)
+    /// `data_file_length` on disk, so `files_consistent` fails and the index is rebuilt from
+    /// the WAL rather than trusted torn.
+    fn ordered_sync(&mut self) -> Result<(), io::Error> {
+        // Stamp a CRC on every dirty (zero-CRC) bucket so the on-disk image is CRC-valid.
+        self.crc_dirty_buckets();
+        // Write the bloom but NOT the header: the header page keeps its previous data_file_length
+        // until the commit msync below.
+        self.write_bloom()?;
+        // Overflow records the buckets reference must be durable before the buckets.
+        self.odx_file.sync_all()?;
+        // Make bloom + buckets (and the still-previous header) durable.
+        self.hdx_file.sync_all()?;
+        // Commit marker: publish the new header, then msync just its page so data_file_length lands
+        // durably after everything it accounts for.
+        self.write_header_only()?;
+        self.hdx_file.sync_range(0, HEADER_SIZE as u64)?;
         Ok(())
     }
 
@@ -583,31 +621,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
 impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
     fn drop(&mut self) {
         if !self.read_only && !self.synced {
-            if !std::thread::panicking() {
-                tracing::warn!(
-                    "HdxIndexMmap dropped with unsynced data - caller should call sync()"
-                );
-            }
-            if let Err(e) = self.write_header() {
+            // The WAL model never syncs the index on the hot path, so a clean close is the expected
+            // place it is made durable — not a misuse to warn about. Use the same ordered flush as
+            // `sync` (which also sequences the odx before the hdx buckets that reference it) so a
+            // torn close can't fool `files_consistent`.
+            if let Err(e) = self.ordered_sync() {
                 if !std::thread::panicking() {
-                    tracing::error!("HdxIndexMmap: failed to write header on drop: {e}");
-                }
-            }
-            if let Err(e) = self.hdx_file.flush() {
-                if !std::thread::panicking() {
-                    tracing::error!("HdxIndexMmap: failed to flush file on drop: {e}");
-                }
-            }
-            // Sync the overflow log before the index: hdx buckets reference odx overflow records by
-            // position, so if the hdx is durable but the odx tail is lost, those positions dangle.
-            if let Err(e) = self.odx_file.sync_all() {
-                if !std::thread::panicking() {
-                    tracing::error!("HdxIndexMmap: failed to sync overflow file on drop: {e}");
-                }
-            }
-            if let Err(e) = self.hdx_file.sync_all() {
-                if !std::thread::panicking() {
-                    tracing::error!("HdxIndexMmap: failed to sync file on drop: {e}");
+                    tracing::error!("HdxIndex: failed to sync on drop: {e}");
                 }
             }
         }
@@ -641,17 +661,13 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex
         }
     }
 
-    /// Flush and sync all the index data to disk.
+    /// Flush and sync all the index data to disk. The `data_file_length` commit marker is written
+    /// last (see [`Self::ordered_sync`]) so `files_consistent` never trusts a torn index.
     fn sync(&mut self) -> Result<(), CommitError> {
         if self.read_only {
             Err(CommitError::ReadOnly)
         } else {
-            // Writes left modified buckets dirty (zeroed CRC); stamp those now so the on-disk index
-            // is CRC-valid (a clean `bucket_crc_scan` on reopen).
-            self.crc_dirty_buckets();
-            self.write_header().map_err(CommitError::IndexFileSync)?;
-            self.odx_file.sync_all().map_err(CommitError::IndexFileSync)?;
-            self.hdx_file.sync_all().map_err(CommitError::IndexFileSync)?;
+            self.ordered_sync().map_err(CommitError::IndexFileSync)?;
             self.synced = true;
             Ok(())
         }
@@ -748,9 +764,9 @@ mod tests {
         );
     }
 
-    /// The on-disk format is identical to `HdxIndex`: a file written by `HdxIndexMmap` reads back
-    /// correctly through the original `HdxIndex` (on the mmap backend), and vice versa — a file
-    /// written by `HdxIndex` on the buffered backend reads back through `HdxIndexMmap`.
+    /// The on-disk format is identical across backends: a file written by the mmap `HdxIndex` reads
+    /// back correctly through `HdxIndexDirectIO`, and vice versa — a file written by
+    /// `HdxIndexDirectIO` on the buffered backend reads back through the mmap `HdxIndex`.
     #[test]
     fn test_archive_hdx_cross_compat() {
         let tmp_dir = TempDir::with_prefix("test_archive_hdx_cross").expect("temp dir");
@@ -813,7 +829,7 @@ mod tests {
             )
             .expect("mmap reader");
             for i in 0..N {
-                assert_eq!(idx.load(key(i)).expect("load via HdxIndexMmap"), i);
+                assert_eq!(idx.load(key(i)).expect("load via HdxIndex"), i);
             }
         }
     }
@@ -941,5 +957,98 @@ mod tests {
             BucketCrcReport { dirty: 1, corrupt: 1 },
             "a zeroed CRC reads as dirty, independent of the corrupt bucket"
         );
+    }
+
+    /// The ordered commit sync (`ordered_sync`, used by `sync`/`Drop`) leaves a fully consistent
+    /// on-disk image: every dirty bucket CRC'd, the `data_file_length` commit marker persisted, and
+    /// — on reopen — every key found (no bloom false negative).
+    #[test]
+    fn test_archive_hdx_index_mmap_ordered_sync() {
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_ordered_sync").expect("temp dir");
+        let tmp_path = tmp_dir.path();
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        const N: u64 = 50_000; // force splits + overflow
+        const DL: u64 = 123_456;
+
+        {
+            let mut idx: HdxIndex = HdxIndex::open_hdx_file(
+                tmp_path.join("index.hdx"),
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                false,
+            )
+            .expect("open");
+            for i in 0..N {
+                idx.save(key(i), i).unwrap_or_else(|e| panic!("save {i}: {e}"));
+            }
+            idx.set_data_file_length(DL);
+            idx.sync().expect("ordered sync");
+            assert_eq!(
+                idx.bucket_crc_scan(),
+                BucketCrcReport::default(),
+                "ordered sync must leave no dirty/corrupt bucket"
+            );
+        } // already synced, so no Drop resync
+
+        // Reopen read-only: the commit marker is persisted and every key is found.
+        let mut idx: HdxIndex = HdxIndex::open_hdx_file(
+            tmp_path.join("index.hdx"),
+            &data_header,
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        )
+        .expect("reopen");
+        assert_eq!(idx.data_file_length(), DL, "data_file_length marker must survive reopen");
+        assert_eq!(
+            idx.bucket_crc_scan(),
+            BucketCrcReport::default(),
+            "reopened image is CRC-clean"
+        );
+        for i in 0..N {
+            assert_eq!(idx.load(key(i)).unwrap_or_else(|e| panic!("load {i}: {e}")), i);
+        }
+    }
+
+    /// `data_file_length` is a commit marker: it reaches disk only when the index is synced, never
+    /// on a bare `set_data_file_length`. That is what makes `files_consistent` trigger a WAL
+    /// rebuild after an unclean shutdown. A second (read-only) handle must see the last
+    /// *synced* value, not a later un-synced one.
+    #[test]
+    fn test_archive_hdx_index_mmap_commit_marker_last() {
+        let tmp_dir = TempDir::with_prefix("test_archive_hdx_commit_marker").expect("temp dir");
+        let path = tmp_dir.path().join("index.hdx");
+        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
+        let open = |read_only: bool| -> HdxIndex {
+            HdxIndex::open_hdx_file(
+                &path,
+                &data_header,
+                BuildHasherDefault::<FxHasher>::default(),
+                read_only,
+            )
+            .expect("open")
+        };
+
+        let mut writer = open(false);
+        writer.save(key(0), 0).expect("save 0");
+        writer.set_data_file_length(100);
+        writer.sync().expect("sync 100");
+
+        // Advance the length + write another key but DON'T sync: both stay in-memory only.
+        writer.save(key(1), 1).expect("save 1");
+        writer.set_data_file_length(200);
+
+        // A fresh read-only handle reads the on-disk header -> still the last synced marker (100).
+        let reader = open(true);
+        assert_eq!(
+            reader.data_file_length(),
+            100,
+            "un-synced data_file_length must not be on disk"
+        );
+        drop(reader);
+
+        // After syncing, the new marker is durable.
+        writer.sync().expect("sync 200");
+        let reader = open(true);
+        assert_eq!(reader.data_file_length(), 200, "sync publishes the new marker");
     }
 }
