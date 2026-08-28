@@ -3811,6 +3811,79 @@ pub(crate) mod test {
         assert_eq!(output.number(), 1, "static read must return the output saved after the heal");
     }
 
+    /// A live (persisted-but-not-dropped) pack's `data` file is physically padded to its mmap
+    /// capacity. The state export copies `consensus_data` with a raw `std::fs::copy`, so without
+    /// reconciling first the bundle would carry that trailing zero padding and the importer's
+    /// record walk would fail its CRC on the zeros (the e2e "crc32 mismatch").
+    /// `reconcile_data_len` — called via `ConsensusChain::reconcile_current` right before the
+    /// export copy — truncates the file to its logical length so a raw copy round-trips through
+    /// `stream_import`.
+    #[tokio::test]
+    async fn test_reconcile_before_copy_lets_raw_copy_stream_import() {
+        let temp_dir = TempDir::with_prefix("test_cp_reconcile_copy").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+
+        // Append a few outputs and persist WITHOUT dropping: the pack stays live, so its data file
+        // keeps the mmap capacity padding (persist msyncs but does not truncate).
+        let pack =
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+                .expect("open pack");
+        let num_outputs = 3usize;
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..num_outputs {
+            let output = make_test_output(&committee, i % 4, chain.clone(), i as u64 + 1, parent);
+            parent = output.digest().into();
+            outputs.push(output.clone());
+            pack.save_consensus_output(output).await.unwrap();
+        }
+        pack.persist().await.expect("persist");
+        let padded_len = std::fs::metadata(&data_path).expect("metadata").len();
+
+        // Reconcile (what `ConsensusChain::reconcile_current` does before the export copy):
+        // truncate the padding away so the on-disk file is exactly its logical length.
+        pack.reconcile_data_len().await.expect("reconcile");
+        let reconciled_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(
+            reconciled_len < padded_len,
+            "reconcile must shrink the padded file ({padded_len}) to its logical length \
+             ({reconciled_len})"
+        );
+
+        // A raw copy of the reconciled file — exactly what the export does for `consensus_data` —
+        // must stream_import cleanly, with no trailing padding for the record walk to choke on.
+        let bundle_dir = TempDir::with_prefix("test_cp_reconcile_bundle").expect("temp dir");
+        let copy_dst = bundle_dir.path().join("consensus_data");
+        std::fs::copy(&data_path, &copy_dst).expect("copy reconciled data");
+        let dst_dir = TempDir::with_prefix("test_cp_reconcile_dst").expect("temp dir");
+        let stream = tokio::fs::File::open(&copy_dst).await.expect("open copy");
+        let imported = ConsensusPack::stream_import(
+            dst_dir.path(),
+            stream,
+            0,
+            &previous_epoch,
+            num_outputs as u64,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("raw copy of a reconciled pack must stream_import");
+        wait_for(
+            async || imported.get_consensus_output(num_outputs as u64).await.is_ok(),
+            "last stream-imported output to be readable",
+        )
+        .await;
+        for i in 0..num_outputs {
+            let got = imported.get_consensus_output(i as u64 + 1).await.unwrap();
+            compare_outputs(&got, &outputs[i]);
+        }
+        drop(imported);
+        drop(pack);
+    }
+
     /// The heal above must stay narrow.  A first record whose size prefix has been corrupted to
     /// run past EOF looks torn, but the position index still holds committed outputs behind it,
     /// so `open_append` must fail closed rather than truncate real consensus data away.

@@ -577,6 +577,16 @@ where
             warn!(target: "tn::snapshot", epoch, error = %e, "could not persist consensus pack; skipping export");
             return Ok(());
         }
+        // Reconcile the pack's `data` file to its logical length, truncating away the mmap capacity
+        // padding. The completion task copies this file with a raw `std::fs::copy`; without this
+        // the copy would include the transient trailing padding, and the importer's record
+        // walk would fail its CRC on the zeros. Safe here for the same reason as the
+        // persist above: the epoch has concluded, so nothing re-grows the padding before
+        // the copy. Skip the export on error.
+        if let Err(e) = self.consensus_chain.reconcile_current().await {
+            warn!(target: "tn::snapshot", epoch, error = %e, "could not reconcile consensus pack; skipping export");
+            return Ok(());
+        }
         // The consensus pack is a per-epoch file under the epochs base dir; it is copied into the
         // bundle. The records/certs are written from the actor in the completion task instead.
         let epochs_dir = self.tn_datadir.epochs_db_path();

@@ -1099,6 +1099,17 @@ impl ConsensusChain {
         Ok(())
     }
 
+    /// Reconcile the current epoch's pack `data` file to its logical length, truncating away the
+    /// mmap capacity padding so an external consumer that reads to EOF sees exactly the written
+    /// record bytes. The state export copies `consensus_data` with a raw `std::fs::copy`, which
+    /// would otherwise include the transient padding and make the importer's record walk fail its
+    /// CRC on the trailing zeros. Only safe once the epoch has concluded and no further output is
+    /// written to the current pack (the next write would re-grow the padding).
+    pub async fn reconcile_current(&self) -> Result<(), ConsensusChainError> {
+        self.current_pack().reconcile_data_len().await?;
+        Ok(())
+    }
+
     /// Return the latest consensus header for `epoch` by reading directly from the pack index,
     /// bypassing the slot files (LatestConsensus). This is always consistent with
     /// read_last_committed and should be used during startup recovery.
