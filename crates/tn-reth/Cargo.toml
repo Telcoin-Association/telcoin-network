@@ -71,6 +71,7 @@ tempfile = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
 tokio = { workspace = true, features = ["macros", "time", "sync"] }
+tokio-stream = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
 

@@ -266,7 +266,7 @@ where
         self.epoch_votes_seen.lock().contains_key(&(author, epoch))
     }
 
-    /// Record a verified `(author, epoch, epoch-record)` vote so later replays are dropped before
+    /// Record a verified `(author, epoch)` vote so later replays are dropped before
     /// the signature check.
     ///
     /// Callers MUST invoke this only after [`EpochVote::check_signature`] succeeds: recording a
@@ -518,6 +518,12 @@ where
                 if let Some((record, None)) =
                     self.consensus_chain.epochs().get_epoch_by_number(vote.epoch).await
                 {
+                    // Note that forcing the epoch record to be locally generated before accepting
+                    // votes may lead to lagging nodes missing early votes.
+                    // There is a small delay in publishing and a republish
+                    // schedule that should alleviate issues with this.
+                    // The alternative would involve a lot of bookkeeping to track future votes so
+                    // the simplicity of this solution is deliberately selected.
                     // Make sure this is a vote for the same digest we expect for EpochRecord.
                     ensure!(
                         record.digest() == vote.epoch_hash,
