@@ -10,6 +10,11 @@
 #                              attested) and on `merge_group` (for every PR, against
 #                              main + the PR).
 #
+# A third caller, .github/workflows/cache-deps.yaml, compiles the lanes on main to warm the
+# caches pr.yaml restores. It goes through this file so the artifacts it saves are the ones
+# the queue's lanes need, flag for flag; `--build-only` below is its one concession, and it
+# exists only because nextest has no other way to build a lane without running it.
+#
 # Before this file existed the two copies had already diverged: CI ran clippy only under
 # --all-features and excluded a package that no longer exists, so "CI runs what the
 # attested local run runs" was true only by inspection, and it was not true.
@@ -20,6 +25,11 @@
 # that takes hours does not belong in it.
 #
 # Usage: etc/ci-lanes.sh <fmt|clippy|test-default|test-adiri|all>
+#        etc/ci-lanes.sh <test-default|test-adiri> --build-only
+#
+# `--build-only` compiles a test lane's binaries without running them. It is accepted for
+# the two test lanes and nothing else, and it is the only option there is: no flag passes
+# through to cargo, so a caller still cannot weaken a lane, only skip the run.
 #
 # NEXTEST_PROFILE selects a profile from .config/nextest.toml. CI sets it to `ci`
 # (retries = 2), so a flaky test is less likely to eject a PR from the merge queue and
@@ -47,10 +57,22 @@ export CARGO_PROFILE_TEST_DEBUG=0
 # .github/ACTIONS.md "Toolchain pins".
 NIGHTLY=$(cat rust-nightly)
 
+usage() {
+    echo "usage: $0 <fmt|clippy|test-default|test-adiri|all>" >&2
+    echo "       $0 <test-default|test-adiri> --build-only" >&2
+    exit 2
+}
+
 run() {
     echo "+ $*"
     "$@"
 }
+
+# How the test lanes end: run every test and keep going past failures, or (`--build-only`)
+# stop once the binaries exist. nextest rejects `--no-run` together with `--no-fail-fast`
+# (nothing runs, so there is nothing to stop early), which is why this is a swap and not an
+# extra flag.
+run_mode=(--no-fail-fast)
 
 lane_fmt() {
     # --all is explicit, not load-bearing today: the root manifest is virtual, so there is
@@ -70,7 +92,7 @@ lane_clippy() {
 }
 
 lane_test_default() {
-    run cargo nextest run --locked --workspace --no-fail-fast
+    run cargo nextest run --locked --workspace "${run_mode[@]}"
 }
 
 lane_test_adiri() {
@@ -89,8 +111,20 @@ lane_test_adiri() {
     run cargo nextest run --locked \
         -p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-config \
         --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-config/adiri \
-        --no-fail-fast
+        "${run_mode[@]}"
 }
+
+(($# <= 2)) || usage
+case "${2:-}" in
+"") ;;
+--build-only)
+    case "${1:-}" in
+    test-default | test-adiri) run_mode=(--no-run) ;;
+    *) usage ;;
+    esac
+    ;;
+*) usage ;;
+esac
 
 case "${1:-}" in
 fmt) lane_fmt ;;
@@ -103,8 +137,5 @@ all)
     lane_test_default
     lane_test_adiri
     ;;
-*)
-    echo "usage: $0 <fmt|clippy|test-default|test-adiri|all>" >&2
-    exit 2
-    ;;
+*) usage ;;
 esac

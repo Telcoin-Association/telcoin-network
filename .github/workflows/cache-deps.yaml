@@ -1,11 +1,68 @@
+# Warms the dependency caches that .github/workflows/pr.yaml restores.
+#
+# main is the only writer. A cache saved by a pull_request run is scoped to that PR's
+# branch and one saved by a merge_group run lands on the queue's throwaway branch, so no
+# other run ever reads either. pr.yaml therefore only restores (`save-if: "false"`), on
+# both events, and reads what this workflow wrote on main. A lane's cold build is paid
+# once here, off the critical path, instead of on every queue entry.
+#
+# Two jobs, two entries, one per toolchain pr.yaml uses:
+#
+#   clippy-cache  both clippy passes (default and --all-features) under the nightly pin;
+#                 read by pr.yaml's `clippy` job
+#   test-cache    the test binaries of both test lanes (default and adiri features) under
+#                 the stable pin; read by `test` and `adiri-test`
+#
+# rust-cache's key is <prefix-key>-<shared-key>-<os>-<hash of the rustc version and every
+# CARGO*/RUST* variable in the environment>-<hash of the lockfiles>. For a restore in
+# pr.yaml to hit, the env block and every step before the cache step must match this file:
+# the same six variables, plus RUST_NIGHTLY written to GITHUB_ENV before the cache step in
+# the clippy jobs. Keep the two files in lockstep by hand; there is no shared definition
+# yet. A `rust-nightly` bump changes RUST_NIGHTLY, so the whole key, which is why that file
+# is in `paths` below. The computed key is printed in each cache step's "Cache
+# Configuration" log group.
+#
+# Entries are immutable and an exact key hit skips the save. A change to WHAT a job here
+# builds (a lane added, a feature set changed) is therefore never written while the key
+# stays the same: bump `prefix-key` in both workflows, here first and in pr.yaml once main
+# has written the new entries (or delete the entries under Settings > Actions > Caches).
+#
+# No `cache-on-failure`: a warm job that died mid-build would freeze a partial target dir
+# under the exact key, permanently. A failed warm saves nothing; fix it and re-dispatch.
 name: Warm dependency cache
+
 on:
   push:
     branches: [main]
+    # Anything that changes the key or what the jobs build.
     paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "rust-toolchain.toml"
+      - "rust-nightly"
+      - ".cargo/config.toml"
+      - "etc/ci-lanes.sh"
+      - ".github/workflows/cache-deps.yaml"
+  # Re-warm by hand: after deleting entries, or when a warm failed.
+  workflow_dispatch:
+  # GitHub deletes an entry not accessed for 7 days, so a quiet week would leave the queue
+  # cold. Twice a week keeps the entries alive; on an exact hit the run restores, rebuilds
+  # only the workspace crates, saves nothing and is done in a few minutes. Off the hour to
+  # dodge the scheduled-load spike.
+  schedule:
+    - cron: "23 5 * * 1,4"
 
+# Only reads the repository; cache writes go through the cache service, not the token.
+permissions:
+  contents: read
+
+# One warm at a time, never cancelled: a schedule and a push landing together would
+# otherwise race to save the same key.
+concurrency:
+  group: cache-deps
+  cancel-in-progress: false
+
+# Identical to pr.yaml on purpose: every variable here is hashed into the cache key.
 env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings -D unused_extern_crates"
@@ -15,13 +72,19 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
+  # Steps up to the cache step mirror pr.yaml's `clippy` job.
   warm-clippy-cache:
     runs-on: ubuntu-latest
+    # Both passes from cold, after a heavy dependency bump; the --all-features pass alone
+    # took 11.5 min with a partial cache.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 1
 
+      # Before the cache step: RUST_NIGHTLY is part of the key.
       - name: Read nightly version
         run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> $GITHUB_ENV
 
@@ -31,18 +94,24 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
+          prefix-key: v1-rust
           shared-key: clippy-cache
-          cache-on-failure: "true"
 
-      - name: Build to populate cache
-        run: cargo +$RUST_NIGHTLY clippy --locked --all --all-features -- -D warnings
+      # The same lane the queue runs, so the same artifacts.
+      - name: Build both clippy passes
+        run: ./etc/ci-lanes.sh clippy
 
+  # Steps up to the cache step mirror pr.yaml's `test` and `adiri-test` jobs.
   warm-test-cache:
     runs-on: ubuntu-latest
+    # Both lanes' test binaries from cold; the default lane alone took 9.5 min with a
+    # partial cache after a heavy dependency bump.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 1
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
@@ -55,8 +124,15 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
+          prefix-key: v1-rust
           shared-key: test-cache
-          cache-on-failure: "true"
 
-      - name: Build to populate cache
-        run: cargo nextest list --locked --workspace
+      # Both test lanes into one target dir. The adiri feature set unifies differently
+      # (tn-reth/adiri pulls in faucet and tn-types/adiri, and resolver-2 unification is
+      # per selected package), so its dependency artifacts are distinct from the default
+      # lane's; the two sets coexist in target/, and rust-cache keeps every variant of a
+      # dependency it finds there. One entry keeps the quota predictable.
+      - name: Build the test binaries of both test lanes
+        run: |
+          ./etc/ci-lanes.sh test-default --build-only
+          ./etc/ci-lanes.sh test-adiri --build-only

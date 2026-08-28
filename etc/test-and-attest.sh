@@ -108,6 +108,11 @@ fi
 # nothing, so it runs first and fails fast)
 ./etc/archive-mode-guard.sh
 
+# guard against rocksdb re-entering the default feature graph (resolves the graph, compiles
+# nothing). The merge queue runs this too; until it ran here as well, the queue enforced a
+# check the attested run had never made.
+./etc/rocksdb-gate.sh
+
 # fmt, clippy and both unit-test lanes. These live in etc/ci-lanes.sh because
 # .github/workflows/pr.yaml runs the very same file, on `pull_request` and again on
 # `merge_group` against main + this PR. One definition, so the queue cannot end up
@@ -148,7 +153,7 @@ echo "all checks passed - submitting attestation on-chain..."
 # Send the transaction using cast
 output=$(cast send --private-key ${PRIVATE_KEY} \
     --rpc-url ${RPC_ENDPOINT} \
-    --chain "2017" \
+    --chain "${CHAIN_ID}" \
     --gas-limit 1000000 \
     ${CONTRACT_ADDRESS} \
     "${ATTEST_CALL}" "${COMMIT_HASH}" "true")

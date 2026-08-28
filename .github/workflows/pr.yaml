@@ -25,6 +25,14 @@
 # and a push to a queued PR removes it from the queue with a new head that is unattested
 # until a maintainer runs `make attest` again.
 #
+# The compile lanes restore their dependency caches and never save them (`save-if:
+# "false"`). A cache saved by a pull_request run is scoped to that PR's branch and one
+# saved by a merge_group run lands on the queue's throwaway branch, so no other run could
+# read either; the upload would only add minutes to the critical path and consume quota
+# that evicts the entries the queue does read. Those are written on main by
+# .github/workflows/cache-deps.yaml, and the cache steps here must stay in lockstep with
+# it: same env block, same steps before the cache step. Its header has the details.
+#
 # The fmt, clippy and test lanes below do not spell out their own commands. They call
 # etc/ci-lanes.sh, which etc/test-and-attest.sh also calls, so what the merge queue
 # enforces and what a maintainer attests locally are the same commands by construction
@@ -56,6 +64,7 @@ concurrency:
 permissions:
   contents: read
 
+# Identical to cache-deps.yaml on purpose: every variable here is hashed into the cache key.
 env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings -D unused_extern_crates"
@@ -164,40 +173,58 @@ jobs:
   #
   # Two passes, default features and then --all-features (see etc/ci-lanes.sh for why one
   # does not cover the other). The two feature sets unify differently, so each pass
-  # compiles its own artifacts and the lane costs roughly twice what a single pass did.
-  # The timeout is sized for both, not one.
+  # compiles its own artifacts; cache-deps.yaml warms both.
+  #
+  # 45 minutes is a ceiling, not the budget. Warm, the --all-features pass compiled in 20 s
+  # on main (checkout with submodules ~80 s, restore ~20 s), so expect a few minutes. The
+  # ceiling covers the window after a heavy dependency bump before cache-deps has
+  # re-warmed: 11.5 min measured for one pass with a partial cache. A lane anywhere near
+  # 45 min means the cache is broken, not that the build is slow.
   clippy:
     needs: ci-scope
     if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
 
+      # Before the cache step: RUST_NIGHTLY is part of the cache key (rust-cache hashes
+      # every CARGO*/RUST* variable in the environment), and cache-deps.yaml sets it at
+      # the same point.
       - name: Read nightly version
         run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> $GITHUB_ENV
 
       - name: Install nightly toolchain
         run: rustup toolchain install $RUST_NIGHTLY -c clippy,rust-src --profile minimal
 
+      # Restore only; cache-deps.yaml writes the entries on main (see the header). The
+      # `prefix-key` deliberately still defaults to v0-rust: the v1-rust entries cache-deps
+      # now writes do not exist until it has run on main, and a fully cold queue run would
+      # hit the timeout. Flip all three cache steps to `prefix-key: v1-rust` in a follow-up
+      # once it has (see .github/ACTIONS.md, "Caches").
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
           shared-key: clippy-cache
-          cache-on-failure: "true"
+          save-if: "false"
 
       - name: Run clippy
         run: ./etc/ci-lanes.sh clippy
 
-  # Tests - compile and run with nextest for parallel execution
+  # Tests - compile and run with nextest for parallel execution.
+  #
+  # 45 minutes is a ceiling, not the budget. Warm, every workspace test binary built in
+  # 1 m 48 s on main. The suite's own run time on a GitHub runner is unmeasured (every
+  # recent PR was maintainer-authored and skipped this lane), and the ceiling also covers
+  # a cold dependency build after a heavy bump: 9.5 min measured with a partial cache.
   test:
     needs: ci-scope
     if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -212,11 +239,19 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Restore only; see the clippy job.
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
           shared-key: test-cache
-          cache-on-failure: "true"
+          save-if: "false"
+
+      # Resolves the dependency graph only (compiles nothing; seconds, with the registry
+      # index restored above). The script says why rocksdb must stay out of the default
+      # graph. It runs inside this job to reuse the restored cargo home instead of cloning
+      # reth's git repository again in a job of its own.
+      - name: Assert rocksdb absent from the default feature graph
+        run: ./etc/rocksdb-gate.sh
 
       - name: Run tests
         # `ci` profile: retries = 2, so a flake is less likely to eject a PR from the
@@ -228,12 +263,12 @@ jobs:
   # Adiri feature lane: the adiri-gated suites only compile under the adiri features, so
   # the default-feature test job above never builds or runs them. The package and feature
   # list lives in etc/ci-lanes.sh, next to the note on which packages are deliberately
-  # left off it.
+  # left off it. Same 45-minute ceiling as `test`, for the same reasons.
   adiri-test:
     needs: ci-scope
     if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -248,51 +283,19 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Restore only (see the clippy job), from the same entry as `test`: cache-deps builds
+      # both test lanes into one target dir, where the adiri variants of the shared
+      # dependencies coexist with the default ones.
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
-          shared-key: adiri-test-cache
-          cache-on-failure: "true"
+          shared-key: test-cache
+          save-if: "false"
 
       - name: Run adiri-gated tests
         env:
           NEXTEST_PROFILE: ci
         run: ./etc/ci-lanes.sh test-adiri
-
-  # Guard: rocksdb (librocksdb-sys, the entire RocksDB C++ engine and the single largest
-  # native compile in the tree) must stay out of the default feature graph. It is gated
-  # behind the off-by-default `rocksdb` feature; this catches a future reth bump whose
-  # default set silently re-introduces it. Resolves the graph only - nothing is compiled.
-  rocksdb-gate:
-    needs: ci-scope
-    if: needs.ci-scope.outputs.run_lanes == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
-        with:
-          shared-key: rocksdb-gate-cache
-          cache-on-failure: "true"
-
-      - name: Assert rocksdb absent from default feature graph
-        run: |
-          # Structured check: count rocksdb packages in the feature-resolved metadata
-          # graph instead of scraping cargo's error wording. A cargo/jq failure fails
-          # the assignment (bash -e -o pipefail), so infrastructure errors fail closed.
-          hits=$(cargo metadata --locked --format-version 1 \
-            | jq '[.resolve.nodes[].id | select(test("[/#]rocksdb@"))] | length')
-          if [[ "$hits" -ne 0 ]]; then
-            echo "librocksdb-sys re-entered the default dependency graph ($hits rocksdb package(s) resolved):"
-            cargo tree --locked -e features -i rocksdb || true
-            exit 1
-          fi
-          echo "rocksdb absent from the default feature graph"
 
   # Guard: pinned consensus-registry reads (committee membership, epoch records, epoch state,
   # worker fee configs) resolve historical state through `state_by_block_hash`, which reth fails
@@ -318,7 +321,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, rocksdb-gate, archive-mode-gate]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate]
     steps:
       - name: Check all jobs passed
         env:
@@ -345,7 +348,7 @@ jobs:
           # The job list is asserted, not discovered: a job renamed or dropped from
           # `needs` would otherwise leave this check silently, or turn up as an unnamed
           # lane whose `skipped` the pull_request branch below accepts.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy fmt rocksdb-gate test"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy fmt test"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
