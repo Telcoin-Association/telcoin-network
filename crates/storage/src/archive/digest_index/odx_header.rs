@@ -5,7 +5,6 @@ use crate::archive::{
     data_file::fsync_directory,
     data_file_mmap::{MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     error::load_header::LoadHeaderError,
-    pack::{FileBackend, PackFileIo},
 };
 use std::{
     io::{Read, Seek, SeekFrom, Write},
@@ -75,24 +74,6 @@ impl OdxHeader {
     }
 
     /// Open the index overflow file (odx file) and return the open file and header.
-    pub fn open_odx_file<P: AsRef<Path>>(
-        version: u16,
-        uid: u64,
-        appnum: u32,
-        path: P,
-        read_only: bool,
-        backend: FileBackend,
-    ) -> Result<(Box<dyn PackFileIo>, OdxHeader), LoadHeaderError> {
-        let path = path.as_ref();
-        // odx is an append-only overflow log (`append = true`); writes go to EOF via explicit seek.
-        let mut file = backend.open_boxed_random(path, read_only, true)?;
-
-        let header = Self::open_header(&mut file, version, uid, appnum, path, read_only)?;
-        Ok((file, header))
-    }
-
-    /// Open the index overflow file (odx file) and return the open file and header.
-    /// This returns an mmap specific version.
     pub fn open_odx_file_mmap<P: AsRef<Path>>(
         version: u16,
         uid: u64,

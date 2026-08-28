@@ -15,7 +15,7 @@ use tracing::{error, info};
 
 use crate::{
     archive::{
-        digest_index::index_directio::HdxIndexDirectIO,
+        digest_index::HdxIndex,
         error::{fetch::FetchError, open::OpenError},
         fxhasher::FxHasher,
         index::Index as _,
@@ -270,7 +270,7 @@ pub const DATA_NAME: &str = Inner::DATA_NAME;
 #[derive(Debug)]
 struct Inner {
     data: Pack<Certificate>,
-    digest_idx: HdxIndexDirectIO,
+    digest_idx: HdxIndex,
 }
 
 impl Inner {
@@ -290,7 +290,7 @@ impl Inner {
             PACK_VERSION,
         )?;
         let builder = BuildHasherDefault::<FxHasher>::default();
-        let mut digest_idx = HdxIndexDirectIO::open_hdx_file(
+        let mut digest_idx = HdxIndex::open_hdx_file(
             base_dir.join(Self::HASH_NAME),
             data.header(),
             builder,

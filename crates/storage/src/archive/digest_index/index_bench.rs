@@ -1,13 +1,6 @@
-//! On-demand benchmark comparing the digest-index implementations: the buffered/direct-IO
-//! [`HdxIndexDirectIO`](super::index_directio::HdxIndexDirectIO) (raw `File` + in-memory bucket
-//! cache) vs the cache-free, zero-copy memory-mapped [`HdxIndex`](super::index::HdxIndex). Three
-//! columns:
-//! - `hdx-buf`  — `HdxIndexDirectIO` on the buffered `File` backend (the direct-IO version).
-//! - `hdx-mmap` — `HdxIndexDirectIO` on the mmap file backend (same cached logic — isolates the
-//!   file backend).
-//! - `mmap`     — `HdxIndex`, the cache-free, zero-copy index. It defers CRC: each write zeros the
-//!   bucket's CRC trailer (a "dirty" marker) and only the dirty buckets are CRC'd at `sync()` (the
-//!   WAL/rebuildable regime; reads do not verify a per-op CRC).
+//! On-demand performance-regression benchmark for the memory-mapped
+//! [`HdxIndex`](super::index::HdxIndex) digest index — the single digest-index implementation. It
+//! reports one `HdxIndex` column so runs can be compared over time to catch regressions.
 //!
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
 //!
@@ -16,23 +9,20 @@
 //! ```
 //!
 //! It sweeps a set of index sizes `N` (env `HDX_BENCH_N=200000,2000000` overrides; default
-//! `[200k, 2M, 8M]`). The default's 8M crosses the buffered `CACHED_BUCKETS = 400_000` cache
-//! (~6.4M keys), where the ranking is expected to flip toward the page-cache-backed mmap index —
-//! set a smaller env list if RAM/disk-constrained (the 8M column needs a few GB). Rows per size:
-//! `insert` (N saves, no sync), `sync_bulk` (one `sync()`), `load_hit` / `load_miss` (N random
-//! point lookups, present / absent), `reopen_load` (reopen read-only then N lookups); plus one
-//! fixed `insert_dur` probe (K_DUR save+sync pairs).
+//! `[200k, 2M, 8M]`; the 8M size needs a few GB, so trim via the env if RAM/disk-constrained). Rows
+//! per size: `insert` (N saves, no sync), `sync_bulk` (one `sync()`), `load_hit` / `load_miss` (N
+//! random point lookups, present / absent), `reopen_load` (reopen read-only then N lookups); plus
+//! one fixed `insert_dur` probe (K_DUR save+sync pairs).
 //!
-//! Framing: `sync_bulk`/`insert_dur` measure the *index* durability barrier. If the index is not
-//! synced (rebuilt from the data-log WAL on unclean shutdown), those rows are moot and `mmap`'s
-//! cheap insert/load is what matters — deferring the CRC off the per-op path to a targeted `sync`
-//! (only the dirty, zero-CRC buckets are CRC'd) makes per-op sync (`insert_dur`) cheap, while a
-//! full-build `sync_bulk` (nearly all buckets dirty) stays roughly the same.
+//! Framing: `sync_bulk`/`insert_dur` measure the *index* durability barrier. The index is rebuilt
+//! from the data-log WAL on an unclean shutdown, so it defers CRC off the per-op path: each write
+//! zeros the bucket's CRC trailer (a "dirty" marker) and only the dirty buckets are CRC'd at
+//! `sync()` (reads do not verify a per-op CRC). That makes per-op sync (`insert_dur`) cheap, while
+//! a full-build `sync_bulk` (nearly all buckets dirty) is the worst case.
 //!
 //! Caveats: under `#[cfg(test)]` the bloom filter is 64 KB (2 MB in prod), so `load_miss` probes
-//! more buckets than production — both impls share it, so the comparison is fair. `reopen_load` is
-//! cold only in-process (the file stays in the OS page cache). macOS `fsync` is not a full barrier
-//! — run on Linux/SSD for the durability rows.
+//! more buckets than production. `reopen_load` is cold only in-process (the file stays in the OS
+//! page cache). macOS `fsync` is not a full barrier — run on Linux/SSD for the durability rows.
 
 use std::{
     hash::BuildHasherDefault,
@@ -43,11 +33,11 @@ use std::{
 use tempfile::TempDir;
 use tn_types::B256;
 
-use super::{index::HdxIndex, index_directio::HdxIndexDirectIO};
+use super::index::HdxIndex;
 use crate::archive::{
     fxhasher::FxHasher,
     index::Index,
-    pack::{DataHeader, FileBackend, PackCompression},
+    pack::{DataHeader, PackCompression},
 };
 
 /// Per-op durable inserts (a `sync()` after each — 2 barriers/op; N-independent, kept modest).
@@ -194,22 +184,6 @@ fn row_labels(sizes: &[u64]) -> Vec<String> {
     rows
 }
 
-fn open_hdx(
-    header: &DataHeader,
-    dir: &Path,
-    read_only: bool,
-    backend: FileBackend,
-) -> HdxIndexDirectIO {
-    HdxIndexDirectIO::open_hdx_file_with_backend(
-        dir.join("hdx"),
-        header,
-        BuildHasherDefault::<FxHasher>::default(),
-        read_only,
-        backend,
-    )
-    .expect("open hdx")
-}
-
 fn open_mmap(header: &DataHeader, dir: &Path, read_only: bool) -> HdxIndex {
     HdxIndex::open_hdx_file(
         dir.join("hdx"),
@@ -224,10 +198,8 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     let label_w = rows.iter().map(|s| s.len()).max().unwrap_or(0).max("benchmark".len());
     let cell_w = 12usize;
 
-    println!(
-        "\n=== digest index: direct-IO (HdxIndexDirectIO) vs mmap (HdxIndex) (ms; lower is better) ==="
-    );
-    println!("legend: hdx-buf = buffered File + bucket cache; hdx-mmap = same cache on an mmap file; mmap = cache-free mmap, per-op CRC replaced by a zeroed dirty marker, only dirty buckets CRC'd at sync (WAL/rebuildable regime; no per-op CRC on read). insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. Default N sweep crosses the 400k-bucket buffered cache at 8M. test-cfg bloom is 64 KB; run on Linux/SSD.");
+    println!("\n=== digest index: HdxIndex (ms; lower is better) ===");
+    println!("legend: HdxIndex = cache-free mmap; per-op CRC replaced by a zeroed dirty marker, only dirty buckets CRC'd at sync (WAL/rebuildable regime; no per-op CRC on read). insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. test-cfg bloom is 64 KB; run on Linux/SSD.");
 
     print!("{:<label_w$}", "benchmark", label_w = label_w);
     for (name, _) in cols {
@@ -248,31 +220,20 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     println!();
 }
 
-/// Compare the direct-IO `HdxIndexDirectIO` (buffered + mmap file) against the cache-free,
-/// deferred-CRC `HdxIndex`, swept across index sizes.
+/// Benchmark the cache-free, deferred-CRC `HdxIndex` across index sizes, as a regression baseline.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
 /// `cargo test -p tn-storage digest_index_bench -- --ignored --nocapture --test-threads 1`.
 #[test]
-#[ignore = "on-demand digest-index direct-IO vs mmap comparison; run with --ignored --nocapture --test-threads 1"]
+#[ignore = "on-demand HdxIndex perf-regression benchmark; run with --ignored --nocapture --test-threads 1"]
 fn digest_index_bench() {
     let header = DataHeader::new(0, PackCompression::None, 0);
     let sizes = n_sizes();
     let rows = row_labels(&sizes);
     let mut cols: Vec<(&str, Vec<Duration>)> = Vec::new();
 
-    println!("  running hdx-buf ...");
-    cols.push((
-        "hdx-buf",
-        column(|dir, ro| open_hdx(&header, dir, ro, FileBackend::Buffered), &sizes),
-    ));
-    println!("  running hdx-mmap ...");
-    cols.push((
-        "hdx-mmap",
-        column(|dir, ro| open_hdx(&header, dir, ro, FileBackend::Mmap), &sizes),
-    ));
-    println!("  running mmap ...");
-    cols.push(("mmap", column(|dir, ro| open_mmap(&header, dir, ro), &sizes)));
+    println!("  running HdxIndex ...");
+    cols.push(("HdxIndex", column(|dir, ro| open_mmap(&header, dir, ro), &sizes)));
 
     print_table(&rows, &cols);
 }

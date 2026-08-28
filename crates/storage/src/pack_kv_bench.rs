@@ -3,7 +3,7 @@
 //! Gauges whether a "pack file + added features" store could replace MDBX on raw point-KV
 //! performance. It pits a minimal pack-file KV — the existing append-only data log
 //! ([`Pack`](crate::archive::pack::Pack)) keyed by the hash digest index
-//! ([`DigestIndex`](crate::archive::digest_index::DigestIndex)) — against MDBX across the common
+//! ([`HdxIndex`](crate::archive::digest_index::HdxIndex)) — against MDBX across the common
 //! subset both can do: bulk write, per-commit durable write, and random point reads.
 //!
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
@@ -13,8 +13,8 @@
 //! ```
 //!
 //! ## Columns
-//! - `pack-buf` / `pack-mmap` — the pack KV on the buffered (`fsync`) vs memory-mapped (`msync`)
-//!   file backend.
+//! - `pack-buf` / `pack-mmap` — the pack KV with the *data log* on the buffered (`fsync`) vs
+//!   memory-mapped (`msync`) file backend. The hash index is always the mmap `HdxIndex`.
 //! - `mdbx-durable` — MDBX with real fsync-on-commit (via `TN_TEST_MDBX_SYNC=durable`, set by the
 //!   bench). This is the apples-to-apples durability comparison.
 //! - `mdbx-nosync` — MDBX in `SafeNoSync` (the `#[cfg(test)]` default): commits without fsync, for
@@ -43,7 +43,7 @@ use tempfile::TempDir;
 use tn_types::B256;
 
 use crate::archive::{
-    digest_index::DigestIndex,
+    digest_index::HdxIndex,
     fxhasher::FxHasher,
     index::Index as _,
     pack::{FileBackend, Pack, PackCompression},
@@ -102,7 +102,7 @@ trait KvStore {
 
 struct PackKv {
     data: Pack<Vec<u8>>,
-    index: DigestIndex,
+    index: HdxIndex,
 }
 
 impl PackKv {
@@ -116,12 +116,11 @@ impl PackKv {
             backend,
         )
         .expect("open pack data");
-        let index = DigestIndex::open_hdx_file(
+        let index = HdxIndex::open_hdx_file(
             dir.join("idx"),
             data.header(),
             BuildHasherDefault::<FxHasher>::default(),
             false,
-            backend,
         )
         .expect("open digest index");
         Self { data, index }

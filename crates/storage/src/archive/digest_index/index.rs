@@ -1,12 +1,10 @@
 //! The memory-mapped, cache-free digest index — the default backend for a pack's hash indexes.
 //!
 //! [`HdxIndex`] implements the [`Index`] trait over two memory-mapped files (the `hdx` buckets and
-//! the `odx` overflow log) and keeps **no bucket caches**. Its buffered/direct-IO sibling
-//! [`HdxIndexDirectIO`](super::index_directio::HdxIndexDirectIO) copies every bucket into `Vec<u8>`
-//! buffers held in `HashMap`/`VecDeque` caches; this one instead reads bucket bytes **directly from
+//! the `odx` overflow log) and keeps **no bucket caches**: it reads bucket bytes **directly from
 //! the mapping** (zero-copy) and writes each modified bucket straight back through it. On an mmap
-//! file the OS page cache already *is* the bucket cache, so those extra copies are pure overhead.
-//! Both share the **same on-disk format**, so their files are cross-compatible.
+//! file the OS page cache already *is* the bucket cache, so a separate in-memory bucket cache would
+//! be pure overhead.
 //!
 //! ## Reads (zero-copy)
 //! [`HdxIndex::find_in_bucket`] borrows the target bucket from the hdx mapping, scans it, and — on
@@ -38,12 +36,11 @@
 use tn_types::B256;
 
 use crate::archive::{
-    crc::{add_crc32, crc_is_zero, crc_state, zero_crc, CrcState},
+    crc::{add_crc32, check_crc, crc_is_zero, crc_state, zero_crc, CrcState},
     data_file::fsync_directory,
     data_file_mmap::{MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     digest_index::{
         bloom::{Bloom, BLOOM_SIZE_BYTES},
-        index_directio::{HdxHeader, HdxIndexDirectIO, HEADER_SIZE},
         odx_header::OdxHeader,
     },
     error::{
@@ -51,7 +48,7 @@ use crate::archive::{
     },
     fxhasher::FxHasher,
     index::Index,
-    pack::DataHeader,
+    pack::{DataHeader, DATA_HEADER_BYTES},
 };
 use std::{
     collections::BTreeSet,
@@ -61,6 +58,202 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Size of a header.
+const HEADER_SIZE: usize = 68;
+
+/// Header for an hdx (index) file.  This contains the hash buckets for lookups.
+/// This file is not a log file and the header and buckets will change in place over time.
+/// This data in the file will be followed by a CRC32 checksum value to verify it.
+#[derive(Debug)]
+struct HdxHeader {
+    type_id: [u8; 8], // The characters "telcoinx"
+    version: u16,     // Holds the version number
+    uid: u64,         // Unique ID generated on creation
+    appnum: u32,      // Application defined constant
+    buckets: u32,
+    bucket_elements: u16,
+    bucket_size: u16,
+    salt: u64,
+    pepper: u64,
+    load_factor: u16,
+    values: u64,
+    data_file_length: u64,
+}
+
+impl HdxHeader {
+    /// Return a default HdxHeader with any values from data_header overridden.
+    /// This includes the version, uid, appnum, bucket_size and bucket_elements.
+    fn from_data_header<const KSIZE: usize, S: BuildHasher + Default>(
+        data_header: &DataHeader,
+        salt: u64,
+        pepper: u64,
+    ) -> Self {
+        Self {
+            type_id: *b"telcoinx",
+            version: data_header.version(),
+            uid: data_header.uid(),
+            appnum: data_header.appnum(),
+            bucket_elements: HdxIndex::<KSIZE, S>::BUCKET_ELEMENTS as u16,
+            bucket_size: HdxIndex::<KSIZE, S>::BUCKET_SIZE as u16,
+            buckets: HdxIndex::<KSIZE, S>::INITIAL_BUCKETS as u32,
+            load_factor: (u16::MAX as f32 * 0.5) as u16,
+            salt,
+            pepper,
+            values: 0,
+            data_file_length: DATA_HEADER_BYTES as u64,
+        }
+    }
+
+    /// Load a HdxHeader from a file.  This will seek to the beginning and leave the file
+    /// positioned after the header.
+    fn load_header<F: Read + Seek + ?Sized>(hdx_file: &mut F) -> Result<Self, LoadHeaderError> {
+        hdx_file.rewind()?;
+        let mut buffer = [0_u8; HEADER_SIZE];
+        let mut buf16 = [0_u8; 2];
+        let mut buf32 = [0_u8; 4];
+        let mut buf64 = [0_u8; 8];
+        let mut pos = 0;
+        hdx_file.read_exact(&mut buffer[..])?;
+        if !check_crc(&buffer[..]) {
+            return Err(LoadHeaderError::CrcFailed);
+        }
+        let mut type_id = [0_u8; 8];
+        type_id.copy_from_slice(&buffer[0..8]);
+        pos += 8;
+        if &type_id != b"telcoinx" {
+            return Err(LoadHeaderError::InvalidType);
+        }
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let version = u16::from_le_bytes(buf16);
+        pos += 2;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let uid = u64::from_le_bytes(buf64);
+        pos += 8;
+        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
+        let appnum = u32::from_le_bytes(buf32);
+        pos += 4;
+        buf32.copy_from_slice(&buffer[pos..(pos + 4)]);
+        let buckets = u32::from_le_bytes(buf32);
+        pos += 4;
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let bucket_elements = u16::from_le_bytes(buf16);
+        pos += 2;
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let bucket_size = u16::from_le_bytes(buf16);
+        pos += 2;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let salt = u64::from_le_bytes(buf64);
+        pos += 8;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let pepper = u64::from_le_bytes(buf64);
+        pos += 8;
+        buf16.copy_from_slice(&buffer[pos..(pos + 2)]);
+        let load_factor = u16::from_le_bytes(buf16);
+        pos += 2;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let values = u64::from_le_bytes(buf64);
+        pos += 8;
+        buf64.copy_from_slice(&buffer[pos..(pos + 8)]);
+        let data_file_length = u64::from_le_bytes(buf64);
+        let header = Self {
+            type_id,
+            version,
+            uid,
+            appnum,
+            buckets,
+            bucket_elements,
+            bucket_size,
+            salt,
+            pepper,
+            load_factor,
+            values,
+            data_file_length,
+        };
+        Ok(header)
+    }
+
+    /// Write this header to sync at current seek position.
+    fn write_header<F: Write + Seek + ?Sized>(
+        &mut self,
+        hdx_file: &mut F,
+    ) -> Result<(), io::Error> {
+        hdx_file.rewind()?;
+        let header_size = self.header_size();
+        let mut buffer = vec![0_u8; header_size];
+        let mut pos = 0;
+        buffer[pos..8].copy_from_slice(&self.type_id);
+        pos += 8;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.version.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.uid.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + 4)].copy_from_slice(&self.appnum.to_le_bytes());
+        pos += 4;
+        buffer[pos..(pos + 4)].copy_from_slice(&self.buckets.to_le_bytes());
+        pos += 4;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.bucket_elements.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.bucket_size.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.salt.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.pepper.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + 2)].copy_from_slice(&self.load_factor.to_le_bytes());
+        pos += 2;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.values.to_le_bytes());
+        pos += 8;
+        buffer[pos..(pos + 8)].copy_from_slice(&self.data_file_length.to_le_bytes());
+        add_crc32(&mut buffer[..]);
+        hdx_file.write_all(&buffer[..])?;
+        Ok(())
+    }
+
+    /// Return the size of the HDX header.
+    fn header_size(&self) -> usize {
+        HEADER_SIZE
+    }
+
+    /// Number of elements in each bucket.
+    fn bucket_elements(&self) -> u16 {
+        self.bucket_elements
+    }
+
+    /// Size in bytes of a bucket.
+    fn bucket_size(&self) -> u16 {
+        self.bucket_size
+    }
+
+    /// Load factor converted to a f32.
+    fn load_factor(&self) -> f32 {
+        self.load_factor as f32 / u16::MAX as f32
+    }
+
+    /// File version number.
+    fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Unique ID generated on creation
+    fn uid(&self) -> u64 {
+        self.uid
+    }
+
+    /// Application defined constant
+    fn appnum(&self) -> u32 {
+        self.appnum
+    }
+
+    /// Return the index salt.
+    fn salt(&self) -> u64 {
+        self.salt
+    }
+
+    /// Return the index pepper.
+    fn pepper(&self) -> u64 {
+        self.pepper
+    }
+}
 /// A hash digest index (256-bit digest -> u64 record position) that is memory-mapped only and
 /// reads/writes hash buckets directly through the mapping with no in-memory bucket caches.
 ///
@@ -100,11 +293,14 @@ pub struct BucketCrcReport {
 
 impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// Bytes of one bucket element: a KSIZE-byte digest plus its u64 record position.
-    const BUCKET_ELEMENT_SIZE: usize = HdxIndexDirectIO::<KSIZE, S>::BUCKET_ELEMENT_SIZE;
+    const BUCKET_ELEMENT_SIZE: usize = KSIZE + 8;
     /// Elements a bucket holds before overflowing to the odx log.
-    const BUCKET_ELEMENTS: usize = HdxIndexDirectIO::<KSIZE, S>::BUCKET_ELEMENTS;
-    /// On-disk size in bytes of one bucket (including its trailing CRC32).
-    const BUCKET_SIZE: usize = HdxIndexDirectIO::<KSIZE, S>::BUCKET_SIZE;
+    const BUCKET_ELEMENTS: usize = 32;
+    /// On-disk size in bytes of one bucket: an 8-byte overflow pointer + 4-byte element count +
+    /// the elements + a trailing 4-byte CRC32.
+    const BUCKET_SIZE: usize = 16 + (Self::BUCKET_ELEMENT_SIZE * Self::BUCKET_ELEMENTS);
+    /// Number of buckets to allocate in a fresh index.
+    const INITIAL_BUCKETS: usize = 1_000;
 
     /// Open (creating if empty) a memory-mapped HDX index in directory `dir`.
     ///
@@ -680,7 +876,6 @@ mod tests {
     use tn_types::DefaultHashFunction;
 
     use super::*;
-    use crate::archive::{digest_index::index_directio::HdxIndexDirectIO, pack::FileBackend};
 
     fn key(i: u64) -> B256 {
         let mut hasher = DefaultHashFunction::new();
@@ -762,76 +957,6 @@ mod tests {
             matches!(res, Err(LoadHeaderError::InvalidIndexGeometry)),
             "expected InvalidIndexGeometry, got {res:?}"
         );
-    }
-
-    /// The on-disk format is identical across backends: a file written by the mmap `HdxIndex` reads
-    /// back correctly through `HdxIndexDirectIO`, and vice versa — a file written by
-    /// `HdxIndexDirectIO` on the buffered backend reads back through the mmap `HdxIndex`.
-    #[test]
-    fn test_archive_hdx_cross_compat() {
-        let tmp_dir = TempDir::with_prefix("test_archive_hdx_cross").expect("temp dir");
-        let tmp_path = tmp_dir.path();
-        let data_header = DataHeader::new(0, crate::archive::pack::PackCompression::ZStd, 0);
-        // Force some splits + overflow so both the hdx and odx paths are exercised.
-        const N: u64 = 20_000;
-
-        // (a) mmap writer -> HdxIndex (mmap backend) reader.
-        let dir_a = tmp_path.join("a.hdx");
-        {
-            let mut idx: HdxIndex = HdxIndex::open_hdx_file(
-                &dir_a,
-                &data_header,
-                BuildHasherDefault::<FxHasher>::default(),
-                false,
-            )
-            .expect("mmap writer");
-            for i in 0..N {
-                idx.save(key(i), i).expect("save");
-            }
-            idx.sync().expect("sync");
-        }
-        {
-            let mut idx: HdxIndexDirectIO = HdxIndexDirectIO::open_hdx_file_with_backend(
-                &dir_a,
-                &data_header,
-                BuildHasherDefault::<FxHasher>::default(),
-                true,
-                FileBackend::Mmap,
-            )
-            .expect("HdxIndex reader");
-            for i in 0..N {
-                assert_eq!(idx.load(key(i)).expect("load via HdxIndex"), i);
-            }
-        }
-
-        // (b) HdxIndex (buffered backend) writer -> mmap reader.
-        let dir_b = tmp_path.join("b.hdx");
-        {
-            let mut idx: HdxIndexDirectIO = HdxIndexDirectIO::open_hdx_file_with_backend(
-                &dir_b,
-                &data_header,
-                BuildHasherDefault::<FxHasher>::default(),
-                false,
-                FileBackend::Buffered,
-            )
-            .expect("buffered writer");
-            for i in 0..N {
-                idx.save(key(i), i).expect("save");
-            }
-            idx.sync().expect("sync");
-        }
-        {
-            let mut idx: HdxIndex = HdxIndex::open_hdx_file(
-                &dir_b,
-                &data_header,
-                BuildHasherDefault::<FxHasher>::default(),
-                true,
-            )
-            .expect("mmap reader");
-            for i in 0..N {
-                assert_eq!(idx.load(key(i)).expect("load via HdxIndex"), i);
-            }
-        }
     }
 
     /// The zero-CRC "dirty" sentinel. A freshly-opened index is all-valid; a write leaves its

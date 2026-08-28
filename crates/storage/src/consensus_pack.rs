@@ -33,7 +33,7 @@ use tracing::{debug, error};
 
 use crate::archive::{
     data_file::create_dir_synced,
-    digest_index::DigestIndex,
+    digest_index::HdxIndex,
     error::{
         fetch::FetchError,
         load_header::LoadHeaderError,
@@ -634,8 +634,8 @@ struct Inner {
     /// and last (exclusive) bytes of the encoded data for a ConsensusOutput as well as just
     /// the ConsensusHeader.
     consensus_pos_idx: PositionIndex<IndexPositions>,
-    consensus_digests: DigestIndex,
-    batch_digests: DigestIndex,
+    consensus_digests: HdxIndex,
+    batch_digests: HdxIndex,
     epoch_meta: EpochMeta,
 }
 
@@ -649,8 +649,8 @@ impl Inner {
     fn files_consistent(
         data: &Pack<PackRecord>,
         consensus_pos_idx: &mut PositionIndex<IndexPositions>,
-        consensus_digests: &DigestIndex,
-        batch_digests: &DigestIndex,
+        consensus_digests: &HdxIndex,
+        batch_digests: &HdxIndex,
     ) -> bool {
         let pack_len = data.file_len();
         let consensus_final = consensus_digests.data_file_length();
@@ -689,10 +689,9 @@ impl Inner {
         data: &mut Pack<PackRecord>,
         base_dir: P,
         mut consensus_pos_idx: PositionIndex<IndexPositions>,
-        consensus_digests: DigestIndex,
-        batch_digests: DigestIndex,
-        backend: FileBackend,
-    ) -> Result<(PositionIndex<IndexPositions>, DigestIndex, DigestIndex), PackError> {
+        consensus_digests: HdxIndex,
+        batch_digests: HdxIndex,
+    ) -> Result<(PositionIndex<IndexPositions>, HdxIndex, HdxIndex), PackError> {
         if Self::files_consistent(data, &mut consensus_pos_idx, &consensus_digests, &batch_digests)
         {
             return Ok((consensus_pos_idx, consensus_digests, batch_digests));
@@ -706,7 +705,7 @@ impl Inner {
         std::fs::remove_dir_all(base_dir.join(Self::CONSENSUS_HASH_NAME))?;
         std::fs::remove_dir_all(base_dir.join(Self::BATCH_HASH_NAME))?;
         let (mut consensus_digests, mut batch_digests) =
-            Self::open_digest_indexes(base_dir, data.header(), false, backend)?;
+            Self::open_digest_indexes(base_dir, data.header(), false)?;
 
         let mut iter = data.raw_iter().map_err(DataFileOpen)?;
         // 0-based local index of the output within this pack (mirrors `save_consensus_output`).
@@ -846,30 +845,26 @@ impl Inner {
         Ok(consensus_pos_idx)
     }
 
-    /// Open (creating if empty) both of an epoch's digest indexes on the chosen file `backend`,
-    /// returning `(consensus_digests, batch_digests)`. The backend flows from the pack open, so a
-    /// buffered pack gets buffered (`HdxIndexDirectIO`) digest indexes and an mmap pack gets
-    /// cache-free mmap (`HdxIndex`) ones; both share the same on-disk format.
+    /// Open (creating if empty) both of an epoch's digest indexes, returning
+    /// `(consensus_digests, batch_digests)`. The digest index is always the cache-free,
+    /// memory-mapped [`HdxIndex`].
     fn open_digest_indexes(
         base_dir: &Path,
         data_header: &DataHeader,
         read_only: bool,
-        backend: FileBackend,
-    ) -> Result<(DigestIndex, DigestIndex), PackError> {
-        let consensus_digests = DigestIndex::open_hdx_file(
+    ) -> Result<(HdxIndex, HdxIndex), PackError> {
+        let consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
             data_header,
             BuildHasherDefault::<FxHasher>::default(),
             read_only,
-            backend,
         )
         .map_err(OpenError::IndexFileOpen)?;
-        let batch_digests = DigestIndex::open_hdx_file(
+        let batch_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::BATCH_HASH_NAME),
             data_header,
             BuildHasherDefault::<FxHasher>::default(),
             read_only,
-            backend,
         )
         .map_err(OpenError::IndexFileOpen)?;
         Ok((consensus_digests, batch_digests))
@@ -921,7 +916,7 @@ impl Inner {
         }
         let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
         let (mut consensus_digests, mut batch_digests) =
-            Self::open_digest_indexes(&base_dir, data.header(), false, backend)?;
+            Self::open_digest_indexes(&base_dir, data.header(), false)?;
         if !have_pack {
             // If this is a new DB then update the file lengths in indexes after create.
             let len = data.file_len();
@@ -935,7 +930,6 @@ impl Inner {
             consensus_pos_idx,
             consensus_digests,
             batch_digests,
-            backend,
         )?;
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
@@ -962,7 +956,7 @@ impl Inner {
             .into_epoch()?;
         let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
         let (consensus_digests, batch_digests) =
-            Self::open_digest_indexes(&base_dir, data.header(), false, backend)?;
+            Self::open_digest_indexes(&base_dir, data.header(), false)?;
 
         // Rebuild the indexes from the data-log WAL and truncate any torn tail record.
         let (consensus_pos_idx, consensus_digests, batch_digests) = Self::recover_pack(
@@ -971,7 +965,6 @@ impl Inner {
             consensus_pos_idx,
             consensus_digests,
             batch_digests,
-            backend,
         )?;
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
@@ -998,7 +991,7 @@ impl Inner {
             .into_epoch()?;
         let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), true, backend)?;
         let (consensus_digests, batch_digests) =
-            Self::open_digest_indexes(&base_dir, data.header(), true, backend)?;
+            Self::open_digest_indexes(&base_dir, data.header(), true)?;
 
         if !Self::files_consistent(
             &data,
@@ -1045,7 +1038,7 @@ impl Inner {
             .map_err(|e| PackError::Append(e.to_string()))?;
         let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false, backend)?;
         let (consensus_digests, batch_digests) =
-            Self::open_digest_indexes(&base_dir, data.header(), false, backend)?;
+            Self::open_digest_indexes(&base_dir, data.header(), false)?;
         let mut parent_digest_expectation = if epoch == 0 {
             // Don't worry about consensus block 1 in epoch 0, if it is invalid other verifications
             // will fail (for instance epoch 0 final state will not verify). This can be set but
