@@ -341,84 +341,13 @@ fn test_removed_selectors_are_rejected() {
 }
 
 // ==============================
-// `DELEGATECALL` storage-target regression
-// ==============================
-
-/// Address used to host the `DELEGATECALL` relay contract in
-/// [`test_delegatecall_writes_target_precompile_storage`].
-const RELAY_ADDR: Address = address!("dddd0000000000000000000000000000000000d1");
-
-/// Hand-assembled minimal runtime bytecode for a `DELEGATECALL` relay.
-///
-/// Forwards calldata to `0x7e1` via `DELEGATECALL` and returns whatever the
-/// precompile returned. Used to verify revm's storage-target semantics.
-///
-/// Disassembly:
-/// ```text
-///   CALLDATASIZE; PUSH1 0; PUSH1 0; CALLDATACOPY     // mem[0..csize] = calldata
-///   PUSH1 0; PUSH1 0; CALLDATASIZE; PUSH1 0;          // retSize, retOffset, argsSize, argsOffset
-///   PUSH2 0x07e1; GAS; DELEGATECALL; POP              // delegatecall to TEL precompile
-///   RETURNDATASIZE; PUSH1 0; PUSH1 0; RETURNDATACOPY  // mem[0..rsize] = returndata
-///   RETURNDATASIZE; PUSH1 0; RETURN                   // return mem[0..rsize]
-/// ```
-const RELAY_BYTECODE: &[u8] = &[
-    0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
-    0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00, 0x61, 0x07, 0xe1, 0x5a, 0xf4,
-    0x50, // DELEGATECALL
-    0x3d, 0x60, 0x00, 0x60, 0x00, 0x3e, // RETURNDATACOPY(0, 0, RETURNDATASIZE)
-    0x3d, 0x60, 0x00, 0xf3, // RETURN(0, RETURNDATASIZE)
-];
-
-/// Lock in revm's `DELEGATECALL`-into-precompile semantics: every `SSTORE` the
-/// precompile performs targets the literal `TELCOIN_PRECOMPILE_ADDRESS` it passes
-/// to `EvmInternals::sstore`, **not** the calling contract's storage.
-///
-/// A future revm upgrade that quietly changed this would silently invalidate the
-/// security rationale documented in `README.md`. This test fails in CI if that
-/// happens.
-///
-/// Test plan (mainnet feature only — exercises `mint` which writes the pending
-/// amount slot under `keccak256(governance, 0)`):
-/// 1. Deploy a relay contract that `DELEGATECALL`s `0x7e1` with the inbound calldata.
-/// 2. Send `mint(1234)` from `GOVERNANCE_SAFE_ADDRESS` to the relay. Because `msg.sender` is
-///    preserved across `DELEGATECALL`, the precompile's governance check passes inside the relay
-///    frame.
-/// 3. Assert the pending-mint slot under `TELCOIN_PRECOMPILE_ADDRESS` holds `1234`.
-/// 4. Assert the same slot under `RELAY_ADDR` is **untouched** (zero) — the `SSTORE` did not bleed
-///    into the caller's storage.
-#[test]
-#[cfg(not(feature = "faucet"))]
-fn test_delegatecall_writes_target_precompile_storage() {
-    let mut env = TestEnv::new();
-    env.deploy_code(RELAY_ADDR, Bytes::from_static(RELAY_BYTECODE));
-
-    let amount = U256::from(1234);
-    let calldata = mintCall { amount }.abi_encode();
-    let result = env.exec_to(GOVERNANCE_SAFE_ADDRESS, RELAY_ADDR, calldata, 200_000);
-    assert_success(&result);
-
-    // Pending-mint amount slot for governance: keccak256(abi.encode(GOVERNANCE_SAFE_ADDRESS, 0)).
-    let mut buf = [0u8; 64];
-    buf[12..32].copy_from_slice(GOVERNANCE_SAFE_ADDRESS.as_slice());
-    let pending_slot = U256::from_be_bytes(keccak256(buf).0);
-
-    assert_eq!(
-        env.get_storage(TELCOIN_PRECOMPILE_ADDRESS, pending_slot),
-        amount,
-        "SSTORE under DELEGATECALL must land in the precompile's storage"
-    );
-    assert_eq!(
-        env.get_storage(RELAY_ADDR, pending_slot),
-        U256::ZERO,
-        "caller's storage must NOT be written by precompile under DELEGATECALL"
-    );
-}
-
-// ==============================
 // `STATICCALL` write protection
 // ==============================
 
-use crate::precompile_relays::{CALL_RELAY_BYTECODE, STATICCALL_RELAY_BYTECODE};
+use crate::precompile_relays::{
+    CALLCODE_RELAY_BYTECODE, CALL_RELAY_BYTECODE, DELEGATECALL_RELAY_BYTECODE,
+    STATICCALL_RELAY_BYTECODE,
+};
 
 /// Pending-mint amount slot for governance: `keccak256(abi.encode(GOVERNANCE_SAFE_ADDRESS, 0))`.
 fn governance_pending_slot() -> U256 {
@@ -511,4 +440,120 @@ fn test_staticcall_still_serves_read_only_selectors() {
         env.exec_to(USER, GOVERNANCE_SAFE_ADDRESS, totalSupplyCall {}.abi_encode(), 200_000);
     assert_success(&result);
     assert!(decode_bool(&result), "totalSupply() must remain callable under STATICCALL");
+}
+
+// ==============================
+// Direct-call guard: `DELEGATECALL` / `CALLCODE` refusal
+// ==============================
+
+/// Address hosting the `DELEGATECALL` relay in the direct-call guard tests.
+///
+/// The relay must live at an address other than [`GOVERNANCE_SAFE_ADDRESS`]: `DELEGATECALL`
+/// preserves the parent frame's `msg.sender`, so hosting it here and driving it from governance is
+/// what puts `caller == GOVERNANCE_SAFE_ADDRESS` in front of the precompile together with
+/// `target_address == RELAY_ADDR`.
+const RELAY_ADDR: Address = address!("dddd0000000000000000000000000000000000d1");
+
+/// A `DELEGATECALL` into `0x7e1` is refused before dispatch, and writes nothing.
+///
+/// revm dispatches a precompile by the frame's `bytecode_address` alone, so a `DELEGATECALL` whose
+/// code address is `0x7e1` reaches the dispatcher with `caller` inherited from the parent frame:
+/// here `GOVERNANCE_SAFE_ADDRESS`, because governance is the one calling the relay. Before the
+/// direct-call guard existed this frame passed the governance check and wrote the pending-mint
+/// slot under the canonical `0x7e1` (the handlers hardcode that address for every `SSTORE`, so
+/// nothing landed in the relay's own storage). This test pins the refusal: a contract that
+/// governance chooses to `CALL` must not be able to act as governance towards the precompile.
+///
+/// Test plan:
+/// 1. Host a `DELEGATECALL` relay at [`RELAY_ADDR`] and `mint(1234)` through it from
+///    [`GOVERNANCE_SAFE_ADDRESS`]. The inner frame has `caller == GOVERNANCE_SAFE_ADDRESS` and
+///    `target_address == RELAY_ADDR`, which is not `0x7e1`.
+/// 2. Assert the inner call reported failure.
+/// 3. Assert the pending-mint slot is untouched under both `0x7e1` and [`RELAY_ADDR`].
+///
+/// The positive control (the same governance authorization succeeds through a direct `CALL`
+/// relay frame) is the first half of [`test_staticcall_cannot_mutate_precompile_state`].
+#[test]
+#[cfg(not(feature = "faucet"))]
+fn test_delegatecall_cannot_reach_precompile() {
+    let pending_slot = governance_pending_slot();
+    let mut env = TestEnv::new();
+    env.deploy_code(RELAY_ADDR, Bytes::from_static(DELEGATECALL_RELAY_BYTECODE));
+
+    let result = env.exec_to(
+        GOVERNANCE_SAFE_ADDRESS,
+        RELAY_ADDR,
+        mintCall { amount: U256::from(1234) }.abi_encode(),
+        200_000,
+    );
+    assert_success(&result);
+    assert!(
+        !decode_bool(&result),
+        "DELEGATECALL into the precompile must be refused even with a governance caller"
+    );
+    assert_eq!(
+        env.get_storage(TELCOIN_PRECOMPILE_ADDRESS, pending_slot),
+        U256::ZERO,
+        "DELEGATECALL must not write the canonical pending-mint slot"
+    );
+    assert_eq!(
+        env.get_storage(RELAY_ADDR, pending_slot),
+        U256::ZERO,
+        "DELEGATECALL must not write the relay's storage either"
+    );
+}
+
+/// The direct-call guard is keyed on the call scheme, not the selector: `totalSupply()` is served
+/// to a `STATICCALL` but refused to a `DELEGATECALL`.
+///
+/// Pins the guard's placement ahead of the read-only classification, so an indirect frame is
+/// refused whatever it asks for. The same relay is refused a `mint` in
+/// [`test_delegatecall_cannot_reach_precompile`], and the same selector is served through the
+/// `STATICCALL` relay in [`test_staticcall_still_serves_read_only_selectors`], so the call scheme
+/// is the only variable.
+#[test]
+fn test_delegatecall_refuses_read_only_selectors_too() {
+    let mut env = TestEnv::new();
+    env.deploy_code(RELAY_ADDR, Bytes::from_static(DELEGATECALL_RELAY_BYTECODE));
+
+    let result = env.exec_to(USER, RELAY_ADDR, totalSupplyCall {}.abi_encode(), 200_000);
+    assert_success(&result);
+    assert!(!decode_bool(&result), "totalSupply() must be refused under DELEGATECALL");
+}
+
+/// A `CALLCODE` into `0x7e1` is refused before dispatch, and writes nothing.
+///
+/// `CALLCODE` sets the inner frame's `caller` to the calling contract itself (not the preserved
+/// grandparent that `DELEGATECALL` presents), so to put a governance caller in front of the
+/// precompile the relay is hosted **at** [`GOVERNANCE_SAFE_ADDRESS`], as the `STATICCALL` tests
+/// do, and driven by [`USER`] (EIP-3607 rejects a transaction whose sender has code). That is the
+/// strongest case: even a frame whose `caller` genuinely is governance is refused when it did not
+/// reach `0x7e1` by a direct call, because `target_address` is the relay's own address. The `CALL`
+/// relay at the same address is accepted in [`test_staticcall_cannot_mutate_precompile_state`], so
+/// the opcode is the only variable.
+#[test]
+#[cfg(not(feature = "faucet"))]
+fn test_callcode_cannot_reach_precompile() {
+    let pending_slot = governance_pending_slot();
+    let mut env = TestEnv::new();
+    env.deploy_code(GOVERNANCE_SAFE_ADDRESS, Bytes::from_static(CALLCODE_RELAY_BYTECODE));
+
+    let result = env.exec_to(
+        USER,
+        GOVERNANCE_SAFE_ADDRESS,
+        mintCall { amount: U256::from(1234) }.abi_encode(),
+        200_000,
+    );
+    assert_success(&result);
+    assert!(!decode_bool(&result), "CALLCODE into the precompile must be refused");
+    assert_eq!(
+        env.get_storage(TELCOIN_PRECOMPILE_ADDRESS, pending_slot),
+        U256::ZERO,
+        "CALLCODE must not write the canonical pending-mint slot"
+    );
+    assert_eq!(
+        env.get_storage(GOVERNANCE_SAFE_ADDRESS, pending_slot),
+        U256::ZERO,
+        "CALLCODE must not write the relay's storage either"
+    );
 }

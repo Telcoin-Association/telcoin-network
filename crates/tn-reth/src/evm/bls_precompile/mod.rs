@@ -71,6 +71,10 @@ sol! {
 ///
 /// The length-dependent portion of hash-to-curve is charged separately by
 /// [`BLS_VERIFY_PER_WORD_GAS_COST`]; the total for a given message is [`bls_verify_gas_cost`].
+///
+/// The base is also the O(1) gas floor that [`handle_bls_verify`] checks before it decodes the
+/// calldata: no accepted call pays less than this, so a call that cannot fund it is refused before
+/// any of its `bytes` arguments are copied.
 const BLS_VERIFY_GAS_COST: u64 = 150_000;
 
 /// Per-32-byte-word surcharge over the hashed `message`.
@@ -140,13 +144,28 @@ fn dispatch(data: &[u8], gas: u64) -> PrecompileResult {
 
 /// `blsVerify(bytes,bytes,bytes) -> bool`.
 ///
-/// Decoding precedes the gas gate so the message length - which determines the charge - is known
-/// before pricing (the decode is cheap; the previous early gate was only a coarse floor). The
-/// message is capped at [`MAX_BLS_VERIFY_MESSAGE_LEN`] and then charged [`bls_verify_gas_cost`]
-/// (base plus a per-word surcharge), so a caller supplying a long message pays for the extra
-/// hash-to-curve work it induces instead of riding the flat base. An over-cap message is rejected
-/// as `Other`; an under-funded call is `OutOfGas`.
+/// Gas is gated twice, cheapest first.
+///
+/// 1. An O(1) floor of [`BLS_VERIFY_GAS_COST`] runs before the calldata is decoded. The base is the
+///    least any accepted call pays, so a call that cannot fund it is refused before its three
+///    `bytes` arguments are copied out of calldata. That copy is the only O(calldata) work in the
+///    precompile that no earlier charge covers: the precompile address is warm, and a `STATICCALL`
+///    can reach it with 0 forwarded gas, so without the floor a warm call's 100 gas base buys an
+///    arbitrarily large memcpy on every executing node (the `signature` and `pubkey` fields are
+///    unbounded `bytes`, so the message cap alone does not bound the copy).
+/// 2. The decode then yields the message length, which fixes the exact charge. The message is
+///    capped at [`MAX_BLS_VERIFY_MESSAGE_LEN`] and charged [`bls_verify_gas_cost`] (base plus a
+///    per-word surcharge), so a caller supplying a long message pays for the extra hash-to-curve
+///    work it induces instead of riding the flat base.
+///
+/// An over-cap message is rejected as `Other`; an under-funded call is `OutOfGas` at whichever
+/// gate it fails. Every accepted call clears both gates, so the floor changes neither the accepted
+/// set nor `gas_used`. The one observable difference is that an under-funded call whose calldata
+/// is malformed or carries an over-cap message is now `OutOfGas` instead of `Other`; the EVM treats
+/// both the same way (the caller frame gets `0` and its forwarded gas is consumed).
 fn handle_bls_verify(calldata: &[u8], gas_limit: u64) -> PrecompileResult {
+    (gas_limit >= BLS_VERIFY_GAS_COST).then_some(()).ok_or(PrecompileError::OutOfGas)?;
+
     let decoded = blsVerifyCall::abi_decode_raw(calldata)
         .map_err(|e| PrecompileError::Other(format!("blsVerify: {e}").into()))?;
 
@@ -367,13 +386,44 @@ mod tests {
         assert_eq!(out.gas_used, expected);
     }
 
-    /// Verification with less gas than the length-dependent cost is metered as out-of-gas.
+    /// Verification with less gas than the length-dependent cost is metered as out-of-gas. The
+    /// budget here (`cost - 1`) clears the O(1) floor and fails only the exact post-decode charge,
+    /// so this pins the second gate independently of the first.
     #[test]
     fn dispatch_verify_out_of_gas() {
         let v = vector(7, 0x42);
         let cost = bls_verify_gas_cost(v.message.len()).expect("cost fits u64");
+        assert!(cost > BLS_VERIFY_GAS_COST, "budget must clear the floor to reach the exact gate");
         let res = dispatch(&encode_verify(&v.sig, &v.pubkey, &v.message), cost - 1);
         assert!(matches!(res, Err(PrecompileError::OutOfGas)));
+    }
+
+    /// The O(1) gas floor is checked before the calldata is decoded. Under-funded calls are
+    /// `OutOfGas` even when the calldata would not decode or carries an over-cap message, and the
+    /// same bytes with the floor met reach the decoder and fail as `Other`. Restoring decode-first
+    /// flips the under-funded cases to `Other`, so this pins the ordering.
+    #[test]
+    fn dispatch_gas_floor_precedes_decode() {
+        // Three head words of 0xff: offsets far past the end of the data, so decoding fails.
+        let malformed = [blsVerifyCall::SELECTOR.as_slice(), [0xffu8; 96].as_slice()].concat();
+        assert!(matches!(dispatch(&malformed, 0), Err(PrecompileError::OutOfGas)));
+        assert!(matches!(
+            dispatch(&malformed, BLS_VERIFY_GAS_COST - 1),
+            Err(PrecompileError::OutOfGas)
+        ));
+        // Positive control: with the floor met, the decoder runs and rejects the bytes, so the
+        // `OutOfGas` above comes from the floor and not from a decoder that never saw the input.
+        assert!(matches!(
+            dispatch(&malformed, BLS_VERIFY_GAS_COST),
+            Err(PrecompileError::Other(_))
+        ));
+
+        // An over-cap 1 MiB message under the floor is refused by the floor, not by the cap that
+        // runs after the decode; with the floor met the same call reaches the cap.
+        let big_message = vec![0u8; 1 << 20];
+        let over = encode_verify(&[0u8; 48], &[0u8; 96], &big_message);
+        assert!(matches!(dispatch(&over, 0), Err(PrecompileError::OutOfGas)));
+        assert!(matches!(dispatch(&over, BLS_VERIFY_GAS_COST), Err(PrecompileError::Other(_))));
     }
 
     /// `bls_verify_gas_cost` is the flat base plus the per-word surcharge, rounding the message up

@@ -160,7 +160,7 @@ impl Header {
 
         // Ensure all worker ids are correct.
         for worker_id in self.inner.payload.values() {
-            if *worker_id as usize >= committee.number_of_workers() {
+            if usize::from(*worker_id) >= committee.number_of_workers() {
                 return Err(HeaderError::UnkownWorkerId);
             }
         }

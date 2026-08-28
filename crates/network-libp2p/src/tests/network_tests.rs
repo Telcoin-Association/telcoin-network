@@ -13,7 +13,7 @@ use tn_config::{ConsensusConfig, NetworkConfig};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{wait_until, CommitteeFixture};
-use tn_types::{BlsKeypair, Certificate, Header, TaskManager};
+use tn_types::{BlsKeypair, Certificate, Header, TaskManager, DEFAULT_WORKER_ID};
 use tokio::{sync::mpsc, time::timeout};
 
 /// Test topic for gossip.
@@ -724,7 +724,7 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
         MemDatabase::default(),
         task_manager.get_spawner(),
         NetworkType::Worker(0),
-        config_2.worker_address(),
+        config_2.worker_address(DEFAULT_WORKER_ID).expect("worker 0 address"),
         None,
     )
     .expect("worker network created");
@@ -735,7 +735,9 @@ async fn test_primary_worker_protocol_isolation() -> eyre::Result<()> {
 
     // start listening
     primary.start_listening(config_1.primary_address()).await?;
-    worker.start_listening(config_2.worker_address()).await?;
+    worker
+        .start_listening(config_2.worker_address(DEFAULT_WORKER_ID).expect("worker 0 address"))
+        .await?;
     let worker_addr = worker.listeners().await?.first().expect("worker listen addr").clone();
     let primary_peer_id = primary.local_peer_id().await?;
 
@@ -852,7 +854,7 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
         MemDatabase::default(),
         task_manager.get_spawner(),
         NetworkType::Worker(0),
-        config_2.worker_address(),
+        config_2.worker_address(DEFAULT_WORKER_ID).expect("worker 0 address"),
         None,
     )
     .expect("worker network created");
@@ -862,7 +864,9 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
     });
 
     primary.start_listening(config_1.primary_address()).await?;
-    worker.start_listening(config_2.worker_address()).await?;
+    worker
+        .start_listening(config_2.worker_address(DEFAULT_WORKER_ID).expect("worker 0 address"))
+        .await?;
     let worker_addr = worker.listeners().await?.first().expect("worker listen addr").clone();
     let worker_peer_id = worker.local_peer_id().await?;
     let worker_bls = config_2.key_config().primary_public_key();

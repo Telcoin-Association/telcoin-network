@@ -6,11 +6,13 @@ use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsStr,
     fs,
+    num::NonZeroUsize,
     path::Path,
 };
 use tn_types::{
-    address, test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature,
-    Committee, CommitteeBuilder, Genesis, GenesisAccount, Multiaddr, NetworkPublicKey, NodeP2pInfo,
+    address, forks::multi_workers_fork_active, test_genesis, verify_proof_of_possession_bls,
+    Address, BlsPublicKey, BlsSignature, Committee, CommitteeBuilder, Genesis, GenesisAccount,
+    Multiaddr, NetworkPublicKey, NodeP2pInfo, P2pNode, WorkerId,
 };
 use tracing::{info, warn};
 
@@ -126,6 +128,8 @@ impl NetworkGenesis {
 
     /// Validate each validator:
     /// - verify proof of possession
+    /// - every validator runs the same, non-zero number of workers, and that count is one the
+    ///   epoch-0 [`Committee`] layout can hold
     pub fn validate(&self) -> eyre::Result<()> {
         for (pubkey, validator) in self.validators.iter() {
             info!(target: "genesis::validate", "verifying validator: {}", pubkey);
@@ -135,13 +139,59 @@ impl NetworkGenesis {
                 &validator.execution_address,
             )?;
         }
+        self.agreed_num_workers()?;
         info!(target: "genesis::validate", "all validators valid for genesis");
         Ok(())
     }
 
+    /// Return the worker count shared by every validator.
+    ///
+    /// The count is a protocol-level value, so genesis is rejected when validators disagree or
+    /// when any validator advertises no worker. An empty validator set yields one worker.
+    ///
+    /// A count above one additionally requires [`multi_workers_fork_active`] at epoch 0, the epoch
+    /// of the committee this genesis produces. Below that fork the [`Committee`] bcs layout has no
+    /// field to carry a worker count, so the encoder refuses the value outright — a genesis that
+    /// slipped through here would not fail until the first consensus pack tried to write its
+    /// `EpochMeta`, i.e. a panic at epoch-0 startup rather than a config error while generating
+    /// genesis.
+    fn agreed_num_workers(&self) -> eyre::Result<NonZeroUsize> {
+        let counts = self
+            .validators
+            .iter()
+            .map(|(pubkey, validator)| {
+                NonZeroUsize::new(validator.num_workers()).map(|count| (pubkey, count)).ok_or_else(
+                    || eyre::eyre!("validator {pubkey} advertises no workers in genesis"),
+                )
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        let first = counts.first().map_or(NonZeroUsize::MIN, |(_, count)| *count);
+        // disagreement is checked before the fork gate so its message stays the same in every
+        // build: a mismatched set is malformed regardless of which counts the fork allows
+        if let Some((pubkey, count)) = counts.iter().find(|(_, count)| *count != first) {
+            eyre::bail!(
+                "validator {pubkey} advertises {count} workers but the first validator advertises \
+                 {first}: all validators must run the same number of workers"
+            );
+        }
+        // the committee built from this genesis is epoch 0, which is the epoch the gate reads
+        if first.get() != 1 && !multi_workers_fork_active(0) {
+            eyre::bail!(
+                "genesis validators agree on {first} workers but the multi-workers fork is not \
+                 active at epoch 0: the pre-fork committee layout cannot hold a worker count, so \
+                 this network must be generated with one worker per validator"
+            );
+        }
+        Ok(first)
+    }
+
     /// Create a [Committee] from the validators in [NetworkGenesis].
+    ///
+    /// The committee's worker count is the count every validator agrees on (see
+    /// [Self::validate]); the bootstrap record for each validator carries all of its workers.
     pub fn create_committee(&self) -> eyre::Result<Committee> {
-        let mut committee_builder = CommitteeBuilder::new(0);
+        let num_workers = self.agreed_num_workers()?;
+        let mut committee_builder = CommitteeBuilder::new(0).with_num_workers(num_workers);
         for (pubkey, validator) in self.validators.iter() {
             committee_builder.add_authority_and_bootstrap(
                 *pubkey,
@@ -150,11 +200,7 @@ impl NetworkGenesis {
                     validator.primary_network_key().clone(),
                 )
                     .into(),
-                (
-                    validator.worker_network_address().clone(),
-                    validator.worker_network_key().clone(),
-                )
-                    .into(),
+                validator.worker_p2p_nodes().to_vec(),
                 validator.execution_address,
             );
         }
@@ -223,14 +269,24 @@ impl NodeInfo {
         &self.p2p_info.primary.network_address
     }
 
-    /// Return the primary's public network key.
-    pub fn worker_network_key(&self) -> &NetworkPublicKey {
-        &self.p2p_info.worker.network_key
+    /// Return the public network key of worker `worker_id`, if this node runs that worker.
+    pub fn worker_network_key(&self, worker_id: WorkerId) -> Option<&NetworkPublicKey> {
+        self.p2p_info.worker(worker_id).map(|worker| &worker.network_key)
     }
 
-    /// Return the primary's network address.
-    pub fn worker_network_address(&self) -> &Multiaddr {
-        &self.p2p_info.worker.network_address
+    /// Return the network address of worker `worker_id`, if this node runs that worker.
+    pub fn worker_network_address(&self, worker_id: WorkerId) -> Option<&Multiaddr> {
+        self.p2p_info.worker(worker_id).map(|worker| &worker.network_address)
+    }
+
+    /// Return the p2p info of every worker, indexed by [WorkerId].
+    pub fn worker_p2p_nodes(&self) -> &[P2pNode] {
+        &self.p2p_info.workers
+    }
+
+    /// Return the number of workers this node runs.
+    pub fn num_workers(&self) -> usize {
+        self.p2p_info.num_workers()
     }
 }
 
@@ -286,7 +342,9 @@ mod tests {
             let worker_network_address = Multiaddr::empty();
             let primary_info = NodeP2pInfo::new(
                 (network_keypair.public().clone().into(), primary_network_address).into(),
-                (worker_network_keypair.public().clone().into(), worker_network_address).into(),
+                vec![
+                    (worker_network_keypair.public().clone().into(), worker_network_address).into()
+                ],
             );
             let name = format!("validator-{v}");
             // create validator
@@ -323,7 +381,9 @@ mod tests {
             let worker_network_address = Multiaddr::empty();
             let primary_info = NodeP2pInfo::new(
                 (network_keypair.public().clone().into(), primary_network_address).into(),
-                (worker_network_keypair.public().clone().into(), worker_network_address).into(),
+                vec![
+                    (worker_network_keypair.public().clone().into(), worker_network_address).into()
+                ],
             );
             let name = format!("validator-{v}");
             // create validator
@@ -339,5 +399,97 @@ mod tests {
         }
         // validate should fail
         assert!(network_genesis.validate().is_err(), "proof of possession should fail")
+    }
+
+    /// Build a valid validator with `num_workers` workers.
+    fn validator_with_workers(index: usize, num_workers: usize) -> NodeInfo {
+        let seed = u8::try_from(index).expect("validator index fits a seed byte");
+        let bls_keypair = BlsKeypair::generate(&mut StdRng::from_seed([seed; 32]));
+        let network_keypair = NetworkKeypair::generate_ed25519();
+        let address = Address::from_raw_public_key(&[0; 64]);
+        let proof_of_possession =
+            generate_proof_of_possession_bls_for_test(&bls_keypair, &address).unwrap();
+        let workers = (0..num_workers)
+            .map(|_| {
+                (NetworkKeypair::generate_ed25519().public().clone().into(), Multiaddr::empty())
+                    .into()
+            })
+            .collect();
+        NodeInfo {
+            name: format!("validator-{index}"),
+            bls_public_key: *bls_keypair.public(),
+            p2p_info: NodeP2pInfo::new(
+                (network_keypair.public().clone().into(), Multiaddr::empty()).into(),
+                workers,
+            ),
+            execution_address: address,
+            proof_of_possession,
+        }
+    }
+
+    /// Default builds have the multi-worker committee layout active from genesis, so an agreed
+    /// count above one is a valid genesis and reaches the committee unchanged; the adiri lane
+    /// covers the pre-fork rejection below.
+    ///
+    /// The `cfg` selects this test on this crate's feature set, but the gate it relies on lives in
+    /// tn-types — so the two can desync, and the runtime check below is what names it. A build
+    /// where tn-config compiles without `adiri` while tn-types compiles with it (feature
+    /// unification from elsewhere in the graph, or a missing `tn-config/adiri` forward) would
+    /// otherwise reach `validate` and fail with a fork-rejection message this lane never expects.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn test_validate_genesis_agrees_on_worker_count() {
+        // spelled out through tn_types rather than the module's import, because which crate owns
+        // the gate is the whole point of the desync this catches
+        assert!(
+            tn_types::forks::multi_workers_fork_active(0),
+            "epoch 0 must be post-fork for this lane to mean anything: tn-config compiled without \
+             `adiri` yet the gate is dormant, so tn-types' `adiri` feature is desynced from this \
+             crate's; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment?"
+        );
+
+        let mut network_genesis = NetworkGenesis::new_for_test();
+        (0..4).for_each(|v| network_genesis.add_validator(validator_with_workers(v, 2)));
+        assert!(network_genesis.validate().is_ok());
+        let committee = network_genesis.create_committee().expect("committee");
+        assert_eq!(committee.number_of_workers(), 2);
+        let bootstrap = committee.bootstrap_servers();
+        assert!(bootstrap.values().all(|server| server.num_workers() == 2));
+    }
+
+    /// Pre-fork the committee layout has no field for a worker count, so an agreed count above one
+    /// is rejected while generating genesis instead of panicking the first time epoch 0's
+    /// `EpochMeta` is encoded. A single worker still validates.
+    ///
+    /// The adiri fork epoch is a `u32::MAX` placeholder and its arming constraint floors it at 407,
+    /// so epoch 0 is pre-fork in this lane however the constant moves.
+    /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
+    /// `OnceLock` is process-wide and the whole test binary shares one process.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn test_validate_genesis_rejects_multiple_workers_pre_fork() {
+        let mut network_genesis = NetworkGenesis::new_for_test();
+        (0..4).for_each(|v| network_genesis.add_validator(validator_with_workers(v, 2)));
+        let err = network_genesis.validate().expect_err("pre-fork multi-worker genesis must fail");
+        assert!(err.to_string().contains("multi-workers fork is not active"), "{err}");
+        assert!(network_genesis.create_committee().is_err());
+
+        let mut single_worker = NetworkGenesis::new_for_test();
+        (0..4).for_each(|v| single_worker.add_validator(validator_with_workers(v, 1)));
+        single_worker.validate().expect("single-worker genesis is valid pre-fork");
+        let committee = single_worker.create_committee().expect("committee");
+        assert_eq!(committee.number_of_workers(), 1);
+    }
+
+    /// Validators disagreeing is malformed in every build, so this assertion holds in both lanes:
+    /// the disagreement check runs before the fork gate.
+    #[test]
+    fn test_validate_genesis_rejects_mismatched_worker_count() {
+        let mut network_genesis = NetworkGenesis::new_for_test();
+        (0..3).for_each(|v| network_genesis.add_validator(validator_with_workers(v, 2)));
+        network_genesis.add_validator(validator_with_workers(3, 1));
+        let err = network_genesis.validate().expect_err("mismatched worker counts must fail");
+        assert!(err.to_string().contains("same number of workers"), "{err}");
+        assert!(network_genesis.create_committee().is_err());
     }
 }
