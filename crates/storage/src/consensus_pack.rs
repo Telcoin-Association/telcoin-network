@@ -118,6 +118,9 @@ enum PackMessage {
     // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
     /// become visible to other file handles on the same file (visibility, not durability).
     FlushData(oneshot::Sender<Result<(), PackError>>),
+    /// Reconcile the physical data file down to its logical length (drop mmap capacity padding) so
+    /// a separate file handle reading to EOF observes exactly the written bytes.
+    ReconcileDataLen(oneshot::Sender<Result<(), PackError>>),
 }
 
 /// Manage a single pack file of consensus data (typically one epoch os the consensus chain).
@@ -184,6 +187,9 @@ fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
             }
             PackMessage::FlushData(tx) => {
                 let _ = tx.send(inner.flush_data());
+            }
+            PackMessage::ReconcileDataLen(tx) => {
+                let _ = tx.send(inner.reconcile_data_len());
             }
         }
     }
@@ -533,6 +539,14 @@ impl ConsensusPack {
     pub async fn flush_data(&self) -> Result<(), PackError> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::FlushData(tx)).await;
+        rx.await.map_err(|_| PackError::ReceiveFailed)?
+    }
+
+    /// Reconcile the on-disk data file down to its logical length (dropping any mmap capacity
+    /// padding) so a separate handle reading the file to EOF observes exactly the written bytes.
+    pub async fn reconcile_data_len(&self) -> Result<(), PackError> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(PackMessage::ReconcileDataLen(tx)).await;
         rx.await.map_err(|_| PackError::ReceiveFailed)?
     }
 
@@ -1268,6 +1282,19 @@ impl Inner {
     fn flush_data(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
             self.data.flush().map_err(|e| PackError::PersistError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Prepare the on-disk data file for an external reader: flush pending writes (the buffered
+    /// backend's write buffer / the mmap dirty pages), then reconcile the physical length down to
+    /// the logical `end`, dropping any mmap capacity padding — so a separate file handle reading to
+    /// EOF sees exactly `[0, end)`. No-op for a read-only pack, whose file was already reconciled
+    /// when its writer closed.
+    fn reconcile_data_len(&mut self) -> Result<(), PackError> {
+        if !self.data.read_only() {
+            self.data.flush().map_err(|e| PackError::PersistError(e.to_string()))?;
+            self.data.reconcile_len().map_err(|e| PackError::PersistError(e.to_string()))?;
         }
         Ok(())
     }

@@ -595,10 +595,13 @@ impl ConsensusChain {
                         if epoch_record.final_consensus.number == last_header.number
                             && epoch_final_hash == last_header.digest()
                         {
+                            // The mmap data-file backend zero-pads the physical file past the
+                            // logical `end` (the mapping must be >= the file). Reconcile it to `end`
+                            // (flush pending writes, then truncate the padding, as a clean close
+                            // does) so the raw read-to-EOF below yields exactly `[0, end)` and not
+                            // trailing zero-padding the receiver cannot decode.
+                            pack.reconcile_data_len().await?;
                             drop(pack);
-                            // Remove the other open file.
-                            // Should not matter a "complete" pack file should not be changed or
-                            // moved again.
                             let base_dir = self.base_path.join(format!("epoch-{epoch}"));
                             let stream = AsyncFile::open(base_dir.join(DATA_NAME)).await?;
                             Ok(Box::new(stream))
