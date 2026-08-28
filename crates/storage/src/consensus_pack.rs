@@ -3757,7 +3757,13 @@ pub(crate) mod test {
         let committee = fixture.committee();
         let previous_epoch = test_previous_epoch(&committee);
 
-        let clean_len = {
+        // Open + persist a clean meta-only pack, then DROP it so `Drop` truncates the mmap capacity
+        // padding away and the on-disk file is exactly its logical length — the same basis
+        // `healed_len` is measured on below. (A live pack is physically padded to `capacity`; the
+        // file is reconciled to `end` only at `try_clone`/`Drop`, so measuring while the pack is
+        // alive would read the transient padding, not the logical meta-only length.)
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        {
             let pack = ConsensusPack::open_append(
                 temp_dir.path(),
                 previous_epoch.clone(),
@@ -3765,13 +3771,11 @@ pub(crate) mod test {
             )
             .expect("open pack");
             pack.persist().await.expect("persist");
-            let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
-            std::fs::metadata(&data_path).expect("metadata").len()
-        };
+        }
+        let clean_len = std::fs::metadata(&data_path).expect("metadata").len();
 
         // Tear the meta record mid size-prefix: record bytes exist past the header, but the
         // first record cannot be read and no output was ever committed behind it.
-        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
         let torn_len = DATA_HEADER_BYTES as u64 + 2;
         {
             let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
