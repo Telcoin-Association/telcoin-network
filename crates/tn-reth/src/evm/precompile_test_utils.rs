@@ -38,6 +38,10 @@ use tn_types::{Bytes, TxKind, U256};
 /// precompile.
 pub use crate::evm::tel_precompile::test_utils::GENESIS_SUPPLY;
 
+/// Halt classification, re-exported so tests can name the reason
+/// [`assert_halt_consuming_all_gas`] hands back without importing revm themselves.
+pub use reth_revm::context::result::{HaltReason, OutOfGasError};
+
 // --- Type aliases ---
 
 /// EVM context type used by the test harness, backed by an [`InMemoryDB`].
@@ -66,6 +70,12 @@ pub const USER: Address = address!("1111100000000000000000000000000000000001");
 
 /// Test address used as a transfer/mint recipient in unit and integration tests.
 pub const RECIPIENT: Address = address!("2222222000000000000000000000000000000002");
+
+/// Gas limit [`TestEnv::exec_default`] attaches to a call.
+///
+/// Named so tests that assert on gas consumption can refer to the same number the call was given
+/// instead of repeating the literal.
+pub const DEFAULT_GAS_LIMIT: u64 = 100_000;
 
 /// Code deployed at [`TELCOIN_PRECOMPILE_ADDRESS`] in genesis: a bare `INVALID` opcode.
 ///
@@ -282,9 +292,9 @@ impl TestEnv {
         self.exec_value_to(caller, TELCOIN_PRECOMPILE_ADDRESS, calldata, gas_limit, value)
     }
 
-    /// Execute a precompile call with the default gas limit (100,000).
+    /// Execute a precompile call with [`DEFAULT_GAS_LIMIT`].
     pub fn exec_default(&mut self, caller: Address, calldata: Vec<u8>) -> TestResult {
-        self.exec(caller, calldata, 100_000)
+        self.exec(caller, calldata, DEFAULT_GAS_LIMIT)
     }
 
     /// Read the native account balance of `account`.
@@ -351,6 +361,28 @@ pub fn assert_not_success(result: &TestResult) {
     if let Ok(ExecutionResult::Success { .. }) = result {
         panic!("expected non-success, got Success")
     }
+}
+
+/// Assert that the result is `Ok(ExecutionResult::Halt { .. })` charged the full `gas_limit`, and
+/// return the halt reason.
+///
+/// A precompile rejection is a halt rather than a revert, and revm hands back unspent gas only for
+/// instruction results that are `is_ok_or_revert()`. A rejected top-level transaction is therefore
+/// charged its whole `gas_limit`, and a rejected sub-call loses the entire 63/64 it was forwarded.
+///
+/// [`assert_not_success`] cannot hold that line: it accepts `Err`, `Revert`, and `Halt` alike, so a
+/// revm change or a dispatcher rewrite that turned a rejection into a gas-refunding revert would
+/// leave every rejection test green while the documented gas semantics silently changed. Use this
+/// helper in the tests that exist to back that claim, and keep [`assert_not_success`] for the ones
+/// that only care that the call did not go through.
+///
+/// Panics on `Err(..)`, on `Ok(Success { .. })`, on `Ok(Revert { .. })`, and on a halt whose
+/// `gas_used` is not exactly `gas_limit`.
+pub fn assert_halt_consuming_all_gas(result: &TestResult, gas_limit: u64) -> &HaltReason {
+    let r = result.as_ref().expect("expected Ok(Halt), got Err");
+    let ExecutionResult::Halt { reason, gas_used } = r else { panic!("expected Halt, got {r:?}") };
+    assert_eq!(*gas_used, gas_limit, "a halt spends the whole gas limit");
+    reason
 }
 
 /// Extract the logs emitted by a successful execution, in emission order.
