@@ -72,6 +72,10 @@ enum EpochDbMessage {
     /// so the caller pays a single actor round trip instead of a record read followed by a
     /// separate cert read.
     EpochByNumber(Epoch, oneshot::Sender<Option<(EpochRecord, Option<EpochCertificate>)>>),
+    /// Retrieve an [`EpochRecord`] and its certificate (if stored) by record digest in one turn,
+    /// so the caller pays a single actor round trip instead of a record read followed by a
+    /// separate cert read.
+    EpochByHash(EpochDigest, oneshot::Sender<Option<(EpochRecord, Option<EpochCertificate>)>>),
     /// True if the database contains a record for the given epoch number.
     ContainsEpoch(Epoch, oneshot::Sender<bool>),
     /// True if the database contains a dummy record for the given epoch 0.
@@ -165,6 +169,17 @@ fn run_db_loop(
                 // interleaving between the two reads. Same failure-collapsing semantics as the
                 // separate `RecordByEpoch`/`CertByDigest` arms.
                 let result = match inner.record_by_epoch(epoch) {
+                    Some(record) => {
+                        let cert = inner.cert_by_digest(record.digest());
+                        Some((record, cert))
+                    }
+                    None => None,
+                };
+                let _ = tx.send(result);
+            }
+            EpochDbMessage::EpochByHash(hash, tx) => {
+                // Same single-turn atomic snapshot as `EpochByNumber`, keyed by record digest.
+                let result = match inner.record_by_digest(hash) {
                     Some(record) => {
                         let cert = inner.cert_by_digest(record.digest());
                         Some((record, cert))
@@ -867,13 +882,19 @@ impl EpochRecordDb {
     }
 
     /// Retrieve the epoch record and certificate (if available) by record digest.
+    ///
+    /// One actor round trip: the record and cert are resolved together on the background thread
+    /// (see [`EpochDbMessage::EpochByHash`]) rather than as two separate lookups.
     pub async fn get_epoch_by_hash(
         &self,
         hash: EpochDigest,
     ) -> Option<(EpochRecord, Option<EpochCertificate>)> {
-        let record = self.record_by_digest(hash).await?;
-        let cert = self.cert_by_digest(record.digest()).await;
-        Some((record, cert))
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(EpochDbMessage::EpochByHash(hash, tx)).await.is_ok() {
+            rx.await.unwrap_or(None)
+        } else {
+            None
+        }
     }
 
     /// Write a bounded export bundle covering epochs `0..=through_epoch` into fresh records/certs
