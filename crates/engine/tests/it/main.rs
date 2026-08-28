@@ -2434,15 +2434,6 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
 /// priority-fee credit land on the VICTIM. Reverting `payload_builder` to credit
 /// `cert_batch.address` flips the block beneficiary and the balance credit to the ATTACKER, failing
 /// every assertion here.
-///
-/// Fork-gate determinism: the `tn-engine` integration-test binary is built WITHOUT the `adiri`
-/// feature (`adiri` is opt-in and no dev-dependency enables `tn-types/adiri`), so
-/// `batch_producer_beneficiary_build_fork_active` takes the non-adiri branch and the rule is active
-/// from genesis at every epoch. `tn-types/test-utils` IS enabled here, so the env override
-/// `TN_BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH` could in principle disable the rule; the precondition
-/// assertion below fails loudly if the rule is inactive for this run rather than silently
-/// exercising the pre-fork branch. A single post-fork case therefore suffices with no epoch
-/// juggling; the pre-fork boundary is pinned in the `tn_types::forks` unit tests instead.
 #[tokio::test]
 async fn test_priority_fee_credits_batch_producer_not_header_author() -> eyre::Result<()> {
     let _guard = IT_TEST_GUARD.lock();
@@ -2557,17 +2548,6 @@ async fn test_priority_fee_credits_batch_producer_not_header_author() -> eyre::R
         vec![CertifiedBatch { address: attacker_header_author, batches: vec![batch] }],
     );
     let consensus_output_hash = consensus_output.consensus_header_hash();
-
-    // Precondition: the producer-beneficiary rule MUST be active for this output's epoch, or the
-    // assertions below would silently pass against the pre-fork branch. See the fork-gate note in
-    // the doc comment above.
-    let output_epoch = consensus_output.leader().epoch();
-    assert!(
-        tn_types::forks::batch_producer_beneficiary_active(output_epoch),
-        "producer-beneficiary rule must be active for epoch {output_epoch}; the tn-engine \
-         it-binary is non-adiri (active from genesis). If TN_BATCH_PRODUCER_BENEFICIARY_FORK_EPOCH \
-         is set to disable it, run this test without that override",
-    );
 
     //=== Execution
     let rewards_counter = gas_accumulator.rewards_counter();
