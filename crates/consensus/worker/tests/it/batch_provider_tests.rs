@@ -17,7 +17,9 @@ async fn make_batch() {
 
     // Mock the primary client to always succeed.
     let mock_server = MockWorkerToPrimary();
-    client.set_worker_to_primary_local_handler(Arc::new(mock_server));
+    client
+        .set_worker_to_primary_local_handler(Arc::new(mock_server))
+        .expect("register mock primary handler");
 
     // Spawn a `BatchProvider` instance.
     let id = 0;
@@ -71,7 +73,9 @@ async fn observer_seal_without_admission_returns_not_validator() {
 
     // Mock the primary client to always succeed.
     let mock_server = MockWorkerToPrimary();
-    client.set_worker_to_primary_local_handler(Arc::new(mock_server));
+    client
+        .set_worker_to_primary_local_handler(Arc::new(mock_server))
+        .expect("register mock primary handler");
 
     // A `BatchProvider` instance without a quorum waiter: the observer path.
     let id = 0;

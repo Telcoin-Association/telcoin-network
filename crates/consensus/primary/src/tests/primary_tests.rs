@@ -2,7 +2,7 @@
 
 use crate::{
     error::PrimaryNetworkError,
-    network::{handler::RequestHandler, PrimaryResponse},
+    network::{handler::RequestHandler, PrimaryResponse, WorkerReceiverHandler},
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
@@ -13,14 +13,17 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
-use tn_network_types::MockPrimaryToWorkerClient;
+use tn_network_types::{
+    MockPrimaryToWorkerClient, WorkerOthersBatchMessage, WorkerOwnBatchMessage,
+    WorkerToPrimaryClient,
+};
 use tn_primary::test_utils::make_optimal_signed_certificates;
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase, CertificateStore, PayloadStore};
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
     error::HeaderError, now, BlockNumHash, Certificate, Committee, ConsensusHeaderDigest,
-    ConsensusNumHash, ExecHeader, Hash as _, SealedHeader, TaskManager,
+    ConsensusNumHash, ExecHeader, Hash as _, SealedHeader, TaskManager, TnReceiver, B256,
 };
 use tokio::time::timeout;
 
@@ -587,7 +590,8 @@ async fn test_request_vote_missing_batches() {
     let authority_id = primary.id();
     let author = fixture.authorities().nth(2).unwrap();
     let author_peer = *author.authority().protocol_key();
-    let client = primary.consensus_config().local_network().clone();
+    let client =
+        primary.consensus_config().local_network(0).expect("worker 0 local network").clone();
 
     let certificate_store = primary.consensus_config().node_storage().clone();
     let payload_store = primary.consensus_config().node_storage().clone();
@@ -649,7 +653,9 @@ async fn test_request_vote_missing_batches() {
     // Set up mock worker.
     let mock_server = MockPrimaryToWorkerClient::default();
 
-    client.set_primary_to_worker_local_handler(Arc::new(mock_server));
+    client
+        .set_primary_to_worker_local_handler(Arc::new(mock_server))
+        .expect("register mock worker client");
 
     cb.app().committed_round_updates().send_replace(1);
     // Verify Handler synchronizes missing batches and generates a Vote.
@@ -669,7 +675,8 @@ async fn test_request_vote_already_voted() {
     let id = primary.id();
     let author = fixture.authorities().nth(2).unwrap();
     let author_peer = *author.authority().protocol_key();
-    let client = primary.consensus_config().local_network().clone();
+    let client =
+        primary.consensus_config().local_network(0).expect("worker 0 local network").clone();
 
     let certificate_store = primary.consensus_config().node_storage().clone();
     let payload_store = primary.consensus_config().node_storage().clone();
@@ -722,7 +729,9 @@ async fn test_request_vote_already_voted() {
     // Set up mock worker.
     let mock_server = MockPrimaryToWorkerClient::default();
 
-    client.set_primary_to_worker_local_handler(Arc::new(mock_server));
+    client
+        .set_primary_to_worker_local_handler(Arc::new(mock_server))
+        .expect("register mock worker client");
 
     // Verify Handler generates a Vote.
     let test_header = author
@@ -784,7 +793,8 @@ async fn test_request_vote_created_at_in_future() {
     let id = primary.id();
     let author = fixture.authorities().nth(2).unwrap();
     let author_peer = *author.authority().protocol_key();
-    let client = primary.consensus_config().local_network().clone();
+    let client =
+        primary.consensus_config().local_network(0).expect("worker 0 local network").clone();
 
     let certificate_store = primary.consensus_config().node_storage().clone();
     let payload_store = primary.consensus_config().node_storage().clone();
@@ -837,7 +847,9 @@ async fn test_request_vote_created_at_in_future() {
     // Set up mock worker.
     let mock_server = MockPrimaryToWorkerClient::default();
 
-    client.set_primary_to_worker_local_handler(Arc::new(mock_server));
+    client
+        .set_primary_to_worker_local_handler(Arc::new(mock_server))
+        .expect("register mock worker client");
 
     // Verify Handler generates a Vote.
 
@@ -905,4 +917,46 @@ async fn test_request_vote_created_at_in_future() {
         panic!("not a vote!");
     };
     assert!(created_at <= now());
+}
+
+/// The primary's worker-to-primary handler is bound to one worker id per local network
+/// instance (issue #556): a message stamped with a different id is rejected before anything
+/// reaches the proposer's digest channel or the payload store.
+#[tokio::test]
+async fn test_worker_receiver_handler_bound_to_worker_id() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let primary = fixture.authorities().next().unwrap();
+    let payload_store = primary.consensus_config().node_storage().clone();
+    let cb = ConsensusBus::new();
+    let handler = WorkerReceiverHandler::new(1, cb.clone(), payload_store.clone());
+
+    // mismatched ids never reach the bus or the store
+    assert!(handler.report_own_batch(WorkerOwnBatchMessage::new(0, B256::random())).await.is_err());
+    let foreign_digest = B256::random();
+    assert!(handler
+        .report_others_batch(WorkerOthersBatchMessage::new(foreign_digest, 0))
+        .await
+        .is_err());
+    assert!(!payload_store.contains_payload(foreign_digest, 0).expect("store read"));
+
+    // a matching id flows through: ack the digest like the proposer would
+    let mut rx_digests = cb.subscribe_our_digests();
+    let own_digest = B256::random();
+    let ack = tokio::spawn(async move {
+        let msg = rx_digests.recv().await.expect("digest reaches the bus");
+        let _ = msg.ack_channel.send(());
+        (msg.digest, msg.worker_id)
+    });
+    handler
+        .report_own_batch(WorkerOwnBatchMessage::new(1, own_digest))
+        .await
+        .expect("matching id accepted");
+    assert_eq!(ack.await.expect("ack task"), (own_digest, 1));
+
+    let others_digest = B256::random();
+    handler
+        .report_others_batch(WorkerOthersBatchMessage::new(others_digest, 1))
+        .await
+        .expect("matching id accepted");
+    assert!(payload_store.contains_payload(others_digest, 1).expect("store read"));
 }

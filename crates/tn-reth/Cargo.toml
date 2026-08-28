@@ -11,7 +11,8 @@ authors = [
 publish = false
 
 [dependencies]
-# `server` + `macros` back the `--rpc.txfeecap` guard's method overrides (`rpc_fee_cap`).
+# `server` + `macros` back the TN eth-method overrides (`rpc_fee_history` and the
+# `--rpc.txfeecap` guard's `rpc_fee_cap`).
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
 async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }

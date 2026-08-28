@@ -1,0 +1,426 @@
+<!DOCTYPE HTML>
+<html lang="{{ language }}" class="{{ default_theme }} sidebar-visible" dir="{{ text_direction }}">
+    <head>
+        <!-- Book generated using mdBook -->
+        <!-- TN-EDIT E0: Telcoin Network theme. Based on the stock mdBook 0.5.4 index.hbs
+             with six marked edits (E0-E5). When upgrading mdbook, re-dump the stock theme
+             (`mdbook init <dir> --theme`) and re-apply the TN-EDIT blocks on top. -->
+        <meta charset="UTF-8">
+        <title>{{ title }}</title>
+        {{#if is_print }}
+        <meta name="robots" content="noindex">
+        {{/if}}
+        {{#if base_url}}
+        <base href="{{ base_url }}">
+        {{/if}}
+
+
+        <!-- Custom HTML head -->
+        {{> head}}
+
+        <meta name="description" content="{{ description }}">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        {{#if favicon_svg}}
+        <link rel="icon" href="{{ resource "favicon.svg" }}">
+        {{/if}}
+        {{#if favicon_png}}
+        <link rel="shortcut icon" href="{{ resource "favicon.png" }}">
+        {{/if}}
+        <link rel="stylesheet" href="{{ resource "css/variables.css" }}">
+        <link rel="stylesheet" href="{{ resource "css/general.css" }}">
+        <link rel="stylesheet" href="{{ resource "css/chrome.css" }}">
+        {{#if print_enable}}
+        <link rel="stylesheet" href="{{ resource "css/print.css" }}" media="print">
+        {{/if}}
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="{{ resource "fonts/fonts.css" }}">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="{{ resource "highlight.css" }}">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="{{ resource "tomorrow-night.css" }}">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="{{ resource "ayu-highlight.css" }}">
+
+        <!-- Custom theme stylesheets -->
+        {{#each additional_css}}
+        <link rel="stylesheet" href="{{ resource this }}">
+        {{/each}}
+
+        {{#if mathjax_support}}
+        <!-- MathJax -->
+        <script async src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.1/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+        {{/if}}
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "{{ path_to_root }}";
+            const default_light_theme = "{{ default_theme }}";
+            const default_dark_theme = "{{ preferred_dark_theme }}";
+        {{#if search_js}}
+            window.path_to_searchindex_js = "{{ resource "searchindex.js" }}";
+        {{/if}}
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="{{ resource "toc.js" }}"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                {{#if search_enabled}}
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                {{/if}}
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('{{ default_theme }}')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                // TN-EDIT E6: stock forces the overlay sidebar closed on every page load below
+                // 1080px, so following a nav link shut the menu. A session flag (written by
+                // tn-custom.js when the user opens/closes the sidebar) keeps it open across
+                // in-book navigation; first visits still start hidden.
+                let keepOpen = null;
+                try { keepOpen = sessionStorage.getItem('tn-sidebar-open'); } catch(e) { }
+                sidebar = keepOpen === '1' ? 'visible' : 'hidden';
+                sidebar_toggle.checked = sidebar === 'visible';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="{{ path_to_root }}toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                {{> header}}
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            {{fa "solid" "bars"}}
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            {{fa "solid" "paintbrush"}}
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- TN-EDIT E1: only Auto/Light/Navy themes are offered; the list stays in the
+                                 DOM (hidden via CSS) because book.js drives theme switching through it. -->
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                        </ul>
+                        <!-- TN-EDIT E2: search toggle moved to .right-buttons as a rounded search pill. -->
+                    </div>
+
+                    <!-- TN-EDIT E3: home-linked logo replaces the text title; the light/dark wordmark
+                         swap and the small-screen badge swap are handled in tn-custom.css. Keeps
+                         class "menu-title" for book.js. -->
+                    <h1 class="menu-title tn-logo-title">
+                        <a class="tn-logo-link" href="{{ path_to_root }}index.html" aria-label="Telcoin Network home">
+                            <img class="tn-logo tn-logo-light" src="{{ path_to_root }}assets/tn-light.svg" alt="Telcoin Network">
+                            <img class="tn-logo tn-logo-dark" src="{{ path_to_root }}assets/tn-dark.svg" alt="" aria-hidden="true">
+                            <img class="tn-logo tn-logo-badge" src="{{ path_to_root }}assets/tel-badge.svg" alt="" aria-hidden="true">
+                        </a>
+                    </h1>
+
+                    <div class="right-buttons">
+                        <!-- TN-EDIT E2: search pill (same id/handlers as the stock toggle). -->
+                        {{#if search_enabled}}
+                        <button id="mdbook-search-toggle" class="icon-button tn-search-pill" type="button" title="Search" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            {{fa "solid" "magnifying-glass"}}
+                            <span class="tn-search-label">Search</span>
+                            <kbd class="tn-search-kbd" aria-hidden="true">&#8984;K</kbd>
+                        </button>
+                        {{/if}}
+                        <!-- TN-EDIT E4: 3-way theme switch (Light / System / Dark). tn-custom.js relays
+                             clicks to the hidden stock theme-list buttons so book.js keeps ownership
+                             of theme state, localStorage and highlight stylesheets. -->
+                        <div class="tn-theme-switch" role="radiogroup" aria-label="Color theme">
+                            <button type="button" class="tn-theme-choice" data-theme-choice="light" role="radio" aria-checked="false" title="Light theme" aria-label="Light theme">
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+                            </button>
+                            <button type="button" class="tn-theme-choice" data-theme-choice="default_theme" role="radio" aria-checked="false" title="System theme" aria-label="System theme">
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                            </button>
+                            <button type="button" class="tn-theme-choice" data-theme-choice="navy" role="radio" aria-checked="false" title="Dark theme" aria-label="Dark theme">
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+                            </button>
+                        </div>
+                        <!-- TN-EDIT E7: version picker. tn-custom.js labels the button with the
+                             version this build lives under (site root = latest, /vX.Y.Z/ = tag)
+                             and fills the menu from versions.json at the site root, which CI
+                             writes when it assembles the multi-version site. Local builds have
+                             no versions.json and list only the current version. -->
+                        <div class="tn-version-picker">
+                            <button type="button" id="tn-version-button" class="tn-version-button" aria-haspopup="listbox" aria-expanded="false" aria-controls="tn-version-menu" title="Switch documentation version">
+                                <span class="tn-version-label">latest</span>
+                                <svg class="tn-version-caret" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+                            </button>
+                            <ul id="tn-version-menu" class="tn-version-menu" role="listbox" aria-label="Documentation versions" hidden></ul>
+                        </div>
+                        {{#if print_enable}}
+                        <a href="{{ path_to_root }}print.html" title="Print this book" aria-label="Print this book">
+                            {{fa "solid" "print" "print-button"}}
+                        </a>
+                        {{/if}}
+                        {{#if git_repository_url}}
+                        <a href="{{git_repository_url}}" title="Git repository" aria-label="Git repository">
+                            {{fa git_repository_icon_class git_repository_icon}}
+                        </a>
+                        {{/if}}
+                        {{#if git_repository_edit_url}}
+                        <a href="{{git_repository_edit_url}}" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            {{fa "solid" "pencil" "git-edit-button"}}
+                        </a>
+                        {{/if}}
+
+                    </div>
+                </div>
+
+                {{#if search_enabled}}
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                {{fa "solid" "spinner" "fa-spin"}}
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+                {{/if}}
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        {{{ content }}}
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                        <!-- TN-EDIT E5: prev/next become navigation cards (direction label + page
+                             title). The stock wide side arrows (.nav-wide-wrapper) are hidden in CSS. -->
+                        {{#if previous}}
+                            <a rel="prev" href="{{ path_to_root }}{{previous.link}}" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class="tn-nav-text">
+                                    <span class="tn-nav-dir">
+                                        {{#if (eq ../text_direction "rtl")}}
+                                        {{fa "solid" "angle-right"}}
+                                        {{else}}
+                                        {{fa "solid" "angle-left"}}
+                                        {{/if}}
+                                        Previous</span>
+                                    <span class="tn-nav-title">{{previous.title}}</span>
+                                </span>
+                            </a>
+                        {{/if}}
+
+                        {{#if next}}
+                            <a rel="next prefetch" href="{{ path_to_root }}{{next.link}}" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class="tn-nav-text">
+                                    <span class="tn-nav-dir">Next
+                                        {{#if (eq ../text_direction "rtl")}}
+                                        {{fa "solid" "angle-left"}}
+                                        {{else}}
+                                        {{fa "solid" "angle-right"}}
+                                        {{/if}}
+                                    </span>
+                                    <span class="tn-nav-title">{{next.title}}</span>
+                                </span>
+                            </a>
+                        {{/if}}
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                {{#if previous}}
+                    <a rel="prev" href="{{ path_to_root }}{{previous.link}}" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        {{#if (eq ../text_direction "rtl")}}
+                        {{fa "solid" "angle-right"}}
+                        {{else}}
+                        {{fa "solid" "angle-left"}}
+                        {{/if}}
+                    </a>
+                {{/if}}
+
+                {{#if next}}
+                    <a rel="next prefetch" href="{{ path_to_root }}{{next.link}}" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        {{#if (eq text_direction "rtl")}}
+                        {{fa "solid" "angle-left"}}
+                        {{else}}
+                        {{fa "solid" "angle-right"}}
+                        {{/if}}
+                    </a>
+                {{/if}}
+            </nav>
+
+        </div>
+
+        <template id=fa-eye>{{fa "solid" "eye"}}</template>
+        <template id=fa-eye-slash>{{fa "solid" "eye-slash"}}</template>
+        <template id=fa-copy>{{fa "regular" "copy"}}</template>
+        <template id=fa-play>{{fa "solid" "play"}}</template>
+        <template id=fa-clock-rotate-left>{{fa "solid" "clock-rotate-left"}}</template>
+
+        {{#if live_reload_endpoint}}
+        <!-- Livereload script (if served using the cli tool) -->
+        <script>
+            const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsAddress = wsProtocol + "//" + location.host + "/" + "{{{live_reload_endpoint}}}";
+            const socket = new WebSocket(wsAddress);
+            socket.onmessage = function (event) {
+                if (event.data === "reload") {
+                    socket.close();
+                    location.reload();
+                }
+            };
+
+            window.onbeforeunload = function() {
+                socket.close();
+            }
+        </script>
+        {{/if}}
+
+        {{#if playground_line_numbers}}
+        <script>
+            window.playground_line_numbers = true;
+        </script>
+        {{/if}}
+
+        {{#if playground_copyable}}
+        <script>
+            window.playground_copyable = true;
+        </script>
+        {{/if}}
+
+        {{#if playground_js}}
+        <script src="{{ resource "ace.js" }}"></script>
+        <script src="{{ resource "mode-rust.js" }}"></script>
+        <script src="{{ resource "editor.js" }}"></script>
+        <script src="{{ resource "theme-dawn.js" }}"></script>
+        <script src="{{ resource "theme-tomorrow_night.js" }}"></script>
+        {{/if}}
+
+        {{#if search_js}}
+        <script src="{{ resource "elasticlunr.min.js" }}"></script>
+        <script src="{{ resource "mark.min.js" }}"></script>
+        <script src="{{ resource "searcher.js" }}"></script>
+        {{/if}}
+
+        <script src="{{ resource "clipboard.min.js" }}"></script>
+        <script src="{{ resource "highlight.js" }}"></script>
+        <script src="{{ resource "book.js" }}"></script>
+
+        <!-- Custom JS scripts -->
+        {{#each additional_js}}
+        <script src="{{ resource this}}"></script>
+        {{/each}}
+
+        {{#if is_print}}
+        {{#if mathjax_support}}
+        <script>
+        window.addEventListener('load', function() {
+            MathJax.Hub.Register.StartupHook('End', function() {
+                window.setTimeout(window.print, 100);
+            });
+        });
+        </script>
+        {{else}}
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+        {{/if}}
+        {{/if}}
+
+        {{#if fragment_map}}
+        <script>
+            document.addEventListener('DOMContentLoaded', function() {
+                const fragmentMap =
+                    {{{fragment_map}}}
+                ;
+                const target = fragmentMap[window.location.hash];
+                if (target) {
+                    let url = new URL(target, window.location.href);
+                    window.location.replace(url.href);
+                }
+            });
+        </script>
+        {{/if}}
+
+    </div>
+    </body>
+</html>

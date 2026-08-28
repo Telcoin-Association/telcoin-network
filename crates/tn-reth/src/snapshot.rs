@@ -92,7 +92,7 @@ use reth_trie_db::DatabaseStateRoot;
 use std::{iter::Peekable, path::Path};
 use tn_storage::exec_state_pack::{
     ExecStateAccountMeta, ExecStatePackReader, ExecStatePackWriter, ExecStateStats, StateEntry,
-    STORAGE_CHUNK_SLOTS,
+    BLOCKHASH_ANCESTORS, STORAGE_CHUNK_SLOTS,
 };
 use tn_types::{
     gas_accumulator::{entry_fee_for_worker, GasAccumulator},
@@ -503,7 +503,9 @@ impl SnapshotRestorer {
     /// Write a header-only chain scaffold up to the snapshot's final block `B`.
     ///
     /// `window` is a contiguous, ascending, parent-hash-linked run of the real headers that end at
-    /// `final_state` (block `B`); it must not include genesis. Those properties are re-checked
+    /// `final_state` (block `B`); it must not include genesis, and it must cover the EVM
+    /// `BLOCKHASH` lookback: its first block must be at or below
+    /// `max(1, B - ([`BLOCKHASH_ANCESTORS`] - 1))`. Those properties are re-checked
     /// here rather than assumed, so every caller of this `pub` API gets them. This method, run
     /// once before [`import_state`](Self::import_state):
     ///
@@ -557,6 +559,19 @@ impl SnapshotRestorer {
         if window_start == 0 {
             return Err(eyre!("snapshot restore: window must not include genesis (block 0)"));
         }
+        // defense-in-depth floor (issue #1174): every block below `window_start` is scaffolded
+        // with a zero hash, so a window that does not cover the EVM `BLOCKHASH` lookback below
+        // the tip (or reach block 1) would let the first post-restore block read a zero hash
+        // inside its lookback and fork this node's state root off the fleet. The honest
+        // exporter always ships this window (`gather_headers` in `tn-node`); only a truncated
+        // or corrupted pack fails here.
+        let floor = b.saturating_sub(BLOCKHASH_ANCESTORS - 1).max(1);
+        (window_start <= floor).then_some(()).ok_or_else(|| {
+            eyre!(
+                "snapshot restore: window start {window_start} does not cover the BLOCKHASH \
+                 lookback (need <= {floor} for tip {b})"
+            )
+        })?;
         for (i, header) in window.iter().enumerate() {
             let expected = window_start + i as u64;
             if header.number != expected {
@@ -621,8 +636,8 @@ impl SnapshotRestorer {
         };
 
         // headers 1..=B-1: real headers with real hashes inside the window, zero-hash dummies below
-        // it. the dummies are never referenced by BLOCKHASH within the shipped window, so a zero
-        // hash there is inert.
+        // it. the lookback floor enforced above keeps every dummy strictly below the `BLOCKHASH`
+        // reach of all post-restore blocks, so a zero hash there is inert.
         {
             let mut headers_writer = sf.latest_writer(StaticFileSegment::Headers)?;
             for number in 1..b {
@@ -1144,8 +1159,8 @@ pub use tn_types::gas_accumulator::worker_id_from_header;
 #[cfg(test)]
 mod tests {
     use super::{
-        export_plain_state, worker_id_from_header, PinnedStateView, SnapshotRestorer, StateEntry,
-        StatePackSink, KECCAK_EMPTY,
+        export_plain_state, eyre, worker_id_from_header, PinnedStateView, SnapshotRestorer,
+        StateEntry, StatePackSink, BLOCKHASH_ANCESTORS, KECCAK_EMPTY,
     };
     use crate::{
         error::{TnRethError, TnRethResult},
@@ -1991,6 +2006,54 @@ mod tests {
         Ok(())
     }
 
+    /// The scaffold writes a zero-hash dummy for every block below the window, so a window that
+    /// does not cover the EVM `BLOCKHASH` lookback would let the first post-restore block
+    /// (`B + 1`) read a zero hash inside its 256-block lookback and fork this node's state root
+    /// off the fleet (issue #1174). Boundary pair at tip 300: a window starting exactly at the
+    /// floor (45 = 300 - 255) is accepted, and one starting a single block higher is refused.
+    #[tokio::test]
+    async fn import_rejects_a_window_short_of_the_blockhash_lookback() -> eyre::Result<()> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let genesis_header = chain.sealed_genesis_header();
+        let state_root = genesis_header.state_root;
+
+        let b = 300u64;
+        let run = |start: u64| -> eyre::Result<()> {
+            // a hash-linked, contiguous run start..=b. the parent hash of the first window
+            // header points below the window and is deliberately arbitrary: the scaffold's
+            // linkage walk only checks pairs inside the window
+            let window: Vec<SealedHeader> = std::iter::successors(
+                Some(synthetic_header(start, B256::repeat_byte(0xaa), state_root)),
+                |parent| {
+                    (parent.number < b)
+                        .then(|| synthetic_header(parent.number + 1, parent.hash(), state_root))
+                },
+            )
+            .collect();
+            let tip = window.last().ok_or_else(|| eyre!("window is never empty"))?;
+            let final_state = BlockNumHash::new(b, tip.hash());
+
+            let dir = TempDir::new()?;
+            let tm = TaskManager::new("Window Lookback Floor");
+            let (reth_config, db) = temp_config_and_db(chain.clone(), dir.path())?;
+            let restorer = SnapshotRestorer::open(&reth_config, db, &tm)?;
+            restorer.import_chain_scaffold(&window, final_state)
+        };
+
+        // positive control: a window covering exactly the lookback floor is accepted, so the
+        // rejection below is attributable to the missing coverage rather than to the fixture
+        run(b - (BLOCKHASH_ANCESTORS - 1))?;
+
+        let err = run(b - (BLOCKHASH_ANCESTORS - 1) + 1)
+            .expect_err("a window short of the BLOCKHASH lookback must be rejected");
+        assert!(
+            err.to_string().contains("does not cover the BLOCKHASH lookback"),
+            "expected a lookback-floor rejection, got: {err:?}"
+        );
+
+        Ok(())
+    }
+
     /// Several slots more than the exporter packs into a single storage record, so the whale
     /// account below is emitted across MANY [`STORAGE_CHUNK_SLOTS`]-bounded storage chunks and the
     /// streaming import must write each chunk without ever materializing the whole account. Only a
@@ -2480,17 +2543,21 @@ mod tests {
         let (reth_config, db) = temp_config_and_db(chain.clone(), dst_dir.path())?;
         let restorer = SnapshotRestorer::open(&reth_config, db, &tm)?;
 
-        // a window that starts ABOVE block 1: blocks 3..=5. the first header's parent lies
-        // outside the window (linkage is only checked between window members), mirroring a real
-        // bounded window, so blocks 1..=2 become zero-hash placeholders
-        let h3 = synthetic_header(3, B256::from([0x33; 32]), B256::ZERO);
+        // a full window down to block 1: the lookback floor (issue #1174) requires a tip-5
+        // window to reach block 1 (the zero-hash placeholder path for a window that starts
+        // above block 1 is covered by `import_rejects_a_window_short_of_the_blockhash_lookback`).
+        // h1's parent (genesis) lies outside the window; linkage is only checked between
+        // window members
+        let h1 = synthetic_header(1, B256::from([0x11; 32]), B256::ZERO);
+        let h2 = synthetic_header(2, h1.hash(), B256::ZERO);
+        let h3 = synthetic_header(3, h2.hash(), B256::ZERO);
         let h4 = synthetic_header(4, h3.hash(), B256::ZERO);
         let h5 = synthetic_header(5, h4.hash(), B256::ZERO);
-        let window = vec![h3.clone(), h4, h5.clone()];
+        let window = vec![h1, h2, h3.clone(), h4, h5.clone()];
         restorer.import_chain_scaffold(&window, BlockNumHash::new(5, h5.hash()))?;
         drop(restorer);
 
-        // the marker holds the final block (5), not the window start (3)
+        // the marker holds the final block (5), not the window start (1)
         let marker = std::fs::read_to_string(RethEnv::restored_state_floor_path(&reth_config.0))?;
         assert_eq!(marker.trim(), "5", "the floor marker must hold the snapshot's final block");
 

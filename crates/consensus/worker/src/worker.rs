@@ -36,7 +36,7 @@ pub fn new_worker<DB: Database>(
     network_handle: WorkerNetworkHandle,
     forwarder: Arc<dyn TxnForwarder>,
     consensus_chain: ConsensusChain,
-) -> Worker<DB, QuorumWaiter> {
+) -> eyre::Result<Worker<DB, QuorumWaiter>> {
     info!(target: "worker::worker", "Boot worker node with id {} key {:?}", id, consensus_config.key_config().primary_public_key());
 
     let batch_fetcher = BatchFetcher::new(
@@ -45,18 +45,23 @@ pub fn new_worker<DB: Database>(
         consensus_chain,
         WorkerMetrics::new_for_worker(id),
     );
-    consensus_config.local_network().set_primary_to_worker_local_handler(Arc::new(
-        PrimaryReceiverHandler {
-            store: consensus_config.node_storage().clone(),
-            network: Some(network_handle.clone()),
-            batch_fetcher,
-            validator,
-        },
-    ));
+    // This worker's own local network instance: a worker id outside the committee's worker
+    // set is a wiring bug, surfaced as an error rather than a fallback onto another
+    // worker's instance.
+    let local_network = consensus_config
+        .local_network(id)
+        .cloned()
+        .ok_or_else(|| eyre::eyre!("no local network instance for worker id {id}"))?;
+    local_network.set_primary_to_worker_local_handler(Arc::new(PrimaryReceiverHandler {
+        store: consensus_config.node_storage().clone(),
+        network: Some(network_handle.clone()),
+        batch_fetcher,
+        validator,
+    }))?;
     let batch_provider = new_worker_internal(
         id,
         &consensus_config,
-        consensus_config.local_network().clone(),
+        local_network,
         network_handle.clone(),
         forwarder,
     );
@@ -65,10 +70,10 @@ pub fn new_worker<DB: Database>(
     info!(target: "worker::worker",
         "Worker {} successfully booted on {}",
         id,
-        consensus_config.config().node_info.p2p_info.worker.network_address
+        consensus_config.worker_address(id).map_or_else(|| "<no address>".to_string(), |addr| addr.to_string())
     );
 
-    batch_provider
+    Ok(batch_provider)
 }
 
 /// Builds a new batch provider responsible for handling client transactions.
@@ -377,7 +382,7 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         }
 
         // Send the batch to the primary.
-        let message = WorkerOwnBatchMessage { worker_id: self.id, digest };
+        let message = WorkerOwnBatchMessage::new(self.id, digest);
         if let Err(err) = self.client.report_own_batch(message).await {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
             Err(BlockSealError::FailedToReport)

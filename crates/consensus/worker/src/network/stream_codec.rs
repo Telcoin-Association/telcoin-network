@@ -243,4 +243,150 @@ mod tests {
         let received: BTreeSet<B256> = result.iter().map(|(d, _)| *d).collect();
         assert_eq!(received, digests);
     }
+
+    /// An [`AsyncRead`] that replays pre-serialized frames, pausing `gap` of
+    /// (paused-clock) time before each frame after the first, so every frame still
+    /// lands inside the per-frame `BATCH_STREAM_TIMEOUT`. This is the advisory's
+    /// slow-drip batch source, made deterministic.
+    struct DripReader {
+        frames: Vec<Vec<u8>>,
+        frame: usize,
+        offset: usize,
+        gap: std::time::Duration,
+        paid: bool,
+        timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl DripReader {
+        fn new(frames: Vec<Vec<u8>>, gap: std::time::Duration) -> Self {
+            Self { frames, frame: 0, offset: 0, gap, paid: false, timer: None }
+        }
+    }
+
+    impl futures::io::AsyncRead for DripReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            use std::task::Poll;
+            let this = self.get_mut();
+
+            match this.frame >= this.frames.len() {
+                // stream exhausted
+                true => Poll::Ready(Ok(0)),
+                false => {
+                    // wait out the inter-frame gap before the first byte of each
+                    // frame after the first
+                    let needs_gap = this.offset == 0 && this.frame > 0 && !this.paid;
+                    let gap_ready = match needs_gap {
+                        false => true,
+                        true => {
+                            let gap = this.gap;
+                            let timer =
+                                this.timer.get_or_insert_with(|| Box::pin(tokio::time::sleep(gap)));
+                            match std::future::Future::poll(timer.as_mut(), cx) {
+                                Poll::Pending => false,
+                                Poll::Ready(()) => {
+                                    this.timer = None;
+                                    this.paid = true;
+                                    true
+                                }
+                            }
+                        }
+                    };
+
+                    match gap_ready {
+                        false => Poll::Pending,
+                        true => {
+                            // deliver the current frame; a frame may span several polls
+                            let (n, frame_len) = {
+                                let frame = &this.frames[this.frame];
+                                let remaining = &frame[this.offset..];
+                                let n = remaining.len().min(buf.len());
+                                buf[..n].copy_from_slice(&remaining[..n]);
+                                (n, frame.len())
+                            };
+                            this.offset += n;
+                            let advanced = this.offset >= frame_len;
+                            this.frame += usize::from(advanced);
+                            this.offset = match advanced {
+                                true => 0,
+                                false => this.offset,
+                            };
+                            this.paid = match advanced {
+                                true => false,
+                                false => this.paid,
+                            };
+                            Poll::Ready(Ok(n))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A source that drips one valid, requested, unique batch just inside every
+    /// per-frame `BATCH_STREAM_TIMEOUT` cannot stall the reader indefinitely: the
+    /// aggregate `BATCH_STREAM_TOTAL_TIMEOUT` bounds the whole exchange. Regression
+    /// test for the worker batch-sync slow-drip DoS (GHSA-h59j-q8p3-hw5v).
+    #[tokio::test(start_paused = true)]
+    async fn read_sync_batches_is_bounded_by_total_timeout() {
+        use crate::network::handle::{max_sync_frame_size, BATCH_STREAM_TOTAL_TIMEOUT};
+        use futures::stream::{self, StreamExt};
+        use std::time::Duration;
+        use tn_network_libp2p::error::NetworkError;
+
+        // 4s < BATCH_STREAM_TIMEOUT (5s), so no single frame trips the inner bound
+        let gap = Duration::from_secs(4);
+        let batches = create_test_batches(60);
+        let digests: BTreeSet<B256> = batches.iter().map(|b| b.digest()).collect();
+        assert_eq!(digests.len(), batches.len(), "test batches must be distinct");
+        let max_frame = max_sync_frame_size(0);
+
+        // pre-serialize each batch as its own Data frame so the reader can meter
+        // them out one gap apart
+        let frames: Vec<Vec<u8>> = stream::iter(batches.iter())
+            .then(|batch| async move {
+                let mut buf = Vec::new();
+                let (mut enc, mut comp) = (Vec::new(), Vec::new());
+                write_frame(
+                    &mut buf,
+                    &SyncFrame::<WorkerSyncRequest>::Data(encode(batch)),
+                    &mut enc,
+                    &mut comp,
+                    max_frame,
+                )
+                .await
+                .expect("frame encodes");
+                buf
+            })
+            .collect()
+            .await;
+
+        // dripping all frames would take (n - 1) * gap, which must exceed the cap
+        assert!(
+            gap * (frames.len() as u32 - 1) > BATCH_STREAM_TOTAL_TIMEOUT,
+            "test must drip past the total timeout"
+        );
+
+        let mut reader = DripReader::new(frames, gap);
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new_for_test(task_manager.get_spawner());
+
+        let start = tokio::time::Instant::now();
+        let outcome = handle.read_sync_batches(&mut reader, &digests).await.map(|b| b.len());
+        let elapsed = start.elapsed();
+
+        // the exchange is cut off, not run to completion
+        assert!(
+            matches!(outcome, Err(NetworkError::Timeout)),
+            "expected aggregate timeout, got {outcome:?}"
+        );
+        // and it is the aggregate bound (~210s) that fired, not a per-frame 5s stall
+        assert!(
+            elapsed >= BATCH_STREAM_TOTAL_TIMEOUT && elapsed < BATCH_STREAM_TOTAL_TIMEOUT + gap * 2,
+            "total timeout should fire at ~{BATCH_STREAM_TOTAL_TIMEOUT:?}, fired at {elapsed:?}"
+        );
+    }
 }

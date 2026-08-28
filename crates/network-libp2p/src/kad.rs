@@ -1,6 +1,6 @@
 //! Module with kademlia specific extensions, like a persistant store.
 
-use crate::types::NetworkType;
+use crate::{consensus::MAX_ADVERTISED_MULTIADDRS, types::NetworkType};
 use libp2p::{
     kad::{
         store::{Error, MemoryStoreConfig, RecordStore},
@@ -510,14 +510,21 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn add_provider(&mut self, record: ProviderRecord) -> libp2p::kad::store::Result<()> {
-        if self.num_providers >= self.config.max_provided_keys {
-            // Try to free a slot by evicting fully-expired provider key groups.
-            self.evict_expired_providers();
-        }
-        // Re-check after the eviction attempt; still full is a hard error.
-        (self.num_providers < self.config.max_provided_keys)
-            .then_some(())
-            .ok_or(Error::MaxProvidedKeys)?;
+        // Reject a record that advertises an implausible number of addresses. A legitimate
+        // provider carries at most a few addresses, so a large list is only an attempt to
+        // write attacker-controlled bytes into the consensus database (issue #1185). This
+        // mirrors the `MAX_ADVERTISED_MULTIADDRS` cap on the signed `NodeRecord` path; the
+        // sibling caps here (`max_providers_per_key`, `max_provided_keys`) bound different
+        // axes and do not limit the address list inside one record.
+        (record.addresses.len() <= MAX_ADVERTISED_MULTIADDRS).then_some(()).ok_or_else(|| {
+            warn!(
+                target: "network-kad",
+                count = record.addresses.len(),
+                max = MAX_ADVERTISED_MULTIADDRS,
+                "provider record rejected: address count exceeds cap"
+            );
+            Error::ValueTooLarge
+        })?;
 
         let key = self.key_to_hash(&record.key);
         let kr: KadProviderRecord = record.into();
@@ -533,6 +540,23 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         // genuinely new key it is already counted in `num_providers`, so only a missing
         // row bumps the gauge (issue #999).
         let row_exists = stored.is_some();
+
+        // The capacity check applies only to a brand-new key, mirroring `put`'s
+        // `new_record` gate: an overwrite of an existing, already-counted row cannot
+        // grow the table, so a refresh of a key this node already stores (including
+        // its own self-provide) must succeed even when byzantine peers have
+        // saturated the table with other keys (issue #1195).
+        if !row_exists {
+            if self.num_providers >= self.config.max_provided_keys {
+                // Try to free a slot by evicting fully-expired provider key groups.
+                self.evict_expired_providers();
+            }
+            // Re-check after the eviction attempt; still full is a hard error.
+            (self.num_providers < self.config.max_provided_keys)
+                .then_some(())
+                .ok_or(Error::MaxProvidedKeys)?;
+        }
+
         let merged = stored
             .as_deref()
             .and_then(|raw| decode_providers(&key, raw))
@@ -1084,6 +1108,81 @@ mod test {
         assert!(matches!(kad_store_worker.put(rec.clone()), Err(Error::MaxRecords)));
     }
 
+    // ---- issue #1195: the provider capacity check gates only brand-new keys ----
+
+    /// A refresh of an existing provider key is an overwrite, not a new row: it must
+    /// succeed at capacity and leave the count unchanged, while a brand-new key is
+    /// still rejected. Mirrors `test_kad_put_limit`, which locks the same gating for
+    /// `put`.
+    #[test]
+    fn test_kad_add_provider_refresh_allowed_at_capacity() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut kad_store =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        let mut kad_store_worker =
+            KadStore::new(db, PeerId::random(), &key_config, NetworkType::Worker(0));
+        // A small cap keeps the test fast; the gating logic does not depend on the
+        // cap's value.
+        kad_store.config.max_provided_keys = 4;
+        kad_store_worker.config.max_provided_keys = 4;
+
+        // Fill both tables to capacity with distinct live keys, keeping one record
+        // to refresh later.
+        let refresh_rec = live_provider_under(&fresh_record_key());
+        kad_store.add_provider(refresh_rec.clone()).expect("add provider");
+        kad_store_worker.add_provider(refresh_rec.clone()).expect("add provider");
+        (1..4).for_each(|_| {
+            let rec = live_provider_under(&fresh_record_key());
+            kad_store.add_provider(rec.clone()).expect("add provider");
+            kad_store_worker.add_provider(rec).expect("add provider");
+        });
+        assert_eq!(kad_store.num_providers, 4);
+        assert_eq!(kad_store_worker.num_providers, 4);
+
+        // The refresh of an existing key must succeed at capacity (issue #1195: the
+        // node keeps its own provider records live this way).
+        (0..10).for_each(|_| {
+            kad_store.add_provider(refresh_rec.clone()).expect("refresh at capacity");
+            kad_store_worker.add_provider(refresh_rec.clone()).expect("refresh at capacity");
+        });
+        assert_eq!(kad_store.num_providers, 4, "refresh must not change the count");
+        assert_eq!(kad_store_worker.num_providers, 4, "refresh must not change the count");
+
+        // Positive control: a brand-new key is still rejected while full.
+        let new_rec = live_provider_under(&fresh_record_key());
+        assert!(matches!(kad_store.add_provider(new_rec.clone()), Err(Error::MaxProvidedKeys)));
+        assert!(matches!(kad_store_worker.add_provider(new_rec), Err(Error::MaxProvidedKeys)));
+    }
+
+    /// A brand-new key at capacity still triggers the expired-group eviction attempt
+    /// before the hard error: moving the capacity check behind the new-key gate
+    /// (issue #1195) must not lose the eviction. Mirrors
+    /// `test_kad_put_evicts_expired_when_full`.
+    #[test]
+    fn test_kad_add_provider_evicts_expired_when_full() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut kad_store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        kad_store.config.max_provided_keys = 4;
+
+        // Saturate the table with already-expired provider groups.
+        (0..4).for_each(|_| {
+            kad_store
+                .add_provider(expired_provider_under(&fresh_record_key()))
+                .expect("add expired provider");
+        });
+        assert_eq!(kad_store.num_providers, 4);
+
+        // A live record under a brand-new key must succeed: eviction makes room.
+        let fresh_key = fresh_record_key();
+        kad_store.add_provider(live_provider_under(&fresh_key)).expect("eviction must make room");
+        assert_eq!(kad_store.num_providers, 1, "only the fresh row should remain");
+        assert_eq!(kad_store.providers(&fresh_key).len(), 1, "fresh provider retained");
+    }
+
     /// Lock the per-role, chain-namespaced wire-protocol names. These strings are a
     /// peer-compatibility contract: a silent change would prevent peers from
     /// negotiating sessions, and the chain id keeps different chains from ever
@@ -1267,6 +1366,13 @@ mod test {
         ProviderRecord { key: key.clone(), provider, expires, addresses: vec![] }
     }
 
+    /// A provider record under `key` whose expiry is already in the past.
+    fn expired_provider_under(key: &RecordKey) -> ProviderRecord {
+        let provider = PeerId::random();
+        let expires = Instant::now().checked_sub(Duration::from_secs(60));
+        ProviderRecord { key: key.clone(), provider, expires, addresses: vec![] }
+    }
+
     /// `providers()` is a read-only path: an undecodable row must be skipped (empty result)
     /// rather than panic the caller, and neighbouring good rows must be unaffected.
     #[test]
@@ -1376,5 +1482,70 @@ mod test {
         assert!(store.providers(&corrupt_key).is_empty(), "worker read skips corrupt row");
         assert_eq!(store.scrub_corrupt_providers(), 1, "worker scrub purges corrupt row");
         assert_eq!(store.num_providers, 0, "worker count reflects the purge");
+    }
+
+    // ---- issue #1185: a provider record's address list is capped ----
+
+    /// A live provider record under `key` that carries `count` distinct addresses.
+    fn provider_with_addresses(key: &RecordKey, count: usize) -> ProviderRecord {
+        let provider = PeerId::random();
+        let expires = Instant::now().checked_add(Duration::from_secs(60 * 60 * 24));
+        let addresses = (0..count)
+            .map(|i| format!("/ip4/127.0.0.1/tcp/{}", 1000 + i).parse().expect("valid multiaddr"))
+            .collect();
+        ProviderRecord { key: key.clone(), provider, expires, addresses }
+    }
+
+    /// One address over the cap: `add_provider` must reject the record with
+    /// `ValueTooLarge` and leave the store untouched. Without the cap, each
+    /// `AddProvider` request could write an attacker-sized address list into the
+    /// consensus database.
+    #[test]
+    fn test_kad_add_provider_rejects_oversized_address_list() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+
+        let key = fresh_record_key();
+        let rec = provider_with_addresses(&key, MAX_ADVERTISED_MULTIADDRS + 1);
+        assert!(matches!(store.add_provider(rec), Err(Error::ValueTooLarge)));
+        assert_eq!(store.num_providers, 0, "rejected record must not bump the provider count");
+        assert!(store.providers(&key).is_empty(), "rejected record must not be stored");
+    }
+
+    /// A record at exactly the cap is legitimate and must be admitted with its full
+    /// address list intact (positive control for the rejection test).
+    #[test]
+    fn test_kad_add_provider_admits_address_list_at_cap() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+
+        let key = fresh_record_key();
+        let rec = provider_with_addresses(&key, MAX_ADVERTISED_MULTIADDRS);
+        store.add_provider(rec.clone()).expect("record at the cap is admitted");
+        assert_eq!(store.num_providers, 1);
+        let got = store.providers(&key);
+        assert_eq!(got.len(), 1, "record at the cap is stored");
+        assert_eq!(got[0].addresses.len(), MAX_ADVERTISED_MULTIADDRS, "address list kept intact");
+        assert_eq!(got[0].provider, rec.provider);
+    }
+
+    /// The cap guards the shared entry point, so the worker table is covered by the
+    /// same check: an oversized record is rejected there too.
+    #[test]
+    fn test_kad_add_provider_worker_rejects_oversized_address_list() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Worker(0));
+
+        let key = fresh_record_key();
+        let rec = provider_with_addresses(&key, MAX_ADVERTISED_MULTIADDRS + 1);
+        assert!(matches!(store.add_provider(rec), Err(Error::ValueTooLarge)));
+        assert_eq!(store.num_providers, 0, "rejected record must not bump the provider count");
+        assert!(store.providers(&key).is_empty(), "rejected record must not be stored");
     }
 }

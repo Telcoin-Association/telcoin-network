@@ -2,13 +2,14 @@
 
 use crate::{
     crypto::{BlsPublicKey, NetworkPublicKey},
-    Address, Multiaddr,
+    forks::multi_workers_fork_active,
+    Address, Multiaddr, WorkerId,
 };
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     str::FromStr,
     sync::Arc,
 };
@@ -110,19 +111,155 @@ impl From<(NetworkPublicKey, Multiaddr)> for P2pNode {
     }
 }
 
+/// The current on-disk shape of a primary plus its worker list: `{ primary, workers }`.
+///
+/// Shared by [BootstrapServer] and `NodeP2pInfo`. This is the only shape written today and the
+/// only shape binary codecs (bcs: the consensus store and pack encoding) read.
+#[derive(Deserialize)]
+pub(crate) struct PrimaryWorkersCurrent {
+    /// The p2p info of the primary.
+    pub(crate) primary: P2pNode,
+    /// The p2p info for each worker, never empty.
+    #[serde(deserialize_with = "deserialize_non_empty_workers")]
+    pub(crate) workers: Vec<P2pNode>,
+}
+
+/// The legacy single-worker shape: `{ primary, worker }`.
+///
+/// Still accepted from human-readable files written before the worker list existed.
+#[derive(Deserialize)]
+pub(crate) struct PrimaryWorkersLegacy {
+    /// The p2p info of the primary.
+    pub(crate) primary: P2pNode,
+    /// The p2p info of the single worker.
+    pub(crate) worker: P2pNode,
+}
+
+/// Human-readable (YAML, JSON) representations of a primary plus its worker list.
+///
+/// Both variants are boxed so the enum stays small (clippy `large_enum_variant`; `P2pNode` is
+/// wide). Untagged: serde tries [PrimaryWorkersCurrent] first, then [PrimaryWorkersLegacy].
+/// Untagged enums buffer the input through `deserialize_any`, which non-self-describing codecs
+/// (bcs) do not support, so this enum is only used when the deserializer reports
+/// `is_human_readable()`; see [deserialize_primary_workers].
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(crate) enum PrimaryWorkersRepr {
+    /// The current shape: `workers: [..]`.
+    Current(Box<PrimaryWorkersCurrent>),
+    /// The legacy shape: `worker: {..}`.
+    Legacy(Box<PrimaryWorkersLegacy>),
+}
+
+impl From<PrimaryWorkersRepr> for (P2pNode, Vec<P2pNode>) {
+    fn from(value: PrimaryWorkersRepr) -> Self {
+        match value {
+            PrimaryWorkersRepr::Current(current) => {
+                let PrimaryWorkersCurrent { primary, workers } = *current;
+                (primary, workers)
+            }
+            PrimaryWorkersRepr::Legacy(legacy) => {
+                let PrimaryWorkersLegacy { primary, worker } = *legacy;
+                (primary, vec![worker])
+            }
+        }
+    }
+}
+
+/// Deserialize the `(primary, workers)` pair shared by [BootstrapServer] and `NodeP2pInfo`.
+///
+/// Human-readable formats (the YAML and JSON config and committee files) accept both the
+/// current `workers: [..]` list and the legacy single `worker: {..}` map. Binary formats (bcs,
+/// used by the consensus store and the consensus pack) carry only the current shape and are read
+/// directly: the untagged legacy fallback needs `deserialize_any`, which bcs rejects.
+pub(crate) fn deserialize_primary_workers<'de, D>(
+    deserializer: D,
+) -> Result<(P2pNode, Vec<P2pNode>), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    if deserializer.is_human_readable() {
+        PrimaryWorkersRepr::deserialize(deserializer).map(Into::into)
+    } else {
+        PrimaryWorkersCurrent::deserialize(deserializer)
+            .map(|PrimaryWorkersCurrent { primary, workers }| (primary, workers))
+    }
+}
+
+/// Deserialize a worker list and reject an empty one.
+///
+/// A node must run at least one worker, so an empty list is a configuration error rather than a
+/// valid value.
+pub(crate) fn deserialize_non_empty_workers<'de, D>(
+    deserializer: D,
+) -> Result<Vec<P2pNode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let workers = Vec::<P2pNode>::deserialize(deserializer)?;
+    (!workers.is_empty())
+        .then_some(workers)
+        .ok_or_else(|| serde::de::Error::custom("`workers` must contain at least one entry"))
+}
+
 /// Bootstrap p2p server info to join the network.
-#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+///
+/// `workers` holds one [P2pNode] per worker, indexed by [WorkerId], and is never empty. It is a
+/// dial-hint list, not a validated invariant: a bootstrap entry may advertise fewer workers than
+/// [Committee::number_of_workers] (today every entry advertises exactly one). Per-worker
+/// bootstrap addresses arrive with the per-worker swarms.
+///
+/// Serialization: the current on-disk shape is `workers: [..]`. The legacy single-worker shape
+/// `worker: {..}` is still accepted on read so existing committee files load unchanged; it is
+/// written back in the new shape.
+#[derive(Clone, Serialize, Debug, Eq, PartialEq)]
 pub struct BootstrapServer {
     /// The p2p info the primary.
     pub primary: P2pNode,
-    /// The p2p info the worker.
-    pub worker: P2pNode,
+    /// The p2p info for each worker, indexed by [WorkerId].
+    pub workers: Vec<P2pNode>,
+}
+
+impl<'de> Deserialize<'de> for BootstrapServer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_primary_workers(deserializer)
+            .map(|(primary, workers)| Self { primary, workers })
+    }
+}
+
+impl From<PrimaryWorkersLegacy> for BootstrapServer {
+    fn from(value: PrimaryWorkersLegacy) -> Self {
+        let PrimaryWorkersLegacy { primary, worker } = value;
+        Self { primary, workers: vec![worker] }
+    }
 }
 
 impl BootstrapServer {
-    pub fn new(primary_node: P2pNode, worker_node: P2pNode) -> Self {
-        Self { primary: primary_node, worker: worker_node }
+    /// Create a new [BootstrapServer] with one [P2pNode] per worker.
+    pub fn new(primary_node: P2pNode, worker_nodes: Vec<P2pNode>) -> Self {
+        Self { primary: primary_node, workers: worker_nodes }
     }
+
+    /// Return the [P2pNode] for `worker_id`, or `None` if the server has no such worker.
+    pub fn worker(&self, worker_id: WorkerId) -> Option<&P2pNode> {
+        self.workers.get(usize::from(worker_id))
+    }
+
+    /// Return the number of workers this bootstrap server advertises.
+    pub fn num_workers(&self) -> usize {
+        self.workers.len()
+    }
+}
+
+/// The default worker count for a committee: one worker per validator.
+const ONE_WORKER: NonZeroUsize = NonZeroUsize::MIN;
+
+/// Serde default for [CommitteeInner::num_workers] so committee files without the field load.
+fn default_num_workers() -> NonZeroUsize {
+    ONE_WORKER
 }
 
 /// Immutable authority data.
@@ -197,25 +334,49 @@ impl<'de> Deserialize<'de> for Authority {
 }
 
 /// The committee lists all validators that participate in consensus.
-#[derive(Serialize, Deserialize, Debug, Eq, Default)]
+///
+/// Deliberately carries no serde derives: the binary wire layout is epoch-gated (#554, gated by
+/// [`crate::forks::multi_workers_fork_active`]), so every encode and decode path routes through the
+/// hand-written impls below. Human-readable formats keep the derive's exact behavior through
+/// [`CommitteeInnerHr`].
+#[derive(Debug, Eq)]
 struct CommitteeInner {
     /// The authorities of epoch.
     authorities: BTreeMap<BlsPublicKey, Authority>,
     /// Keeps and index of the Authorities by their respective identifier
     /// This is a helper struct, not included in serde or equality.
-    #[serde(skip)]
     authorities_by_id: BTreeMap<AuthorityIdentifier, Authority>,
     /// The epoch number of this committee
     epoch: Epoch,
     /// The quorum threshold (2f+1)
-    #[serde(skip)]
+    /// Derived from the authorities, never serialized.
     quorum_threshold: VotingPower,
     /// The validity threshold (f+1)
-    #[serde(skip)]
+    /// Derived from the authorities, never serialized.
     validity_threshold: VotingPower,
     /// The bootstrap servers to initially join a network (probably the initial committee).
     /// Note, not included in partial eq since they are not relevand to overall committee equality.
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// The number of workers every validator in this committee runs.
+    ///
+    /// This is a protocol-level value: all nodes must agree on it. Its source of truth is the
+    /// on-chain `WorkerConfigs` contract, read at the previous epoch's closing block when the
+    /// committee for an epoch is created. Committee files without the field default to one.
+    num_workers: NonZeroUsize,
+}
+
+impl Default for CommitteeInner {
+    fn default() -> Self {
+        Self {
+            authorities: BTreeMap::default(),
+            authorities_by_id: BTreeMap::default(),
+            epoch: Epoch::default(),
+            quorum_threshold: VotingPower::default(),
+            validity_threshold: VotingPower::default(),
+            bootstrap_servers: BTreeMap::default(),
+            num_workers: ONE_WORKER,
+        }
+    }
 }
 
 impl PartialEq for CommitteeInner {
@@ -223,11 +384,34 @@ impl PartialEq for CommitteeInner {
         self.epoch == other.epoch
             && self.quorum_threshold == other.quorum_threshold
             && self.validity_threshold == other.validity_threshold
+            && self.num_workers == other.num_workers
             && self.authorities.eq(&other.authorities)
     }
 }
 
 impl CommitteeInner {
+    /// Assemble the wire fields of a committee into a [CommitteeInner].
+    ///
+    /// The three derived indexes are left at their defaults: they are absent from every wire
+    /// layout in both directions, and [`Committee::deserialize`] rebuilds them by calling
+    /// [`CommitteeInner::load`].
+    fn from_wire_fields(
+        authorities: BTreeMap<BlsPublicKey, Authority>,
+        epoch: Epoch,
+        bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+        num_workers: NonZeroUsize,
+    ) -> Self {
+        Self {
+            authorities,
+            authorities_by_id: BTreeMap::default(),
+            epoch,
+            quorum_threshold: VotingPower::default(),
+            validity_threshold: VotingPower::default(),
+            bootstrap_servers,
+            num_workers,
+        }
+    }
+
     /// Updates the committee internal secondary indexes.
     fn load(&mut self) {
         self.authorities_by_id = self
@@ -260,6 +444,190 @@ impl CommitteeInner {
 
     fn total_voting_power(&self) -> VotingPower {
         self.authorities.len() as VotingPower
+    }
+}
+
+/// Number of `CommitteeInner` wire fields on the legacy (pre-multi-worker) layout.
+const COMMITTEE_FIELDS_LEGACY: usize = 3;
+/// Number of `CommitteeInner` wire fields once the multi-worker layout is active for the
+/// committee's epoch.
+const COMMITTEE_FIELDS_V1: usize = 4;
+/// Field names for [`serde::Deserializer::deserialize_struct`], superset (post-fork) layout.
+///
+/// Naming all four fields is load-bearing, not cosmetic: bcs sizes its field sequence from this
+/// list, so a three-entry list would make the post-fork read of the trailing `num_workers` return
+/// `None` instead of decoding it. The legacy arm simply stops after three fields, which bcs
+/// permits — it never checks that the sequence was drained.
+const COMMITTEE_FIELD_NAMES: [&str; COMMITTEE_FIELDS_V1] =
+    ["authorities", "epoch", "bootstrap_servers", "num_workers"];
+
+/// Human-readable (YAML, JSON) representation of [`CommitteeInner`], carrying the exact field set
+/// and attributes the removed derive had.
+///
+/// The epoch gate is binary-only. Human-readable formats name their fields, so a committee file
+/// written by any build loads on any other: `num_workers` defaults when absent (as in every
+/// `chain-configs/*/committee.yaml` today), and each [`BootstrapServer`] still accepts the legacy
+/// `worker:` key through its own deserializer. Both are covered by the tests below.
+#[derive(Deserialize)]
+#[serde(rename = "CommitteeInner")]
+struct CommitteeInnerHr {
+    /// The authorities of epoch.
+    authorities: BTreeMap<BlsPublicKey, Authority>,
+    /// The epoch number of this committee.
+    epoch: Epoch,
+    /// The bootstrap servers to initially join a network.
+    bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// The number of workers every validator in this committee runs.
+    #[serde(default = "default_num_workers")]
+    num_workers: NonZeroUsize,
+}
+
+/// Borrowed serialization view writing a [`BootstrapServer`] in the legacy single-worker shape
+/// (`{ primary, worker }`), byte-identical to the pre-#554 derive.
+///
+/// Used only by the pre-fork arm of [`CommitteeInner`]'s binary serializer. The shape cannot
+/// represent more than one worker, so the view fails closed rather than silently dropping the
+/// rest: a committee that the legacy layout cannot express must be unrepresentable, not
+/// mis-encoded. Callers below the fork epoch are structurally single-worker (the pre-fork
+/// on-chain registry exposes no path that raises the count), so this error means a bug or a
+/// governance action taken too early, never routine operation.
+struct BootstrapServerLegacyRef<'a>(&'a BootstrapServer);
+
+impl Serialize for BootstrapServerLegacyRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let [worker] = self.0.workers.as_slice() else {
+            return Err(serde::ser::Error::custom(format!(
+                "the pre-fork layout holds exactly one worker per bootstrap server, got {}",
+                self.0.workers.len()
+            )));
+        };
+        // serialize_struct mirrors the pre-#554 derive exactly: bcs emits no framing for structs,
+        // so the wire bytes are the concatenated fields in declaration order.
+        let mut state = serializer.serialize_struct("BootstrapServer", 2)?;
+        state.serialize_field("primary", &self.0.primary)?;
+        state.serialize_field("worker", worker)?;
+        state.end()
+    }
+}
+
+/// Extracts the next element of the committee field sequence, converting an early end of input
+/// into a field-labeled error (bcs would otherwise surface only a distal `Eof`).
+fn next_committee_field<'de, A, T>(seq: &mut A, field: &'static str) -> Result<T, A::Error>
+where
+    A: serde::de::SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    seq.next_element()?.ok_or_else(|| serde::de::Error::missing_field(field))
+}
+
+impl Serialize for CommitteeInner {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // human-readable formats name their fields, so the committee file is never gated: it
+        // carries the current shape at every epoch, exactly as the derive wrote it. for binary
+        // formats the gate reads the epoch inside this committee, never node-local state, so a
+        // historical committee keeps its historical layout at any nesting depth (pack records,
+        // epoch records, state-sync payloads).
+        if serializer.is_human_readable() || multi_workers_fork_active(self.epoch) {
+            let mut state = serializer.serialize_struct("CommitteeInner", COMMITTEE_FIELDS_V1)?;
+            state.serialize_field("authorities", &self.authorities)?;
+            state.serialize_field("epoch", &self.epoch)?;
+            state.serialize_field("bootstrap_servers", &self.bootstrap_servers)?;
+            state.serialize_field("num_workers", &self.num_workers)?;
+            return state.end();
+        }
+
+        // fail closed: the legacy layout has no field to carry a worker count, so encoding a
+        // multi-worker committee below the fork epoch would silently write a committee that
+        // decodes as single-worker on every node, including this one.
+        if self.num_workers != ONE_WORKER {
+            return Err(serde::ser::Error::custom(format!(
+                "committee for epoch {} runs {} workers, which the pre-fork layout cannot hold",
+                self.epoch, self.num_workers
+            )));
+        }
+        let legacy_servers: BTreeMap<&BlsPublicKey, BootstrapServerLegacyRef<'_>> = self
+            .bootstrap_servers
+            .iter()
+            .map(|(key, server)| (key, BootstrapServerLegacyRef(server)))
+            .collect();
+        let mut state = serializer.serialize_struct("CommitteeInner", COMMITTEE_FIELDS_LEGACY)?;
+        state.serialize_field("authorities", &self.authorities)?;
+        state.serialize_field("epoch", &self.epoch)?;
+        state.serialize_field("bootstrap_servers", &legacy_servers)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CommitteeInner {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let CommitteeInnerHr { authorities, epoch, bootstrap_servers, num_workers } =
+                CommitteeInnerHr::deserialize(deserializer)?;
+            return Ok(Self::from_wire_fields(authorities, epoch, bootstrap_servers, num_workers));
+        }
+
+        /// Reads the two ungated fields, then branches on the just-decoded `epoch`: pre-fork
+        /// values carry one unprefixed `worker` per bootstrap server and no `num_workers`.
+        struct CommitteeInnerVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CommitteeInnerVisitor {
+            type Value = CommitteeInner;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(
+                    "a CommitteeInner: authorities and epoch, then bootstrap servers in the \
+                     layout that epoch selects, plus num_workers once the multi-workers fork \
+                     is active",
+                )
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let authorities = next_committee_field(&mut seq, "authorities")?;
+                let epoch: Epoch = next_committee_field(&mut seq, "epoch")?;
+                if multi_workers_fork_active(epoch) {
+                    let bootstrap_servers = next_committee_field(&mut seq, "bootstrap_servers")?;
+                    let num_workers = next_committee_field(&mut seq, "num_workers")?;
+                    return Ok(CommitteeInner::from_wire_fields(
+                        authorities,
+                        epoch,
+                        bootstrap_servers,
+                        num_workers,
+                    ));
+                }
+
+                // the legacy value type is the whole discriminator: the two shapes are not
+                // self-describing under bcs (`primary ++ worker` against `primary ++ ULEB128(n)
+                // ++ n worker`), so sniffing the bytes is unsound and only the epoch decides.
+                let legacy: BTreeMap<BlsPublicKey, PrimaryWorkersLegacy> =
+                    next_committee_field(&mut seq, "bootstrap_servers")?;
+                let bootstrap_servers =
+                    legacy.into_iter().map(|(key, server)| (key, server.into())).collect();
+                Ok(CommitteeInner::from_wire_fields(
+                    authorities,
+                    epoch,
+                    bootstrap_servers,
+                    ONE_WORKER,
+                ))
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "CommitteeInner",
+            &COMMITTEE_FIELD_NAMES,
+            CommitteeInnerVisitor,
+        )
     }
 }
 
@@ -419,6 +787,7 @@ impl Committee {
         authorities: BTreeMap<BlsPublicKey, Authority>,
         epoch: Epoch,
         bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+        num_workers: NonZeroUsize,
     ) -> Self {
         let mut committee = CommitteeInner {
             authorities,
@@ -427,6 +796,7 @@ impl Committee {
             validity_threshold: 0,
             quorum_threshold: 0,
             bootstrap_servers,
+            num_workers,
         };
         committee.load();
 
@@ -443,7 +813,7 @@ impl Committee {
     /// on new.
     ///
     /// Pass an optional epoch_boundary timestamp. Defaults to u64::MAX to disable epoch
-    /// transitions.
+    /// transitions. The committee has one worker; use [Committee::with_num_workers] to widen it.
     pub fn new_for_test(
         authorities: BTreeMap<BlsPublicKey, Authority>,
         epoch: Epoch,
@@ -456,6 +826,7 @@ impl Committee {
             validity_threshold: 0,
             quorum_threshold: 0,
             bootstrap_servers,
+            num_workers: ONE_WORKER,
         };
 
         committee.authorities_by_id = committee
@@ -599,11 +970,41 @@ impl Committee {
     }
 
     /// Return the number of workers that are in use for this committee.
+    ///
     /// This is a protocol level value, all nodes have to agree on this and be
-    /// running the required number of workers.
-    /// Currently 1 but may change with a future fork on an epoch boundary.
+    /// running the required number of workers. The source of truth is the on-chain
+    /// `WorkerConfigs` contract at the previous epoch's closing block, so a change takes
+    /// effect at an epoch boundary. Committees built without an explicit count have one worker.
     pub fn number_of_workers(&self) -> usize {
-        1
+        self.inner.num_workers.get()
+    }
+
+    /// Return the worker ids in use for this committee, in ascending order.
+    ///
+    /// Yields `0..number_of_workers()` without any numeric cast: the iterator walks the
+    /// [`WorkerId`] domain directly and stops at the committee's count, so a count beyond
+    /// `WorkerId`'s range simply saturates at the ids that can exist on a header.
+    pub fn worker_ids(&self) -> impl Iterator<Item = WorkerId> + '_ {
+        (0..=WorkerId::MAX).take_while(|id| usize::from(*id) < self.number_of_workers())
+    }
+
+    /// Return a copy of this committee with the worker count set to `num_workers`.
+    ///
+    /// The epoch-0 committee is loaded from the committee file, whose count is a default; the
+    /// epoch manager uses this to stamp the on-chain count onto it. Every other field, including
+    /// the derived indexes and thresholds, is copied as-is: this does not re-run
+    /// `CommitteeInner::load`, so it is safe on a default (empty) committee as well.
+    pub fn with_num_workers(&self, num_workers: NonZeroUsize) -> Committee {
+        let inner = CommitteeInner {
+            authorities: self.inner.authorities.clone(),
+            authorities_by_id: self.inner.authorities_by_id.clone(),
+            epoch: self.inner.epoch,
+            quorum_threshold: self.inner.quorum_threshold,
+            validity_threshold: self.inner.validity_threshold,
+            bootstrap_servers: self.inner.bootstrap_servers.clone(),
+            num_workers,
+        };
+        Committee { inner: Arc::new(inner) }
     }
 }
 
@@ -637,12 +1038,25 @@ pub struct CommitteeBuilder {
     authorities: BTreeMap<BlsPublicKey, Authority>,
     /// The map of [BlsPublicKey] for each [BootstrapServer].
     bootstrap_server: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// The number of workers every validator runs (defaults to one).
+    num_workers: NonZeroUsize,
 }
 
 impl CommitteeBuilder {
     /// Create a new instance of [CommitteeBuilder] for making a new [Committee].
     pub fn new(epoch: Epoch) -> Self {
-        Self { epoch, authorities: BTreeMap::default(), bootstrap_server: BTreeMap::default() }
+        Self {
+            epoch,
+            authorities: BTreeMap::default(),
+            bootstrap_server: BTreeMap::default(),
+            num_workers: ONE_WORKER,
+        }
+    }
+
+    /// Set the number of workers every validator in the committee runs.
+    pub fn with_num_workers(mut self, num_workers: NonZeroUsize) -> Self {
+        self.num_workers = num_workers;
+        self
     }
 
     /// Add an authority and bootstrap server to the committee builder.
@@ -650,12 +1064,12 @@ impl CommitteeBuilder {
         &mut self,
         protocol_key: BlsPublicKey,
         primary_node: P2pNode,
-        worker_node: P2pNode,
+        worker_nodes: Vec<P2pNode>,
         execution_address: Address,
     ) {
         let authority = Authority::new(protocol_key, execution_address);
         self.authorities.insert(protocol_key, authority);
-        let bootstrap = BootstrapServer::new(primary_node, worker_node);
+        let bootstrap = BootstrapServer::new(primary_node, worker_nodes);
         self.bootstrap_server.insert(protocol_key, bootstrap);
     }
 
@@ -665,19 +1079,20 @@ impl CommitteeBuilder {
         self.authorities.insert(protocol_key, authority);
     }
 
-    /// Add an authority to the committee builder.
+    /// Add a bootstrap server to the committee builder.
     pub fn add_bootstrap_server(
         &mut self,
         protocol_key: BlsPublicKey,
         primary_node: P2pNode,
-        worker_node: P2pNode,
+        worker_nodes: Vec<P2pNode>,
     ) {
-        let bootstrap = BootstrapServer::new(primary_node, worker_node);
+        let bootstrap = BootstrapServer::new(primary_node, worker_nodes);
         self.bootstrap_server.insert(protocol_key, bootstrap);
     }
 
+    /// Build the [Committee].
     pub fn build(self) -> Committee {
-        Committee::new(self.authorities, self.epoch, self.bootstrap_server)
+        Committee::new(self.authorities, self.epoch, self.bootstrap_server, self.num_workers)
     }
 }
 
@@ -690,12 +1105,13 @@ pub fn quorum_threshold(committee_members: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey, BootstrapServer,
-        Committee, Multiaddr, NetworkKeypair, ParseAuthorityIdentifierError, ReputationScores,
-        EQUAL_VOTING_POWER,
+        encode, try_decode, Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey,
+        BootstrapServer, Committee, Epoch, Multiaddr, NetworkKeypair, P2pNode,
+        ParseAuthorityIdentifierError, ReputationScores, RpcInfo, EQUAL_VOTING_POWER,
     };
     use rand::rng;
-    use std::collections::BTreeMap;
+    use serde::{Deserialize, Serialize};
+    use std::{collections::BTreeMap, num::NonZeroUsize};
 
     #[test]
     fn committee_load() {
@@ -723,7 +1139,7 @@ mod tests {
 
                 let b = BootstrapServer::new(
                     (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
-                    (Multiaddr::empty(), worker_keypair.public().clone().into()).into(),
+                    vec![(Multiaddr::empty(), worker_keypair.public().clone().into()).into()],
                 );
 
                 (*key, b)
@@ -731,7 +1147,7 @@ mod tests {
             .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
 
         // WHEN
-        let committee = Committee::new(authorities, 10, bootstrap_servers);
+        let committee = Committee::new(authorities, 10, bootstrap_servers, super::ONE_WORKER);
 
         // THEN
         assert_eq!(committee.inner.authorities_by_id.len() as u64, num_of_authorities);
@@ -760,6 +1176,872 @@ mod tests {
         assert_eq!(total, num_of_authorities);
     }
 
+    /// A [BootstrapServer] with fresh keys and `num_workers` workers.
+    fn bootstrap_with_workers(num_workers: usize) -> BootstrapServer {
+        let primary_keypair = NetworkKeypair::generate_ed25519();
+        BootstrapServer::new(
+            (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
+            (0..num_workers)
+                .map(|_| {
+                    let keypair = NetworkKeypair::generate_ed25519();
+                    (Multiaddr::empty(), keypair.public().clone().into()).into()
+                })
+                .collect(),
+        )
+    }
+
+    /// Indent every line of a YAML fragment by two spaces so it nests under a key (the document
+    /// start marker is dropped).
+    fn indent(fragment: &str) -> String {
+        fragment
+            .lines()
+            .filter(|l| *l != "---")
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn bootstrap_server_new_shape_round_trips() {
+        let bootstrap = bootstrap_with_workers(2);
+        let yaml = serde_yaml::to_string(&bootstrap).expect("serialize");
+        assert!(yaml.contains("workers:"), "new shape must serialize `workers`: {yaml}");
+        assert!(!yaml.contains("\nworker:"), "new shape must not serialize `worker`: {yaml}");
+        let decoded: BootstrapServer = serde_yaml::from_str(&yaml).expect("deserialize");
+        assert_eq!(decoded, bootstrap);
+        assert_eq!(decoded.num_workers(), 2);
+        assert_eq!(decoded.worker(1), bootstrap.workers.get(1));
+        assert!(decoded.worker(2).is_none());
+    }
+
+    #[test]
+    fn bootstrap_server_legacy_shape_decodes_as_one_worker() {
+        let expected = bootstrap_with_workers(1);
+        let worker = expected.worker(0).expect("one worker").clone();
+        let primary_yaml = serde_yaml::to_string(&expected.primary).expect("serialize primary");
+        let worker_yaml = serde_yaml::to_string(&worker).expect("serialize worker");
+        let legacy =
+            format!("primary:\n{}\nworker:\n{}\n", indent(&primary_yaml), indent(&worker_yaml));
+        let decoded: BootstrapServer = serde_yaml::from_str(&legacy).expect("legacy deserialize");
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn bootstrap_server_empty_workers_rejected() {
+        let bootstrap = bootstrap_with_workers(1);
+        let primary_yaml = serde_yaml::to_string(&bootstrap.primary).expect("serialize primary");
+        let doc = format!("primary:\n{}\nworkers: []\n", indent(&primary_yaml));
+        let result: Result<BootstrapServer, _> = serde_yaml::from_str(&doc);
+        assert!(result.is_err(), "empty workers must be rejected");
+    }
+
+    #[test]
+    fn bootstrap_server_bcs_round_trips() {
+        // bcs is not self-describing: the legacy-tolerant untagged path cannot run there, so the
+        // binary codec must read the current shape directly.
+        let bootstrap = bootstrap_with_workers(2);
+        let bytes = crate::encode(&bootstrap);
+        let decoded: BootstrapServer = crate::try_decode(&bytes).expect("bcs deserialize");
+        assert_eq!(decoded, bootstrap);
+    }
+
+    /// A committee at `epoch` with four authorities whose bootstrap servers each advertise
+    /// `workers_per_server` workers, with the committee's worker count set to match.
+    #[cfg(feature = "adiri")]
+    fn committee_with_workers(epoch: crate::Epoch, workers_per_server: usize) -> Committee {
+        let mut rng = rng();
+        let authorities = (0..4u8)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                (*keypair.public(), Authority::new(*keypair.public(), Address::repeat_byte(i)))
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| (*key, bootstrap_with_workers(workers_per_server)))
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+        Committee::new(
+            authorities,
+            epoch,
+            bootstrap_servers,
+            std::num::NonZeroUsize::new(workers_per_server).expect("worker count is not 0"),
+        )
+    }
+
+    /// Below the fork epoch a committee is encoded in the legacy single-worker layout, which has
+    /// no field for a worker count: the encoder refuses a committee it cannot represent rather
+    /// than write one that decodes as single-worker on every node.
+    ///
+    /// The adiri fork epoch is a `u32::MAX` placeholder, so every epoch is pre-fork in this lane.
+    /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
+    /// `OnceLock` is process-wide and the whole test binary shares one process.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn committee_bcs_legacy_layout_refuses_multi_worker() {
+        // bcs directly rather than `crate::encode`, which panics on a serializer error
+        let multi_worker = committee_with_workers(7, 2);
+        assert!(
+            bcs::to_bytes(&multi_worker).is_err(),
+            "the pre-fork layout cannot represent a two-worker committee"
+        );
+
+        // a single-worker committee round-trips, and re-encoding the decoded value reproduces the
+        // exact bytes: a pre-fork pack survives the decode/re-append cycle unchanged
+        let committee = committee_with_workers(7, 1);
+        let bytes = bcs::to_bytes(&committee).expect("legacy encode");
+        let decoded: Committee = crate::try_decode(&bytes).expect("bcs deserialize");
+        assert_eq!(decoded, committee);
+        assert_eq!(decoded.number_of_workers(), 1);
+        assert_eq!(decoded.bootstrap_servers().len(), 4);
+        assert!(decoded.bootstrap_servers().values().all(|server| server.num_workers() == 1));
+        assert_eq!(bcs::to_bytes(&decoded).expect("legacy re-encode"), bytes);
+    }
+
+    /// Default builds have the multi-worker layout active from genesis, so this exercises the
+    /// post-fork arm; the adiri lane covers the legacy arm above.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn committee_bcs_round_trips_with_bootstrap_servers() {
+        // The consensus store and the consensus pack persist committees with bcs.
+        let mut rng = rng();
+        let authorities = (0..4u8)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                (*keypair.public(), Authority::new(*keypair.public(), Address::repeat_byte(i)))
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| (*key, bootstrap_with_workers(2)))
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+        let committee = Committee::new(
+            authorities,
+            7,
+            bootstrap_servers,
+            std::num::NonZeroUsize::new(2).expect("2 is not 0"),
+        );
+        let bytes = crate::encode(&committee);
+        let decoded: Committee = crate::try_decode(&bytes).expect("bcs deserialize");
+        assert_eq!(decoded, committee);
+        assert_eq!(decoded.number_of_workers(), 2);
+        assert_eq!(decoded.bootstrap_servers().len(), 4);
+        assert!(decoded.bootstrap_servers().values().all(|server| server.num_workers() == 2));
+    }
+
+    /// Legacy (pre-#554) shadow of the [`BootstrapServer`] wire layout: a primary plus a single
+    /// unprefixed `worker`.
+    ///
+    /// Derived serde, so it is byte-identical to the `origin/main` `BootstrapServer` derive output
+    /// BY CONSTRUCTION — same field types, same order, same attributes. #554 left [`P2pNode`]
+    /// untouched, so the real type is reused here rather than shadowed: only the field that
+    /// changed shape gets a shadow.
+    #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+    struct BootstrapReprLegacy {
+        /// The p2p info the primary.
+        primary: P2pNode,
+        /// The p2p info the worker.
+        worker: P2pNode,
+    }
+
+    impl From<BootstrapReprLegacy> for BootstrapServer {
+        fn from(value: BootstrapReprLegacy) -> Self {
+            let BootstrapReprLegacy { primary, worker } = value;
+            Self { primary, workers: vec![worker] }
+        }
+    }
+
+    /// Post-fork shadow of the [`BootstrapServer`] wire layout: a primary plus a length-prefixed
+    /// worker list.
+    ///
+    /// Derived serde, so it is byte-identical to a plain derive on [`BootstrapServer`] BY
+    /// CONSTRUCTION — and that derive is what the post-fork arm writes, since #554 hand-wrote only
+    /// the enclosing committee's serializer, not this one. Pairs with [`BootstrapReprLegacy`]: the
+    /// two shapes differ by exactly the ULEB128 worker-list prefix.
+    #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+    struct BootstrapReprV1 {
+        /// The p2p info the primary.
+        primary: P2pNode,
+        /// The p2p info for each worker, indexed by [`crate::WorkerId`].
+        workers: Vec<P2pNode>,
+    }
+
+    /// Legacy (pre-#554) shadow of the [`CommitteeInner`] wire layout: its three serialized
+    /// fields, with derived serde, so it is byte-identical to the `origin/main` derive output BY
+    /// CONSTRUCTION.
+    ///
+    /// `origin/main` interleaved three `#[serde(skip)]` helper fields between these
+    /// (`authorities_by_id`, `quorum_threshold`, `validity_threshold`). Skipped fields never reach
+    /// the wire, so omitting them preserves both the field set and its order. Names are absent
+    /// too: bcs writes neither struct nor field names, so only the types and their order decide
+    /// the bytes and no `#[serde(rename)]` is load-bearing here.
+    #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+    struct CommitteeReprLegacy {
+        /// The authorities of epoch.
+        authorities: BTreeMap<BlsPublicKey, Authority>,
+        /// The epoch number of this committee.
+        epoch: Epoch,
+        /// The bootstrap servers to initially join a network.
+        bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapReprLegacy>,
+    }
+
+    /// Post-fork shadow of the [`CommitteeInner`] wire layout: its four serialized fields with
+    /// derived serde, byte-identical to a plain derive on the current struct BY CONSTRUCTION.
+    ///
+    /// The same reasoning as [`CommitteeReprLegacy`] applies to the field set: the three helper
+    /// fields the real struct carries are absent from every wire layout, and bcs writes neither
+    /// struct nor field names, so only the types and their order decide the bytes. Anchors the
+    /// post-fork golden vector independently of the hand-written epoch gate.
+    #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+    struct CommitteeReprV1 {
+        /// The authorities of epoch.
+        authorities: BTreeMap<BlsPublicKey, Authority>,
+        /// The epoch number of this committee.
+        epoch: Epoch,
+        /// The bootstrap servers to initially join a network.
+        bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapReprV1>,
+        /// The number of workers every validator in this committee runs.
+        num_workers: NonZeroUsize,
+    }
+
+    /// Build the real [`Committee`] a legacy shadow describes.
+    ///
+    /// The worker count is one: the legacy layout holds exactly one worker per bootstrap server
+    /// and carries no count field, so a single-worker committee is the only thing it can express.
+    fn committee_from_legacy_repr(repr: &CommitteeReprLegacy) -> Committee {
+        let bootstrap_servers = repr
+            .bootstrap_servers
+            .iter()
+            .map(|(key, server)| (*key, server.clone().into()))
+            .collect();
+        Committee::new(repr.authorities.clone(), repr.epoch, bootstrap_servers, super::ONE_WORKER)
+    }
+
+    /// Project a [`Committee`] onto its legacy shadow, so both sides of the differential can also
+    /// be derived from a single committee rather than only from a single fixture.
+    ///
+    /// # Panics
+    ///
+    /// If any bootstrap server advertises anything other than exactly one worker. The legacy
+    /// layout has no field to hold a second worker, so such a committee has no legacy shadow at
+    /// all — the same value the pre-fork encoder refuses to write rather than truncate.
+    fn legacy_repr_from_committee(committee: &Committee) -> CommitteeReprLegacy {
+        let bootstrap_servers = committee
+            .inner
+            .bootstrap_servers
+            .iter()
+            .map(|(key, server)| {
+                let [worker] = server.workers.as_slice() else {
+                    panic!(
+                        "the legacy layout holds exactly one worker per bootstrap server, got {}",
+                        server.workers.len()
+                    );
+                };
+                let repr =
+                    BootstrapReprLegacy { primary: server.primary.clone(), worker: worker.clone() };
+                (*key, repr)
+            })
+            .collect();
+        CommitteeReprLegacy {
+            authorities: committee.inner.authorities.clone(),
+            epoch: committee.inner.epoch,
+            bootstrap_servers,
+        }
+    }
+
+    /// Epoch of the legacy-layout fixtures: 406, one epoch below `CONSENSUS_REGISTRY_FORK_EPOCH`
+    /// (407), which is the documented arming floor of the multi-workers fork.
+    ///
+    /// One below the floor rather than the floor itself, because the fork may legally be armed AT
+    /// 407: the gate is `>=`, so 407 would become post-fork and every anti-vacuity assert below
+    /// would fail — with the frozen vectors then tempting exactly the re-freeze they forbid. 406
+    /// is structurally pre-fork under every legal arming, whichever epoch the arming PR picks, so
+    /// `adiri` encodes it in the legacy layout while staying adjacent to the floor: the pre-fork
+    /// region with the least margin for error.
+    ///
+    /// Moving this constant is the one legitimate reason to re-freeze the vectors below. The epoch
+    /// is a field of the encoded value, so its bytes move with it; any OTHER divergence is a
+    /// compatibility break to fix in the encoder.
+    const LEGACY_FIXTURE_EPOCH: Epoch = 406;
+
+    /// Epoch of the post-fork-layout fixtures: `u32::MAX`, the one epoch that carries the
+    /// multi-worker layout under every build, armed or not.
+    ///
+    /// Non-adiri is post-fork from genesis. Adiri gates on `epoch >= MULTI_WORKERS_FORK_EPOCH`
+    /// and that constant is the `u32::MAX` placeholder, so the top epoch is post-fork even while
+    /// the fork is dormant — and stays post-fork once the epoch-setting PR lowers the constant. One
+    /// frozen vector therefore pins the post-fork bytes on every lane, before and after arming.
+    const V1_FIXTURE_EPOCH: Epoch = u32::MAX;
+
+    /// Seed tag marking a fixture primary's network key, so no primary shares a key with a worker.
+    const PRIMARY_SEED_TAG: u8 = 0xB0;
+    /// Seed tag marking a fixture worker's network key.
+    const WORKER_SEED_TAG: u8 = 0xC0;
+
+    /// Deterministic BLS keypair for fixture authority slot `slot`.
+    ///
+    /// Built from a fixed scalar rather than a seeded rng, so the derived public key — and with it
+    /// the `authorities` map order and every encoded byte — is stable across `rand` version bumps
+    /// as well as across runs. The leading bytes stay zero, which keeps the scalar far below the
+    /// BLS12-381 group order and nonzero, the only two values `blst` rejects.
+    fn fixture_bls_keypair(slot: u8) -> BlsKeypair {
+        let mut scalar = [0_u8; 32];
+        scalar[30] = slot;
+        scalar[31] = 0x2A;
+        BlsKeypair::from_bytes(&scalar).expect("fixture bls scalar is a valid private key")
+    }
+
+    /// A fixed 32-byte ed25519 secret seed identifying one fixture node.
+    fn fixture_seed(tag: u8, authority: u8, worker: u8) -> [u8; 32] {
+        let mut seed = [0_u8; 32];
+        seed[0] = tag;
+        seed[1] = authority;
+        seed[2] = worker;
+        seed
+    }
+
+    /// A [`P2pNode`] from a fixed ed25519 seed and port.
+    ///
+    /// ed25519 secret keys *are* 32-byte seeds, so a fixed seed yields a fixed public key with no
+    /// rng in the path; the multiaddr comes from a literal rather than an OS-assigned port.
+    fn fixture_p2p_node(seed: [u8; 32], port: u16, rpc: Option<RpcInfo>) -> P2pNode {
+        P2pNode {
+            network_address: format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+                .parse()
+                .expect("fixture multiaddr parses"),
+            network_key: NetworkKeypair::ed25519_from_bytes(seed)
+                .expect("a 32-byte array is a valid ed25519 secret seed")
+                .public()
+                .clone()
+                .into(),
+            rpc,
+        }
+    }
+
+    /// The primary node of fixture authority `authority`. Primaries never advertise rpc.
+    fn fixture_primary_node(authority: u8) -> P2pNode {
+        fixture_p2p_node(
+            fixture_seed(PRIMARY_SEED_TAG, authority, 0),
+            40_000 + u16::from(authority),
+            None,
+        )
+    }
+
+    /// Worker `worker` of fixture authority `authority`.
+    ///
+    /// The first worker of the first authority advertises an rpc endpoint and no other worker
+    /// does, so both arms of [`P2pNode::rpc`]'s `Option` appear in the encoded fixture.
+    fn fixture_worker_node(authority: u8, worker: u8) -> P2pNode {
+        let rpc = (authority == 0 && worker == 0).then(|| RpcInfo {
+            http: "https://validator0.example.com:8545/".parse().expect("fixture http url"),
+            ws: Some("wss://validator0.example.com:8546/".parse().expect("fixture ws url")),
+        });
+        fixture_p2p_node(
+            fixture_seed(WORKER_SEED_TAG, authority, worker),
+            41_000 + u16::from(authority) * 8 + u16::from(worker),
+            rpc,
+        )
+    }
+
+    /// Shape of a deterministic committee fixture for wire-layout tests.
+    ///
+    /// Every value it produces — BLS keys, network keys, multiaddrs, execution addresses, rpc
+    /// endpoints — is derived from a constant plus a slot index, with no rng, no clock and no
+    /// OS-assigned port, so the encoded bytes are reproducible across runs, machines and
+    /// dependency bumps. Here that matters more than realism: these fixtures anchor the
+    /// differential assertions below and, later, frozen golden byte vectors.
+    #[derive(Clone, Copy, Debug)]
+    struct CommitteeWireFixture {
+        /// The committee's epoch, which is the only input the wire-layout gate reads.
+        epoch: Epoch,
+        /// Number of authorities. Must be at least two: `CommitteeInner::load` asserts a committee
+        /// larger than one.
+        authorities: u8,
+        /// Number of bootstrap servers, attached to authority slots `0..bootstrap_servers`.
+        ///
+        /// Tracked separately from [`Self::authorities`] because the two maps are independent on
+        /// the wire: a committee may carry fewer bootstrap hints than it has authorities. Letting
+        /// the two lengths differ gives the maps distinct ULEB128 length prefixes, so a layout
+        /// that read one where the other belongs would not line up.
+        bootstrap_servers: u8,
+        /// Workers each bootstrap server advertises, which is also the committee's worker count.
+        workers_per_server: u8,
+    }
+
+    impl CommitteeWireFixture {
+        /// A single-worker fixture: the only shape the legacy layout can express.
+        const fn single_worker(epoch: Epoch, authorities: u8, bootstrap_servers: u8) -> Self {
+            Self { epoch, authorities, bootstrap_servers, workers_per_server: 1 }
+        }
+
+        /// A fixture whose every bootstrap server advertises `workers_per_server` workers, which is
+        /// also the committee's worker count: a shape only the post-fork layout can express.
+        const fn multi_worker(
+            epoch: Epoch,
+            authorities: u8,
+            bootstrap_servers: u8,
+            workers_per_server: u8,
+        ) -> Self {
+            Self { epoch, authorities, bootstrap_servers, workers_per_server }
+        }
+
+        /// The committee-level worker count this fixture describes.
+        fn num_workers(self) -> NonZeroUsize {
+            NonZeroUsize::new(usize::from(self.workers_per_server))
+                .expect("a fixture runs at least one worker per server")
+        }
+
+        /// The fixture's authorities, keyed by BLS public key.
+        ///
+        /// Shared by both builders below: #554 left this field's layout untouched, and a byte
+        /// comparison is only meaningful when both sides hold the same values. Only the fields
+        /// whose shape changed are built twice.
+        fn authority_map(self) -> BTreeMap<BlsPublicKey, Authority> {
+            (0..self.authorities)
+                .map(|slot| {
+                    let key = *fixture_bls_keypair(slot).public();
+                    (key, Authority::new(key, Address::repeat_byte(slot)))
+                })
+                .collect()
+        }
+
+        /// The `(slot, bls key)` pairs that carry a bootstrap server.
+        ///
+        /// # Panics
+        ///
+        /// If the fixture has more bootstrap servers than authorities: servers attach to authority
+        /// slots, so a wider fixture would key them off nonexistent authorities.
+        fn bootstrap_slots(self) -> impl Iterator<Item = (u8, BlsPublicKey)> {
+            assert!(
+                self.bootstrap_servers <= self.authorities,
+                "fixture has {} bootstrap servers but only {} authorities to attach them to",
+                self.bootstrap_servers,
+                self.authorities
+            );
+            (0..self.bootstrap_servers).map(|slot| (slot, *fixture_bls_keypair(slot).public()))
+        }
+
+        /// Build the [`Committee`] this fixture describes.
+        fn committee(self) -> Committee {
+            let bootstrap_servers = self
+                .bootstrap_slots()
+                .map(|(slot, key)| {
+                    let workers = (0..self.workers_per_server)
+                        .map(|worker| fixture_worker_node(slot, worker))
+                        .collect();
+                    (key, BootstrapServer::new(fixture_primary_node(slot), workers))
+                })
+                .collect();
+            Committee::new(self.authority_map(), self.epoch, bootstrap_servers, self.num_workers())
+        }
+
+        /// Build the legacy shadow this fixture describes.
+        ///
+        /// Reaches the shadow reprs straight from the slot-derived keys and nodes, never through
+        /// [`Self::committee`], so a bug in the gated encoder cannot make the two sides of the
+        /// differential agree.
+        ///
+        /// # Panics
+        ///
+        /// If the fixture runs more than one worker per server. The legacy layout carries exactly
+        /// one unprefixed `worker` per bootstrap server and no count field, so a wider fixture has
+        /// no legacy shadow at all.
+        fn legacy_repr(self) -> CommitteeReprLegacy {
+            assert_eq!(
+                self.workers_per_server, 1,
+                "the legacy layout holds exactly one worker per bootstrap server"
+            );
+            let bootstrap_servers = self
+                .bootstrap_slots()
+                .map(|(slot, key)| {
+                    let repr = BootstrapReprLegacy {
+                        primary: fixture_primary_node(slot),
+                        worker: fixture_worker_node(slot, 0),
+                    };
+                    (key, repr)
+                })
+                .collect();
+            CommitteeReprLegacy {
+                authorities: self.authority_map(),
+                epoch: self.epoch,
+                bootstrap_servers,
+            }
+        }
+
+        /// Build the post-fork shadow this fixture describes.
+        ///
+        /// Like [`Self::legacy_repr`], reaches the shadow reprs straight from the slot-derived keys
+        /// and nodes rather than through [`Self::committee`], so a bug in the gated encoder cannot
+        /// make the two sides of the differential agree.
+        fn v1_repr(self) -> CommitteeReprV1 {
+            let bootstrap_servers = self
+                .bootstrap_slots()
+                .map(|(slot, key)| {
+                    let repr = BootstrapReprV1 {
+                        primary: fixture_primary_node(slot),
+                        workers: (0..self.workers_per_server)
+                            .map(|worker| fixture_worker_node(slot, worker))
+                            .collect(),
+                    };
+                    (key, repr)
+                })
+                .collect();
+            CommitteeReprV1 {
+                authorities: self.authority_map(),
+                epoch: self.epoch,
+                bootstrap_servers,
+                num_workers: self.num_workers(),
+            }
+        }
+    }
+
+    /// The legacy shadow reprs are self-consistent under bcs, reproducible, and describe the same
+    /// value as the [`Committee`] the same fixture builds.
+    ///
+    /// Runs on every lane so the reprs, the fixture and the conversions stay compiled and
+    /// exercised in builds whose gate never selects the legacy layout (non-adiri is post-fork from
+    /// genesis). The byte-level differential against the gated encoder is adiri-only, below.
+    #[test]
+    fn legacy_committee_repr_round_trips() {
+        let fixture = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3);
+        let repr = fixture.legacy_repr();
+        let bytes = encode(&repr);
+
+        // a second, independent build of the same fixture encodes to the same bytes: no rng,
+        // clock or OS-assigned port leaked into the fixture
+        assert_eq!(encode(&fixture.legacy_repr()), bytes, "fixture bytes are not reproducible");
+
+        // encode -> decode -> re-encode is byte-identical
+        let decoded: CommitteeReprLegacy =
+            try_decode(&bytes).expect("legacy repr decodes its own bytes");
+        assert_eq!(decoded, repr, "legacy repr lost data through bcs");
+        assert_eq!(encode(&decoded), bytes, "legacy repr re-encode diverged");
+
+        // the shadow and the real committee describe the same value in both directions.
+        // `Committee`'s PartialEq deliberately ignores bootstrap servers, so compare those too.
+        let committee = fixture.committee();
+        let from_repr = committee_from_legacy_repr(&repr);
+        assert_eq!(from_repr, committee, "legacy repr describes a different committee");
+        assert_eq!(
+            from_repr.bootstrap_servers(),
+            committee.bootstrap_servers(),
+            "legacy repr describes different bootstrap servers"
+        );
+        assert_eq!(
+            legacy_repr_from_committee(&committee),
+            repr,
+            "committee projects onto a different legacy repr"
+        );
+
+        // the two bootstrap layouts genuinely differ: the current shape length-prefixes its worker
+        // list, so the same value encodes exactly one byte longer. if these ever matched, the fork
+        // gate — and every assertion built on it — would be testing nothing.
+        let legacy_server = repr.bootstrap_servers.values().next().expect("fixture has servers");
+        let current_server = BootstrapServer::from(legacy_server.clone());
+        assert_eq!(
+            encode(&current_server).len(),
+            encode(legacy_server).len() + 1,
+            "the current bootstrap layout must differ from the legacy one"
+        );
+    }
+
+    /// Pre-fork differential: the epoch-gated [`Committee`] and the derived legacy shadow encode
+    /// to the same bytes, and each side reads what the other wrote.
+    ///
+    /// The `adiri` multi-workers fork epoch is a `u32::MAX` placeholder, so every epoch is
+    /// pre-fork in this lane. `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage
+    /// that: the override's `OnceLock` is process-wide and the whole test binary shares one
+    /// process.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn committee_bcs_pre_fork_layout_matches_legacy_repr() {
+        let fixture = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3);
+        let committee = fixture.committee();
+        assert!(
+            !crate::forks::multi_workers_fork_active(committee.epoch()),
+            "epoch {} must be pre-fork for this differential to mean anything; is \
+             TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed?",
+            committee.epoch()
+        );
+
+        let repr = fixture.legacy_repr();
+        let legacy_bytes = encode(&repr);
+        let gated_bytes = encode(&committee);
+
+        // the gated encoder reproduces the pre-#554 derive byte for byte
+        assert_eq!(gated_bytes, legacy_bytes, "pre-fork Committee bytes left the legacy layout");
+
+        // legacy bytes decode through the gated `Committee`: a pack written by a pre-#554 binary
+        // still loads on this build
+        let from_legacy: Committee =
+            try_decode(&legacy_bytes).expect("legacy bytes decode as a Committee");
+        assert_eq!(from_legacy, committee);
+        assert_eq!(from_legacy.bootstrap_servers(), committee.bootstrap_servers());
+        assert_eq!(from_legacy.number_of_workers(), 1);
+
+        // gated bytes decode through the shadow: a pre-#554 binary still reads what this build
+        // writes for a pre-fork epoch
+        let read_back: CommitteeReprLegacy =
+            try_decode(&gated_bytes).expect("pre-fork Committee bytes decode as the legacy repr");
+        assert_eq!(read_back, repr, "pre-fork Committee bytes are not the legacy layout");
+    }
+
+    /// Decode a frozen hex vector, failing loudly on a malformed constant.
+    fn unhex(hex_str: &str) -> Vec<u8> {
+        hex::decode(hex_str).expect("frozen hex vector must be valid hex")
+    }
+
+    /// FROZEN pre-fork committee vector: the bcs bytes of
+    /// `CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3)` — four authorities and
+    /// three single-worker bootstrap servers, one worker of which advertises rpc — wire-identical
+    /// to the pre-#554 derive output by construction of [`CommitteeReprLegacy`].
+    ///
+    /// This is the layout every committee already on adiri disk is written in: [`Committee`] is
+    /// embedded in `EpochMeta`, the first record of every consensus pack. If this pin breaks, that
+    /// historical layout moved and those packs stop decoding — a compatibility break to fix in the
+    /// encoder, NOT a constant to refresh. The one exception is a move of
+    /// [`LEGACY_FIXTURE_EPOCH`], which is a field of the encoded value and so legitimately shifts
+    /// these bytes. The fixture takes no rng, clock or OS-assigned port, so nothing else can move
+    /// them but an encoder, a field type, or a dependency's serde impl.
+    const GOLDEN_LEGACY_COMMITTEE_HEX: &str = "046085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87356085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87351401010101010101010101010101010101010101016096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad6096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad14020202020202020202020202020202020202020260991387de238ff1a895ccff0d14bbdd0ad15e27504209243d391d5fcd07b6dd620af231d7852a007b4f149e43531ea94402446153bf7a53b5f907d54d1e208fb5b5a1088725b772777f87391ae331d9124c58a66d24c65ddb957314eeb607ca0460991387de238ff1a895ccff0d14bbdd0ad15e27504209243d391d5fcd07b6dd620af231d7852a007b4f149e43531ea94402446153bf7a53b5f907d54d1e208fb5b5a1088725b772777f87391ae331d9124c58a66d24c65ddb957314eeb607ca0414030303030303030303030303030303030303030360ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b8444460ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b8444414000000000000000000000000000000000000000096010000036085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87350b047f00000191029c41cd032408011220b14a3296426492458270c2e577fdc549b6d67155e5800b0bf96c3f4106b4ae71000b047f0000019102a030cd032408011220c602145e9a9f1672b151652377fa8c23fc78ded1add621fe177d33b8ebcd4214006096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad0b047f00000191029c42cd03240801122032fb5b7c292018fbb8b436c83f39526a6035aa410421a8c5f46e8d06de48fa66000b047f0000019102a038cd0324080112201edb6a1734e1f14d1461431b25a7f3ca348acab2fa98e4262685d2b46ce335800060ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b844440b047f00000191029c40cd032408011220e0fcb53429020d03e8f4e471ec73993f9329ad0d76e69cfdfcb08c94aa39fdab000b047f0000019102a028cd032408011220055139b0f6daf33b3fdc294e2bfc1ad914de91f7d6e9f717b4509c047fbc6acc012468747470733a2f2f76616c696461746f72302e6578616d706c652e636f6d3a383534352f01227773733a2f2f76616c696461746f72302e6578616d706c652e636f6d3a383534362f";
+    /// FROZEN post-fork committee vector: the bcs bytes of
+    /// `CommitteeWireFixture::multi_worker(V1_FIXTURE_EPOCH, 4, 3, 2)` — the same authorities and
+    /// servers as [`GOLDEN_LEGACY_COMMITTEE_HEX`], now with two workers per server and a trailing
+    /// `num_workers`, so a diff of the two constants is a diff of the fork itself.
+    ///
+    /// Multi-worker deliberately: it freezes both halves of the layout change (the ULEB128
+    /// worker-list prefix and the trailing count) where a single-worker fixture would only show the
+    /// second. Same warning as the pre-fork pin — this is the layout every post-fork pack is
+    /// written in.
+    const GOLDEN_V1_COMMITTEE_HEX: &str = "046085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87356085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87351401010101010101010101010101010101010101016096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad6096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad14020202020202020202020202020202020202020260991387de238ff1a895ccff0d14bbdd0ad15e27504209243d391d5fcd07b6dd620af231d7852a007b4f149e43531ea94402446153bf7a53b5f907d54d1e208fb5b5a1088725b772777f87391ae331d9124c58a66d24c65ddb957314eeb607ca0460991387de238ff1a895ccff0d14bbdd0ad15e27504209243d391d5fcd07b6dd620af231d7852a007b4f149e43531ea94402446153bf7a53b5f907d54d1e208fb5b5a1088725b772777f87391ae331d9124c58a66d24c65ddb957314eeb607ca0414030303030303030303030303030303030303030360ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b8444460ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b84444140000000000000000000000000000000000000000ffffffff036085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e87350b047f00000191029c41cd032408011220b14a3296426492458270c2e577fdc549b6d67155e5800b0bf96c3f4106b4ae7100020b047f0000019102a030cd032408011220c602145e9a9f1672b151652377fa8c23fc78ded1add621fe177d33b8ebcd4214000b047f0000019102a031cd0324080112201ad1a467248480996c12b0f2eebe5082dc5687256fd150b29806142d3ac6f052006096687254e65b83ac8107af98ed534d7ae8b518b0f82fdacf70c890f867a565c33b1b945543e6d7b6bcc63d0720ff6adb130faa68b017b45d4831b4a96c00b5a98deec5a6b6e7cdfe26fb23e94e5905885f5ca534cd45c233d24d44f07a80a5ad0b047f00000191029c42cd03240801122032fb5b7c292018fbb8b436c83f39526a6035aa410421a8c5f46e8d06de48fa6600020b047f0000019102a038cd0324080112201edb6a1734e1f14d1461431b25a7f3ca348acab2fa98e4262685d2b46ce33580000b047f0000019102a039cd032408011220be1e84fd08b72a68647b9cfe4aa9f04ed7726ff7d9d0d1415eeab62c4b1c98090060ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b844440b047f00000191029c40cd032408011220e0fcb53429020d03e8f4e471ec73993f9329ad0d76e69cfdfcb08c94aa39fdab00020b047f0000019102a028cd032408011220055139b0f6daf33b3fdc294e2bfc1ad914de91f7d6e9f717b4509c047fbc6acc012468747470733a2f2f76616c696461746f72302e6578616d706c652e636f6d3a383534352f01227773733a2f2f76616c696461746f72302e6578616d706c652e636f6d3a383534362f0b047f0000019102a029cd032408011220a72b23753f2dc308151fba8b061458979bce8ec10e3c6448c27a7cbfd7dc12fd000200000000000000";
+
+    /// PIN (all cfgs): the frozen pre-fork vector, anchored through the derived legacy shadow.
+    ///
+    /// The shadow is `origin/main`-identical by construction, so this keeps the historical bytes
+    /// pinned even in builds whose gate never selects the legacy arm (non-adiri is post-fork from
+    /// genesis, [`LEGACY_FIXTURE_EPOCH`] included). The gated encoder is held to the same constant
+    /// by the adiri test below.
+    #[test]
+    fn golden_legacy_committee_wire_bytes_pinned() {
+        let fixture = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3);
+        let repr = fixture.legacy_repr();
+
+        // re-encoding the fixture must reproduce the frozen vector: drift in the fixture, in a
+        // field type or in a serde impl fails here instead of being absorbed silently
+        assert_eq!(
+            hex::encode(encode(&repr)),
+            GOLDEN_LEGACY_COMMITTEE_HEX,
+            "legacy shadow encode diverged from the frozen pre-fork vector"
+        );
+
+        let decoded: CommitteeReprLegacy = try_decode(&unhex(GOLDEN_LEGACY_COMMITTEE_HEX))
+            .expect("frozen pre-fork vector decodes as the legacy repr");
+        assert_eq!(decoded, repr, "decode of the frozen pre-fork vector diverged");
+        assert_eq!(decoded.epoch, LEGACY_FIXTURE_EPOCH, "frozen pre-fork epoch moved");
+        assert_eq!(decoded.authorities.len(), 4, "frozen pre-fork authority count moved");
+        assert_eq!(decoded.bootstrap_servers.len(), 3, "frozen pre-fork server count moved");
+
+        // the two maps carry independent length prefixes but the same keys: every server in the
+        // frozen vector still belongs to an authority in it
+        assert!(
+            decoded.bootstrap_servers.keys().all(|key| decoded.authorities.contains_key(key)),
+            "a frozen bootstrap server is keyed off no authority"
+        );
+
+        // exactly one fixture worker advertises rpc, so both arms of `P2pNode::rpc` are frozen here
+        assert_eq!(
+            decoded.bootstrap_servers.values().filter(|server| server.worker.rpc.is_some()).count(),
+            1,
+            "the frozen pre-fork vector lost its single rpc endpoint"
+        );
+    }
+
+    /// PIN (adiri): the epoch-gated [`Committee`] emits and re-reads the frozen pre-fork vector at
+    /// [`LEGACY_FIXTURE_EPOCH`].
+    ///
+    /// The second, independent anchor of that constant, and the direct proof that the gate selects
+    /// the legacy arm for historical bytes: what a pre-#554 binary wrote decodes here, and what
+    /// this build writes for that epoch is what that binary would have written.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn golden_legacy_committee_gated_wire_bytes_pinned() {
+        assert!(
+            !crate::forks::multi_workers_fork_active(LEGACY_FIXTURE_EPOCH),
+            "epoch {LEGACY_FIXTURE_EPOCH} must be pre-fork for this pin to mean anything; is \
+             TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been armed?"
+        );
+
+        let committee = CommitteeWireFixture::single_worker(LEGACY_FIXTURE_EPOCH, 4, 3).committee();
+        let bytes = encode(&committee);
+        assert_eq!(
+            hex::encode(&bytes),
+            GOLDEN_LEGACY_COMMITTEE_HEX,
+            "pre-fork Committee encode diverged from the frozen pre-fork vector"
+        );
+
+        let decoded: Committee = try_decode(&unhex(GOLDEN_LEGACY_COMMITTEE_HEX))
+            .expect("frozen pre-fork vector decodes as a Committee");
+        assert_eq!(decoded.epoch(), LEGACY_FIXTURE_EPOCH, "frozen pre-fork epoch moved");
+        assert_eq!(decoded.size(), 4, "frozen pre-fork authority count moved");
+        assert_eq!(decoded.bootstrap_servers().len(), 3, "frozen pre-fork server count moved");
+        assert_eq!(decoded.number_of_workers(), 1, "the pre-fork layout carries no worker count");
+        assert!(
+            decoded.bootstrap_servers().values().all(|server| server.num_workers() == 1),
+            "the pre-fork layout holds exactly one worker per bootstrap server"
+        );
+        assert_eq!(decoded, committee, "the frozen pre-fork vector is a different committee");
+        // `Committee`'s PartialEq deliberately ignores bootstrap servers, so compare those too
+        assert_eq!(decoded.bootstrap_servers(), committee.bootstrap_servers());
+
+        // re-encoding what the frozen vector decoded to reproduces it byte for byte: a pre-fork
+        // pack survives the decode/re-append cycle unchanged
+        assert_eq!(encode(&decoded), bytes, "pre-fork re-encode diverged from the frozen vector");
+    }
+
+    /// PIN (all cfgs): the frozen post-fork vector, anchored twice — through the derived four-field
+    /// shadow and through the epoch-gated [`Committee`] itself.
+    ///
+    /// Runs on every lane because [`V1_FIXTURE_EPOCH`] is post-fork under every build, so a single
+    /// vector pins the post-fork bytes for adiri and mainnet alike. The two anchors agreeing is
+    /// also the post-fork half of the layout differential — the gated encoder emits exactly
+    /// what a plain derive on the four-field struct emits — mirroring the pre-fork differential
+    /// above.
+    #[test]
+    fn golden_v1_committee_wire_bytes_pinned() {
+        assert!(
+            crate::forks::multi_workers_fork_active(V1_FIXTURE_EPOCH),
+            "epoch {V1_FIXTURE_EPOCH} must be post-fork for this pin to mean anything; is \
+             TN_MULTI_WORKERS_FORK_EPOCH set in the environment?"
+        );
+
+        let fixture = CommitteeWireFixture::multi_worker(V1_FIXTURE_EPOCH, 4, 3, 2);
+        let repr = fixture.v1_repr();
+        assert_eq!(
+            hex::encode(encode(&repr)),
+            GOLDEN_V1_COMMITTEE_HEX,
+            "post-fork shadow encode diverged from the frozen post-fork vector"
+        );
+
+        let committee = fixture.committee();
+        let bytes = encode(&committee);
+        assert_eq!(
+            hex::encode(&bytes),
+            GOLDEN_V1_COMMITTEE_HEX,
+            "post-fork Committee encode diverged from the frozen post-fork vector"
+        );
+
+        let decoded: Committee = try_decode(&unhex(GOLDEN_V1_COMMITTEE_HEX))
+            .expect("frozen post-fork vector decodes as a Committee");
+        assert_eq!(decoded.epoch(), V1_FIXTURE_EPOCH, "frozen post-fork epoch moved");
+        assert_eq!(decoded.size(), 4, "frozen post-fork authority count moved");
+        assert_eq!(decoded.bootstrap_servers().len(), 3, "frozen post-fork server count moved");
+        assert_eq!(decoded.number_of_workers(), 2, "the frozen post-fork worker count moved");
+        assert!(
+            decoded.bootstrap_servers().values().all(|server| server.num_workers() == 2),
+            "the frozen post-fork vector lost a worker from a length-prefixed list"
+        );
+        assert_eq!(
+            decoded
+                .bootstrap_servers()
+                .values()
+                .flat_map(|server| server.workers.iter())
+                .filter(|worker| worker.rpc.is_some())
+                .count(),
+            1,
+            "the frozen post-fork vector lost its single rpc endpoint"
+        );
+        assert_eq!(decoded, committee, "the frozen post-fork vector is a different committee");
+        assert_eq!(decoded.bootstrap_servers(), committee.bootstrap_servers());
+        assert_eq!(encode(&decoded), bytes, "post-fork re-encode diverged from the frozen vector");
+
+        // the shadow reads the gated bytes back, closing the same loop the pre-fork differential
+        // closes for the legacy arm
+        let read_back: CommitteeReprV1 =
+            try_decode(&bytes).expect("post-fork Committee bytes decode as the post-fork repr");
+        assert_eq!(read_back, repr, "post-fork Committee bytes are not the derived layout");
+    }
+
+    #[test]
+    fn committee_yaml_without_num_workers_defaults_to_one() {
+        let mut rng = rng();
+        let authorities = (0..4u8)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                (*keypair.public(), Authority::new(*keypair.public(), Address::repeat_byte(i)))
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| (*key, bootstrap_with_workers(1)))
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+        let committee = Committee::new(
+            authorities,
+            3,
+            bootstrap_servers,
+            std::num::NonZeroUsize::new(2).expect("2 is not 0"),
+        );
+        assert_eq!(committee.number_of_workers(), 2);
+
+        // strip the field: an older committee file has no `num_workers`
+        let mut yaml_value = serde_yaml::to_value(&committee).expect("YAML serialization failed");
+        let map = yaml_value.as_mapping_mut().expect("committee should serialize to a mapping");
+        assert!(map.remove(&serde_yaml::Value::String("num_workers".to_string())).is_some());
+        let decoded: Committee = serde_yaml::from_value(yaml_value).expect("deserialize");
+        assert_eq!(decoded.number_of_workers(), 1);
+        assert_eq!(decoded.epoch(), 3);
+        // and the count round-trips when present
+        let yaml = serde_yaml::to_string(&committee).expect("serialize");
+        let decoded: Committee = serde_yaml::from_str(&yaml).expect("deserialize");
+        assert_eq!(decoded.number_of_workers(), 2);
+        assert_eq!(decoded.with_num_workers(std::num::NonZeroUsize::MIN).number_of_workers(), 1);
+    }
+
+    #[test]
+    fn with_num_workers_keeps_derived_fields_and_accepts_default_committee() {
+        // a default (empty) committee is what a missing committee file loads as: no panic
+        let widened = Committee::default()
+            .with_num_workers(std::num::NonZeroUsize::new(2).expect("2 is not 0"));
+        assert_eq!(widened.number_of_workers(), 2);
+        assert_eq!(widened.size(), 0);
+
+        // a real committee keeps its authorities, indexes and thresholds
+        let mut rng = rng();
+        let authorities = (0..4u8)
+            .map(|i| {
+                let keypair = BlsKeypair::generate(&mut rng);
+                (*keypair.public(), Authority::new(*keypair.public(), Address::repeat_byte(i)))
+            })
+            .collect::<BTreeMap<BlsPublicKey, Authority>>();
+        let bootstrap_servers = authorities
+            .keys()
+            .map(|key| (*key, bootstrap_with_workers(1)))
+            .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
+        let committee =
+            Committee::new(authorities, 5, bootstrap_servers, std::num::NonZeroUsize::MIN);
+        let widened =
+            committee.with_num_workers(std::num::NonZeroUsize::new(3).expect("3 is not 0"));
+        assert_eq!(widened.number_of_workers(), 3);
+        assert_eq!(widened.epoch(), 5);
+        assert_eq!(widened.size(), committee.size());
+        assert_eq!(widened.quorum_threshold(), committee.quorum_threshold());
+        assert_eq!(widened.validity_threshold(), committee.validity_threshold());
+        assert_eq!(widened.bootstrap_servers().len(), 4);
+        assert!(committee
+            .authorities()
+            .iter()
+            .all(|authority| widened.authority(&authority.id()).is_some()));
+    }
+
+    #[test]
+    fn worker_ids_walk_the_committee_count_in_order() {
+        // default count: one worker, id 0
+        assert_eq!(Committee::default().worker_ids().collect::<Vec<_>>(), vec![0]);
+
+        // widened count: ascending ids 0..n
+        let widened = Committee::default()
+            .with_num_workers(std::num::NonZeroUsize::new(3).expect("3 is not 0"));
+        assert_eq!(widened.worker_ids().collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
     #[test]
     fn committee_yaml_deserialize_with_legacy_authority_voting_power() {
         let mut rng = rng();
@@ -782,13 +2064,13 @@ mod tests {
                 let worker_keypair = NetworkKeypair::generate_ed25519();
                 let bootstrap = BootstrapServer::new(
                     (Multiaddr::empty(), primary_keypair.public().clone().into()).into(),
-                    (Multiaddr::empty(), worker_keypair.public().clone().into()).into(),
+                    vec![(Multiaddr::empty(), worker_keypair.public().clone().into()).into()],
                 );
                 (*key, bootstrap)
             })
             .collect::<BTreeMap<BlsPublicKey, BootstrapServer>>();
 
-        let committee = Committee::new(authorities, 0, bootstrap_servers);
+        let committee = Committee::new(authorities, 0, bootstrap_servers, super::ONE_WORKER);
         let mut yaml_value = serde_yaml::to_value(&committee).expect("YAML serialization failed");
         let committee_map =
             yaml_value.as_mapping_mut().expect("committee should serialize to a mapping");

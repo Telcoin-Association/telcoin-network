@@ -24,7 +24,7 @@
 //! yet executed is replayed to the engine, with a guard that refuses to cross an
 //! epoch boundary.
 
-use super::run_epoch::retry_provider_faults;
+use super::{read_num_workers_at_epoch_entry, run_epoch::retry_provider_faults};
 use crate::{
     engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode, worker::WorkerNode,
     EngineToPrimaryRpc,
@@ -32,6 +32,7 @@ use crate::{
 use eyre::{eyre, OptionExt, WrapErr as _};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    num::NonZeroUsize,
     sync::Arc,
     time::Duration,
 };
@@ -50,10 +51,10 @@ use tn_reth::{
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
-    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
-    CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    EpochDigest, Multiaddr, NetworkPublicKey, P2pNode, SealedHeader, TaskManager, TaskSpawner,
-    DEFAULT_WORKER_ID,
+    forks::multi_workers_fork_active, gas_accumulator::GasAccumulator, BatchValidation,
+    BlsPublicKey, BlsSigner, Committee, CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput,
+    Database as TNDatabase, Epoch, EpochDigest, Multiaddr, NetworkPublicKey, P2pNode, SealedHeader,
+    TaskManager, TaskSpawner, DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
@@ -174,8 +175,10 @@ where
             .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|err| eyre!("failed to create bls key from on-chain bytes: {err:?}"))?;
 
+        let reth_env = engine.get_reth_env().await;
         Ok((
-            self.create_committee_from_state(epoch, validators).await?,
+            self.create_committee_from_state(&reth_env, epoch, epoch_info.blockHeight, validators)
+                .await?,
             epoch_info,
             epoch_start,
             epoch_start_header,
@@ -239,7 +242,8 @@ where
                 .builder
                 .tn_config
                 .node_info
-                .worker_network_address()
+                .worker_network_address(DEFAULT_WORKER_ID)
+                .ok_or_eyre("no worker network address in node info")?
                 .clone(),
             version: self.version_str,
         };
@@ -335,27 +339,45 @@ where
     /// Epoch 0 has no on-chain history, so the genesis committee is loaded from the
     /// committee file on disk. Every later epoch is built with a [`CommitteeBuilder`] from the
     /// statically configured bootstrap servers plus the on-chain validator set for that epoch.
+    ///
+    /// In both cases the committee's worker count comes from the on-chain `WorkerConfigs` state
+    /// at the previous epoch's closing block (`epoch_first_block - 1`; genesis state for epoch
+    /// 0), the same read that sizes the [`GasAccumulator`], so the count that validates header
+    /// payloads is the count execution runs with. A failed read halts epoch entry, and so does a
+    /// count the epoch's committee layout cannot hold (see [`check_committee_worker_count`]).
     async fn create_committee_from_state(
         &self,
+        reth_env: &tn_reth::RethEnv,
         epoch: Epoch,
+        epoch_first_block: u64,
         validators: HashMap<BlsPublicKey, &ConsensusRegistry::ValidatorInfo>,
     ) -> eyre::Result<Committee> {
         info!(target: "epoch-manager", "creating committee from state");
 
+        let num_workers = read_num_workers_at_epoch_entry(reth_env, epoch_first_block)
+            .await
+            .and_then(|count| {
+                NonZeroUsize::new(count)
+                    .ok_or_else(|| eyre!("on-chain WorkerConfigs reports zero workers"))
+            })
+            .wrap_err("failed to read the committee worker count from chain")?;
+        check_committee_worker_count(epoch, num_workers)?;
+
         // the network must be live
         let committee = if epoch == 0 {
-            // read from fs for genesis
+            // read from fs for genesis, then stamp the on-chain count
             Config::load_from_path_or_default::<Committee>(
                 self.tn_datadir.committee_path(),
                 ConfigFmt::YAML,
             )?
+            .with_num_workers(num_workers)
         } else {
-            let mut committee_builder = CommitteeBuilder::new(epoch);
+            let mut committee_builder = CommitteeBuilder::new(epoch).with_num_workers(num_workers);
             for (key, bootstrap) in &self.bootstrap_servers {
                 committee_builder.add_bootstrap_server(
                     *key,
                     bootstrap.primary.clone(),
-                    bootstrap.worker.clone(),
+                    bootstrap.workers.clone(),
                 );
             }
 
@@ -407,10 +429,7 @@ where
         .await?;
 
         // spawn primary - create node and spawn network
-        let primary =
-            PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync);
-
-        Ok(primary)
+        PrimaryNode::new(consensus_config.clone(), consensus_bus, network_handle, state_sync)
     }
 
     /// Construct the epoch's [`WorkerNode`] and bring up its [`WorkerNetwork`].
@@ -438,10 +457,12 @@ where
     ) -> eyre::Result<WorkerNode<DB>> {
         // only support one worker for now (with id 0) - otherwise, loop here
         let worker_id = DEFAULT_WORKER_ID;
-        // u64 snapshot of the worker's base fee, used by both the transaction pool and the batch
-        // validator. Base fee is constant within an epoch, so a snapshot taken at epoch start is
-        // valid for the whole epoch.
-        let base_fee = gas_accumulator.base_fee(worker_id).base_fee();
+        // The worker's shared base-fee container: the RPC server keeps the live handle
+        // (`eth_feeHistory` answers its next-block entry from it). The u64 snapshot below
+        // feeds the transaction pool and the batch validator. Base fee is constant within
+        // an epoch, so a snapshot taken at epoch start is valid for the whole epoch.
+        let base_fee_container = gas_accumulator.base_fee(worker_id);
+        let base_fee = base_fee_container.base_fee();
 
         // update the network handle's task spawner for reporting batches in the epoch
         {
@@ -463,7 +484,7 @@ where
                         worker_id,
                         network_handle.clone(),
                         engine_to_primary,
-                        base_fee,
+                        base_fee_container,
                     )
                     .await?;
             } else {
@@ -477,6 +498,24 @@ where
         // On the init path above the pool was created with this value; this call additionally
         // covers the respawn path, where initialization is skipped.
         engine.set_worker_base_fee(worker_id, base_fee).await?;
+
+        // Mirror the node's consensus catch-up state into every worker's RPC network shim
+        // so the stock `eth_syncing` handler stops reporting a catching-up node as fully
+        // synced (issue #1231). Epoch-scoped like the shim's peer-count task: it dies with
+        // this epoch's task manager and is respawned here on rollover, re-reading the mode
+        // `identify_node_mode` published for the epoch.
+        let engine_for_sync_status = engine.clone();
+        let mut rx_node_mode = self.consensus_bus.node_mode().subscribe();
+        epoch_task_spawner.spawn_task("Worker RPC Sync Status", async move {
+            loop {
+                let syncing = node_mode_is_syncing(*rx_node_mode.borrow_and_update());
+                engine_for_sync_status.set_workers_syncing(syncing).await;
+                if rx_node_mode.changed().await.is_err() {
+                    // The watch sender dropped: consensus is shutting down, end cleanly.
+                    break Ok(());
+                }
+            }
+        });
 
         let network_handle = self
             .worker_network_handle
@@ -774,7 +813,9 @@ where
             .committee()
             .bootstrap_servers()
             .iter()
-            .map(|(k, v)| (*k, v.worker.clone()))
+            // worker 0 always exists (the non-empty list invariant is enforced at deserialize), so
+            // this `filter_map` cannot drop a peer
+            .filter_map(|(k, v)| v.worker(DEFAULT_WORKER_ID).cloned().map(|worker| (*k, worker)))
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
@@ -793,12 +834,14 @@ where
             let worker_address = Self::parse_listener_address_for_swarm(
                 "WORKER_LISTENER_MULTIADDR",
                 consensus_config.primary_networkkey(),
-                consensus_config.worker_address(),
+                consensus_config
+                    .worker_address(DEFAULT_WORKER_ID)
+                    .ok_or_eyre("no worker network address in node info")?,
             )?;
             network_handle.inner_handle().start_listening(worker_address).await?;
         }
 
-        let worker_address = consensus_config.worker_address();
+        let worker_address = consensus_config.worker_address(DEFAULT_WORKER_ID);
 
         // always attempt to dial peers for the new epoch
         // the network's peer manager will intercept dial attempts for peers that are already
@@ -827,7 +870,10 @@ where
         // later epoch unless the subscription is explicitly dropped. Skipping alone would also
         // skip the only refresh of this topic's authorized-publisher allowlist, freezing it on
         // the committee that was current when the node last subscribed.
-        let batch_topic = tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id());
+        let batch_topic = tn_config::LibP2pConfig::worker_batch_topic(
+            consensus_config.chain_id(),
+            DEFAULT_WORKER_ID,
+        );
         let mode = self.consensus_bus.current_node_mode();
         if should_subscribe_batch_topic(mode) {
             debug!(target: "epoch-manager", ?mode, "subscribing to worker batch topic");
@@ -1019,6 +1065,22 @@ impl ReplayResult {
     }
 }
 
+/// Whether this [`NodeMode`] means the node is catching up on consensus output rather than
+/// serving a current view (issue #1231).
+///
+/// `CvvInactive` is the demoted catch-up mode: the node is streaming missed consensus output
+/// to rejoin the committee, so its RPC `latest` view is stale. `CvvActive` is optimistic-current
+/// by definition (the node is demoted when that turns out false), and `Observer` follows
+/// consensus output continuously with no behind/caught-up signal today; both answer
+/// not-syncing. Written as an exhaustive match so a new [`NodeMode`] variant fails to compile
+/// until this decision is made for it.
+fn node_mode_is_syncing(mode: NodeMode) -> bool {
+    match mode {
+        NodeMode::CvvInactive => true,
+        NodeMode::CvvActive | NodeMode::Observer => false,
+    }
+}
+
 /// Whether a node in this [`NodeMode`] should subscribe to the worker batch-digest gossip topic.
 ///
 /// Only nodes that consume individual current-epoch batches benefit: a committee validator
@@ -1038,9 +1100,50 @@ fn should_subscribe_batch_topic(mode: NodeMode) -> bool {
     }
 }
 
+/// Whether `epoch` may be entered with an on-chain worker count of `num_workers`.
+///
+/// A single worker is always fine. Above one, the answer depends on the multi-workers fork
+/// ([`multi_workers_fork_active`]), evaluated at the epoch being entered - the same epoch carried
+/// inside the [`Committee`] this count is about to be stamped onto, so the gate here and the gate
+/// the encoder consults cannot disagree:
+///
+/// - pre-fork the legacy committee layout has no field to carry a worker count, so the encoder
+///   refuses the value. Halting here turns that into a diagnosable epoch-entry failure instead of a
+///   panic from the first pack write, which is the only thing the node could do about it anyway:
+///   the count is chain state and cannot be talked down locally.
+/// - post-fork the count is representable and epoch entry proceeds. It still only warns, because
+///   this node version spawns worker [`DEFAULT_WORKER_ID`] alone: header payloads keyed to higher
+///   worker ids validate, but nothing local produces them.
+fn check_committee_worker_count(epoch: Epoch, num_workers: NonZeroUsize) -> eyre::Result<()> {
+    if num_workers.get() == 1 {
+        return Ok(());
+    }
+
+    if !multi_workers_fork_active(epoch) {
+        return Err(eyre!(
+            "on-chain WorkerConfigs reports {num_workers} workers but the multi-workers fork \
+             is not active at epoch {epoch}: the pre-fork committee layout cannot hold a worker \
+             count, so this epoch's committee cannot be encoded"
+        ));
+    }
+
+    warn!(
+        target: "epoch-manager",
+        epoch,
+        num_workers,
+        spawned_worker = DEFAULT_WORKER_ID,
+        "committee runs multiple workers but this node version spawns only worker {DEFAULT_WORKER_ID}: \
+         ids >= 1 are accepted by header validation but not produced locally"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{should_subscribe_batch_topic, NodeMode};
+    use super::{
+        check_committee_worker_count, node_mode_is_syncing, should_subscribe_batch_topic, NodeMode,
+    };
+    use std::num::NonZeroUsize;
 
     /// An active committee validator prefetches batches for the vote path.
     #[test]
@@ -1059,5 +1162,46 @@ mod tests {
     #[test]
     fn observer_does_not_subscribe_to_batch_topic() {
         assert!(!should_subscribe_batch_topic(NodeMode::Observer));
+    }
+
+    /// Only the demoted catch-up mode reports syncing over `eth_syncing` (issue #1231).
+    #[test]
+    fn only_inactive_cvv_reports_syncing() {
+        assert!(node_mode_is_syncing(NodeMode::CvvInactive));
+        assert!(!node_mode_is_syncing(NodeMode::CvvActive));
+        assert!(!node_mode_is_syncing(NodeMode::Observer));
+    }
+
+    /// One worker is representable in both committee layouts, so entry never blocks on it.
+    #[test]
+    fn single_worker_epoch_entry_is_always_allowed() {
+        for epoch in [0, 1, 407, u32::MAX] {
+            check_committee_worker_count(epoch, NonZeroUsize::MIN)
+                .expect("one worker is representable at every epoch");
+        }
+    }
+
+    /// Pre-fork the legacy committee layout cannot carry a worker count, so entry halts rather than
+    /// deferring the failure to the first pack write.
+    ///
+    /// The adiri fork epoch is a `u32::MAX` placeholder and its arming constraint floors it at 407,
+    /// so epoch 0 is pre-fork in this lane however the constant moves.
+    /// `TN_MULTI_WORKERS_FORK_EPOCH` is deliberately not used to stage that: the override's
+    /// `OnceLock` is process-wide and the whole test binary shares one process.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn pre_fork_epoch_entry_rejects_multiple_workers() {
+        let err = check_committee_worker_count(0, NonZeroUsize::new(2).expect("2 is not 0"))
+            .expect_err("a pre-fork multi-worker committee cannot be encoded");
+        assert!(err.to_string().contains("multi-workers fork is not active"), "{err}");
+    }
+
+    /// Default builds have the multi-worker layout active from genesis, so a count above one is
+    /// representable and entry proceeds (with a warning that this node still spawns one worker).
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn post_fork_epoch_entry_allows_multiple_workers() {
+        check_committee_worker_count(0, NonZeroUsize::new(2).expect("2 is not 0"))
+            .expect("the post-fork layout holds a worker count");
     }
 }

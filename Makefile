@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs
+.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -22,6 +22,7 @@ help:
 	@echo "  cargo install cargo-nextest --locked   # fast test runner" ;
 	@echo "  cargo install cargo-llvm-cov           # code coverage" ;
 	@echo "  cargo install sccache --locked         # compilation cache (optional)" ;
+	@echo "  cargo install mdbook --version 0.5.4 --locked   # docs site builder" ;
 	@echo ;
 	@echo "make attest" ;
 	@echo "    :::> Run CI locally and submit signed attestation to Adiri testnet." ;
@@ -87,6 +88,12 @@ help:
 	@echo "make clean-logs LOG_FILE=path/to/file.log" ;
 	@echo "    :::> Strip ANSI color codes and timestamps from a log file." ;
 	@echo ;
+	@echo "make book" ;
+	@echo "    :::> Build the docs book and open it in the default browser." ;
+	@echo ;
+	@echo "make book-serve" ;
+	@echo "    :::> Serve the docs book at localhost:3000 with live reload." ;
+	@echo ;
 
 # run CI locally and submit attestation githash to on-chain program
 attest:
@@ -144,27 +151,37 @@ E2E_BIN := $(E2E_TARGET_ROOT)/e2e/telcoin-network
 # seed_signature_override_is_inert_when_unset requires a process WITHOUT the variable.
 TN_SEED_SIGNATURE_FORK_EPOCH ?= 4294967295
 
+# Multi-workers fork epoch for the e2e lanes (#554). Same shape as the seed-signature
+# variable above and armed independently of it: defaults to u32::MAX so the default lanes run
+# the fork DORMANT (legacy single-worker committee layout, what adiri carries on disk);
+# non-adiri builds are otherwise active from genesis. Override for a fork-active lane:
+#   TN_MULTI_WORKERS_FORK_EPOCH=1 make test-epochs
+# Only test-utils builds consult it (tn_types::forks::multi_workers_fork_epoch_override).
+# Set only on name-filtered nextest lines, never a bare --workspace run: tn-types'
+# multi_workers_override_is_inert_when_unset requires a process WITHOUT the variable.
+TN_MULTI_WORKERS_FORK_EPOCH ?= 4294967295
+
 # run restart integration tests
 test-restarts: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # run epoch integration tests (same filter as the public-tests epoch line). The scheduled
 # Durable e2e lane (#1149) runs this and test-restarts with TN_TEST_MDBX_SYNC=durable
 # exported so every spawned node opens MDBX in Durable.
 test-epochs: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
 
 # run e2e tests
 test-e2e: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
-	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast ;
+	cargo llvm-cov nextest --workspace --no-fail-fast ;
 
 # generate HTML coverage report
 coverage-html:
-	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast --html ;
+	cargo llvm-cov nextest --workspace --no-fail-fast --html ;
 	@echo "Coverage report: target/llvm-cov/html/index.html"
 
 # format using the nightly toolchain pinned in rust-nightly
@@ -231,9 +248,9 @@ revert-submodule:
 
 # workspace tests that don't require faucet credentials
 public-tests: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" cargo nextest run --workspace --exclude tn-faucet --no-fail-fast ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" cargo nextest run --workspace --no-fail-fast ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # local checks to ensure PR is ready
 pr:
@@ -249,3 +266,11 @@ clean-logs:
 		exit 1; \
 	fi
 	sed -i '' -E "s/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+Z //g; s/\x1B\[([0-9]{1,3}(;[0-9]{1,3})*)?[mGK]//g" $(LOG_FILE)
+
+# build the docs book and open it in the default browser
+book:
+	mdbook build docs --open ;
+
+# serve the docs book at localhost:3000 with live reload
+book-serve:
+	mdbook serve docs --open ;
