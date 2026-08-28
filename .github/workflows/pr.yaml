@@ -12,7 +12,18 @@
 # `merge_group` does not fail the queue, it hangs it until the queue timeout ejects the PR.
 #
 # `CI Success` is the single required check. Keep it that way; adding a second required
-# name means a second workflow that must also learn `merge_group`.
+# name means a second workflow that must also learn `merge_group`. Never add a third
+# trigger (`workflow_dispatch`, `push`) to this file either: GitHub matches a required
+# check by name on the head sha, whatever event produced it, so a run from another event
+# would stand in for the two that gate the branch. `CI Success` fails on an event it does
+# not know for the same reason.
+#
+# The on-chain attestation (`verify-on-chain`) is checked on `pull_request` only. The
+# merge group's commit is minted by GitHub seconds before this workflow runs, so no local
+# suite can have covered it and nothing can attest it; a lane that required it would hang
+# the queue. It gates entry instead: a PR cannot be queued until its head sha is attested,
+# and a push to a queued PR removes it from the queue with a new head that is unattested
+# until a maintainer runs `make attest` again.
 #
 # The fmt, clippy and test lanes below do not spell out their own commands. They call
 # etc/ci-lanes.sh, which etc/test-and-attest.sh also calls, so what the merge queue
@@ -23,6 +34,9 @@ name: Pull Request and Merge Queue Checks
 on:
   pull_request:
     branches: [main]
+    # `review_requested` is load-bearing, not cosmetic: `make attest` writes to adiri and
+    # touches nothing on GitHub, so after attesting a maintainer requests a review to
+    # re-run `verify-on-chain` on the same sha. A push would mint a new, unattested sha.
     types: [opened, synchronize, reopened, review_requested, ready_for_review]
   # No `branches:` filter here -- on this event the ref is the queue's temporary
   # `gh-readonly-queue/main/...` branch, which a `[main]` filter would not match.
@@ -82,9 +96,11 @@ jobs:
             exit 0
           fi
 
-          MAINTAINERS=("grantkee" "sstanfield" "MavenRain" "Huwonk")
+          # GitHub logins are case-insensitive and the event carries whatever spelling
+          # the account currently uses, so compare in lowercase. Keep this list lowercase.
+          MAINTAINERS=("grantkee" "sstanfield" "mavenrain" "huwonk")
           run=true
-          if [[ " ${MAINTAINERS[*]} " == *" ${PR_AUTHOR} "* ]]; then
+          if [[ " ${MAINTAINERS[*]} " == *" ${PR_AUTHOR,,} "* ]]; then
             echo "maintainer PR (${PR_AUTHOR}): lanes covered by the local attested run"
             run=false
           elif [[ "$PR_DRAFT" == "true" ]]; then
@@ -93,43 +109,38 @@ jobs:
           fi
           echo "run_lanes=${run}" >> "$GITHUB_OUTPUT"
 
-  # The on-chain attestation gate. Always runs, on both events; the script picks which
-  # commit hash(es) the event makes verifiable. See .github/scripts/verify_attestation.sh.
+  # The on-chain attestation gate: is this PR's head commit hash in the attestation
+  # registry on adiri? A maintainer writes it there with `make attest`, after the full
+  # local suite (fmt, clippy, both test lanes, and the e2e suites CI cannot afford) has
+  # passed on exactly that commit.
   #
-  # This lane deliberately carries no `environment:`. It performs a read-only `cast call`
-  # against a public RPC and uses no secrets, and a deployment environment with protection
-  # rules attached would park the merge queue on a manual approval until it times out.
+  # `pull_request` only, by design. The merge group's commit did not exist when any local
+  # suite ran, so it cannot be attested, and a lane that demanded it would hang the queue
+  # until the timeout ejected the PR. Nor does it need checking there: required checks
+  # must pass before a PR may enter the queue, so every head that reaches the queue was
+  # verified here first, and a push to a queued PR removes it from the queue with a new
+  # head this lane has to verify again. `CI Success` accepts this job as `skipped` on
+  # `merge_group` and nowhere else.
+  #
+  # No `environment:` here. The job performs a read-only `cast call` against a public RPC
+  # and uses no secrets, and a deployment environment with protection rules attached
+  # would park the merge queue on a manual approval until it timed out.
   attest:
     name: verify-on-chain
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # A job-level block replaces the workflow-level one outright, so `contents` is repeated
-    # here. `pull-requests: read` is for the merge_group path only: main's queue squashes,
-    # so the PR head shas are not in the queue branch's history and have to be resolved
-    # from the `(#N)` in each squash subject. Read-only, and still no secrets.
-    permissions:
-      contents: read
-      pull-requests: read
     steps:
-      # Full history on `merge_group` so the group's first-parent chain back to base_sha
-      # is walkable; the PR event needs no history at all. GitHub expressions treat 0 as
-      # falsy, hence the quoted strings.
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: ${{ github.event_name == 'merge_group' && '0' || '1' }}
 
-      # install foundry toolchain for casting txs
+      # cast, for the read-only registry call
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
 
       - name: Verify attestation on adiri
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: .github/scripts/verify_attestation.sh
+          COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/verify_commit_hash.sh
 
   # Format check - no compilation needed, finishes in ~30s
   fmt:
@@ -315,36 +326,74 @@ jobs:
           RESULTS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          # Allowlist the acceptable conclusions rather than blocklisting `failure`. The
-          # blocklist form let `cancelled` and any future conclusion through, greening the
-          # gate on a job that never produced a result.
+          # Allowlist, not blocklist: every (event, job, result) triple is either named
+          # below as acceptable or fails. The blocklist this replaces let `cancelled` and
+          # any future conclusion through, greening the gate on a job that never produced
+          # a result.
           #
-          # `skipped` is acceptable only on a pull_request, where it is the deliberate
-          # maintainer/draft bypass. In the merge queue nothing may be skipped: a skipped
-          # lane there means the merged commit went untested, which is the one thing the
-          # queue exists to prevent.
+          # Every jq call is a plain assignment, so unparseable RESULTS fails the step
+          # under set -e. The old loop read from a process substitution, whose exit status
+          # is discarded, and malformed input printed "All checks passed".
+          case "${EVENT_NAME}" in
+            pull_request|merge_group) ;;
+            *)
+              echo "::error::CI Success does not know the '${EVENT_NAME}' event; only pull_request and merge_group gate main"
+              exit 1
+              ;;
+          esac
+
+          # The job list is asserted, not discovered: a job renamed or dropped from
+          # `needs` would otherwise leave this check silently, or turn up as an unnamed
+          # lane whose `skipped` the pull_request branch below accepts.
+          expected="adiri-test archive-mode-gate attest ci-scope clippy fmt rocksdb-gate test"
+          actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
+            exit 1
+          fi
+
+          run_lanes=$(jq -r '."ci-scope".outputs.run_lanes // ""' <<<"${RESULTS}")
+          rows=$(jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<<"${RESULTS}")
+
           failed=0
           while read -r job result; do
-            case "$result" in
-              success)
-                echo "  ok       ${job}"
+            case "${EVENT_NAME}:${job}:${result}" in
+              # ci-scope decides whether the lanes ran; nothing below can be trusted if it
+              # did not itself succeed.
+              *:ci-scope:success) echo "  ok       ${job}" ;;
+              *:ci-scope:*)
+                echo "::error::ci-scope: ${result}"
+                failed=1
                 ;;
-              skipped)
-                if [[ "$EVENT_NAME" == "merge_group" ]]; then
-                  echo "::error::${job} was skipped in the merge queue; every lane must run on the merged commit"
-                  failed=1
+              # The attestation runs on the pull request only (see the attest job): it
+              # must succeed there, and must not have run in the queue.
+              pull_request:attest:success) echo "  ok       ${job}" ;;
+              merge_group:attest:skipped) echo "  skipped  ${job} (verified at queue entry)" ;;
+              *:attest:*)
+                echo "::error::attest: ${result} on ${EVENT_NAME}"
+                failed=1
+                ;;
+              *:*:success) echo "  ok       ${job}" ;;
+              # A skipped lane is the maintainer/draft bypass and nothing else: ci-scope
+              # must have said the lanes were not to run. In the queue nothing may be
+              # skipped -- a skipped lane there means the merged commit went untested,
+              # which is the one thing the queue exists to prevent.
+              pull_request:*:skipped)
+                if [[ "${run_lanes}" == "false" ]]; then
+                  echo "  skipped  ${job} (ci-scope: covered by the attested local run)"
                 else
-                  echo "  skipped  ${job}"
+                  echo "::error::${job} was skipped although ci-scope asked for the lanes to run"
+                  failed=1
                 fi
                 ;;
               *)
-                echo "::error::${job}: ${result}"
+                echo "::error::${job}: ${result} on ${EVENT_NAME}"
                 failed=1
                 ;;
             esac
-          done < <(jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<<"$RESULTS")
+          done <<<"${rows}"
 
-          if [[ "$failed" -ne 0 ]]; then
+          if [[ "${failed}" -ne 0 ]]; then
             echo "One or more checks failed"
             exit 1
           fi

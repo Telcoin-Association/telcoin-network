@@ -11,9 +11,11 @@
 #   1  the registry answered and at least one hash is NOT attested
 #   2  the registry never answered (adiri RPC unreachable or erroring after retries)
 #
-# Callers must keep 1 and 2 apart. 1 is a real gate failure; 2 is an adiri outage, and
-# under a merge queue an outage that fails closed ejects every queued PR. See
-# verify_attestation.sh for the policy that acts on these codes.
+# The `verify-on-chain` lane in .github/workflows/pr.yaml runs this on the pull request
+# head sha, and only there. Both non-zero codes fail that check, which is right at PR
+# level: an outage keeps a PR out of the queue until someone re-runs the job, and cannot
+# touch a PR already queued, because the lane does not run on `merge_group`. The codes
+# stay distinct so the annotation on the failed step can say which one it was.
 
 set -uo pipefail
 
@@ -44,23 +46,25 @@ query() {
 hashes=("$@")
 if ((${#hashes[@]} == 0)); then
     if [[ -z "${COMMIT_HASH:-}" ]]; then
-        echo "no commit hash supplied (pass as arguments or set COMMIT_HASH)" >&2
+        echo "::error::no commit hash supplied (pass as arguments or set COMMIT_HASH)"
         exit 2
     fi
     hashes=("${COMMIT_HASH}")
 fi
 
+# `::error::` lines become annotations on the failed step, so the reason is visible from
+# the checks tab without opening the log.
 missing=0
 for sha in "${hashes[@]}"; do
     if ! result=$(query "${sha}"); then
-        echo "could not reach ${RPC_ENDPOINT} to verify ${sha}" >&2
+        echo "::error::adiri RPC (${RPC_ENDPOINT}) did not answer after ${ATTEMPTS} attempts, so ${sha} could not be verified. Re-run this job."
         exit 2
     fi
     # the registry returns an abi-encoded bool: 0x00..00 or 0x00..01
     if [[ "${result: -1}" == "1" ]]; then
         echo "attested:     ${sha}"
     else
-        echo "NOT attested: ${sha}"
+        echo "::error::${sha} is not attested. A maintainer must run 'make attest' on this commit, then request a review to re-run this check."
         missing=1
     fi
 done
