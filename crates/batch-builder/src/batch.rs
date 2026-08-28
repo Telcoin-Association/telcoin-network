@@ -7,7 +7,7 @@
 //! The mined transactions are returned with the built block so the worker can update the pool.
 
 use std::collections::HashMap;
-use tn_reth::{ChangedAccount, TxPool, TxnSize};
+use tn_reth::{ChangedAccount, TxPool};
 use tn_types::{
     max_batch_gas, max_batch_size, Address, Batch, BatchBuilderArgs, Encodable2718 as _,
     TransactionTrait as _, TxHash, WorkerId, U256,
@@ -38,7 +38,8 @@ pub struct BatchBuilderOutput {
 /// Returns the [`BatchBuilderOutput`] and cannot fail. The batch continues to add
 /// transactions to the proposed block until either:
 /// - accumulated transaction gas limit reached (measured by tx.gas_limit())
-/// - max byte size of transactions (measured by tx.size())
+/// - max byte size of transactions (measured by the encoded EIP-2718 byte length, the same
+///   measurement peers apply in the batch validator)
 ///
 /// NOTE: it's possible to under utilize resources if users submit transactions
 /// with very high gas limits. It's impossible to know the amount of gas a transaction
@@ -106,24 +107,37 @@ pub fn build_batch<P: TxPool>(
             continue;
         }
 
-        // ensure block has capacity (in bytes) for this transaction
-        if total_bytes_size + tx.size() > max_size {
-            // the tx could exceed max gas limit for the block
+        // encode the transaction once and measure the batch by the encoded
+        // (EIP-2718) byte length.  Peers size a batch by exactly this value in
+        // the batch validator (`validate_batch_size_bytes` sums `tx.len()` over
+        // the encoded byte vectors against `max_batch_size(epoch)`), so the
+        // producer must cap on the same measurement.  The earlier heuristic
+        // (`TxnSize`, Reth's `InMemorySize`) estimates heap and struct memory,
+        // not the wire length; for access-list-heavy transactions it undercounts
+        // the encoded length and lets the producer build a batch that its own
+        // accounting accepts but every peer rejects, stalling the worker lane
+        // (issue #1248).
+        let tx_gas_limit = tx.gas_limit();
+        let encoded = tx.into_inner().encoded_2718();
+
+        // ensure the batch has capacity (in bytes) for this transaction
+        if total_bytes_size + encoded.len() > max_size {
+            // the tx could exceed the max byte size for the batch
             // marking as invalid within the context of the `BestTransactions` pulled in this
             // current iteration  all dependents for this transaction are now considered invalid
             // before continuing loop
-            best_txs.max_batch_size(&pool_tx, tx.size(), max_size);
+            best_txs.max_batch_size(&pool_tx, encoded.len(), max_size);
             debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
             continue;
         }
 
         // txs are not executed, so use the gas_limit
-        total_possible_gas += tx.gas_limit();
-        total_bytes_size += tx.size();
+        total_possible_gas += tx_gas_limit;
+        total_bytes_size += encoded.len();
 
         // append transaction to the list of executed transactions
         mined_transactions.push(*pool_tx.hash());
-        transactions.push(tx.into_inner().encoded_2718());
+        transactions.push(encoded);
 
         // track max nonce per sender for pool state updates
         let sender = pool_tx.sender();
@@ -196,9 +210,10 @@ pub fn build_batch<P: TxPool>(
 mod tests {
     use super::*;
     use crate::test_utils::TestPool;
+    use alloy::eips::eip2930::{AccessList, AccessListItem};
     use std::sync::Arc;
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
-    use tn_types::{test_genesis, BatchBuilderArgs, Bytes, MIN_PROTOCOL_BASE_FEE, U256};
+    use tn_types::{test_genesis, BatchBuilderArgs, Bytes, B256, MIN_PROTOCOL_BASE_FEE, U256};
 
     /// The optimistic `changed_accounts` update must carry the sender's real balance, not an
     /// inflated `U256::MAX`. An inflated balance lets the pool promote a sender's parked
@@ -250,5 +265,85 @@ mod tests {
         assert_ne!(changed.balance, U256::MAX);
         // the nonce is still advanced past the highest mined nonce (throughput fix preserved)
         assert_eq!(changed.nonce, 2);
+    }
+
+    /// The producer must size a batch by the encoded (EIP-2718) byte length, the same measurement
+    /// peers apply in the batch validator (`validate_batch_size_bytes` sums `tx.len()` over the
+    /// encoded byte vectors against `max_batch_size`). Sizing on `TxnSize` (Reth's `InMemorySize`)
+    /// undercounts access-list-heavy transactions, so a remote user could make the producer build
+    /// a batch that its own accounting accepts but every peer rejects, stalling the worker lane
+    /// (issue #1248). This locks the invariant: given transactions whose aggregate encoded length
+    /// exceeds the limit, the produced batch stays within the limit the validator enforces.
+    #[test]
+    fn batch_is_sized_by_encoded_bytes_not_in_memory_size() {
+        // Enough access-list-heavy transactions that their aggregate encoded length runs well
+        // over the batch limit, so the byte cap is exercised. The declared gas limit is kept low
+        // so the gas cap (30M) never governs before the byte cap. Sizing on `InMemorySize`
+        // undercounts each transaction by roughly one byte per storage key, so the buggy producer
+        // packs more transactions than fit on the wire and overshoots the limit.
+        const TX_COUNT: usize = 40;
+        const STORAGE_KEYS_PER_TX: usize = 1_024;
+        const GAS_LIMIT_PER_TX: u64 = 500_000;
+        const EPOCH: u32 = 0;
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut tx_factory = TransactionFactory::new();
+        let sender = tx_factory.address();
+
+        // Craft transactions with a large EIP-2930 access list. `InMemorySize` charges 32 bytes
+        // per storage key, but RLP encodes each 32-byte key as a one-byte prefix plus the 32 bytes,
+        // so the encoded length runs about one byte per key above the in-memory estimate. A
+        // power-of-two key count keeps `Vec` capacity equal to length.
+        let transactions: Vec<Vec<u8>> = (0..TX_COUNT)
+            .map(|tx_index| {
+                let storage_keys = (0..STORAGE_KEYS_PER_TX)
+                    .map(|key_index| {
+                        let unique = tx_index * STORAGE_KEYS_PER_TX + key_index;
+                        B256::from(U256::from(unique).to_be_bytes::<32>())
+                    })
+                    .collect();
+                let access_list =
+                    AccessList(vec![AccessListItem { address: Address::ZERO, storage_keys }]);
+                tx_factory
+                    .create_explicit_eip1559(
+                        Some(chain.chain.id()),
+                        None,
+                        None,
+                        None,
+                        Some(GAS_LIMIT_PER_TX),
+                        Some(Address::ZERO),
+                        Some(U256::from(1)),
+                        None,
+                        Some(access_list),
+                    )
+                    .encoded_2718()
+            })
+            .collect();
+
+        // The setup must genuinely exceed the limit in aggregate, or the cap is never exercised.
+        let available_encoded: usize = transactions.iter().map(|tx| tx.len()).sum();
+        assert!(
+            available_encoded > max_batch_size(EPOCH),
+            "test setup encodes {available_encoded} bytes, which must exceed the \
+             {} batch limit to exercise the cap",
+            max_batch_size(EPOCH),
+        );
+
+        let pool = TestPool::new(&transactions).with_balance(sender, U256::MAX);
+        let args = BatchBuilderArgs { pool, beneficiary: Address::ZERO, epoch: EPOCH };
+        let BatchBuilderOutput { batch, .. } = build_batch(args, 0, MIN_PROTOCOL_BASE_FEE);
+
+        // the producer packed at least one transaction (the assertion below is not vacuous)
+        assert!(!batch.transactions.is_empty(), "the producer must pack some transactions");
+
+        // the produced batch stays within the encoded-byte limit the validator enforces, so a
+        // correct peer accepts it
+        let encoded_total: usize = batch.transactions.iter().map(|tx| tx.len()).sum();
+        assert!(
+            encoded_total <= max_batch_size(EPOCH),
+            "the producer packed {encoded_total} encoded bytes, over the {} limit the validator \
+             enforces on the same measurement",
+            max_batch_size(EPOCH),
+        );
     }
 }
