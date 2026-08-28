@@ -94,12 +94,12 @@ async fn manage_epoch_votes(
                 match result {
                     Ok(None) => break,  // Channel closed- we are done.
                     Ok(Some(vote)) => {
-                        if vote.public_key == me {
-                            // Record our vote if we see it for this epoch so we can revote if/when needed.
-                            my_vote = Some(vote);
-                        }
                         if vote.epoch != epoch_rec.epoch {
                             continue;
+                        }
+                        if vote.public_key == me && vote.epoch_hash == epoch_hash {
+                            // Record our vote if we see it for this epoch so we can revote if/when needed.
+                            my_vote = Some(vote);
                         }
                         // Signature already verified by handler, just check
                         // epoch_hash match and committee membership
@@ -153,12 +153,6 @@ async fn manage_epoch_votes(
             target: "epoch-manager",
             "reached quorum on epoch close for {}/{epoch_hash}", epoch_rec.epoch
         );
-        // Republish our vote one final time.  This is not strictly needed but if we were the first
-        // validator to close the epoch and we got no timeouts the laggy validators may have
-        // missed our vote- give them one more chance.
-        if let Some(vote) = my_vote {
-            let _ = primary_network.publish_epoch_vote(vote).await;
-        }
         match BlsAggregateSignature::aggregate(&sigs[..], true) {
             Ok(aggregated_signature) => {
                 let signature: BlsSignature = aggregated_signature.to_signature();
@@ -195,6 +189,12 @@ async fn manage_epoch_votes(
                 );
             }
         }
+        // Republish our vote one final time.  This is not strictly needed but if we were the first
+        // validator to close the epoch and we got no timeouts the laggy validators may have
+        // missed our vote- give them one more chance.
+        if let Some(vote) = my_vote {
+            let _ = primary_network.publish_epoch_vote(vote).await;
+        }
     } else {
         error!(
             target: "epoch-manager",
@@ -205,6 +205,10 @@ async fn manage_epoch_votes(
         // Try to recover by downloading the epoch record and cert from a peer
         let mut got_epoch_record = false;
         for _ in 0..EPOCH_CERT_RECOVERY_ATTEMPTS {
+            if vote_rx.is_closed() {
+                // If this channel closed then the sender was dropped and this task needs to exit...
+                break;
+            }
             match network.request_epoch_cert(Some(epoch_rec.epoch), None).await {
                 Ok((new_epoch_rec, cert)) => {
                     // Anchor the downloaded record to the locally-trusted committee using the
@@ -262,7 +266,7 @@ async fn manage_epoch_votes(
     }
 }
 
-/// Direct a newly received vote to it's task.
+/// Direct a newly received vote to its task.
 async fn handle_new_vote(
     vote: EpochVote,
     vote_queues: &mut VoteQueue,
@@ -291,12 +295,16 @@ async fn handle_new_vote(
     if !found {
         // We do not have a collector for this epoch so start one and send it this vote.
         let (epoch_vote_tx, epoch_vote_rx) = mpsc::channel(10_000);
-        // If we recieve a valid vote and aren't collecting votes to certify then start.
+        // If we receive a valid vote and aren't collecting votes to certify then start.
         let Some((epoch_rec, None)) =
             consensus_chain.epochs().get_epoch_by_hash(vote.epoch_hash).await
         else {
             // Missing the record or it is certified.  These were pre-checked when the gossip came
             // in so this should not happen.
+            error!(
+                target: "epoch-manager",
+                "Received a vote for a missing epoch record- this should not happen! {} {}", vote.epoch, vote.epoch_hash
+            );
             return;
         };
         // Spawn the vote collector in response to a vote if it was missing.
@@ -391,9 +399,14 @@ pub(crate) fn spawn_epoch_vote_collector(
                             "Failed to certify last epoch, re-publishing epoch record vote for epoch {} {}", last_epoch_rec.epoch, last_epoch_rec.digest()
                         );
                         // Sending our vote to this channel will trigger us to start the vote collector when we get it.
-                        // The other committe members of last epoch should also do the same.
+                        // The other committee members of last epoch should also do the same.
                         // This should not happen and if it does certification may fail again but retry after an epoch anyway.
-                        let _ = consensus_bus.new_epoch_votes().send(epoch_vote).await;
+                        if let Err(_) = consensus_bus.new_epoch_votes().send(epoch_vote).await {
+                            error!(
+                                target: "epoch-manager",
+                                "Failed to send vote {} for epoch {} on internal bus- this is a critical error", epoch_vote.epoch_hash, epoch_vote.epoch
+                            );
+                        }
                         let _ = primary_network.publish_epoch_vote(epoch_vote).await;
                     }
                 }
@@ -409,7 +422,12 @@ pub(crate) fn spawn_epoch_vote_collector(
                         "publishing epoch record vote for epoch {} {epoch_hash}", epoch_rec.epoch,
                     );
                     // Sending our vote to this channel will trigger us to start the vote collector when we get it.
-                    let _ = consensus_bus.new_epoch_votes().send(epoch_vote).await;
+                    if let Err(_) = consensus_bus.new_epoch_votes().send(epoch_vote).await {
+                        error!(
+                            target: "epoch-manager",
+                            "Failed to send vote {} for epoch {} on internal bus- this is a critical error", epoch_vote.epoch_hash, epoch_vote.epoch
+                        );
+                    }
                     let primary_network_clone = primary_network.clone();
                     task_spawner.spawn_task("publish_epoch_vote_delayed", async move {
                         // Stagger the outbound gossip (see INITIAL_VOTE_PUBLISH_DELAY) so slower
@@ -421,21 +439,18 @@ pub(crate) fn spawn_epoch_vote_collector(
                     });
                 }
             }
-            // See spawn_epoch_record_collector() for how syncing nodes can keep up there epoch certs if not following the tip.
+            // See spawn_epoch_record_collector() for how syncing nodes can keep up their epoch certs if not following the tip.
         }
     });
 }
 
 /// Re-arm the epoch-vote round for a stored-but-uncertified latest epoch record.
 ///
-/// The vote collector is armed only by `epoch_record_watch`, and only the epoch-close paths
-/// write that channel. The channel is in-memory. A node that persists its epoch record and
+/// The vote collector is armed by a vote for an uncertified epoch record, and only the epoch-close
+/// paths write that channel. The channel is in-memory. A node that persists its epoch record and
 /// then shuts down before a vote quorum aggregates never writes the channel again: after a
 /// restart no vote is re-signed, so a fleet that holds records without certificates cannot
-/// self-heal (issue #1198). This startup hook closes that gap. It re-publishes the stored
-/// record on the watch when the store holds no certificate for it, which makes the doc
-/// contract of `CERTIFIED_ANCHOR_WAIT` ("the vote collector and this wait start from nearly
-/// the same instant") hold on the restart path too.
+/// self-heal (issue #1198). This startup hook closes that gap.
 ///
 /// The re-publish is idempotent and bounded. Votes re-sign deterministically (BLS over the
 /// record's digest), the vote handler verifies and deduplicates them, certificate writes are
@@ -449,8 +464,8 @@ pub(crate) fn spawn_epoch_vote_collector(
 /// closed-epoch-0 record.
 ///
 /// Deliberate scope (the issue defers the rest to the network refactor): this heals the
-/// latest stored record only, once per process start. A historical gap behind an already
-/// certified later record needs the refactor's certificate backfill, and a round that
+/// latest stored record or previous record only, once per process start. A historical gap behind an
+/// already certified later record needs the refactor's certificate backfill, and a round that
 /// expires before enough peers are back up is retried only by the next restart.
 ///
 /// Call this AFTER [`spawn_epoch_vote_collector`]: the collector subscribes to the watch

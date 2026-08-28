@@ -882,9 +882,6 @@ impl EpochRecordDb {
     }
 
     /// Retrieve the epoch record and certificate (if available) by record digest.
-    ///
-    /// One actor round trip: the record and cert are resolved together on the background thread
-    /// (see [`EpochDbMessage::EpochByHash`]) rather than as two separate lookups.
     pub async fn get_epoch_by_hash(
         &self,
         hash: EpochDigest,
