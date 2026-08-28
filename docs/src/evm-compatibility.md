@@ -120,12 +120,18 @@ TN repurposes several Ethereum block header fields to carry consensus-layer meta
 | -------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------ |
 | `nonce`                    | PoW mining nonce             | Epoch and consensus round, packed as `(epoch << 32) \| round`                              |
 | `difficulty`               | Network difficulty           | Worker ID and batch index, packed as `(batch_index << 16) \| worker_id`                    |
-| `mix_hash`                 | PoW mix digest               | Consensus output digest XOR'd with batch digest. If no batches, just the output digest     |
+| `mix_hash`                 | PoW mix digest               | `keccak256("TN_PREVRANDAO_V1" \|\| epoch seed chain value \|\| consensus block number \|\| batch index)`, the latter two little-endian `u64`. Before the PREVRANDAO fork epoch: consensus output digest XOR'd with batch digest (just the output digest if no batches) |
 | `ommers_hash`              | Uncle block hash             | Digest of the consensus `Batch` executed to produce this block. `B256::ZERO` if no batches |
 | `parent_beacon_block_root` | Beacon chain parent root     | Digest of the `ConsensusHeader` that committed the transactions                            |
 | `extra_data`               | Arbitrary miner data         | Committee-shuffle seed (the epoch seed chain value) at epoch boundaries, empty bytes otherwise |
 | `base_fee_per_gas`         | Adjusts per block (EIP-1559) | Fixed for the entire epoch, adjusts at epoch boundaries. See [basefees](basefees.md)       |
 | `withdrawals`              | Beacon chain withdrawals     | Validator reward records at epoch boundaries, empty otherwise                              |
+
+The `mix_hash` derivation changed at a hard fork. Blocks from epochs before the PREVRANDAO fork epoch use
+the legacy `output_digest ^ batch_digest` form; blocks from that epoch onward use the seed-chain
+derivation. Indexers that reproduce `mix_hash` from consensus data must branch on the block's epoch (the
+upper 32 bits of `nonce`). The seed chain value is the same one published as `extra_data` on the epoch's
+closing block.
 
 #### Fixed / Unused Fields
 
