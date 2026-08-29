@@ -177,6 +177,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             multi_workers_fork_epoch = tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
             prevrandao_fork_epoch = tn_types::forks::PREVRANDAO_FORK_EPOCH,
             leader_seeded_ordering_fork_epoch = tn_types::forks::LEADER_SEEDED_ORDERING_FORK_EPOCH,
+            governance_safe_fork_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH,
             "fork schedule (adiri)"
         );
         #[cfg(not(feature = "adiri"))]
