@@ -63,7 +63,7 @@ async fn test_precompile_genesis_accounts() -> eyre::Result<()> {
     let expected: HashMap<Address, GenesisAccount> =
         serde_yaml::from_str(GENESIS_ACCOUNT_STATE_YAML).expect("yaml parsing failure");
 
-    // verify count matches (currently 9 precompile accounts)
+    // verify count matches (currently 25 precompile accounts)
     assert_eq!(
         precompile_accounts.len(),
         expected.len(),
