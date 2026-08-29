@@ -401,7 +401,7 @@ pub(crate) fn spawn_epoch_vote_collector(
                         // Sending our vote to this channel will trigger us to start the vote collector when we get it.
                         // The other committee members of last epoch should also do the same.
                         // This should not happen and if it does certification may fail again but retry after an epoch anyway.
-                        if let Err(_) = consensus_bus.new_epoch_votes().send(epoch_vote).await {
+                        if consensus_bus.new_epoch_votes().send(epoch_vote).await.is_err() {
                             error!(
                                 target: "epoch-manager",
                                 "Failed to send vote {} for epoch {} on internal bus- this is a critical error", epoch_vote.epoch_hash, epoch_vote.epoch
@@ -422,7 +422,7 @@ pub(crate) fn spawn_epoch_vote_collector(
                         "publishing epoch record vote for epoch {} {epoch_hash}", epoch_rec.epoch,
                     );
                     // Sending our vote to this channel will trigger us to start the vote collector when we get it.
-                    if let Err(_) = consensus_bus.new_epoch_votes().send(epoch_vote).await {
+                    if consensus_bus.new_epoch_votes().send(epoch_vote).await.is_err() {
                         error!(
                             target: "epoch-manager",
                             "Failed to send vote {} for epoch {} on internal bus- this is a critical error", epoch_vote.epoch_hash, epoch_vote.epoch
@@ -492,8 +492,12 @@ pub(crate) async fn revote_uncertified_epoch_record_on_startup(
 mod epoch_vote_collector_tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng as _};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tempfile::TempDir;
-    use tn_network_libp2p::types::{MessageId, NetworkCommand};
+    use tn_network_libp2p::types::{MessageId, NetworkCommand, NetworkResponseMessage};
     use tn_primary::{
         network::{PrimaryRequest, PrimaryResponse},
         ConsensusBus, NodeMode,
@@ -1300,5 +1304,435 @@ mod epoch_vote_collector_tests {
         .unwrap();
 
         node_shutdown.notify();
+    }
+
+    /// Build a super-quorum certificate over `record`, signed by `signers` whose committee
+    /// indices are `0..signers.len()`. Mirrors the aggregation in [`manage_epoch_votes`] and the
+    /// cert construction in `crates/types` epoch tests.
+    fn make_cert(record: &EpochRecord, signers: &[&KeyConfig]) -> EpochCertificate {
+        let sigs: Vec<_> = signers.iter().map(|kc| record.sign_vote(*kc).signature).collect();
+        let signature = BlsAggregateSignature::aggregate(&sigs[..], true).unwrap().to_signature();
+        let mut signed_authorities = roaring::RoaringBitmap::new();
+        for i in 0..signers.len() as u32 {
+            signed_authorities.push(i);
+        }
+        EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities }
+    }
+
+    /// Fail-stop on fork: after a failed local vote quorum, the peer-recovery download returns a
+    /// record that validates against our locally-trusted anchor but whose digest differs from the
+    /// one we computed. That is an unrecoverable fork (records are deterministic), so the collector
+    /// must call `node_shutdown.notify()` rather than silently adopt the peer's record.
+    ///
+    /// Paused clock: `manage_epoch_votes` reaches the recovery path only after
+    /// `MAX_EPOCH_VOTE_TIMEOUTS` vote windows of `EPOCH_VOTE_RECV_TIMEOUT` each (~60s of real
+    /// time), and the recovery loop bails if the vote channel is closed, so the sender is held
+    /// open and the windows are fast-forwarded.
+    #[tokio::test(start_paused = true)]
+    async fn test_fork_digest_mismatch_triggers_shutdown() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+        let kc1 = KeyConfig::new_with_testing_key(kp1);
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("fork_digest_mismatch").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+
+        // Epoch-0 record: its `next_committee` is the locally-trusted anchor for epoch 1.
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+        consensus_chain.epochs().save_record(rec0.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
+
+        // Our local epoch-1 record (the one we tried and failed to certify).
+        let local_rec = EpochRecord {
+            epoch: 1,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            parent_hash: rec0.digest(),
+            ..Default::default()
+        };
+        let local_hash = local_rec.digest();
+
+        // The peer's certified record for the same epoch: same anchor and committee, but a
+        // different `next_committee` (a stand-in for any content divergence) so its digest
+        // differs, plus a real super-quorum certificate over it.
+        let alt_rec = EpochRecord {
+            epoch: 1,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk2, pk3, pk4],
+            parent_hash: rec0.digest(),
+            ..Default::default()
+        };
+        assert_ne!(alt_rec.digest(), local_hash, "alt record must differ from ours");
+        let alt_cert = make_cert(&alt_rec, &[&kc1, &kc2, &kc3]);
+
+        // Mock network: answer the recovery `SendRequestAny` with the alt record + cert.
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        {
+            let alt_rec = alt_rec.clone();
+            tokio::spawn(async move {
+                while let Some(cmd) = net_rx.recv().await {
+                    if let NetworkCommand::SendRequestAny { reply, .. } = cmd {
+                        let _ = reply.send(Ok(NetworkResponseMessage {
+                            peer: pk1,
+                            result: PrimaryResponse::EpochRecord {
+                                record: alt_rec.clone(),
+                                certificate: alt_cert.clone(),
+                            },
+                        }));
+                    }
+                }
+            });
+        }
+
+        // Hold the vote sender open so the recovery loop does not bail at `is_closed()`; send no
+        // votes, so the round times out into recovery.
+        let (_vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
+
+        let node_shutdown = ShutdownNotifier::new();
+        let noticer = node_shutdown.subscribe();
+
+        // Drive the collector directly: the vote windows auto-advance under the paused clock, the
+        // recovery download returns the mismatched record, and the fork is detected. Returns once
+        // shutdown is signalled.
+        manage_epoch_votes(
+            local_rec,
+            kc1,
+            primary_network,
+            vote_rx,
+            consensus_chain,
+            node_shutdown,
+        )
+        .await;
+
+        assert!(noticer.noticed(), "digest mismatch must trigger node shutdown");
+    }
+
+    /// Dead-collector respawn: a queued collector whose receiver was dropped makes the forward
+    /// `send` fail, so `handle_new_vote` must remove the dead entry and spawn a fresh collector for
+    /// the epoch (re-queued with a live sender).
+    #[tokio::test]
+    async fn test_handle_new_vote_respawns_dead_collector() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+        let kc1 = KeyConfig::new_with_testing_key(kp1);
+
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("respawn_dead_collector").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        // The record must be present and uncertified so the respawn's lookup finds it.
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
+
+        // Drain-only mock network.
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move { while net_rx.recv().await.is_some() {} });
+
+        let task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+        let node_shutdown = ShutdownNotifier::new();
+
+        // Seed the queue with a DEAD collector entry: receiver dropped, so a forward send fails.
+        let (dead_tx, dead_rx) = mpsc::channel::<EpochVote>(1);
+        drop(dead_rx);
+        let mut vote_queues: VoteQueue = VecDeque::new();
+        vote_queues.push_back((epoch_rec.epoch, dead_tx));
+
+        let vote = epoch_rec.sign_vote(&kc1);
+        handle_new_vote(
+            vote,
+            &mut vote_queues,
+            consensus_chain,
+            kc1,
+            primary_network,
+            &spawner,
+            node_shutdown,
+        )
+        .await;
+
+        assert_eq!(vote_queues.len(), 1, "dead entry replaced, not duplicated");
+        assert_eq!(vote_queues[0].0, epoch_rec.epoch);
+        assert!(
+            !vote_queues[0].1.is_closed(),
+            "replacement sender must be live (its collector holds the receiver)",
+        );
+    }
+
+    /// `handle_new_vote` must drop a vote whose record is unknown or already certified — spawning
+    /// no collector — because both are pre-filtered upstream and should never reach a fresh
+    /// collector.
+    #[tokio::test]
+    async fn test_handle_new_vote_drops_certified_and_unknown() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+        let kc1 = KeyConfig::new_with_testing_key(kp1);
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("drop_certified_unknown").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+
+        // Drain-only mock network.
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        tokio::spawn(async move { while net_rx.recv().await.is_some() {} });
+
+        let task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+        let node_shutdown = ShutdownNotifier::new();
+
+        // `EpochVote` is `Copy`, so the same vote drives both cases.
+        let vote = epoch_rec.sign_vote(&kc1);
+
+        // Case 1: unknown record (nothing saved) → dropped, no collector.
+        let mut vote_queues: VoteQueue = VecDeque::new();
+        handle_new_vote(
+            vote,
+            &mut vote_queues,
+            consensus_chain.clone(),
+            kc1.clone(),
+            primary_network.clone(),
+            &spawner,
+            node_shutdown.clone(),
+        )
+        .await;
+        assert!(vote_queues.is_empty(), "vote for an unknown record must be dropped");
+
+        // Case 2: certified record → dropped, no collector.
+        consensus_chain
+            .epochs()
+            .save(epoch_rec.clone(), make_cert(&epoch_rec, &[&kc1, &kc2, &kc3]))
+            .await
+            .unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
+        let mut vote_queues: VoteQueue = VecDeque::new();
+        handle_new_vote(
+            vote,
+            &mut vote_queues,
+            consensus_chain,
+            kc1,
+            primary_network,
+            &spawner,
+            node_shutdown,
+        )
+        .await;
+        assert!(vote_queues.is_empty(), "vote for a certified record must be dropped");
+    }
+
+    /// A committee member arming the collector publishes its vote to the network exactly twice:
+    /// once after the 500ms initial-gossip delay, and once as the post-quorum final republish.
+    #[tokio::test]
+    async fn test_publishes_delayed_initial_and_at_quorum() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        // Committee of 4: super_quorum = 3 (kp1 self-sign + kp2 + kp3).
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+        let epoch_hash = epoch_rec.digest();
+
+        let consensus_bus = ConsensusBus::new();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("publishes_delayed_and_quorum").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        consensus_chain.epochs().save_record(epoch_rec.clone()).await.unwrap();
+        consensus_chain.epochs().persist().await.unwrap();
+
+        // Counting mock network: tally Publish commands.
+        let publishes = Arc::new(AtomicUsize::new(0));
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        {
+            let publishes = publishes.clone();
+            tokio::spawn(async move {
+                while let Some(cmd) = net_rx.recv().await {
+                    if let NetworkCommand::Publish { reply, .. } = cmd {
+                        publishes.fetch_add(1, Ordering::SeqCst);
+                        let _ = reply.send(Ok(MessageId::new(b"test")));
+                    }
+                }
+            });
+        }
+
+        let task_manager = TaskManager::default();
+        let node_shutdown = ShutdownNotifier::new();
+
+        spawn_epoch_vote_collector(
+            consensus_chain.clone(),
+            consensus_bus.app().clone(),
+            key_config,
+            primary_network,
+            task_manager.get_spawner(),
+            node_shutdown.clone(),
+        );
+
+        // Two peer votes buffered: with kp1's self-sign that is exactly quorum (3 of 4).
+        let kc2 = KeyConfig::new_with_testing_key(kp2);
+        let kc3 = KeyConfig::new_with_testing_key(kp3);
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc2)).await.unwrap();
+        consensus_bus.app().new_epoch_votes().send(epoch_rec.sign_vote(&kc3)).await.unwrap();
+        consensus_bus.app().epoch_record_watch().send_replace(Some(epoch_rec.clone()));
+
+        // The cert lands from quorum, and exactly two publishes reach the network: the delayed
+        // initial gossip and the post-quorum final republish (no pre-quorum timeout republish
+        // fires because all three votes are buffered and consumed within one window).
+        wait_until(Duration::from_secs(3), "cert stored and two publishes", || async {
+            Ok(consensus_chain.epochs().cert_by_digest(epoch_hash).await.is_some()
+                && publishes.load(Ordering::SeqCst) == 2)
+        })
+        .await
+        .unwrap();
+
+        // Give any spurious extra publish a moment to appear, then pin the count.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(publishes.load(Ordering::SeqCst), 2, "exactly two publishes reach the network");
+
+        node_shutdown.notify();
+    }
+
+    /// `my_vote` capture + timeout republish: with our own vote captured from the stream and quorum
+    /// unreachable (1 of 4), each vote-window timeout republishes our vote to the network.
+    ///
+    /// Paused clock fast-forwards the vote windows. `manage_epoch_votes` is driven directly (not
+    /// via the collector), so the timeout republish is the only publisher — any publish proves the
+    /// captured `my_vote` was resent.
+    #[tokio::test(start_paused = true)]
+    async fn test_my_vote_republished_on_timeout() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+        let kc1 = KeyConfig::new_with_testing_key(kp1);
+
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("my_vote_republish").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+
+        // Counting mock network (only Publish commands appear on this path).
+        let publishes = Arc::new(AtomicUsize::new(0));
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        {
+            let publishes = publishes.clone();
+            tokio::spawn(async move {
+                while let Some(cmd) = net_rx.recv().await {
+                    if let NetworkCommand::Publish { reply, .. } = cmd {
+                        publishes.fetch_add(1, Ordering::SeqCst);
+                        let _ = reply.send(Ok(MessageId::new(b"test")));
+                    }
+                }
+            });
+        }
+
+        // Seed only our own vote: `my_vote` is captured, but 1 of 4 never reaches quorum (3). Hold
+        // the sender open so the round times out (rather than seeing a closed channel).
+        let (vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
+        vote_tx.send(epoch_rec.sign_vote(&kc1)).await.unwrap();
+
+        let node_shutdown = ShutdownNotifier::new();
+
+        manage_epoch_votes(
+            epoch_rec,
+            kc1,
+            primary_network,
+            vote_rx,
+            consensus_chain,
+            node_shutdown,
+        )
+        .await;
+
+        assert!(
+            publishes.load(Ordering::SeqCst) >= 1,
+            "my_vote must be republished on a vote-window timeout",
+        );
     }
 }

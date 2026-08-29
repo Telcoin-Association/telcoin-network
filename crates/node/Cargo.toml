@@ -60,6 +60,9 @@ rocksdb = ["tn-reth/rocksdb"]
 faucet = ["tn-reth/faucet"]
 
 [dev-dependencies]
+# `test-util` (paused clock) is dev-only and used by the epoch-vote fail-stop/timeout tests to
+# fast-forward the vote-window timeouts; features union with the [dependencies] tokio entry.
+tokio = { workspace = true, features = ["test-util"] }
 metrics-util = { workspace = true }
 rand = { workspace = true }
 tn-primary = { workspace = true, features = ["test-utils"] }
