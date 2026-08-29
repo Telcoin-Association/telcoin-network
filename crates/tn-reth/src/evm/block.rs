@@ -346,6 +346,20 @@ fn classify_system_call_log(log: &Log) -> SystemCallLog<'_> {
 }
 
 // alloy-evm
+/// One account the governance-Safe fork installs: canonical runtime bytecode for a canonical
+/// cross-chain address, an optional pre-fork pin when the address is an in-place swap of a
+/// live recompiled deployment (`None` means the address must hold no code), and the storage
+/// slots a fresh etch must seed (constructor effects the etched code never runs).
+#[cfg(feature = "adiri")]
+struct GovernanceSafeForkInstall {
+    name: &'static str,
+    address: Address,
+    bytecode: reth_revm::bytecode::Bytecode,
+    code_hash: B256,
+    pre_fork_code_hash: Option<B256>,
+    storage: &'static [(U256, U256)],
+}
+
 impl<'db, Evm, Spec, R, DB> TNBlockExecutor<Evm, Spec, R>
 where
     DB: Database + 'db,
@@ -1028,6 +1042,342 @@ where
         Ok(())
     }
 
+    /// The canonical Safe v1.4.1 suite the governance-Safe fork installs, decoded once from
+    /// the vendored byte-exact Ethereum-mainnet captures embedded at compile time.
+    ///
+    /// Row order, addresses, and hashes come from
+    /// `tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE`; every decoded byte string is
+    /// asserted against its pinned hash at materialization, so a drifted or corrupt vendored
+    /// file is a corrupt build — uniform across the fleet — not a live-node runtime condition;
+    /// hence panics rather than fallible returns, on the same terms as
+    /// [`Self::consensus_registry_runtime_code`]. (The tn-types pin test
+    /// `test_governance_safe_fork_canonical_suite_pinned` checks the identical property in
+    /// default-feature CI.)
+    #[cfg(feature = "adiri")]
+    fn governance_safe_fork_suite() -> &'static [GovernanceSafeForkInstall] {
+        use reth_revm::bytecode::Bytecode;
+        use std::sync::LazyLock;
+
+        /// The vendored canonical runtime bytes, in
+        /// `GOVERNANCE_SAFE_FORK_CANONICAL_SUITE` row order — the same files mainnet genesis
+        /// etches (`tn-contracts/deployments/genesis/canonical-bytecode/`, provenance in its
+        /// README).
+        const VENDORED_HEX: [&str; 13] = [
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/Safe.hex"),
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeL2.hex"),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeProxyFactory.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/CompatibilityFallbackHandler.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeToL2Setup.hex"
+            ),
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/MultiSend.hex"),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/MultiSendCallOnly.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SignMessageLib.hex"
+            ),
+            include_str!("../../../../tn-contracts/deployments/genesis/canonical-bytecode/CreateCall.hex"),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SimulateTxAccessor.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeSingletonFactory.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeMigration.hex"
+            ),
+            include_str!(
+                "../../../../tn-contracts/deployments/genesis/canonical-bytecode/SafeToL2Migration.hex"
+            ),
+        ];
+
+        /// SafeL2's `threshold` slot (4) seeds 1, replicating the constructor the etched code
+        /// never runs; without it anyone could `setup()`-hijack the fresh singleton. The Safe
+        /// singleton needs no row: its slot 4 = 1 came from the live recompile's constructor
+        /// and survives the code-only swap.
+        const SAFE_L2_THRESHOLD_STORAGE: &[(U256, U256)] =
+            &[(U256::from_limbs([4, 0, 0, 0]), U256::from_limbs([1, 0, 0, 0]))];
+
+        static SUITE: LazyLock<Vec<GovernanceSafeForkInstall>> = LazyLock::new(|| {
+            tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE
+                .iter()
+                .zip(VENDORED_HEX)
+                .map(|((name, address, expected_hash), hex)| {
+                    let raw = alloy::hex::decode(hex.trim())
+                        .unwrap_or_else(|e| panic!("vendored {name}.hex is valid hex: {e}"));
+                    let bytecode = Bytecode::new_raw(raw.into());
+                    let code_hash = bytecode.hash_slow();
+                    assert_eq!(
+                        code_hash, *expected_hash,
+                        "{name}: vendored canonical bytecode must hash to its \
+                         GOVERNANCE_SAFE_FORK_CANONICAL_SUITE pin",
+                    );
+                    let pre_fork_code_hash = match *name {
+                        "Safe" => Some(tn_types::forks::SAFE_SINGLETON_PRE_FORK_CODE_HASH),
+                        "SafeProxyFactory" => {
+                            Some(tn_types::forks::SAFE_PROXY_FACTORY_PRE_FORK_CODE_HASH)
+                        }
+                        _ => None,
+                    };
+                    let storage: &'static [(U256, U256)] =
+                        if *name == "SafeL2" { SAFE_L2_THRESHOLD_STORAGE } else { &[] };
+                    GovernanceSafeForkInstall {
+                        name,
+                        address: *address,
+                        bytecode,
+                        code_hash,
+                        pre_fork_code_hash,
+                        storage,
+                    }
+                })
+                .collect()
+        });
+
+        &SUITE
+    }
+
+    /// Apply the in-protocol governance-Safe fork.
+    ///
+    /// Brings live adiri's Safe stack to parity with mainnet genesis in one deterministic
+    /// commit (see `tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH` for the full runbook):
+    /// - **etch** the eleven canonical v1.4.1 contracts adiri lacks (SafeL2, the fallback
+    ///   handler, the delegatecall libraries, both migration helpers, the singleton factory) —
+    ///   each target must hold no code (a stray balance is preserved; the nonce lands on the
+    ///   EIP-161 contract-account value 1, mirroring mainnet genesis);
+    /// - **swap** the recompiled `Safe` singleton and `SafeProxyFactory` to the canonical
+    ///   bytes — code-only, preserving balance, nonce, and all storage, gated fail-closed on
+    ///   the pinned pre-fork hashes (Safe v1.4.1 storage layout is identical between the
+    ///   recompile and the canonical build, so the preserved slots stay valid);
+    /// - **migrate** the governance Safe proxy onto SafeL2: slot 0 (singleton) and the
+    ///   fallback-handler slot are the only two writes, gated fail-closed on the proxy's
+    ///   pinned code hash AND on slot 0 still holding the L1 singleton. Owners, threshold,
+    ///   the Safe nonce, and the TEL balance are untouched (preserved by omission — only
+    ///   changed slots enter the bundle).
+    ///
+    /// Fires exactly once, from the epoch-closing block that concludes
+    /// `GOVERNANCE_SAFE_FORK_EPOCH - 1` (one-shot `==` trigger in `finish`). No system call
+    /// follows it in this block that reads Safe state, so ordering relative to the epoch-close
+    /// sequence is not load-bearing; it runs before the close for symmetry with the registry
+    /// fork.
+    ///
+    /// Determinism: a pure function of committed state plus the embedded vendored bytes —
+    /// every gate reads committed state only, so the whole fleet passes or aborts in lockstep
+    /// and re-derives a byte-identical `state_root`. Nothing is committed until every gate
+    /// holds; fatal on failure, like the registry fork.
+    #[cfg(feature = "adiri")]
+    fn apply_governance_safe_fork(&mut self) -> TnRethResult<()> {
+        // revm `Database` trait provides `basic`/`storage`; imported anonymously to avoid
+        // clashing with the `alloy_evm::Database` already in module scope.
+        use reth_revm::{
+            state::{Account, AccountInfo, AccountStatus, EvmState, EvmStorage, EvmStorageSlot},
+            Database as _,
+        };
+        use tn_config::GOVERNANCE_SAFE_ADDRESS;
+
+        let suite = Self::governance_safe_fork_suite();
+        let address_of = |name: &str| {
+            suite
+                .iter()
+                .find(|install| install.name == name)
+                .map(|install| install.address)
+                .expect("governance safe fork suite carries every canonical row")
+        };
+        let safe_l1_singleton = address_of("Safe");
+        let safe_l2_singleton = address_of("SafeL2");
+        let fallback_handler = address_of("CompatibilityFallbackHandler");
+
+        // Stage every account before committing anything: each gate is a pure function of
+        // committed state, so every fork-capable node evaluates the full set identically and
+        // fails (or passes) in lockstep, and a failure aborts the block with no partial
+        // migration. Reading via `basic` also loads each account into the `State` cache, which
+        // the commit below requires even for absent accounts.
+        let mut staged: Vec<(Address, Account)> = Vec::with_capacity(suite.len() + 1);
+        for install in suite {
+            let current = self
+                .evm
+                .db_mut()
+                .basic(install.address)
+                .map_err(|e| {
+                    TnRethError::EVMCustom(format!("{}: account read failed: {e}", install.name))
+                })?
+                .unwrap_or_default();
+
+            let account = if let Some(pin) = install.pre_fork_code_hash {
+                // in-place swap of a live recompiled deployment: fail closed on any other
+                // code, and rewrite only the account-code leaf (empty storage map + plain
+                // `Touched`, same shape as the registry swap)
+                if current.code_hash != pin {
+                    error!(
+                        target: "engine",
+                        contract = install.name,
+                        pre_swap_code_hash = %current.code_hash,
+                        expected = %pin,
+                        "governance safe fork failing closed: unexpected pre-fork code",
+                    );
+                    return Err(TnRethError::EVMCustom(format!(
+                        "governance safe fork failing closed: {} code hash {} does not match \
+                         the pinned pre-fork deployment {}",
+                        install.name, current.code_hash, pin,
+                    )));
+                }
+                Account {
+                    info: AccountInfo {
+                        balance: current.balance,
+                        nonce: current.nonce,
+                        code_hash: install.code_hash,
+                        code: Some(install.bytecode.clone()),
+                        ..Default::default()
+                    },
+                    status: AccountStatus::Touched,
+                    ..Default::default()
+                }
+            } else {
+                // fresh etch: the canonical address must hold no code. An EOA-shaped account
+                // with a stray balance passes (the balance is preserved); anything with code
+                // is an unknown deployment squatting on a canonical address — abort.
+                if !current.is_empty_code_hash() {
+                    error!(
+                        target: "engine",
+                        contract = install.name,
+                        address = %install.address,
+                        found_code_hash = %current.code_hash,
+                        "governance safe fork failing closed: etch target already has code",
+                    );
+                    return Err(TnRethError::EVMCustom(format!(
+                        "governance safe fork failing closed: etch target {} ({}) already \
+                         carries code {}",
+                        install.name, install.address, current.code_hash,
+                    )));
+                }
+                let storage: EvmStorage = install
+                    .storage
+                    .iter()
+                    .map(|(slot, value)| {
+                        // a code-free account has no storage, so every seeded slot's original
+                        // value is zero; `new_changed` keeps it past the `is_changed` filter
+                        (*slot, EvmStorageSlot::new_changed(U256::ZERO, *value, 0))
+                    })
+                    .collect();
+                Account {
+                    info: AccountInfo {
+                        balance: current.balance,
+                        nonce: current.nonce.max(1),
+                        code_hash: install.code_hash,
+                        code: Some(install.bytecode.clone()),
+                        ..Default::default()
+                    },
+                    storage,
+                    // `Created` routes `apply_account_state` onto the fresh-account path
+                    // (no DB storage fetches for an account that never had storage)
+                    status: AccountStatus::Touched | AccountStatus::Created,
+                    ..Default::default()
+                }
+            };
+            staged.push((install.address, account));
+        }
+
+        // governance Safe proxy: two storage writes behind two gates, everything else untouched
+        let governance = self
+            .evm
+            .db_mut()
+            .basic(GOVERNANCE_SAFE_ADDRESS)
+            .map_err(|e| {
+                TnRethError::EVMCustom(format!("governance safe account read failed: {e}"))
+            })?
+            .unwrap_or_default();
+        if governance.code_hash != tn_types::forks::GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH {
+            error!(
+                target: "engine",
+                pre_fork_code_hash = %governance.code_hash,
+                expected = %tn_types::forks::GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH,
+                "governance safe fork failing closed: unexpected governance proxy code",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "governance safe fork failing closed: governance proxy code hash {} does not \
+                 match the pinned pre-fork deployment {}",
+                governance.code_hash,
+                tn_types::forks::GOVERNANCE_SAFE_PROXY_PRE_FORK_CODE_HASH,
+            )));
+        }
+        let singleton_slot =
+            self.evm.db_mut().storage(GOVERNANCE_SAFE_ADDRESS, U256::ZERO).map_err(|e| {
+                TnRethError::EVMCustom(format!("governance safe slot 0 read failed: {e}"))
+            })?;
+        let expected_singleton = U256::from_be_bytes(safe_l1_singleton.into_word().0);
+        if singleton_slot != expected_singleton {
+            error!(
+                target: "engine",
+                slot0 = %singleton_slot,
+                expected = %expected_singleton,
+                "governance safe fork failing closed: governance proxy slot 0 is not the L1 \
+                 Safe singleton",
+            );
+            return Err(TnRethError::EVMCustom(format!(
+                "governance safe fork failing closed: governance proxy slot 0 holds {} instead \
+                 of the pre-fork L1 Safe singleton {}",
+                singleton_slot, expected_singleton,
+            )));
+        }
+        // `FallbackManager.FALLBACK_HANDLER_STORAGE_SLOT`, derived exactly as the Safe source
+        // does; read (not gated — unset on the live chain, and an already-canonical value
+        // would simply drop out of the changeset via the `is_changed` filter)
+        let handler_slot = U256::from_be_bytes(
+            alloy::primitives::keccak256(b"fallback_manager.handler.address").0,
+        );
+        let current_handler =
+            self.evm.db_mut().storage(GOVERNANCE_SAFE_ADDRESS, handler_slot).map_err(|e| {
+                TnRethError::EVMCustom(format!("governance safe handler slot read failed: {e}"))
+            })?;
+        let governance_storage: EvmStorage = [
+            (
+                U256::ZERO,
+                EvmStorageSlot::new_changed(
+                    singleton_slot,
+                    U256::from_be_bytes(safe_l2_singleton.into_word().0),
+                    0,
+                ),
+            ),
+            (
+                handler_slot,
+                EvmStorageSlot::new_changed(
+                    current_handler,
+                    U256::from_be_bytes(fallback_handler.into_word().0),
+                    0,
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        staged.push((
+            GOVERNANCE_SAFE_ADDRESS,
+            Account {
+                // account info passes through unchanged: balance, nonce, and code stay exactly
+                // as committed — the migration is the two storage slots above
+                info: governance,
+                storage: governance_storage,
+                status: AccountStatus::Touched,
+                ..Default::default()
+            },
+        ));
+
+        self.evm.db_mut().commit(EvmState::from_iter(staged));
+
+        tracing::info!(
+            target: "engine",
+            installed = suite.len(),
+            singleton = %safe_l2_singleton,
+            handler = %fallback_handler,
+            "governance safe fork applied: canonical Safe v1.4.1 suite installed, governance \
+             proxy migrated to SafeL2",
+        );
+        Ok(())
+    }
+
     /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
     ///
     /// The seeded shuffle decides committee membership; the shuffled addresses are then sorted
@@ -1423,6 +1773,24 @@ where
                 // no migrate-style call — see `apply_worker_configs_fork` for the storage
                 // preservation and `maxStrategy` runbook notes.
                 self.apply_worker_configs_fork().map_err(|e| {
+                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+                })?;
+            }
+
+            // In-protocol governance-Safe fork boundary: same one-shot trigger shape as the
+            // registry fork above, keyed on its own (independently armed) epoch constant —
+            // `governance_safe_fork_epoch()` is the compile-time
+            // `GOVERNANCE_SAFE_FORK_EPOCH` unless a test-utils build overrides it via
+            // `TN_GOVERNANCE_SAFE_FORK_EPOCH`. Nothing in this block's close reads Safe
+            // state, so the position (after the registry pair, before the close) mirrors the
+            // fork-leads convention rather than a data dependency. Both the production and
+            // replay paths reach this with an identical `ctx`, so the resulting `state_root`
+            // is byte-identical across the fleet.
+            #[cfg(feature = "adiri")]
+            if tn_types::deconstruct_nonce(self.ctx.nonce).0.checked_add(1)
+                == Some(tn_types::forks::governance_safe_fork_epoch())
+            {
+                self.apply_governance_safe_fork().map_err(|e| {
                     BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
                 })?;
             }
@@ -1932,6 +2300,82 @@ mod tests {
         assert!(
             format!("{err:#}").contains("worker configs fork failing closed"),
             "abort must come from the WorkerConfigs fail-closed code-hash gate, got: {err:#}"
+        );
+
+        Ok(())
+    }
+
+    /// The governance-Safe fork must fail closed over unexpected pre-fork state.
+    ///
+    /// Two independent gates are exercised, each a stand-in for "adiri's Safe state moved
+    /// since the pins were taken":
+    /// 1. a swap target off its pin — the `Safe` singleton account is overwritten with the
+    ///    post-fork registry artifact bytes (any hash other than
+    ///    `SAFE_SINGLETON_PRE_FORK_CODE_HASH`), and the boundary must abort rather than
+    ///    swap over an unknown storage layout;
+    /// 2. an etch target that already carries code — a squatter at the canonical SafeL2
+    ///    address, over which etching would silently bury a deployment.
+    ///
+    /// (Without the gates both blocks would execute — the etch bytes are position-independent
+    /// and the swap is storage-compatible — making this test the discriminating check.)
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_governance_safe_fork_fails_closed_on_unexpected_code() -> eyre::Result<()> {
+        // an arbitrary wrong code blob: the post-fork registry artifact (hash matches no pin)
+        let stand_in_value = RethEnv::fetch_value_from_json_str(
+            CONSENSUS_REGISTRY_JSON,
+            Some("deployedBytecode.object"),
+        )?;
+        let stand_in_code: Bytes = alloy::hex::decode(
+            stand_in_value.as_str().expect("deployedBytecode.object is a string"),
+        )?
+        .into();
+
+        // fork fires when the concluding epoch + 1 == GOVERNANCE_SAFE_FORK_EPOCH
+        let concluding_epoch = tn_types::forks::GOVERNANCE_SAFE_FORK_EPOCH - 1;
+
+        // --- case 1: swap target (the recompiled Safe singleton) off its pre-fork pin ---
+        let mut genesis = tn_types::test_genesis();
+        let safe_singleton = tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE[0].1;
+        genesis
+            .alloc
+            .get_mut(&safe_singleton)
+            .expect("testnet genesis must allocate the recompiled Safe singleton")
+            .code = Some(stand_in_code.clone());
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("governance fork fail closed swap");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        let err = execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect_err("fork over an unexpected Safe singleton deployment must abort the block");
+        assert!(
+            format!("{err:#}").contains("governance safe fork failing closed"),
+            "abort must come from the governance fail-closed gate, got: {err:#}"
+        );
+
+        // --- case 2: etch target (the canonical SafeL2 address) already carries code ---
+        let mut genesis = tn_types::test_genesis();
+        let safe_l2 = tn_types::forks::GOVERNANCE_SAFE_FORK_CANONICAL_SUITE[1].1;
+        genesis.alloc.insert(safe_l2, GenesisAccount::default().with_code(Some(stand_in_code)));
+
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = chain.sealed_genesis_header();
+        let output = consensus_output_for_tests(2, concluding_epoch, 1, true);
+        let payload = TNPayload::new_for_test(genesis_header.clone(), &output);
+
+        let tmp = TempDir::new().unwrap();
+        let tm = TaskManager::new("governance fork fail closed etch");
+        let env = RethEnv::new_for_temp_chain(chain.clone(), tmp.path(), &tm, None).unwrap();
+        let err = execute_payload_and_update_canonical_chain(&env, payload, vec![])
+            .expect_err("fork over a squatted canonical SafeL2 address must abort the block");
+        assert!(
+            format!("{err:#}").contains("already carries code"),
+            "abort must come from the etch-target gate, got: {err:#}"
         );
 
         Ok(())
