@@ -81,7 +81,10 @@ const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("1
 /// as the store keeps for a peer, and the set cap is what bounds accumulation across repeated
 /// records. Folding a record into an entry that already holds a connection form replaces that
 /// form; that only trims the peer-exchange payload built from the entry.
-const MAX_ADVERTISED_MULTIADDRS: usize = peers::MAX_MULTIADDRS_PER_PEER;
+///
+/// The same cap bounds the address list of a kad provider record before it is written to the
+/// consensus database (`KadStore::add_provider`, issue #1185).
+pub(crate) const MAX_ADVERTISED_MULTIADDRS: usize = peers::MAX_MULTIADDRS_PER_PEER;
 
 /// Maximum number of concurrent established connections a single peer may hold, across both
 /// directions (inbound and outbound).
@@ -2008,9 +2011,20 @@ where
             return Ok(());
         }
 
-        // verify record signature and ensure publisher matches record's network
-        // key
-        if let Some((key, value)) = self.peer_record_valid(&record) {
+        // Rate limit inbound put requests per source, independent of ban state, before the
+        // expensive signature verify and kad store write below. A valid self-signed record
+        // (publisher == source == attacker) clears the ban check above and is never penalized on
+        // the accept path, so without this a single unbanned peer can flood valid records and
+        // force repeated ~1ms BLS verifies plus MDBX writes on the network task that also relays
+        // consensus gossip, starving the event loop (GHSA-f6rq-62rr-4h9g). Banned sources already
+        // returned above, so this bounds the unbanned population; an honest source's
+        // republication cadence stays far below the limit.
+        if self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
+            trace!(target: "network-kad", ?source, "rate limiting inbound put request");
+            self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Medium);
+        } else if let Some((key, value)) = self.peer_record_valid(&record) {
+            // verify record signature and ensure publisher matches record's network key
+
             // store latest node records
             if self.is_newer_record(&record) {
                 self.swarm

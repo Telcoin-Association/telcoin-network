@@ -979,6 +979,15 @@ impl Committee {
         self.inner.num_workers.get()
     }
 
+    /// Return the worker ids in use for this committee, in ascending order.
+    ///
+    /// Yields `0..number_of_workers()` without any numeric cast: the iterator walks the
+    /// [`WorkerId`] domain directly and stops at the committee's count, so a count beyond
+    /// `WorkerId`'s range simply saturates at the ids that can exist on a header.
+    pub fn worker_ids(&self) -> impl Iterator<Item = WorkerId> + '_ {
+        (0..=WorkerId::MAX).take_while(|id| usize::from(*id) < self.number_of_workers())
+    }
+
     /// Return a copy of this committee with the worker count set to `num_workers`.
     ///
     /// The epoch-0 committee is loaded from the committee file, whose count is a default; the
@@ -2020,6 +2029,17 @@ mod tests {
             .authorities()
             .iter()
             .all(|authority| widened.authority(&authority.id()).is_some()));
+    }
+
+    #[test]
+    fn worker_ids_walk_the_committee_count_in_order() {
+        // default count: one worker, id 0
+        assert_eq!(Committee::default().worker_ids().collect::<Vec<_>>(), vec![0]);
+
+        // widened count: ascending ids 0..n
+        let widened = Committee::default()
+            .with_num_workers(std::num::NonZeroUsize::new(3).expect("3 is not 0"));
+        assert_eq!(widened.worker_ids().collect::<Vec<_>>(), vec![0, 1, 2]);
     }
 
     #[test]

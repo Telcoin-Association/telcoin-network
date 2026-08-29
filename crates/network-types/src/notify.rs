@@ -19,21 +19,61 @@ pub struct WorkerSynchronizeMessage {
 }
 
 /// Used by worker to inform primary it sealed a new batch.
+///
+/// Fields are private so the id is stamped once at the sending seam and read-only after:
+/// these messages never cross the peer wire, and a mutable id would let any holder re-route
+/// a digest to another worker's identity.
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug)]
 pub struct WorkerOwnBatchMessage {
     /// The worker's id.
-    pub worker_id: WorkerId,
+    worker_id: WorkerId,
     /// The digest for the batch that reached quorum.
-    pub digest: BlockHash,
+    digest: BlockHash,
+}
+
+impl WorkerOwnBatchMessage {
+    /// Create a new message stamped with the sending worker's id.
+    pub fn new(worker_id: WorkerId, digest: BlockHash) -> Self {
+        Self { worker_id, digest }
+    }
+
+    /// The worker's id.
+    pub fn worker_id(&self) -> WorkerId {
+        self.worker_id
+    }
+
+    /// The digest for the batch that reached quorum.
+    pub fn digest(&self) -> BlockHash {
+        self.digest
+    }
 }
 
 /// Used by worker to inform primary it received a batch from another authority.
+///
+/// Fields are private for the same reason as [`WorkerOwnBatchMessage`].
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug)]
 pub struct WorkerOthersBatchMessage {
     /// The peer worker's batch digest.
-    pub digest: BlockHash,
+    digest: BlockHash,
     /// The worker's id.
-    pub worker_id: WorkerId,
+    worker_id: WorkerId,
+}
+
+impl WorkerOthersBatchMessage {
+    /// Create a new message stamped with the receiving worker's id.
+    pub fn new(digest: BlockHash, worker_id: WorkerId) -> Self {
+        Self { digest, worker_id }
+    }
+
+    /// The peer worker's batch digest.
+    pub fn digest(&self) -> BlockHash {
+        self.digest
+    }
+
+    /// The worker's id.
+    pub fn worker_id(&self) -> WorkerId {
+        self.worker_id
+    }
 }
 
 /// Used by workers to send a new batch to peers.

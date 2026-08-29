@@ -548,7 +548,9 @@ mod tests {
         let address = Address::from(U160::from(33));
         let client = LocalNetwork::new_with_empty_id();
         let worker_to_primary = Arc::new(MockWorkerToPrimaryHang {});
-        client.set_worker_to_primary_local_handler(worker_to_primary);
+        client
+            .set_worker_to_primary_local_handler(worker_to_primary)
+            .expect("register mock primary handler");
         let temp_dir = TempDir::new().unwrap();
         let store = open_db(temp_dir.path());
         let qw = TestMakeBlockQuorumWaiter::new_test();
@@ -678,7 +680,9 @@ mod tests {
         let address = Address::from(U160::from(33));
         let client = LocalNetwork::new_with_empty_id();
         let worker_to_primary = Arc::new(MockWorkerToPrimaryHang {});
-        client.set_worker_to_primary_local_handler(worker_to_primary);
+        client
+            .set_worker_to_primary_local_handler(worker_to_primary)
+            .expect("register mock primary handler");
         let temp_dir = TempDir::new().unwrap();
         let store = open_db(temp_dir.path());
         let seal_timeout = Duration::from_secs(5);
