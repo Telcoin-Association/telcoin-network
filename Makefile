@@ -177,11 +177,11 @@ test-e2e: build-e2e-bin
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
-	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast ;
+	cargo llvm-cov nextest --workspace --no-fail-fast ;
 
 # generate HTML coverage report
 coverage-html:
-	cargo llvm-cov nextest --workspace --exclude tn-faucet --no-fail-fast --html ;
+	cargo llvm-cov nextest --workspace --no-fail-fast --html ;
 	@echo "Coverage report: target/llvm-cov/html/index.html"
 
 # format using the nightly toolchain pinned in rust-nightly
@@ -248,7 +248,7 @@ revert-submodule:
 
 # workspace tests that don't require faucet credentials
 public-tests: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" cargo nextest run --workspace --exclude tn-faucet --no-fail-fast ;
+	TN_BIN_PATH="$(E2E_BIN)" cargo nextest run --workspace --no-fail-fast ;
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 

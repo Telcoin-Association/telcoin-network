@@ -9,10 +9,11 @@ use alloy::sol_types::SolCall;
 use proptest::prelude::*;
 use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::{
-    burnCall, claimCall, mintCall, test_utils::precompile_test_utils::GENESIS_SUPPLY,
-    TELCOIN_PRECOMPILE_ADDRESS, TIMELOCK_DURATION,
+    burnCall, claimCall, mintCall, system_calls::PRECOMPILE_GENESIS_BYTECODE,
+    test_utils::precompile_test_utils::GENESIS_SUPPLY, TELCOIN_PRECOMPILE_ADDRESS,
+    TIMELOCK_DURATION,
 };
-use tn_types::U256;
+use tn_types::{Bytes, U256};
 
 // ==============================
 // Mint / Claim / Burn properties
@@ -470,6 +471,72 @@ proptest! {
             precompile_after,
             precompile_before,
             "precompile balance should be unchanged after failed burn"
+        );
+    }
+}
+
+// ==============================
+// EIP-158 state clearing
+// ==============================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    /// Burning the entire pool leaves the precompile account - and its `totalSupply` slot - intact.
+    ///
+    /// The account never sends a transaction, so its nonce stays zero, and a full burn takes its
+    /// balance to zero. Only the canonical genesis `0xfe` code keeps it non-empty under EIP-158
+    /// state clearing: a code-less account is deleted at the end of the block that touched it,
+    /// taking `totalSupply` with it. Seeding genesis by replacing the canonical `0x7e1` entry
+    /// rather than extending it drops that code and reintroduces the deletion.
+    #[test]
+    fn prop_pipeline_full_burn_preserves_precompile_account(
+        pool_tel in 1u64..1_000u64,
+        residual_supply_tel in 1u64..1_000u64,
+    ) {
+        let one_tel = U256::from(10).pow(U256::from(18));
+        let large_balance = one_tel * U256::from(1_000_000_000u64);
+        let pool = one_tel * U256::from(pool_tel);
+        // supply strictly exceeds the pool so a surviving slot reads back nonzero, which a wiped
+        // slot never can
+        let total_supply = pool + one_tel * U256::from(residual_supply_tel);
+
+        let mut env = PipelineTestEnv::new_with_custom_state(
+            total_supply,
+            pool,
+            large_balance,
+            large_balance,
+            large_balance,
+            large_balance,
+        );
+
+        // the harness genesis must reproduce the production account shape, code included
+        prop_assert_eq!(
+            env.reth_env.account_code(&TELCOIN_PRECOMPILE_ADDRESS).expect("read precompile code"),
+            Some(Bytes::from_static(PRECOMPILE_GENESIS_BYTECODE)),
+            "precompile genesis account must carry its canonical code"
+        );
+
+        let burn_tx = env.governance_tx(burnCall { amount: pool }.abi_encode());
+        let block = env.execute_block(vec![burn_tx]).expect("execute burn block");
+        assert!(env.tx_succeeded(&block, 0), "full-pool burn should succeed");
+
+        prop_assert_eq!(
+            env.get_balance(TELCOIN_PRECOMPILE_ADDRESS),
+            U256::ZERO,
+            "burning the whole pool should leave a zero balance"
+        );
+        prop_assert!(
+            env.reth_env
+                .retrieve_account(&TELCOIN_PRECOMPILE_ADDRESS)
+                .expect("retrieve precompile account")
+                .is_some(),
+            "precompile account was cleared by EIP-158 once the pool hit zero"
+        );
+        prop_assert_eq!(
+            env.get_total_supply(),
+            total_supply - pool,
+            "totalSupply should survive a full burn"
         );
     }
 }

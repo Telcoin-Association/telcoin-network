@@ -543,6 +543,75 @@ async fn test_process_peer_exchange() {
     assert!(peer_manager.next_dial_request().is_none());
 }
 
+/// Helper to build an exchange map of `count` eligible peers, returning the map and its ids.
+fn eligible_exchange_map(
+    count: usize,
+    seed: u8,
+) -> (HashMap<BlsPublicKey, (NetworkPublicKey, HashSet<Multiaddr>)>, HashSet<PeerId>) {
+    let mut rng = StdRng::from_seed([seed; 32]);
+    (0..count).fold(
+        (HashMap::new(), HashSet::new()),
+        |(mut exchange_map, mut exchanged_peers), _| {
+            let bls = *BlsKeypair::generate(&mut rng).public();
+            let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().clone().into();
+            let peer_id: PeerId = net.clone().into();
+            exchanged_peers.insert(peer_id);
+            exchange_map.insert(bls, (net, HashSet::from([create_multiaddr(None)])));
+            (exchange_map, exchanged_peers)
+        },
+    )
+}
+
+#[tokio::test]
+async fn test_process_peer_exchange_bounds_discovery_to_missing_target() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let max_discovery_peers = peer_manager.config.max_discovery_peers();
+
+    // pre-seed some discovery peers so the missing target is smaller than the max
+    let preseeded = 3;
+    let preseeded_peers: HashSet<PeerId> = (0..preseeded)
+        .map(|_| {
+            let peer_id = PeerId::random();
+            peer_manager.discovery_peers.insert(peer_id, vec![create_multiaddr(None)]);
+            peer_id
+        })
+        .collect();
+
+    // build an exchange map with more eligible peers than the missing target
+    let (exchange_map, exchanged_peers) = eligible_exchange_map(max_discovery_peers + 8, 1);
+
+    // process the oversized exchange
+    peer_manager.process_peer_exchange(PeerExchangeMap::from(exchange_map));
+
+    // verify the sample tops up to the max, not to max + preseeded or the full map size
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery_peers);
+
+    // verify the pre-seeded peers survive and exactly the missing target came from the exchange
+    assert!(preseeded_peers.iter().all(|id| peer_manager.discovery_peers.contains_key(id)));
+    let sampled =
+        peer_manager.discovery_peers.keys().filter(|id| exchanged_peers.contains(id)).count();
+    assert_eq!(sampled, max_discovery_peers - preseeded);
+}
+
+#[tokio::test]
+async fn test_process_peer_exchange_skips_when_discovery_full() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let max_discovery_peers = peer_manager.config.max_discovery_peers();
+
+    // fill discovery peers to the max
+    (0..max_discovery_peers).for_each(|_| {
+        peer_manager.discovery_peers.insert(PeerId::random(), vec![create_multiaddr(None)]);
+    });
+
+    // process an exchange with eligible peers
+    let (exchange_map, exchanged_peers) = eligible_exchange_map(5, 2);
+    peer_manager.process_peer_exchange(PeerExchangeMap::from(exchange_map));
+
+    // verify nothing was added from the exchange
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery_peers);
+    assert!(peer_manager.discovery_peers.keys().all(|id| !exchanged_peers.contains(id)));
+}
+
 /// Helper to build a distinct, deterministic multiaddr per index.
 ///
 /// All addresses target the same IP with different ports, the shape of a dial-amplification
@@ -1687,6 +1756,46 @@ async fn test_process_peers_for_discovery_filters_duplicates() {
     assert_eq!(peer_manager.discovery_peers.remove(&peer_id), Some(vec![addr]));
 }
 
+// Regression (issue #1252): `process_peers_for_discovery` bounds the set to
+// `max_discovery_peers` at insert time, so overshoot never persists until the
+// next heartbeat prune. The bound is enforced by random eviction over old and
+// new entries alike, never by rejecting newcomers, so no first-come occupant
+// can starve fresh kad results out of the pool.
+#[tokio::test]
+async fn test_process_peers_for_discovery_caps_inserts() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let max_discovery = peer_manager.config.max_discovery_peers();
+
+    // flood past the cap in a single batch
+    let flood: Vec<_> = (0..max_discovery + 10)
+        .map(|_| PeerInfo { peer_id: PeerId::random(), addrs: vec![create_multiaddr(None)] })
+        .collect();
+    peer_manager.process_peers_for_discovery(flood);
+
+    // capped at insert time - no transient overshoot
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery);
+
+    // at the cap, another batch still leaves the set exactly at the cap
+    let second_flood: Vec<_> = (0..10)
+        .map(|_| PeerInfo { peer_id: PeerId::random(), addrs: vec![create_multiaddr(None)] })
+        .collect();
+    peer_manager.process_peers_for_discovery(second_flood);
+    assert_eq!(peer_manager.discovery_peers.len(), max_discovery);
+
+    // an address update for a tracked peer replaces its entry without growing
+    // the set, and with no excess nothing is evicted
+    let tracked_id = peer_manager.discovery_peers.keys().next().copied();
+    let new_addr = create_multiaddr(None);
+    tracked_id.into_iter().for_each(|tracked_id| {
+        peer_manager.process_peers_for_discovery(vec![PeerInfo {
+            peer_id: tracked_id,
+            addrs: vec![new_addr.clone()],
+        }]);
+        assert_eq!(peer_manager.discovery_peers.len(), max_discovery);
+        assert_eq!(peer_manager.discovery_peers.remove(&tracked_id), Some(vec![new_addr.clone()]));
+    });
+}
+
 // Regression (issue #777 Part B): the node's own peer id must never be added to
 // the discovery feed. A self entry (learned via kad closest-peers or peer
 // exchange) would otherwise be selected for a self-dial during the heartbeat.
@@ -2067,4 +2176,56 @@ async fn test_discovery_heartbeat_removes_banned_ip_peers() {
 
     // discovery peer with banned ip should be removed
     assert!(!peer_manager.discovery_peers.contains_key(&discovery_peer));
+}
+
+#[tokio::test]
+async fn test_put_record_rate_limit_trips_after_threshold() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    // the first window's worth of records are accepted
+    (0..MAX_PUT_RECORDS_PER_WINDOW)
+        .for_each(|_| assert!(!peer_manager.put_record_rate_limited(source)));
+
+    // the next record in the same window trips the limit
+    assert!(peer_manager.put_record_rate_limited(source));
+}
+
+#[tokio::test]
+async fn test_put_record_window_resets_after_interval() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = PeerId::random();
+
+    (0..=MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
+        peer_manager.put_record_rate_limited(source);
+    });
+    assert!(peer_manager.put_record_rate_limited(source));
+
+    // age the window past the interval; the next record starts a fresh window and is accepted
+    peer_manager.put_record_windows.get_mut(&source).expect("window exists").started =
+        std::time::Instant::now() - PUT_RECORD_RATE_WINDOW;
+    assert!(!peer_manager.put_record_rate_limited(source));
+}
+
+#[tokio::test]
+async fn test_put_record_window_evicted_on_disconnect() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let source = register_peer(&mut peer_manager, None);
+
+    assert!(!peer_manager.put_record_rate_limited(source));
+    assert!(peer_manager.put_record_windows.contains_key(&source));
+
+    peer_manager.register_disconnected(&source);
+    assert!(!peer_manager.put_record_windows.contains_key(&source));
+}
+
+#[tokio::test]
+async fn test_put_record_rate_limit_never_applies_to_local_peer() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = peer_manager.local_peer_id;
+
+    // the local id is exempt no matter how many records arrive, and never allocates a window
+    (0..=MAX_PUT_RECORDS_PER_WINDOW)
+        .for_each(|_| assert!(!peer_manager.put_record_rate_limited(local)));
+    assert!(!peer_manager.put_record_windows.contains_key(&local));
 }
