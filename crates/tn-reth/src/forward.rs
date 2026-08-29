@@ -57,6 +57,7 @@ use alloy::{
     transports::{RpcError, TransportErrorKind},
 };
 use futures::{future::OptionFuture, StreamExt};
+use rand::{seq::SliceRandom as _, Rng};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::{Ipv4Addr, Ipv6Addr},
@@ -555,10 +556,7 @@ impl WorkerRpcForwarder {
         // #1277). Per forward, not per transaction: every transaction of one forward walks
         // the same order, so one account's transactions stay on one fallback validator
         // within a batch (nonce-gap hygiene), matching the owner routing below.
-        let fallbacks = shuffled_fallbacks(
-            providers.keys().cloned().collect(),
-            std::iter::repeat_with(rand::random::<u64>),
-        );
+        let fallbacks = shuffled_fallbacks(providers.keys().cloned().collect(), &mut rand::rng());
         let cache = Arc::clone(&self.cache);
         let requeue_pool = self.requeue_pool.clone();
 
@@ -871,8 +869,7 @@ fn next_txn_budget(deadline: Instant, now: Instant) -> Option<Duration> {
     (!remaining.is_zero()).then(|| remaining.min(FORWARD_TX_BUDGET))
 }
 
-/// The fallback dial order for one spawned forward: `fallbacks` sorted by `ranks`, ties (and
-/// any entries past the end of `ranks`) staying in input order.
+/// The fallback dial order for one spawned forward: `fallbacks` shuffled uniformly with `rng`.
 ///
 /// Without a shuffle the order derives from the raw byte sort of the committee's BLS public
 /// keys, which a validator can grind offline. A key that sorts first bought a permanent first
@@ -884,20 +881,11 @@ fn next_txn_budget(deadline: Instant, now: Instant) -> Option<Duration> {
 /// forward. Forwarding is a local networking choice on this observer, not a consensus input,
 /// so the nondeterminism is safe. Owner-first routing is unchanged: the owner is dialed ahead
 /// of this list (see [`WorkerRpcForwarder::spawn_forward`]).
-fn shuffled_fallbacks(
-    fallbacks: Vec<BlsPublicKey>,
-    ranks: impl IntoIterator<Item = u64>,
-) -> Vec<BlsPublicKey> {
-    // The index in the sort key is what keeps this total: equal ranks (and a rank stream
-    // shorter than the list, padded here with `u64::MAX`) collapse to input order instead of
-    // dropping entries behind a duplicate map key.
-    let ranked: BTreeMap<(u64, usize), BlsPublicKey> = fallbacks
-        .into_iter()
-        .zip(ranks.into_iter().chain(std::iter::repeat(u64::MAX)))
-        .enumerate()
-        .map(|(index, (key, rank))| ((rank, index), key))
-        .collect();
-    ranked.into_values().collect()
+fn shuffled_fallbacks(mut fallbacks: Vec<BlsPublicKey>, rng: &mut impl Rng) -> Vec<BlsPublicKey> {
+    // Fisher-Yates, in place: uniform over all permutations, O(n), and it reuses the caller's
+    // allocation rather than staging the list through a map.
+    fallbacks.shuffle(rng);
+    fallbacks
 }
 
 /// Return the BLS key of the committee slot that owns `tx_bytes`, matching the receiver-side
@@ -2163,21 +2151,29 @@ mod tests {
         Ok(())
     }
 
-    /// The ranks pick the order, and no entry is ever dropped or duplicated: equal ranks and
-    /// a rank stream shorter than the list both degrade to input order rather than losing
-    /// entries behind a duplicate sort key.
+    /// The shuffle is a permutation: no entry is ever dropped or duplicated, and the order
+    /// actually moves. Deliberately not an exact-order assertion - rand documents `StdRng`'s
+    /// and the shuffle's algorithms as free to change in any release.
     #[test]
-    fn shuffled_fallbacks_orders_by_rank_without_losing_entries() {
-        let (a, b, c) = (test_key(1), test_key(2), test_key(3));
-        assert_eq!(shuffled_fallbacks(vec![a, b, c], [2_u64, 0, 1]), vec![b, c, a]);
-        // Equal ranks: input order, through the index tiebreak.
-        assert_eq!(shuffled_fallbacks(vec![a, b, c], [7_u64, 7, 7]), vec![a, b, c]);
-        // A rank stream shorter than the list ranks the tail last, in input order, instead
-        // of dropping it. `u64::MAX` for the one provided rank makes the padding collide
-        // with a real rank at the same time, and the tiebreak still keeps every entry.
-        assert_eq!(shuffled_fallbacks(vec![a, b, c], [u64::MAX]), vec![a, b, c]);
-        assert_eq!(shuffled_fallbacks(vec![a, b, c], [0_u64]), vec![a, b, c]);
-        assert_eq!(shuffled_fallbacks(Vec::new(), [1_u64, 2]), Vec::<BlsPublicKey>::new());
+    fn shuffled_fallbacks_permutes_without_losing_entries() {
+        let keys: Vec<_> = (1..=8).map(test_key).collect();
+        let expected: BTreeSet<_> = keys.iter().copied().collect();
+        let mut rng = StdRng::seed_from_u64(1277);
+        let shuffles: Vec<_> =
+            (0..64).map(|_| shuffled_fallbacks(keys.clone(), &mut rng)).collect();
+        shuffles.iter().for_each(|shuffled| {
+            assert_eq!(shuffled.len(), keys.len(), "a shuffle changed the fallback count");
+            assert_eq!(
+                shuffled.iter().copied().collect::<BTreeSet<_>>(),
+                expected,
+                "a shuffle dropped or duplicated a fallback"
+            );
+        });
+        assert!(
+            shuffles.iter().any(|shuffled| *shuffled != keys),
+            "64 shuffles of 8 keys never left input order"
+        );
+        assert!(shuffled_fallbacks(Vec::new(), &mut rng).is_empty());
     }
 
     /// The fallback dialed first varies across forwards: the shuffle, not the key sort,
