@@ -193,7 +193,9 @@ const NON_PAYABLE_CALL_VALUE: &str = "call value: selector is not payable";
 /// balance, a plain value send reverts on the calldata-length check above, and the genesis
 /// account starts with zero balance, so attaching value to `burn(amount)` is the sanctioned inlet
 /// for the pool it draws from: `msg.value == amount` funds and burns in one transaction, and any
-/// excess stays in the pool for later burns. The classification is a payable-list rather than a
+/// excess stays in the pool for later burns. The EVM's own transfer of that value emits nothing,
+/// so [`handle_burn`](burnable::handle_burn) mirrors it as an inbound `Transfer` log — see there.
+/// The classification is a payable-list rather than a
 /// reject-list for the same fail-safe reason as the static gate: a selector added later rejects
 /// value unless it is explicitly named payable, and an unrecognised value-bearing selector
 /// reports [`NON_PAYABLE_CALL_VALUE`] rather than `"Unknown function selector"`. Inside a
@@ -203,6 +205,41 @@ const NON_PAYABLE_CALL_VALUE: &str = "call value: selector is not payable";
 /// exemption requires [`PrecompileInput::target_address`] to be the precompile itself, so
 /// apparent value that never funded the pool could not authorize a draw from it even if an
 /// indirect frame reached this check.
+///
+/// # Rejection gas semantics
+///
+/// Every rejection here — the static-call refusal, the payability refusal, an unrecognised
+/// selector, and each handler's own gas-limit precheck, `unauthorized`, decode, and arithmetic
+/// errors — returns [`PrecompileError`]. The provider that runs it is `alloy-evm`'s
+/// `PrecompilesMap`: [`add_telcoin_precompile`] registers into that map and the factory names it
+/// as the EVM's `Precompiles` type, so `PrecompilesMap::run` (`alloy-evm`'s `precompiles.rs`) is
+/// what splits the error into two instruction results, keyed on `PrecompileError::is_oog`. The
+/// `gas_limit < GAS_COST` precheck each handler runs returns `PrecompileError::OutOfGas`, which
+/// maps to `InstructionResult::PrecompileOOG`; every other variant maps to
+/// `InstructionResult::PrecompileError`. Both are a **halt**, not a revert, and a halt consumes
+/// all the gas the frame was given. revm returns the unspent remainder only for results that are
+/// `is_ok_or_revert()` (`revm-handler`'s `EthFrame::return_result` for a sub-call,
+/// `last_frame_result` for the top level), and neither halt is, so a rejected sub-call loses the
+/// entire 63/64 it was forwarded and a rejected top-level transaction is charged its full
+/// `gas_limit`.
+///
+/// Which provider runs is load-bearing rather than a citation detail. revm's own `EthPrecompiles`
+/// makes the identical `is_oog` split, but it additionally stashes the error string for a call at
+/// journal depth 1, which `revm-handler`'s `post_execution.rs` promotes to
+/// `HaltReason::PrecompileErrorWithContext(message)`. `PrecompilesMap` stashes nothing, so a
+/// rejected top-level call here halts with the bare `HaltReason::PrecompileError` and surfaces no
+/// reason on the receipt at all. That is what the bare-variant assertions in this module's tests
+/// pin, and what makes the "the halt carries no message" claim in
+/// `docs/src/evm-compatibility.md` true.
+///
+/// For callers this is a cliff rather than a soft failure. A contract that forwards `msg.value`
+/// into [`TELCOIN_PRECOMPILE_ADDRESS`] and inspects the returned boolean does get `false` — a
+/// non-ok call result pushes zero — but it holds only the 1/64 it retained, so the outer frame
+/// dies instead of handling the failure. The pre-existing static-call refusal has always behaved
+/// this way and the payability refusal deliberately matches it: consuming the limit is the
+/// EVM's standard price for an invalid operation, and a value-bearing call to a non-payable
+/// selector is a caller bug. Callers must satisfy the precompile's rules up front rather than
+/// plan to recover from a rejection.
 fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
     // Refuse DELEGATECALL/CALLCODE before anything else. See "Direct-call guard" above.
     input
@@ -244,9 +281,13 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
         burnable::claimCall::SELECTOR => {
             burnable::handle_claim(&mut input.internals, calldata, input.caller, input.gas)
         }
-        burnable::burnCall::SELECTOR => {
-            burnable::handle_burn(&mut input.internals, calldata, input.caller, input.gas)
-        }
+        burnable::burnCall::SELECTOR => burnable::handle_burn(
+            &mut input.internals,
+            calldata,
+            input.caller,
+            input.gas,
+            input.value,
+        ),
         // Read-only functions
         burnable::totalSupplyCall::SELECTOR => {
             burnable::handle_total_supply(&mut input.internals, input.gas)
@@ -278,14 +319,20 @@ fn telcoin_precompile(mut input: PrecompileInput<'_>) -> PrecompileResult {
 mod tests {
     use super::*;
     use crate::evm::precompile_test_utils::*;
-    use alloy::sol_types::SolCall;
+    use alloy::sol_types::{SolCall, SolEvent};
     use tn_config::GOVERNANCE_SAFE_ADDRESS;
 
     #[test]
     fn test_input_too_short() {
         let mut env = TestEnv::new();
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, vec![0xAB, 0xCD]);
-        assert_not_success(&result);
+        // The *bare* variant is what pins the provider: revm's `EthPrecompiles` would report
+        // `PrecompileErrorWithContext` at this depth, `alloy-evm`'s `PrecompilesMap` reports no
+        // reason at all. A dependency bump that swapped them fails here rather than mysteriously.
+        assert_eq!(
+            assert_halt_consuming_all_gas(&result, DEFAULT_GAS_LIMIT),
+            &HaltReason::PrecompileError
+        );
     }
 
     #[test]
@@ -294,7 +341,12 @@ mod tests {
         let mut data = vec![0xDE, 0xAD, 0xBE, 0xEF];
         data.extend_from_slice(&[0u8; 32]);
         let result = env.exec_default(GOVERNANCE_SAFE_ADDRESS, data);
-        assert_not_success(&result);
+        // the fallthrough halts rather than reverting, so the sender is charged the whole limit
+        // instead of being handed back the unspent remainder.
+        assert_eq!(
+            assert_halt_consuming_all_gas(&result, DEFAULT_GAS_LIMIT),
+            &HaltReason::PrecompileError
+        );
     }
 
     #[test]
@@ -302,15 +354,26 @@ mod tests {
         let mut env = TestEnv::new();
         let pool_before = env.get_balance(TELCOIN_PRECOMPILE_ADDRESS);
         let user_before = env.get_balance(USER);
-        let result =
-            env.exec_with_value(USER, totalSupplyCall {}.abi_encode(), 100_000, U256::from(1));
-        assert_not_success(&result);
+        let result = env.exec_with_value(
+            USER,
+            totalSupplyCall {}.abi_encode(),
+            DEFAULT_GAS_LIMIT,
+            U256::from(1),
+        );
+        assert_eq!(
+            assert_halt_consuming_all_gas(&result, DEFAULT_GAS_LIMIT),
+            &HaltReason::PrecompileError
+        );
         // The journaled value transfer is reverted: neither balance moves.
         assert_eq!(env.get_balance(TELCOIN_PRECOMPILE_ADDRESS), pool_before);
         assert_eq!(env.get_balance(USER), user_before);
         // Positive control: the same call without value succeeds.
-        let result =
-            env.exec_with_value(USER, totalSupplyCall {}.abi_encode(), 100_000, U256::ZERO);
+        let result = env.exec_with_value(
+            USER,
+            totalSupplyCall {}.abi_encode(),
+            DEFAULT_GAS_LIMIT,
+            U256::ZERO,
+        );
         assert_success(&result);
     }
 
@@ -320,18 +383,28 @@ mod tests {
         let mut env = TestEnv::new();
         let pool_before = env.get_balance(TELCOIN_PRECOMPILE_ADDRESS);
         let calldata = mintCall { amount: U256::from(500) }.abi_encode();
-        let result =
-            env.exec_with_value(GOVERNANCE_SAFE_ADDRESS, calldata.clone(), 100_000, U256::from(1));
-        assert_not_success(&result);
+        let result = env.exec_with_value(
+            GOVERNANCE_SAFE_ADDRESS,
+            calldata.clone(),
+            DEFAULT_GAS_LIMIT,
+            U256::from(1),
+        );
+        assert_eq!(
+            assert_halt_consuming_all_gas(&result, DEFAULT_GAS_LIMIT),
+            &HaltReason::PrecompileError
+        );
         assert_eq!(env.get_balance(TELCOIN_PRECOMPILE_ADDRESS), pool_before);
         // Positive control: the same call without value succeeds.
-        let result = env.exec_with_value(GOVERNANCE_SAFE_ADDRESS, calldata, 100_000, U256::ZERO);
+        let result =
+            env.exec_with_value(GOVERNANCE_SAFE_ADDRESS, calldata, DEFAULT_GAS_LIMIT, U256::ZERO);
         assert_success(&result);
     }
 
     #[test]
     fn test_burn_value_funds_pool_and_burns() {
-        // The pool starts empty (mainnet genesis also allocates the account zero balance).
+        // The pool starts empty, as it does on mainnet: genesis allocates the account zero
+        // balance with `0xfe` code, the nonzero code being what exempts it from EIP-158 state
+        // clearing while the balance sits at zero.
         let one_tel = U256::from(10).pow(U256::from(18));
         let mut env = TestEnv::new_with_balances(one_tel, one_tel, U256::ZERO);
         let amount = U256::from(500);
@@ -351,6 +424,70 @@ mod tests {
         assert_eq!(env.get_balance(TELCOIN_PRECOMPILE_ADDRESS), U256::ZERO);
         assert_eq!(env.get_balance(GOVERNANCE_SAFE_ADDRESS), gov_before - amount);
         assert_eq!(env.get_total_supply(), supply_before - amount);
+    }
+
+    #[test]
+    fn test_value_funded_burn_mirrors_the_top_up_as_a_transfer() {
+        let one_tel = U256::from(10).pow(U256::from(18));
+        let mut env = TestEnv::new_with_balances(one_tel, one_tel, U256::ZERO);
+        let value = U256::from(500);
+        let amount = U256::from(200);
+        let result = env.exec_with_value(
+            GOVERNANCE_SAFE_ADDRESS,
+            burnCall { amount }.abi_encode(),
+            DEFAULT_GAS_LIMIT,
+            value,
+        );
+        let logs = extract_logs(&result);
+        // Three logs: the mirrored top-up, then the burn pair. Without the first, an indexer
+        // rebuilding balances from these events sees the pool pay out wei it never received.
+        assert_eq!(logs.len(), 3);
+        // Every log comes from the precompile and carries a full 32-byte ABI word. The value
+        // assertions below decode with `from_be_slice`, which accepts a short slice, so only the
+        // length check catches a trimmed encoding.
+        for log in logs {
+            assert_eq!(log.address, TELCOIN_PRECOMPILE_ADDRESS);
+            assert_eq!(log.data.data.len(), 32);
+        }
+        assert_eq!(
+            logs[0].topics(),
+            [
+                burnable::Transfer::SIGNATURE_HASH,
+                GOVERNANCE_SAFE_ADDRESS.into_word(),
+                TELCOIN_PRECOMPILE_ADDRESS.into_word(),
+            ]
+        );
+        // The mirror reports the attached value, not the burned amount.
+        assert_eq!(U256::from_be_slice(logs[0].data.data.as_ref()), value);
+        assert_eq!(logs[1].topics(), [burnable::Burn::SIGNATURE_HASH]);
+        assert_eq!(
+            logs[2].topics(),
+            [
+                burnable::Transfer::SIGNATURE_HASH,
+                TELCOIN_PRECOMPILE_ADDRESS.into_word(),
+                Address::ZERO.into_word(),
+            ]
+        );
+        assert_eq!(U256::from_be_slice(logs[2].data.data.as_ref()), amount);
+    }
+
+    #[test]
+    fn test_zero_value_burn_emits_no_inbound_transfer() {
+        // The pool is pre-funded, so this burn moves no wei into the precompile.
+        let mut env = TestEnv::new();
+        let result = env.exec_with_value(
+            GOVERNANCE_SAFE_ADDRESS,
+            burnCall { amount: U256::from(100) }.abi_encode(),
+            DEFAULT_GAS_LIMIT,
+            U256::ZERO,
+        );
+        let logs = extract_logs(&result);
+        assert_eq!(logs.len(), 2);
+        for log in logs {
+            assert_eq!(log.address, TELCOIN_PRECOMPILE_ADDRESS);
+            assert_eq!(log.data.data.len(), 32);
+        }
+        assert_eq!(logs[0].topics(), [burnable::Burn::SIGNATURE_HASH]);
     }
 
     #[test]
@@ -416,5 +553,139 @@ mod tests {
         let result = env.exec(GOVERNANCE_SAFE_ADDRESS, calldata, 200_000);
         assert_success(&result);
         assert_eq!(env.get_balance(TELCOIN_PRECOMPILE_ADDRESS), pool_before - amount);
+    }
+
+    #[test]
+    fn test_handler_rejection_halts_consuming_all_gas() {
+        // Every dispatcher gate passes here — a direct, non-static, zero-value call carrying a
+        // recognised selector — so the refusal comes from the handler's own authorization check.
+        // It is charged on the same terms as the gates above it.
+        let mut env = TestEnv::new();
+        let calldata = burnCall { amount: U256::from(1) }.abi_encode();
+        let result = env.exec(USER, calldata.clone(), DEFAULT_GAS_LIMIT);
+        assert_eq!(
+            assert_halt_consuming_all_gas(&result, DEFAULT_GAS_LIMIT),
+            &HaltReason::PrecompileError
+        );
+        // Positive control: the same burn from governance is served.
+        assert_success(&env.exec(GOVERNANCE_SAFE_ADDRESS, calldata, DEFAULT_GAS_LIMIT));
+    }
+
+    #[test]
+    fn test_gas_precheck_halts_as_oog_while_a_gate_halts_as_precompile_error() {
+        // A handler's `gas_limit < GAS_COST` precheck returns `PrecompileError::OutOfGas`, which
+        // revm maps to `PrecompileOOG`; every other rejection maps to `PrecompileError`. Both
+        // halt and both spend the limit, so only the reason separates them.
+        //
+        // 23,000 clears the intrinsic cost of either transaction below but leaves the precompile
+        // frame short of the 2,100 `totalSupply` prechecks.
+        const TIGHT_GAS_LIMIT: u64 = 23_000;
+        let mut env = TestEnv::new();
+        let calldata = totalSupplyCall {}.abi_encode();
+        let result = env.exec(USER, calldata.clone(), TIGHT_GAS_LIMIT);
+        assert_eq!(
+            assert_halt_consuming_all_gas(&result, TIGHT_GAS_LIMIT),
+            &HaltReason::OutOfGas(OutOfGasError::Precompile)
+        );
+        // At the same limit an unknown selector is refused before any handler runs, so it never
+        // reaches a gas precheck and reports the other reason.
+        let mut unknown = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        unknown.extend_from_slice(&[0u8; 32]);
+        let result = env.exec(USER, unknown, TIGHT_GAS_LIMIT);
+        assert_eq!(
+            assert_halt_consuming_all_gas(&result, TIGHT_GAS_LIMIT),
+            &HaltReason::PrecompileError
+        );
+        // Positive control: with room to run, the precheck passes and the view is served.
+        assert_success(&env.exec(USER, calldata, DEFAULT_GAS_LIMIT));
+    }
+
+    #[test]
+    fn test_rejected_sub_call_loses_the_gas_it_was_forwarded() {
+        const PROBE: Address = address!("5555555000000000000000000000000000000005");
+        let mut env = TestEnv::new();
+        env.deploy_code(PROBE, gas_probe_code(ProbeCall::Call));
+        let mut unknown = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        unknown.extend_from_slice(&[0u8; 32]);
+
+        // The caller does observe the failure — a non-ok sub-call pushes zero — but it is left
+        // holding only the 1/64 it withheld. A revert would have handed the remainder back.
+        assert_probe_lost_forwarded_gas(&env.exec_to(USER, PROBE, unknown, 200_000));
+
+        // Positive control: the same probe over a served call gets its unspent gas back, which is
+        // what makes the bound above a measurement rather than an artifact of the harness.
+        let result = env.exec_to(USER, PROBE, totalSupplyCall {}.abi_encode(), 200_000);
+        let (before, flag, after) = decode_gas_probe(&result);
+        assert_eq!(flag, U256::from(1));
+        assert!(
+            after > before / 2,
+            "a served sub-call returns its unspent gas: {after} of {before} left"
+        );
+    }
+
+    #[test]
+    fn test_indirect_entry_refusal_burns_the_forwarded_gas() {
+        // No transaction can reach the direct-call guard from the top level: a transaction always
+        // enters 0x7e1 with `target_address == bytecode_address`. Its gas semantics are therefore
+        // only observable from a sub-call, and the relay in
+        // `test_delegatecall_burn_refused_with_and_without_value` reverts on failure, which
+        // erases the evidence.
+
+        const PROBE: Address = address!("6666666000000000000000000000000000000006");
+        let mut env = TestEnv::new();
+        env.deploy_code(PROBE, gas_probe_code(ProbeCall::DelegateCall));
+
+        // `totalSupply` would be served by a direct call and needs no authorization, so the only
+        // thing refusing this frame is the indirect-entry guard.
+        let calldata = totalSupplyCall {}.abi_encode();
+        assert_probe_lost_forwarded_gas(&env.exec_to(USER, PROBE, calldata, 200_000));
+    }
+
+    #[test]
+    fn test_static_call_refusal_burns_the_forwarded_gas() {
+        // Like the direct-call guard, the static gate is out of reach from the top level: a
+        // transaction's own frame is never static. The rustdoc leans on this refusal as the
+        // precedent the payability refusal was matched to, so its gas semantics are worth
+        // pinning rather than assuming.
+
+        const PROBE: Address = address!("7777777000000000000000000000000000000007");
+        let mut env = TestEnv::new();
+        env.deploy_code(PROBE, gas_probe_code(ProbeCall::StaticCall));
+
+        // `burn` mutates, so the static gate refuses it before dispatch — ahead of the handler's
+        // own authorization check, which would also have refused this caller.
+        let calldata = burnCall { amount: U256::from(1) }.abi_encode();
+        assert_probe_lost_forwarded_gas(&env.exec_to(USER, PROBE, calldata, 200_000));
+
+        // Positive control: the read-only selector stays served inside the same static frame,
+        // and keeps its unspent gas.
+        let calldata = totalSupplyCall {}.abi_encode();
+        let result = env.exec_to(USER, PROBE, calldata, 200_000);
+        let (before, flag, after) = decode_gas_probe(&result);
+        assert_eq!(flag, U256::from(1));
+        assert!(after > before / 2, "a served sub-call keeps its unspent gas: {after} of {before}");
+    }
+
+    /// Assert a gas probe recorded a refused sub-call: a zero success flag, and a caller left
+    /// holding no more than the 1/64 it withheld. A rejection that reverted instead of halting
+    /// would return the forwarded 63/64 and blow the upper bound wide open, while leaving the
+    /// flag zero either way.
+    fn assert_probe_lost_forwarded_gas(result: &TestResult) {
+        let (before, flag, after) = decode_gas_probe(result);
+        assert!(flag.is_zero(), "a halted sub-call pushes a zero flag, got {flag}");
+        assert!(after > 0, "caller should keep the 1/64 it withheld");
+        assert!(
+            after <= before / 64,
+            "a refused sub-call should burn the forwarded 63/64: {after} of {before} left"
+        );
+    }
+
+    /// Decode the three words a gas probe returns: the gas the calling frame held before the
+    /// sub-call, the sub-call's success flag, and the gas it held after.
+    fn decode_gas_probe(result: &TestResult) -> (u64, U256, u64) {
+        let out = extract_output_bytes(result);
+        assert_eq!(out.len(), 96, "gas probe returns three 32-byte words");
+        let word = |i: usize| U256::from_be_slice(&out[i * 32..(i + 1) * 32]);
+        (word(0).to::<u64>(), word(1), word(2).to::<u64>())
     }
 }
