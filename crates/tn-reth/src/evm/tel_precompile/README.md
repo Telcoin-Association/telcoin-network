@@ -12,7 +12,7 @@ The precompile is registered as a `DynPrecompile` inside reth's `PrecompilesMap`
 | `burnable.rs`   | Timelocked `mint`/`claim` lifecycle, `burn`, and the `totalSupply()` view (mainnet)            |
 | `faucet.rs`     | Instant `mint` with role management (testnet, `faucet` feature)                                |
 | `helpers.rs`    | Storage slot derivation + balance manipulation helpers                                         |
-| `test_utils.rs` | In-memory EVM test harness (gated behind `#[cfg(test)]` / `test-utils` feature)                |
+| `test_utils.rs` | TEL-specific test helpers on top of the shared harness in `../precompile_test_utils.rs` (gated behind `#[cfg(test)]` / `test-utils` feature) |
 
 ## Storage layout
 
@@ -42,13 +42,14 @@ claim(recipient)  →  [if block.timestamp >= unlock_ts]
                      totalSupply += amount
                      clear pending slots
 
-burn(amount)  →  precompile.balance -= amount  (sent to address(0))
+burn(amount)  →  [msg.value, if attached, was already credited to precompile.balance]
+                 precompile.balance -= amount  (sent to address(0))
                  totalSupply -= amount
 ```
 
 - **`mint`**: Governance-only. Creates a pending mint with a 7-day timelock. A second `mint` overwrites the previous pending amount (can be used to cancel by minting 0).
 - **`claim`**: Governance-only. Finalizes the pending mint after the timelock has expired.
-- **`burn`**: Governance-only. Destroys tokens held by the precompile's own account.
+- **`burn`**: Governance-only, and the only payable selector. Destroys tokens held by the precompile's own account. Attached `msg.value` is credited to that account by the EVM before the handler runs, so it tops up the pool the burn draws from: `msg.value == amount` funds and burns in one transaction, and any excess stays in the pool for a later `burn`. See "Native balance equivalence" for the log that mirrors the top-up.
 
 ### Testnet (`faucet` feature)
 
@@ -111,6 +112,23 @@ This matters because staticcall-into-precompile is a live pattern in this codeba
 
 Four regression tests pin both directions, reaching the precompile through the `STATICCALL` relay in `crates/tn-reth/tests/it/precompile_relays.rs`: `test_staticcall_cannot_mutate_precompile_state` and `test_staticcall_still_serves_read_only_selectors` (mainnet, in `tel_precompile_props.rs`), and `test_staticcall_cannot_grant_mint_role` and `test_staticcall_still_serves_has_mint_role` (`faucet`, in `tel_precompile_faucet_props.rs`).
 
+### Rejection semantics: halt, not revert
+
+Every rejection the precompile issues — the `STATICCALL` refusal above, the `call value: selector is not payable` refusal, an unrecognised selector, and each handler's own gas-limit precheck, `unauthorized`, calldata-length, and arithmetic errors — is a `PrecompileError`. The provider that runs `0x7e1` is `alloy-evm`'s `PrecompilesMap` — `add_telcoin_precompile` registers into that map, and the factory names it as the EVM's `Precompiles` type — so `PrecompilesMap::run` (`alloy-evm`'s `precompiles.rs`) is what maps `PrecompileError::OutOfGas`, which is what the `gas_limit < GAS_COST` precheck in each handler returns, to `InstructionResult::PrecompileOOG`, and every other variant to `InstructionResult::PrecompileError`. Both are a **halt**, not a revert, and a halt consumes every unit of gas the frame was given: unspent gas is returned only for results that are `is_ok_or_revert()`, and neither halt is.
+
+Which provider runs is load-bearing rather than a citation detail. revm's own `EthPrecompiles` makes the identical split, but it additionally stashes the error string for a call at journal depth 1, which `revm-handler`'s `post_execution.rs` promotes to `HaltReason::PrecompileErrorWithContext(message)`. `PrecompilesMap` stashes nothing, so a rejected top-level call here halts with the bare `HaltReason::PrecompileError` and surfaces no reason on the receipt at all — which is what the unit tests in `mod.rs` assert, and what makes the "the halt carries no message" claim in `docs/src/evm-compatibility.md` true.
+
+So a rejected call is not a cheap failure:
+
+- A **sub-call** into `0x7e1` loses the entire 63/64 of the caller's gas that was forwarded to it, leaving the calling frame the 1/64 it withheld.
+- A **top-level transaction** is charged its full `gas_limit` and reported as `Halt`, not `Revert`.
+
+The `false` a rejected `CALL` pushes on the stack is therefore not usefully actionable. A contract written as "forward `msg.value` into `0x7e1`, then branch on the returned boolean" reaches the branch with 1/64 of its gas and, in practice, dies there. The change bites hardest on a value-bearing call that used to succeed: `0x7e1.call{value: v}(totalSupply())` cost on the order of 9,000 gas before the payability gate, and now consumes the caller's whole budget.
+
+The precompile's own 2,100 charge is the small part of that 9,000. `CALL` charges 100 for the account access (revm pre-warms every registered precompile address, so `0x7e1` is never cold) plus a flat 9,000 for attaching nonzero value. That 9,000 buys the callee a 2,300 gas stipend on top of the forwarded gas, which more than covers the 2,100, so 200 of it comes back unspent: `100 + 9,000 + 2,100 - 2,300 = 8,900` net, before the caller's own memory and calldata costs. The 25,000 empty-account surcharge never applies, because the genesis `0x7e1` account carries code (see "Genesis account and the `0xfe` code" below).
+
+This behaviour is not new with the payability gate; the `STATICCALL` refusal has always had it, and the gates match each other on purpose. Consuming the limit is the EVM's ordinary price for an invalid operation, and reaching either gate means the caller violated a documented rule. Callers should satisfy those rules up front — do not attach value to anything but `burn`, do not reach mutating selectors from a static frame — rather than expecting to detect the rejection and continue.
+
 ### Timelock bypass (`faucet` feature)
 
 The `faucet` feature **removes the 7-day timelock** on minting. A mainnet binary must never be compiled with this feature enabled. The feature is set at compile time — there is no runtime toggle.
@@ -121,11 +139,24 @@ After `claim` succeeds, both the amount and timestamp storage slots are zeroed, 
 
 ### Native balance equivalence
 
-Token holdings are native account balances, so any direct value transfer (e.g., `CALL` with value) changes a holder's TEL balance without going through the precompile. Off-chain indexers that track issuance/destruction must watch the precompile's `Mint`, `Claim`, `Burn`, and `Transfer(0x0,…)`/`Transfer(…,0x0)` events; ordinary user-to-user TEL movement is observable as native value transfers in transaction traces.
+Token holdings are native account balances, so any direct value transfer (e.g., `CALL` with value) changes a holder's TEL balance without going through the precompile. Off-chain indexers that track issuance/destruction must watch the precompile's `Mint`, `Claim`, `Burn`, the `Transfer(0x0,…)`/`Transfer(…,0x0)` mint and burn legs, and the inbound `Transfer(caller, 0x7e1, msg.value)` a value-funded `burn` emits (below — neither of its legs is `0x0`); ordinary user-to-user TEL movement is observable as native value transfers in transaction traces.
+
+One movement into the precompile does have an event: `burn` is payable, and the wei it receives arrives through the EVM's own transfer, which emits nothing. `handle_burn` therefore emits `Transfer(caller, 0x7e1, msg.value)` before the burn events whenever the call carries value, so an indexer reconstructing TEL as an ERC-20 from these logs never sees the pool pay out wei it was not seen receiving. The mirror reports the attached value, which may exceed the burned amount — the excess stays in the pool and is destroyed by a later `burn`.
+
+That mirror makes the log stream a complete account of the pool's balance across every path that runs precompile code, which is not the same as every path. `SELFDESTRUCT` remains a logless inlet: under EIP-6780 (active from genesis, `cancunTime: 0`) the beneficiary credit still happens — only the account deletion was removed — so a contract self-destructing to `0x7e1` tops the pool up with no log and no precompile frame to observe it, and a later `burn` of that wei emits an outbound `Transfer` for wei nothing was seen sending. The precompile cannot see such a credit, so there is nothing to emit; an indexer should reconcile against the account's native balance rather than treat the log stream as closed.
 
 ### Total supply accounting
 
 `totalSupply` is only updated by `claim` (increment) and `burn` (decrement). It does **not** account for native balance changes outside the precompile (e.g., gas fees, coinbase rewards). The genesis value must be set correctly at chain initialization.
+
+### Genesis account and the `0xfe` code
+
+The genesis account at `0x7e1` is `nonce: "0x0"`, `balance: "0x0"`, `code: "0xfe"` (`chain-configs/mainnet/genesis.yaml:46-49`). That code is a single `0xfe` (`INVALID`) byte, defined once as `PRECOMPILE_GENESIS_BYTECODE` in `crates/tn-reth/src/system_calls.rs:47-54`. The precompile map short-circuits before any bytecode load, so the byte never executes; it is there for what its presence does to the account:
+
+- It keeps the account non-empty, so EIP-158 state clearing never prunes it. An account with zero nonce, zero balance, and no code is deleted at the end of any block that touches it, which would silently wipe the `totalSupply` slot at slot 100 and every pending mint. The precompile's balance legitimately drains to zero after a `burn` of the whole pool, so this is a reachable state, not a theoretical one.
+- It makes a call that bypasses precompile dispatch fail rather than succeed against an EOA. With no code, `0x7e1` is an EOA and a plain call to it returns success; `INVALID` halts the frame instead. The constant's own doc also notes that reth skips calls to accounts with no bytecode, which the code field avoids.
+
+Anything that seeds state under `0x7e1` — a faucet mint role, for example — must extend this account rather than replace it; dropping the `code` field reintroduces the pruning bug. `faucet_mint_role_slot` in `mod.rs` carries the same warning, and the in-memory harness gives its precompile account the identical shape — reading the same `PRECOMPILE_GENESIS_BYTECODE` rather than restating the byte — so tests that burn the pool empty exercise the production account shape (`TestEnv::new_with_balances` in `crates/tn-reth/src/evm/precompile_test_utils.rs`).
 
 ## Gas costs
 
@@ -190,16 +221,21 @@ Native-balance mutations (`balance_incr` / `balance_decr` in `claim`, `burn`, an
 
 ### `burn` — 8,000 gas
 
-| Operation                | Access                | Gas        |
-| ------------------------ | --------------------- | ---------- |
-| load_account(precompile) | cold                  | 2,600      |
-| SLOAD totalSupply        | cold                  | 2,100      |
-| SSTORE totalSupply       | warm, nonzero→nonzero | 2,900      |
-| LOG1 (Burn, 32 B)        | —                     | 1,006      |
-| LOG3 (Transfer, 32 B)    | —                     | 1,756      |
-| **Total**                |                       | **10,362** |
+| Operation                     | Access                       | Gas       |
+| ----------------------------- | ---------------------------- | --------- |
+| load_account(precompile)      | warm (pre-warmed precompile) | 100       |
+| SLOAD totalSupply             | cold                         | 2,100     |
+| SSTORE totalSupply            | warm, nonzero→nonzero        | 2,900     |
+| LOG3 (inbound Transfer, 32 B) | value-funded only            | 1,756     |
+| LOG1 (Burn, 32 B)             | —                            | 1,006     |
+| LOG3 (Transfer, 32 B)         | —                            | 1,756     |
+| **Total**                     |                              | **9,618** |
 
-**Status: Undercharged** — 0.77× headroom. Gas constant is 2,362 below worst-case EVM cost.
+**Status: Undercharged on a value-funded burn only** — 0.83× headroom, 1,618 below worst case. A
+zero-value burn skips the inbound `Transfer`, costs 7,862, and is fully covered (1.02×). This is
+the one table whose `load_account` targets the precompile's own account rather than a recipient:
+revm pre-warms every registered precompile address before any frame runs, so `0x7e1` is never cold
+here. Burning is governance-only, so the subsidy is not reachable by untrusted callers.
 
 ### `mint` (faucet) — 30,000 gas
 
@@ -241,20 +277,24 @@ Native-balance mutations (`balance_incr` / `balance_decr` in `claim`, `burn`, an
 
 ## Testing
 
-Test infrastructure lives in `test_utils.rs` and is the single source of truth for both unit tests (in each module's `#[cfg(test)] mod tests`) and integration tests (in `crates/tn-reth/tests/it/`).
+The shared in-memory EVM harness lives in `crates/tn-reth/src/evm/precompile_test_utils.rs`; `test_utils.rs` in this directory layers the TEL token helpers (`mint`, `get_total_supply`, `set_total_supply`, `GENESIS_SUPPLY`) onto it. Together they are the single source of truth for both unit tests (in each module's `#[cfg(test)] mod tests`) and integration tests (in `crates/tn-reth/tests/it/`).
 
 Example: read totalSupply by calling `0x18160ddd` with no arguments.
 
+CI and `make test` both run the suite through nextest (`.github/workflows/pr.yaml`, `Makefile:111`), so use nextest here too:
+
 ```bash
-# Unit tests (mainnet mint)
-cargo test -p tn-reth --lib tel_precompile
+# Unit tests (mainnet)
+cargo nextest run -p tn-reth --features test-utils --lib -E 'test(tel_precompile)'
 
-# Unit tests (faucet mint)
-cargo test -p tn-reth --lib tel_precompile --features faucet
+# Integration tests (mainnet)
+cargo nextest run -p tn-reth --features test-utils --test it -E 'test(tel_precompile)'
 
-# Integration tests
-cargo test -p tn-reth --features test-utils --test it -- tel_precompile
+# Unit tests (faucet)
+cargo nextest run -p tn-reth --features "test-utils,faucet" --lib -E 'test(tel_precompile)'
 
-# Integration tests with faucet
-cargo test -p tn-reth --features "test-utils,faucet" --test it -- tel_precompile
+# Integration tests (faucet)
+cargo nextest run -p tn-reth --features "test-utils,faucet" --test it -E 'test(tel_precompile)'
 ```
+
+`-E 'test(tel_precompile)'` matches the full test path, so `--lib` selects the `evm::tel_precompile::*` unit tests and `--test it` selects the matching modules under `crates/tn-reth/tests/it/`. All four commands are needed because the `faucet` feature changes which tests compile rather than merely adding to them. The integration sets are disjoint — `tel_precompile_props` and `pipeline_tel_precompile_props` compile only on mainnet, `tel_precompile_faucet_props` only under `faucet` — and the unit sets overlap without either containing the other, since some mainnet unit tests do not compile under `faucet`.
