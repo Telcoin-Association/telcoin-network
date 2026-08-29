@@ -522,10 +522,11 @@ async fn test_process_committed_headers() {
 
         // round 3's digests should have been prepended to self.digests
         assert!(!proposer.digests.is_empty(), "round 3 digests should be re-queued");
-        assert_eq!(proposer.digests.len(), 2, "round 3 had two digests");
+        assert_eq!(proposer.pending_digests_len(), 2, "round 3 had two digests");
 
         // verify the re-queued digests match round 3's payload
-        let requeued: Vec<BlockHash> = proposer.digests.iter().map(|pd| pd.digest).collect();
+        let requeued: Vec<BlockHash> =
+            proposer.digests.values().flatten().map(|pd| pd.digest).collect();
         assert!(requeued.contains(&d3a), "d3a should be re-queued");
         assert!(requeued.contains(&d3b), "d3b should be re-queued");
 
@@ -573,4 +574,119 @@ async fn test_process_committed_headers() {
         assert!(proposer.proposed_headers.contains_key(&5));
         assert!(proposer.proposed_headers.contains_key(&6));
     }
+}
+
+/// Header slots are shared across workers: a deep worker-0 backlog cannot starve worker 1
+/// (issue #556). Slots interleave one-per-worker in ascending id order, FIFO within a
+/// worker, and a worker's unused share flows to the workers that still have digests.
+#[tokio::test]
+async fn test_drain_digests_shares_header_slots_across_workers() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let mut proposer = Proposer::new(
+        primary.consensus_config(),
+        primary.consensus_config().authority_id().expect("authority"),
+        cb.clone(),
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    );
+    assert_eq!(proposer.max_header_num_of_batches, 10, "test assumes the default header cap");
+
+    // worker 0 queues a deep backlog, worker 1 only three digests
+    let w0: Vec<B256> = (0..15).map(|_| B256::random()).collect();
+    let w1: Vec<B256> = (0..3).map(|_| B256::random()).collect();
+    proposer.digests.insert(
+        0,
+        w0.iter().map(|digest| ProposerDigest { digest: *digest, worker_id: 0 }).collect(),
+    );
+    proposer.digests.insert(
+        1,
+        w1.iter().map(|digest| ProposerDigest { digest: *digest, worker_id: 1 }).collect(),
+    );
+
+    let selected = proposer.drain_digests_for_header();
+    assert_eq!(selected.len(), 10, "header fills to the cap");
+
+    // rounds of one-per-worker while both lanes have digests, then worker 0 takes the rest
+    let expected = vec![w0[0], w1[0], w0[1], w1[1], w0[2], w1[2], w0[3], w0[4], w0[5], w0[6]];
+    let got: Vec<B256> = selected.iter().map(|digest| digest.digest).collect();
+    assert_eq!(got, expected, "slots interleave per worker, FIFO within each worker");
+
+    // worker 1 fully drained, worker 0 keeps its FIFO tail for the next header
+    assert_eq!(proposer.digests.get(&1).map(VecDeque::len), Some(0));
+    let remaining: Vec<B256> =
+        proposer.digests.get(&0).expect("worker 0 lane").iter().map(|d| d.digest).collect();
+    assert_eq!(remaining, w0[7..].to_vec(), "worker 0 tail stays FIFO");
+}
+
+/// With a single worker the fair drain is exactly the old FIFO drain.
+#[tokio::test]
+async fn test_drain_digests_single_worker_is_fifo() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let mut proposer = Proposer::new(
+        primary.consensus_config(),
+        primary.consensus_config().authority_id().expect("authority"),
+        cb.clone(),
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    );
+
+    let cap = proposer.max_header_num_of_batches;
+    let w0: Vec<B256> = (0..cap + 2).map(|_| B256::random()).collect();
+    proposer.digests.insert(
+        0,
+        w0.iter().map(|digest| ProposerDigest { digest: *digest, worker_id: 0 }).collect(),
+    );
+
+    let selected = proposer.drain_digests_for_header();
+    let got: Vec<B256> = selected.iter().map(|digest| digest.digest).collect();
+    assert_eq!(got, w0[..cap].to_vec(), "single worker drains FIFO up to the cap");
+    let remaining: Vec<B256> =
+        proposer.digests.get(&0).expect("worker 0 lane").iter().map(|d| d.digest).collect();
+    assert_eq!(remaining, w0[cap..].to_vec(), "the tail stays queued in order");
+}
+
+/// When more workers have pending digests than a header holds, the slot walk rotates
+/// across headers via the cursor, so no lane is excluded permanently (the depth-0 round
+/// alone already overflows the cap).
+#[tokio::test]
+async fn test_drain_digests_rotates_across_headers_when_lanes_exceed_cap() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let mut proposer = Proposer::new(
+        primary.consensus_config(),
+        primary.consensus_config().authority_id().expect("authority"),
+        cb.clone(),
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    );
+    assert_eq!(proposer.max_header_num_of_batches, 10, "test assumes the default header cap");
+
+    // twelve lanes with one digest each; lane 0 carries a persistent extra backlog
+    (0..12u16).for_each(|worker_id| {
+        let depth = if worker_id == 0 { 2 } else { 1 };
+        proposer.digests.insert(
+            worker_id,
+            (0..depth).map(|_| ProposerDigest { digest: B256::random(), worker_id }).collect(),
+        );
+    });
+
+    let first: Vec<WorkerId> =
+        proposer.drain_digests_for_header().iter().map(|digest| digest.worker_id).collect();
+    assert_eq!(first, (0..10).collect::<Vec<_>>(), "first header serves lanes 0-9");
+
+    // the next header resumes at lane 10 instead of restarting at lane 0
+    let second: Vec<WorkerId> =
+        proposer.drain_digests_for_header().iter().map(|digest| digest.worker_id).collect();
+    assert_eq!(second, vec![10, 11, 0], "the cursor rotates the walk to the unserved lanes");
 }

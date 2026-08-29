@@ -11,7 +11,8 @@ authors = [
 publish = false
 
 [dependencies]
-# `server` + `macros` back the `--rpc.txfeecap` guard's method overrides (`rpc_fee_cap`).
+# `server` + `macros` back the TN eth-method overrides (`rpc_fee_history` and the
+# `--rpc.txfeecap` guard's `rpc_fee_cap`).
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
 async-trait = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
@@ -75,6 +76,7 @@ tokio = { workspace = true, features = ["macros", "time", "sync"] }
 # `Service` impl for the size-capped forwarder transport (issue #1275). Only the trait; the
 # HTTP client underneath comes through alloy's re-export so the TLS backend stays alloy's.
 tower = { workspace = true }
+tokio-stream = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
 
