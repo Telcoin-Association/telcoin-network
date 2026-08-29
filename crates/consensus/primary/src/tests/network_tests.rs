@@ -39,9 +39,9 @@ use tn_types::{
     encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
     BlockHeader, BlockNumHash, BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner as _, Certificate,
     CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusResult, Database, Epoch,
-    EpochDigest, EpochRecord, EpochSeedMessage, EpochVote, ExecHeader, Hash as _, HeaderDigest,
-    ReputationScores, Round, SealedHeader, TaskManager, TnReceiver as _, TnSender as _, VoteDigest,
-    VoteInfo, B256,
+    EpochCertificate, EpochDigest, EpochRecord, EpochSeedMessage, EpochVote, ExecHeader, Hash as _,
+    HeaderDigest, ReputationScores, Round, SealedHeader, TaskManager, TnReceiver as _,
+    TnSender as _, VoteDigest, VoteInfo, B256,
 };
 use tracing::debug;
 
@@ -1167,6 +1167,51 @@ async fn test_epoch_vote_wrong_digest_rejected_before_verify() -> eyre::Result<(
     assert!(
         tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
         "a mismatched-digest vote must not reach the collector"
+    );
+    Ok(())
+}
+
+/// The other half of the ingress gate: a vote for an epoch we hold but that is ALREADY CERTIFIED
+/// (`get_epoch_by_number` returns `Some((record, Some(cert)))`) must be dropped silently — no
+/// error, no penalty, not forwarded. Certification is complete so further votes are surplus, and
+/// the benign drop must not be charged to the (honest) relayer on the gossip path. Companion to
+/// `test_epoch_vote_wrong_digest_rejected_before_verify`, which covers the digest arm.
+#[tokio::test]
+async fn test_epoch_vote_already_certified_epoch_dropped_before_verify() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+
+    // Seed the epoch-0 record, then store a certificate for it so the gate sees it as certified.
+    // This branch never verifies the cert, so a minimal one (a valid BLS signature reused from a
+    // vote, empty signer bitmap) is enough to flip `get_epoch_by_number`'s `None` -> `Some(cert)`.
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+    let auth = committee.authorities().next().expect("committee has authorities");
+    let key_config = auth.consensus_config().key_config().clone();
+    let vote = record.sign_vote(&key_config);
+    let cert = EpochCertificate {
+        epoch_hash: record.digest(),
+        signature: vote.signature,
+        signed_authorities: RoaringBitmap::new(),
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_certificate(record.digest(), cert)
+        .await
+        .expect("store epoch-0 certificate");
+
+    // The vote is otherwise valid (correct digest, real committee member) — it is dropped ONLY
+    // because the epoch is already certified.
+    let mut rx = consensus_bus.subscribe_new_epoch_votes();
+    let res = handler.process_gossip(&epoch_vote_gossip(vote, 0)).await;
+    assert!(
+        res.is_ok(),
+        "a vote for an already-certified epoch must be dropped without error or penalty: {res:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+        "a vote for an already-certified epoch must not reach the collector"
     );
     Ok(())
 }
