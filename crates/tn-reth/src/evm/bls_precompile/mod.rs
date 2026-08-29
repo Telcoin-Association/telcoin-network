@@ -293,9 +293,20 @@ mod tests {
         .abi_encode()
     }
 
-    /// Decodes the ABI-encoded `bool` returned by a `blsVerify` call.
+    /// Decodes the ABI-encoded `bool` returned by a `blsVerify` call, pinning the return to the
+    /// canonical 32-byte word rather than only its decoded value.
+    ///
+    /// The decoder is more permissive than the ABI it decodes, so decoding alone would not catch a
+    /// regression in the return encoding. It reads one word and ignores every trailing byte, so an
+    /// over-wide return still decodes (`vec![false].abi_encode()` decodes as `true` - the leading
+    /// offset word is read as the bool), and it detokenizes any non-zero word to `true`, so a
+    /// dirty word such as `0x00..02` decodes as `true` too. The validating `abi_decode_validate`
+    /// closes neither: it only requires the leading 31 bytes to be zero. The round-trip equality -
+    /// not the decode - is therefore what pins the width and canonicity.
     fn decode_bool(bytes: &[u8]) -> bool {
-        <bool as SolValue>::abi_decode(bytes).expect("decode bool return")
+        let decoded = <bool as SolValue>::abi_decode(bytes).expect("decode bool return");
+        assert_eq!(bytes, decoded.abi_encode(), "return is the canonical 32-byte ABI bool");
+        decoded
     }
 
     // --- `bls_verify` crypto semantics -----------------------------------------------------------
