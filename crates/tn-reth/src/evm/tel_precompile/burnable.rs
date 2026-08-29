@@ -4,7 +4,12 @@
 //! 1. **`mint(uint256)`** — governance creates a pending mint with a 7-day timelock.
 //! 2. **`claim(address)`** — only governance can finalize the mint after the timelock expires,
 //!    crediting governance safe's native balance and incrementing `totalSupply`.
-//! 3. **`burn(uint256)`** — governance destroys tokens held by the precompile account.
+//! 3. **`burn(uint256)`** — governance destroys tokens held by the precompile account. `burn` is
+//!    the one payable selector: the EVM credits attached `msg.value` to the precompile before the
+//!    handler runs, topping up the pool the burn draws from, so `msg.value == amount` funds and
+//!    burns in one transaction and any excess stays in the pool for a later `burn`. That transfer
+//!    happens inside the EVM and emits nothing, so the handler mirrors it as an inbound
+//!    `Transfer(caller, precompile, msg.value)` log ahead of the burn events.
 //!
 //! The timelock provides a safety window for governance to cancel malicious mints before
 //! tokens enter circulation. A second `mint` call **overwrites** any pending mint, which
@@ -55,7 +60,8 @@ sol! {
     event Claim(address indexed recipient, uint256 amount);
     /// Emitted when tokens are burned.
     event Burn(uint256 amount);
-    /// Emitted when tokens are minted (from address(0)) or burned (to address(0)).
+    /// Emitted when tokens are minted (from address(0)), burned (to address(0)), or sent to the
+    /// precompile as call value funding a `burn`.
     event Transfer(address indexed from, address indexed to, uint256 value);
 }
 
@@ -342,6 +348,14 @@ pub(super) fn handle_claim(
 ///
 /// Decrements the precompile's native balance by `amount`, then decrements `totalSupply`.
 ///
+/// `value` is the call value the EVM credited to the precompile before this handler ran. The
+/// dispatcher's payability gate admits it for this selector alone, and only when the precompile is
+/// the actual transfer target, so nonzero `value` is always `caller` topping up the pool this
+/// handler draws from. That transfer happens inside the EVM and emits nothing, so the handler
+/// mirrors it as `Transfer(caller, precompile, value)` ahead of the burn events: an indexer
+/// reconstructing TEL as an ERC-20 from these logs would otherwise watch tokens leave a pool they
+/// were never seen entering, and drift negative.
+///
 /// # Access control
 /// Governance-only via [`has_governance_role`].
 pub(super) fn handle_burn(
@@ -349,14 +363,18 @@ pub(super) fn handle_burn(
     calldata: &[u8],
     caller: Address,
     gas_limit: u64,
+    value: U256,
 ) -> PrecompileResult {
     /// Flat charge for destroying tokens held by the precompile.
     ///
-    /// A cold `load_account` of the precompile itself (`2_600`), a cold `SLOAD` plus warm
-    /// `nonzero -> nonzero` `SSTORE` of the supply slot (`2_100 + 2_900`), and the `Burn` and
-    /// `Transfer` logs (`1_006 + 1_756`): `10_362` total. At `8_000` this covers `0.77x` of the
-    /// worst case, so `burn` is **undercharged** by `2_362` relative to equivalent Solidity.
-    /// Burning is governance-only, so the subsidy is not reachable by untrusted callers.
+    /// A warm `load_account` of the precompile itself (`100`: revm pre-warms every registered
+    /// precompile address, so `0x7e1` is never cold), a cold `SLOAD` plus warm `nonzero ->
+    /// nonzero` `SSTORE` of the supply slot (`2_100 + 2_900`), and the `Burn` and `Transfer` logs
+    /// (`1_006 + 1_756`): `7_862` for a zero-value burn, which the flat `8_000` covers in full
+    /// (`1.02x`). A value-funded burn adds the inbound `Transfer` mirroring the top-up (`1_756`)
+    /// for `9_618`, and is therefore **undercharged** by `1_618` (`0.83x`) relative to equivalent
+    /// Solidity. Burning is governance-only, so that subsidy is not reachable by untrusted
+    /// callers.
     ///
     /// Derived in this module's `README.md`, "Gas costs" / "`burn`".
     const GAS_COST: u64 = 8_000;
@@ -388,6 +406,27 @@ pub(super) fn handle_burn(
     internals
         .sstore(TELCOIN_PRECOMPILE_ADDRESS, TOTAL_SUPPLY_SLOT, new_supply)
         .map_err(|e| PrecompileError::Other(format!("sstore failed: {e:?}").into()))?;
+
+    // Emit Transfer(caller, precompile, value) — mirrors the EVM's own silent value transfer that
+    // funded this burn, keeping the event log a complete account of the pool's balance across
+    // every path that runs precompile code. One inlet stays outside those paths: under EIP-6780 a
+    // `SELFDESTRUCT` naming 0x7e1 as beneficiary still transfers its balance (only the account
+    // deletion was removed), crediting the pool with no log and no frame here to observe it. An
+    // indexer should reconcile against the account's native balance rather than treat this log
+    // stream as closed.
+    if !value.is_zero() {
+        let funding_log = reth_revm::primitives::Log::new(
+            TELCOIN_PRECOMPILE_ADDRESS,
+            vec![
+                Transfer::SIGNATURE_HASH,
+                caller.into_word(),
+                TELCOIN_PRECOMPILE_ADDRESS.into_word(),
+            ],
+            value.to_be_bytes_vec().into(),
+        )
+        .ok_or_else(|| PrecompileError::Other("Failed to create Transfer log".into()))?;
+        internals.log(funding_log);
+    }
 
     // Emit Burn(uint256 amount)
     let topic0 = Burn::SIGNATURE_HASH;
