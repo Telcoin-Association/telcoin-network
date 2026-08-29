@@ -32,16 +32,14 @@ impl<CDB: ConsensusDatabase> WorkerNodeInner<CDB> {
     ///
     /// Return the task manager for the worker and the [Worker] struct for spawning execution tasks.
     async fn new_worker(&mut self) -> eyre::Result<Worker<CDB, QuorumWaiter>> {
-        let batch_provider = new_worker(
+        new_worker(
             self.id,
             self.validator.clone(),
             self.consensus_config.clone(),
             self.network_handle.clone(),
             self.forwarder.clone(),
             self.consensus_chain.clone(),
-        );
-
-        Ok(batch_provider)
+        )
     }
 }
 

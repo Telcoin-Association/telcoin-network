@@ -770,7 +770,7 @@ where
             self.key_config.clone(),
             primary_network_handle.clone(),
             node_task_manager.get_spawner(),
-            self.node_shutdown.subscribe(),
+            self.node_shutdown.clone(),
         );
 
         // Re-vote from durable storage on restart (issue #1198): the collector above is armed

@@ -13,7 +13,7 @@ publish = false
 [dependencies]
 futures.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 tn-storage = { workspace = true }
 tn-network-types = { workspace = true }
