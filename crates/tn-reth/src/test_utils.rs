@@ -866,12 +866,19 @@ pub fn governance_burn_tx(
 
 /// Build a block from a [`TNPayload`] and transactions, then commit it as the new canonical
 /// tip (chain-state update + finalization normally handled by `tn_engine`'s payload builder).
+///
+/// Every block persists before the next build here, so a fresh empty
+/// [`crate::OutputTrieOverlay`] per block is exact (#1301).
 pub fn execute_payload_and_update_canonical_chain(
     reth_env: &RethEnv,
     payload: TNPayload,
     transactions: Vec<Vec<u8>>,
 ) -> eyre::Result<ExecutedBlock> {
-    let block = reth_env.build_block_from_batch_payload(payload, &transactions)?;
+    let block = reth_env.build_block_from_batch_payload(
+        payload,
+        &transactions,
+        &mut crate::OutputTrieOverlay::new(),
+    )?;
     // update chain state - normally handled by tn_engine::payload_builder
     let canonical_header = block.recovered_block.clone_sealed_header();
     let canonical_in_memory_state = reth_env.blockchain_provider().canonical_in_memory_state();

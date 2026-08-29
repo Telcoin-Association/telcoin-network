@@ -264,8 +264,13 @@ impl PipelineTestEnv {
         // 2. Build TNPayload
         let payload = TNPayload::new_for_test(self.canonical_header.clone(), &output);
 
-        // 3. Build and execute block
-        let block = self.reth_env.build_block_from_batch_payload(payload, &txs)?;
+        // 3. Build and execute block. Each block persists in step 5 before the next build,
+        // so a fresh empty overlay per block is exact (#1301).
+        let block = self.reth_env.build_block_from_batch_payload(
+            payload,
+            &txs,
+            &mut tn_reth::OutputTrieOverlay::new(),
+        )?;
 
         // 4. Update canonical in-memory state
         let canonical_header = block.recovered_block.clone_sealed_header();
@@ -380,7 +385,7 @@ impl PipelineTestEnv {
 /// Create a `ConsensusOutput` with a controlled timestamp.
 ///
 /// Adapted from `lib.rs:1478-1510`.
-fn consensus_output_for_test(
+pub(crate) fn consensus_output_for_test(
     round: u32,
     epoch: u32,
     subdag_index: u64,

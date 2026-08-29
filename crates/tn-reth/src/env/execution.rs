@@ -8,6 +8,17 @@
 //! source of canonical blocks: there is no fork choice and no reorg path, and every
 //! committed block is final by construction.
 //!
+//! # State roots for multi-block output (#1301)
+//!
+//! Within one `ConsensusOutput`, each block's state root is computed by TN's own
+//! layered path (`OutputTrieOverlay` in `output_overlay.rs`) rather than reth's
+//! `MemoryOverlayStateProvider`: an output-scoped overlay accumulates the built
+//! blocks' sorted deltas in place, and the root runs directly against a read-only
+//! database transaction with the current block's deltas layered over the overlay.
+//! This bypasses (does not fix upstream) reth's per-block re-merge/copy/re-sort of
+//! every in-memory ancestor - see `build_block_from_batch_payload` for the honest
+//! cost bound. All other state reads still resolve through reth's memory overlay.
+//!
 //! # Deliberate transaction drops (fork safety)
 //!
 //! Block building silently drops transactions on exactly two paths:
@@ -72,7 +83,10 @@ use crate::{
     TNPrimitives,
 };
 
-use super::RethEnv;
+use super::{
+    output_overlay::{OutputTrieOverlay, OverlayRootStateProvider},
+    RethEnv,
+};
 
 impl RethEnv {
     /// Construct a canonical block from a worker's block that reached consensus.
@@ -86,17 +100,43 @@ impl RethEnv {
     /// The returned block's trie bundle holds only this block's own sorted state and
     /// trie-update deltas. It never carries the cumulative ancestor overlay, so
     /// `anchored_trie_input` is `None`. No consumer on the node's path reads that
-    /// overlay: persistence and canonical-chain notifications use the per-block deltas,
-    /// and state roots and RPC proofs over unpersisted blocks assemble their trie input
-    /// from the same per-block deltas in reth's `MemoryOverlayStateProvider`. Building
-    /// the overlay was also not O(1) here: the parent's bundle keeps the overlay `Arc`s
-    /// alive, so reth's parent-reuse fast path (`Arc::make_mut`) deep-copies the whole
-    /// cumulative overlay for every block. One `ConsensusOutput` of `N` blocks with `M`
-    /// state updates each paid `O(N^2 * M)` copy work and transient memory (#1266).
+    /// overlay: persistence and canonical-chain notifications use the per-block deltas.
+    /// Building the overlay was also not O(1) here: the parent's bundle keeps the
+    /// overlay `Arc`s alive, so reth's parent-reuse fast path (`Arc::make_mut`)
+    /// deep-copies the whole cumulative overlay for every block - one `ConsensusOutput`
+    /// of `N` blocks with `M` state updates each paid `O(N^2 * M)` copy work and
+    /// transient memory (#1266).
+    ///
+    /// # State-root path (#1301)
+    ///
+    /// The state root does NOT go through reth's `MemoryOverlayStateProvider`, whose
+    /// `state_root_with_updates` re-merges, deep-copies, and re-sorts EVERY in-memory
+    /// ancestor's deltas per block - the second, reth-side `O(N^2 * M)` term, which is
+    /// bypassed here rather than fixed upstream. Instead the caller-supplied `overlay`
+    /// accumulates the output's already-sorted per-block deltas in place, and the root
+    /// runs against a fresh read-only database transaction with layered in-memory
+    /// cursors: current block's sorted deltas over the accumulated overlay over the
+    /// database, prefix sets from the current block only (see
+    /// [`OutputTrieOverlay::layered_root_with_updates`]). All other provider reads
+    /// still resolve through reth's memory overlay, unchanged.
+    ///
+    /// Honest bound (in-place-merge variant, the one that landed): per block,
+    /// `O(M log M)` to sort the block's own deltas, an `O(M)`-driven trie walk, and
+    /// ONE linear merge pass `O(|accumulated| + M)`. Per output the merges sum to
+    /// `O(N * D + N * M)` where `D` is the DISTINCT keys touched across the output;
+    /// with fully disjoint keys the raw element copies still sum to `O(N^2 * M)` - but
+    /// as a single pass with no allocation churn, versus reth's three passes plus full
+    /// clone plus re-sort. This is NOT a flat `O(N * M)`; the LSM-style layered-runs
+    /// variant would achieve `O(N * M log)` and was not needed.
+    ///
+    /// Callers that persist every block before building the next (tests, e2e helpers)
+    /// pass a fresh empty overlay per block: the database then already holds the
+    /// parent state, so the empty overlay is exact.
     pub fn build_block_from_batch_payload(
         &self,
         payload: TNPayload,
         transactions: &Vec<Vec<u8>>,
+        overlay: &mut OutputTrieOverlay,
     ) -> TnRethResult<ExecutedBlock> {
         let parent_header = payload.parent_header.clone();
         debug!(target: "engine", ?parent_header, "retrieving state for next block");
@@ -189,8 +229,16 @@ impl RethEnv {
             }
         }
 
-        let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } =
-            builder.finish(&state_provider)?;
+        // Scope the wrapper so its borrows of the overlay are dropped before the
+        // overlay is extended below (`Arc::make_mut` must not see a live borrow).
+        let BlockBuilderOutcome { execution_result, block, hashed_state, trie_updates } = {
+            let root_provider = OverlayRootStateProvider::new(
+                &state_provider,
+                overlay,
+                &self.inner.blockchain_provider,
+            );
+            builder.finish(&root_provider)?
+        };
 
         debug!(target: "engine", hash=?block.hash(), "block builder outcome");
         let block_execution_output =
@@ -201,6 +249,11 @@ impl RethEnv {
             Arc::new(sorted_hashed_state),
             Arc::new(sorted_trie_updates),
         );
+        // Accumulate this block's sorted deltas into the output-scoped overlay so the
+        // NEXT block's layered state root sees them without re-merging its ancestors
+        // (#1301). One linear merge pass; the `Arc`s are shared with the block's
+        // `ComputedTrieData`, so nothing is recomputed.
+        overlay.extend_from_block(&computed_trie_data);
         let res: ExecutedBlock<TNPrimitives> = ExecutedBlock::new(
             Arc::new(block),
             Arc::new(block_execution_output),

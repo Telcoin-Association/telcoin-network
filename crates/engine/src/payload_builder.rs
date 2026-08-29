@@ -6,7 +6,8 @@ use crate::error::{EngineResult, TnEngineError};
 use tn_reth::{
     error::TnRethError,
     payload::{BuildArguments, TNPayload},
-    CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, ProviderError, RethEnv,
+    CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain, OutputTrieOverlay, ProviderError,
+    RethEnv,
 };
 use tn_types::{
     gas_accumulator::GasAccumulator, max_batch_gas, EngineUpdate, Hash as _, SealedHeader, B256,
@@ -100,6 +101,13 @@ pub fn execute_consensus_output(
     // If a later block fails, the earlier blocks' advance is rolled back to this header so no
     // phantom canonical head survives (see `rollback_in_memory_output`).
     let anchor_header = canonical_header.clone();
+    // ONE output-scoped trie overlay, anchored at the pre-output database tip. Each built
+    // block's sorted deltas are merged into it in place, so later blocks' state roots layer
+    // the accumulated deltas over the database instead of re-merging every unpersisted
+    // ancestor per block through reth's memory-overlay provider (#1301). Dropped with this
+    // scope: persistence uses the per-block deltas, never this accumulation, and an error
+    // path discards it together with the rolled-back in-memory advance.
+    let mut output_overlay = OutputTrieOverlay::new();
 
     if batches.is_empty() {
         if !output.close_epoch() {
@@ -171,6 +179,7 @@ pub fn execute_consensus_output(
             &mut executed_blocks,
             &reth_env,
             &canonical_in_memory_state,
+            &mut output_overlay,
         );
         // On failure, revert the in-memory advance applied by any earlier block of this output so
         // the propagated error never leaves a phantom canonical head observable to RPC. The leader
@@ -216,6 +225,7 @@ pub fn execute_consensus_output(
                 &mut executed_blocks,
                 &reth_env,
                 &canonical_in_memory_state,
+                &mut output_overlay,
             );
             // On failure of a later block, revert the in-memory advance applied by the earlier
             // blocks of this output so the propagated (node-halting) error never leaves a phantom
@@ -274,15 +284,21 @@ pub fn execute_consensus_output(
 }
 
 /// Execute the transaction and update canon chain in-memory.
+///
+/// `output_overlay` is the consensus output's shared accumulated trie overlay: the build
+/// computes this block's state root layered over it and then extends it with the block's
+/// sorted deltas for the NEXT block of the output (#1301).
 fn execute_payload(
     payload: TNPayload,
     transactions: &Vec<Vec<u8>>,
     executed_blocks: &mut Vec<ExecutedBlock>,
     reth_env: &RethEnv,
     canonical_in_memory_state: &CanonicalInMemoryState,
+    output_overlay: &mut OutputTrieOverlay,
 ) -> EngineResult<SealedHeader> {
     // execute
-    let next_canonical_block = reth_env.build_block_from_batch_payload(payload, transactions)?;
+    let next_canonical_block =
+        reth_env.build_block_from_batch_payload(payload, transactions, output_overlay)?;
     debug!(target: "engine", ?next_canonical_block, "block executed");
 
     // update header for next block execution in loop
@@ -291,10 +307,11 @@ fn execute_payload(
     crate::metrics::ENGINE_METRICS.blocks_executed_total.increment(1);
     crate::metrics::ENGINE_METRICS.block_gas_used.record(canonical_header.gas_used as f64);
     // Eagerly advance the shared in-memory state. This is load-bearing within a multi-block
-    // output: the next block in the loop resolves its parent state through this advance. The
-    // advance is speculative until the whole output commits durably after the loop; if a later
-    // block fails to build, `execute_consensus_output` compensates it via
-    // `rollback_in_memory_output`.
+    // output: the next block in the loop resolves its parent state through this advance
+    // (account/storage/bytecode reads via reth's memory overlay; the state root itself runs
+    // over `output_overlay` instead, see #1301). The advance is speculative until the whole
+    // output commits durably after the loop; if a later block fails to build,
+    // `execute_consensus_output` compensates it via `rollback_in_memory_output`.
     canonical_in_memory_state.set_pending_block(next_canonical_block.clone());
     canonical_in_memory_state
         .update_chain(NewCanonicalChain::Commit { new: vec![next_canonical_block.clone()] });
