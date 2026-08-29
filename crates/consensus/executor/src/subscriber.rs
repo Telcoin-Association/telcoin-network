@@ -4,21 +4,30 @@ use crate::{errors::SubscriberResult, metrics::ExecutorMetrics, SubscriberError}
 use futures::{stream::FuturesOrdered, StreamExt, TryStreamExt};
 use state_sync::{last_consensus_parent, save_consensus, spawn_state_sync};
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
 use tn_config::ConsensusConfig;
-use tn_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
+use tn_network_types::PrimaryToWorkerClient;
 use tn_primary::{network::PrimaryNetworkHandle, ConsensusBus, ConsensusBusApp, NodeMode};
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
     ConsensusOutput, ConsensusResult, Database, Hash as _, Noticer, TaskManager, TaskSpawner,
-    Timestamp, TimestampSec, TnReceiver, TnSender,
+    Timestamp, TimestampSec, TnReceiver, TnSender, WorkerId,
 };
 use tracing::{debug, error, info, instrument, warn};
+
+/// Interval between stall warnings while a worker's batch-fetch leg is outstanding.
+///
+/// The fetch itself is deliberately unbounded: the sub-dag is committed, so a quorum holds
+/// its batches and `BatchFetcher::fetch_for_primary` retries until they arrive. Cancelling
+/// on a deadline would fail-stop the node during a transient outage (a restart re-enters
+/// the identical wait, a crash loop exactly when the node is furthest behind). The watchdog
+/// keeps the unbounded wait but makes a stall loud instead of silent.
+const FETCH_BATCHES_STALL_WARN_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
 /// downloaded all the transactions references by the certificates; it then
@@ -44,8 +53,6 @@ struct Inner {
     authority_id: Option<AuthorityIdentifier>,
     /// The committee for the epoch.
     committee: Committee,
-    /// The client to request worker batches and build consensus output.
-    client: LocalNetwork,
     /// Access to the consensus chain data.
     consensus_chain: ConsensusChain,
     /// Epoch boundary time.
@@ -66,7 +73,6 @@ pub fn spawn_subscriber<DB: Database>(
 ) {
     let authority_id = config.authority_id();
     let committee = config.committee().clone();
-    let client = config.local_network().clone();
     let mode = consensus_bus.app().current_node_mode();
     info!(target: "tn::observer", node_mode = ?mode, "subscriber starting in mode");
     let subscriber = Subscriber {
@@ -76,7 +82,6 @@ pub fn spawn_subscriber<DB: Database>(
         inner: Arc::new(Inner {
             authority_id,
             committee,
-            client,
             consensus_chain: consensus_chain.clone(),
             epoch_boundary,
             metrics: ExecutorMetrics::default(),
@@ -444,12 +449,14 @@ impl<DB: Database> Subscriber<DB> {
             return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, number));
         }
 
-        let mut batch_set: BTreeSet<BlockHash> = BTreeSet::new();
+        // Partition the payload per worker id so each digest is fetched through the local
+        // network instance of the worker that owns it (dedup within a worker via the set).
+        let mut batches_by_worker: BTreeMap<WorkerId, BTreeSet<BlockHash>> = BTreeMap::new();
 
         let mut batch_digests = VecDeque::with_capacity(num_certs);
         for header in sub_dag.headers() {
-            for (digest, _) in header.payload().iter() {
-                batch_set.insert(*digest);
+            for (digest, worker_id) in header.payload().iter() {
+                batches_by_worker.entry(*worker_id).or_default().insert(*digest);
                 batch_digests.push_back(*digest);
             }
         }
@@ -464,7 +471,7 @@ impl<DB: Database> Subscriber<DB> {
         // MAX_HEADER_NUM_OF_BATCHES` unique digests.  The consensus-pack reader
         // (`max_batches_per_output`) uses that same bound, so every output built here can
         // later be reconstructed from pack storage.
-        let mut fetched_batches = self.fetch_batches_from_peers(batch_set).await?;
+        let mut fetched_batches = self.fetch_batches_from_peers(batches_by_worker).await?;
 
         let mut batches = Vec::with_capacity(num_certs);
         // map all fetched batches to their respective certificates for applying block rewards
@@ -553,38 +560,79 @@ impl<DB: Database> Subscriber<DB> {
         ))
     }
 
+    /// Warn every [`FETCH_BATCHES_STALL_WARN_INTERVAL`] while a worker's fetch leg is
+    /// outstanding.
+    ///
+    /// Never resolves; the caller races it against the fetch itself, so it only ever adds
+    /// log lines and cannot cancel the fetch.
+    async fn stall_watchdog(worker_id: WorkerId) -> std::convert::Infallible {
+        futures::stream::unfold((), |()| async {
+            tokio::time::sleep(FETCH_BATCHES_STALL_WARN_INTERVAL).await;
+            Some(((), ()))
+        })
+        .for_each(|()| {
+            warn!(
+                target: "subscriber",
+                worker_id,
+                "batch fetch from worker still outstanding; waiting on local db or peers"
+            );
+            futures::future::ready(())
+        })
+        .await;
+        // the unfold stream above is infinite, so `for_each` never completes
+        futures::future::pending().await
+    }
+
     /// Send message to relevant workers to fetch batches for execution.
     ///
-    /// The worker is responsible for retrieving the batch from it's local DB or fetching from
-    /// peers.
+    /// One request per worker id, over that worker's local network instance; the worker is
+    /// responsible for retrieving the batch from its local DB or fetching from peers. The
+    /// legs run concurrently, each raced against a stall watchdog that warns every
+    /// [`FETCH_BATCHES_STALL_WARN_INTERVAL`] without cancelling, and any leg's real error
+    /// fails the whole fetch (an incomplete output can never execute).
     async fn fetch_batches_from_peers(
         &self,
-        batch_digests: BTreeSet<BlockHash>,
+        batches_by_worker: BTreeMap<WorkerId, BTreeSet<BlockHash>>,
     ) -> SubscriberResult<HashMap<BlockHash, Batch>> {
-        let mut fetched_blocks = HashMap::new();
+        let num_digests: usize = batches_by_worker.values().map(BTreeSet::len).sum();
+        debug!(target: "subscriber", "Attempting to fetch {num_digests} digests from workers");
 
-        debug!(target: "subscriber", "Attempting to fetch {} digests from workers", batch_digests.len());
-        let batches = match self.inner.client.fetch_batches(batch_digests).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!(target: "subscriber", "Failed to fetch batches from peers: {e:?}");
-                self.inner.metrics.batch_fetch_failures_total.increment(1);
-                return Err(SubscriberError::ClientRequestsFailed);
+        let legs = batches_by_worker.into_iter().map(|(worker_id, digests)| {
+            // Sub-dag payloads passed `Header::validate`'s worker-id bounds check, so a
+            // missing instance means the committee's worker set and this config disagree:
+            // a protocol-level failure, surfaced with the variant that exists for it.
+            let client = self.config.local_network(worker_id).cloned();
+            async move {
+                let client = client.ok_or(SubscriberError::UnexpectedWorkerId(worker_id))?;
+                let fetch = std::pin::pin!(client.fetch_batches(digests));
+                let watchdog = std::pin::pin!(Self::stall_watchdog(worker_id));
+                match futures::future::select(fetch, watchdog).await {
+                    futures::future::Either::Left((result, _)) => result.map_err(|e| {
+                        error!(target: "subscriber", worker_id, "Failed to fetch batches from peers: {e:?}");
+                        SubscriberError::ClientRequestsFailed
+                    }),
+                    futures::future::Either::Right((never, _)) => match never {},
+                }
             }
-        };
-
-        for (digest, block) in batches.into_iter() {
-            debug!(
-                target: "subscriber",
-                "Block {:?} took {:?} seconds since it was received to when it was fetched for execution",
-                digest,
-                block.received_at().map(|t| t.elapsed().as_secs_f64()),
-            );
-
-            fetched_blocks.insert(digest, block);
-        }
-
-        Ok(fetched_blocks)
+        });
+        futures::future::try_join_all(legs)
+            .await
+            .inspect_err(|_| self.inner.metrics.batch_fetch_failures_total.increment(1))
+            .map(|fetched| {
+                fetched
+                    .into_iter()
+                    .flatten()
+                    .map(|(digest, block)| {
+                        debug!(
+                            target: "subscriber",
+                            "Block {:?} took {:?} seconds since it was received to when it was fetched for execution",
+                            digest,
+                            block.received_at().map(|t| t.elapsed().as_secs_f64()),
+                        );
+                        (digest, block)
+                    })
+                    .collect()
+            })
     }
 }
 
@@ -855,5 +903,90 @@ mod tests {
             !matches!(consensus_chain.consensus_header_by_number(2).await, Ok(Some(_))),
             "output 2 (past the failed fetch) must not be persisted",
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_fanout_tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+    use tempfile::TempDir;
+    use tn_network_types::MockPrimaryToWorkerClient;
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils::CommitteeFixture;
+    use tokio::sync::mpsc;
+
+    /// One fetch leg per worker id, merged into one result; an id with no local network
+    /// instance is the protocol violation `UnexpectedWorkerId` (issue #556).
+    #[tokio::test]
+    async fn fetch_batches_from_peers_fans_out_per_worker() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let primary = fixture.authorities().next().unwrap();
+        let base = primary.consensus_config().clone();
+        // a two-worker committee sizes the per-worker local networks
+        let committee =
+            base.committee().with_num_workers(NonZeroUsize::new(2).expect("2 is not 0"));
+        let config = ConsensusConfig::new_with_committee_for_test(
+            base.config().clone(),
+            base.node_storage().clone(),
+            base.key_config().clone(),
+            committee,
+            base.network_config().clone(),
+        )
+        .expect("two-worker consensus config");
+
+        // each worker's instance serves a disjoint batch
+        let digest_0 = BlockHash::random();
+        let digest_1 = BlockHash::random();
+        let batch = Batch::default();
+        config
+            .local_network(0)
+            .expect("worker 0 local network")
+            .set_primary_to_worker_local_handler(Arc::new(MockPrimaryToWorkerClient {
+                batches: HashMap::from([(digest_0, batch.clone())]),
+            }))
+            .expect("register worker 0 mock");
+        config
+            .local_network(1)
+            .expect("worker 1 local network")
+            .set_primary_to_worker_local_handler(Arc::new(MockPrimaryToWorkerClient {
+                batches: HashMap::from([(digest_1, batch)]),
+            }))
+            .expect("register worker 1 mock");
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
+                .await
+                .expect("consensus chain");
+        let (tx, _rx) = mpsc::channel(5);
+        let consensus_bus = ConsensusBus::new();
+        let subscriber = Subscriber {
+            consensus_bus: consensus_bus.app().clone(),
+            config: config.clone(),
+            network_handle: PrimaryNetworkHandle::new_for_test(tx),
+            inner: Arc::new(Inner {
+                authority_id: config.authority_id(),
+                committee: config.committee().clone(),
+                consensus_chain,
+                epoch_boundary: u64::MAX,
+                metrics: ExecutorMetrics::default(),
+            }),
+        };
+
+        // both legs fetch concurrently and the results merge
+        let by_worker =
+            BTreeMap::from([(0, BTreeSet::from([digest_0])), (1, BTreeSet::from([digest_1]))]);
+        let fetched =
+            subscriber.fetch_batches_from_peers(by_worker).await.expect("both worker legs succeed");
+        assert!(fetched.contains_key(&digest_0), "worker 0's batch fetched");
+        assert!(fetched.contains_key(&digest_1), "worker 1's batch fetched");
+
+        // an id outside the committee's worker set is a protocol violation
+        let unknown = BTreeMap::from([(7, BTreeSet::from([digest_0]))]);
+        assert!(matches!(
+            subscriber.fetch_batches_from_peers(unknown).await,
+            Err(SubscriberError::UnexpectedWorkerId(7))
+        ));
     }
 }

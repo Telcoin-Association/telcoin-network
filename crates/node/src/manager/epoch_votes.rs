@@ -94,6 +94,10 @@ async fn manage_epoch_votes(
                 match result {
                     Ok(None) => break,  // Channel closed- we are done.
                     Ok(Some(vote)) => {
+                        if vote.public_key == me {
+                            // Record our vote if we see it for this epoch so we can revote if/when needed.
+                            my_vote = Some(vote);
+                        }
                         if vote.epoch != epoch_rec.epoch {
                             continue;
                         }
@@ -153,6 +157,12 @@ async fn manage_epoch_votes(
             target: "epoch-manager",
             "reached quorum on epoch close for {}/{epoch_hash}", epoch_rec.epoch
         );
+        // Republish our vote one final time.  This is not strictly needed but if we were the first
+        // validator to close the epoch and we got no timeouts the laggy validators may have
+        // missed our vote- give them one more chance.
+        if let Some(vote) = my_vote {
+            let _ = primary_network.publish_epoch_vote(vote).await;
+        }
         match BlsAggregateSignature::aggregate(&sigs[..], true) {
             Ok(aggregated_signature) => {
                 let signature: BlsSignature = aggregated_signature.to_signature();

@@ -39,6 +39,9 @@ tempfile = { workspace = true }
 [features]
 default = []
 test-utils = []
+# Adiri testnet: tn-config has no adiri-gated code of its own, but its genesis validation consults
+# tn-types' fork schedule, so the forward lets those tests run against the testnet schedule.
+adiri = ["tn-types/adiri"]
 
 [lints]
 workspace = true

@@ -3142,6 +3142,7 @@ dependencies = [
  "tn-config",
  "tn-node",
  "tn-reth",
+ "tn-storage",
  "tn-test-utils",
  "tn-types",
  "tokio",
@@ -11800,6 +11801,7 @@ dependencies = [
  "rustversion",
  "serde",
  "tn-types",
+ "tokio",
  "tracing",
 ]
 
@@ -11940,6 +11942,7 @@ dependencies = [
  "tn-types",
  "tn-worker",
  "tokio",
+ "tokio-stream",
  "tracing",
  "url",
 ]

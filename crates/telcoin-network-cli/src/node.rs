@@ -44,14 +44,15 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Configures the ports of the node to avoid conflicts with the defaults.
     /// This is useful for running multiple nodes on the same machine.
     ///
-    /// Max number of instances is 200. It is chosen in a way so that it's not possible to have
-    /// port numbers that conflict with each other.
+    /// Instance numbers run from 1 to 200. The max is chosen in a way so that it's not possible
+    /// to have port numbers that conflict with each other. 0 is rejected at parse time: the port
+    /// arithmetic below subtracts `instance - 1`, which underflows on 0.
     ///
     /// Changes to the following port numbers:
     /// - `HTTP_RPC_PORT`: default - `instance` + 1
     /// - `WS_RPC_PORT`: default + `instance` * 2 - 2
     /// - `IPC_PATH`: default + `-instance`
-    #[arg(long, value_name = "INSTANCE", global = true,  value_parser = value_parser!(u16).range(..=200))]
+    #[arg(long, value_name = "INSTANCE", global = true,  value_parser = value_parser!(u16).range(1..=200))]
     pub instance: Option<u16>,
 
     /// Is this an observer node?  True if set, an observer will never be in the committee
@@ -118,16 +119,21 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // Log the compiled fork schedule once per process start (#1086) so operators can diff it
         // across the fleet before a fork epoch arrives. Adiri builds carry epoch-gated forks;
-        // every other build has the seed-signature wire format (#1032) active from genesis.
+        // every other build has both the seed-signature (#1032) and multi-worker committee (#554)
+        // wire formats active from genesis.
         #[cfg(feature = "adiri")]
         info!(
             target: "cli",
             consensus_registry_fork_epoch = tn_types::forks::CONSENSUS_REGISTRY_FORK_EPOCH,
             seed_signature_fork_epoch = tn_types::forks::SEED_SIGNATURE_FORK_EPOCH,
+            multi_workers_fork_epoch = tn_types::forks::MULTI_WORKERS_FORK_EPOCH,
             "fork schedule (adiri)"
         );
         #[cfg(not(feature = "adiri"))]
-        info!(target: "cli", "fork schedule: seed_signature active from genesis");
+        info!(
+            target: "cli",
+            "fork schedule: seed_signature and multi_workers active from genesis"
+        );
 
         // Raise the fd limit of the process.
         // Does not do anything on windows.
@@ -275,7 +281,34 @@ fn genesis_block_hash(genesis: Genesis) -> B256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
     use tn_types::adiri_genesis;
+
+    /// Parse `--instance <raw>` through the node command and return the parsed value, or the
+    /// clap error kind that rejected it.
+    fn parse_instance(raw: &str) -> Result<Option<u16>, ErrorKind> {
+        NodeCommand::<NoArgs>::try_parse_from(["node", "--instance", raw])
+            .map(|cmd| cmd.instance)
+            .map_err(|err| err.kind())
+    }
+
+    /// `--instance 0` must fail at parse time. reth's `adjust_instance_ports` computes
+    /// `instance - 1` on `u16`, so 0 panics under overflow checks and wraps in release (instance
+    /// 0 then takes HTTP port 8546, instance 1's WebSocket port). The upper bound is reth's too.
+    #[test]
+    fn instance_rejects_zero_and_above_max_at_parse() {
+        let rejected = ["0", "201"].map(parse_instance);
+        assert_eq!(rejected, [Err(ErrorKind::ValueValidation), Err(ErrorKind::ValueValidation)]);
+    }
+
+    /// Both ends of the documented `1-200` range parse, and an absent flag stays `None`.
+    #[test]
+    fn instance_accepts_documented_bounds() {
+        let accepted = ["1", "200"].map(parse_instance);
+        assert_eq!(accepted, [Ok(Some(1)), Ok(Some(200))]);
+        let absent = NodeCommand::<NoArgs>::try_parse_from(["node"]).map(|cmd| cmd.instance);
+        assert!(matches!(absent, Ok(None)));
+    }
 
     /// A faucet build configured with the canonical mainnet genesis must refuse to start.
     #[test]

@@ -22,6 +22,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     task::Context,
+    time::{Duration, Instant},
 };
 use tn_config::PeerConfig;
 use tn_types::BlsPublicKey;
@@ -31,6 +32,27 @@ use tracing::{debug, error, trace, warn};
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
+
+/// Sliding window over which inbound kad `PutRecord` messages are counted per source.
+const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum inbound kad `PutRecord` messages accepted from a single source per
+/// [`PUT_RECORD_RATE_WINDOW`] before the source is rate limited.
+///
+/// Honest inbound sits far below this. A source refreshes its own record on the kad
+/// republication cadence (`kad_publication_interval`, 12h by default) and the libp2p
+/// replication interval (~1h), so even a post-restart burst is a small handful of records
+/// per minute. A source sustaining more than this in a rolling minute is not explainable by
+/// that cadence and is treated as a flood (GHSA-f6rq-62rr-4h9g).
+const MAX_PUT_RECORDS_PER_WINDOW: usize = 30;
+
+/// Per-source inbound kad `PutRecord` rate window.
+struct PutRecordWindow {
+    /// Records counted from the source in the current window.
+    count: usize,
+    /// When the current window started.
+    started: Instant,
+}
 
 /// The type to manage peers.
 pub(crate) struct PeerManager {
@@ -111,6 +133,14 @@ pub(crate) struct PeerManager {
     /// These peers are not connected and reserved for dial attempts at heartbeat intervals if
     /// connections drop.
     discovery_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    /// Per-source inbound kad `PutRecord` rate windows.
+    ///
+    /// Bounds the expensive BLS verify plus kad store write in `process_kad_put_request` to
+    /// [`MAX_PUT_RECORDS_PER_WINDOW`] per [`PUT_RECORD_RATE_WINDOW`] per source, independent of
+    /// ban state, so a valid but unbanned self-signed record flood cannot starve the network
+    /// task that also relays consensus gossip (GHSA-f6rq-62rr-4h9g). Entries are evicted per
+    /// source in [`Self::register_disconnected`].
+    put_record_windows: HashMap<PeerId, PutRecordWindow>,
     /// Prometheus metrics for peer lifecycle events.
     pub(super) metrics: PeerManagerMetrics,
 }
@@ -149,6 +179,7 @@ impl PeerManager {
             dial_requests: Default::default(),
             temporarily_banned,
             discovery_peers: Default::default(),
+            put_record_windows: Default::default(),
             metrics,
         }
     }
@@ -575,6 +606,9 @@ impl PeerManager {
     /// peers doesn't grow infinitely large. Peers may become "unbanned" if the limit for banned
     /// peers is reached.
     pub(super) fn register_disconnected(&mut self, peer_id: &PeerId) {
+        // drop the peer's inbound put-record rate window; a fresh connection starts clean
+        self.put_record_windows.remove(peer_id);
+
         let (action, pruned_peers) = self.peers.register_disconnected(peer_id);
 
         debug!(target: "peer-manager", ?action, ?pruned_peers, ?peer_id, "register disconnected");
@@ -872,6 +906,34 @@ impl PeerManager {
             return;
         }
         self.cache_known_peer(bls_key, info);
+    }
+
+    /// Record an inbound kad `PutRecord` from `source` and report whether it exceeds the
+    /// per-source rate.
+    ///
+    /// Counts one message per call in a [`PUT_RECORD_RATE_WINDOW`] sliding window and reports
+    /// `true` once a source passes [`MAX_PUT_RECORDS_PER_WINDOW`] within the current window, so the
+    /// caller can drop the record before the expensive signature verify and store write. The local
+    /// node's own id is never limited. Mirrors the inbound-stream rate limiter in the stream
+    /// behaviour.
+    pub(crate) fn put_record_rate_limited(&mut self, source: PeerId) -> bool {
+        if self.is_local_peer(&source) {
+            false
+        } else {
+            let now = Instant::now();
+            let window = self
+                .put_record_windows
+                .entry(source)
+                .or_insert(PutRecordWindow { count: 0, started: now });
+            let window_expired = now.duration_since(window.started) >= PUT_RECORD_RATE_WINDOW;
+            if window_expired {
+                window.count = 1;
+                window.started = now;
+            } else {
+                window.count += 1;
+            }
+            window.count > MAX_PUT_RECORDS_PER_WINDOW
+        }
     }
 
     /// Admit a peer record pushed to us over the peer's own authenticated connection (a kad PUT

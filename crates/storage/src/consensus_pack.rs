@@ -745,8 +745,38 @@ impl Inner {
         Ok(consensus_pos_idx)
     }
 
+    /// True when the data file ends inside its own first record and no consensus output is
+    /// indexed, i.e. the pack carries a torn [`EpochMeta`] with nothing reachable behind it.
+    ///
+    /// Two independent witnesses, because neither is sufficient alone:
+    ///
+    /// * [`Pack::record_size`] validates the size prefix and the record crc without decompressing,
+    ///   so `UnexpectedEof` there means the first record is not fully on disk. That is distinct
+    ///   from a complete record failing its crc or its decode, and because the data file is a
+    ///   sequential append-only log, a file that stops inside record zero cannot hold a record
+    ///   after it.
+    /// * The size prefix has no checksum of its own, so a flipped bit could inflate the record's
+    ///   extent past EOF and mimic a tear on a pack that really does hold data.  The position index
+    ///   settles it: every consensus read resolves through it, so an empty one means no output was
+    ///   ever committed here.
+    fn first_record_is_dataless_tear(
+        data: &mut Pack<PackRecord>,
+        consensus_pos_idx: &PositionIndex<IndexPositions>,
+    ) -> bool {
+        let ends_inside_first_record = matches!(
+            data.record_size(DATA_HEADER_BYTES as u64),
+            Err(FetchError::IO(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        );
+        ends_inside_first_record && consensus_pos_idx.is_empty()
+    }
+
     /// Opens a new epoch pack for append.  Will create a new set of epoch static
     /// files to write consensus output into if they do not exist.
+    ///
+    /// A data file holding record bytes must begin with a readable [`EpochMeta`] matching this
+    /// epoch.  An unreadable first record fails the open rather than appending a second meta,
+    /// except for the one window that is provably dataless -- a tear inside the meta itself with
+    /// nothing indexed behind it -- which truncates back to the header and rewrites the meta.
     fn open_append<P: AsRef<Path>>(
         path: P,
         previous_epoch: &EpochRecord,
@@ -770,19 +800,75 @@ impl Inner {
             genesis_consensus: previous_epoch.final_consensus,
         };
 
-        if let Ok(meta) = data.fetch(DATA_HEADER_BYTES as u64) {
-            let meta = meta.into_epoch()?;
-            if epoch_meta != meta {
-                return Err(PackError::InvalidEpoch(
-                    epoch,
-                    format!("open append has unexpected meta data, expected {epoch_meta:?} got {meta:?}"),
-                ));
+        // Opened ahead of the meta check: the torn-record heal below needs the position index as
+        // an independent witness of whether any consensus output was ever committed here.
+        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
+
+        // Set on every branch that writes a fresh meta at the data header.  Either way the pack
+        // is byte-for-byte a freshly created one, so it needs the same index initialization.
+        let mut wrote_fresh_meta = false;
+
+        // Discriminate a missing meta by length, not by fetch error kind: fetch reports a read
+        // at EOF as an io error, the same class as a torn or corrupt record, so record bytes
+        // past the header mean the first record must load as a matching meta.
+        let pack_len = data.file_len();
+        if pack_len > DATA_HEADER_BYTES as u64 {
+            match data.fetch(DATA_HEADER_BYTES as u64) {
+                Ok(record) => {
+                    let meta = record.into_epoch()?;
+                    if epoch_meta != meta {
+                        return Err(PackError::InvalidEpoch(
+                            epoch,
+                            format!("open append has unexpected meta data, expected {epoch_meta:?} got {meta:?}"),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    // A complete-but-corrupt first record keeps failing the open: trunc_and_heal
+                    // only repairs the tail, and records behind the meta stay addressable through
+                    // the indexes, so discarding them here would be silent data loss.  Only the
+                    // provably dataless tear self-heals, matching the header-only branch below.
+                    if !Self::first_record_is_dataless_tear(&mut data, &consensus_pos_idx) {
+                        return Err(PackError::EpochLoad(format!(
+                            "epoch {epoch} pack {} ({pack_len} bytes): first record (the epoch \
+                             meta) is unreadable: {e}. The pack cannot be opened by any path. \
+                             Inspect it with `telcoin-network db validate {}`; if it holds no \
+                             output worth recovering, stop the node and remove that one \
+                             `epoch-{epoch}` directory so the epoch is rebuilt on restart. Do NOT \
+                             delete the chain-data directories (`db`, `static_files`, \
+                             `consensus-db`)",
+                            pack_file.display(),
+                            base_dir.display(),
+                        )));
+                    }
+                    // The old meta is unreadable, so it cannot be compared against: the
+                    // rewritten one is whatever this caller supplied.  Log the committee it is
+                    // being rebuilt from so a drifted epoch-start snapshot is traceable.
+                    tracing::warn!(
+                        target: "consensus_pack",
+                        epoch,
+                        path = ?pack_file,
+                        len = pack_len,
+                        committee_size = epoch_meta.committee.size(),
+                        start_consensus_number,
+                        "first pack record (the epoch meta) is torn and nothing is indexed \
+                         behind it; truncating to the data header and rewriting the meta from \
+                         the caller's previous_epoch + committee"
+                    );
+                    data.truncate(DATA_HEADER_BYTES as u64)
+                        .map_err(|e| PackError::IO(Arc::new(e)))?;
+                    data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
+                        .map_err(|e| PackError::Append(e.to_string()))?;
+                    wrote_fresh_meta = true;
+                }
             }
         } else {
+            // Header-only file: brand new, or a crash landed between the header write and the
+            // meta append.  Either way appending the meta initializes the pack.
             data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
                 .map_err(|e| PackError::Append(e.to_string()))?;
+            wrote_fresh_meta = true;
         }
-        let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
         let mut consensus_digests = HdxIndex::open_hdx_file(
             base_dir.join(Self::CONSENSUS_HASH_NAME),
@@ -799,8 +885,12 @@ impl Inner {
             false,
         )
         .map_err(OpenError::IndexFileOpen)?;
-        if !have_pack {
-            // If this is a new DB then update the file lengths in indexes after create.
+        if !have_pack || wrote_fresh_meta {
+            // If this is a new DB then update the file lengths in indexes after create.  A pack
+            // whose meta was just rewritten at the data header counts as new: the indexes still
+            // carry the length from before the damage, and leaving that stale would make
+            // trunc_and_heal cut the meta we just wrote back down to it whenever the rewritten
+            // meta is the longer one -- returning a live pack with a torn first record.
             let len = data.file_len();
             consensus_digests.set_data_file_length(len);
             batch_digests.set_data_file_length(len);
@@ -818,17 +908,25 @@ impl Inner {
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
     fn open_append_exists<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
+        let pack_file = base_dir.join(Self::DATA_NAME);
 
         let mut data = Pack::<PackRecord>::open(
-            base_dir.join(Self::DATA_NAME),
+            &pack_file,
             epoch as u64,
             false,
             PackCompression::ZStd,
             PACK_VERSION,
         )?;
+        // No remediation hint here: unlike open_append this door does not create the epoch
+        // directory, so removing it would leave the node unable to start at all.
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
-            .map_err(|e| PackError::EpochLoad(e.to_string()))?
+            .map_err(|e| {
+                PackError::EpochLoad(format!(
+                    "epoch {epoch} pack {}: first record (the epoch meta) is unreadable: {e}",
+                    pack_file.display(),
+                ))
+            })?
             .into_epoch()?;
         let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
@@ -861,9 +959,10 @@ impl Inner {
     /// Open up the static files for previous epoch.  These will be read only.
     fn open_static<P: AsRef<Path>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
+        let pack_file = base_dir.join(Self::DATA_NAME);
 
         let mut data = Pack::<PackRecord>::open(
-            base_dir.join(Self::DATA_NAME),
+            &pack_file,
             epoch as u64,
             true,
             PackCompression::ZStd,
@@ -871,7 +970,12 @@ impl Inner {
         )?;
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
-            .map_err(|e| PackError::EpochLoad(e.to_string()))?
+            .map_err(|e| {
+                PackError::EpochLoad(format!(
+                    "epoch {epoch} pack {}: first record (the epoch meta) is unreadable: {e}",
+                    pack_file.display(),
+                ))
+            })?
             .into_epoch()?;
         let mut consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), true)?;
         let builder = BuildHasherDefault::<FxHasher>::default();
@@ -1389,6 +1493,20 @@ fn collect_batches(consensus: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
 /// Extracted from [`Inner::stream_import`] as a free function (it is stateless) so the offline pack
 /// validator ([`crate::pack_validate`]) can reuse the exact same epoch-linkage checks without
 /// duplicating them.
+///
+/// Beyond the linkage this also pins the record's two internal identities to each other: the
+/// embedded [`Committee`]'s own epoch must equal the record's `epoch`. The committee's epoch is
+/// what SELECTED its bcs layout on the way in —
+/// [`multi_workers_fork_active`](tn_types::forks::multi_workers_fork_active) reads the epoch
+/// carried inside the value being decoded, not the record's — so a record whose committee claims a
+/// different epoch was parsed under a layout the record's own epoch does not select, and no later
+/// reader can tell. Both halves are then used as if they agreed: `epoch_meta.epoch` decides which
+/// outputs [`Inner::save_consensus_output`] accepts, while `epoch_meta.committee` is the validator
+/// set every output in the pack is decoded and verified against, and
+/// [`ConsensusPack::stream_import`] reports `epoch()` from the request while `committee()` comes
+/// from this record. A local write cannot break the equality — [`Inner::open_append`] derives the
+/// record's epoch FROM the committee — so a divergence only ever arrives over the wire (peer epoch
+/// sync) or from an imported bundle, which is precisely what this function screens.
 pub(crate) fn verify_epoch_meta(
     epoch: Epoch,
     previous_epoch: &EpochRecord,
@@ -1398,6 +1516,16 @@ pub(crate) fn verify_epoch_meta(
         return Err(PackError::InvalidEpoch(
             epoch,
             format!("meta data epoch is {}", epoch_meta.epoch),
+        ));
+    }
+    if epoch_meta.committee.epoch() != epoch_meta.epoch {
+        return Err(PackError::InvalidEpoch(
+            epoch,
+            format!(
+                "meta data epoch is {} but its committee is for epoch {}",
+                epoch_meta.epoch,
+                epoch_meta.committee.epoch()
+            ),
         ));
     }
     let start_consensus_number =
@@ -2063,6 +2191,7 @@ pub(crate) mod test {
         collections::VecDeque,
         fs::{File, OpenOptions},
         io::{Seek as _, SeekFrom},
+        num::NonZeroUsize,
         sync::Arc,
         time::Duration,
     };
@@ -2077,8 +2206,8 @@ pub(crate) mod test {
     };
 
     use crate::{
-        archive::pack::PackCompression,
-        consensus_pack::{max_batches_per_output, ConsensusPack, Inner, PACK_VERSION},
+        archive::pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+        consensus_pack::{max_batches_per_output, ConsensusPack, Inner, PackRecord, PACK_VERSION},
         mem_db::MemDatabase,
     };
 
@@ -3246,6 +3375,384 @@ pub(crate) mod test {
         assert!(pack.get_consensus_output(4).await.is_ok());
     }
 
+    /// A pack whose first record (the epoch meta) is corrupt must fail `open_append` with
+    /// `EpochLoad` instead of treating the unreadable record as absent and appending a second
+    /// meta after it.  The flipped byte leaves a *complete* record on disk, so the tear heal
+    /// does not apply: the file continues past the meta and those records stay addressable.
+    #[tokio::test]
+    async fn test_open_append_rejects_corrupt_first_record() {
+        let temp_dir = TempDir::with_prefix("test_cp_corrupt_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
+            let mut parent = ConsensusHeader::default().digest();
+            for i in 0..3 {
+                let output =
+                    make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+                parent = output.digest();
+                pack.save_consensus_output(output).await.unwrap();
+            }
+            pack.persist().await.expect("persist");
+        }
+
+        // Flip one byte inside the meta record's value; the record crc covers it, so the
+        // meta fetch itself fails rather than decoding to different values.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut bytes = std::fs::read(&data_path).expect("read data");
+        bytes[DATA_HEADER_BYTES + 6] ^= 0xff;
+        std::fs::write(&data_path, &bytes).expect("write data");
+        let len_before = bytes.len() as u64;
+
+        let result = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone());
+        assert!(
+            matches!(result, Err(super::PackError::EpochLoad(_))),
+            "expected EpochLoad, got {result:?}"
+        );
+        let len_after = std::fs::metadata(&data_path).expect("metadata").len();
+        assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// A pack whose first record is torn (a crash mid meta append left only part of the size
+    /// prefix) with nothing indexed behind it is the one recoverable window: `open_append`
+    /// truncates back to the data header and rewrites the meta, exactly as the header-only
+    /// branch does one instant earlier.  Nothing reachable is lost -- the meta is rebuilt from
+    /// `previous_epoch` + `committee`.
+    #[tokio::test]
+    async fn test_open_append_heals_dataless_torn_first_record() {
+        let temp_dir = TempDir::with_prefix("test_cp_torn_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        let clean_len = {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
+            pack.persist().await.expect("persist");
+            let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+            std::fs::metadata(&data_path).expect("metadata").len()
+        };
+
+        // Tear the meta record mid size-prefix: record bytes exist past the header, but the
+        // first record cannot be read and no output was ever committed behind it.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let torn_len = DATA_HEADER_BYTES as u64 + 2;
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.set_len(torn_len).expect("truncate");
+        }
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("torn meta with no data behind it must heal");
+            // The healed pack is writable: the rewritten meta put it back in service.
+            let parent = ConsensusHeader::default().digest();
+            let output = make_test_output(&committee, 0, chain.clone(), 1, parent);
+            pack.save_consensus_output(output).await.unwrap();
+            pack.persist().await.expect("persist after heal");
+        }
+
+        // The torn bytes were dropped rather than appended after, so the meta sits at the data
+        // header again and the pack grew past its clean meta-only length by the saved output.
+        let healed_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(
+            healed_len > clean_len,
+            "healed pack ({healed_len}) must hold the meta plus the new output (clean meta-only \
+             was {clean_len})"
+        );
+
+        // Both read-only doors agree the recovered pack is sound.
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static after heal");
+        let output = pack.get_consensus_output(1).await.expect("read output through static open");
+        assert_eq!(output.number(), 1, "static read must return the output saved after the heal");
+    }
+
+    /// The heal above must stay narrow.  A first record whose size prefix has been corrupted to
+    /// run past EOF looks torn, but the position index still holds committed outputs behind it,
+    /// so `open_append` must fail closed rather than truncate real consensus data away.
+    #[tokio::test]
+    async fn test_open_append_rejects_torn_first_record_with_indexed_outputs() {
+        let temp_dir = TempDir::with_prefix("test_cp_torn_with_data").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
+            let mut parent = ConsensusHeader::default().digest();
+            for i in 0..3 {
+                let output =
+                    make_test_output(&committee, i % 4, chain.clone(), (i as u64) + 1, parent);
+                parent = output.digest();
+                pack.save_consensus_output(output).await.unwrap();
+            }
+            pack.persist().await.expect("persist");
+        }
+
+        // Inflate the meta record's size prefix so its declared extent runs past EOF: the record
+        // reads as torn even though three outputs sit behind it, fully addressable through the
+        // position index.  The value stays under MAX_RECORD_SIZE so the read reaches EOF rather
+        // than tripping the size guard.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut bytes = std::fs::read(&data_path).expect("read data");
+        let len_before = bytes.len() as u64;
+        let inflated = len_before as u32;
+        bytes[DATA_HEADER_BYTES..DATA_HEADER_BYTES + 4].copy_from_slice(&inflated.to_le_bytes());
+        std::fs::write(&data_path, &bytes).expect("write data");
+
+        let result = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone());
+        assert!(
+            matches!(result, Err(super::PackError::EpochLoad(_))),
+            "expected EpochLoad, got {result:?}"
+        );
+        let len_after = std::fs::metadata(&data_path).expect("metadata").len();
+        assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// The heal rebuilds the pack from its data header, so the digest indexes must be
+    /// reinitialized with it.  Left carrying the length from before the tear, `trunc_and_heal`
+    /// would cut the meta just written back down to that stale length whenever the rewritten
+    /// meta is the longer one, leaving the pack torn again and re-healing on every restart.
+    #[tokio::test]
+    async fn test_heal_reinitializes_index_lengths_for_a_longer_meta() {
+        let temp_dir = TempDir::with_prefix("test_cp_heal_longer_meta").expect("temp dir");
+        let small = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(4).expect("nonzero"))
+            .build();
+        let small_committee = small.committee();
+        let prev_small = test_previous_epoch(&small_committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                prev_small.clone(),
+                small_committee.clone(),
+            )
+            .expect("open pack");
+            pack.persist().await.expect("persist");
+        }
+
+        // Tear the meta, leaving the digest indexes synced to the pre-tear length.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let small_len = std::fs::metadata(&data_path).expect("metadata").len();
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.set_len(DATA_HEADER_BYTES as u64 + 2).expect("truncate");
+        }
+
+        // Reopen with a larger committee so the rewritten meta is longer than the stale length.
+        let big = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(10).expect("nonzero"))
+            .build();
+        let big_committee = big.committee();
+        let prev_big = test_previous_epoch(&big_committee);
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                prev_big.clone(),
+                big_committee.clone(),
+            )
+            .expect("heal with a longer meta");
+            pack.persist().await.expect("persist after heal");
+        }
+
+        // The healed pack must hold the whole new meta, not a copy truncated to the old length.
+        let healed_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(
+            healed_len > small_len,
+            "healed pack ({healed_len}) was cut back to the stale index length ({small_len})"
+        );
+
+        // open_static both runs files_consistent and re-reads the meta, so it is the gate that
+        // catches a meta left torn by a stale-length truncate.
+        ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("healed pack must open read-only with a readable meta");
+    }
+
+    /// Same stale-index hazard as above, but landing in the header-only branch: the data file
+    /// is rolled back to exactly `DATA_HEADER_BYTES` while the digest indexes keep their larger
+    /// pre-damage length.  That branch writes a fresh meta too, so it needs the same index
+    /// reinitialization -- without it `trunc_and_heal` cuts the new meta down to the stale
+    /// length and hands back a live pack whose first record is torn.
+    #[tokio::test]
+    async fn test_header_only_reinitializes_index_lengths_for_a_longer_meta() {
+        let temp_dir = TempDir::with_prefix("test_cp_header_only_longer").expect("temp dir");
+        let small = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(4).expect("nonzero"))
+            .build();
+        let small_committee = small.committee();
+        let prev_small = test_previous_epoch(&small_committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                prev_small.clone(),
+                small_committee.clone(),
+            )
+            .expect("open pack");
+            pack.persist().await.expect("persist");
+        }
+
+        // Roll the data file back to exactly the header, leaving the digest indexes synced to
+        // the pre-damage length.  This lands in the header-only branch, not the tear heal.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let small_len = std::fs::metadata(&data_path).expect("metadata").len();
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.set_len(DATA_HEADER_BYTES as u64).expect("truncate");
+        }
+
+        let big = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(10).expect("nonzero"))
+            .build();
+        let big_committee = big.committee();
+        let prev_big = test_previous_epoch(&big_committee);
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                prev_big.clone(),
+                big_committee.clone(),
+            )
+            .expect("header-only reopen with a longer meta");
+            pack.persist().await.expect("persist after reopen");
+        }
+
+        let healed_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(
+            healed_len > small_len,
+            "rewritten meta ({healed_len}) was cut back to the stale index length ({small_len})"
+        );
+        ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("pack must open read-only with a readable meta");
+    }
+
+    /// The other half of the narrowing: an empty position index alone is not licence to
+    /// truncate.  This meta record is whole on disk and merely fails its crc, which is
+    /// corruption at rest rather than an interrupted append, so `open_append` must fail closed
+    /// even though nothing is indexed behind it.
+    #[tokio::test]
+    async fn test_open_append_rejects_corrupt_first_record_without_outputs() {
+        let temp_dir = TempDir::with_prefix("test_cp_corrupt_no_data").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open pack");
+            pack.persist().await.expect("persist");
+        }
+
+        // Flip a byte inside the meta value.  The record is complete -- size prefix and crc
+        // suffix are both present -- so this reads as corruption, not as a tear.
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut bytes = std::fs::read(&data_path).expect("read data");
+        bytes[DATA_HEADER_BYTES + 6] ^= 0xff;
+        std::fs::write(&data_path, &bytes).expect("write data");
+        let len_before = bytes.len() as u64;
+
+        let result = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone());
+        assert!(
+            matches!(result, Err(super::PackError::EpochLoad(_))),
+            "expected EpochLoad, got {result:?}"
+        );
+        let len_after = std::fs::metadata(&data_path).expect("metadata").len();
+        assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// The crash window "data header written, meta never appended" must stay recoverable:
+    /// `open_append` on a header-only data file appends the meta and the pack works from
+    /// then on.
+    #[tokio::test]
+    async fn test_open_append_appends_meta_to_header_only_file() {
+        let temp_dir = TempDir::with_prefix("test_cp_header_only").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // Write only the data header, the state a crash right after pack creation leaves.
+        let base_dir = temp_dir.path().join("epoch-0");
+        std::fs::create_dir_all(&base_dir).expect("create epoch dir");
+        let data_path = base_dir.join(Inner::DATA_NAME);
+        {
+            let mut raw: Pack<PackRecord> =
+                Pack::open(&data_path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("raw pack");
+            raw.commit().expect("commit header");
+        }
+        assert_eq!(
+            std::fs::metadata(&data_path).expect("metadata").len(),
+            DATA_HEADER_BYTES as u64,
+            "setup must produce a header-only data file"
+        );
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("open append on header-only file");
+            let parent = ConsensusHeader::default().digest();
+            let output = make_test_output(&committee, 0, chain.clone(), 1, parent);
+            pack.save_consensus_output(output).await.unwrap();
+            pack.persist().await.expect("persist");
+        }
+        assert!(
+            std::fs::metadata(&data_path).expect("metadata").len() > DATA_HEADER_BYTES as u64,
+            "meta must have been appended"
+        );
+
+        // Reopening finds the appended meta and compares clean: recovering the crash window
+        // is idempotent.
+        {
+            let pack =
+                ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+                    .expect("reopen append");
+            assert!(pack.get_consensus_output(1).await.is_ok());
+            pack.persist().await.expect("persist after reopen");
+        }
+
+        // The append reopen heals through `trunc_and_heal`; `open_static` is the door that runs
+        // `files_consistent`, so a read-only reopen pins the recovered pack for read-only
+        // consumers too.
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("open static after header-only recovery");
+        let output = pack
+            .get_consensus_output(1)
+            .await
+            .expect("recovered output reads back through the static path");
+        assert_eq!(output.number(), 1, "static read must return the recovered output");
+    }
+
     /// `verify_epoch_meta` committee linkage across the shapes a mid-epoch on-chain ejection
     /// (governance `burn` / slash-to-zero) produces. The committee check is set-based
     /// (`BTreeSet`), so the stored order of `next_committee` must not matter — only shrinking
@@ -3327,6 +3834,133 @@ pub(crate) mod test {
         let err = verify_epoch_meta(2, &rec1, &meta_for(2, &committee5_next, &rec1))
             .expect_err("shrunken vs full must fail");
         assert!(matches!(err, PackError::InvalidEpoch(2, _)), "got {err:?}");
+    }
+
+    /// `verify_epoch_meta` pins the [`EpochMeta`]'s embedded committee to the record's own epoch.
+    ///
+    /// The committee's epoch is what selects its bcs layout, so a meta whose outer epoch and
+    /// committee epoch disagree carries a committee decoded under a layout that record does not
+    /// select — while `epoch_meta.epoch` and `epoch_meta.committee` are used downstream as if they
+    /// agreed. Every other check here is satisfied (identical key set, matching start number and
+    /// genesis links), so only the committee-epoch check can reject these metas, and the error text
+    /// is asserted to prove it is the arm that fired.
+    #[test]
+    fn test_verify_epoch_meta_rejects_committee_epoch_mismatch() {
+        use std::collections::BTreeMap;
+
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::{Address, Authority, BlsKeypair, BlsPublicKey};
+
+        use crate::consensus_pack::{verify_epoch_meta, EpochMeta, PackError};
+
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let keys: Vec<BlsPublicKey> =
+            (0..3).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+        let authorities = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (*k, Authority::new_for_test(*k, Address::repeat_byte(i as u8 + 1))))
+            .collect::<BTreeMap<_, _>>();
+        let committee = Committee::new_for_test(authorities, 1, BTreeMap::default());
+
+        let previous = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            final_consensus: ConsensusNumHash::new(77, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        let meta_with = |committee: Committee| EpochMeta {
+            epoch: 1,
+            committee,
+            start_consensus_number: previous.final_consensus.number + 1,
+            genesis_exec_state: previous.final_state,
+            genesis_consensus: previous.final_consensus,
+        };
+
+        // A committee carrying the record's own epoch verifies.
+        verify_epoch_meta(1, &previous, &meta_with(committee.clone()))
+            .expect("a committee at the record's epoch must verify");
+
+        // A committee from either side of the record's epoch does not, even though its key set is
+        // the one the previous record hands off to.
+        for committee_epoch in [0, 2] {
+            let meta = meta_with(committee.advance_epoch_for_test(committee_epoch));
+            let Err(err) = verify_epoch_meta(1, &previous, &meta) else {
+                panic!("committee epoch {committee_epoch} must not verify in an epoch-1 record")
+            };
+            assert!(
+                matches!(err, PackError::InvalidEpoch(1, _)),
+                "committee epoch {committee_epoch}: got {err:?}"
+            );
+            assert!(
+                err.to_string().contains(&format!("committee is for epoch {committee_epoch}")),
+                "committee epoch {committee_epoch}: a different check rejected this meta: {err}"
+            );
+        }
+    }
+
+    /// PEER PATH: `stream_import` rejects a record stream whose [`EpochMeta`] carries a committee
+    /// for a different epoch, and rejects it before appending anything.
+    ///
+    /// This is the door the check exists for: a local write cannot produce such a meta, since
+    /// `Inner::open_append` derives the record's epoch from the committee it is handed. Only a
+    /// hostile or buggy peer (or an imported bundle) can, and the committee it ships is the
+    /// validator set every output in the pack would then be verified against.
+    #[tokio::test]
+    async fn test_stream_import_rejects_committee_epoch_mismatch() {
+        use crate::{
+            archive::pack::Pack,
+            consensus_pack::{EpochMeta, PackError, PackRecord},
+        };
+
+        let temp_dir = TempDir::with_prefix("test_cp_meta_committee_epoch").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+
+        // The container and every linkage field are well formed for epoch 0; only the embedded
+        // committee claims epoch 1.
+        let source = temp_dir.path().join("peer_stream");
+        {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&source, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open peer stream");
+            pack.append(&PackRecord::EpochMeta(EpochMeta {
+                epoch: 0,
+                committee: committee.advance_epoch_for_test(1),
+                start_consensus_number: 1,
+                genesis_exec_state: previous_epoch.final_state,
+                genesis_consensus: previous_epoch.final_consensus,
+            }))
+            .expect("append hostile meta");
+            pack.commit().expect("commit peer stream");
+        }
+
+        let target = TempDir::with_prefix("test_cp_meta_committee_epoch_out").expect("temp dir");
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let err = ConsensusPack::stream_import(
+            target.path(),
+            stream,
+            0,
+            &previous_epoch,
+            1,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a meta whose committee is for another epoch must not import");
+        assert!(matches!(err, PackError::InvalidEpoch(0, _)), "got {err:?}");
+        assert!(
+            err.to_string().contains("committee is for epoch 1"),
+            "a different check rejected the import: {err}"
+        );
+
+        // Rejected before the append: the epoch has no readable meta record, so no reader can pick
+        // the hostile committee up.
+        assert!(
+            ConsensusPack::open_append_exists(target.path(), 0).is_err(),
+            "the rejected meta was appended anyway"
+        );
     }
 
     /// Deterministic BLS seed signature for fork-active fixture headers: the keypair comes
@@ -3426,6 +4060,664 @@ pub(crate) mod test {
         assert_eq!(
             expected_gate, decoded_gate,
             "per-element gate visibility must survive the round trip"
+        );
+    }
+
+    /// Epoch of the frozen pre-fork pack: 406.
+    ///
+    /// One epoch below `CONSENSUS_REGISTRY_FORK_EPOCH` (407), the documented arming floor of the
+    /// multi-workers fork (#554), and the same epoch `tn_types`' `LEGACY_FIXTURE_EPOCH`
+    /// pins — so the frozen committee vector there and the frozen pack file here describe one wire
+    /// moment from opposite ends of the stack.
+    ///
+    /// One below the floor rather than the floor itself, because the fork may legally be armed AT
+    /// 407: the gate is `>=`, so 407 would become post-fork and the anti-vacuity assert in
+    /// `test_golden_legacy_pack_regenerates` would fail. 406 is structurally pre-fork under every
+    /// legal arming, so the embedded [`Committee`] encodes in the legacy single-worker layout
+    /// whichever epoch the arming PR picks. It is still at or above `SEED_SIGNATURE_FORK_EPOCH`
+    /// (383), so the nested headers carry `seed_signature`: exactly the shape of an epoch pack
+    /// sitting on an adiri node's disk today.
+    const LEGACY_PACK_EPOCH: Epoch = 406;
+
+    /// Final consensus number of the epoch before [`LEGACY_PACK_EPOCH`].
+    ///
+    /// Nonzero on purpose: it keeps the fixture on the `previous_epoch.final_consensus.number + 1`
+    /// branch of `Inner::open_append` rather than the epoch-0 special case, so the frozen
+    /// `start_consensus_number` is a value the linkage checks can actually disagree with.
+    const LEGACY_PACK_PREV_CONSENSUS: u64 = 9_100;
+
+    /// First consensus number in the frozen pack.
+    ///
+    /// Only the `adiri` lane ever reads it: on a post-fork build the frozen bytes never decode far
+    /// enough to have a consensus range at all.
+    #[cfg(feature = "adiri")]
+    const LEGACY_PACK_FIRST_CONSENSUS: u64 = LEGACY_PACK_PREV_CONSENSUS + 1;
+
+    /// Last consensus number in the frozen pack, which holds two outputs.
+    const LEGACY_PACK_LAST_CONSENSUS: u64 = LEGACY_PACK_PREV_CONSENSUS + 2;
+
+    /// FROZEN pre-fork epoch pack: the complete, sealed `epoch-406/data` file (978 bytes) a build
+    /// of this crate writes at [`LEGACY_PACK_EPOCH`] on the `adiri` lane — data header, then an
+    /// `EpochMeta` record whose [`Committee`] is in the legacy single-worker layout, then two
+    /// consensus outputs (header record followed by its batch record, the v1 ordering).
+    ///
+    /// This is the layout of every consensus pack already on adiri disk: `Committee` is embedded in
+    /// `EpochMeta`, the FIRST record of every pack, and bcs is not self-describing. Before the
+    /// epoch-gated encoder landed, every adiri node restarting against an existing consensus-db
+    /// failed to decode this record and exited 1, and epoch-pack peer sync broke across versions.
+    /// The tests below open these exact bytes through every read door in the crate.
+    ///
+    /// If a test here fails, work out WHICH pin moved before touching this constant:
+    ///
+    /// - [`LEGACY_PACK_EPOCH`] moving is the one legitimate reason to re-freeze these bytes: the
+    ///   epoch is a field of the `EpochMeta`, of every nested header and of every batch, so its
+    ///   bytes move with it. Regenerate from `test_golden_legacy_pack_regenerates`, never by hand.
+    /// - `tn_types`' `golden_legacy_committee_wire_bytes_pinned` also failing means the committee
+    ///   wire layout moved. That is a compatibility break to fix in the encoder, NOT a constant to
+    ///   refresh — refreshing it strands every pack already written.
+    /// - that pin still passing means the container moved, not the payload: the record framing, the
+    ///   crc, the zstd encoder, or the fixture. `test_golden_legacy_pack_regenerates` cross-checks
+    ///   the committee bytes inside the frozen container for exactly this reason, so a green
+    ///   committee assertion next to a red byte-identity assertion is the "container moved" signal.
+    ///
+    /// The fixture takes no rng, no clock and no OS-assigned port, so nothing else can move it.
+    const GOLDEN_LEGACY_PACK_HEX: &str = "74656c6e6574010091dcabc6ad9363a20100000001000000a9434593aa01000028b52ffd00580d0d0004170096010000026085ae9977dafa1a29bfeecb4ec68ac8b9690e9adfc6757f6fd30dcc0e040d918c7eee1c50cff8f6e749017ebf77fa1d570f9a74ab3abf73a4ab9a2da56e2603e23f75800adc0f0c6cbfb7c9e3b9044fb7f3fbede2ba642ce75e375d5bbf6e8735140260ac7fa63dfc38bbf3712e27a180391bca4ccabf609c5967a0592eff420b6235f3f2b323051cb099acc3969aca310f7ff4191b2d6db43fafc2c9592f7e5f73981107975d3d92b843891e724dbc9f05b5eee5a3b2b1fc782ede8149f30830b8444414010b047f00000191029c41cd032408011220b14a3296426492458270c2e577fdc549b6d67155e5800b0bf96c3f4106b4ae7100a029c602145e9a9f1672b151652377fa8c23fc78ded1add621fe177d33b8ebcd4214009c40e0fcb53429020d03e8f4e471ec73993f9329ad0d76e69cfdfcb08c94aa39fdab28055139b0f6daf33b3fdc294e2bfc1ad914de91f7d6e9f717b4509c047fbc6acc008d2300921000205e8c207a1100b88654650c7403e7886b049c00d2c0070e2df686f8d09a0f642c550918b62b0d7882a193613a78d24e27a71005806fcb4ec500000028b52ffd0058e50500740a02207a017b403bb2f1bcfe223c27bf0d350aa0dc2e7f02f257580d538ac8a36f21223d29010000009601000001000120c0a1c7fd531551d30b3db2802e873b75067059e1d41d433b8e086c0b79143b5e002000309455941aa83bcaa9f33fa21533d526c4b824ef51132c5629a21619f9975befc7fcf1097d590c01356c37ba346bfc2c42203cd4585ccad5b8f09b28c2444dfda62125ab6d4c235efc635ecc10ddf4f447048d2307000833c000bf60980d828607f61b184a03dc39a570361e00000028b52ffd0058ad000060010108019601000014000700031000044e2523027f4c188fe300000028b52ffd0058d50600640c0220e9ef2e767a88948d2c477c097f516a936acdc86a3ea64f290630d28c5030d6e3015237b9c5d795289c9a054ba2761ff631cd622c9d94df6ab749814cede8549d3f02000000960100000200012031a3a82b0b9828c83bafb69afd821c11801ec62cfb6a88b7fed03599e21b507c002000309455941aa83bcaa9f33fa21533d526c4b824ef51132c5629a21619f9975befc7fcf1097d590c01356c37ba346bfc2c42206f9ec6c464377d4f9f935156387873e428662cfe18ef258641136a71aa5cb7da8e2306000833c000bf60980d828607f637033003692185471e00000028b52ffd0058ad000060010108029601000014000700031000044e252302fb1782dc";
+
+    /// Decode [`GOLDEN_LEGACY_PACK_HEX`], failing loudly on a malformed constant.
+    fn golden_legacy_pack_bytes() -> Vec<u8> {
+        tn_types::hex::decode(GOLDEN_LEGACY_PACK_HEX).expect("frozen hex vector must be valid hex")
+    }
+
+    /// Lay the frozen bytes down as a bare `epoch-406/data` file with NO sidecar indexes, and
+    /// return its path.
+    ///
+    /// The strictest shape a read door can be handed: nothing but the pack stream, so whatever it
+    /// learns about the epoch it learns by decoding the `EpochMeta` record itself.
+    fn write_golden_legacy_data_file(dir: &std::path::Path) -> std::path::PathBuf {
+        let base = dir.join(format!("epoch-{LEGACY_PACK_EPOCH}"));
+        std::fs::create_dir_all(&base).expect("create pack dir");
+        let path = base.join(Inner::DATA_NAME);
+        std::fs::write(&path, golden_legacy_pack_bytes()).expect("write frozen data file");
+        path
+    }
+
+    /// Deterministic BLS keypair for fixture slot `slot`.
+    ///
+    /// A fixed scalar rather than a seeded rng, so the derived public key — and with it the
+    /// `authorities` map order and every frozen byte above — survives `rand` and `blst` bumps as
+    /// well as reruns. The leading bytes stay zero, which keeps the scalar nonzero and far below
+    /// the BLS12-381 group order, the only two values `blst` rejects.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_bls_keypair(slot: u8) -> tn_types::BlsKeypair {
+        let mut scalar = [0_u8; 32];
+        scalar[30] = slot;
+        scalar[31] = 0x2A;
+        tn_types::BlsKeypair::from_bytes(&scalar)
+            .expect("fixture bls scalar is a valid private key")
+    }
+
+    /// A fixture [`P2pNode`](tn_types::P2pNode) from a fixed ed25519 seed and port.
+    ///
+    /// ed25519 secret keys *are* 32-byte seeds, so a fixed seed yields a fixed public key with no
+    /// rng in the path, and the multiaddr comes from a literal rather than an OS-assigned port.
+    /// `rpc` stays `None`: the `Some` arm needs a `url::Url`, which this crate does not depend on,
+    /// and `tn_types`' frozen committee vectors already pin both arms.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_p2p_node(tag: u8, slot: u8, port: u16) -> tn_types::P2pNode {
+        let mut seed = [0_u8; 32];
+        seed[0] = tag;
+        seed[1] = slot;
+        tn_types::P2pNode {
+            network_address: format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+                .parse()
+                .expect("fixture multiaddr parses"),
+            network_key: tn_types::NetworkKeypair::ed25519_from_bytes(seed)
+                .expect("a 32-byte array is a valid ed25519 secret seed")
+                .public()
+                .clone()
+                .into(),
+            rpc: None,
+        }
+    }
+
+    /// The frozen pack's committee: two authorities, each with a single-worker bootstrap server.
+    ///
+    /// Two is the minimum — `CommitteeInner::load` asserts a committee larger than one — and the
+    /// point of the fixture is the wire layout, not the quorum math, so it stays at the minimum to
+    /// keep the frozen vector small. One worker per server is the only shape the legacy layout can
+    /// express at all.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_committee() -> Committee {
+        use std::collections::BTreeMap;
+
+        use tn_types::{Address, Authority, BootstrapServer};
+
+        let mut authorities = BTreeMap::new();
+        let mut bootstrap_servers = BTreeMap::new();
+        for slot in 0..2_u8 {
+            let key = *legacy_pack_bls_keypair(slot).public();
+            authorities.insert(key, Authority::new_for_test(key, Address::repeat_byte(slot + 1)));
+            bootstrap_servers.insert(
+                key,
+                BootstrapServer::new(
+                    legacy_pack_p2p_node(0xB0, slot, 40_000 + u16::from(slot)),
+                    vec![legacy_pack_p2p_node(0xC0, slot, 41_000 + u16::from(slot))],
+                ),
+            );
+        }
+        Committee::new_for_test(authorities, LEGACY_PACK_EPOCH, bootstrap_servers)
+    }
+
+    /// The previous epoch's record the frozen pack links to.
+    ///
+    /// Every field here is frozen INTO the pack: `open_append` copies `final_state` and
+    /// `final_consensus` into the `EpochMeta` and derives `start_consensus_number` from them, and
+    /// `verify_epoch_meta` re-checks all three plus the committee key set on every import and
+    /// validation. Feeding this record to those doors therefore pins the meta's fields, not just
+    /// its committee.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_previous_epoch(committee: &Committee) -> EpochRecord {
+        EpochRecord {
+            epoch: LEGACY_PACK_EPOCH - 1,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            final_state: tn_types::BlockNumHash::new(4_242, tn_types::B256::repeat_byte(0x5E)),
+            final_consensus: ConsensusNumHash::new(
+                LEGACY_PACK_PREV_CONSENSUS,
+                ConsensusHeaderDigest::from([0x7A_u8; 32]),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// One fully deterministic output for the frozen pack: a single-certificate sub-DAG whose
+    /// leader header references exactly one batch.
+    ///
+    /// `tag` seeds every value that distinguishes one fixture output from another (round,
+    /// `created_at`, the batch's payload bytes, and which authority authors it), so the two outputs
+    /// differ in every hashed field while neither reaches for a clock or an rng. The seed signature
+    /// is a real BLS signature over a fixed message: BLS signing takes no nonce, so it is
+    /// reproducible, and it is on the wire at this epoch because the seed-signature fork is active
+    /// here.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_output(
+        committee: &Committee,
+        number: u64,
+        parent: ConsensusHeaderDigest,
+        tag: u8,
+    ) -> ConsensusOutput {
+        use tn_types::Signer as _;
+
+        let batch =
+            Batch::new_for_test(vec![vec![tag; 8]], ExecHeader::default(), 0, LEGACY_PACK_EPOCH);
+        let authorities = committee.authorities();
+        let authority = authorities
+            .get(usize::from(tag) % authorities.len())
+            .expect("modulo keeps the index in range");
+        let seed_signature = legacy_pack_bls_keypair(0xF0).sign(b"pack-fixture-seed");
+        let header = HeaderBuilder::default()
+            .author(authority.id())
+            .round(u32::from(tag))
+            .epoch(LEGACY_PACK_EPOCH)
+            .created_at(u64::from(tag))
+            .seed_signature(seed_signature)
+            .with_payload_batch(&batch, 0_u16)
+            .build();
+        let mut leader = Certificate::default();
+        leader.update_header_for_test(header);
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            u64::from(tag),
+            ReputationScores::default(),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        );
+        let batch_digests: VecDeque<BlockHash> = [batch.digest()].into_iter().collect();
+        ConsensusOutput::new(
+            sub_dag,
+            parent,
+            number,
+            false,
+            batch_digests,
+            vec![CertifiedBatch { address: authority.execution_address(), batches: vec![batch] }],
+        )
+    }
+
+    /// The frozen pack's two outputs, chained: the first parents off the previous epoch's final
+    /// consensus header, the second off the first. Tags 1 and 2 land on different authorities, so
+    /// both committee members author one output and the decoder's author lookup is exercised for
+    /// each.
+    #[cfg(feature = "adiri")]
+    fn legacy_pack_outputs(committee: &Committee, previous: &EpochRecord) -> Vec<ConsensusOutput> {
+        let mut parent = previous.final_consensus.hash;
+        let mut number = previous.final_consensus.number + 1;
+        let mut outputs = Vec::new();
+        for tag in [1_u8, 2] {
+            let output = legacy_pack_output(committee, number, parent, tag);
+            parent = output.digest();
+            number += 1;
+            outputs.push(output);
+        }
+        outputs
+    }
+
+    /// Write the fixture pack through the normal write path (`open_append` +
+    /// `save_consensus_output`) into `dir` and return the resulting `data` file bytes.
+    ///
+    /// On the `adiri` lane at [`LEGACY_PACK_EPOCH`] the gated encoder emits the legacy committee
+    /// layout, which `tn_types`' differentials prove is byte-identical to the pre-#554 derive. A
+    /// pack this writes at that epoch therefore IS a pre-fork pack, byte for byte — which is what
+    /// makes freezing its output a fixture of history rather than of this build.
+    #[cfg(feature = "adiri")]
+    async fn write_legacy_pack(dir: &std::path::Path) -> Vec<u8> {
+        let committee = legacy_pack_committee();
+        let previous_epoch = legacy_pack_previous_epoch(&committee);
+        let pack = ConsensusPack::open_append(dir, previous_epoch.clone(), committee.clone())
+            .expect("open fixture pack for append");
+        for output in legacy_pack_outputs(&committee, &previous_epoch) {
+            pack.save_consensus_output(output).await.expect("save fixture output");
+        }
+        pack.persist().await.expect("persist fixture pack");
+        drop(pack);
+        std::fs::read(dir.join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME))
+            .expect("read fixture data file")
+    }
+
+    /// Materialize a complete pack directory (data file plus sidecar indexes) in `dir` FROM the
+    /// frozen bytes, by feeding them to `stream_import` the way a peer stream arrives.
+    ///
+    /// `stream_import` is the only path that builds a pack's indexes from a record stream, so it is
+    /// how the doors that need sidecars (`open_static`, and reading outputs back through
+    /// `open_append_exists` / `open_append`) get an on-disk pack whose `data` file is provably the
+    /// frozen constant — asserted here, so every caller inherits the guarantee.
+    #[cfg(feature = "adiri")]
+    async fn import_golden_legacy_pack(dir: &std::path::Path) {
+        let frozen = golden_legacy_pack_bytes();
+        let source = dir.join("peer_stream");
+        std::fs::write(&source, &frozen).expect("write peer stream");
+        let committee = legacy_pack_committee();
+        let previous_epoch = legacy_pack_previous_epoch(&committee);
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let pack = ConsensusPack::stream_import(
+            dir,
+            stream,
+            LEGACY_PACK_EPOCH,
+            &previous_epoch,
+            LEGACY_PACK_LAST_CONSENSUS,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("stream import of the frozen pre-fork pack");
+        pack.persist().await.expect("persist imported pack");
+        drop(pack);
+        let on_disk =
+            std::fs::read(dir.join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME))
+                .expect("read imported data file");
+        assert_eq!(
+            tn_types::hex::encode(&on_disk),
+            GOLDEN_LEGACY_PACK_HEX,
+            "the materialized pack's data file is not the frozen pre-fork bytes"
+        );
+    }
+
+    /// Assert `pack`'s handle-level committee is the frozen pre-fork committee, in the legacy
+    /// single-worker shape.
+    ///
+    /// `Committee`'s `PartialEq` deliberately ignores bootstrap servers, so the map is compared
+    /// separately — without that a pack whose bootstrap hints decoded to something else entirely
+    /// would compare equal.
+    #[cfg(feature = "adiri")]
+    fn assert_legacy_pack_committee(pack: &ConsensusPack) {
+        let expected = legacy_pack_committee();
+        assert_eq!(pack.epoch(), LEGACY_PACK_EPOCH, "pack epoch moved");
+        assert_eq!(pack.committee().epoch(), LEGACY_PACK_EPOCH, "meta committee epoch moved");
+        assert_eq!(pack.committee().size(), 2, "meta committee authority count moved");
+        assert_eq!(
+            pack.committee().number_of_workers(),
+            1,
+            "the legacy layout carries no worker count, so it must decode as single-worker"
+        );
+        assert_eq!(pack.committee().bootstrap_servers().len(), 2, "bootstrap server count moved");
+        assert!(
+            pack.committee().bootstrap_servers().values().all(|server| server.num_workers() == 1),
+            "the legacy layout holds exactly one worker per bootstrap server"
+        );
+        assert_eq!(*pack.committee(), expected, "the meta holds a different committee");
+        assert_eq!(
+            pack.committee().bootstrap_servers(),
+            expected.bootstrap_servers(),
+            "the meta holds different bootstrap servers"
+        );
+    }
+
+    /// Read both frozen outputs back through `pack` and compare them to the fixture, and confirm
+    /// the frozen `start_consensus_number` by rejecting the number just below it.
+    #[cfg(feature = "adiri")]
+    async fn assert_legacy_pack_outputs(pack: &ConsensusPack) {
+        let committee = legacy_pack_committee();
+        let previous_epoch = legacy_pack_previous_epoch(&committee);
+        let expected = legacy_pack_outputs(&committee, &previous_epoch);
+        for output in &expected {
+            let read_back = pack.get_consensus_output(output.number()).await.unwrap_or_else(|e| {
+                panic!("read output {} from the frozen pack: {e}", output.number())
+            });
+            compare_outputs(&read_back, output);
+        }
+        assert!(
+            pack.get_consensus_output(LEGACY_PACK_PREV_CONSENSUS).await.is_err(),
+            "a number below the frozen start_consensus_number must be rejected"
+        );
+        assert!(
+            !pack
+                .contains_consensus_header_number(LEGACY_PACK_PREV_CONSENSUS)
+                .await
+                .expect("query the frozen pack"),
+            "the frozen pack must not claim the previous epoch's final consensus number"
+        );
+        assert!(
+            pack.contains_consensus_header_number(LEGACY_PACK_LAST_CONSENSUS)
+                .await
+                .expect("query the frozen pack"),
+            "the frozen pack must claim its own last consensus number"
+        );
+    }
+
+    /// ANCHOR (adiri): the frozen pre-fork pack is exactly what this build's normal write path
+    /// produces at [`LEGACY_PACK_EPOCH`], so the fixture cannot drift away from the encoder it is
+    /// meant to hold still.
+    ///
+    /// Also the anti-vacuity check for the whole group: it asserts the two gates that decide the
+    /// frozen layout, so a stray `TN_MULTI_WORKERS_FORK_EPOCH` in the environment (or the fork
+    /// being armed) fails here with a diagnosis instead of downstream as an unexplained byte diff.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_regenerates() {
+        use tn_types::{encode, forks};
+
+        assert!(
+            !forks::multi_workers_fork_active(LEGACY_PACK_EPOCH),
+            "epoch {LEGACY_PACK_EPOCH} must be PRE-fork for the frozen pack to be a legacy-layout \
+             pack; is TN_MULTI_WORKERS_FORK_EPOCH set in the environment, or has the fork been \
+             armed?"
+        );
+        assert!(
+            forks::seed_signature_active(LEGACY_PACK_EPOCH),
+            "epoch {LEGACY_PACK_EPOCH} must be seed-signature-active for the frozen headers to \
+             carry seed_signature; is TN_SEED_SIGNATURE_FORK_EPOCH set in the environment?"
+        );
+
+        let first = TempDir::with_prefix("golden_legacy_pack_a").expect("temp dir");
+        let bytes = write_legacy_pack(first.path()).await;
+        assert_eq!(
+            tn_types::hex::encode(&bytes),
+            GOLDEN_LEGACY_PACK_HEX,
+            "the pre-fork write path diverged from the frozen pack"
+        );
+
+        // a second, independent write of the same fixture must produce the same file: no rng,
+        // clock or OS-assigned port leaked into the fixture
+        let second = TempDir::with_prefix("golden_legacy_pack_b").expect("temp dir");
+        assert_eq!(
+            write_legacy_pack(second.path()).await,
+            bytes,
+            "the fixture pack is not reproducible"
+        );
+
+        // Cross-check the committee bytes INSIDE the frozen container. This separates the two ways
+        // the byte-identity assertion above can fail: if this still passes, the container moved
+        // (framing, crc, zstd) and not the committee wire layout.
+        let pack = ConsensusPack::open_append_exists(first.path(), LEGACY_PACK_EPOCH)
+            .expect("reopen the pack just written");
+        assert_eq!(
+            tn_types::hex::encode(encode(pack.committee())),
+            tn_types::hex::encode(encode(&legacy_pack_committee())),
+            "the committee stored in the frozen pack is not the legacy-layout fixture committee"
+        );
+        assert_legacy_pack_committee(&pack);
+    }
+
+    /// DOOR 1 (adiri): warm restart — `open_append_exists`, the door that exited 1 in production.
+    ///
+    /// Driven twice over the same frozen bytes: first as a bare `data` file with no sidecar
+    /// indexes, which is the strictest form (everything the door knows about the epoch it decodes
+    /// out of the `EpochMeta` record itself), then over a full pack directory, where the frozen
+    /// outputs must also read back. Opening for append must not rewrite the file either way.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_opens_append_exists() {
+        let bare = TempDir::with_prefix("golden_legacy_warm_bare").expect("temp dir");
+        let data_file = write_golden_legacy_data_file(bare.path());
+        {
+            let pack = ConsensusPack::open_append_exists(bare.path(), LEGACY_PACK_EPOCH)
+                .expect("warm restart against a bare frozen pre-fork data file");
+            assert_eq!(pack.version, PACK_VERSION, "frozen pack version moved");
+            assert!(!pack.is_static(), "a warm-restart handle is writable");
+            assert_legacy_pack_committee(&pack);
+            pack.persist().await.expect("persist");
+        }
+        assert_eq!(
+            tn_types::hex::encode(std::fs::read(&data_file).expect("reread data file")),
+            GOLDEN_LEGACY_PACK_HEX,
+            "opening a pre-fork pack for append rewrote or truncated it"
+        );
+
+        let full = TempDir::with_prefix("golden_legacy_warm_full").expect("temp dir");
+        import_golden_legacy_pack(full.path()).await;
+        let pack = ConsensusPack::open_append_exists(full.path(), LEGACY_PACK_EPOCH)
+            .expect("warm restart against a complete frozen pre-fork pack");
+        assert_legacy_pack_committee(&pack);
+        assert_legacy_pack_outputs(&pack).await;
+    }
+
+    /// DOOR 2 (adiri): historical reads — `open_static` over the frozen bytes.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_opens_static() {
+        let dir = TempDir::with_prefix("golden_legacy_static").expect("temp dir");
+        import_golden_legacy_pack(dir.path()).await;
+
+        let pack = ConsensusPack::open_static(dir.path(), LEGACY_PACK_EPOCH)
+            .expect("read-only open of the frozen pre-fork pack");
+        assert!(pack.is_static(), "open_static must yield a read-only handle");
+        assert_legacy_pack_committee(&pack);
+        assert_legacy_pack_outputs(&pack).await;
+    }
+
+    /// DOOR 3 (adiri): peer epoch sync — `stream_import` of the frozen bytes.
+    ///
+    /// The load-bearing assertion is byte identity: importing and then serving a pre-fork pack must
+    /// leave the meta record exactly as it arrived, because those same bytes are what this node
+    /// hands to a peer still running a pre-fork build. A rewritten meta would decode here and
+    /// nowhere else.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_stream_imports() {
+        let dir = TempDir::with_prefix("golden_legacy_import").expect("temp dir");
+        // asserts the imported data file is byte-identical to the frozen bytes
+        import_golden_legacy_pack(dir.path()).await;
+
+        let committee = legacy_pack_committee();
+        let previous_epoch = legacy_pack_previous_epoch(&committee);
+        let expected = legacy_pack_outputs(&committee, &previous_epoch);
+        let pack = ConsensusPack::open_append_exists(dir.path(), LEGACY_PACK_EPOCH)
+            .expect("reopen the imported pack");
+        assert_legacy_pack_committee(&pack);
+        assert_legacy_pack_outputs(&pack).await;
+
+        // serving: the bytes handed to a peer decode back to the same outputs under the pack's own
+        // (legacy-layout) committee
+        for output in &expected {
+            let served = pack
+                .get_consensus_output_bytes(output.number())
+                .await
+                .expect("serve a frozen output to a peer");
+            let decoded = pack.decode_output(served).await.expect("peer-side decode");
+            compare_outputs(&decoded, output);
+        }
+        pack.persist().await.expect("persist after serving");
+        drop(pack);
+
+        let on_disk = std::fs::read(
+            dir.path().join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME),
+        )
+        .expect("reread the imported data file");
+        assert_eq!(
+            tn_types::hex::encode(&on_disk),
+            GOLDEN_LEGACY_PACK_HEX,
+            "importing and serving a pre-fork pack rewrote its bytes, so peers on a pre-fork build \
+             would no longer be able to read it"
+        );
+    }
+
+    /// DOOR 4 (adiri): the meta-compare arm of `open_append`.
+    ///
+    /// Reopening a pre-fork pack with the same committee takes the compare branch — the meta this
+    /// build constructs must equal the one decoded off disk — so it must succeed WITHOUT appending
+    /// a second `EpochMeta` record. The file length and bytes are unchanged.
+    #[cfg(feature = "adiri")]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_reopens_append_without_duplicate_meta() {
+        let dir = TempDir::with_prefix("golden_legacy_reappend").expect("temp dir");
+        import_golden_legacy_pack(dir.path()).await;
+        let data_file =
+            dir.path().join(format!("epoch-{LEGACY_PACK_EPOCH}")).join(Inner::DATA_NAME);
+        let len_before = std::fs::metadata(&data_file).expect("stat data file").len();
+
+        let committee = legacy_pack_committee();
+        let previous_epoch = legacy_pack_previous_epoch(&committee);
+        {
+            let pack =
+                ConsensusPack::open_append(dir.path(), previous_epoch.clone(), committee.clone())
+                    .expect("reopen the frozen pre-fork pack for append with the same committee");
+            assert_legacy_pack_committee(&pack);
+            assert_legacy_pack_outputs(&pack).await;
+            pack.persist().await.expect("persist");
+        }
+
+        assert_eq!(
+            std::fs::metadata(&data_file).expect("stat data file").len(),
+            len_before,
+            "open_append grew a pre-fork pack, so it appended a duplicate EpochMeta"
+        );
+        assert_eq!(
+            tn_types::hex::encode(std::fs::read(&data_file).expect("reread data file")),
+            GOLDEN_LEGACY_PACK_HEX,
+            "open_append rewrote the frozen pre-fork bytes"
+        );
+
+        // A validation pass proves the file still holds exactly one EpochMeta: a second one is
+        // reported as an EpochMetaMismatch issue.
+        let report = crate::pack_validate::validate_pack_file(
+            &data_file,
+            LEGACY_PACK_EPOCH,
+            Some(&previous_epoch),
+        )
+        .expect("validate after reopen");
+        assert_eq!(
+            report.verdict,
+            crate::pack_validate::Verdict::Valid,
+            "reopened pre-fork pack no longer validates: {:?}",
+            report.issues
+        );
+    }
+
+    /// DOOR 5 (adiri): the offline validator — `validate_pack_file` over the bare frozen bytes.
+    ///
+    /// Run with the previous epoch's record so the full `verify_epoch_meta` linkage executes: this
+    /// is what pins the frozen meta's `start_consensus_number`, `genesis_exec_state`,
+    /// `genesis_consensus` and committee key set, not just its committee layout.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn test_golden_legacy_pack_validates() {
+        use crate::pack_validate::{validate_pack_file, Verdict};
+
+        let dir = TempDir::with_prefix("golden_legacy_validate").expect("temp dir");
+        let data_file = write_golden_legacy_data_file(dir.path());
+        let previous_epoch = legacy_pack_previous_epoch(&legacy_pack_committee());
+
+        let report = validate_pack_file(&data_file, LEGACY_PACK_EPOCH, Some(&previous_epoch))
+            .expect("validate the frozen pre-fork pack");
+        assert_eq!(
+            report.verdict,
+            Verdict::Valid,
+            "the frozen pre-fork pack must validate clean: {:?}",
+            report.issues
+        );
+        assert_eq!(report.epoch, LEGACY_PACK_EPOCH);
+        assert_eq!(
+            report.start_consensus_number, LEGACY_PACK_FIRST_CONSENSUS,
+            "frozen start_consensus_number moved"
+        );
+        assert_eq!(report.consensus_count, 2, "frozen consensus record count moved");
+        assert_eq!(report.batch_count, 2, "frozen batch record count moved");
+        assert_eq!(report.first_consensus_number, Some(LEGACY_PACK_FIRST_CONSENSUS));
+        assert_eq!(report.last_consensus_number, Some(LEGACY_PACK_LAST_CONSENSUS));
+    }
+
+    /// PIN (non-adiri): the frozen pre-fork bytes are indecodable in a build whose multi-workers
+    /// gate is active from genesis, and every read door says so loudly.
+    ///
+    /// This documents the build-gate contract at the storage layer rather than a gap: no non-adiri
+    /// network carries pre-fork packs, so mainnet's gate is active at every epoch and the legacy
+    /// layout is unreadable there BY DESIGN. What matters is that it fails with an error instead of
+    /// decoding into a plausible-looking committee — a silent misparse of the first record of every
+    /// pack is how a node ends up verifying consensus against the wrong validator set.
+    #[cfg(not(feature = "adiri"))]
+    #[tokio::test]
+    async fn test_golden_legacy_pack_rejected_without_adiri() {
+        assert!(
+            tn_types::forks::multi_workers_fork_active(LEGACY_PACK_EPOCH),
+            "a non-adiri build must be post-fork at every epoch, epoch {LEGACY_PACK_EPOCH} included"
+        );
+
+        let dir = TempDir::with_prefix("golden_legacy_non_adiri").expect("temp dir");
+        let data_file = write_golden_legacy_data_file(dir.path());
+
+        // the warm-restart door: the meta fails to decode, so the open fails
+        let warm = ConsensusPack::open_append_exists(dir.path(), LEGACY_PACK_EPOCH);
+        assert!(
+            matches!(warm, Err(super::PackError::EpochLoad(_))),
+            "expected the legacy-layout meta to fail decoding, got {:?}",
+            warm.map(|pack| pack.epoch())
+        );
+
+        // The offline validator reports the same failure rather than a clean pack. Anti-vacuity:
+        // the failure must NOT be an open error — the frozen container (data header, framing) is
+        // well formed on every lane, and only the legacy-layout record inside it is unreadable
+        // here. Without that the assertion would also pass on a garbage constant.
+        let validated =
+            crate::pack_validate::validate_pack_file(&data_file, LEGACY_PACK_EPOCH, None);
+        match validated {
+            Err(super::PackError::Open(e)) => {
+                panic!("the frozen pack container must open on any lane, got open error {e}")
+            }
+            Err(_) => {}
+            Ok(report) => panic!(
+                "the offline validator must reject legacy-layout bytes on a post-fork build, got \
+                 {:?}",
+                report.verdict
+            ),
+        }
+
+        // the peer-sync door: the first streamed record fails to decode
+        let source = dir.path().join("peer_stream");
+        std::fs::write(&source, golden_legacy_pack_bytes()).expect("write peer stream");
+        let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        let imported = TempDir::with_prefix("golden_legacy_non_adiri_import").expect("temp dir");
+        let import = ConsensusPack::stream_import(
+            imported.path(),
+            stream,
+            LEGACY_PACK_EPOCH,
+            &EpochRecord::default(),
+            LEGACY_PACK_LAST_CONSENSUS,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            import.is_err(),
+            "peer sync must reject legacy-layout bytes on a post-fork build, got {:?}",
+            import.map(|pack| pack.epoch())
         );
     }
 }

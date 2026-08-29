@@ -53,15 +53,39 @@ impl LocalNetwork {
     }
 
     /// Set the handler for worker to primary messages.
-    pub fn set_worker_to_primary_local_handler(&self, handler: Arc<dyn WorkerToPrimaryClient>) {
+    ///
+    /// A handler binds exactly once: a second registration is a wiring bug (two components
+    /// claiming the same seam would otherwise alias silently, last writer winning), so it
+    /// returns an error instead of overwriting.
+    pub fn set_worker_to_primary_local_handler(
+        &self,
+        handler: Arc<dyn WorkerToPrimaryClient>,
+    ) -> eyre::Result<()> {
         let mut inner = self.inner.write();
-        inner.worker_to_primary_handler = Some(handler);
+        if inner.worker_to_primary_handler.is_some() {
+            Err(eyre::eyre!("worker to primary handler already set"))
+        } else {
+            inner.worker_to_primary_handler = Some(handler);
+            Ok(())
+        }
     }
 
     /// Set the handler for primary to worker messages.
-    pub fn set_primary_to_worker_local_handler(&self, handler: Arc<dyn PrimaryToWorkerClient>) {
+    ///
+    /// A handler binds exactly once: a second registration is a wiring bug (two components
+    /// claiming the same seam would otherwise alias silently, last writer winning), so it
+    /// returns an error instead of overwriting.
+    pub fn set_primary_to_worker_local_handler(
+        &self,
+        handler: Arc<dyn PrimaryToWorkerClient>,
+    ) -> eyre::Result<()> {
         let mut inner = self.inner.write();
-        inner.primary_to_worker_handler = Some(handler);
+        if inner.primary_to_worker_handler.is_some() {
+            Err(eyre::eyre!("primary to worker handler already set"))
+        } else {
+            inner.primary_to_worker_handler = Some(handler);
+            Ok(())
+        }
     }
 
     /// Get the handler for worker to primary messages.
@@ -105,19 +129,71 @@ impl PrimaryToWorkerClient for LocalNetwork {
 impl WorkerToPrimaryClient for LocalNetwork {
     async fn report_own_batch(&self, request: WorkerOwnBatchMessage) -> eyre::Result<()> {
         if let Some(c) = self.get_worker_to_primary_handler().await {
-            c.report_own_batch(request).await?;
+            c.report_own_batch(request).await
         } else {
-            tracing::warn!(target = "local_network", "working to primary handler not set yet!");
+            // A missing handler must surface as an error, symmetric with `synchronize` /
+            // `fetch_batches` below: swallowing it would let `Worker::seal` report success
+            // while the digest never reached the proposer, and the batch builder would evict
+            // the batch's transactions from the pool as mined.
+            tracing::warn!(target = "local_network", "worker to primary handler not set yet!");
+            Err(eyre::eyre!("worker to primary handler not set yet"))
         }
-        Ok(())
     }
 
     async fn report_others_batch(&self, request: WorkerOthersBatchMessage) -> eyre::Result<()> {
         if let Some(c) = self.get_worker_to_primary_handler().await {
-            c.report_others_batch(request).await?;
+            c.report_others_batch(request).await
         } else {
-            tracing::warn!(target = "local_network", "working to primary handler not set yet!");
+            // See `report_own_batch`: a missing handler is an error, never a silent drop.
+            tracing::warn!(target = "local_network", "worker to primary handler not set yet!");
+            Err(eyre::eyre!("worker to primary handler not set yet"))
         }
-        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{MockPrimaryToWorkerClient, MockWorkerToPrimary};
+
+    #[tokio::test]
+    async fn report_paths_surface_a_missing_handler() {
+        let local = LocalNetwork::new_with_empty_id();
+
+        // no handler: both report paths error instead of swallowing the message
+        let own = WorkerOwnBatchMessage::new(0, BlockHash::default());
+        assert!(local.report_own_batch(own.clone()).await.is_err());
+        let others = WorkerOthersBatchMessage::new(BlockHash::default(), 0);
+        assert!(local.report_others_batch(others.clone()).await.is_err());
+
+        // registered handler: both paths succeed
+        local
+            .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+            .expect("first registration");
+        assert!(local.report_own_batch(own).await.is_ok());
+        assert!(local.report_others_batch(others).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn handlers_bind_exactly_once() {
+        let local = LocalNetwork::new_with_empty_id();
+
+        local
+            .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+            .expect("first registration");
+        assert!(
+            local.set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary())).is_err(),
+            "a second registration is a wiring bug"
+        );
+
+        local
+            .set_primary_to_worker_local_handler(Arc::new(MockPrimaryToWorkerClient::default()))
+            .expect("first registration");
+        assert!(
+            local
+                .set_primary_to_worker_local_handler(Arc::new(MockPrimaryToWorkerClient::default()))
+                .is_err(),
+            "a second registration is a wiring bug"
+        );
     }
 }

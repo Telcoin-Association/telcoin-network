@@ -1,0 +1,29 @@
+[book]
+title = "Telcoin Network"
+description = "Documentation for Telcoin Network, an EVM-compatible public blockchain secured by GSMA member Mobile Network Operators using proof of stake consensus."
+authors = ["Telcoin Association"]
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/Telcoin-Association/telcoin-network"
+edit-url-template = "https://github.com/Telcoin-Association/telcoin-network/edit/main/docs/src/{path}"
+# GitHub Pages project-site prefix; flip to "/" when docs.telcoin.network DNS cuts over.
+site-url = "/telcoin-network/"
+
+# Theme (docs/theme/): light + navy only; the header switch offers Light/System/Dark.
+# "navy" must stay the dark theme id — book.js keys highlight-css switching on it.
+default-theme = "light"
+preferred-dark-theme = "navy"
+no-section-label = true
+# The right rail ("On this page", tn-custom.js) replaces in-sidebar heading nav.
+sidebar-header-nav = false
+additional-css = ["theme/tn-custom.css"]
+additional-js = ["theme/tn-custom.js"]
+
+[output.html.fold]
+enable = true
+level = 0

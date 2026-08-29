@@ -46,6 +46,7 @@ serde_json = { workspace = true }
 # a `--features adiri` node build actually compiles it in. tn-node's own adiri code is test-only:
 # the pre-fork entry-fee pin in `manager::node::run_epoch::tests`.
 adiri = [
+    "tn-config/adiri",
     "tn-engine/adiri",
     "tn-executor/adiri",
     "tn-reth/adiri",
