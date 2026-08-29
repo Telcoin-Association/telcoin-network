@@ -251,7 +251,9 @@ docker-login:
 	gcloud auth configure-docker us-docker.pkg.dev ;
 
 # build and push latest adiri image for amd64 and arm64
-# CARGO_FEATURES=adiri compiles in the testnet fork logic (ConsensusRegistry fork, ADIRI_DUP_BATCH_EPOCH).
+# CARGO_FEATURES=adiri compiles in the epoch-gated testnet fork logic. The authoritative
+# list is crates/types/src/forks.rs; a running node logs its compiled schedule at startup
+# (target "cli", "fork schedule (adiri)").
 docker-adiri:
 	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
 
