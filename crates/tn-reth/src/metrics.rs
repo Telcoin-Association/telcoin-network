@@ -1,6 +1,6 @@
 //! Prometheus metrics for the reth execution environment.
 //!
-//! The counter series are exported under the `tn_reth` scope, in two unrelated groups.
+//! The counter series are exported under the `tn_reth` scope, in three unrelated groups.
 //!
 //! Block building. Two series count transactions that `build_block_from_batch_payload`
 //! declines to include in a block: `tn_reth.unrecoverable_txs_dropped_total` (alertable - a
@@ -20,6 +20,12 @@
 //! further series, `tn_reth.forwarded_rejections_overridden_total`, is an integrity signal
 //! rather than a loss: it counts validator verdicts that contradicted each other on one
 //! forwarded transaction (issue #1167). See [`ForwarderMetrics`] for per-series semantics.
+//!
+//! Worker pool canonical-state subscription health. `tn_reth.canon_state_lagged_total`
+//! (alertable) counts broadcast lag events observed by the pool maintenance task;
+//! `tn_reth.canon_state_notifications_missed_total` carries the magnitude behind each event;
+//! and `tn_reth.canon_state_resync_read_failures_total` counts canonical account reads the
+//! post-lag resync absorbed and retried. See [`RethEnvMetrics`] for per-series semantics.
 //!
 //! [`report_db_metrics`] additionally samples reth database metrics as a pre-scrape hook.
 //!
@@ -73,33 +79,39 @@ use crate::{evm::SYSTEM_CALL_GAS_LIMIT, RethDb};
 /// the noop one.
 pub(crate) static RETH_METRICS: LazyLock<RethEnvMetrics> = LazyLock::new(RethEnvMetrics::default);
 
-/// Register every block-building series with the global recorder without recording an event.
+/// Register every [`RethEnvMetrics`] counter and every labeled skip series with the global
+/// recorder without recording an event.
 ///
-/// For the derive-based counter, registration happens when the `LazyLock` is first forced, and
-/// the only sites that force it are drop paths a healthy node never takes. Without this call
-/// the series would simply not exist in a scrape until the first drop, which breaks the
-/// counters in the two ways that matter: an absent series is indistinguishable from a broken
-/// exporter or a mistyped metric name, so the "alert on any nonzero value" rule can never be
-/// verified in its negative case; and `rate()` over a series whose very first sample is
-/// already nonzero renders no step, so a one-shot drop burst on an otherwise quiet node stays
-/// invisible on the dashboard. The labeled skip series need the same treatment per label
-/// value, which [`register_invalid_tx_skip_series`] provides.
+/// For the derive-based counters, registration happens when the `LazyLock` is first forced,
+/// and the sites that force it are drop paths a healthy node never takes plus the pool
+/// maintenance task's lag recovery (`mark_drifted` in `txn_pool.rs`), which a healthy node
+/// also never reaches. Without this call the series would simply not exist in a scrape until
+/// the first drop, which breaks the counters in the two ways that matter: an absent series is
+/// indistinguishable from a broken exporter or a mistyped metric name, so the "alert on any
+/// nonzero value" rule can never be verified in its negative case; and `rate()` over a series
+/// whose very first sample is already nonzero renders no step, so a one-shot drop burst on an
+/// otherwise quiet node stays invisible on the dashboard. The labeled skip series need the
+/// same treatment per label value, which [`register_invalid_tx_skip_series`] provides.
 ///
 /// Called from [`crate::RethEnv::new`], which runs after `tn_metrics::install_recorder`, so
 /// every counter baselines at zero from process start . . . the same way the worker and
-/// executor counters they sit beside on the dashboard already do.
+/// executor counters they sit beside on the dashboard already do. A lag event is exactly the
+/// moment an operator needs the series to already exist with a zero baseline, or `rate()`
+/// renders no step for the first event.
 pub(crate) fn init() {
     LazyLock::force(&RETH_METRICS);
     register_invalid_tx_skip_series();
 }
 
-/// Metrics for building canonical blocks from certified batch payloads.
+/// Metrics for the execution environment: block building from certified batch payloads, plus
+/// the worker pool's canonical-state subscription health.
 ///
-/// This counter and the labeled skip series under [`INVALID_TXS_SKIPPED`] cover transactions
-/// that `build_block_from_batch_payload` silently declines to include in the block it returns.
-/// The two drop sites have opposite expectedness, so they are counted separately rather than
-/// summed - see the per-series docs. The skip series lives outside this struct because it
-/// carries a `reason` label, which the derive cannot express (see the module docs).
+/// The unrecoverable-drop counter and the labeled skip series under [`INVALID_TXS_SKIPPED`]
+/// cover transactions that `build_block_from_batch_payload` silently declines to include in
+/// the block it returns. The two drop sites have opposite expectedness, so they are counted
+/// separately rather than summed - see the per-series docs. The skip series lives outside
+/// this struct because it carries a `reason` label, which the derive cannot express (see the
+/// module docs).
 #[derive(Metrics)]
 #[metrics(scope = "tn_reth")]
 pub(crate) struct RethEnvMetrics {
@@ -110,6 +122,36 @@ pub(crate) struct RethEnvMetrics {
     /// issues #933 / #938); reaching that path at all means a batch carrying undecodable
     /// transaction bytes was certified, i.e. batch validation was bypassed somewhere upstream.
     pub(crate) unrecoverable_txs_dropped_total: Counter,
+
+    /// Canonical-state broadcast lag events observed by the worker pool maintenance task.
+    ///
+    /// Alert on any nonzero value. Each increment means the pool task fell more than the
+    /// broadcast channel's capacity behind `notify_canon_state` and lost `Commit`
+    /// notifications it can never replay; the task marks every pool sender dirty and reloads
+    /// canonical account state in bounded chunks to recover (see `txn_pool.rs`). A nonzero
+    /// rate means the worker cannot keep up with per-round pool maintenance - resync bounds
+    /// the damage, but sustained lag warrants investigation. The magnitude of each event
+    /// lives in [`RethEnvMetrics::canon_state_notifications_missed_total`].
+    pub(crate) canon_state_lagged_total: Counter,
+
+    /// Canonical-state notifications the worker pool maintenance task lost to broadcast lag.
+    ///
+    /// The magnitude behind [`RethEnvMetrics::canon_state_lagged_total`], which counts lag
+    /// EVENTS: one increment there reads identically whether one notification was dropped or
+    /// ten thousand were, and the count otherwise exists only in the `missed` field of the
+    /// accompanying `warn!`. Read the two together - `rate(missed) / rate(lagged)` is the
+    /// average gap per event, and it is the gap, not the event count, that says how much
+    /// sender state the pool had to rebuild.
+    pub(crate) canon_state_notifications_missed_total: Counter,
+
+    /// Canonical account reads that failed while resyncing pool senders after a lag event.
+    ///
+    /// Alert on a sustained rate, not on any nonzero value. A failed read leaves its sender
+    /// in the dirty set to be retried on a later maintenance iteration, so isolated
+    /// increments are the intended absorption of a transient provider fault. A rate that
+    /// does not fall back to zero means the resync is stuck retrying the same senders and
+    /// the pool's view of them stays stale.
+    pub(crate) canon_state_resync_read_failures_total: Counter,
 }
 
 /// Counter name for transactions skipped while building a block because the EVM rejected them
@@ -634,13 +676,13 @@ mod tests {
         assert!(matches!(value, DebugValue::Counter(2)));
     }
 
-    /// Construction alone must register the derive-based series at zero, with no drop having
-    /// happened.
+    /// Construction alone must register every derive-based series at zero, with no event
+    /// having happened.
     ///
     /// This is the property [`init`] relies on: a healthy node that never drops a transaction
-    /// still exports the counter, so `absent()` distinguishes "no drops" from "exporter
-    /// broken" and the first drop renders as a step from zero rather than as a series that
-    /// appears already nonzero.
+    /// or falls behind the canonical-state broadcast still exports every counter, so
+    /// `absent()` distinguishes "no events" from "exporter broken" and the first event
+    /// renders as a step from zero rather than as a series that appears already nonzero.
     #[test]
     fn test_metrics_register_at_zero_without_any_event() {
         let recorder = DebuggingRecorder::new();
@@ -662,6 +704,12 @@ mod tests {
         };
 
         let (_, _, _, value) = find("tn_reth.unrecoverable_txs_dropped_total");
+        assert!(matches!(value, DebugValue::Counter(0)));
+        let (_, _, _, value) = find("tn_reth.canon_state_lagged_total");
+        assert!(matches!(value, DebugValue::Counter(0)));
+        let (_, _, _, value) = find("tn_reth.canon_state_notifications_missed_total");
+        assert!(matches!(value, DebugValue::Counter(0)));
+        let (_, _, _, value) = find("tn_reth.canon_state_resync_read_failures_total");
         assert!(matches!(value, DebugValue::Counter(0)));
     }
 

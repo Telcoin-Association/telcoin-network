@@ -1,14 +1,70 @@
-name: Pull Request Checks
+# Checks that gate a change into main, on both events that can produce one.
+#
+#   `pull_request`  -- the PR in isolation, on the author's head commit.
+#   `merge_group`   -- the merge queue's temporary commit: main, plus this PR, plus every
+#                      PR ahead of it in the batch. This combination has never been
+#                      compiled anywhere, which is the whole point: it is where a semantic
+#                      merge conflict (both sides green, the merge broken) surfaces.
+#
+# Every job below reports under the same check name on both events. That matters: GitHub
+# evaluates the branch's required checks twice -- once on the PR before it may enter the
+# queue, and again on the merge group -- and a required check that never reports on
+# `merge_group` does not fail the queue, it hangs it until the queue timeout ejects the PR.
+#
+# `CI Success` is the single required check. Keep it that way; adding a second required
+# name means a second workflow that must also learn `merge_group`. Never add a third
+# trigger (`workflow_dispatch`, `push`) to this file either: GitHub matches a required
+# check by name on the head sha, whatever event produced it, so a run from another event
+# would stand in for the two that gate the branch. `CI Success` fails on an event it does
+# not know for the same reason.
+#
+# The on-chain attestation (`verify-on-chain`) is checked on `pull_request` only. The
+# merge group's commit is minted by GitHub seconds before this workflow runs, so no local
+# suite can have covered it and nothing can attest it; a lane that required it would hang
+# the queue. It gates entry instead: a PR cannot be queued until its head sha is attested,
+# and a push to a queued PR removes it from the queue with a new head that is unattested
+# until a maintainer runs `make attest` again.
+#
+# The compile lanes restore their dependency caches and never save them (`save-if:
+# "false"`). A cache saved by a pull_request run is scoped to that PR's branch and one
+# saved by a merge_group run lands on the queue's throwaway branch, so no other run could
+# read either; the upload would only add minutes to the critical path and consume quota
+# that evicts the entries the queue does read. Those are written on main by
+# .github/workflows/cache-deps.yaml, and the cache steps here must stay in lockstep with
+# it: same env block, same steps before the cache step. Its header has the details.
+#
+# The fmt, clippy and test lanes below do not spell out their own commands. They call
+# etc/ci-lanes.sh, which etc/test-and-attest.sh also calls, so what the merge queue
+# enforces and what a maintainer attests locally are the same commands by construction
+# rather than by inspection. Change a lane there, not here.
+name: Pull Request and Merge Queue Checks
+
 on:
   pull_request:
     branches: [main]
+    # `review_requested` is load-bearing, not cosmetic: `make attest` writes to adiri and
+    # touches nothing on GitHub, so after attesting a maintainer requests a review to
+    # re-run `verify-on-chain` on the same sha. A push would mint a new, unattested sha.
     types: [opened, synchronize, reopened, review_requested, ready_for_review]
+  # No `branches:` filter here -- on this event the ref is the queue's temporary
+  # `gh-readonly-queue/main/...` branch, which a `[main]` filter would not match.
+  merge_group:
+    types: [checks_requested]
 
-# Cancel in-progress runs when a new commit is pushed to the same PR
+# Cancel superseded runs on a PR. Never on a merge group: those runs are not superseded
+# (each tests a distinct candidate commit), and a cancelled run reports as a non-success
+# conclusion, which ejects the PR from the queue. `github.head_ref` is empty on
+# `merge_group`, so the group's own ref keys the group and each run gets its own slot.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.merge_group.head_ref || github.head_ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Everything here only reads the repository; the attestation lane reads a public RPC and
+# needs no secrets (least privilege, CodeQL actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
+# Identical to cache-deps.yaml on purpose: every variable here is hashed into the cache key.
 env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: "-D warnings -D unused_extern_crates"
@@ -18,29 +74,89 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  # maintainers test and attest locally
-  skip-maintainers:
+  # Decides whether the compile-and-test lanes run at all.
+  #
+  # On a `pull_request` they are skipped for a draft, and for a maintainer-authored PR --
+  # a maintainer runs a strictly larger suite locally and attests it (etc/test-and-attest.sh),
+  # so re-running a subset of it on GitHub buys nothing.
+  #
+  # Neither reason survives into the merge queue. The queue's commit is main + this PR,
+  # which no local run covered no matter who authored it, so every lane runs there for
+  # every author. That is the coverage the attestation cannot provide and the reason the
+  # queue is worth having. Note this used to hold only by accident: on `merge_group` the
+  # PR-author login is empty, so the maintainer test happened to evaluate false.
+  ci-scope:
+    name: ci-scope
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
-      is_maintainer: ${{ steps.check.outputs.is_maintainer }}
+      run_lanes: ${{ steps.decide.outputs.run_lanes }}
+    steps:
+      - id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "merge_group" ]]; then
+            echo "merge queue: running every lane on the merged commit"
+            echo "run_lanes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # GitHub logins are case-insensitive and the event carries whatever spelling
+          # the account currently uses, so compare in lowercase. Keep this list lowercase.
+          MAINTAINERS=("grantkee" "sstanfield" "mavenrain" "huwonk")
+          run=true
+          if [[ " ${MAINTAINERS[*]} " == *" ${PR_AUTHOR,,} "* ]]; then
+            echo "maintainer PR (${PR_AUTHOR}): lanes covered by the local attested run"
+            run=false
+          elif [[ "$PR_DRAFT" == "true" ]]; then
+            echo "draft PR: lanes deferred until ready for review"
+            run=false
+          fi
+          echo "run_lanes=${run}" >> "$GITHUB_OUTPUT"
+
+  # The on-chain attestation gate: is this PR's head commit hash in the attestation
+  # registry on adiri? A maintainer writes it there with `make attest`, after the full
+  # local suite (fmt, clippy, both test lanes, and the e2e suites CI cannot afford) has
+  # passed on exactly that commit.
+  #
+  # `pull_request` only, by design. The merge group's commit did not exist when any local
+  # suite ran, so it cannot be attested, and a lane that demanded it would hang the queue
+  # until the timeout ejected the PR. Nor does it need checking there: required checks
+  # must pass before a PR may enter the queue, so every head that reaches the queue was
+  # verified here first, and a push to a queued PR removes it from the queue with a new
+  # head this lane has to verify again. `CI Success` accepts this job as `skipped` on
+  # `merge_group` and nowhere else.
+  #
+  # No `environment:` here. The job performs a read-only `cast call` against a public RPC
+  # and uses no secrets, and a deployment environment with protection rules attached
+  # would park the merge queue on a manual approval until it timed out.
+  attest:
+    name: verify-on-chain
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - id: check
-        run: |
-          MAINTAINERS=("grantkee" "sstanfield" "MavenRain" "Huwonk")
-          if [[ " ${MAINTAINERS[@]} " =~ " ${{ github.event.pull_request.user.login }} " ]]; then
-            echo "is_maintainer=true" >> $GITHUB_OUTPUT
-          else
-            echo "is_maintainer=false" >> $GITHUB_OUTPUT
-          fi
+
+      # cast, for the read-only registry call
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Verify attestation on adiri
+        env:
+          COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/verify_commit_hash.sh
 
   # Format check - no compilation needed, finishes in ~30s
   fmt:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -51,43 +167,64 @@ jobs:
         run: rustup toolchain install $RUST_NIGHTLY -c rustfmt --profile minimal
 
       - name: Check formatting
-        run: cargo +$RUST_NIGHTLY fmt --all -- --check
+        run: ./etc/ci-lanes.sh fmt
 
-  # Clippy - replaces cargo check, catches more issues
+  # Clippy - replaces cargo check, catches more issues.
+  #
+  # Two passes, default features and then --all-features (see etc/ci-lanes.sh for why one
+  # does not cover the other). The two feature sets unify differently, so each pass
+  # compiles its own artifacts; cache-deps.yaml warms both.
+  #
+  # 45 minutes is a ceiling, not the budget. Warm, the --all-features pass compiled in 20 s
+  # on main (checkout with submodules ~80 s, restore ~20 s), so expect a few minutes. The
+  # ceiling covers the window after a heavy dependency bump before cache-deps has
+  # re-warmed: 11.5 min measured for one pass with a partial cache. A lane anywhere near
+  # 45 min means the cache is broken, not that the build is slow.
   clippy:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
 
+      # Before the cache step: RUST_NIGHTLY is part of the cache key (rust-cache hashes
+      # every CARGO*/RUST* variable in the environment), and cache-deps.yaml sets it at
+      # the same point.
       - name: Read nightly version
         run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> $GITHUB_ENV
 
       - name: Install nightly toolchain
         run: rustup toolchain install $RUST_NIGHTLY -c clippy,rust-src --profile minimal
 
+      # Restore only; cache-deps.yaml writes the entries on main (see the header). The
+      # `prefix-key` deliberately still defaults to v0-rust: the v1-rust entries cache-deps
+      # now writes do not exist until it has run on main, and a fully cold queue run would
+      # hit the timeout. Flip all three cache steps to `prefix-key: v1-rust` in a follow-up
+      # once it has (see .github/ACTIONS.md, "Caches").
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
           shared-key: clippy-cache
-          cache-on-failure: "true"
+          save-if: "false"
 
       - name: Run clippy
-        run: cargo +$RUST_NIGHTLY clippy --locked --all --all-features -- -D warnings
+        run: ./etc/ci-lanes.sh clippy
 
-  # Tests - compile and run with nextest for parallel execution
+  # Tests - compile and run with nextest for parallel execution.
+  #
+  # 45 minutes is a ceiling, not the budget. Warm, every workspace test binary built in
+  # 1 m 48 s on main. The suite's own run time on a GitHub runner is unmeasured (every
+  # recent PR was maintainer-authored and skipped this lane), and the ceiling also covers
+  # a cold dependency build after a heavy bump: 9.5 min measured with a partial cache.
   test:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,28 +239,36 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Restore only; see the clippy job.
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
           shared-key: test-cache
-          cache-on-failure: "true"
+          save-if: "false"
+
+      # Resolves the dependency graph only (compiles nothing; seconds, with the registry
+      # index restored above). The script says why rocksdb must stay out of the default
+      # graph. It runs inside this job to reuse the restored cargo home instead of cloning
+      # reth's git repository again in a job of its own.
+      - name: Assert rocksdb absent from the default feature graph
+        run: ./etc/rocksdb-gate.sh
 
       - name: Run tests
-        run: cargo nextest run --locked --workspace --exclude tn-faucet --no-fail-fast --profile ci
+        # `ci` profile: retries = 2, so a flake is less likely to eject a PR from the
+        # queue and force a rebuild of everything behind it. See etc/ci-lanes.sh.
+        env:
+          NEXTEST_PROFILE: ci
+        run: ./etc/ci-lanes.sh test-default
 
   # Adiri feature lane: the adiri-gated suites only compile under the adiri features, so
-  # the default-feature test job above never builds or runs them - the legacy header
-  # wire-format pins and the frozen pre-fork committee vectors in tn-types, the
-  # consensus-registry fork tests in tn-reth, the pre-fork entry-fee pin in tn-node, the
-  # frozen pre-fork consensus-pack fixtures in tn-storage, and the pre-fork genesis
-  # rejection in tn-config. Every crate that forwards `adiri` and has adiri-gated tests
-  # belongs on this line: one left off silently stops testing its pre-fork lane.
+  # the default-feature test job above never builds or runs them. The package and feature
+  # list lives in etc/ci-lanes.sh, next to the note on which packages are deliberately
+  # left off it. Same 45-minute ceiling as `test`, for the same reasons.
   adiri-test:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -138,50 +283,19 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Restore only (see the clippy job), from the same entry as `test`: cache-deps builds
+      # both test lanes into one target dir, where the adiri variants of the shared
+      # dependencies coexist with the default ones.
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
-          shared-key: adiri-test-cache
-          cache-on-failure: "true"
+          shared-key: test-cache
+          save-if: "false"
 
       - name: Run adiri-gated tests
-        run: cargo nextest run --locked -p tn-types -p tn-reth -p tn-node -p tn-storage -p tn-config --features tn-types/adiri,tn-reth/adiri,tn-reth/test-utils,tn-node/adiri,tn-storage/adiri,tn-config/adiri --no-fail-fast --profile ci
-
-  # Guard: rocksdb (librocksdb-sys, the entire RocksDB C++ engine and the single largest
-  # native compile in the tree) must stay out of the default feature graph. It is gated
-  # behind the off-by-default `rocksdb` feature; this catches a future reth bump whose
-  # default set silently re-introduces it. Resolves the graph only - nothing is compiled.
-  rocksdb-gate:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
-        with:
-          shared-key: rocksdb-gate-cache
-          cache-on-failure: "true"
-
-      - name: Assert rocksdb absent from default feature graph
-        run: |
-          # Structured check: count rocksdb packages in the feature-resolved metadata
-          # graph instead of scraping cargo's error wording. A cargo/jq failure fails
-          # the assignment (bash -e -o pipefail), so infrastructure errors fail closed.
-          hits=$(cargo metadata --locked --format-version 1 \
-            | jq '[.resolve.nodes[].id | select(test("[/#]rocksdb@"))] | length')
-          if [[ "$hits" -ne 0 ]]; then
-            echo "librocksdb-sys re-entered the default dependency graph ($hits rocksdb package(s) resolved):"
-            cargo tree --locked -e features -i rocksdb || true
-            exit 1
-          fi
-          echo "rocksdb absent from the default feature graph"
+        env:
+          NEXTEST_PROFILE: ci
+        run: ./etc/ci-lanes.sh test-adiri
 
   # Guard: pinned consensus-registry reads (committee membership, epoch records, epoch state,
   # worker fee configs) resolve historical state through `state_by_block_hash`, which reth fails
@@ -191,32 +305,98 @@ jobs:
   # behind `NodeConfig::prune_config`.
   # Greps only - nothing is resolved or compiled, so no toolchain or cache is needed.
   archive-mode-gate:
-    needs: skip-maintainers
-    if: >-
-      needs.skip-maintainers.outputs.is_maintainer == 'false' &&
-      github.event.pull_request.draft != true
+    needs: ci-scope
+    if: needs.ci-scope.outputs.run_lanes == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - name: Assert no pruning entry point in the node
         run: ./etc/archive-mode-guard.sh
 
-  # Gate job for branch protection - depends on all checks
+  # The one required status check, for branch protection and for the merge queue.
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: always()
-    needs: [fmt, clippy, test, adiri-test, rocksdb-gate, archive-mode-gate]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate]
     steps:
       - name: Check all jobs passed
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RESULTS: ${{ toJSON(needs) }}
         run: |
-          if [[ "${{ needs.fmt.result }}" == "failure" || \
-                "${{ needs.clippy.result }}" == "failure" || \
-                "${{ needs.test.result }}" == "failure" || \
-                "${{ needs.adiri-test.result }}" == "failure" || \
-                "${{ needs.rocksdb-gate.result }}" == "failure" || \
-                "${{ needs.archive-mode-gate.result }}" == "failure" ]]; then
+          set -euo pipefail
+          # Allowlist, not blocklist: every (event, job, result) triple is either named
+          # below as acceptable or fails. The blocklist this replaces let `cancelled` and
+          # any future conclusion through, greening the gate on a job that never produced
+          # a result.
+          #
+          # Every jq call is a plain assignment, so unparseable RESULTS fails the step
+          # under set -e. The old loop read from a process substitution, whose exit status
+          # is discarded, and malformed input printed "All checks passed".
+          case "${EVENT_NAME}" in
+            pull_request|merge_group) ;;
+            *)
+              echo "::error::CI Success does not know the '${EVENT_NAME}' event; only pull_request and merge_group gate main"
+              exit 1
+              ;;
+          esac
+
+          # The job list is asserted, not discovered: a job renamed or dropped from
+          # `needs` would otherwise leave this check silently, or turn up as an unnamed
+          # lane whose `skipped` the pull_request branch below accepts.
+          expected="adiri-test archive-mode-gate attest ci-scope clippy fmt test"
+          actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
+            exit 1
+          fi
+
+          run_lanes=$(jq -r '."ci-scope".outputs.run_lanes // ""' <<<"${RESULTS}")
+          rows=$(jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<<"${RESULTS}")
+
+          failed=0
+          while read -r job result; do
+            case "${EVENT_NAME}:${job}:${result}" in
+              # ci-scope decides whether the lanes ran; nothing below can be trusted if it
+              # did not itself succeed.
+              *:ci-scope:success) echo "  ok       ${job}" ;;
+              *:ci-scope:*)
+                echo "::error::ci-scope: ${result}"
+                failed=1
+                ;;
+              # The attestation runs on the pull request only (see the attest job): it
+              # must succeed there, and must not have run in the queue.
+              pull_request:attest:success) echo "  ok       ${job}" ;;
+              merge_group:attest:skipped) echo "  skipped  ${job} (verified at queue entry)" ;;
+              *:attest:*)
+                echo "::error::attest: ${result} on ${EVENT_NAME}"
+                failed=1
+                ;;
+              *:*:success) echo "  ok       ${job}" ;;
+              # A skipped lane is the maintainer/draft bypass and nothing else: ci-scope
+              # must have said the lanes were not to run. In the queue nothing may be
+              # skipped -- a skipped lane there means the merged commit went untested,
+              # which is the one thing the queue exists to prevent.
+              pull_request:*:skipped)
+                if [[ "${run_lanes}" == "false" ]]; then
+                  echo "  skipped  ${job} (ci-scope: covered by the attested local run)"
+                else
+                  echo "::error::${job} was skipped although ci-scope asked for the lanes to run"
+                  failed=1
+                fi
+                ;;
+              *)
+                echo "::error::${job}: ${result} on ${EVENT_NAME}"
+                failed=1
+                ;;
+            esac
+          done <<<"${rows}"
+
+          if [[ "${failed}" -ne 0 ]]; then
             echo "One or more checks failed"
             exit 1
           fi
