@@ -16,6 +16,7 @@ use tn_config::GOVERNANCE_SAFE_ADDRESS;
 use tn_reth::mintCall;
 use tn_reth::{
     payload::TNPayload,
+    system_calls::PRECOMPILE_GENESIS_BYTECODE,
     test_utils::{precompile_test_utils::GENESIS_SUPPLY, TransactionFactory},
     totalSupplyCall, ExecutedBlock, NewCanonicalChain, RethChainSpec, RethEnv,
     TELCOIN_PRECOMPILE_ADDRESS,
@@ -175,18 +176,27 @@ impl PipelineTestEnv {
                     .with_balance(governance_safe_balance)
                     .with_code(Some(Bytes::from_static(GOVERNANCE_FORWARDER_BYTECODE))),
             ),
-            // Precompile account with balance and total supply storage
+            // Precompile account with balance and total supply storage.
+            //
+            // `extend_accounts` replaces the canonical `0x7e1` entry inherited from
+            // `test_genesis()` rather than merging into it, so the genesis code has to be restated
+            // here. Without it the account is code-less, and once its balance reaches zero (a full
+            // burn of the pool) it is empty by EIP-158 and gets cleared at the end of the block
+            // that touched it - taking the total supply slot with it.
             (
                 TELCOIN_PRECOMPILE_ADDRESS,
-                GenesisAccount::default().with_balance(precompile_balance).with_storage(Some({
-                    let mut storage = std::collections::BTreeMap::new();
-                    // Slot 100 = totalSupply
-                    storage.insert(
-                        tn_types::B256::from(U256::from(100)),
-                        tn_types::B256::from(total_supply),
-                    );
-                    storage
-                })),
+                GenesisAccount::default()
+                    .with_balance(precompile_balance)
+                    .with_code(Some(Bytes::from_static(PRECOMPILE_GENESIS_BYTECODE)))
+                    .with_storage(Some({
+                        let mut storage = std::collections::BTreeMap::new();
+                        // Slot 100 = totalSupply
+                        storage.insert(
+                            tn_types::B256::from(U256::from(100)),
+                            tn_types::B256::from(total_supply),
+                        );
+                        storage
+                    })),
             ),
         ];
         #[cfg(feature = "faucet")]

@@ -280,7 +280,48 @@ impl ConsensusOutput {
     pub fn parent_hash(&self) -> ConsensusHeaderDigest {
         self.inner.parent_hash
     }
+
+    /// The executed block's `mix_hash` (EVM `PREVRANDAO`) for the payload at `batch_index`.
+    ///
+    /// Post-fork ([`crate::forks::prevrandao_seed_active`] for the committing leader's
+    /// epoch), the value is `keccak256` over [`PREVRANDAO_DOMAIN`], the epoch seed chain
+    /// value as of this commit ([`Self::committee_shuffle_seed`]), the consensus block
+    /// number, and the batch index (integers little-endian). Every input is fixed by the
+    /// committed order: the seed chain folds only digest-pinned deterministic BLS seed
+    /// signatures, so transaction bytes, transaction ordering, and batch selection cannot
+    /// vary the result. This closes the grinding channel of #1247, where both halves of the
+    /// legacy XOR commit to transaction bytes and let a committing leader enumerate
+    /// candidate `PREVRANDAO` values by re-cutting the payload it proposes.
+    ///
+    /// Pre-fork, the legacy derivation is preserved byte-identically for replay: the
+    /// consensus header digest XOR `batch_digest`. The empty epoch-closing block passes
+    /// [`B256::ZERO`], which reduces the XOR to the bare consensus header digest, exactly
+    /// the value the engine used for that path.
+    pub fn prev_randao(&self, batch_index: usize, batch_digest: B256) -> B256 {
+        if crate::forks::prevrandao_seed_active(self.leader().epoch()) {
+            seeded_prev_randao(self.committee_shuffle_seed(), self.number(), batch_index)
+        } else {
+            let output_digest: B256 = self.digest().into();
+            output_digest ^ batch_digest
+        }
+    }
 }
+
+/// The post-fork `PREVRANDAO` derivation over the raw committed inputs (#1247).
+///
+/// A free function so the exact byte layout is pinnable by unit tests under every feature
+/// set; [`ConsensusOutput::prev_randao`] owns the fork dispatch.
+fn seeded_prev_randao(seed: B256, number: u64, batch_index: usize) -> B256 {
+    let number = number.to_le_bytes();
+    let index = (batch_index as u64).to_le_bytes();
+    keccak256([PREVRANDAO_DOMAIN, seed.as_slice(), number.as_slice(), index.as_slice()].concat())
+}
+
+/// Domain tag for the post-fork `PREVRANDAO` derivation ([`ConsensusOutput::prev_randao`]).
+///
+/// Versioned like the seed-chain domains (`TN_EPOCH_SEED_*_V1`) so any future change to the
+/// derivation can separate its outputs from this one's.
+const PREVRANDAO_DOMAIN: &[u8] = b"TN_PREVRANDAO_V1";
 
 impl Hash<{ crypto::DIGEST_LENGTH }> for ConsensusOutput {
     type TypedDigest = ConsensusHeaderDigest;
@@ -581,3 +622,106 @@ crate::crypto::digest_newtype! {
 }
 
 // See test_utils output_tests.rs for this modules tests.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an output over `digests` with a default single-header sub-dag, so two outputs
+    /// differ only in their committed payload digests.
+    fn output_with_digests(number: u64, digests: Vec<BlockHash>) -> ConsensusOutput {
+        ConsensusOutput::new(
+            CommittedSubDag::new_with_headers_for_test(vec![Header::default()]),
+            ConsensusHeaderDigest::default(),
+            number,
+            false,
+            digests.into(),
+            Vec::new(),
+        )
+    }
+
+    /// Pin the exact post-fork byte layout: keccak256 of the versioned domain tag, the seed
+    /// chain value, then the consensus block number and batch index as little-endian u64s.
+    #[test]
+    fn seeded_prev_randao_pins_the_exact_derivation() {
+        let seed = B256::repeat_byte(0xAB);
+        let expected = keccak256(
+            [
+                b"TN_PREVRANDAO_V1".as_slice(),
+                seed.as_slice(),
+                7u64.to_le_bytes().as_slice(),
+                3u64.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        assert_eq!(seeded_prev_randao(seed, 7, 3), expected);
+    }
+
+    /// Every derivation input must move the value, and distinct inputs must not collide.
+    #[test]
+    fn seeded_prev_randao_varies_with_every_input() {
+        let base = seeded_prev_randao(B256::repeat_byte(1), 1, 1);
+        let variants = [
+            seeded_prev_randao(B256::repeat_byte(2), 1, 1),
+            seeded_prev_randao(B256::repeat_byte(1), 2, 1),
+            seeded_prev_randao(B256::repeat_byte(1), 1, 2),
+        ];
+        variants
+            .iter()
+            .for_each(|variant| assert_ne!(&base, variant, "each input must alter the value"));
+        assert_ne!(variants[0], variants[1], "seed and number changes must not collide");
+        assert_ne!(variants[0], variants[2], "seed and index changes must not collide");
+        assert_ne!(variants[1], variants[2], "number and index changes must not collide");
+    }
+
+    /// The anti-grinding property of #1247: two outputs identical except for their committed
+    /// payload digests. Post-fork the executed `PREVRANDAO` is identical across them, so
+    /// re-cutting the payload yields no new candidate values; pre-fork the legacy XOR
+    /// replays byte-identically (and does differ, which is exactly the grinding channel).
+    #[test]
+    fn prev_randao_ignores_payload_construction_post_fork() {
+        let digest_a = BlockHash::repeat_byte(0x11);
+        let digest_b = BlockHash::repeat_byte(0x22);
+        let output_a = output_with_digests(5, vec![digest_a]);
+        let output_b = output_with_digests(5, vec![digest_b]);
+        let randao_a = output_a.prev_randao(0, digest_a);
+        let randao_b = output_b.prev_randao(0, digest_b);
+        if crate::forks::prevrandao_seed_active(output_a.leader().epoch()) {
+            let expected = seeded_prev_randao(output_a.committee_shuffle_seed(), 5, 0);
+            assert_eq!(randao_a, expected, "post-fork value must be the seeded derivation");
+            assert_eq!(randao_b, expected, "payload-only changes must not move PREVRANDAO");
+        } else {
+            let header_a: B256 = output_a.digest().into();
+            let header_b: B256 = output_b.digest().into();
+            assert_eq!(randao_a, header_a ^ digest_a, "pre-fork arm must replay the XOR");
+            assert_eq!(randao_b, header_b ^ digest_b, "pre-fork arm must replay the XOR");
+            assert_ne!(randao_a, randao_b, "the legacy XOR is payload-dependent");
+        }
+    }
+
+    /// Batch indices within one output must yield distinct values, and the empty
+    /// epoch-close call shape (`batch_index` 0, zero batch digest) must reduce pre-fork to
+    /// the bare consensus header digest, the value the engine historically used there.
+    #[test]
+    fn prev_randao_separates_batch_indices_and_replays_the_empty_block() {
+        let digest_a = BlockHash::repeat_byte(0x33);
+        let digest_b = BlockHash::repeat_byte(0x44);
+        let output = output_with_digests(9, vec![digest_a, digest_b]);
+        assert_ne!(
+            output.prev_randao(0, digest_a),
+            output.prev_randao(1, digest_b),
+            "sibling blocks of one output must not share a PREVRANDAO",
+        );
+        let empty = output.prev_randao(0, B256::ZERO);
+        if crate::forks::prevrandao_seed_active(output.leader().epoch()) {
+            assert_eq!(
+                empty,
+                seeded_prev_randao(output.committee_shuffle_seed(), 9, 0),
+                "the empty block must use the seeded derivation at index 0",
+            );
+        } else {
+            let header: B256 = output.digest().into();
+            assert_eq!(empty, header, "a zero batch digest must reduce to the header digest");
+        }
+    }
+}
