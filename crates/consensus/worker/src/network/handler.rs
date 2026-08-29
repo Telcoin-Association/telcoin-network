@@ -278,7 +278,12 @@ where
             return Err(WorkerNetworkError::NonCommitteeBatch);
         }
 
-        let client = self.consensus_config.local_network().clone();
+        let client = self.consensus_config.local_network(self.id).cloned().ok_or_else(|| {
+            WorkerNetworkError::Internal(format!(
+                "no local network instance for worker id {}",
+                self.id
+            ))
+        })?;
         let store = self.consensus_config.node_storage().clone();
         // validate batch - log error if invalid
         self.validator
@@ -295,7 +300,7 @@ where
 
         // notify primary for payload store
         client
-            .report_others_batch(WorkerOthersBatchMessage { digest, worker_id: self.id })
+            .report_others_batch(WorkerOthersBatchMessage::new(digest, self.id))
             .await
             .map_err(|e| WorkerNetworkError::Internal(e.to_string()))?;
 

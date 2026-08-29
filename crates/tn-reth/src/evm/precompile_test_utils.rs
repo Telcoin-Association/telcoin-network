@@ -10,10 +10,13 @@
 //! `tel_precompile::test_utils` as an extension of
 //! [`TestEnv`]. The stateless BLS precompile needs no extra harness.
 
-use crate::evm::{
-    bls_precompile::add_bls_precompile,
-    context::{TNEvmContext, TelcoinEvm},
-    tel_precompile::{add_telcoin_precompile, TELCOIN_PRECOMPILE_ADDRESS},
+use crate::{
+    evm::{
+        bls_precompile::add_bls_precompile,
+        context::{TNEvmContext, TelcoinEvm},
+        tel_precompile::{add_telcoin_precompile, TELCOIN_PRECOMPILE_ADDRESS},
+    },
+    system_calls::PRECOMPILE_GENESIS_BYTECODE,
 };
 use alloy_evm::precompiles::PrecompilesMap;
 use reth_revm::{
@@ -25,7 +28,7 @@ use reth_revm::{
     db::InMemoryDB,
     handler::{instructions::EthInstructions, EthPrecompiles, Handler, MainnetHandler},
     inspector::NoOpInspector,
-    primitives::{address, Address, KECCAK_EMPTY},
+    primitives::{address, Address, Log, KECCAK_EMPTY},
     state::AccountInfo,
     Database, MainContext,
 };
@@ -37,6 +40,10 @@ use tn_types::{Bytes, TxKind, U256};
 /// `precompile_test_utils` even though it (and the TEL token helpers) live with the TEL
 /// precompile.
 pub use crate::evm::tel_precompile::test_utils::GENESIS_SUPPLY;
+
+/// Halt classification, re-exported so tests can name the reason
+/// [`assert_halt_consuming_all_gas`] hands back without importing revm themselves.
+pub use reth_revm::context::result::{HaltReason, OutOfGasError};
 
 // --- Type aliases ---
 
@@ -67,6 +74,12 @@ pub const USER: Address = address!("1111100000000000000000000000000000000001");
 /// Test address used as a transfer/mint recipient in unit and integration tests.
 pub const RECIPIENT: Address = address!("2222222000000000000000000000000000000002");
 
+/// Gas limit [`TestEnv::exec_default`] attaches to a call.
+///
+/// Named so tests that assert on gas consumption can refer to the same number the call was given
+/// instead of repeating the literal.
+pub const DEFAULT_GAS_LIMIT: u64 = 100_000;
+
 // --- Test environment ---
 
 /// Lightweight in-memory EVM environment for testing the native precompiles.
@@ -81,8 +94,9 @@ pub const RECIPIENT: Address = address!("222222200000000000000000000000000000000
 /// - [`GOVERNANCE_SAFE_ADDRESS`] — governance caller
 /// - [`USER`] — unprivileged caller
 ///
-/// The TEL precompile account at [`TELCOIN_PRECOMPILE_ADDRESS`] is funded with 1000 wei and
-/// seeded with [`GENESIS_SUPPLY`] in `totalSupply`.
+/// The TEL precompile account at [`TELCOIN_PRECOMPILE_ADDRESS`] is funded with 1000 wei, given
+/// the same `0xfe` code mainnet genesis assigns it, and seeded with [`GENESIS_SUPPLY`] in
+/// `totalSupply`.
 #[derive(Debug)]
 pub struct TestEnv {
     /// The EVM instance with in-memory state and the precompiles registered.
@@ -128,13 +142,23 @@ impl TestEnv {
             },
         );
 
+        // Mirror the mainnet genesis account for the precompile: zero nonce, the requested
+        // balance, and the bare `INVALID` byte `chain-configs/mainnet/genesis.yaml` assigns
+        // `0x7e1`, taken from `PRECOMPILE_GENESIS_BYTECODE` rather than restated here so the
+        // harness cannot drift from the constant the rest of the crate builds genesis accounts
+        // from. The precompile map short-circuits before any bytecode load, so the byte never
+        // executes; it is there to keep the account out of EIP-158 state clearing once its balance
+        // drains to zero, so tests that burn the pool empty exercise the same account shape
+        // production has. An empty account here would only diverge once something finalizes the
+        // journal, which this harness never does, but the divergence is free to remove.
+        let precompile_code = Bytecode::new_raw(Bytes::from_static(PRECOMPILE_GENESIS_BYTECODE));
         db.insert_account_info(
             TELCOIN_PRECOMPILE_ADDRESS,
             AccountInfo {
                 balance: precompile_bal,
                 nonce: 0,
-                code_hash: KECCAK_EMPTY,
-                code: None,
+                code_hash: precompile_code.hash_slow(),
+                code: Some(precompile_code),
                 ..Default::default()
             },
         );
@@ -267,9 +291,9 @@ impl TestEnv {
         self.exec_value_to(caller, TELCOIN_PRECOMPILE_ADDRESS, calldata, gas_limit, value)
     }
 
-    /// Execute a precompile call with the default gas limit (100,000).
+    /// Execute a precompile call with [`DEFAULT_GAS_LIMIT`].
     pub fn exec_default(&mut self, caller: Address, calldata: Vec<u8>) -> TestResult {
-        self.exec(caller, calldata, 100_000)
+        self.exec(caller, calldata, DEFAULT_GAS_LIMIT)
     }
 
     /// Read the native account balance of `account`.
@@ -317,6 +341,70 @@ impl Default for TestEnv {
     }
 }
 
+// --- Gas probe bytecode ---
+
+/// Call opcode a [`gas_probe_code`] probe uses to reach the precompile.
+///
+/// The variant fixes both the opcode byte and the operand count: `CALL` takes seven stack
+/// operands, `DELEGATECALL` and `STATICCALL` take six, having no `value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeCall {
+    /// `CALL` (`0xf1`) — a direct frame; the only one of the three carrying `value`.
+    Call,
+    /// `DELEGATECALL` (`0xf4`) — an indirect frame, refused by the direct-call guard.
+    DelegateCall,
+    /// `STATICCALL` (`0xfa`) — a read-only frame, refused for every mutating selector.
+    StaticCall,
+}
+
+/// Runtime bytecode that measures what a sub-call into `0x7e1` costs its caller.
+///
+/// Reads `GAS` on either side of a `call`-family instruction that forwards everything available to
+/// the precompile, and returns three words: the gas the frame held before the call, the call's
+/// success flag, and the gas it held after. Nothing propagates the inner failure, so the probe
+/// frame returns normally and the three words reach the transaction output even when the callee
+/// halts — which is the point, since a relay that reverted on failure would erase the measurement.
+///
+/// Disassembly (the `value` push is emitted for [`ProbeCall::Call`] only):
+/// ```text
+///   CALLDATASIZE; PUSH1 0; PUSH1 0; CALLDATACOPY   // mem[0..csize] = calldata
+///   GAS                                            // gas before
+///   PUSH1 0; PUSH1 0; CALLDATASIZE; PUSH1 0;       // retSize, retOffset, argsSize,
+///                                                  // argsOffset
+///   PUSH1 0                                        // value (CALL only)
+///   PUSH2 0x07e1; GAS; <CALL|DELEGATECALL|STATICCALL>
+///   GAS                                            // gas after
+///   PUSH1 0x40; MSTORE                             // mem[64] = gas after
+///   PUSH1 0x20; MSTORE                             // mem[32] = success flag
+///   PUSH1 0x00; MSTORE                             // mem[0]  = gas before
+///   PUSH1 0x60; PUSH1 0; RETURN                    // return those three words
+/// ```
+pub fn gas_probe_code(call: ProbeCall) -> Bytes {
+    let (opcode, pushes_value) = match call {
+        ProbeCall::Call => (0xf1, true),
+        ProbeCall::DelegateCall => (0xf4, false),
+        ProbeCall::StaticCall => (0xfa, false),
+    };
+    let mut code = vec![
+        0x36, 0x60, 0x00, 0x60, 0x00, 0x37, // CALLDATACOPY(0, 0, CALLDATASIZE)
+        0x5a, // GAS -> gas before
+        0x60, 0x00, 0x60, 0x00, // retSize = 0, retOffset = 0
+        0x36, 0x60, 0x00, // argsSize = CALLDATASIZE, argsOffset = 0
+    ];
+    if pushes_value {
+        code.extend_from_slice(&[0x60, 0x00]); // value = 0
+    }
+    code.extend_from_slice(&[
+        0x61, 0x07, 0xe1, 0x5a, opcode, // PUSH2 0x07e1; GAS; <call opcode>
+        0x5a,   // GAS -> gas after
+        0x60, 0x40, 0x52, // MSTORE(0x40, gas after)
+        0x60, 0x20, 0x52, // MSTORE(0x20, success flag)
+        0x60, 0x00, 0x52, // MSTORE(0x00, gas before)
+        0x60, 0x60, 0x60, 0x00, 0xf3, // RETURN(0, 0x60)
+    ]);
+    code.into()
+}
+
 // --- Assertion helpers ---
 
 /// Assert that the result is `Ok(ExecutionResult::Success { .. })` and return the inner result.
@@ -336,6 +424,35 @@ pub fn assert_not_success(result: &TestResult) {
     if let Ok(ExecutionResult::Success { .. }) = result {
         panic!("expected non-success, got Success")
     }
+}
+
+/// Assert that the result is `Ok(ExecutionResult::Halt { .. })` charged the full `gas_limit`, and
+/// return the halt reason.
+///
+/// A precompile rejection is a halt rather than a revert, and revm hands back unspent gas only for
+/// instruction results that are `is_ok_or_revert()`. A rejected top-level transaction is therefore
+/// charged its whole `gas_limit`, and a rejected sub-call loses the entire 63/64 it was forwarded.
+///
+/// [`assert_not_success`] cannot hold that line: it accepts `Err`, `Revert`, and `Halt` alike, so a
+/// revm change or a dispatcher rewrite that turned a rejection into a gas-refunding revert would
+/// leave every rejection test green while the documented gas semantics silently changed. Use this
+/// helper in the tests that exist to back that claim, and keep [`assert_not_success`] for the ones
+/// that only care that the call did not go through.
+///
+/// Panics on `Err(..)`, on `Ok(Success { .. })`, on `Ok(Revert { .. })`, and on a halt whose
+/// `gas_used` is not exactly `gas_limit`.
+pub fn assert_halt_consuming_all_gas(result: &TestResult, gas_limit: u64) -> &HaltReason {
+    let r = result.as_ref().expect("expected Ok(Halt), got Err");
+    let ExecutionResult::Halt { reason, gas_used } = r else { panic!("expected Halt, got {r:?}") };
+    assert_eq!(*gas_used, gas_limit, "a halt spends the whole gas limit");
+    reason
+}
+
+/// Extract the logs emitted by a successful execution, in emission order.
+///
+/// Panics if the result is not a success.
+pub fn extract_logs(result: &TestResult) -> &[Log] {
+    assert_success(result).logs()
 }
 
 /// Extract the raw output bytes from a successful execution result.

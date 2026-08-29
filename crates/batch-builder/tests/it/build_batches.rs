@@ -41,7 +41,9 @@ async fn test_make_batch_el_to_cl() -> eyre::Result<()> {
 
     // Mock the primary client to always succeed.
     let mock_server = MockWorkerToPrimary();
-    network_client.set_worker_to_primary_local_handler(Arc::new(mock_server));
+    network_client
+        .set_worker_to_primary_local_handler(Arc::new(mock_server))
+        .expect("register mock primary handler");
 
     let qw = TestMakeBlockQuorumWaiter::new_test();
     let timeout = Duration::from_secs(5);

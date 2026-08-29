@@ -32,11 +32,11 @@ use tn_reth::{
 };
 use tn_test_utils::default_test_execution_node;
 use tn_types::{
-    gas_accumulator::GasAccumulator, max_batch_gas, now, test_chain_spec_arc, test_genesis,
-    Address, Batch, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch, CommittedSubDag,
-    ConsensusHeaderDigest, ConsensusOutput, Encodable2718, GenesisAccount, Hash as _, Notifier,
-    ReputationScores, SealedBlock, SealedHeader, TaskManager, TransactionTrait as _, B256,
-    EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
+    gas_accumulator::GasAccumulator, keccak256, max_batch_gas, now, test_chain_spec_arc,
+    test_genesis, Address, Batch, BlockHash, Bloom, Bytes, Certificate, CertifiedBatch,
+    CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Encodable2718, GenesisAccount,
+    Notifier, ReputationScores, SealedBlock, SealedHeader, TaskManager, TransactionTrait as _,
+    B256, EMPTY_WITHDRAWALS, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use tokio::{sync::oneshot, time::timeout};
 use tracing::debug;
@@ -491,10 +491,10 @@ async fn test_empty_output_with_close_epoch_still_executes() -> eyre::Result<()>
     // expect header number genesis + 1
     assert_eq!(expected_block.number, expected_block_height);
 
-    // mix hash is xor bitwise with worker sealed block's hash and consensus output
-    // just use consensus output hash if no batches in the round
-    let consensus_output_hash = B256::from(consensus_output.digest());
-    assert_eq!(expected_block.mix_hash, consensus_output_hash);
+    // mix hash is the fork-gated `ConsensusOutput::prev_randao` derivation
+    // the empty epoch-close block uses batch index 0 and a zero batch digest
+    let expected_mix_hash = consensus_output.prev_randao(0, B256::ZERO);
+    assert_eq!(expected_block.mix_hash, expected_mix_hash);
     // bloom expected to be the same bc all proposed transactions should be good
     // ie) no duplicates, etc.
     assert_eq!(expected_block.logs_bloom, genesis_header.logs_bloom);
@@ -1249,8 +1249,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
 
     // basefee intentionally increased with loop
     let mut expected_base_fee = MIN_PROTOCOL_BASE_FEE;
-    let output_digest_1: B256 = consensus_output_1.digest().into();
-    let output_digest_2: B256 = consensus_output_2.digest().into();
 
     // assert blocks are executed as expected
     for (idx, txs) in txs_by_block.iter().enumerate() {
@@ -1267,7 +1265,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         // define re-usable variable here for asserting all values against expected output
         let mut expected_output = &consensus_output_1;
         let mut expected_subdag_index = &sub_dag_index_1;
-        let mut output_digest = output_digest_1;
         let mut expected_parent_beacon_block_root = consensus_output_1.consensus_header_hash();
         let mut expected_batch_index = idx;
 
@@ -1276,7 +1273,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
             // use different output for last 4 blocks
             expected_output = &consensus_output_2;
             expected_subdag_index = &sub_dag_index_2;
-            output_digest = output_digest_2;
             expected_parent_beacon_block_root = consensus_output_2.consensus_header_hash();
             // takeaway 4 to compensate for independent loops for executing batches
             expected_batch_index = idx - 4;
@@ -1314,8 +1310,9 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
             assert_ne!(block.number, 1);
         }
 
-        // mix hash is xor batch's hash and consensus output digest
-        let expected_mix_hash = output_digest ^ all_batches[idx].digest();
+        // mix hash is the fork-gated `ConsensusOutput::prev_randao` derivation
+        let expected_mix_hash =
+            expected_output.prev_randao(expected_batch_index, all_batches[idx].digest());
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
@@ -1778,8 +1775,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
 
     // basefee intentionally increased with loop
     let mut expected_base_fee = MIN_PROTOCOL_BASE_FEE;
-    let output_digest_1: B256 = consensus_output_1.digest().into();
-    let output_digest_2: B256 = consensus_output_2.digest().into();
 
     // assert blocks are execute as expected
     for (idx, txs) in txs_by_block.iter().enumerate() {
@@ -1810,7 +1805,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         // define re-usable variable here for asserting all values against expected output
         let mut expected_output = &consensus_output_1;
         let mut expected_subdag_index = &sub_dag_index_1;
-        let mut output_digest = output_digest_1;
         // We just set this to default in the test...
         let mut expected_parent_beacon_block_root = consensus_output_1.consensus_header_hash();
         let mut expected_batch_index = idx;
@@ -1821,7 +1815,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
             // use different output for last 4 blocks
             expected_output = &consensus_output_2;
             expected_subdag_index = &sub_dag_index_2;
-            output_digest = output_digest_2;
             expected_parent_beacon_block_root = consensus_output_2.consensus_header_hash();
             // takeaway 4 to compensate for independent loops for executing batches
             expected_batch_index = idx - 4;
@@ -1860,8 +1853,9 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
             assert_ne!(block.number, 1);
         }
 
-        // mix hash is xor batch's hash and consensus output digest
-        let expected_mix_hash = all_batches[idx].digest() ^ output_digest;
+        // mix hash is the fork-gated `ConsensusOutput::prev_randao` derivation
+        let expected_mix_hash =
+            expected_output.prev_randao(expected_batch_index, all_batches[idx].digest());
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.
@@ -2382,9 +2376,23 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
             assert_ne!(block.number, 1);
         }
 
-        // mix hash is xor batch's hash and consensus output digest
-        let consensus_output_hash_bytes: B256 = consensus_output_hash.into();
-        let expected_mix_hash = consensus_output_hash_bytes ^ batch_digest;
+        // Independent oracle for the post-fork mix hash (active in this build): recompose
+        // the exact bytes by hand rather than trusting `ConsensusOutput::prev_randao` to
+        // check itself.
+        let expected_mix_hash = keccak256(
+            [
+                b"TN_PREVRANDAO_V1".as_slice(),
+                consensus_output.committee_shuffle_seed().as_slice(),
+                consensus_output.number().to_le_bytes().as_slice(),
+                0u64.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            expected_mix_hash,
+            consensus_output.prev_randao(0, batch_digest),
+            "engine derivation must match the hand-composed oracle",
+        );
         assert_eq!(block.mix_hash, expected_mix_hash);
         // bloom expected to be the same bc all proposed transactions should be good
         // ie) no duplicates, etc.

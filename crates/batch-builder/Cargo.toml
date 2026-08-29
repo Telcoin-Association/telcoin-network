@@ -24,6 +24,7 @@ reth-metrics = { workspace = true }
 
 [dev-dependencies]
 # unit tests
+alloy = { workspace = true }
 assert_matches = { workspace = true }
 metrics-util = { workspace = true }
 tempfile = { workspace = true }

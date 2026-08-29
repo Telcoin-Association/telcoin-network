@@ -43,6 +43,47 @@ use tracing::{error, warn};
 /// the store keeps for a peer.
 pub(crate) const MAX_MULTIADDRS_PER_PEER: usize = 1;
 
+/// Maximum number of distinct observed connection IPs retained for a single peer.
+///
+/// `observed_ip_addresses` is fed only by genuine connection source IPs (`register_incoming` /
+/// `register_outgoing`), never by self-advertised records, so growing it requires the peer to
+/// really present each IP on a connection. One IPv6 /64 makes that cheap enough to matter:
+/// without a bound one peer entry grows without limit (slow memory growth), and every recorded
+/// IP later becomes one entry of the per-ban fan-out (`filter_new_ips_to_ban` yields one `Ban`
+/// action per IP), so the set size is also the per-ban work factor (issue #1251).
+///
+/// This bound is deliberately independent of [`MAX_MULTIADDRS_PER_PEER`]. The two sets must stay
+/// separate: the multiaddr set includes self-advertised addresses and is capped against a
+/// republish flood (GHSA-29v6-gvv5-45gx), while this set must never admit an advertised address
+/// at all, so an attacker cannot feed the per-IP ban counter by advertising an honest peer's IP
+/// (GHSA-6qcj-p42p-779j). Routing this set through the multiaddr cap would collapse that
+/// separation.
+///
+/// The cap refuses a new IP once the set is full; it never admits one by evicting another. Ban
+/// accounting relies on the set only ever growing: per-IP ban counts are incremented from this
+/// set when a ban starts (`add_banned_peer`) and decremented from it again when the ban ends
+/// (`remove_banned_peer`), so the unban-time set must contain every IP the ban-time set held.
+/// An eviction between those two reads would strand a count and keep the IP banned after its
+/// peer is unbanned, penalizing any honest peer that shares the IP (the same harm class
+/// GHSA-6qcj closed for advertised addresses). Refusal keeps growth monotonic, which closes
+/// that stranding direction. The mirror direction (an IP admitted while a ban is in force is
+/// decremented at unban without ever having been incremented) is a pre-existing hazard of
+/// re-reading the live set at both moments; the cap neither causes nor fixes it. A ban-time
+/// snapshot held by `BannedPeers` would close both directions and would then also permit
+/// recency-biased eviction; that is a follow-up, not this change.
+///
+/// The retention trade-off is deliberate: once the cap is full a later connection contributes
+/// no IP, so a ban fans out only to the first addresses the peer presented. This does not
+/// change the containment class. The peer-identity ban is the primary control and the per-IP
+/// fan-out is defense-in-depth: an attacker holding more addresses than any cap re-enters from
+/// a fresh address under refusal and eviction alike, while an attacker holding at most the
+/// cap's worth of addresses has every address recorded. Every retained IP is one the peer
+/// genuinely connected from.
+///
+/// Sixteen leaves generous room for honest churn (dual-stack v4 + v6, DHCP renewal, mobile
+/// roaming) while bounding both the per-peer memory and the per-ban fan-out.
+pub(crate) const MAX_OBSERVED_IPS_PER_PEER: usize = 16;
+
 /// Information about a given connected peer.
 /// Note that bls_public_key and network_key are Optional.
 /// It is possible we need to track a peer before we have network settings.
@@ -72,6 +113,10 @@ pub(super) struct Peer {
     /// [`Self::known_ip_addresses`] and therefore for the per-IP ban counter, so a peer can only
     /// contribute an IP it genuinely presented on a connection. An attacker cannot get an honest
     /// peer's IP banned by advertising it in a signed record (GHSA-6qcj-p42p-779j).
+    ///
+    /// Bounded by [`MAX_OBSERVED_IPS_PER_PEER`] (issue #1251): once full, a new IP is refused,
+    /// never admitted by evicting an old one, so the set grows monotonically and an unban can
+    /// never strand a per-IP ban count behind an eviction.
     observed_ip_addresses: HashSet<IpAddr>,
     /// Connection status of the peer.
     connection_status: ConnectionStatus,
@@ -217,6 +262,20 @@ impl Peer {
         self.observed_ip_addresses.iter().copied()
     }
 
+    /// Record the source IP of an observed connection, keeping the set within
+    /// [`MAX_OBSERVED_IPS_PER_PEER`].
+    ///
+    /// Once the set is full a new IP is refused, never admitted by evicting an old one: ban
+    /// accounting needs the set to grow monotonically so every per-IP count incremented at ban
+    /// time can be decremented at unban time (see [`MAX_OBSERVED_IPS_PER_PEER`]). An IP already
+    /// in the set stays recorded, so re-presenting a known IP at the cap is a no-op, not a loss.
+    fn note_observed_ip(&mut self, multiaddr: &Multiaddr) {
+        let has_capacity = self.observed_ip_addresses.len() < MAX_OBSERVED_IPS_PER_PEER;
+        if let Some(ip) = Self::ip_from_multiaddr(multiaddr).filter(|_| has_capacity) {
+            self.observed_ip_addresses.insert(ip);
+        }
+    }
+
     /// Extract the IP address carried by a multiaddr, if any.
     fn ip_from_multiaddr(addr: &Multiaddr) -> Option<IpAddr> {
         addr.iter().find_map(|protocol| match protocol {
@@ -311,10 +370,9 @@ impl Peer {
     /// This method also updates the number of incoming connections +1.
     pub(super) fn register_incoming(&mut self, multiaddr: Multiaddr) {
         // an observed connection address: record its IP as one the peer genuinely presented, which
-        // is the only kind of IP allowed to feed the per-IP ban counter (GHSA-6qcj-p42p-779j)
-        if let Some(ip) = Self::ip_from_multiaddr(&multiaddr) {
-            self.observed_ip_addresses.insert(ip);
-        }
+        // is the only kind of IP allowed to feed the per-IP ban counter (GHSA-6qcj-p42p-779j);
+        // the recorded set is itself bounded (issue #1251)
+        self.note_observed_ip(&multiaddr);
         // keep the stored multiaddr set bounded (GHSA-29v6-gvv5-45gx); the observed IP recorded
         // above is independent of this set and is never evicted by the cap
         self.note_multiaddr(multiaddr);
@@ -337,10 +395,9 @@ impl Peer {
     /// This method also updates the number of outgoing connections +1.
     pub(super) fn register_outgoing(&mut self, multiaddr: Multiaddr) {
         // an observed connection address: record its IP as one the peer genuinely presented, which
-        // is the only kind of IP allowed to feed the per-IP ban counter (GHSA-6qcj-p42p-779j)
-        if let Some(ip) = Self::ip_from_multiaddr(&multiaddr) {
-            self.observed_ip_addresses.insert(ip);
-        }
+        // is the only kind of IP allowed to feed the per-IP ban counter (GHSA-6qcj-p42p-779j);
+        // the recorded set is itself bounded (issue #1251)
+        self.note_observed_ip(&multiaddr);
         // keep the stored multiaddr set bounded (GHSA-29v6-gvv5-45gx); the observed IP recorded
         // above is independent of this set and is never evicted by the cap
         self.note_multiaddr(multiaddr);
@@ -590,5 +647,90 @@ mod tests {
                 peer.connection_status
             );
         }
+    }
+
+    /// Regression (issue #1251): `observed_ip_addresses` had no size cap. A peer that genuinely
+    /// connects from many distinct source IPs (cheap from one IPv6 /64) grew its entry without
+    /// bound, and every recorded IP later became one `Ban` action in the per-ban fan-out. The
+    /// set must clamp at [`MAX_OBSERVED_IPS_PER_PEER`], and the fan-out source
+    /// (`filter_new_ips_to_ban`) is bounded by the same cap.
+    #[test]
+    fn observed_ips_clamp_at_the_cap() {
+        use std::net::Ipv4Addr;
+        // constructing a `Peer` builds its `Score`, which reads the global score config
+        super::super::score::init_peer_score_config(ScoreConfig::default());
+        let mut peer = Peer::default_for_test();
+
+        // far more distinct genuine source IPs than the cap (TEST-NET-3)
+        (0u8..200).for_each(|i| {
+            peer.register_incoming(create_multiaddr(Some(Ipv4Addr::new(203, 0, 113, i).into())));
+        });
+        assert_eq!(
+            peer.observed_ip_addresses.len(),
+            MAX_OBSERVED_IPS_PER_PEER,
+            "the observed-IP set must clamp at the cap under a many-source-IP flood"
+        );
+
+        // the flood tail was refused, not admitted by evicting an earlier IP
+        let tail: IpAddr = Ipv4Addr::new(203, 0, 113, 199).into();
+        assert!(
+            !peer.known_ip_addresses().any(|ip| ip == tail),
+            "an IP past the cap must be refused"
+        );
+
+        // the other connection direction feeds the same bounded set (TEST-NET-2)
+        peer.register_outgoing(create_multiaddr(Some(Ipv4Addr::new(198, 51, 100, 1).into())));
+        assert_eq!(
+            peer.observed_ip_addresses.len(),
+            MAX_OBSERVED_IPS_PER_PEER,
+            "outgoing registrations must respect the same cap"
+        );
+
+        // the per-ban IP fan-out is bounded by the same cap
+        assert!(
+            peer.filter_new_ips_to_ban(&HashSet::new()).len() <= MAX_OBSERVED_IPS_PER_PEER,
+            "a ban must fan out to at most the cap"
+        );
+    }
+
+    /// Refusal keeps ban accounting symmetric (issue #1251): every IP admitted before the cap is
+    /// still present after an arbitrary flood - growth is monotonic, nothing is evicted - so the
+    /// per-IP ban counts incremented from this set at ban time can all be decremented from it at
+    /// unban time. Re-presenting an admitted IP at the cap stays a no-op, not a loss.
+    #[test]
+    fn observed_ips_refuse_new_entries_instead_of_evicting() {
+        use std::net::Ipv4Addr;
+        // constructing a `Peer` builds its `Score`, which reads the global score config
+        super::super::score::init_peer_score_config(ScoreConfig::default());
+        let mut peer = Peer::default_for_test();
+
+        // admit exactly cap-many IPs (TEST-NET-3)
+        let admitted = (0u8..)
+            .take(MAX_OBSERVED_IPS_PER_PEER)
+            .map(|i| IpAddr::from(Ipv4Addr::new(203, 0, 113, i)))
+            .collect::<Vec<_>>();
+        admitted.iter().for_each(|ip| peer.register_incoming(create_multiaddr(Some(*ip))));
+        assert_eq!(peer.observed_ip_addresses.len(), MAX_OBSERVED_IPS_PER_PEER);
+
+        // flood past the cap from a different range (TEST-NET-2)
+        (0u8..100).for_each(|i| {
+            peer.register_outgoing(create_multiaddr(Some(Ipv4Addr::new(198, 51, 100, i).into())));
+        });
+
+        // every admitted IP survives the flood
+        admitted.iter().for_each(|ip| {
+            assert!(
+                peer.known_ip_addresses().any(|known| known == *ip),
+                "an admitted IP must never be evicted; ban add/remove symmetry depends on it"
+            );
+        });
+
+        // re-presenting an admitted IP at the cap is a no-op admit
+        admitted.iter().take(1).for_each(|ip| peer.register_incoming(create_multiaddr(Some(*ip))));
+        assert_eq!(
+            peer.observed_ip_addresses.len(),
+            MAX_OBSERVED_IPS_PER_PEER,
+            "re-presenting a recorded IP at the cap must not change the set"
+        );
     }
 }
