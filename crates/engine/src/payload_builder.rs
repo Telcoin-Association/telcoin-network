@@ -205,9 +205,14 @@ pub fn execute_consensus_output(
             // round. Post-fork: the seed-chain PREVRANDAO derivation, still unique per batch
             // via the batch index but immune to payload grinding (#1247).
             let mix_hash = output.prev_randao(batch_index, batch_digest);
+            // The block beneficiary that receives this batch's priority fees is the producer's
+            // own `Batch::beneficiary` (#1222). That field is covered by the batch digest, so a
+            // byzantine header that copies another validator's batch digest cannot redirect the
+            // fees: whichever header references the digest, the batch carries its producer's
+            // beneficiary.
             let payload = TNPayload::new(
                 canonical_header,
-                cert_batch.address,
+                batch.beneficiary,
                 batch_index,
                 batch_digest,
                 &output,
