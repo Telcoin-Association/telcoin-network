@@ -1,5 +1,6 @@
 //! Worker network implementation.
 
+use crate::metrics::{SyncShedReason, WorkerMetrics};
 use futures::AsyncWriteExt as _;
 use handle::max_sync_frame_size;
 pub use handle::WorkerNetworkHandle;
@@ -143,6 +144,24 @@ fn try_admit_shed(semaphore: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     semaphore.clone().try_acquire_owned().ok()
 }
 
+/// Reserve a shed slot and record the refusal that follows from the outcome.
+///
+/// A reserved slot means the stream gets a deny task, so it counts as
+/// [`SyncShedReason::Denied`]. No slot means the stream is dropped with no reply,
+/// so it counts as [`SyncShedReason::BudgetExhausted`]. Recording here, at the
+/// decision, keeps the count exact when the best-effort deny write later fails
+/// or the task never runs (#1307).
+fn admit_shed_and_record(
+    semaphore: &Arc<Semaphore>,
+    metrics: &WorkerMetrics,
+) -> Option<OwnedSemaphorePermit> {
+    let permit = try_admit_shed(semaphore);
+    let reason =
+        permit.as_ref().map_or(SyncShedReason::BudgetExhausted, |_| SyncShedReason::Denied);
+    metrics.record_sync_stream_shed(reason);
+    permit
+}
+
 /// Handle inter-node communication between primaries.
 #[derive(Debug)]
 pub struct WorkerNetwork<DB, Events> {
@@ -169,6 +188,12 @@ pub struct WorkerNetwork<DB, Events> {
     /// `Deny(AtCapacity)` write), so [`MAX_CONCURRENT_SHED_TASKS`] caps the
     /// spawn fan-out from over-cap substream bursts.
     shed_task_semaphore: Arc<Semaphore>,
+    /// Prometheus metrics for the inbound sync stream admission path.
+    ///
+    /// Built from the worker id, like the [`RequestHandler`]'s instance: the registry
+    /// keys a series by name and labels, so both record into the same per-worker
+    /// series and no handle is threaded through [`Self::new`].
+    metrics: WorkerMetrics,
     /// Access to the consensus chain.
     consensus_chain: ConsensusChain,
 }
@@ -196,6 +221,7 @@ where
             batch_stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS)),
             sync_stream_peers: Arc::new(Mutex::new(HashMap::new())),
             shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
+            metrics: WorkerMetrics::new_for_worker(id),
             consensus_chain,
         }
     }
@@ -441,8 +467,15 @@ where
     /// gated by [`MAX_CONCURRENT_SHED_TASKS`]: past that budget the stream is
     /// dropped without spawning (the requester sees a reset), so a burst of
     /// over-cap substreams cannot fan out to unbounded tasks (#1254).
+    ///
+    /// Both arms bump `tn_worker.sync_streams_shed_total`, labeled by
+    /// [`SyncShedReason`], at the decision point through
+    /// [`admit_shed_and_record`] (#1307). The `debug!` lines are hidden by the
+    /// default `info` filter, and past the budget the requester sees only a
+    /// generic read error, so the counter is the one signal that distinguishes
+    /// backpressure from a transport fault.
     fn shed_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
-        try_admit_shed(&self.shed_task_semaphore).map_or_else(
+        admit_shed_and_record(&self.shed_task_semaphore, &self.metrics).map_or_else(
             || {
                 debug!(target: "worker::network", %peer, "dropping inbound sync stream: shed budget exhausted");
             },
@@ -480,6 +513,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     // A single fixed peer suffices: every case exercises the per-peer cap for one
     // peer. `BlsPublicKey::default()` is the same key the crate's other unit tests
@@ -539,5 +573,46 @@ mod tests {
         drop(permits);
         assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_SHED_TASKS);
         assert!(try_admit_shed(&semaphore).is_some());
+    }
+
+    // Both shed arms record their own reason: every budgeted slot counts as
+    // `denied`, and the refusal past the budget counts as `budget_exhausted`.
+    // Swapping the two reasons in `admit_shed_and_record` fails this test.
+    #[test]
+    fn shed_admit_records_reason_per_arm() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
+            let metrics = WorkerMetrics::new_for_worker(0);
+            let permits: Vec<_> = (0..MAX_CONCURRENT_SHED_TASKS)
+                .map(|_| admit_shed_and_record(&semaphore, &metrics))
+                .collect();
+            assert!(permits.iter().all(Option::is_some), "every budgeted slot admits");
+            assert!(
+                admit_shed_and_record(&semaphore, &metrics).is_none(),
+                "the request past the budget is refused"
+            );
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let counted = |reason: &str, expected: usize| {
+            snapshot.iter().any(|(key, _, _, value)| {
+                key.key().name() == "tn_worker.sync_streams_shed_total"
+                    && key.key().labels().any(|l| l.key() == "reason" && l.value() == reason)
+                    && matches!(
+                        value,
+                        DebugValue::Counter(n) if usize::try_from(*n).ok() == Some(expected)
+                    )
+            })
+        };
+        assert!(
+            counted("denied", MAX_CONCURRENT_SHED_TASKS),
+            "every budgeted slot records `denied`"
+        );
+        assert!(
+            counted("budget_exhausted", 1),
+            "the refusal past the budget records `budget_exhausted`"
+        );
     }
 }
