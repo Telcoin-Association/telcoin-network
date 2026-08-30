@@ -306,6 +306,16 @@ pub fn seed_signature_fork_epoch_override() -> Option<Epoch> {
 /// history reproduces the same headers. Non-adiri builds carry no such history and are
 /// active from genesis, exactly as with the seed-signature fork (like
 /// [`SEED_SIGNATURE_FORK_EPOCH`], this constant does not exist there).
+///
+/// The full fork schedule is logged at startup so operators can diff it across the fleet
+/// before an arming PR arrives; a compile-time constant that differs between binaries has
+/// no other in-protocol detection.
+///
+/// Accepted residual (#1247): the seed chain closes payload grinding, but the committing
+/// leader can still compute every `PREVRANDAO` its commit will produce before broadcasting
+/// and withhold the proposal if it dislikes them . . . one propose-or-withhold choice per
+/// commit. This fork promotes that bias into an opcode contracts can read; contracts that
+/// need unbiasable randomness must not use `PREVRANDAO` alone.
 #[cfg(feature = "adiri")]
 pub const PREVRANDAO_FORK_EPOCH: Epoch = Epoch::MAX;
 
@@ -680,6 +690,54 @@ mod tests {
                 prevrandao_fork_point_active(epoch),
                 prevrandao_build_fork_active(epoch),
                 "an unset override must not shift the fork point at epoch {epoch}",
+            );
+        });
+    }
+
+    /// The fail-closed conjunction of [`prevrandao_seed_active`]: epochs where the seed
+    /// fork is dormant stay on the legacy arm regardless of the PREVRANDAO fork point.
+    ///
+    /// Pins the seed fork to "never fires" and the PREVRANDAO fork point to "active from
+    /// genesis", the exact ordering the conjunct exists for. If the gate ever consulted the
+    /// fork point alone, every seed-dormant epoch would promote the forkable legacy
+    /// leader-aggregate seed into `PREVRANDAO`; this test observes that ordering directly
+    /// instead of relying on the compile-time `>=` assertion between the two constants.
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn prevrandao_stays_legacy_while_seed_fork_is_dormant() {
+        // Both overrides latch in process-wide `OnceLock`s, so pin them before the first
+        // read and fail loudly if another value latched first (nextest gives each test its
+        // own process). A silent mis-pin would make every assertion below vacuous.
+        std::env::set_var("TN_SEED_SIGNATURE_FORK_EPOCH", u32::MAX.to_string());
+        std::env::set_var("TN_PREVRANDAO_FORK_EPOCH", "0");
+        assert_eq!(
+            seed_signature_fork_epoch_override(),
+            Some(u32::MAX),
+            "TN_SEED_SIGNATURE_FORK_EPOCH latched to another value before this test pinned \
+             it; the override is OnceLock-latched, so run this test in its own process",
+        );
+        assert_eq!(
+            prevrandao_fork_epoch_override(),
+            Some(0),
+            "TN_PREVRANDAO_FORK_EPOCH latched to another value before this test pinned it; \
+             the override is OnceLock-latched, so run this test in its own process",
+        );
+        // The seed gate is `>=`, so `u32::MAX` itself fires it: the dormant grid stops one
+        // below. Every epoch on it has the fork point active (anti-vacuity: the conjunction
+        // is actually being exercised) yet must stay on the legacy arm.
+        [0, 1, 2, u32::MAX - 1].into_iter().for_each(|epoch| {
+            assert!(
+                prevrandao_fork_point_active(epoch),
+                "anti-vacuity: the pinned fork point must be active at epoch {epoch}",
+            );
+            assert!(
+                !seed_signature_active(epoch),
+                "the seed fork must be dormant at epoch {epoch} under the never-fires pin",
+            );
+            assert!(
+                !prevrandao_seed_active(epoch),
+                "seed-dormant epoch {epoch} must stay on the legacy arm even with the \
+                 PREVRANDAO fork point active: the gate fails closed",
             );
         });
     }

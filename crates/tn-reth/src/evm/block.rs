@@ -1606,6 +1606,10 @@ where
             withdrawals_root,
             logs_bloom,
             timestamp,
+            // fork-gated upstream (`ConsensusOutput::prev_randao`, #1247): legacy
+            // `output_digest ^ batch_digest` pre-fork, seed-chain keccak post-fork. The
+            // committing leader keeps one propose-or-withhold choice per commit either way,
+            // so this opcode alone is not unbiasable randomness.
             mix_hash: evm_env.block_env.prevrandao().unwrap_or_default(),
             nonce,
             base_fee_per_gas: Some(evm_env.block_env.basefee()),

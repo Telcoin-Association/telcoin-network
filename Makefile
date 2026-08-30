@@ -161,19 +161,32 @@ TN_SEED_SIGNATURE_FORK_EPOCH ?= 4294967295
 # multi_workers_override_is_inert_when_unset requires a process WITHOUT the variable.
 TN_MULTI_WORKERS_FORK_EPOCH ?= 4294967295
 
+# PREVRANDAO fork epoch for the e2e lanes (#1247). Same shape as the two siblings above,
+# defaulting to u32::MAX so the default lanes run the fork DORMANT (legacy
+# `output_digest ^ batch_digest` mix hash). Unlike the siblings this fork does NOT arm
+# independently: `prevrandao_seed_active` is the fail-closed conjunction of this fork point
+# and the seed-signature fork, and non-adiri builds leave the fork point active from
+# genesis, so without this pin a lane arming the seed fork alone would silently arm the
+# seeded PREVRANDAO derivation too. A lane that wants it arms both knobs deliberately:
+#   TN_SEED_SIGNATURE_FORK_EPOCH=0 TN_PREVRANDAO_FORK_EPOCH=0 make test-e2e
+# Only test-utils builds consult it (tn_types::forks::prevrandao_fork_epoch_override).
+# Set only on name-filtered nextest lines, never a bare --workspace run: tn-types'
+# prevrandao_override_is_inert_when_unset requires a process WITHOUT the variable.
+TN_PREVRANDAO_FORK_EPOCH ?= 4294967295
+
 # run restart integration tests
 test-restarts: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # run epoch integration tests (same filter as the public-tests epoch line). The scheduled
 # Durable e2e lane (#1149) runs this and test-restarts with TN_TEST_MDBX_SYNC=durable
 # exported so every spawned node opens MDBX in Durable.
 test-epochs: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
 
 # run e2e tests
 test-e2e: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
@@ -249,8 +262,8 @@ revert-submodule:
 # workspace tests that don't require faucet credentials
 public-tests: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" cargo nextest run --workspace --no-fail-fast ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # local checks to ensure PR is ready
 pr:

@@ -2376,18 +2376,26 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
             assert_ne!(block.number, 1);
         }
 
-        // Independent oracle for the post-fork mix hash (active in this build): recompose
-        // the exact bytes by hand rather than trusting `ConsensusOutput::prev_randao` to
-        // check itself.
-        let expected_mix_hash = keccak256(
-            [
-                b"TN_PREVRANDAO_V1".as_slice(),
-                consensus_output.committee_shuffle_seed().as_slice(),
-                consensus_output.number().to_le_bytes().as_slice(),
-                0u64.to_le_bytes().as_slice(),
-            ]
-            .concat(),
-        );
+        // Independent oracle for the mix hash: recompose by hand the exact bytes of
+        // whichever derivation this build's fork schedule selects, rather than trusting
+        // `ConsensusOutput::prev_randao` to check itself. The fixture leader sits at epoch
+        // 0, so adiri builds (dormant until `PREVRANDAO_FORK_EPOCH`) take the legacy XOR
+        // arm here and every other build takes the seeded arm from genesis.
+        let expected_mix_hash =
+            if tn_types::forks::prevrandao_seed_active(consensus_output.leader().epoch()) {
+                keccak256(
+                    [
+                        b"TN_PREVRANDAO_V1".as_slice(),
+                        consensus_output.committee_shuffle_seed().as_slice(),
+                        consensus_output.number().to_le_bytes().as_slice(),
+                        0u64.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                )
+            } else {
+                let output_digest: B256 = consensus_output_hash.into();
+                output_digest ^ batch_digest
+            };
         assert_eq!(
             expected_mix_hash,
             consensus_output.prev_randao(0, batch_digest),
