@@ -166,8 +166,10 @@ impl<DB: Database> AuthorityFixture<DB> {
         // These key updates don't return errors...
         let _ = config.update_protocol_key(key_config.primary_public_key());
         let _ = config.update_primary_network_key(key_config.primary_network_public_key());
-        let _ = config
-            .update_worker_network_key(DEFAULT_WORKER_ID, key_config.worker_network_public_key());
+        let _ = config.update_worker_network_key(
+            DEFAULT_WORKER_ID,
+            key_config.worker_network_public_key(DEFAULT_WORKER_ID),
+        );
 
         let consensus_config = ConsensusConfig::new_with_committee_and_prior_epoch_record_for_test(
             config,

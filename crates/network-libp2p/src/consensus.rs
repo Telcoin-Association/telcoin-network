@@ -360,7 +360,7 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
-        let network_key = key_config.worker_network_keypair().clone();
+        let network_key = key_config.worker_network_keypair(worker_id);
         Self::new(
             network_config,
             event_stream,

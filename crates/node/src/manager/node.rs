@@ -89,8 +89,9 @@ pub(crate) struct EpochManager<P, DB> {
     tn_datadir: P,
     /// Primary network handle.
     primary_network_handle: Option<PrimaryNetworkHandle>,
-    /// Worker network handle.
-    worker_network_handle: Option<WorkerNetworkHandle>,
+    /// Worker network handles, indexed by [`WorkerId`](tn_types::WorkerId). Empty until
+    /// [`spawn_node_networks`](Self::spawn_node_networks) runs.
+    worker_network_handles: Vec<WorkerNetworkHandle>,
     /// Key config - loaded once for application lifetime.
     key_config: KeyConfig,
     /// The epoch manager's [ShutdownNotifier] to shutdown all node processes.
@@ -123,9 +124,10 @@ pub(crate) struct EpochManager<P, DB> {
     /// Application-scoped consensus bus. Survives epoch boundaries and is reset between epochs via
     /// `reset_for_epoch`; carries `recent_blocks`, node mode, and other cross-component state.
     consensus_bus: ConsensusBusApp,
-    /// Persistent event stream for the long-running worker network. Outlives any single epoch so
-    /// the worker swarm does not have to be rebuilt on each transition.
-    worker_event_stream: QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>,
+    /// Persistent event streams for the long-running worker networks, one per configured worker
+    /// and indexed by [`WorkerId`](tn_types::WorkerId). Outlive any single epoch so the worker
+    /// swarms do not have to be rebuilt on each transition.
+    worker_event_streams: Vec<QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>>,
 
     /// Final consensus header of the epoch that just closed, carried into the next epoch so it can
     /// be used as the starting point for the new epoch's chain.
@@ -609,7 +611,10 @@ where
             // Don't risk keeping the default CVV active mode...
             consensus_bus.node_mode().send_replace(NodeMode::Observer);
         }
-        let worker_event_stream = QueChannel::new();
+        // one event stream per configured worker, indexed by worker id
+        let worker_event_streams = (0..builder.tn_config.node_info.p2p_info.num_workers())
+            .map(|_| QueChannel::new())
+            .collect();
         let bootstrap_servers = if let Ok(committee_zero) =
             Config::load_from_path_or_default::<Committee>(
                 tn_datadir.committee_path(),
@@ -638,7 +643,7 @@ where
             builder,
             tn_datadir,
             primary_network_handle: None,
-            worker_network_handle: None,
+            worker_network_handles: Vec::new(),
             key_config,
             node_shutdown,
             epoch_boundary: Default::default(),
@@ -646,7 +651,7 @@ where
             reth_db,
             consensus_db,
             consensus_bus,
-            worker_event_stream,
+            worker_event_streams,
             last_consensus_header: None,
             last_forwarded_consensus_number: 0,
             consensus_chain,
@@ -980,8 +985,8 @@ where
     /// Spawn the process-lifetime primary and worker [`ConsensusNetwork`] swarms.
     ///
     /// Each swarm runs as a critical task until node shutdown. The resulting network handles are
-    /// stored on the manager for use by every epoch; the worker handle is seeded with the starting
-    /// `epoch` and its task spawner is refreshed on each epoch transition.
+    /// stored on the manager for use by every epoch; the worker handles are seeded with the
+    /// starting `epoch` and their task spawners are refreshed on each epoch transition.
     async fn spawn_node_networks(
         &mut self,
         node_task_spawner: TaskSpawner,
@@ -1032,59 +1037,75 @@ where
         self.primary_network_handle =
             Some(PrimaryNetworkHandle::new(primary_network_handle, network_config.chain_id()));
 
-        // pass through the worker's RPC descriptor so peers can discover this
-        // validator's JSON-RPC endpoint via kademlia. validators that did not
-        // configure RPC leave the descriptor `None`. fail fast on a misconfigured
-        // endpoint rather than advertising something peers will reject.
-        let worker_p2p = self
-            .builder
-            .tn_config
-            .node_info
-            .p2p_info
-            .worker(DEFAULT_WORKER_ID)
-            .ok_or_else(|| eyre!("no worker {DEFAULT_WORKER_ID} in node info"))?
-            .clone();
-        let worker_rpc = worker_p2p.rpc;
-        if let Some(rpc) = &worker_rpc {
-            rpc.validate()
-                .wrap_err("invalid `node_info.p2p_info.workers[0].rpc` endpoint in node config")?;
-        }
+        //
+        //=== WORKERS
+        //
 
-        // create long-running network task for worker
-        let worker_network = ConsensusNetwork::new_for_worker(
-            DEFAULT_WORKER_ID,
-            network_config,
-            self.worker_event_stream.clone(),
-            self.key_config.clone(),
-            self.consensus_db.clone(),
-            node_task_spawner.clone(),
-            worker_p2p.network_address,
-            worker_rpc,
-        )?;
-        let worker_network_handle = worker_network.network_handle();
-        let node_shutdown = self.node_shutdown.subscribe();
+        // create one long-running swarm per configured worker
+        // the per-epoch code still drives worker 0 only (#557 loops over worker components)
+        let workers = self.builder.tn_config.node_info.p2p_info.workers.clone();
+        self.worker_network_handles = workers
+            .into_iter()
+            .zip(self.worker_event_streams.iter())
+            .enumerate()
+            .map(|(idx, (worker_p2p, worker_event_stream))| {
+                let worker_id = u16::try_from(idx)
+                    .map_err(|_| eyre!("worker index {idx} exceeds the WorkerId range"))?;
 
-        // spawn long-running primary network task
-        node_task_spawner.spawn_critical_task("Worker Network", async move {
-            tokio::select!(
-                _ = &node_shutdown => {
-                    Ok(())
+                // pass through the worker's RPC descriptor so peers can discover this
+                // validator's JSON-RPC endpoint via kademlia. validators that did not
+                // configure RPC leave the descriptor `None`. fail fast on a misconfigured
+                // endpoint rather than advertising something peers will reject.
+                let worker_rpc = worker_p2p.rpc;
+                if let Some(rpc) = &worker_rpc {
+                    rpc.validate().wrap_err_with(|| {
+                        format!(
+                            "invalid `node_info.p2p_info.workers[{worker_id}].rpc` endpoint in \
+                             node config"
+                        )
+                    })?;
                 }
-                res = worker_network.run() => {
-                    warn!(target: "epoch-manager", ?res, "worker network stopped");
-                    Ok(res?)
-                }
-            )
-        });
 
-        // set temporary task spawner - this is updated with each epoch
-        self.worker_network_handle = Some(WorkerNetworkHandle::new(
-            worker_network_handle,
-            node_task_spawner.clone(),
-            DEFAULT_WORKER_ID,
-            epoch,
-            network_config.chain_id(),
-        ));
+                // create long-running network task for this worker
+                let worker_network = ConsensusNetwork::new_for_worker(
+                    worker_id,
+                    network_config,
+                    worker_event_stream.clone(),
+                    self.key_config.clone(),
+                    self.consensus_db.clone(),
+                    node_task_spawner.clone(),
+                    worker_p2p.network_address,
+                    worker_rpc,
+                )?;
+                let worker_network_handle = worker_network.network_handle();
+                let node_shutdown = self.node_shutdown.subscribe();
+
+                // spawn long-running worker network task
+                node_task_spawner.spawn_critical_task(
+                    format!("Worker Network {worker_id}"),
+                    async move {
+                        tokio::select!(
+                            _ = &node_shutdown => {
+                                Ok(())
+                            }
+                            res = worker_network.run() => {
+                                warn!(target: "epoch-manager", ?res, "worker network stopped");
+                                Ok(res?)
+                            }
+                        )
+                    },
+                );
+
+                // set temporary task spawner - this is updated with each epoch
+                Ok(WorkerNetworkHandle::new(
+                    worker_network_handle,
+                    node_task_spawner.clone(),
+                    worker_id,
+                    epoch,
+                    network_config.chain_id(),
+                ))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
 
         Ok(())
     }

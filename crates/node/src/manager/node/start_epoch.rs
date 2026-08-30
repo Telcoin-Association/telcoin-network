@@ -231,7 +231,8 @@ where
             authority_id: public_key.into(),
             execution_address: self.builder.tn_config.node_info.execution_address,
             primary_network_key: self.key_config.primary_network_public_key(),
-            worker_network_key: self.key_config.worker_network_public_key(),
+            // the node record only advertises worker 0 for now (#557)
+            worker_network_key: self.key_config.worker_network_public_key(DEFAULT_WORKER_ID),
             primary_external_address: self
                 .builder
                 .tn_config
@@ -434,10 +435,10 @@ where
 
     /// Construct the epoch's [`WorkerNode`] and bring up its [`WorkerNetwork`].
     ///
-    /// Only worker id [`tn_types::DEFAULT_WORKER_ID`] is supported. The shared
-    /// [`WorkerNetworkHandle`] on the [`EpochManager`] is re-pointed at this epoch's task
-    /// spawner and epoch number before anything else, so batch reporting runs under the
-    /// epoch-scoped lifetime.
+    /// Only worker id [`tn_types::DEFAULT_WORKER_ID`] is driven for now (#557 adds the loop).
+    /// That worker's [`WorkerNetworkHandle`] on the [`EpochManager`] is re-pointed at this
+    /// epoch's task spawner and epoch number before anything else, so batch reporting runs
+    /// under the epoch-scoped lifetime.
     ///
     /// The engine's worker components are initialized on the initial epoch, and also whenever
     /// the engine reports no workers yet — the latter covers the case where the first epoch
@@ -467,9 +468,9 @@ where
         // update the network handle's task spawner for reporting batches in the epoch
         {
             let network_handle = self
-                .worker_network_handle
-                .as_mut()
-                .ok_or_eyre("worker network handle missing from epoch manager")?;
+                .worker_network_handles
+                .get_mut(usize::from(worker_id))
+                .ok_or_else(|| eyre!("no network handle for worker {worker_id}"))?;
 
             network_handle.update_task_spawner(epoch_task_spawner.clone());
             network_handle.update_epoch(consensus_config.committee().epoch());
@@ -518,9 +519,9 @@ where
         });
 
         let network_handle = self
-            .worker_network_handle
-            .as_ref()
-            .ok_or_eyre("worker network handle missing from epoch manager")?
+            .worker_network_handles
+            .get(usize::from(worker_id))
+            .ok_or_else(|| eyre!("no network handle for worker {worker_id}"))?
             .clone();
 
         let validator = engine
@@ -799,7 +800,11 @@ where
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<()> {
         // get event streams for the worker network handler
-        let rx_event_stream = self.worker_event_stream.subscribe();
+        let rx_event_stream = self
+            .worker_event_streams
+            .get(usize::from(*worker_id))
+            .ok_or_else(|| eyre!("no event stream for worker {worker_id}"))?
+            .subscribe();
         debug!(target: "epoch-manager", "spawning worker network for epoch");
 
         let committee_keys: HashSet<BlsPublicKey> = consensus_config
@@ -813,9 +818,10 @@ where
             .committee()
             .bootstrap_servers()
             .iter()
-            // worker 0 always exists (the non-empty list invariant is enforced at deserialize), so
-            // this `filter_map` cannot drop a peer
-            .filter_map(|(k, v)| v.worker(DEFAULT_WORKER_ID).cloned().map(|worker| (*k, worker)))
+            // worker 0 always exists (the non-empty list invariant is enforced at deserialize).
+            // for higher ids a missing entry drops the peer, which is correct: a peer that runs
+            // fewer workers has no swarm for this id
+            .filter_map(|(k, v)| v.worker(*worker_id).cloned().map(|worker| (*k, worker)))
             .collect();
         let next_committee_keys: HashSet<BlsPublicKey> =
             consensus_config.next_committee_keys().iter().copied().collect();
@@ -831,17 +837,24 @@ where
 
         // start listening if the network needs to be initialized
         if initial_epoch {
-            let worker_address = Self::parse_listener_address_for_swarm(
-                "WORKER_LISTENER_MULTIADDR",
-                consensus_config.primary_networkkey(),
-                consensus_config
-                    .worker_address(DEFAULT_WORKER_ID)
-                    .ok_or_eyre("no worker network address in node info")?,
-            )?;
+            let configured_address = consensus_config
+                .worker_address(*worker_id)
+                .ok_or_else(|| eyre!("no network address for worker {worker_id} in node info"))?;
+            // the env override applies to worker 0 only: one env var cannot name N distinct
+            // listeners, so higher ids always bind their configured address
+            let worker_address = if *worker_id == DEFAULT_WORKER_ID {
+                Self::parse_listener_address_for_swarm(
+                    "WORKER_LISTENER_MULTIADDR",
+                    consensus_config.primary_networkkey(),
+                    configured_address,
+                )?
+            } else {
+                configured_address
+            };
             network_handle.inner_handle().start_listening(worker_address).await?;
         }
 
-        let worker_address = consensus_config.worker_address(DEFAULT_WORKER_ID);
+        let worker_address = consensus_config.worker_address(*worker_id);
 
         // always attempt to dial peers for the new epoch
         // the network's peer manager will intercept dial attempts for peers that are already
@@ -870,10 +883,8 @@ where
         // later epoch unless the subscription is explicitly dropped. Skipping alone would also
         // skip the only refresh of this topic's authorized-publisher allowlist, freezing it on
         // the committee that was current when the node last subscribed.
-        let batch_topic = tn_config::LibP2pConfig::worker_batch_topic(
-            consensus_config.chain_id(),
-            DEFAULT_WORKER_ID,
-        );
+        let batch_topic =
+            tn_config::LibP2pConfig::worker_batch_topic(consensus_config.chain_id(), *worker_id);
         let mode = self.consensus_bus.current_node_mode();
         if should_subscribe_batch_topic(mode) {
             debug!(target: "epoch-manager", ?mode, "subscribing to worker batch topic");
