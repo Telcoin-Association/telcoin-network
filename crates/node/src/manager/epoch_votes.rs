@@ -94,10 +94,6 @@ async fn manage_epoch_votes(
                 match result {
                     Ok(None) => break,  // Channel closed- we are done.
                     Ok(Some(vote)) => {
-                        if vote.public_key == me {
-                            // Record our vote if we see it for this epoch so we can revote if/when needed.
-                            my_vote = Some(vote);
-                        }
                         if vote.epoch != epoch_rec.epoch {
                             continue;
                         }
@@ -157,12 +153,6 @@ async fn manage_epoch_votes(
             target: "epoch-manager",
             "reached quorum on epoch close for {}/{epoch_hash}", epoch_rec.epoch
         );
-        // Republish our vote one final time.  This is not strictly needed but if we were the first
-        // validator to close the epoch and we got no timeouts the laggy validators may have
-        // missed our vote- give them one more chance.
-        if let Some(vote) = my_vote {
-            let _ = primary_network.publish_epoch_vote(vote).await;
-        }
         match BlsAggregateSignature::aggregate(&sigs[..], true) {
             Ok(aggregated_signature) => {
                 let signature: BlsSignature = aggregated_signature.to_signature();
@@ -306,16 +296,24 @@ async fn handle_new_vote(
         // We do not have a collector for this epoch so start one and send it this vote.
         let (epoch_vote_tx, epoch_vote_rx) = mpsc::channel(10_000);
         // If we receive a valid vote and aren't collecting votes to certify then start.
-        let Some((epoch_rec, None)) =
-            consensus_chain.epochs().get_epoch_by_hash(vote.epoch_hash).await
-        else {
-            // Missing the record or it is certified.  These were pre-checked when the gossip came
-            // in so this should not happen.
-            error!(
-                target: "epoch-manager",
-                "Received a vote for a missing epoch record- this should not happen! {} {}", vote.epoch, vote.epoch_hash
-            );
-            return;
+        let epoch_rec = match consensus_chain.epochs().get_epoch_by_hash(vote.epoch_hash).await {
+            Some((epoch_rec, None)) => epoch_rec,
+            Some((_, Some(_))) => {
+                info!(
+                    target: "epoch-manager",
+                    "Received a vote for an already certified epoch record {} {}- ignoring.", vote.epoch, vote.epoch_hash
+                );
+                return;
+            }
+            None => {
+                // Missing the record.  These were pre-checked when the gossip came
+                // in so this should not happen.
+                error!(
+                    target: "epoch-manager",
+                    "Received a vote for a missing epoch record- this should not happen! {} {}", vote.epoch, vote.epoch_hash
+                );
+                return;
+            }
         };
         // Spawn the vote collector in response to a vote if it was missing.
         // This allows the possibility of recovering a cert with a republished vote even if stale.
@@ -340,6 +338,18 @@ async fn handle_new_vote(
             }
             vote_queues.push_back((vote.epoch, epoch_vote_tx));
         }
+    }
+}
+
+/// Send an epoch vote to the new_epoch_votes channel and log an error.
+/// Note, this is not async since blocking at the callsite will most likely
+/// wedge an epoch vote collector.
+fn new_epoch_vote(consensus_bus: &ConsensusBusApp, epoch_vote: EpochVote) {
+    if let Err(e) = consensus_bus.new_epoch_votes().try_send(epoch_vote) {
+        error!(
+            target: "epoch-manager",
+            "Failed to send vote {} for epoch {} on internal bus: {e}", epoch_vote.epoch_hash, epoch_vote.epoch
+        );
     }
 }
 
@@ -411,12 +421,7 @@ pub(crate) fn spawn_epoch_vote_collector(
                         // Sending our vote to this channel will trigger us to start the vote collector when we get it.
                         // The other committee members of last epoch should also do the same.
                         // This should not happen and if it does certification may fail again but retry after an epoch anyway.
-                        if consensus_bus.new_epoch_votes().send(epoch_vote).await.is_err() {
-                            error!(
-                                target: "epoch-manager",
-                                "Failed to send vote {} for epoch {} on internal bus- this is a critical error", epoch_vote.epoch_hash, epoch_vote.epoch
-                            );
-                        }
+                        new_epoch_vote(&consensus_bus, epoch_vote);
                         let _ = primary_network.publish_epoch_vote(epoch_vote).await;
                     }
                 }
@@ -432,12 +437,7 @@ pub(crate) fn spawn_epoch_vote_collector(
                         "publishing epoch record vote for epoch {} {epoch_hash}", epoch_rec.epoch,
                     );
                     // Sending our vote to this channel will trigger us to start the vote collector when we get it.
-                    if consensus_bus.new_epoch_votes().send(epoch_vote).await.is_err() {
-                        error!(
-                            target: "epoch-manager",
-                            "Failed to send vote {} for epoch {} on internal bus- this is a critical error", epoch_vote.epoch_hash, epoch_vote.epoch
-                        );
-                    }
+                    new_epoch_vote(&consensus_bus, epoch_vote);
                     let primary_network_clone = primary_network.clone();
                     task_spawner.spawn_task("publish_epoch_vote_delayed", async move {
                         // Stagger the outbound gossip (see INITIAL_VOTE_PUBLISH_DELAY) so slower
