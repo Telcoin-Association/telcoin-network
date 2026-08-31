@@ -170,8 +170,8 @@ pub(crate) struct EpochManager<P, DB> {
 /// 3. **Leader counts** — walks the consensus DB in reverse, counting each leader's committed
 ///    blocks for rounds that have already been executed (i.e. `leader_round <=
 ///    last_executed_round`). Rounds beyond the last executed round are intentionally skipped
-///    because [`EpochManager::replay_missed_consensus`] will re-execute them, which increments
-///    leader counts through the normal payload-builder path.
+///    because `EpochManager::replay_missed_consensus` will re-execute them, which increments leader
+///    counts through the normal payload-builder path.
 ///
 /// Base fees are NOT restored here: the epoch entry seeding in `run_epoch` owns both the worker
 /// count and every worker's base fee for the entered epoch, reading them from the previous

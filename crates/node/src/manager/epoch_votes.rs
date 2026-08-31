@@ -456,11 +456,13 @@ pub(crate) fn spawn_epoch_vote_collector(
 
 /// Re-arm the epoch-vote round for a stored-but-uncertified latest epoch record.
 ///
-/// The vote collector is armed by a vote for an uncertified epoch record, and only the epoch-close
-/// paths write that channel. The channel is in-memory. A node that persists its epoch record and
-/// then shuts down before a vote quorum aggregates never writes the channel again: after a
-/// restart no vote is re-signed, so a fleet that holds records without certificates cannot
-/// self-heal (issue #1198). This startup hook closes that gap.
+/// Normally a fresh `EpochRecord` reaches the collector over the in-memory `epoch_record_watch`
+/// (written by the epoch-close path), and that is what makes the collector re-sign and publish
+/// its vote. A node that persists its epoch record and then shuts down before the round
+/// certifies loses that signal: on restart the watch holds nothing, no vote is re-signed, and a
+/// fleet holding records without certificates cannot self-heal (issue #1198). This startup hook
+/// closes that gap by writing the stored-but-uncertified record back to `epoch_record_watch`,
+/// re-arming the collector exactly as an epoch close would.
 ///
 /// The re-publish is idempotent and bounded. Votes re-sign deterministically (BLS over the
 /// record's digest), the vote handler verifies and deduplicates them, certificate writes are
@@ -473,10 +475,13 @@ pub(crate) fn spawn_epoch_vote_collector(
 /// `save_dummy_epoch0` never persists it, so a stored epoch-0 record at startup is a genuine
 /// closed-epoch-0 record.
 ///
-/// Deliberate scope (the issue defers the rest to the network refactor): this heals the
-/// latest stored record or previous record only, once per process start. A historical gap behind an
-/// already certified later record needs the refactor's certificate backfill, and a round that
-/// expires before enough peers are back up is retried only by the next restart.
+/// Deliberate scope (the issue defers the rest to the network refactor): this inspects only the
+/// latest stored record and re-arms it when it is uncertified; the collector's failsafe then also
+/// retries the record before it (N-1) as a side effect of that arming, when N-1 is likewise
+/// uncertified. So a gap behind an already-certified latest record — the common "N certified,
+/// N-1 uncertified" shape — is NOT healed here (nothing writes the watch, so the failsafe never
+/// fires); that needs the refactor's certificate backfill. A round that expires before enough
+/// peers are back up is retried only by the next restart.
 ///
 /// Call this AFTER [`spawn_epoch_vote_collector`]: the collector subscribes to the watch
 /// inside the spawn call, and a subscription created after a send treats that value as
