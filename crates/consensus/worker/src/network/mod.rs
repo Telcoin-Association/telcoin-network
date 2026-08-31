@@ -1,6 +1,6 @@
 //! Worker network implementation.
 
-use futures::AsyncWriteExt as _;
+use futures::{AsyncWrite, AsyncWriteExt as _};
 use handle::max_sync_frame_size;
 pub use handle::WorkerNetworkHandle;
 use handler::RequestHandler;
@@ -18,8 +18,8 @@ use tn_network_libp2p::{
 };
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
-    BatchValidation, BlsPublicKey, Database, SealedBatch, TaskError, TaskSpawner, TnReceiver,
-    WorkerId, B256,
+    BatchValidation, BlsPublicKey, Database, Epoch, SealedBatch, TaskError, TaskSpawner,
+    TnReceiver, WorkerId, B256,
 };
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
@@ -141,6 +141,62 @@ fn try_admit_sync(
 /// permit frees the slot for the next denied stream.
 fn try_admit_shed(semaphore: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
     semaphore.clone().try_acquire_owned().ok()
+}
+
+/// Shed a denied inbound sync stream on a budgeted task.
+///
+/// Spawns a short-lived task that writes [`DenyReason::AtCapacity`] and closes,
+/// so the requester fails fast and tries elsewhere. The spawn is gated by the
+/// budget in `shed_semaphore` ([`MAX_CONCURRENT_SHED_TASKS`] slots): past that
+/// budget the stream is dropped without spawning (the requester sees a reset),
+/// so a burst of over-cap substreams cannot fan out to unbounded tasks (#1254).
+/// A spawned task holds its budget slot for its lifetime, and the best-effort
+/// deny write is bounded by [`SYNC_REQUEST_READ_TIMEOUT`], so a peer that never
+/// reads returns the slot at the timeout.
+///
+/// Generic over the stream, in the style of `send_sync_batches_over_stream`, so
+/// unit tests drive the full shed path with in-memory writers and a paused
+/// clock (#1314).
+fn shed_sync_stream<S>(
+    shed_semaphore: &Arc<Semaphore>,
+    spawner: &TaskSpawner,
+    epoch: Epoch,
+    peer: BlsPublicKey,
+    stream: S,
+) where
+    S: AsyncWrite + Unpin + Send + 'static,
+{
+    try_admit_shed(shed_semaphore).map_or_else(
+        || {
+            debug!(target: "worker::network", %peer, "dropping inbound sync stream: shed budget exhausted");
+        },
+        |shed_permit| {
+            let task_name = format!("shed-sync-batches-{peer}");
+            spawner.spawn_task(task_name, async move {
+                // hold the shed budget slot for the lifetime of the task
+                let _shed_permit = shed_permit;
+                let mut stream = stream;
+                let max_frame = max_sync_frame_size(epoch);
+                let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
+                debug!(target: "worker::network", %peer, "denying inbound sync stream: at capacity");
+                // bound the best-effort shed write: a peer that applies receive
+                // backpressure and never reads must not pin the shed budget slot.
+                let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
+                    let _ = write_frame(
+                        &mut stream,
+                        &SyncFrame::<WorkerSyncRequest>::Deny(DenyReason::AtCapacity),
+                        &mut encode_buffer,
+                        &mut compressed_buffer,
+                        max_frame,
+                    )
+                    .await;
+                    let _ = stream.close().await;
+                })
+                .await;
+                Ok(())
+            });
+        },
+    )
 }
 
 /// Handle inter-node communication between primaries.
@@ -436,43 +492,18 @@ where
 
     /// Shed a denied inbound sync stream on a budgeted task.
     ///
-    /// Spawns a short-lived task that writes [`DenyReason::AtCapacity`] and
-    /// closes, so the requester fails fast and tries elsewhere. The spawn is
-    /// gated by [`MAX_CONCURRENT_SHED_TASKS`]: past that budget the stream is
-    /// dropped without spawning (the requester sees a reset), so a burst of
-    /// over-cap substreams cannot fan out to unbounded tasks (#1254).
+    /// Thin wrapper over [`shed_sync_stream`]: binds the live network's
+    /// [`Self::shed_task_semaphore`], task spawner, and current epoch to the
+    /// generic shed path (#1314). See the free function for the budget and
+    /// timeout bounds (#1254).
     fn shed_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
-        try_admit_shed(&self.shed_task_semaphore).map_or_else(
-            || {
-                debug!(target: "worker::network", %peer, "dropping inbound sync stream: shed budget exhausted");
-            },
-            |shed_permit| {
-                let epoch = self.network_handle.epoch();
-                let task_name = format!("shed-sync-batches-{peer}");
-                self.network_handle.get_task_spawner().spawn_task(task_name, async move {
-                    // hold the shed budget slot for the lifetime of the task
-                    let _shed_permit = shed_permit;
-                    let mut stream = stream;
-                    let max_frame = max_sync_frame_size(epoch);
-                    let (mut encode_buffer, mut compressed_buffer) = (Vec::new(), Vec::new());
-                    debug!(target: "worker::network", %peer, "denying inbound sync stream: at capacity");
-                    // bound the best-effort shed write: a peer that applies receive
-                    // backpressure and never reads must not pin the shed budget slot.
-                    let _ = tokio::time::timeout(SYNC_REQUEST_READ_TIMEOUT, async {
-                        let _ = write_frame(
-                            &mut stream,
-                            &SyncFrame::<WorkerSyncRequest>::Deny(DenyReason::AtCapacity),
-                            &mut encode_buffer,
-                            &mut compressed_buffer,
-                            max_frame,
-                        )
-                        .await;
-                        let _ = stream.close().await;
-                    })
-                    .await;
-                    Ok(())
-                });
-            },
+        let spawner = self.network_handle.get_task_spawner();
+        shed_sync_stream(
+            &self.shed_task_semaphore,
+            &spawner,
+            self.network_handle.epoch(),
+            peer,
+            stream,
         )
     }
 }
@@ -480,6 +511,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tn_types::TaskManager;
 
     // A single fixed peer suffices: every case exercises the per-peer cap for one
     // peer. `BlsPublicKey::default()` is the same key the crate's other unit tests
@@ -539,5 +575,124 @@ mod tests {
         drop(permits);
         assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_SHED_TASKS);
         assert!(try_admit_shed(&semaphore).is_some());
+    }
+
+    // A writer whose polls never complete, modeling a peer that applies receive
+    // backpressure and never reads its deny reply. `poll_close` pends too, so
+    // only the SYNC_REQUEST_READ_TIMEOUT bound can end a shed task.
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    // The full shed path: each denied stream below the budget spawns a task
+    // that holds its slot while it runs (the budget bounds live tasks, not
+    // spawn attempts), a denied stream past the budget spawns nothing without
+    // corrupting the accounting, and the SYNC_REQUEST_READ_TIMEOUT bound on
+    // the deny write returns every slot even when the peer never reads.
+    #[tokio::test(start_paused = true)]
+    async fn shed_sync_stream_bounds_live_tasks_and_times_out_stuck_writes() {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
+        let task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+
+        // fill the budget: every denied stream below the cap spawns a shed task
+        (0..MAX_CONCURRENT_SHED_TASKS)
+            .for_each(|_| shed_sync_stream(&semaphore, &spawner, 0, peer(), PendingWriter));
+        // let each task start and block on the pending deny write, inside the
+        // SYNC_REQUEST_READ_TIMEOUT bound. The permit is taken at admit time
+        // (before the spawn); the timeout step below proves the running task is
+        // what holds it.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            semaphore.available_permits(),
+            0,
+            "every slot is taken by an admitted shed task"
+        );
+
+        // over budget: no spawn, no negative accounting
+        shed_sync_stream(&semaphore, &spawner, 0, peer(), PendingWriter);
+        tokio::task::yield_now().await;
+        assert_eq!(semaphore.available_permits(), 0);
+
+        // the bounded write trips SYNC_REQUEST_READ_TIMEOUT and every slot returns
+        tokio::time::advance(SYNC_REQUEST_READ_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_SHED_TASKS);
+    }
+
+    // A writer that accepts every byte into a shared buffer and completes, so
+    // the deny write finishes without the timeout.
+    #[derive(Clone, Default)]
+    struct CapturingWriter {
+        /// The bytes the shed task wrote, shared with the test body.
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for CapturingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.bytes.lock().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // A successful shed task writes exactly one Deny(AtCapacity) frame (the
+    // requester-side contract: fail fast and try elsewhere, not a reset) and
+    // returns its budget slot without needing the timeout bound.
+    #[tokio::test(start_paused = true)]
+    async fn shed_sync_stream_writes_deny_at_capacity_and_frees_slot() {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS));
+        let task_manager = TaskManager::default();
+        let spawner = task_manager.get_spawner();
+        let writer = CapturingWriter::default();
+        let bytes = writer.bytes.clone();
+
+        shed_sync_stream(&semaphore, &spawner, 0, peer(), writer);
+        tokio::task::yield_now().await;
+
+        // the task completed with no clock advance: the slot is already back
+        assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_SHED_TASKS);
+
+        // the captured bytes decode to the deny frame
+        let written = bytes.lock().clone();
+        let frame = read_frame::<_, WorkerSyncRequest>(
+            &mut written.as_slice(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            max_sync_frame_size(0),
+        )
+        .await
+        .expect("captured bytes decode to a sync frame");
+        assert!(
+            matches!(frame, SyncFrame::Deny(DenyReason::AtCapacity)),
+            "shed task writes Deny(AtCapacity), got {frame:?}"
+        );
     }
 }
