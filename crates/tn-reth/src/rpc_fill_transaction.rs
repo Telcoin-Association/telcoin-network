@@ -40,7 +40,7 @@ use alloy::rpc::types::TransactionRequest;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_rpc_eth_api::{
-    helpers::{EstimateCall, EthApiSpec, EthTransactions, LoadBlock, LoadFee},
+    helpers::{estimate::EstimateCall, EthApiSpec, EthTransactions, LoadBlock, LoadFee},
     EthApiTypes, RpcNodeCore,
 };
 use reth_rpc_eth_types::FillTransaction;
