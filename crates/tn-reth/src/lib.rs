@@ -131,6 +131,7 @@ pub mod forward;
 mod metrics;
 mod rpc_fee_cap;
 mod rpc_fee_history;
+mod rpc_fill_transaction;
 mod rpc_gas_price;
 pub mod rpc_server_args;
 pub mod snapshot;
