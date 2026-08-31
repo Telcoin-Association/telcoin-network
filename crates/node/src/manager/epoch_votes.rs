@@ -16,7 +16,7 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     watch,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 type VoteQueue = VecDeque<(Epoch, Sender<EpochVote>)>;
 
@@ -33,6 +33,12 @@ pub(crate) const MAX_EPOCH_VOTE_TIMEOUTS: u32 = 24;
 /// Number of peer-recovery attempts [`manage_epoch_votes`] makes (each one
 /// `request_epoch_cert` call) after failing to reach a local vote quorum.
 pub(crate) const EPOCH_CERT_RECOVERY_ATTEMPTS: u32 = 5;
+
+/// Backoff between peer-recovery attempts in [`manage_epoch_votes`]. Without it, a node with no
+/// connected peers gets an immediate `NoPeers` answer and burns all
+/// [`EPOCH_CERT_RECOVERY_ATTEMPTS`] in microseconds; spacing them lets the ladder span real time so
+/// peers can (re)appear. Cancelled promptly by node shutdown.
+const EPOCH_CERT_RECOVERY_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Delay before gossiping our freshly-signed epoch vote, so slower nodes can reach the new epoch
 /// and hold its record before our vote arrives (otherwise they drop it and wait for a republish).
@@ -82,6 +88,10 @@ async fn manage_epoch_votes(
     let me = key_config.primary_public_key();
     // Collect votes from peers
     let mut reached_quorum = false;
+    // Set when our vote channel closes (Ok(None)): this collector was evicted from `vote_queues`
+    // (capacity pop_front dropped our sender) or the node is tearing down. Either way the round is
+    // over — skip peer recovery and its alarm.
+    let mut channel_closed = false;
     let mut timeout = EPOCH_VOTE_RECV_TIMEOUT;
     let mut timeouts = 0;
     let committee_size = epoch_rec.committee.len() as u64;
@@ -92,7 +102,11 @@ async fn manage_epoch_votes(
             _ = &shutdown => return,
             result = tokio::time::timeout(timeout, vote_rx.recv()) => {
                 match result {
-                    Ok(None) => break,  // Channel closed- we are done.
+                    Ok(None) => {
+                        // Channel closed: evicted from `vote_queues` or the node is shutting down.
+                        channel_closed = true;
+                        break;
+                    }
                     Ok(Some(vote)) => {
                         if vote.epoch != epoch_rec.epoch {
                             continue;
@@ -195,6 +209,14 @@ async fn manage_epoch_votes(
         if let Some(vote) = my_vote {
             let _ = primary_network.publish_epoch_vote(vote).await;
         }
+    } else if channel_closed {
+        // Evicted from `vote_queues` (capacity pop_front dropped our sender) or the node is
+        // shutting down: the round is over. No peer recovery and no alarm — this is not a
+        // certification failure, and another collector (or a restart) owns the epoch now.
+        debug!(
+            target: "epoch-manager",
+            "epoch vote round for {epoch_hash} ended before quorum (collector evicted or shutting down)",
+        );
     } else {
         error!(
             target: "epoch-manager",
@@ -202,61 +224,83 @@ async fn manage_epoch_votes(
         );
         let db = consensus_chain.epochs().clone();
         let network = primary_network.clone();
-        // Try to recover by downloading the epoch record and cert from a peer
+        // Try to recover by downloading the epoch record and cert from a peer. This needs only the
+        // network and db; it is bounded by EPOCH_CERT_RECOVERY_ATTEMPTS, spaced by
+        // EPOCH_CERT_RECOVERY_BACKOFF, and cancelled promptly by node shutdown.
         let mut got_epoch_record = false;
-        for _ in 0..EPOCH_CERT_RECOVERY_ATTEMPTS {
-            if vote_rx.is_closed() {
-                // If this channel closed then the sender was dropped and this task needs to exit...
-                break;
-            }
-            match network.request_epoch_cert(Some(epoch_rec.epoch), None).await {
-                Ok((new_epoch_rec, cert)) => {
-                    // Anchor the downloaded record to the locally-trusted committee using the
-                    // same routine the state-sync ingest path uses (see crates/state-sync
-                    // epoch.rs). `verify_with_cert` alone only proves the record is
-                    // self-consistent with its own embedded committee, so a peer could return an
-                    // attacker-committee record self-signed by that committee; the anchor rejects
-                    // it because its committee is not the one derived from prev.next_committee.
-                    if db
-                        .validate_downloaded_record(epoch_rec.epoch, &new_epoch_rec, &cert)
-                        .await
-                        .is_valid()
-                    {
-                        let new_epoch_hash = new_epoch_rec.digest();
-                        if new_epoch_hash != epoch_hash {
-                            error!(
-                                target: "epoch-manager",
-                                "Network came to consensus on epoch record {new_epoch_hash} we expected epoch record {epoch_hash}, we have forked!",
-                            );
-                            // We generated a different record than the network certified, so we
-                            // have forked. A fork is not something a node can safely recover from
-                            // (records are deterministic, so ours is simply wrong) — fail-stop
-                            // rather than adopt the network's record and pretend to recover.
-                            node_shutdown.notify();
-                        } else {
-                            info!(
-                                target: "epoch-manager",
-                                "retrieved cert for epoch {}/{new_epoch_hash} from a peer", epoch_rec.epoch
-                            );
-                            save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
-                        }
-                        got_epoch_record = true;
+        let mut shutting_down = false;
+        for attempt in 0..EPOCH_CERT_RECOVERY_ATTEMPTS {
+            if attempt > 0 {
+                // Space attempts so the ladder spans real time even when peers are absent
+                // (request_epoch_cert returns immediately with NoPeers); cancellable by shutdown.
+                tokio::select! {
+                    _ = &shutdown => {
+                        shutting_down = true;
                         break;
-                    } else {
-                        warn!(
+                    }
+                    _ = tokio::time::sleep(EPOCH_CERT_RECOVERY_BACKOFF) => {}
+                }
+            }
+            tokio::select! {
+                // Shutdown must cancel recovery promptly, even mid-request: request_epoch_cert
+                // blocks on sequential peer-request timeouts that a between-attempts check cannot.
+                _ = &shutdown => {
+                    shutting_down = true;
+                    break;
+                }
+                res = network.request_epoch_cert(Some(epoch_rec.epoch), None) => {
+                    match res {
+                        Ok((new_epoch_rec, cert)) => {
+                            // Anchor the downloaded record to the locally-trusted committee using the
+                            // same routine the state-sync ingest path uses (see crates/state-sync
+                            // epoch.rs). `verify_with_cert` alone only proves the record is
+                            // self-consistent with its own embedded committee, so a peer could return an
+                            // attacker-committee record self-signed by that committee; the anchor rejects
+                            // it because its committee is not the one derived from prev.next_committee.
+                            if db
+                                .validate_downloaded_record(epoch_rec.epoch, &new_epoch_rec, &cert)
+                                .await
+                                .is_valid()
+                            {
+                                let new_epoch_hash = new_epoch_rec.digest();
+                                if new_epoch_hash != epoch_hash {
+                                    error!(
+                                        target: "epoch-manager",
+                                        "Network came to consensus on epoch record {new_epoch_hash} we expected epoch record {epoch_hash}, we have forked!",
+                                    );
+                                    // We generated a different record than the network certified, so we
+                                    // have forked. A fork is not something a node can safely recover from
+                                    // (records are deterministic, so ours is simply wrong) — fail-stop
+                                    // rather than adopt the network's record and pretend to recover.
+                                    node_shutdown.notify();
+                                } else {
+                                    info!(
+                                        target: "epoch-manager",
+                                        "retrieved cert for epoch {}/{new_epoch_hash} from a peer", epoch_rec.epoch
+                                    );
+                                    save_and_persist_with_logs(&db, new_epoch_rec, cert).await;
+                                }
+                                got_epoch_record = true;
+                                break;
+                            } else {
+                                warn!(
+                                    target: "epoch-manager",
+                                    "rejected an unanchored epoch record for epoch {} received from a peer during recovery",
+                                    epoch_rec.epoch,
+                                );
+                            }
+                        }
+                        Err(err) => error!(
                             target: "epoch-manager",
-                            "rejected an unanchored epoch record for epoch {} received from a peer during recovery",
-                            epoch_rec.epoch,
-                        );
+                            "failed to retrieve epoch from a peer {epoch_hash}: {err}",
+                        ),
                     }
                 }
-                Err(err) => error!(
-                    target: "epoch-manager",
-                    "failed to retrieve epoch from a peer {epoch_hash}: {err}",
-                ),
             }
         }
-        if !got_epoch_record {
+        // Alarm only on a genuine fetch failure: not while shutting down, and not if we were
+        // evicted mid-recovery (is_closed() here gates the log only, never the fetch above).
+        if !got_epoch_record && !shutting_down && !vote_rx.is_closed() {
             error!(
                 target: "epoch-manager",
                 "Failed to retrieve an epoch record for epoch {}- We have a missing epoch certificate, if this is not local then sync will be compromised!",
@@ -1797,5 +1841,78 @@ mod epoch_vote_collector_tests {
             0,
             "only the matching vote may be republished; a mismatched self-vote must be ignored",
         );
+    }
+
+    /// Node shutdown must cancel a stalled peer-recovery instead of hanging inside
+    /// `request_epoch_cert`. The mock answers the recovery request by signalling shutdown and then
+    /// never replying, so the only way `manage_epoch_votes` returns is the recovery loop's shutdown
+    /// arm. Without that arm the held reply blocks forever and the outer timeout elapses.
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_cancels_recovery() {
+        let mut rng = StdRng::from_os_rng();
+        let kp1 = BlsKeypair::generate(&mut rng);
+        let kp2 = BlsKeypair::generate(&mut rng);
+        let kp3 = BlsKeypair::generate(&mut rng);
+        let kp4 = BlsKeypair::generate(&mut rng);
+        let pk1 = *kp1.public();
+        let pk2 = *kp2.public();
+        let pk3 = *kp3.public();
+        let pk4 = *kp4.public();
+        let key_config = KeyConfig::new_with_testing_key(kp1);
+
+        let epoch_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk1, pk2, pk3, pk4],
+            ..Default::default()
+        };
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::with_prefix("shutdown_cancels_recovery").unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+
+        let node_shutdown = ShutdownNotifier::new();
+
+        // Mock network: on the recovery request, signal shutdown and HOLD the reply (never respond)
+        // so `request_epoch_cert` would otherwise block forever.
+        let (net_tx, mut net_rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
+        let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
+        {
+            let node_shutdown = node_shutdown.clone();
+            tokio::spawn(async move {
+                // Own the held reply senders so their oneshots stay unresolved.
+                let mut held = Vec::new();
+                while let Some(cmd) = net_rx.recv().await {
+                    if let NetworkCommand::SendRequestAny { reply, .. } = cmd {
+                        node_shutdown.notify();
+                        held.push(reply);
+                    }
+                }
+            });
+        }
+
+        // Hold the vote sender open so the round reaches recovery via timeout exhaustion.
+        let (_vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
+
+        // With the shutdown arm, `manage_epoch_votes` returns; without it, it blocks on the held
+        // reply and the outer timeout elapses.
+        let result = tokio::time::timeout(
+            Duration::from_secs(120),
+            manage_epoch_votes(
+                epoch_rec,
+                key_config,
+                primary_network,
+                vote_rx,
+                consensus_chain,
+                node_shutdown,
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok(), "shutdown must cancel recovery so manage_epoch_votes returns");
     }
 }
