@@ -497,10 +497,9 @@ where
     /// generic shed path (#1314). See the free function for the budget and
     /// timeout bounds (#1254).
     fn shed_inbound_sync_stream(&self, peer: BlsPublicKey, stream: Stream) {
-        let spawner = self.network_handle.get_task_spawner();
         shed_sync_stream(
             &self.shed_task_semaphore,
-            &spawner,
+            self.network_handle.get_task_spawner(),
             self.network_handle.epoch(),
             peer,
             stream,
