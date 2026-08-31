@@ -8,9 +8,10 @@
 //! Note: [`RethEnv::get_rpc_server`] swallows a failure to merge the TN-specific module at
 //! `error!` level; the server still starts and serves the standard namespaces with the TN
 //! module missing. The corrected `eth_feeHistory` install (`crate::rpc_fee_history`),
-//! the `--rpc.txfeecap` guard install (`crate::rpc_fee_cap`), and the epoch-fee
-//! gas-price quote install (`crate::rpc_gas_price`) return an error instead of
-//! logging. The installs' coverage is structural: the same module config drives the
+//! the `--rpc.txfeecap` guard install (`crate::rpc_fee_cap`), the epoch-fee
+//! gas-price quote install (`crate::rpc_gas_price`), and the corrected
+//! `eth_fillTransaction` install (`crate::rpc_fill_transaction`) return an error
+//! instead of logging. The installs' coverage is structural: the same module config drives the
 //! module build and each handler replacement, so every transport that serves the eth
 //! namespace gets the corrected and guarded methods, and a transport without the
 //! namespace has no eth methods to correct or guard. The `Result` keeps a future
@@ -34,6 +35,7 @@ use crate::{
     evm::TnEvmConfig,
     rpc_fee_cap::{CappedEthSubmitServer as _, EthSubmitWithCap, TxFeeCapWei},
     rpc_fee_history::{EpochFeeHistoryServer as _, FeeHistoryWithEpochBaseFee},
+    rpc_fill_transaction::{EpochFillTransactionServer as _, FillTransactionWithEpochBaseFee},
     rpc_gas_price::{EpochGasPriceServer as _, GasPriceWithEpochBaseFee},
     traits::{TNExecution, TelcoinNode},
     worker::WorkerNetwork,
@@ -81,12 +83,13 @@ impl RethEnv {
     ///
     /// `base_fee` is this worker's shared epoch base-fee container: the corrected
     /// `eth_feeHistory` answers its next-block entry from it (`crate::rpc_fee_history`),
-    /// and `eth_gasPrice` / `eth_maxPriorityFeePerGas` quote it directly
-    /// (`crate::rpc_gas_price`).
+    /// `eth_gasPrice` / `eth_maxPriorityFeePerGas` quote it directly
+    /// (`crate::rpc_gas_price`), and `eth_fillTransaction` fills missing fee fields
+    /// from it (`crate::rpc_fill_transaction`).
     ///
     /// Errors when the corrected fee-history method, the `--rpc.txfeecap` guard
-    /// (`crate::rpc_fee_cap`), or the epoch-fee gas-price quotes cannot replace the
-    /// stock eth handlers.
+    /// (`crate::rpc_fee_cap`), the epoch-fee gas-price quotes, or the corrected
+    /// fill-transaction method cannot replace the stock eth handlers.
     pub fn get_rpc_server(
         &self,
         transaction_pool: WorkerTxPool,
@@ -126,6 +129,11 @@ impl RethEnv {
         // schedule instead (issue #1231).
         let fee_history =
             FeeHistoryWithEpochBaseFee::new(eth_api.clone(), self.clone(), base_fee.clone());
+        // Fill `eth_fillTransaction`'s missing fee fields from the worker's epoch fee
+        // before delegating: reth's default fills them from the same oracle and header
+        // sources #1305 removed from the quote methods (issue #1313).
+        let fill_transaction =
+            FillTransactionWithEpochBaseFee::new(eth_api.clone(), base_fee.clone());
         // Quote `eth_gasPrice` / `eth_maxPriorityFeePerGas` from the worker's epoch fee:
         // reth's tip-sampling oracle cannot reach TN's fee level, and a client bump loop
         // drove its answer to the 500-gwei clamp on adiri (issue #1305).
@@ -153,6 +161,11 @@ impl RethEnv {
         // exposes the eth namespace. A transport without the namespace serves no
         // gas-price oracle methods to replace.
         server.add_or_replace_if_module_configured(RethRpcModule::Eth, gas_price.into_rpc())?;
+        // Replace `eth_fillTransaction` on every transport that exposes the eth
+        // namespace. A transport without the namespace serves no fill method to
+        // correct.
+        server
+            .add_or_replace_if_module_configured(RethRpcModule::Eth, fill_transaction.into_rpc())?;
 
         Ok(server)
     }
@@ -182,7 +195,10 @@ mod tests {
     use reth_transaction_pool::noop::NoopTransactionPool;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tn_types::{test_genesis, Address, Bytes, Encodable2718 as _, TaskManager, B256, U256};
+    use tn_types::{
+        test_genesis, Address, Bytes, Decodable2718 as _, Encodable2718 as _, TaskManager,
+        TransactionTrait as _, B256, U256,
+    };
     use url::Url;
 
     /// Build a temp env with the given `--rpc.txfeecap` value (wei) and return the
@@ -332,6 +348,62 @@ mod tests {
             .expect_err("over-cap transaction is refused on the HTTP registration");
         assert!(err.to_string().contains("exceeds the configured cap"), "unexpected error: {err}");
         assert_eq!(pool.pool_size().pending, 0);
+    }
+
+    /// `eth_fillTransaction` prices a bare request from the worker's epoch base fee:
+    /// tip zero and fee cap the container value, not the oracle's suggestion, in both
+    /// the returned `tx` fields and the `raw` encoding. An explicit client tip
+    /// survives and raises the filled cap by itself.
+    #[tokio::test]
+    async fn test_fill_transaction_prices_from_the_epoch_base_fee() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            None,
+            reth::args::RpcServerArgs::default(),
+        )
+        .expect("temp chain env");
+        let pool = reth_env.init_txn_pool().expect("txn pool");
+        let network = WorkerNetwork::new_for_test(reth_env.chainspec());
+        // A fee no other source carries: the genesis header's base fee differs, so a
+        // matching fill proves the container is the source.
+        let server = reth_env
+            .get_rpc_server(pool, network, BaseFeeContainer::new(12_345), RpcModule::new(()))
+            .expect("rpc server with the fill-transaction override");
+        let methods = server.methods_by(|name| name == "eth_fillTransaction");
+        let from = TransactionFactory::new().address();
+
+        let bare = alloy::rpc::types::TransactionRequest {
+            from: Some(from),
+            to: Some(Address::ZERO.into()),
+            value: Some(U256::from(100)),
+            ..Default::default()
+        };
+        let filled: serde_json::Value = methods
+            .call("eth_fillTransaction", rpc_params![bare.clone()])
+            .await
+            .expect("bare request is filled");
+        assert_eq!(filled["tx"]["maxPriorityFeePerGas"], "0x0");
+        assert_eq!(filled["tx"]["maxFeePerGas"], format!("{:#x}", 12_345));
+        // The raw encoding carries the same corrected fees as the `tx` fields.
+        let raw: Bytes = serde_json::from_value(filled["raw"].clone()).expect("raw bytes decode");
+        let decoded = tn_types::TransactionSigned::decode_2718_exact(raw.as_ref())
+            .expect("raw is a 2718 transaction");
+        assert_eq!(decoded.max_priority_fee_per_gas(), Some(0));
+        assert_eq!(decoded.max_fee_per_gas(), 12_345);
+
+        let with_tip =
+            alloy::rpc::types::TransactionRequest { max_priority_fee_per_gas: Some(5), ..bare };
+        let filled: serde_json::Value = methods
+            .call("eth_fillTransaction", rpc_params![with_tip])
+            .await
+            .expect("explicit-tip request is filled");
+        assert_eq!(filled["tx"]["maxPriorityFeePerGas"], "0x5");
+        assert_eq!(filled["tx"]["maxFeePerGas"], format!("{:#x}", 12_350));
     }
 
     /// Every applied [`EthConfig`] value reaches the [`EthApiBuilder`]: build a builder over
