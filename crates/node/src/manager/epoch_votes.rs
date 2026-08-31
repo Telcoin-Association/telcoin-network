@@ -515,7 +515,7 @@ mod epoch_vote_collector_tests {
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::wait_until;
     use tn_test_utils_committee::CommitteeFixture;
-    use tn_types::{BlsKeypair, TaskManager};
+    use tn_types::{encode, BlsKeypair, TaskManager};
 
     /// #1198 startup re-vote: a persisted-but-uncertified latest record re-fires the watch.
     #[tokio::test]
@@ -1421,20 +1421,31 @@ mod epoch_vote_collector_tests {
         let node_shutdown = ShutdownNotifier::new();
         let noticer = node_shutdown.subscribe();
 
-        // Drive the collector directly: the vote windows auto-advance under the paused clock, the
-        // recovery download returns the mismatched record, and the fork is detected. Returns once
-        // shutdown is signalled.
+        // Drive the collector directly: the vote windows auto-advance under the paused clock and
+        // the recovery download returns the mismatched record, so the fork is detected and fires
+        // `node_shutdown.notify()`. The call then returns because the recovery loop breaks after
+        // the download — nothing on that path awaits the notifier.
         manage_epoch_votes(
             local_rec,
             kc1,
             primary_network,
             vote_rx,
-            consensus_chain,
+            consensus_chain.clone(),
             node_shutdown,
         )
         .await;
 
         assert!(noticer.noticed(), "digest mismatch must trigger node shutdown");
+        // Fail-stop, NOT adopt: the peer's forked record must be neither certified nor stored.
+        assert!(
+            consensus_chain.epochs().cert_by_digest(alt_rec.digest()).await.is_none(),
+            "the peer's forked record must not be certified",
+        );
+        assert_eq!(
+            consensus_chain.epochs().latest_record().await.map(|r| r.epoch),
+            Some(0),
+            "no newer record may be adopted from the peer (latest stays epoch 0)",
+        );
     }
 
     /// Dead-collector respawn: a queued collector whose receiver was dropped makes the forward
@@ -1673,12 +1684,14 @@ mod epoch_vote_collector_tests {
         node_shutdown.notify();
     }
 
-    /// `my_vote` capture + timeout republish: with our own vote captured from the stream and quorum
-    /// unreachable (1 of 4), each vote-window timeout republishes our vote to the network.
+    /// `my_vote` capture + timeout republish: our own vote is captured from the stream and, with
+    /// quorum unreachable (1 of 4), republished on each vote-window timeout — and it is the
+    /// *matching* vote, not a self-signed vote for some other record (the capture is guarded on
+    /// `epoch_hash`, `epoch_votes.rs:100`).
     ///
     /// Paused clock fast-forwards the vote windows. `manage_epoch_votes` is driven directly (not
-    /// via the collector), so the timeout republish is the only publisher — any publish proves the
-    /// captured `my_vote` was resent.
+    /// via the collector), so the timeout republish is the only publisher; the mock inspects each
+    /// published payload to confirm which vote was resent.
     #[tokio::test(start_paused = true)]
     async fn test_my_vote_republished_on_timeout() {
         let mut rng = StdRng::from_os_rng();
@@ -1698,6 +1711,15 @@ mod epoch_vote_collector_tests {
             next_committee: vec![pk1, pk2, pk3, pk4],
             ..Default::default()
         };
+        // Same epoch, different content ⇒ different digest. A self-signed vote over this is the
+        // decoy: it clears the `:97` epoch check but fails the `epoch_hash` clause of the capture.
+        let alt_rec = EpochRecord {
+            epoch: 0,
+            committee: vec![pk1, pk2, pk3, pk4],
+            next_committee: vec![pk2, pk3, pk4],
+            ..Default::default()
+        };
+        assert_ne!(alt_rec.digest(), epoch_rec.digest());
 
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let temp_dir = TempDir::with_prefix("my_vote_republish").unwrap();
@@ -1706,27 +1728,46 @@ mod epoch_vote_collector_tests {
                 .await
                 .unwrap();
 
-        // Counting mock network (only Publish commands appear on this path).
-        let publishes = Arc::new(AtomicUsize::new(0));
+        // Our matching vote (the one that must be republished) and its wire encoding. The gossip
+        // payload is `encode(&PrimaryGossip::EpochVote(Box::new(vote)))`; BCS prefixes the enum
+        // variant tag and encodes `Box<T>` transparently, so every payload ends with
+        // `encode(&vote)`. (`PrimaryGossip` is `pub(super)`, so decoding it here is not possible;
+        // this suffix check is the equivalent using only public APIs.)
+        let matching = epoch_rec.sign_vote(&kc1);
+        let expected = encode(&matching);
+
+        // Counting mock network: classify each Publish payload as the matching vote or something
+        // else (the decoy, under an unguarded-capture regression).
+        let matching_pubs = Arc::new(AtomicUsize::new(0));
+        let other_pubs = Arc::new(AtomicUsize::new(0));
         let (net_tx, mut net_rx) =
             tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(100);
         let primary_network = PrimaryNetworkHandle::new_for_test(net_tx);
         {
-            let publishes = publishes.clone();
+            let matching_pubs = matching_pubs.clone();
+            let other_pubs = other_pubs.clone();
             tokio::spawn(async move {
                 while let Some(cmd) = net_rx.recv().await {
-                    if let NetworkCommand::Publish { reply, .. } = cmd {
-                        publishes.fetch_add(1, Ordering::SeqCst);
+                    if let NetworkCommand::Publish { msg, reply, .. } = cmd {
+                        if msg.ends_with(&expected) {
+                            matching_pubs.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            other_pubs.fetch_add(1, Ordering::SeqCst);
+                        }
                         let _ = reply.send(Ok(MessageId::new(b"test")));
                     }
                 }
             });
         }
 
-        // Seed only our own vote: `my_vote` is captured, but 1 of 4 never reaches quorum (3). Hold
-        // the sender open so the round times out (rather than seeing a closed channel).
+        // Seed the matching vote FIRST, then the decoy. `my_vote` is captured but 1 of 4 never
+        // reaches quorum (3), so the round times out and republishes it. Order matters: were the
+        // capture unguarded, the decoy (arriving second) would overwrite `my_vote` — matching-first
+        // is the only order under which the guarded and unguarded code diverge. Hold `vote_tx` open
+        // so the round times out rather than seeing a closed channel.
         let (vote_tx, vote_rx) = mpsc::channel::<EpochVote>(10);
-        vote_tx.send(epoch_rec.sign_vote(&kc1)).await.unwrap();
+        vote_tx.send(matching).await.unwrap();
+        vote_tx.send(alt_rec.sign_vote(&kc1)).await.unwrap();
 
         let node_shutdown = ShutdownNotifier::new();
 
@@ -1740,9 +1781,16 @@ mod epoch_vote_collector_tests {
         )
         .await;
 
+        // Every republish must carry our matching vote; an unguarded capture would republish the
+        // decoy (a self-vote for a different record) instead.
         assert!(
-            publishes.load(Ordering::SeqCst) >= 1,
-            "my_vote must be republished on a vote-window timeout",
+            matching_pubs.load(Ordering::SeqCst) >= 1,
+            "my_vote (the matching vote) must be republished on a vote-window timeout",
+        );
+        assert_eq!(
+            other_pubs.load(Ordering::SeqCst),
+            0,
+            "only the matching vote may be republished; a mismatched self-vote must be ignored",
         );
     }
 }
