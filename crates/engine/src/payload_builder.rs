@@ -149,6 +149,9 @@ pub fn execute_consensus_output(
             .ok_or(TnEngineError::UnknownAuthority(leader.clone()))
             .inspect_err(|e| error!(target: "engine", ?e, "failed to find leader's execution address for empty output"))?;
 
+        // Pre-fork this reduces to the bare consensus header digest (zero batch digest);
+        // post-fork it is the seed-chain PREVRANDAO derivation (#1247).
+        let mix_hash = output.prev_randao(0, B256::ZERO);
         let payload = TNPayload::new(
             canonical_header,
             beneficiary,
@@ -158,8 +161,8 @@ pub fn execute_consensus_output(
             output_digest,
             base_fee_per_gas,
             gas_limit,
-            output_digest, // use output digest for mix hash
-            0,             // Use worker 0 becuase we have to provide on.
+            mix_hash,
+            0, // Use worker 0 becuase we have to provide on.
         );
 
         debug!(target: "engine", "executing empty batch payload");
@@ -197,12 +200,18 @@ pub fn execute_consensus_output(
             let base_fee_per_gas = batch.base_fee_per_gas;
             let gas_limit = max_batch_gas(epoch);
 
-            // apply XOR bitwise operator with worker's digest to ensure unique mixed hash per batch
-            // for round
-            let mix_hash = output_digest ^ batch_digest;
+            // Pre-fork: XOR with the worker's digest for a unique mix hash per batch in the
+            // round. Post-fork: the seed-chain PREVRANDAO derivation, still unique per batch
+            // via the batch index but immune to payload grinding (#1247).
+            let mix_hash = output.prev_randao(batch_index, batch_digest);
+            // The block beneficiary that receives this batch's priority fees is the producer's
+            // own `Batch::beneficiary` (#1222). That field is covered by the batch digest, so a
+            // byzantine header that copies another validator's batch digest cannot redirect the
+            // fees: whichever header references the digest, the batch carries its producer's
+            // beneficiary.
             let payload = TNPayload::new(
                 canonical_header,
-                cert_batch.address,
+                batch.beneficiary,
                 batch_index,
                 batch_digest,
                 &output,
