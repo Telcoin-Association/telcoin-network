@@ -97,6 +97,29 @@ impl RethEnv {
         Ok(self.inner.blockchain_provider.sealed_header_by_hash(hash)?)
     }
 
+    /// TEST-ONLY: the state provider for `hash`, exactly as block building resolves its
+    /// parent state (reth's memory-overlay provider over any unpersisted ancestors).
+    ///
+    /// The #1301 differential tests use it as the oracle: reth's own
+    /// `state_root_with_updates` over this provider must equal the layered
+    /// `OutputTrieOverlay` root for every block of an output.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn state_by_block_hash_for_test(&self, hash: B256) -> TnRethResult<StateProviderBox> {
+        Ok(self.inner.blockchain_provider.state_by_block_hash(hash)?)
+    }
+
+    /// TEST-ONLY: a read-only database provider over this env's database (the
+    /// committed-DB-only family; no in-memory overlay).
+    ///
+    /// Exposes the raw transaction (`tx_ref`) that the #1301 trie-level differential
+    /// test drives both root computations over.
+    #[cfg(any(feature = "test-utils", test))]
+    pub fn database_provider_ro_for_test(
+        &self,
+    ) -> TnRethResult<impl reth_provider::DBProvider + use<>> {
+        Ok(self.inner.blockchain_provider.database_provider_ro()?)
+    }
+
     /// Look up and return the sealed header for block number.
     pub fn sealed_header_by_number(&self, number: u64) -> TnRethResult<Option<SealedHeader>> {
         Ok(self.inner.blockchain_provider.database_provider_ro()?.sealed_header(number)?)
