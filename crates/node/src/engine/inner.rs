@@ -300,7 +300,7 @@ impl ExecutionNodeInner {
         let last_block_number = self.reth_env.last_block_number()?;
         debug!(target: "epoch-manager", ?last_block_number, "restoring last executed output blocks");
         collect_last_output_blocks(
-            |block_num| Ok(self.reth_env.sealed_header_by_number(block_num)?),
+            |block_num| self.reth_env.sealed_header_by_number(block_num).map_err(Into::into),
             last_block_number,
             number,
             self.reth_env.real_header_floor(),
