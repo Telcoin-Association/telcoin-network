@@ -7,6 +7,7 @@ mod economics_props;
 mod pipeline_helpers;
 mod precompile_relays;
 mod recover_drop_props;
+mod trie_overlay;
 
 // testnet
 #[cfg(feature = "faucet")]
