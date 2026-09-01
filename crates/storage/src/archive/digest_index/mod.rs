@@ -7,9 +7,6 @@
 
 pub mod bloom;
 pub mod index;
-/// On-demand benchmark used to detect [`HdxIndex`] performance regressions (see `index_bench.rs`).
-#[cfg(test)]
-mod index_bench;
 pub mod odx_header;
 
 pub use index::{BucketCrcReport, HdxIndex};

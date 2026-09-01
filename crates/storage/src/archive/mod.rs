@@ -10,6 +10,9 @@ pub mod digest_index;
 pub mod error;
 pub mod fxhasher;
 pub mod index;
+/// On-demand benchmark comparing the archive point-lookup indexes (see `index_bench.rs`).
+#[cfg(test)]
+mod index_bench;
 pub mod pack;
 pub mod pack_iter;
 pub mod position_index;
