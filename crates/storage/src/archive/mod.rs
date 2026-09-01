@@ -3,6 +3,7 @@
 //! Implement a simple DB to store archival (previous epoch) data.
 //! Will compress data and manage it in chunks (by epoch for instance) to also work well with sync.
 
+pub mod btree_index;
 pub(crate) mod crc;
 pub mod data_file;
 pub mod digest_index;
