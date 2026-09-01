@@ -296,6 +296,30 @@ impl RethEnv {
             })
     }
 
+    /// Return the lowest block number whose header is guaranteed REAL on this datadir.
+    ///
+    /// `0` on a normally-synced node: every persisted header is real down to genesis. On a
+    /// snapshot-restored datadir, real headers exist only inside the restore window; every block
+    /// below it is a scaffold dummy (`ExecHeader::default()` with a zero hash and zero nonce,
+    /// `SnapshotRestorer::import_chain_scaffold` in `snapshot.rs`). Backward header walks must
+    /// stop here instead of genesis: below this bound the dummy nonces never change, so a walk
+    /// keyed on nonce changes (`last_executed_output_blocks` in `tn-node`) would read every
+    /// header down to block 0 (O(chain-height) reads inside startup) and hand its caller a
+    /// synthetic header (issue #1321).
+    ///
+    /// Only the snapshot block `B` is persisted (the floor marker), not the window start, so the
+    /// bound is derived: the restore admits a window only if it starts at or below
+    /// `max(1, B - (BLOCKHASH_ANCESTORS - 1))` (`import_chain_scaffold`), making that expression
+    /// the lowest block guaranteed real. The actual window may reach one block lower; stopping
+    /// at the guarantee merely trims the walk by that block, while trusting an unpersisted
+    /// window start could admit a dummy read.
+    pub fn real_header_floor(&self) -> u64 {
+        use tn_storage::exec_state_pack::BLOCKHASH_ANCESTORS;
+        self.inner
+            .restored_state_floor
+            .map_or(0, |b| b.saturating_sub(BLOCKHASH_ANCESTORS - 1).max(1))
+    }
+
     /// Initialize the provider factory and related components
     fn init_provider_factory(
         node_config: &NodeConfig<RethChainSpec>,
