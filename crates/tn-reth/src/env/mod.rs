@@ -45,7 +45,10 @@ mod epoch;
 mod execution;
 mod genesis;
 mod helpers;
+mod output_overlay;
 mod rpc;
+
+pub use output_overlay::OutputTrieOverlay;
 
 /// This is a wrapped abstraction around Reth.
 ///
@@ -541,9 +544,9 @@ mod tests {
         // transaction) leaves the headers static file durably at 2 while MDBX stays at 1.
         let output2 = consensus_output_for_tests(2, 0, 2, false);
         let payload2 = TNPayload::new_for_test(header1.clone(), &output2);
-        let anchor_hash = payload2.parent_header.hash();
         let no_txs: Vec<Vec<u8>> = Vec::new();
-        let block2 = env1.build_block_from_batch_payload(payload2, &no_txs, anchor_hash, &[])?;
+        let block2 =
+            env1.build_block_from_batch_payload(payload2, &no_txs, &mut OutputTrieOverlay::new())?;
         {
             let provider_rw = env1.blockchain_provider().database_provider_rw()?;
             provider_rw.save_blocks(vec![block2], reth_provider::SaveBlocksMode::Full)?;
