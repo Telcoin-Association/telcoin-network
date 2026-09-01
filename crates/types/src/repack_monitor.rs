@@ -85,15 +85,20 @@ struct RepackWindow {
 
 /// Shared, cloneable monitor for cross-producer transaction re-packing.
 ///
-/// The engine owns one instance per node process and passes a clone into each consensus-output
+/// Monitoring is opt-in: [`RepackMonitor::default`] is disabled, holds no window, and hashes
+/// nothing, so a node that has not opted in pays nothing. [`RepackMonitor::enabled`] builds
+/// the active monitor.
+///
+/// The engine owns one instance and passes a clone into each consensus-output
 /// execution (the same flow as `GasAccumulator`). Observation happens in execution order on the
 /// single engine thread, so the first record for a hash is the first-ordered batch, which is the
 /// copy that collects the fees. The lock recovers from poisoning because the state is telemetry:
 /// a panicked writer can at worst lose its own in-flight observation.
 #[derive(Clone, Debug, Default)]
 pub struct RepackMonitor {
-    /// Window state shared across clones.
-    inner: Arc<Mutex<RepackWindow>>,
+    /// Window state shared across clones. `None` = monitoring disabled: observations return
+    /// nothing without building a window or hashing a transaction.
+    inner: Option<Arc<Mutex<RepackWindow>>>,
 }
 
 impl std::fmt::Debug for RepackWindow {
@@ -107,6 +112,16 @@ impl std::fmt::Debug for RepackWindow {
 }
 
 impl RepackMonitor {
+    /// Build an active monitor with an empty window.
+    pub fn enabled() -> Self {
+        Self { inner: Some(Arc::new(Mutex::new(RepackWindow::default()))) }
+    }
+
+    /// Whether this monitor observes batches. The default-constructed monitor does not.
+    pub fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
     /// Record one batch's transactions for `producer` inside output `consensus_number` and
     /// return the transactions first carried by a different producer's batch.
     ///
@@ -114,13 +129,27 @@ impl RepackMonitor {
     /// hash. Batches must be observed in execution (ordering) order. A duplicate from the same
     /// producer is not reported: re-gossip of a producer's own batch is not poaching. A reported
     /// duplicate stays attributed to its first producer and is not re-inserted.
+    ///
+    /// A disabled monitor returns an empty list and hashes nothing.
     pub fn observe_batch(
         &self,
         consensus_number: u64,
         producer: Address,
         raw_txs: &[Vec<u8>],
     ) -> Vec<RepackedTx> {
-        let mut window = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.inner.as_ref().map_or_else(Vec::new, |inner| {
+            Self::observe(inner, consensus_number, producer, raw_txs)
+        })
+    }
+
+    /// Record one batch into the active window. See [`Self::observe_batch`].
+    fn observe(
+        inner: &Mutex<RepackWindow>,
+        consensus_number: u64,
+        producer: Address,
+        raw_txs: &[Vec<u8>],
+    ) -> Vec<RepackedTx> {
+        let mut window = inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let RepackWindow { outputs, seen, total_txs, repacked_total } = &mut *window;
 
         // Reuse the entry for this output when the previous batch was in the same output,
@@ -188,8 +217,12 @@ impl RepackMonitor {
     }
 
     /// Cross-producer duplicates reported since construction (monotonic, never evicted).
+    ///
+    /// A disabled monitor reports zero.
     pub fn total_repacked(&self) -> u64 {
-        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).repacked_total
+        self.inner.as_ref().map_or(0, |inner| {
+            inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).repacked_total
+        })
     }
 }
 
@@ -207,9 +240,22 @@ mod tests {
         Address::repeat_byte(b)
     }
 
+    /// The default monitor is disabled: it observes nothing and reports nothing, so an
+    /// un-flagged node does no re-packing work at all.
+    #[test]
+    fn test_default_monitor_is_disabled() {
+        let monitor = RepackMonitor::default();
+        assert!(!monitor.is_enabled());
+        assert!(monitor.observe_batch(1, addr(0xaa), &[raw_tx(1)]).is_empty());
+        // The same tx from another producer is not reported: nothing was recorded.
+        assert!(monitor.observe_batch(2, addr(0xbb), &[raw_tx(1)]).is_empty());
+        assert_eq!(monitor.total_repacked(), 0);
+        assert!(RepackMonitor::enabled().is_enabled());
+    }
+
     #[test]
     fn test_cross_producer_duplicate_flagged_with_first_attribution() {
-        let monitor = RepackMonitor::default();
+        let monitor = RepackMonitor::enabled();
         assert!(monitor.observe_batch(1, addr(0xaa), &[raw_tx(1), raw_tx(2)]).is_empty());
         let dups = monitor.observe_batch(2, addr(0xbb), &[raw_tx(2), raw_tx(3)]);
         assert_eq!(
@@ -235,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_same_producer_duplicate_not_flagged() {
-        let monitor = RepackMonitor::default();
+        let monitor = RepackMonitor::enabled();
         // Twice in one batch, then again in a later output, all from one producer.
         assert!(monitor.observe_batch(1, addr(0xaa), &[raw_tx(1), raw_tx(1)]).is_empty());
         assert!(monitor.observe_batch(2, addr(0xaa), &[raw_tx(1)]).is_empty());
@@ -244,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_same_output_cross_producer_flagged() {
-        let monitor = RepackMonitor::default();
+        let monitor = RepackMonitor::enabled();
         assert!(monitor.observe_batch(7, addr(0xaa), &[raw_tx(1)]).is_empty());
         let dups = monitor.observe_batch(7, addr(0xbb), &[raw_tx(1)]);
         assert_eq!(
@@ -259,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_output_window_eviction_forgets_first_seen() {
-        let monitor = RepackMonitor::default();
+        let monitor = RepackMonitor::enabled();
         assert!(monitor.observe_batch(0, addr(0xaa), &[raw_tx(0)]).is_empty());
         // Fill enough later outputs to evict output 0 from the window.
         let window = u64::try_from(REPACK_WINDOW_OUTPUTS).expect("window fits in u64");
@@ -283,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_tx_cap_evicts_oldest_outputs() {
-        let monitor = RepackMonitor::default();
+        let monitor = RepackMonitor::enabled();
         // Two outputs that together exceed the tx cap: the older one is evicted whole.
         let first: Vec<Vec<u8>> = (0..40_000_u32).map(raw_tx).collect();
         let second: Vec<Vec<u8>> = (100_000..130_000_u32).map(raw_tx).collect();

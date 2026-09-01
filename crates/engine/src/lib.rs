@@ -91,8 +91,10 @@ pub struct ExecutorEngine {
     /// Sends (leader_round, consensus_num_hash, `Option<SealedHeader>`) after each
     /// ConsensusOutput is processed.
     engine_update_tx: mpsc::Sender<EngineUpdate>,
-    /// Monitor for cross-producer transaction re-packing (issue #1259). Owned here and cloned
-    /// into each execution task so its rolling window (bounded to the most recent
+    /// Monitor for cross-producer transaction re-packing (issue #1259). Monitoring is opt-in
+    /// (the node's `--enable-repack-monitor` flag); the default monitor is disabled and the
+    /// engine then builds no window and hashes nothing. An active monitor is owned here and
+    /// cloned into each execution task so its rolling window (bounded to the most recent
     /// `REPACK_WINDOW_OUTPUTS` outputs and `REPACK_WINDOW_MAX_TXS` retained hashes, a few
     /// megabytes worst case) persists across the outputs this engine executes. A fresh engine
     /// (an epoch boundary) starts a fresh window, which at worst misses a poach racing across
@@ -116,6 +118,7 @@ impl ExecutorEngine {
         rx_shutdown: Noticer,
         task_spawner: TaskSpawner,
         gas_accumulator: GasAccumulator,
+        repack_monitor: RepackMonitor,
         engine_update_tx: mpsc::Sender<EngineUpdate>,
     ) -> Self {
         let consensus_output_stream = ReceiverStream::new(rx_consensus_output);
@@ -131,7 +134,7 @@ impl ExecutorEngine {
             task_spawner,
             gas_accumulator,
             engine_update_tx,
-            repack_monitor: RepackMonitor::default(),
+            repack_monitor,
         }
     }
 
