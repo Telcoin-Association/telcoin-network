@@ -2536,6 +2536,7 @@ mod tests {
     #[tokio::test]
     async fn scaffold_persists_restored_state_floor_and_env_refuses_below_it() -> eyre::Result<()> {
         use crate::error::StateReadError;
+        use tn_types::CanonicalExecutionReader;
 
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let dst_dir = TempDir::new()?;
@@ -2630,6 +2631,29 @@ mod tests {
         assert!(
             !err.to_string().contains("below this datadir's restored-state floor"),
             "the floor must not refuse a pin at the floor itself, got: {err}"
+        );
+
+        // #1323: the CanonicalExecutionReader DB fallback (consensus `wait_for_execution`) must
+        // refuse the whole scaffold region below the floor. Below `B` it attests no block — not
+        // even a window-interior height whose header carries a real hash, and certainly not a
+        // zero-hash dummy that would otherwise read back as its own `B256::ZERO`. So a peer's
+        // header referencing a scaffold `latest_execution_block` can never clear the execution
+        // check on a restored node, which is what let the poison certify network-wide. At the
+        // floor the reader answers truthfully from the DB.
+        assert_eq!(
+            env.canonical_execution_hash(2),
+            None,
+            "a below-floor height must never be attested as canonical execution"
+        );
+        assert_eq!(
+            env.canonical_execution_hash(3),
+            None,
+            "a window-interior height below B must never be attested as canonical execution"
+        );
+        assert_eq!(
+            env.canonical_execution_hash(5),
+            Some(h5.hash()),
+            "the block at the floor must resolve to its real canonical execution hash"
         );
 
         Ok(())
