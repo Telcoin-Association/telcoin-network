@@ -651,6 +651,27 @@ impl Inner {
             return Ok((consensus_pos_idx, consensus_digests, batch_digests));
         }
         let base_dir = base_dir.as_ref();
+        // Highest record end either index attests as durably indexed: the digest index's
+        // `data_file_length` (the commit marker written last on an index sync) and the position
+        // index's last `output_end`. Indexes sync on a clean close, not on every `persist()`, so
+        // the data WAL can legitimately run *past* this with unacked appends -- a torn record out
+        // there is the normal mmap out-of-order-writeback tail, safe to drop even if later records
+        // still decode. But a tear that leaves the recovered prefix ending *below* an attested
+        // record end means an acked record was lost -- real corruption. Capture both before the
+        // indexes are reset just below. (A fresh/rebuilt index reports `DATA_HEADER_BYTES`, so the
+        // guard degrades to "trust the WAL, truncate at the first tear".)
+        let attested_end = {
+            let digest_end = consensus_digests.data_file_length();
+            let pos_end = if consensus_pos_idx.is_empty() {
+                DATA_HEADER_BYTES as u64
+            } else {
+                consensus_pos_idx
+                    .load(consensus_pos_idx.len() as u64 - 1)
+                    .map(|p| p.output_end)
+                    .unwrap_or(DATA_HEADER_BYTES as u64)
+            };
+            digest_end.max(pos_end)
+        };
         // The data log is authoritative; discard the (stale/damaged) indexes and start fresh. The
         // digest indexes are directories (index.hdx + index.odx), so remove the whole directory.
         consensus_pos_idx.truncate_all()?;
@@ -694,8 +715,10 @@ impl Inner {
                                     .save(batch.digest(), batch_pos)
                                     .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
                             }
-                            // A non-batch where a batch is required is mid-log corruption.
-                            Some(Ok(_)) => return Err(PackError::CorruptPack),
+                            // A decodable non-batch where a batch is required is structurally
+                            // impossible in append order, so it is genuine corruption, not an
+                            // unacked tail -- fail regardless of where it sits.
+                            Some(Ok(_)) => return Err(Self::corrupt_pack(base_dir)),
                             // Torn/short/short-EOF inside the output: it is incomplete, drop it.
                             Some(Err(_)) | None => {
                                 torn = true;
@@ -704,10 +727,13 @@ impl Inner {
                         }
                     }
                     if torn {
-                        // The remainder must be a clean torn/zero-padded tail; a record that still
-                        // decodes after the damage means mid-log corruption, not the final record.
-                        if !Self::tail_is_torn(&mut iter) {
-                            return Err(PackError::CorruptPack);
+                        // Incomplete output ends the consistent prefix. Dropping it is safe unless
+                        // the tear sits within acked data *and* readable records survive past it
+                        // (mid-log corruption, not the final record). Past the attested watermark
+                        // it is an unacked out-of-order-writeback tail, so
+                        // skip the scan entirely.
+                        if consistent_end < attested_end && !Self::tail_is_torn(&mut iter) {
+                            return Err(Self::corrupt_pack(base_dir));
                         }
                         break; // consistent_end still marks the end of the last complete output
                     }
@@ -719,17 +745,19 @@ impl Inner {
                     consistent_end = output_end;
                 }
                 // A torn record where the next output's header would start. The last complete
-                // output is already finalized, so drop only this torn tail —
-                // provided it is the final record (a bit-flip mid-log would leave a
-                // readable record after it, which errors).
+                // output is already finalized; this ends the consistent prefix. It
+                // is only fatal when the tear sits within acked data *and* readable
+                // records survive past it (mid-log corruption); past the attested
+                // watermark it is an unacked tail, safe to drop.
                 Some(Err(_)) => {
-                    if !Self::tail_is_torn(&mut iter) {
-                        return Err(PackError::CorruptPack);
+                    if consistent_end < attested_end && !Self::tail_is_torn(&mut iter) {
+                        return Err(Self::corrupt_pack(base_dir));
                     }
                     break;
                 }
-                // v1 is header-first, so a batch (or a stray second epoch meta) here is corruption.
-                Some(Ok(_)) => return Err(PackError::CorruptPack),
+                // v1 is header-first, so a decodable batch (or a stray second epoch meta) where a
+                // header is expected is append-order-impossible -- genuine corruption, not a tail.
+                Some(Ok(_)) => return Err(Self::corrupt_pack(base_dir)),
             }
         }
 
@@ -759,10 +787,28 @@ impl Inner {
         digests.len()
     }
 
-    /// After recovery hits a damaged record, decide whether the rest of the log is a clean
-    /// torn/zero-padded tail (safe to truncate) or mid-log corruption (an error). A torn tail
-    /// yields only unreadable garbage until EOF; if any later record still decodes then valid
-    /// data survived past the damage, so the damaged record was not the final one.
+    /// A [`PackError::CorruptPack`] carrying the pack location and operator remediation, for when
+    /// recovery finds durably-committed data damaged (a tear below the acked watermark, or a
+    /// structurally impossible record). Unlike an unacked torn tail this cannot be healed by
+    /// truncation, so the message points the operator at `db validate` and warns off the chain-data
+    /// directories.
+    fn corrupt_pack(base_dir: &Path) -> PackError {
+        PackError::CorruptPack(format!(
+            "epoch pack {} is corrupt: durably-committed consensus data is damaged and cannot be \
+             repaired by truncating the log. Inspect it with `telcoin-network db validate {}`. Do \
+             NOT delete the chain-data directories (`db`, `static_files`, `consensus-db`)",
+            base_dir.display(),
+            base_dir.display(),
+        ))
+    }
+
+    /// After recovery hits a damaged record *within acked data*, decide whether the rest of the log
+    /// is a clean torn/zero-padded tail (safe to truncate) or mid-log corruption (an error). A torn
+    /// tail yields only unreadable garbage until EOF; if any later record still decodes then valid
+    /// data survived past the damage, so the damaged record was not the final one. Only consulted
+    /// when the tear is at/below the attested watermark -- past it, an unacked
+    /// out-of-order-writeback tail is expected to hold decodable records and is truncated
+    /// without this scan.
     fn tail_is_torn(
         iter: &mut crate::archive::pack_iter::PackIter<PackRecord, std::fs::File>,
     ) -> bool {
@@ -828,10 +874,15 @@ impl Inner {
     ///   from a complete record failing its crc or its decode, and because the data file is a
     ///   sequential append-only log, a file that stops inside record zero cannot hold a record
     ///   after it.
-    /// * The size prefix has no checksum of its own, so a flipped bit could inflate the record's
-    ///   extent past EOF and mimic a tear on a pack that really does hold data.  The position index
-    ///   settles it: every consensus read resolves through it, so an empty one means no output was
-    ///   ever committed here.
+    /// * The size prefix is covered by the record crc, but that crc can only be checked once the
+    ///   whole claimed extent is read; a flipped bit that inflates the extent past EOF yields
+    ///   `UnexpectedEof` *before* the crc is reached, so it is indistinguishable from a real tear
+    ///   on a pack that holds data.  The position index settles the destructive path: every
+    ///   consensus read resolves through it, so an empty one means no output was ever committed
+    ///   here. Residual gap (tracked separately): when the position index is *non-empty*, a
+    ///   past-EOF-inflated meta prefix still mimics a tear and fails the open with `EpochLoad`,
+    ///   bricking the epoch at startup on a single fault.  A proper fix is an independent checksum
+    ///   on the size prefix -- an on-disk format change deferred to its own PR.
     fn first_record_is_dataless_tear(
         data: &mut Pack<PackRecord>,
         consensus_pos_idx: &PositionIndex<IndexPositions>,
@@ -978,14 +1029,17 @@ impl Inner {
             PackCompression::ZStd,
             PACK_VERSION,
         )?;
-        // No remediation hint here: unlike open_append this door does not create the epoch
-        // directory, so removing it would leave the node unable to start at all.
+        // This door does not create the epoch directory, so the hint must not suggest removing it
+        // (that would leave the node unable to start); it points at `db validate` only.
         let epoch_meta = data
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| {
                 PackError::EpochLoad(format!(
-                    "epoch {epoch} pack {}: first record (the epoch meta) is unreadable: {e}",
+                    "epoch {epoch} pack {}: first record (the epoch meta) is unreadable: {e}. \
+                     Inspect it with `telcoin-network db validate {}`. Do NOT delete the \
+                     chain-data directories (`db`, `static_files`, `consensus-db`)",
                     pack_file.display(),
+                    base_dir.display(),
                 ))
             })?
             .into_epoch()?;
@@ -1020,8 +1074,11 @@ impl Inner {
             .fetch(DATA_HEADER_BYTES as u64)
             .map_err(|e| {
                 PackError::EpochLoad(format!(
-                    "epoch {epoch} pack {}: first record (the epoch meta) is unreadable: {e}",
+                    "epoch {epoch} pack {}: first record (the epoch meta) is unreadable: {e}. \
+                     Inspect it with `telcoin-network db validate {}`. Do NOT delete the \
+                     chain-data directories (`db`, `static_files`, `consensus-db`)",
                     pack_file.display(),
+                    base_dir.display(),
                 ))
             })?
             .into_epoch()?;
@@ -1035,8 +1092,9 @@ impl Inner {
             &consensus_digests,
             &batch_digests,
         ) {
-            // Corrupt static file is bad (damaged at rest?), produce an error.
-            return Err(PackError::CorruptPack);
+            // Corrupt static file is bad (damaged at rest?), produce an error. Read-only opens do
+            // not heal, so this is terminal — surface the same remediation as the recovery path.
+            return Err(Self::corrupt_pack(&base_dir));
         }
         Ok(Self { data, consensus_digests, consensus_pos_idx, batch_digests, epoch_meta })
     }
@@ -2170,7 +2228,9 @@ pub enum PackError {
     PersistError(String),
     InvalidConsensusNumber(u64, u64),
     ConsensusNumberAlreadyAdded,
-    CorruptPack,
+    /// The pack holds damaged durably-committed data that recovery cannot repair by truncation.
+    /// Carries an operator-facing message with the pack path and remediation guidance.
+    CorruptPack(String),
     ConsensusNumberTooLow,
     ConsensusNumberTooHigh,
     TooManyBatches(usize),
@@ -2247,7 +2307,7 @@ impl Display for PackError {
                     "Consensus output MUST be added in consective order by number (already added)"
                 )
             }
-            PackError::CorruptPack => write!(f, "Pack file is corrupt"),
+            PackError::CorruptPack(msg) => write!(f, "{msg}"),
             PackError::ConsensusNumberTooLow => write!(f, "Consensus number too low for this file"),
             PackError::ConsensusNumberTooHigh => {
                 write!(f, "Consensus number too high for this file")
@@ -3694,8 +3754,86 @@ pub(crate) mod test {
         let res =
             ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone());
         assert!(
-            matches!(res, Err(PackError::CorruptPack)),
+            matches!(res, Err(PackError::CorruptPack(_))),
             "mid-log corruption must error, got {res:?}"
+        );
+    }
+
+    /// The mmap backend ends `persist()` at an `msync` only, and the kernel may write dirty pages
+    /// back out of order, so a power loss can leave `[k good][k+1 torn][k+2 good]` in the region
+    /// past the last index sync -- an unacked tail, not committed data. Recovery must truncate it
+    /// and let the node start, not reject the pack because a record still decodes after the tear.
+    /// (Before the fix, `tail_is_torn` saw the decodable `k+2` and returned `CorruptPack`, bricking
+    /// startup on the normal mmap power-loss shape.) The mid-log-corruption test above is the
+    /// mirror image: it keeps the position index, which attests outputs 2/3 as committed, so the
+    /// same byte-level damage is (correctly) fatal there.
+    #[tokio::test]
+    async fn test_recover_truncates_unacked_torn_tail_with_later_good_record() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let temp_dir = TempDir::with_prefix("test_recover_unacked_tail").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // End of output 1 is the last consistent point once output 2 is torn.
+        let output1_end = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(1).await.expect("output 1 end")
+        };
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        let full_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(full_len > output1_end, "outputs 2 and 3 must extend past output 1");
+
+        // Corrupt a byte inside output 2's header payload (past the 4-byte size prefix, so the
+        // framing stays intact and output 3 still decodes AFTER the damage).
+        {
+            let mut f =
+                OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.seek(SeekFrom::Start(output1_end + 20)).expect("seek");
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).expect("read");
+            byte[0] ^= 0xFF;
+            f.seek(SeekFrom::Start(output1_end + 20)).expect("seek back");
+            f.write_all(&byte).expect("write");
+        }
+        // Reset every index so recovery runs with no attested watermark past output 1 -- the
+        // on-disk state a real crash leaves, since indexes sync on a clean close, not on
+        // `persist()`. With nothing attesting outputs 2/3, the torn region is an unacked tail.
+        for name in ["hash", "bhash", "idx"] {
+            std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove index dir");
+        }
+
+        // Recovery must accept the pack (truncate the torn tail) rather than brick startup.
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("unacked torn tail must recover, not brick startup");
+            pack.persist().await.expect("persist after recovery");
+        }
+
+        // The log is truncated back to the end of output 1; outputs 2 and 3 are dropped.
+        let recovered_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert_eq!(
+            recovered_len, output1_end,
+            "recovery must truncate the torn tail back to the last complete output before the tear"
+        );
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("recovered pack must open read-only and pass files_consistent");
+        assert_eq!(
+            pack.get_consensus_output(1).await.expect("output 1 survives").number(),
+            1,
+            "the last complete output before the tear must read back"
+        );
+        assert!(
+            pack.get_consensus_output(2).await.is_err(),
+            "the torn output 2 (and everything after) must be gone"
         );
     }
 
