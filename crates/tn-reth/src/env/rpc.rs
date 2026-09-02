@@ -168,7 +168,10 @@ mod tests {
     use reth_transaction_pool::noop::NoopTransactionPool;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tn_types::{test_genesis, Address, Bytes, Encodable2718 as _, TaskManager, B256, U256};
+    use tn_types::{
+        gas_accumulator::BaseFeeContainer, test_genesis, Address, Bytes, Encodable2718 as _,
+        TaskManager, B256, U256,
+    };
     use url::Url;
 
     /// Build a temp env with the given `--rpc.txfeecap` value (wei) and return the
@@ -194,7 +197,7 @@ mod tests {
             rpc_args,
         )
         .expect("temp chain env");
-        let pool = reth_env.init_txn_pool().expect("txn pool");
+        let pool = reth_env.init_txn_pool(BaseFeeContainer::default()).expect("txn pool");
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let server = reth_env
             .get_rpc_server(pool.clone(), network, BaseFeeContainer::default(), RpcModule::new(()))
@@ -406,14 +409,12 @@ mod tests {
             None,
             reth::args::RpcServerArgs::default(),
         )?;
-        let pool = reth_env.init_txn_pool()?;
+        // One shared container for the pool and the RPC server, as in production (#1262).
+        let base_fee = BaseFeeContainer::default();
+        let pool = reth_env.init_txn_pool(base_fee.clone())?;
         let network = crate::worker::WorkerNetwork::new_for_test(reth_env.chainspec());
-        let server = reth_env.get_rpc_server(
-            pool,
-            network.clone(),
-            BaseFeeContainer::default(),
-            RpcModule::new(()),
-        )?;
+        let server =
+            reth_env.get_rpc_server(pool, network.clone(), base_fee, RpcModule::new(()))?;
         let methods = server.methods_by(|name| name == "eth_syncing");
 
         let synced: serde_json::Value = methods.call("eth_syncing", rpc_params![]).await?;
@@ -480,10 +481,12 @@ mod tests {
             reth::args::RpcServerArgs::default(),
         )
         .expect("temp chain env");
-        let pool = reth_env.init_txn_pool().expect("txn pool");
+        // One shared container for the pool and the RPC server, as in production (#1262).
+        let base_fee = BaseFeeContainer::new(epoch_fee);
+        let pool = reth_env.init_txn_pool(base_fee.clone()).expect("txn pool");
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let server = reth_env
-            .get_rpc_server(pool, network, BaseFeeContainer::new(epoch_fee), RpcModule::new(()))
+            .get_rpc_server(pool, network, base_fee, RpcModule::new(()))
             .expect("rpc server with corrected fee history");
         server.methods_by(|name| name == "eth_feeHistory" || name == "eth_blobBaseFee")
     }
