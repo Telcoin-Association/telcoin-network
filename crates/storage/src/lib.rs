@@ -33,7 +33,8 @@ pub mod mem_db;
 /// On-demand observation benchmark for consensus pack files (see `pack_bench.rs`).
 #[cfg(test)]
 mod pack_bench;
-/// On-demand raw-KV benchmark: pack files vs MDBX (see `pack_kv_bench.rs`).
+/// On-demand raw-KV benchmark: digest vs btree pack files vs MDBX, plus sorted scans (see
+/// `pack_kv_bench.rs`).
 #[cfg(test)]
 mod pack_kv_bench;
 pub mod pack_validate;
