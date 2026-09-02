@@ -13,7 +13,7 @@ use crate::{
     types::{
         GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
         NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NodeRecord,
-        ResponseChannel, RpcInfo,
+        RecordDomain, ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -300,6 +300,11 @@ where
     ///
     /// The external address is self-reported and unconfirmed.
     node_record: NodeRecord,
+    /// The `(chain, role)` domain this node signs and verifies records for.
+    ///
+    /// Folded into every [NodeRecord] signature so a record signed for one
+    /// network never verifies on another (GHSA-cc64-wfq5-56ph).
+    record_domain: RecordDomain,
     /// Peers we have already pushed our [NodeRecord] to.
     ///
     /// A peer connecting for the first time needs our record before it can resolve
@@ -392,6 +397,10 @@ where
         // the network config from genesis at node startup; see
         // `NetworkConfig::set_chain_id`.
         let chain_id = network_config.libp2p_config().chain_id;
+        // The `(chain, role)` domain every NodeRecord this node signs and verifies
+        // is scoped to: a record signed for one network never verifies on another
+        // (GHSA-cc64-wfq5-56ph).
+        let record_domain = RecordDomain::new(chain_id, network_type);
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             // explicitly set default
@@ -449,17 +458,22 @@ where
             .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
         let mut kad_store = KadStore::new(db.clone(), peer_id, &key_config, network_type);
 
-        // Load the Kad records from DB for the local peer cache, decoding with a legacy
-        // fallback so records persisted by pre-upgrade software still load. Collect
-        // corrupt entries (undecodable values or broken keys) for removal.
+        // Load the kad records from the DB into the local peer cache, verifying each
+        // against this node's `(chain, role)` domain so a record poisoned onto the
+        // store by a pre-fix node (GHSA-cc64-wfq5-56ph) is scrubbed on load instead of
+        // re-promoted. Collect entries that fail to decode/verify, or whose key is
+        // broken, for removal.
         let mut known = Vec::new();
         let mut corrupt = Vec::new();
         for record in kad_store.records() {
             match BlsPublicKey::from_literal_bytes(record.key.as_ref()) {
-                Ok(key) => match NodeRecord::try_decode_compat(record.value.as_ref()) {
-                    Some(node_record) => known.push((key, node_record.info)),
-                    None => corrupt.push(record.key.clone()),
-                },
+                Ok(key) => {
+                    match NodeRecord::decode_and_verify(record.value.as_ref(), record_domain, &key)
+                    {
+                        Some((_key, node_record)) => known.push((key, node_record.info)),
+                        None => corrupt.push(record.key.clone()),
+                    }
+                }
                 // How did we get a KAD record with a broken key?
                 Err(error) => {
                     error!(target: "network-kad", ?error, "Invalid/corrupt KAD DB store!");
@@ -471,7 +485,7 @@ where
         // Purge corrupt records before the store is cloned into the kademlia behaviour
         // so its record accounting stays accurate.
         for key in corrupt {
-            warn!(target: "network-kad", ?key, "removing undecodable record from kad store");
+            warn!(target: "network-kad", ?key, "removing invalid record from kad store (undecodable or wrong signing domain)");
             kad_store.remove(&key);
         }
 
@@ -551,7 +565,13 @@ where
         let config = network_config.libp2p_config().clone();
         let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);
         let pending_goodbyes = HashMap::with_capacity(config.max_px_disconnects);
-        let node_record = Self::create_node_record(external_addr, &key_config, network_pubkey, rpc);
+        let node_record = Self::create_node_record(
+            record_domain,
+            external_addr,
+            &key_config,
+            network_pubkey,
+            rpc,
+        );
 
         Ok(Self {
             swarm,
@@ -569,6 +589,7 @@ where
             key_config,
             task_spawner,
             node_record,
+            record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             metrics: SwarmMetrics::new_for(&network_type),
         })
@@ -581,12 +602,13 @@ where
 
     /// Create and sign this node's [NodeRecord].
     fn create_node_record(
+        domain: RecordDomain,
         external_addr: Multiaddr,
         key_config: &KeyConfig,
         network_pubkey: NetworkPublicKey,
         rpc: Option<RpcInfo>,
     ) -> NodeRecord {
-        NodeRecord::build(network_pubkey, external_addr, rpc, |data| {
+        NodeRecord::build(domain, network_pubkey, external_addr, rpc, |data| {
             key_config.request_signature_direct(data)
         })
     }
@@ -613,7 +635,8 @@ where
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
 
         // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
-        let (pubkey, node_record) = NodeRecord::decode_and_verify(record.value.as_ref(), &key)?;
+        let (pubkey, node_record) =
+            NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)?;
 
         // reject records advertising an implausible number of addresses: a legitimate record
         // carries a single address, so a large set is only ever an attempt to inflate the
