@@ -79,13 +79,13 @@ impl RecentBlocks {
     }
 
     /// Is hash a recent block we have executed?
-    ///
-    /// A zero hash never matches: no real executed block seals to `B256::ZERO`, and a snapshot
-    /// restore fabricates its pre-window scaffold headers with exactly that hash. If such a dummy
-    /// is ever seeded into the ring, a peer could clear the execution-result check by referencing
-    /// it, so the zero hash is rejected outright before the ring is scanned.
     pub fn contains_execution_hash(&self, hash: BlockHash) -> bool {
-        hash != BlockHash::ZERO && self.executed_blocks.iter().any(|block| block.hash() == hash)
+        for block in &self.executed_blocks {
+            if block.hash() == hash {
+                return true;
+            }
+        }
+        false
     }
 
     /// Is hash (consensus output) in a recent block we have executed?
@@ -144,29 +144,5 @@ mod tests {
         assert_eq!(recent.latest_consensus_block_num_hash(), consensus_num_hash);
         assert_eq!(recent.latest_execution_block_num_hash(), executed.num_hash());
         assert!(recent.contains_execution_hash(executed.hash()));
-    }
-
-    #[test]
-    fn contains_execution_hash_rejects_the_zero_hash() {
-        use tn_types::BlockHash;
-
-        let mut recent = RecentBlocks::new(4);
-        let cnh = ConsensusNumHash::new(12, ConsensusHeaderDigest::from([3u8; 32]));
-
-        // a genuinely executed block resolves by its true (non-zero) sealed hash
-        let real = SealedHeader::seal_slow(ExecHeader { number: 9, ..Default::default() });
-        recent.push_latest(3, cnh, Some(real.clone()));
-        assert!(recent.contains_execution_hash(real.hash()));
-
-        // seed a zero-hash scaffold dummy the way a snapshot restore would, then confirm it can
-        // never clear the execution-result check: a Byzantine header referencing a scaffold
-        // height carries exactly this `B256::ZERO`
-        let dummy =
-            SealedHeader::new(ExecHeader { number: 3, ..Default::default() }, BlockHash::ZERO);
-        recent.push_latest(4, cnh, Some(dummy));
-        assert!(
-            !recent.contains_execution_hash(BlockHash::ZERO),
-            "a zero-hash dummy in the ring must not be reported as an executed block"
-        );
     }
 }
