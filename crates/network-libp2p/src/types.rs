@@ -889,9 +889,66 @@ impl From<LegacyNodeRecord> for NodeRecord {
     }
 }
 
+/// Domain-separation label folded into every [NodeRecord] signature.
+///
+/// Baked into the signed payload so a signature is valid only for this exact
+/// purpose and schema. The trailing version is the signed-payload schema
+/// version: bumping it invalidates every prior signature and forces a
+/// coordinated re-sign across the network.
+const NODE_RECORD_SIGNING_LABEL: &[u8] = b"telcoin-network/node-record/v1";
+
+/// The `(chain, role)` network a [NodeRecord] signature is bound to.
+///
+/// The domain is folded into the bytes a signature covers but is **never
+/// transmitted**: a verifier reconstructs it from its own network identity, so a
+/// record signed for one `(chain_id, NetworkType)` network can never verify on
+/// another. This closes cross-role / cross-chain [NodeRecord] replay
+/// (GHSA-cc64-wfq5-56ph): a validly-signed worker record no longer verifies on
+/// the primary DHT (the primary reconstructs the payload with the primary role),
+/// and a record signed for one chain no longer verifies on another.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordDomain {
+    /// The chain the record is scoped to.
+    chain_id: u64,
+    /// The role/worker network the record is scoped to.
+    network_type: NetworkType,
+}
+
+impl RecordDomain {
+    /// Build a [RecordDomain] for the given chain and role network.
+    pub fn new(chain_id: u64, network_type: NetworkType) -> Self {
+        Self { chain_id, network_type }
+    }
+
+    /// Role discriminant and worker id folded into the signed payload.
+    ///
+    /// The discriminant (`0` primary, `1` worker) keeps the primary role
+    /// distinct from `Worker(0)`, so the worker id can default to `0` for the
+    /// primary without the two domains colliding.
+    fn role_parts(&self) -> (u8, WorkerId) {
+        match self.network_type {
+            NetworkType::Primary => (0, 0),
+            NetworkType::Worker(id) => (1, id),
+        }
+    }
+}
+
 impl NodeRecord {
-    /// Helper method to build a signed node record.
+    /// The exact bytes a [NodeRecord] signature covers: the domain-separation
+    /// label, the `(chain_id, role, worker_id)` [RecordDomain] the record is
+    /// scoped to, and the BCS encoding of the advertised [NetworkInfo].
+    ///
+    /// The domain is folded in but never transmitted; the verifier reconstructs
+    /// it from its own network identity (see [RecordDomain]), so the signature
+    /// alone decides whether a record belongs on the verifying network.
+    fn signing_bytes(domain: RecordDomain, info: &NetworkInfo) -> Vec<u8> {
+        let (role, worker_id) = domain.role_parts();
+        encode(&(NODE_RECORD_SIGNING_LABEL, domain.chain_id, role, worker_id, info))
+    }
+
+    /// Helper method to build a [NodeRecord] signed for `domain`.
     pub fn build<F>(
+        domain: RecordDomain,
         pubkey: NetworkPublicKey,
         multiaddr: Multiaddr,
         rpc: Option<RpcInfo>,
@@ -901,14 +958,22 @@ impl NodeRecord {
         F: FnOnce(&[u8]) -> BlsSignature,
     {
         let info = NetworkInfo { pubkey, multiaddrs: vec![multiaddr], timestamp: now(), rpc };
-        let data = encode(&info);
+        let data = Self::signing_bytes(domain, &info);
         let signature = signer(&data);
         Self { info, signature }
     }
 
-    /// Verify if a signature matches the record.
-    pub fn verify(self, pubkey: &BlsPublicKey) -> Option<(BlsPublicKey, NodeRecord)> {
-        let data = encode(&self.info);
+    /// Verify the record's signature against `domain` and `pubkey`.
+    ///
+    /// Fails if the record was signed for a different `(chain, role)` network,
+    /// even when the BLS `pubkey` matches: the domain is part of the signed
+    /// bytes (see [RecordDomain]).
+    pub fn verify(
+        self,
+        domain: RecordDomain,
+        pubkey: &BlsPublicKey,
+    ) -> Option<(BlsPublicKey, NodeRecord)> {
+        let data = Self::signing_bytes(domain, &self.info);
         if self.signature.verify_raw(&data, pubkey) {
             Some((*pubkey, self))
         } else {
@@ -945,25 +1010,20 @@ impl NodeRecord {
             .or_else(|| try_decode::<LegacyNodeRecord>(value).ok().map(Into::into))
     }
 
-    /// Decode a [NodeRecord] (with legacy fallback) and verify its BLS
-    /// signature against the layout it was actually signed over.
+    /// Decode a [NodeRecord] and verify its BLS signature against the local
+    /// `domain`.
     ///
-    /// Legacy records were signed over the legacy `info` encoding; re-encoding
-    /// under the current schema would insert the `rpc` Option tag and break
-    /// verification, so each layout verifies against its own re-encoding.
+    /// Only the current domain-scoped schema is accepted. Pre-domain records —
+    /// including the pre-`rpc` [LegacyNodeRecord] layout — carry signatures that
+    /// do not cover the `(chain, role)` domain, which is exactly the
+    /// cross-network replay this rejects (GHSA-cc64-wfq5-56ph); such records no
+    /// longer verify and are dropped after upgrade.
     pub fn decode_and_verify(
         value: &[u8],
+        domain: RecordDomain,
         key: &BlsPublicKey,
     ) -> Option<(BlsPublicKey, NodeRecord)> {
-        if let Ok(record) = try_decode::<NodeRecord>(value) {
-            return record.verify(key);
-        }
-        let legacy = try_decode::<LegacyNodeRecord>(value).ok()?;
-        if legacy.signature.verify_raw(&encode(&legacy.info), key) {
-            Some((*key, legacy.into()))
-        } else {
-            None
-        }
+        try_decode::<NodeRecord>(value).ok()?.verify(domain, key)
     }
 }
 

@@ -48,14 +48,19 @@ fn make_payload(
 }
 
 /// Execute a payload with transactions and commit the block to the canonical chain.
+///
+/// Every block persists before the next build here, so a fresh empty
+/// `OutputTrieOverlay` per block is exact (#1301).
 fn execute_and_commit(
     reth_env: &RethEnv,
     payload: TNPayload,
     transactions: Vec<Vec<u8>>,
 ) -> eyre::Result<SealedHeader> {
-    let anchor_hash = payload.parent_header.hash();
-    let block =
-        reth_env.build_block_from_batch_payload(payload, &transactions, anchor_hash, &[])?;
+    let block = reth_env.build_block_from_batch_payload(
+        payload,
+        &transactions,
+        &mut tn_reth::OutputTrieOverlay::new(),
+    )?;
     let header = block.recovered_block.clone_sealed_header();
     let state = reth_env.canonical_in_memory_state();
     state.update_chain(NewCanonicalChain::Commit { new: vec![block.clone()] });
