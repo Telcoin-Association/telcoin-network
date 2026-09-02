@@ -223,11 +223,6 @@ impl HdxHeader {
         self.bucket_size
     }
 
-    /// Load factor converted to a f32.
-    fn load_factor(&self) -> f32 {
-        self.load_factor as f32 / u16::MAX as f32
-    }
-
     /// File version number.
     fn version(&self) -> u16 {
         self.version
@@ -256,7 +251,7 @@ impl HdxHeader {
 /// A hash digest index (256-bit digest -> u64 record position) that is memory-mapped only and
 /// reads/writes hash buckets directly through the mapping with no in-memory bucket caches.
 ///
-/// It is format compatable with the older direct IO version.
+/// It is format compatible with the older direct IO version.
 #[derive(Debug)]
 pub struct HdxIndex<
     const KSIZE: usize = 32,
@@ -271,6 +266,10 @@ pub struct HdxIndex<
     // We require an mmap backed file so use it directly.
     odx_file: MmapDataFile,
     capacity: u64,
+    /// Precomputed `values` count at which a bucket split is due (`capacity * load_factor`), kept
+    /// in lockstep with `capacity` so the per-insert check in `expand_buckets` is a plain u64
+    /// compare instead of u128 math.
+    expand_at_capacity: u64,
     hasher_builder: S,
     read_only: bool,
     synced: bool,
@@ -396,12 +395,14 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // Don't want buckets and modulus to be the same, so +1.
         let modulus = (header.buckets + 1).next_power_of_two();
         let capacity = header.buckets as u64 * header.bucket_elements() as u64;
+        let expand_at_capacity = Self::expand_threshold(capacity, header.load_factor);
         Ok(Self {
             header,
             modulus,
             hdx_file,
             odx_file,
             capacity,
+            expand_at_capacity,
             hasher_builder,
             read_only,
             synced: true,
@@ -633,11 +634,26 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         Ok(())
     }
 
+    /// The `values` count at which a bucket split is due (`capacity * load_factor`), precomputed to
+    /// a u64 so the per-insert check in [`Self::expand_buckets`] is a plain compare, not u128 math.
+    ///
+    /// `load_factor` is the fraction `stored / u16::MAX`, so the real threshold is
+    /// `capacity * load_factor / u16::MAX`. `div_ceil` preserves the exact
+    /// `values * u16::MAX >= capacity * load_factor` boundary (an integer `values >= ceil(x)` is
+    /// equivalent to `values * u16::MAX >= capacity * load_factor`), and the f32 route's 24-bit
+    /// mantissa rounding above ~16M entries is gone. The result is `<= capacity <= u64::MAX`, so
+    /// the `as u64` is lossless; `u128` keeps the `u64 * u16` product from overflowing.
+    fn expand_threshold(capacity: u64, load_factor: u16) -> u64 {
+        (u128::from(capacity) * u128::from(load_factor)).div_ceil(u128::from(u16::MAX)) as u64
+    }
+
     /// Add buckets to expand capacity: while the load factor is exceeded, split one bucket.
     fn expand_buckets(&mut self) -> Result<(), AppendError> {
-        while self.header.values >= (self.capacity as f32 * self.header.load_factor()) as u64 {
+        while self.header.values >= self.expand_at_capacity {
             self.split_one_bucket()?;
             self.capacity = self.buckets() as u64 * self.header.bucket_elements() as u64;
+            self.expand_at_capacity =
+                Self::expand_threshold(self.capacity, self.header.load_factor);
         }
         Ok(())
     }
@@ -710,9 +726,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         self.save_to_bucket_inner(key, record_pos, bucket_pos)
     }
 
-    /// Read-modify-write body of [`Self::save_to_bucket`], operating on a caller-owned `scratch`
-    /// buffer (never `self.scratch`, to avoid a `&mut self` + `&mut self.scratch` overlap). On any
-    /// error the on-disk bucket is left untouched.
+    /// Read-modify-write body of [`Self::save_to_bucket`]: rewrites the bucket in place through the
+    /// mapping, then zeroes its trailer to mark it dirty for the bulk CRC at `sync()`. On any error
+    /// the on-disk bucket is left untouched.
     fn save_to_bucket_inner(
         &mut self,
         key: &[u8],

@@ -897,10 +897,11 @@ impl Inner {
                     }
                 }
                 Err(e) => {
-                    // A complete-but-corrupt first record keeps failing the open: trunc_and_heal
-                    // only repairs the tail, and records behind the meta stay addressable through
-                    // the indexes, so discarding them here would be silent data loss.  Only the
-                    // provably dataless tear self-heals, matching the header-only branch below.
+                    // A complete-but-corrupt first record keeps failing the open: recovery
+                    // (`recover_pack`) only trims the torn tail, and records behind the meta stay
+                    // addressable through the indexes, so discarding them here would be silent data
+                    // loss.  Only the provably dataless tear self-heals, matching the header-only
+                    // branch below.
                     if !Self::first_record_is_dataless_tear(&mut data, &consensus_pos_idx) {
                         return Err(PackError::EpochLoad(format!(
                             "epoch {epoch} pack {} ({pack_len} bytes): first record (the epoch \
@@ -948,7 +949,7 @@ impl Inner {
             // If this is a new DB then update the file lengths in indexes after create.  A pack
             // whose meta was just rewritten at the data header counts as new: the indexes still
             // carry the length from before the damage, and leaving that stale would make
-            // trunc_and_heal cut the meta we just wrote back down to it whenever the rewritten
+            // recovery truncate the meta we just wrote back down to it whenever the rewritten
             // meta is the longer one -- returning a live pack with a torn first record.
             let len = data.file_len();
             consensus_digests.set_data_file_length(len);
@@ -3933,9 +3934,11 @@ pub(crate) mod test {
     }
 
     /// The heal rebuilds the pack from its data header, so the digest indexes must be
-    /// reinitialized with it.  Left carrying the length from before the tear, `trunc_and_heal`
-    /// would cut the meta just written back down to that stale length whenever the rewritten
+    /// reinitialized with it.  Left carrying the length from before the tear, recovery would
+    /// truncate the meta just written back down to that stale length whenever the rewritten
     /// meta is the longer one, leaving the pack torn again and re-healing on every restart.
+    /// `recover_pack` re-stamps `set_data_file_length` after replay, so the `open_static` gate
+    /// below (which runs `files_consistent`) only opens once the tracked length matches the log.
     #[tokio::test]
     async fn test_heal_reinitializes_index_lengths_for_a_longer_meta() {
         let temp_dir = TempDir::with_prefix("test_cp_heal_longer_meta").expect("temp dir");
@@ -3995,8 +3998,9 @@ pub(crate) mod test {
     /// Same stale-index hazard as above, but landing in the header-only branch: the data file
     /// is rolled back to exactly `DATA_HEADER_BYTES` while the digest indexes keep their larger
     /// pre-damage length.  That branch writes a fresh meta too, so it needs the same index
-    /// reinitialization -- without it `trunc_and_heal` cuts the new meta down to the stale
-    /// length and hands back a live pack whose first record is torn.
+    /// reinitialization -- without `recover_pack` re-stamping `set_data_file_length`, recovery
+    /// cuts the new meta down to the stale length and hands back a live pack whose first record
+    /// is torn.
     #[tokio::test]
     async fn test_header_only_reinitializes_index_lengths_for_a_longer_meta() {
         let temp_dir = TempDir::with_prefix("test_cp_header_only_longer").expect("temp dir");
@@ -4047,6 +4051,74 @@ pub(crate) mod test {
         );
         ConsensusPack::open_static(temp_dir.path(), 0)
             .expect("pack must open read-only with a readable meta");
+    }
+
+    /// A torn *tail* on a pack whose meta is intact is the one recovery path the
+    /// `wrote_fresh_meta` guard never touches: `open_append` reads a valid first record
+    /// (`have_pack == true`, `wrote_fresh_meta == false`), so the guard at the top of the open
+    /// does not fire and the only thing that reconciles the digest indexes' tracked
+    /// `data_file_length` down to the truncated log is `recover_pack`'s `set_data_file_length`
+    /// re-stamp after replay.  Delete that re-stamp and `files_consistent` fails on the next open,
+    /// so this pins it directly -- unlike the longer-meta heals above, which `recover_pack` would
+    /// still fix even with the guard removed.
+    #[tokio::test]
+    async fn test_recover_pack_restamps_index_length_on_a_torn_tail() {
+        let temp_dir = TempDir::with_prefix("test_cp_torn_tail_restamp").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        // End of output 2 is the last self-consistent point once output 3 is torn.
+        let output2_end = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(2).await.expect("output 2 end")
+        };
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let full_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert!(full_len > output2_end, "output 3 must extend past output 2");
+
+        // Tear output 3 mid-record, a few bytes past output 2's end.  The digest indexes still
+        // track `full_len`, so recovery is forced to rebuild -- but the meta stays intact, so the
+        // wrote_fresh_meta guard does not fire and only `recover_pack` can re-stamp the length.
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.set_len(output2_end + 4).expect("truncate");
+        }
+
+        {
+            let pack = ConsensusPack::open_append(
+                temp_dir.path(),
+                previous_epoch.clone(),
+                committee.clone(),
+            )
+            .expect("torn tail with an intact meta must recover");
+            pack.persist().await.expect("persist after recovery");
+        }
+
+        // recover_pack dropped the torn output 3 and re-stamped the tracked length to the last
+        // complete output, so the log ends exactly at output 2 again.
+        let recovered_len = std::fs::metadata(&data_path).expect("metadata").len();
+        assert_eq!(
+            recovered_len, output2_end,
+            "recovery must trim the torn tail back to the last complete output"
+        );
+
+        // `open_static` runs `files_consistent`, whose exact-equality check (`data_file_length`
+        // == `file_len`) only holds if `recover_pack` re-stamped the shortened length onto the
+        // rebuilt indexes.  Output 2 must survive; the torn output 3 must be gone.
+        let pack = ConsensusPack::open_static(temp_dir.path(), 0)
+            .expect("recovered pack must pass files_consistent and open read-only");
+        assert_eq!(
+            pack.get_consensus_output(2).await.expect("output 2 survives").number(),
+            2,
+            "the last complete output must read back after recovery"
+        );
+        assert!(
+            pack.get_consensus_output(3).await.is_err(),
+            "the torn output 3 must not be readable after recovery"
+        );
     }
 
     /// The other half of the narrowing: an empty position index alone is not licence to
@@ -4141,7 +4213,7 @@ pub(crate) mod test {
             pack.persist().await.expect("persist after reopen");
         }
 
-        // The append reopen heals through `trunc_and_heal`; `open_static` is the door that runs
+        // The append reopen heals through `recover_pack`; `open_static` is the door that runs
         // `files_consistent`, so a read-only reopen pins the recovered pack for read-only
         // consumers too.
         let pack = ConsensusPack::open_static(temp_dir.path(), 0)

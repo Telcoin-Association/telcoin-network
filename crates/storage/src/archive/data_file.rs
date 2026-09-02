@@ -636,10 +636,20 @@ impl Read for MmapDataFile {
 impl Seek for MmapDataFile {
     /// Seek within the logical byte range; `SeekFrom::End` is relative to the logical length.
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let new = match pos {
-            SeekFrom::Start(p) => p as i64,
-            SeekFrom::End(p) => self.end as i64 + p,
-            SeekFrom::Current(p) => self.seek_pos as i64 + p,
+        // Compute the target in `i64`, failing on any overflow (an out-of-range `Start`, or an
+        // `End`/`Current` offset that wraps) rather than the raw `as`/`+` that could silently wrap.
+        let out_of_range =
+            || io::Error::new(io::ErrorKind::InvalidInput, "seek position out of range");
+        let new: i64 = match pos {
+            SeekFrom::Start(p) => i64::try_from(p).map_err(|_| out_of_range())?,
+            SeekFrom::End(p) => i64::try_from(self.end)
+                .ok()
+                .and_then(|e| e.checked_add(p))
+                .ok_or_else(out_of_range)?,
+            SeekFrom::Current(p) => i64::try_from(self.seek_pos)
+                .ok()
+                .and_then(|c| c.checked_add(p))
+                .ok_or_else(out_of_range)?,
         };
         if new < 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek to negative position"));
@@ -672,7 +682,7 @@ impl Write for MmapDataFile {
         let start_us = start as usize;
         match &mut self.backing {
             Backing::Rw(map) => map[start_us..start_us + buf.len()].copy_from_slice(buf),
-            _ => return Err(io::Error::other("no writable mapping")),
+            Backing::Ro(_) | Backing::Empty => return Err(io::Error::other("no writable mapping")),
         }
         match self.opts.write_mode {
             WriteMode::Append => self.end += n,

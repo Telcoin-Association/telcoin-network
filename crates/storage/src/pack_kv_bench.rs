@@ -66,7 +66,7 @@ const VALUE_SIZES: &[(&str, usize)] = &[("64B", 64), ("1KB", 1024)];
 /// A deterministic, non-trivial value of `size` bytes.
 fn value(size: usize, seed: u64) -> Vec<u8> {
     let s = seed.to_le_bytes();
-    (0..size).map(|i| s[i % 8].wrapping_add(i as u8)).collect()
+    (0..size).map(|i| s[i % 8].wrapping_add((i & 0xff) as u8)).collect()
 }
 
 /// A well-distributed 64-bit mix (splitmix64) of `x` — used to spread keys and randomize read
@@ -83,7 +83,8 @@ fn mix(x: u64) -> u64 {
 fn key(i: u64) -> B256 {
     let mut b = [0u8; 32];
     for (j, lane) in b.chunks_mut(8).enumerate() {
-        lane.copy_from_slice(&mix(i.wrapping_mul(4).wrapping_add(j as u64)).to_le_bytes());
+        let j = u64::try_from(j).expect("lane index fits u64");
+        lane.copy_from_slice(&mix(i.wrapping_mul(4).wrapping_add(j)).to_le_bytes());
     }
     B256::from(b)
 }
@@ -120,12 +121,11 @@ impl PackKv {
         Self { data, index }
     }
 
-    /// Durably persist everything written so far: `msync` the data log,
-    /// then sync the hash index (its `index.hdx` + `index.odx`).
+    /// Durably persist everything written so far: `msync` the data log. The hash index is not
+    /// synced here — the data log acts as a WAL, so the index is rebuilt from it on recovery.
     fn barrier(&mut self) {
         self.data.commit().expect("pack commit");
-        // We won't need to explicity sync the index- the data log file acts as a WAL.
-        //self.index.sync().expect("index sync");
+        // No explicit index sync is needed here: the data log file acts as a WAL.
     }
 }
 
@@ -242,13 +242,19 @@ fn run_size<S: KvStore>(open: impl Fn(&Path) -> S, size: usize) -> [Duration; 3]
     let t_bulk = timed(|| a.write_bulk(&items));
     let mut hits = 0;
     let t_read = timed(|| hits = a.read_rand(&read_keys));
-    assert_eq!(hits as u64, N_READ, "every read must hit a written key");
+    assert_eq!(
+        u64::try_from(hits).expect("hit count fits u64"),
+        N_READ,
+        "every read must hit a written key"
+    );
     drop(a);
     drop(dir_a);
 
     let dir_b = TempDir::with_prefix("packkv_b").expect("temp dir");
     let mut b = open(dir_b.path());
-    let t_each = timed(|| b.write_each_durable(&items[..N_EACH as usize]));
+    let t_each = timed(|| {
+        b.write_each_durable(&items[..usize::try_from(N_EACH).expect("N_EACH fits usize")])
+    });
     drop(b);
     drop(dir_b);
 
