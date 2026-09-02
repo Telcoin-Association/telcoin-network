@@ -2,17 +2,21 @@
 //! offsets, with sorted point lookup plus (via [`super::iter`]) range/prefix/forward/reverse
 //! iteration.
 //!
-//! The tree is stored in a single `index.btx` file of fixed 4 KiB pages (page 0 holds the header).
-//! It complements the hash-based
+//! The tree lives in a single `index.btx` file of fixed 4 KiB pages (page 0 is the header),
+//! **memory-mapped** and worked on in place through [`MmapDataFile`] — no separate page cache; the
+//! OS page cache is the cache. It complements the hash-based
 //! [`HdxIndex`](crate::archive::digest_index::index::HdxIndex), which offers only point lookups.
-//! Pages are cached (a clean read cache with FIFO eviction plus a dirty write cache) and made
-//! durable by [`Index::sync`], which flushes and fsyncs all data pages *before* rewriting the
-//! header page, so a crash always leaves a consistent tree.
+//!
+//! Durability mirrors the digest index's **lazy-CRC** regime: a modified page's 4-byte CRC trailer
+//! is `zero_crc`'d as a "dirty" marker, reads do **not** verify a per-op CRC, and [`Index::sync`]
+//! CRCs only the dirty pages (`crc_is_zero`) in one pass, then `msync`s the data pages and finally
+//! rewrites + `msync`s the header page (the commit marker) — so a crash always reopens on the last
+//! consistent tree. The index is deterministically rebuildable from its pack
+//! ([`BtreeIndex::rebuild_from`]), which is why it can defer the CRC and skip per-read
+//! verification; [`BtreeIndex::page_crc_scan`] is the off-hot-path integrity check.
 
 use std::{
-    collections::VecDeque,
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -23,18 +27,14 @@ use crate::archive::{
         header::{BtreeHeader, VALUE_SIZE},
         page::{Node, NULL_PAGE, PAGE_SIZE},
     },
-    data_file::fsync_directory,
+    crc::{add_crc32, crc_is_zero, crc_state, zero_crc, CrcState},
+    data_file::{fsync_directory, MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
-    fxhasher::FxHashMap,
     index::Index,
     pack::DataHeader,
 };
-
-/// How many clean pages to cache before FIFO eviction.  Sized to never be hit in normal use
-/// (a backstop against unbounded memory); the OS page cache backs everything beyond it.
-const CACHED_PAGES: usize = 400_000;
 
 /// Hard cap on tree height while descending, a corruption tripwire (real heights are tiny: at a
 /// branching factor of dozens, even 2^48 keys stay well under this).
@@ -49,20 +49,26 @@ fn fetch_to_append(e: FetchError) -> AppendError {
     }
 }
 
-/// A paged, on-disk B+tree "sortable index" over `KSIZE`-byte keys → `u64` file positions.
+/// Counts of data pages by CRC state — the B+tree analogue of the digest index's
+/// `BucketCrcReport`. A clean, synced index reports zero of both; `dirty > 0` means writes were not
+/// synced (rebuild from the pack), `corrupt > 0` means genuine on-disk corruption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageCrcReport {
+    /// Data pages whose CRC trailer is all-zero (written but not yet CRC'd / unsynced).
+    pub dirty: u64,
+    /// Data pages whose non-zero CRC fails to match the payload — genuine corruption.
+    pub corrupt: u64,
+}
+
+/// A paged, mmap-backed on-disk B+tree "sortable index" over `KSIZE`-byte keys → `u64` file
+/// positions.
 ///
-/// Implements [`Index`] over `[u8; KSIZE]` (and, for `KSIZE == 32`, over [`B256`]).  Keys are
+/// Implements [`Index`] over `[u8; KSIZE]` (plus, for `KSIZE == 32`, `B256` adapters). Keys are
 /// ordered lexicographically.
 #[derive(Debug)]
 pub struct BtreeIndex<const KSIZE: usize = 32> {
     header: BtreeHeader,
-    /// Clean (disk-backed) pages, bounded by `page_cache_fifo`.
-    page_cache: FxHashMap<u32, Vec<u8>>,
-    /// Dirty pages awaiting [`Index::sync`].
-    dirty_page_cache: FxHashMap<u32, Vec<u8>>,
-    /// FIFO of clean cache page numbers for bounded eviction.
-    page_cache_fifo: VecDeque<u32>,
-    file: File,
+    file: MmapDataFile,
     read_only: bool,
     synced: bool,
     _index_dir: PathBuf,
@@ -90,35 +96,41 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
                 let _ = fsync_directory(parent);
             }
         }
-        let mut file = if read_only {
-            OpenOptions::new().read(true).write(false).open(dir.join("index.btx"))?
-        } else {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(dir.join("index.btx"))?
+        // In-place page overwrites → Random write mode; point-lookup descent → Random access hint.
+        let opts = MmapFileOptions {
+            write_mode: WriteMode::Random,
+            access: MmapAccess::Random,
+            ..Default::default()
         };
-        let file_end = file.seek(SeekFrom::End(0))?;
+        let mut file = MmapDataFile::open_with(dir.join("index.btx"), read_only, opts)?;
 
-        let header = if file_end == 0 {
+        let header = if file.is_empty() {
             if read_only {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
             let header = BtreeHeader::new(data_header, KSIZE as u16);
-            header.write(&mut file)?;
-            // Page 1: the empty root leaf.
-            let mut leaf = vec![0_u8; PAGE_SIZE];
-            Node::<KSIZE>::init_leaf(&mut leaf, NULL_PAGE, NULL_PAGE);
-            Node::<KSIZE>::finalize(&mut leaf);
-            file.seek(SeekFrom::Start(PAGE_SIZE as u64))?;
-            file.write_all(&leaf)?;
-            // Header + root leaf are written; fsync the directory so index.btx is durable.
+            file.ensure_len(2 * PAGE_SIZE as u64)?;
+            // Page 0: header (valid CRC — it is the commit marker).
+            let page = header.to_page();
+            file.slice_mut(0, PAGE_SIZE)
+                .ok_or_else(|| io::Error::other("header page not mapped"))?
+                .copy_from_slice(&page);
+            // Page 1: the empty root leaf (valid CRC).
+            {
+                let leaf = file
+                    .slice_mut(PAGE_SIZE as u64, PAGE_SIZE)
+                    .ok_or_else(|| io::Error::other("root leaf page not mapped"))?;
+                Node::<KSIZE>::init_leaf(leaf, NULL_PAGE, NULL_PAGE);
+                add_crc32(leaf);
+            }
+            file.sync_all()?; // msync the fresh empty tree
             let _ = fsync_directory(dir);
             header
         } else {
-            let header = BtreeHeader::load(&mut file)?;
+            let header = {
+                let hbuf = file.slice(0, PAGE_SIZE).ok_or(LoadHeaderError::CrcFailed)?;
+                BtreeHeader::from_page(hbuf)?
+            };
             if header.version != data_header.version() {
                 return Err(LoadHeaderError::InvalidIndexVersion);
             }
@@ -136,29 +148,19 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
             {
                 return Err(LoadHeaderError::InvalidIndexGeometry);
             }
-            // The file must be a whole number of pages.  A misaligned tail is a torn final page
-            // (crash mid-write); drop it when writable, reject when read-only.
-            let len = file.seek(SeekFrom::End(0))?;
-            if !len.is_multiple_of(PAGE_SIZE as u64) {
-                if read_only {
-                    return Err(LoadHeaderError::InvalidIndexGeometry);
+            // Normalize to exactly the committed pages when writable — trims any crash padding or a
+            // torn tail past `page_count` (which is authoritative). A read-only handle maps as-is;
+            // reads are bounded by `page_count`, so trailing junk is simply never addressed.
+            if !read_only {
+                let want = header.page_count as u64 * PAGE_SIZE as u64;
+                if file.len() != want {
+                    file.set_len(want)?;
                 }
-                let aligned = (len / PAGE_SIZE as u64) * PAGE_SIZE as u64;
-                file.set_len(aligned)?;
             }
             header
         };
 
-        Ok(Self {
-            header,
-            page_cache: FxHashMap::default(),
-            dirty_page_cache: FxHashMap::default(),
-            page_cache_fifo: VecDeque::default(),
-            file,
-            read_only,
-            synced: true,
-            _index_dir: dir.to_owned(),
-        })
+        Ok(Self { header, file, read_only, synced: true, _index_dir: dir.to_owned() })
     }
 
     /// Number of keys stored in this index.
@@ -190,12 +192,30 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         self.header.data_file_length
     }
 
+    /// Classify the data pages by their trailing CRC — an off-hot-path integrity/verification hook
+    /// (reads themselves never verify a CRC). Lets a pack wrapper decide whether to
+    /// [`Self::rebuild_from`]: `dirty > 0` = unsynced writes, `corrupt > 0` = on-disk corruption.
+    pub fn page_crc_scan(&self) -> PageCrcReport {
+        let mut report = PageCrcReport::default();
+        for p in 1..self.header.page_count {
+            match self.file.slice(Self::page_offset(p), PAGE_SIZE) {
+                Some(buf) => match crc_state(buf) {
+                    CrcState::Valid => {}
+                    CrcState::Dirty => report.dirty += 1,
+                    CrcState::Corrupt => report.corrupt += 1,
+                },
+                None => report.corrupt += 1,
+            }
+        }
+        report
+    }
+
     /// Discard the current tree and rebuild it from `entries`.
     ///
     /// The index is deterministically derivable from the immutable pack it accompanies, so a pack
-    /// wrapper can recover a corrupt index (e.g. an [`Index::load`] returning
-    /// [`FetchError::CrcFailed`]) by re-scanning the pack and feeding `(key, position)` pairs here.
-    /// The index must be writable; call [`Index::sync`] afterwards to make the rebuild durable.
+    /// wrapper can recover a corrupt index (see [`Self::page_crc_scan`]) by re-scanning the pack
+    /// and feeding `(key, position)` pairs here. The index must be writable; call
+    /// [`Index::sync`] afterwards to make the rebuild durable.
     pub fn rebuild_from<I>(&mut self, entries: I) -> Result<(), AppendError>
     where
         I: IntoIterator<Item = ([u8; KSIZE], u64)>,
@@ -213,100 +233,57 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
     /// Reset to a fresh, empty single-leaf tree, rewriting a consistent empty tree to disk so a
     /// crash mid-[`Self::rebuild_from`] reopens clean.
     fn reset_empty(&mut self) -> Result<(), io::Error> {
-        self.page_cache.clear();
-        self.dirty_page_cache.clear();
-        self.page_cache_fifo.clear();
         self.header.root_page = 1;
         self.header.height = 1;
         self.header.page_count = 2;
         self.header.values = 0;
         self.header.first_leaf = 1;
         self.header.last_leaf = 1;
-        self.file.set_len(0)?;
-        self.header.write(&mut self.file)?;
-        let mut leaf = vec![0_u8; PAGE_SIZE];
-        Node::<KSIZE>::init_leaf(&mut leaf, NULL_PAGE, NULL_PAGE);
-        Node::<KSIZE>::finalize(&mut leaf);
-        self.file.seek(SeekFrom::Start(PAGE_SIZE as u64))?;
-        self.file.write_all(&leaf)?;
+        self.file.set_len(0)?; // unmap + truncate to nothing
+        self.file.ensure_len(2 * PAGE_SIZE as u64)?; // grow back to header + root leaf (zero-filled)
+        let page = self.header.to_page();
+        self.file
+            .slice_mut(0, PAGE_SIZE)
+            .ok_or_else(|| io::Error::other("header page not mapped"))?
+            .copy_from_slice(&page);
+        {
+            let leaf = self
+                .file
+                .slice_mut(PAGE_SIZE as u64, PAGE_SIZE)
+                .ok_or_else(|| io::Error::other("root leaf page not mapped"))?;
+            Node::<KSIZE>::init_leaf(leaf, NULL_PAGE, NULL_PAGE);
+            add_crc32(leaf);
+        }
         self.file.sync_all()?;
         self.synced = true;
         Ok(())
     }
 
-    // ---- page cache / IO ----
+    // ---- page IO (zero-copy over the mapping; no cache) ----
 
     fn page_offset(p: u32) -> u64 {
         p as u64 * PAGE_SIZE as u64
     }
 
-    /// Read a page from disk and verify its CRC32.
-    fn read_page_from_disk(&self, p: u32) -> Result<Vec<u8>, FetchError> {
-        let mut buf = vec![0_u8; PAGE_SIZE];
-        let mut f = &self.file;
-        f.seek(SeekFrom::Start(Self::page_offset(p)))?;
-        f.read_exact(&mut buf)?;
-        if !Node::<KSIZE>::verify(&buf) {
-            return Err(FetchError::CrcFailed);
-        }
-        Ok(buf)
+    /// Borrow page `p`'s bytes directly from the mapping (no CRC verification — reads trust the
+    /// mapping; corruption is caught off-path by [`Self::page_crc_scan`]).
+    fn page(&self, p: u32) -> Result<&[u8], FetchError> {
+        self.file.slice(Self::page_offset(p), PAGE_SIZE).ok_or(FetchError::CrcFailed)
     }
 
-    /// Ensure page `p` is present in a cache (dirty or clean), reading from disk on a miss.
-    fn ensure_cached(&mut self, p: u32) -> Result<(), FetchError> {
-        if self.dirty_page_cache.contains_key(&p) || self.page_cache.contains_key(&p) {
-            return Ok(());
-        }
-        let buf = self.read_page_from_disk(p)?;
-        self.cache_clean(p, buf);
-        Ok(())
+    /// Borrow page `p`'s bytes mutably from the mapping for in-place modification.
+    fn page_mut(&mut self, p: u32) -> Result<&mut [u8], FetchError> {
+        self.file.slice_mut(Self::page_offset(p), PAGE_SIZE).ok_or(FetchError::CrcFailed)
     }
 
-    /// Borrow a page that [`Self::ensure_cached`] has already loaded.
-    fn cached(&self, p: u32) -> &[u8] {
-        if let Some(b) = self.dirty_page_cache.get(&p) {
-            return b;
-        }
-        self.page_cache.get(&p).expect("page must be ensure_cached() first")
-    }
-
-    /// Insert a clean page into the read cache, evicting FIFO if over capacity.
-    fn cache_clean(&mut self, p: u32, buf: Vec<u8>) {
-        self.page_cache.insert(p, buf);
-        self.page_cache_fifo.push_back(p);
-        while self.page_cache_fifo.len() > CACHED_PAGES {
-            if let Some(old) = self.page_cache_fifo.pop_front() {
-                if old != p {
-                    self.page_cache.remove(&old);
-                }
-            }
-        }
-    }
-
-    /// Take ownership of a page's buffer for mutation (removing it from whichever cache holds it,
-    /// or reading it from disk).
-    fn take_page(&mut self, p: u32) -> Result<Vec<u8>, FetchError> {
-        if let Some(b) = self.dirty_page_cache.remove(&p) {
-            return Ok(b);
-        }
-        if let Some(b) = self.page_cache.remove(&p) {
-            return Ok(b);
-        }
-        self.read_page_from_disk(p)
-    }
-
-    /// Return a (mutated) page to the dirty cache.
-    fn put_dirty(&mut self, p: u32, buf: Vec<u8>) {
-        self.page_cache.remove(&p);
-        self.dirty_page_cache.insert(p, buf);
-        self.synced = false;
-    }
-
-    /// Allocate the next page number (append-only bump allocator; no free list).
-    fn allocate_page(&mut self) -> u32 {
+    /// Allocate the next page number (append-only bump allocator; no free list), growing the
+    /// mapping to cover it. The grown region is zero-filled, so a fresh page reads as a zero-CRC
+    /// (dirty) page until it is written and CRC'd at [`Index::sync`].
+    fn allocate_page(&mut self) -> Result<u32, io::Error> {
         let p = self.header.page_count;
         self.header.page_count += 1;
-        p
+        self.file.ensure_len((p as u64 + 1) * PAGE_SIZE as u64)?;
+        Ok(p)
     }
 
     // ---- helpers for the leaf-chain iterators (see `super::iter`) ----
@@ -321,18 +298,16 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         self.header.last_leaf
     }
 
-    /// Return an owned, CRC-checked copy of leaf/page `p` for iteration.
+    /// Return an owned copy of page `p` for iteration (one copy per leaf hop).
     pub(super) fn fetch_page(&mut self, p: u32) -> Result<Vec<u8>, FetchError> {
-        self.ensure_cached(p)?;
-        Ok(self.cached(p).to_vec())
+        Ok(self.page(p)?.to_vec())
     }
 
     /// Descend to the leaf page that would contain `key`.
     pub(super) fn find_leaf(&mut self, key: &[u8]) -> Result<u32, FetchError> {
         let mut pno = self.header.root_page;
         for _ in 0..MAX_DEPTH {
-            self.ensure_cached(pno)?;
-            let buf = self.cached(pno);
+            let buf = self.page(pno)?;
             if Node::<KSIZE>::is_leaf(buf) {
                 return Ok(pno);
             }
@@ -344,11 +319,10 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
 
     // ---- lookup ----
 
-    fn get_value(&mut self, key: &[u8]) -> Result<u64, FetchError> {
+    fn get_value(&self, key: &[u8]) -> Result<u64, FetchError> {
         let mut pno = self.header.root_page;
         for _ in 0..MAX_DEPTH {
-            self.ensure_cached(pno)?;
-            let buf = self.cached(pno);
+            let buf = self.page(pno)?;
             if Node::<KSIZE>::is_leaf(buf) {
                 return match Node::<KSIZE>::leaf_search(buf, key) {
                     Ok(i) => Ok(Node::<KSIZE>::leaf_value(buf, i)),
@@ -361,7 +335,7 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         Err(FetchError::CrcFailed)
     }
 
-    // ---- insertion ----
+    // ---- insertion (all in place on the mapping) ----
 
     fn insert_kv(&mut self, key: &[u8], val: u64) -> Result<(), AppendError> {
         // Descend to the target leaf, recording the (page, child_index) path for split propagation.
@@ -369,8 +343,7 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         let mut pno = self.header.root_page;
         let mut leaf_no = None;
         for _ in 0..MAX_DEPTH {
-            self.ensure_cached(pno).map_err(fetch_to_append)?;
-            let buf = self.cached(pno);
+            let buf = self.page(pno).map_err(fetch_to_append)?;
             if Node::<KSIZE>::is_leaf(buf) {
                 leaf_no = Some(pno);
                 break;
@@ -383,68 +356,91 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         let leaf_no = leaf_no.ok_or_else(|| {
             AppendError::SerializeValue("btree descent exceeded max depth".to_string())
         })?;
-        let leaf_buf = self.take_page(leaf_no).map_err(fetch_to_append)?;
-        self.insert_into_leaf(leaf_no, leaf_buf, path, key, val)
+        self.insert_into_leaf(leaf_no, path, key, val)
     }
 
     fn insert_into_leaf(
         &mut self,
         leaf_no: u32,
-        mut buf: Vec<u8>,
         path: Vec<(u32, usize)>,
         key: &[u8],
         val: u64,
     ) -> Result<(), AppendError> {
-        match Node::<KSIZE>::leaf_search(&buf, key) {
-            Ok(i) => {
-                // Duplicate key: overwrite the value, tree shape and count unchanged.
-                Node::<KSIZE>::set_leaf_value(&mut buf, i, val);
-                self.put_dirty(leaf_no, buf);
-                Ok(())
-            }
-            Err(at) => {
-                if Node::<KSIZE>::entry_count(&buf) < Node::<KSIZE>::MAX_LEAF_KEYS {
-                    Node::<KSIZE>::leaf_insert(&mut buf, at, key, val);
-                    self.put_dirty(leaf_no, buf);
-                    self.header.values += 1;
-                    Ok(())
-                } else {
-                    self.split_leaf(leaf_no, buf, path, at, key, val)?;
-                    self.header.values += 1;
-                    Ok(())
+        // Decide the action from a read-only view of the leaf.
+        let (found, at, full) = {
+            let buf = self.page(leaf_no).map_err(fetch_to_append)?;
+            match Node::<KSIZE>::leaf_search(buf, key) {
+                Ok(i) => (Some(i), 0usize, false),
+                Err(at) => {
+                    (None, at, Node::<KSIZE>::entry_count(buf) >= Node::<KSIZE>::MAX_LEAF_KEYS)
                 }
             }
+        };
+        if let Some(i) = found {
+            // Duplicate key: overwrite the value in place; tree shape and count unchanged.
+            {
+                let buf = self.page_mut(leaf_no).map_err(fetch_to_append)?;
+                Node::<KSIZE>::set_leaf_value(buf, i, val);
+                zero_crc(buf);
+            }
+            self.synced = false;
+            return Ok(());
         }
+        if !full {
+            {
+                let buf = self.page_mut(leaf_no).map_err(fetch_to_append)?;
+                Node::<KSIZE>::leaf_insert(buf, at, key, val);
+                zero_crc(buf);
+            }
+            self.synced = false;
+            self.header.values += 1;
+            return Ok(());
+        }
+        self.split_leaf(leaf_no, path, at, key, val)?;
+        self.header.values += 1;
+        Ok(())
     }
 
     fn split_leaf(
         &mut self,
         leaf_no: u32,
-        mut left: Vec<u8>,
         path: Vec<(u32, usize)>,
         at: usize,
         key: &[u8],
         val: u64,
     ) -> Result<(), AppendError> {
-        let right_no = self.allocate_page();
-        let mut right = vec![0_u8; PAGE_SIZE];
-        let sep = Node::<KSIZE>::leaf_split(&mut left, &mut right, at, key, val);
+        // Read the old successor before mutating, then allocate the right sibling (may remap).
+        let old_next = {
+            let l = self.page(leaf_no).map_err(fetch_to_append)?;
+            Node::<KSIZE>::leaf_next(l)
+        };
+        let right_no = self.allocate_page()?;
 
-        // Splice `right` into the leaf chain between `left` and its old successor.
-        let old_next = Node::<KSIZE>::leaf_next(&left);
-        Node::<KSIZE>::set_leaf_prev(&mut right, leaf_no);
-        Node::<KSIZE>::set_leaf_next(&mut right, old_next);
-        Node::<KSIZE>::set_leaf_next(&mut left, right_no);
+        // Split the left leaf in place; build the right leaf in a scratch buffer.
+        let mut rbuf = vec![0_u8; PAGE_SIZE];
+        let sep = {
+            let left = self.page_mut(leaf_no).map_err(fetch_to_append)?;
+            let sep = Node::<KSIZE>::leaf_split(left, &mut rbuf, at, key, val);
+            Node::<KSIZE>::set_leaf_next(left, right_no);
+            zero_crc(left);
+            sep
+        };
+        Node::<KSIZE>::set_leaf_prev(&mut rbuf, leaf_no);
+        Node::<KSIZE>::set_leaf_next(&mut rbuf, old_next);
+        zero_crc(&mut rbuf);
+        {
+            let r = self.page_mut(right_no).map_err(fetch_to_append)?;
+            r.copy_from_slice(&rbuf);
+        }
+        // Relink the old successor's back-pointer, or record the new rightmost leaf.
         if old_next != NULL_PAGE {
-            let mut nb = self.take_page(old_next).map_err(fetch_to_append)?;
-            Node::<KSIZE>::set_leaf_prev(&mut nb, right_no);
-            self.put_dirty(old_next, nb);
+            let nb = self.page_mut(old_next).map_err(fetch_to_append)?;
+            Node::<KSIZE>::set_leaf_prev(nb, right_no);
+            zero_crc(nb);
         } else {
             self.header.last_leaf = right_no;
         }
-        self.put_dirty(leaf_no, left);
-        self.put_dirty(right_no, right);
-
+        self.synced = false;
         self.insert_into_parent(path, sep, right_no)
     }
 
@@ -459,48 +455,73 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         let mut sep = sep;
         let mut right_no = right_no;
         while let Some((pno, ci)) = path.pop() {
-            let mut buf = self.take_page(pno).map_err(fetch_to_append)?;
-            if Node::<KSIZE>::entry_count(&buf) < Node::<KSIZE>::MAX_INTERNAL_KEYS {
-                Node::<KSIZE>::internal_insert(&mut buf, ci, &sep, right_no);
-                self.put_dirty(pno, buf);
+            let has_room = {
+                let buf = self.page(pno).map_err(fetch_to_append)?;
+                Node::<KSIZE>::entry_count(buf) < Node::<KSIZE>::MAX_INTERNAL_KEYS
+            };
+            if has_room {
+                {
+                    let buf = self.page_mut(pno).map_err(fetch_to_append)?;
+                    Node::<KSIZE>::internal_insert(buf, ci, &sep, right_no);
+                    zero_crc(buf);
+                }
+                self.synced = false;
                 return Ok(());
             }
-            // Internal node full: split it and propagate the median upward.
-            let mut new_right = vec![0_u8; PAGE_SIZE];
-            let median = Node::<KSIZE>::internal_split(&mut buf, &mut new_right, ci, &sep, right_no);
-            let new_right_no = self.allocate_page();
-            self.put_dirty(pno, buf);
-            self.put_dirty(new_right_no, new_right);
+            // Internal node full: split it in place (right half to scratch) and propagate the
+            // median.
+            let new_right_no = self.allocate_page()?;
+            let mut qbuf = vec![0_u8; PAGE_SIZE];
+            let median = {
+                let p = self.page_mut(pno).map_err(fetch_to_append)?;
+                let median = Node::<KSIZE>::internal_split(p, &mut qbuf, ci, &sep, right_no);
+                zero_crc(p);
+                median
+            };
+            zero_crc(&mut qbuf);
+            {
+                let q = self.page_mut(new_right_no).map_err(fetch_to_append)?;
+                q.copy_from_slice(&qbuf);
+            }
             sep = median;
             right_no = new_right_no;
         }
         // Path exhausted with a pending split: grow a new root one level up.
+        let new_root_no = self.allocate_page()?;
         let old_root = self.header.root_page;
-        let new_root_no = self.allocate_page();
-        let mut root = vec![0_u8; PAGE_SIZE];
-        Node::<KSIZE>::init_internal(&mut root, old_root);
-        Node::<KSIZE>::internal_insert(&mut root, 0, &sep, right_no);
-        self.put_dirty(new_root_no, root);
+        {
+            let r = self.page_mut(new_root_no).map_err(fetch_to_append)?;
+            Node::<KSIZE>::init_internal(r, old_root);
+            Node::<KSIZE>::internal_insert(r, 0, &sep, right_no);
+            zero_crc(r);
+        }
         self.header.root_page = new_root_no;
         self.header.height += 1;
+        self.synced = false;
         Ok(())
     }
 
-    // ---- durability ----
+    // ---- durability (lazy CRC + msync, header-last commit) ----
 
-    /// Write every dirty page (CRC-stamped) to disk, moving it into the clean cache.
-    fn flush_dirty(&mut self) -> Result<(), io::Error> {
-        let pages: Vec<u32> = self.dirty_page_cache.keys().copied().collect();
-        for p in pages {
-            let mut buf = self.dirty_page_cache.remove(&p).expect("just enumerated");
-            Node::<KSIZE>::finalize(&mut buf);
-            {
-                let mut f = &self.file;
-                f.seek(SeekFrom::Start(Self::page_offset(p)))?;
-                f.write_all(&buf)?;
+    /// CRC every dirty (zero-CRC) data page in one pass. Page 0 (the header) is written separately.
+    fn crc_dirty_pages(&mut self) {
+        let page_count = self.header.page_count;
+        for p in 1..page_count {
+            if let Some(buf) = self.file.slice_mut(Self::page_offset(p), PAGE_SIZE) {
+                if crc_is_zero(buf) {
+                    add_crc32(buf);
+                }
             }
-            self.cache_clean(p, buf);
         }
+    }
+
+    /// Write the in-memory header into page 0 (with a valid CRC — the commit marker).
+    fn write_header(&mut self) -> Result<(), io::Error> {
+        let page = self.header.to_page();
+        self.file
+            .slice_mut(0, PAGE_SIZE)
+            .ok_or_else(|| io::Error::other("header page not mapped"))?
+            .copy_from_slice(&page);
         Ok(())
     }
 
@@ -508,12 +529,12 @@ impl<const KSIZE: usize> BtreeIndex<KSIZE> {
         if self.read_only {
             return Err(CommitError::ReadOnly);
         }
-        // Flush + fsync all data pages BEFORE rewriting the header, so the header (root pointer,
-        // page_count, first/last leaf) never references a not-yet-durable page.
-        self.flush_dirty().map_err(CommitError::IndexFileSync)?;
+        // CRC + msync all data pages BEFORE rewriting/msyncing the header, so the header (root
+        // pointer, page_count, first/last leaf) never becomes durable ahead of the pages it names.
+        self.crc_dirty_pages();
         self.file.sync_all().map_err(CommitError::IndexFileSync)?;
-        self.header.write(&mut self.file).map_err(CommitError::IndexFileSync)?;
-        self.file.sync_all().map_err(CommitError::IndexFileSync)?;
+        self.write_header().map_err(CommitError::IndexFileSync)?;
+        self.file.sync_range(0, PAGE_SIZE as u64).map_err(CommitError::IndexFileSync)?;
         self.synced = true;
         Ok(())
     }
@@ -561,19 +582,12 @@ impl<const KSIZE: usize> Drop for BtreeIndex<KSIZE> {
             if !std::thread::panicking() {
                 tracing::warn!("BtreeIndex dropped with unsynced data - caller should call sync()");
             }
-            if let Err(e) = self.flush_dirty() {
+            // Commit the tree before MmapDataFile's own clean-close (msync + truncate + fsync).
+            if let Err(e) = self.sync_impl() {
                 if !std::thread::panicking() {
-                    tracing::error!("BtreeIndex: failed to flush pages on drop: {e}");
+                    tracing::error!("BtreeIndex: failed to sync on drop: {e}");
                 }
             }
-            // Data pages first, then header, mirroring sync().
-            let _ = self.file.sync_all();
-            if let Err(e) = self.header.write(&mut self.file) {
-                if !std::thread::panicking() {
-                    tracing::error!("BtreeIndex: failed to write header on drop: {e}");
-                }
-            }
-            let _ = self.file.sync_all();
         }
     }
 }
@@ -670,6 +684,9 @@ mod tests {
         idx.save(key_of(42), 999_999_999).expect("overwrite");
         assert_eq!(idx.load(key_of(42)).expect("load dup"), 999_999_999);
         assert_eq!(idx.len(), 1_000_000);
+        idx.sync().expect("sync");
+        // A fully synced tree has no dirty or corrupt pages.
+        assert_eq!(idx.page_crc_scan(), PageCrcReport::default());
         drop(idx);
 
         // Reopen read-only and re-verify persistence across the split-heavy tree.
@@ -724,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn test_archive_btx_torn_tail_heals() {
+    fn test_archive_btx_torn_tail_normalized() {
         use std::io::Write as _;
 
         let tmp = TempDir::with_prefix("test_archive_btx_torn").expect("temp dir");
@@ -740,9 +757,9 @@ mod tests {
             idx.sync().expect("sync");
         }
         let before = std::fs::metadata(&file).expect("meta").len();
-        assert!(before.is_multiple_of(PAGE_SIZE as u64), "file should be whole pages");
+        assert!(before.is_multiple_of(PAGE_SIZE as u64), "clean close leaves whole pages");
 
-        // Simulate a torn final page: append a few sub-page bytes.
+        // Simulate a torn tail: append a few sub-page bytes past the committed pages.
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&file).expect("append");
             f.write_all(&[0xAB, 0xCD, 0xEF]).expect("write torn");
@@ -750,21 +767,20 @@ mod tests {
         }
         assert_eq!(std::fs::metadata(&file).expect("meta").len(), before + 3);
 
-        // A read-only open cannot repair and must reject the misaligned file.
-        let ro = BtreeIndex::<32>::open_btx_file(&dir, &data_header, true);
-        assert!(matches!(ro, Err(LoadHeaderError::InvalidIndexGeometry)), "got {ro:?}");
-
-        // A writable open heals the torn tail; every key still reads back.
+        // A writable reopen normalizes the file back to exactly the committed pages; keys read
+        // back.
         let mut idx: BtreeIndex =
             BtreeIndex::open_btx_file(&dir, &data_header, false).expect("reopen rw");
-        assert_eq!(
-            std::fs::metadata(&file).expect("meta").len(),
-            before,
-            "torn bytes should be truncated"
-        );
         for i in 0..2_000 {
             assert_eq!(idx.load(key_of(i)).expect("load"), i);
         }
+        idx.sync().expect("sync");
+        drop(idx);
+        assert_eq!(
+            std::fs::metadata(&file).expect("meta").len(),
+            before,
+            "torn tail should be trimmed to page_count pages"
+        );
     }
 
     #[test]
@@ -798,24 +814,35 @@ mod tests {
     }
 
     #[test]
-    fn test_archive_btx_crc_detected_and_rebuilt() {
-        use std::io::{Seek as _, Write as _};
+    fn test_archive_btx_crc_regime_and_rebuild() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
 
         let tmp = TempDir::with_prefix("test_archive_btx_crc").expect("temp dir");
         let dir = tmp.path().join("idx");
         let file = dir.join("index.btx");
         let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
         let all: Vec<([u8; 32], u64)> = (0..3_000u64).map(|i| (key_of(i), i)).collect();
+
+        // Insert without syncing: modified pages carry the zero-CRC dirty marker.
         {
             let mut idx: BtreeIndex =
                 BtreeIndex::open_btx_file(&dir, &data_header, false).expect("open");
             for (k, v) in &all {
                 idx.save(*k, *v).expect("save");
             }
+            let before = idx.page_crc_scan();
+            assert!(before.dirty > 0, "unsynced writes should leave dirty pages, got {before:?}");
+            assert_eq!(before.corrupt, 0, "no corruption yet");
+            // sync() CRCs every dirty page.
             idx.sync().expect("sync");
+            assert_eq!(
+                idx.page_crc_scan(),
+                PageCrcReport::default(),
+                "sync clears all dirty pages"
+            );
         }
 
-        // Corrupt the payload of page 1 (the leftmost leaf) without touching its CRC bytes.
+        // Corrupt a leaf page's payload on disk (leaving its now-stale, non-zero CRC).
         {
             let mut f =
                 std::fs::OpenOptions::new().read(true).write(true).open(&file).expect("open rw");
@@ -824,17 +851,24 @@ mod tests {
             f.sync_all().expect("sync");
         }
 
-        // The corruption surfaces as a CRC failure for at least one (smallest) key.
-        let mut idx: BtreeIndex =
-            BtreeIndex::open_btx_file(&dir, &data_header, false).expect("reopen");
-        let saw_crc = all.iter().any(|(k, _)| matches!(idx.load(*k), Err(FetchError::CrcFailed)));
-        assert!(saw_crc, "expected a CRC failure from the corrupted page");
+        // Reads no longer verify a per-op CRC, but the off-path scan detects the corruption.
+        {
+            let idx: BtreeIndex =
+                BtreeIndex::open_btx_file(&dir, &data_header, true).expect("reopen ro");
+            let rep = idx.page_crc_scan();
+            assert!(rep.corrupt > 0, "corrupted page must be flagged by the scan, got {rep:?}");
+        }
 
-        // Rebuilding from the (pack-derived) entries recovers a fully readable index.
-        idx.rebuild_from(all.iter().copied()).expect("rebuild");
-        idx.sync().expect("sync");
-        for (k, v) in &all {
-            assert_eq!(idx.load(*k).expect("load"), *v);
+        // Rebuilding from the (pack-derived) entries recovers a fully readable, clean index.
+        {
+            let mut idx: BtreeIndex =
+                BtreeIndex::open_btx_file(&dir, &data_header, false).expect("reopen rw");
+            idx.rebuild_from(all.iter().copied()).expect("rebuild");
+            idx.sync().expect("sync");
+            for (k, v) in &all {
+                assert_eq!(idx.load(*k).expect("load"), *v);
+            }
+            assert_eq!(idx.page_crc_scan(), PageCrcReport::default(), "rebuilt index is clean");
         }
     }
 }

@@ -15,8 +15,6 @@
 
 use std::cmp::Ordering;
 
-use crate::archive::crc::{add_crc32, check_crc};
-
 /// Size of every page in the index file, in bytes.
 pub(crate) const PAGE_SIZE: usize = 4096;
 
@@ -77,16 +75,6 @@ impl<const KSIZE: usize> Node<KSIZE> {
 
     fn set_entry_count(buf: &mut [u8], n: usize) {
         buf[2..4].copy_from_slice(&(n as u16).to_le_bytes());
-    }
-
-    /// Stamp the CRC32 over the page (overwrites the last 4 bytes).  Call before writing to disk.
-    pub(crate) fn finalize(buf: &mut [u8]) {
-        add_crc32(buf);
-    }
-
-    /// Verify a page's trailing CRC32 after reading from disk.
-    pub(crate) fn verify(buf: &[u8]) -> bool {
-        check_crc(buf)
     }
 
     // ---- little-endian scalar helpers ----

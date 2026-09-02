@@ -4,11 +4,8 @@
 //! with a CRC32 over the page.  It records the paired pack's `version`/`uid`/`appnum` (for
 //! cross-checking), the page/key/value geometry (validated on reopen), and the mutable tree state
 //! (`root_page`, `height`, `page_count`, `values`, `first_leaf`, `last_leaf`, `data_file_length`).
-
-use std::{
-    fs::File,
-    io::{self, Read, Seek, SeekFrom, Write},
-};
+//!
+//! The header is (de)serialized to/from a page-sized byte buffer; the index does the mmap slice IO.
 
 use crate::archive::{
     btree_index::page::PAGE_SIZE,
@@ -64,13 +61,11 @@ impl BtreeHeader {
         }
     }
 
-    /// Load and CRC-check the header page from the start of `file`.  Identity/geometry validation
-    /// against the paired pack is done by the caller (`open_btx_file`).
-    pub(crate) fn load(file: &mut File) -> Result<Self, LoadHeaderError> {
-        file.rewind()?;
-        let mut buf = vec![0_u8; PAGE_SIZE];
-        file.read_exact(&mut buf)?;
-        if !check_crc(&buf) {
+    /// Parse and CRC-check a header from a page-0 byte buffer (`buf.len()` must be [`PAGE_SIZE`]).
+    /// Identity/geometry validation against the paired pack is done by the caller
+    /// (`open_btx_file`).
+    pub(crate) fn from_page(buf: &[u8]) -> Result<Self, LoadHeaderError> {
+        if buf.len() < PAGE_SIZE || !check_crc(buf) {
             return Err(LoadHeaderError::CrcFailed);
         }
         let mut type_id = [0_u8; 8];
@@ -99,7 +94,8 @@ impl BtreeHeader {
         })
     }
 
-    /// Serialize the header into a fresh page-0 buffer with a trailing CRC32.
+    /// Serialize the header into a fresh page-0 buffer with a trailing (valid) CRC32.  This is the
+    /// commit marker, so it always carries a real CRC (never the zero dirty-marker).
     pub(crate) fn to_page(&self) -> Vec<u8> {
         let mut buf = vec![0_u8; PAGE_SIZE];
         buf[0..8].copy_from_slice(&self.type_id);
@@ -118,13 +114,5 @@ impl BtreeHeader {
         buf[58..66].copy_from_slice(&self.data_file_length.to_le_bytes());
         add_crc32(&mut buf);
         buf
-    }
-
-    /// Write the header page to the start of `file`.
-    pub(crate) fn write(&self, file: &mut File) -> Result<(), io::Error> {
-        let buf = self.to_page();
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&buf)?;
-        Ok(())
     }
 }

@@ -45,7 +45,8 @@ impl<'a, const KSIZE: usize> BtreeIter<'a, KSIZE> {
         lower: Bound<[u8; KSIZE]>,
         upper: Bound<[u8; KSIZE]>,
     ) -> Result<Self, FetchError> {
-        let mut it = Self { index, buf: Vec::new(), leaf: NULL_PAGE, pos: 0, reverse, lower, upper };
+        let mut it =
+            Self { index, buf: Vec::new(), leaf: NULL_PAGE, pos: 0, reverse, lower, upper };
         if reverse {
             it.reverse_start()?;
         } else {
@@ -406,9 +407,8 @@ mod tests {
             }
         }
 
-        let collect = |it: BtreeIter<'_, 32>| -> Vec<[u8; 32]> {
-            it.map(|r| r.expect("item").0).collect()
-        };
+        let collect =
+            |it: BtreeIter<'_, 32>| -> Vec<[u8; 32]> { it.map(|r| r.expect("item").0).collect() };
 
         for g in [0u8, 2, 3] {
             let got = collect(idx.prefix(&[g]).expect("prefix"));

@@ -13,5 +13,5 @@ pub(crate) mod page;
 pub mod index;
 pub mod iter;
 
-pub use index::BtreeIndex;
+pub use index::{BtreeIndex, PageCrcReport};
 pub use iter::BtreeIter;
