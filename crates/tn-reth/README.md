@@ -292,10 +292,15 @@ networking is TN's own libp2p; the reth payload builder and pruning are likewise
 
 ### RPC surface
 
-- **Namespace allowlist** (`src/cli.rs`): the constant `ALL_MODULES` permits exactly
-  `eth, net, web3, debug, trace, rpc`. `RpcModuleSelection::All` is rewritten to that set;
-  explicit selections are intersected with it; requests for `admin` or `txpool` are dropped with
-  a warning. Applied to both HTTP and WS.
+- **Namespace allowlist** (`src/cli.rs`): the constant `ALLOWED_MODULES` permits exactly
+  `eth, net, web3, debug, trace, rpc`. `RpcModuleSelection::All` is rewritten to
+  `DEFAULT_MODULES` (`eth, net, web3, rpc`): the expensive `debug` and `trace` namespaces are
+  never part of `all` and are enabled only when named explicitly, which warns. Explicit
+  selections are intersected with the allowlist, and every dropped module (`admin`, `txpool`,
+  or an unrecognized name) is warned about by name. Applied to HTTP and WS from the CLI
+  flags; the IPC transport has no selection flag and serves the same `DEFAULT_MODULES` set
+  (`src/env/rpc.rs`). The TN-specific `tn_*` module is outside this allowlist and is
+  registered on every enabled transport.
 - **Transport limits** (`src/rpc_server_args.rs`, CLI-overridable defaults): 500 max connections,
   15 MB max request, 160 MB max response, 1024 subscriptions per connection, plus reth's default
   `eth_call` gas cap, a 1-ether (1 TEL) RPC transaction fee cap, tracing/filter/proof limits, and
