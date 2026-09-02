@@ -36,9 +36,10 @@ where
     compression: PackCompression,
     version: u16,
     /// Logical data length: the sequential scan stops here rather than at physical EOF. The mmap
-    /// backend pads the physical file past the data, and a `try_clone`d handle can see that padding
-    /// re-grow under a concurrent append, so reading to EOF would decode trailing zeros as a
-    /// (CRC-failing) record. `end` is the exact byte length of the header + all complete records.
+    /// backend pads the physical file past the data, and a `try_clone`d handle can see that
+    /// padding re-grow under a concurrent append, so reading to EOF would decode trailing
+    /// zeros as a (CRC-failing) record. `end` is the exact byte length of the header + all
+    /// complete records.
     end: u64,
     /// Absolute file offset of the next record to read, tracked so the scan can stop at `end`.
     pos: u64,
@@ -69,7 +70,8 @@ where
             compression: header.compression(),
             version: header.version(),
             end,
-            // `load_header` consumed exactly the fixed-size header, so the first record starts here.
+            // `load_header` consumed exactly the fixed-size header, so the first record starts
+            // here.
             pos: DATA_HEADER_BYTES as u64,
         })
     }

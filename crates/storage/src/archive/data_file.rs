@@ -447,7 +447,8 @@ impl MmapDataFile {
     /// Unlike a clean close, this does NOT truncate the capacity padding: the physical file may be
     /// larger than `end` (and a later append re-grows and re-pads it further), so the returned
     /// `end` is the ONLY reliable data boundary. A consumer that reads to physical EOF would run
-    /// into the padding; readers must stop at `end` instead ([`PackIter`](crate::archive::pack_iter)
+    /// into the padding; readers must stop at `end` instead
+    /// ([`PackIter`](crate::archive::pack_iter)
     /// via [`raw_iter`](crate::archive::pack::Pack::raw_iter) does). An external byte consumer that
     /// cannot be told a length (a raw `std::fs::copy`, a read-to-EOF network stream) must instead
     /// physically truncate the file first with [`reconcile_to_end`](Self::reconcile_to_end).
@@ -463,15 +464,16 @@ impl MmapDataFile {
         Ok((self.file.try_clone()?, self.end))
     }
 
-    /// Reconcile the physical file to exactly the logical `end`: flush `[0, end)`, then truncate away
-    /// the capacity padding so a consumer that reads the raw bytes to EOF (a `std::fs::copy` of the
-    /// file, a read-to-EOF network stream) sees exactly the written bytes.
+    /// Reconcile the physical file to exactly the logical `end`: flush `[0, end)`, then truncate
+    /// away the capacity padding so a consumer that reads the raw bytes to EOF (a
+    /// `std::fs::copy` of the file, a read-to-EOF network stream) sees exactly the written
+    /// bytes.
     ///
     /// `File::set_len` takes `&self`; the existing map still spans the old capacity but
     /// `[end, capacity)` is never touched (our own reads are bounded by `end`), and the next write
-    /// re-maps first (see `remap_needed` / [`ensure_capacity`](Self::ensure_capacity)). Intended for
-    /// sealed packs (state export, full-epoch serve), so the next-append remap it arms is not on a
-    /// hot path.
+    /// re-maps first (see `remap_needed` / [`ensure_capacity`](Self::ensure_capacity)). Intended
+    /// for sealed packs (state export, full-epoch serve), so the next-append remap it arms is
+    /// not on a hot path.
     pub fn reconcile_to_end(&self) -> io::Result<()> {
         if !self.read_only {
             if self.end > 0 {

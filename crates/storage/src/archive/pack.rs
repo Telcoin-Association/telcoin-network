@@ -1022,10 +1022,10 @@ mod tests {
 
     /// A `raw_iter` snapshots the pack at its clone-time logical `end`. A concurrent append that
     /// re-grows and re-pads the physical mmap file underneath the already-cloned reader must not
-    /// feed the snapshot iterator the later records or the trailing zero padding (which would decode
-    /// as a 0-size, CRC-failing record). Regression for the `try_clone` EOF-contract hazard: under
-    /// the old truncate-at-clone behavior the post-clone append re-padded the file and the stale
-    /// reader ran off the end into the padding.
+    /// feed the snapshot iterator the later records or the trailing zero padding (which would
+    /// decode as a 0-size, CRC-failing record). Regression for the `try_clone` EOF-contract
+    /// hazard: under the old truncate-at-clone behavior the post-clone append re-padded the
+    /// file and the stale reader ran off the end into the padding.
     #[test]
     fn raw_iter_stops_at_clone_time_end_despite_concurrent_append() {
         let tmp_path = TempDir::with_prefix("pack_iter_bound").expect("temp dir");
@@ -1049,9 +1049,8 @@ mod tests {
 
         // The snapshot iterator yields EXACTLY the three clone-time records and terminates cleanly,
         // never decoding the later appends or the mmap padding.
-        let got: Vec<u64> = iter
-            .map(|r| r.expect("no read/CRC error past the logical end").idx)
-            .collect();
+        let got: Vec<u64> =
+            iter.map(|r| r.expect("no read/CRC error past the logical end").idx).collect();
         assert_eq!(got, vec![1, 2, 3], "iterator is bounded to the clone-time end");
     }
 
