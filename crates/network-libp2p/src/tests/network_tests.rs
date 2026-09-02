@@ -1,9 +1,12 @@
 //! Tests networking using libp2p between peers.
 
 use super::*;
-use crate::common::{
-    create_multiaddr, TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest,
-    TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
+use crate::{
+    common::{
+        create_multiaddr, TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest,
+        TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
+    },
+    types::RecordDomain,
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
@@ -2559,6 +2562,7 @@ async fn test_node_record_validation_rejects_oversized_multiaddr_list() {
     let network = peer1.network;
     let key_config = peer1.config.key_config();
     let cap = crate::peers::MAX_MULTIADDRS_PER_PEER;
+    let chain_id = peer1.config.network_config().libp2p_config().chain_id;
 
     // a correctly signed and published record carrying `count` distinct addresses
     let record_with = |count: usize| {
@@ -2574,7 +2578,9 @@ async fn test_node_record_validation_rejects_oversized_multiaddr_list() {
             timestamp: now(),
             rpc: None,
         };
-        let signature = key_config.request_signature_direct(&encode(&info));
+        let signing_bytes =
+            encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
+        let signature = key_config.request_signature_direct(&signing_bytes);
         let mut record = network.get_peer_record();
         record.value = encode(&NodeRecord { info, signature });
         record
@@ -2757,15 +2763,20 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     let mut network = peer1.network;
     let peer2_new_record = peer2.network.get_peer_record();
     // create valid peer2 record with old timestamp
+    let chain_id = peer2.config.network_config().libp2p_config().chain_id;
+    let domain = RecordDomain::new(chain_id, NetworkType::Primary);
     let mut peer2_info = peer2.network.node_record.info.clone();
     // timestamp in the past
     peer2_info.timestamp = now() - 10_000;
-    // sign record
-    let signature = peer2.config.key_config().request_signature_direct(&encode(&peer2_info));
+    // sign over the domain-scoped payload, mirroring the private NodeRecord::signing_bytes:
+    // label + (chain_id, role=0 primary, worker_id=0) + info.
+    let signing_bytes =
+        encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &peer2_info));
+    let signature = peer2.config.key_config().request_signature_direct(&signing_bytes);
     let old_record = NodeRecord { info: peer2_info, signature };
     // assert old record is valid
     let peer2_pubkey = peer2.config.key_config().primary_public_key();
-    assert!(old_record.clone().verify(&peer2_pubkey).is_some());
+    assert!(old_record.clone().verify(domain, &peer2_pubkey).is_some());
     // store with peer2 to generate old kad record
     peer2.network.node_record = old_record;
     let old_kad_record = peer2.network.get_peer_record();
@@ -2830,8 +2841,11 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
     let mut target_network = target_peer.network.take().expect("target network is some");
     let mut target_info = target_network.node_record.info.clone();
     target_info.rpc = Some(rpc.clone());
+    let chain_id = target_peer.config.network_config().libp2p_config().chain_id;
+    let target_signing_bytes =
+        encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &target_info));
     let target_signature =
-        target_peer.config.key_config().request_signature_direct(&encode(&target_info));
+        target_peer.config.key_config().request_signature_direct(&target_signing_bytes);
     target_network.node_record = NodeRecord { info: target_info, signature: target_signature };
 
     let target_peer_bls = target_peer.config.key_config().primary_public_key();
@@ -2915,12 +2929,13 @@ async fn test_advertise_rpc_via_kad() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Documents the rolling-upgrade contract: a pre-upgrade kad record (no `rpc`
-/// field) decodes through the legacy fallback, verifies against the legacy
-/// encoding it was signed over, and is promoted into `known_peers` with
-/// `rpc: None`. The honest not-yet-upgraded sender is not penalized.
+/// A pre-upgrade kad record (no `rpc` field) is signed over the legacy,
+/// un-domained encoding. After the domain-binding fix (GHSA-cc64-wfq5-56ph) that
+/// signature no longer verifies against this node's `(chain, role)` domain, so
+/// the record is rejected on ingest and is neither stored nor promoted into
+/// `known_peers`.
 #[tokio::test]
-async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()> {
+async fn test_pre_upgrade_record_rejected() -> eyre::Result<()> {
     use libp2p::kad;
     use serde::{Deserialize, Serialize};
     use tn_types::{BlsSignature, Multiaddr, NetworkPublicKey, TimestampSec};
@@ -2964,41 +2979,27 @@ async fn test_pre_upgrade_record_accepted_with_default_rpc() -> eyre::Result<()>
         expires: None,
     };
 
-    // peer_record_valid accepts pre-upgrade bytes via the legacy decode
-    // fallback; the missing rpc field defaults to None.
-    let (key, node_record) =
-        network.peer_record_valid(&kad_record).expect("legacy record accepted");
-    assert_eq!(key, owner_bls);
-    assert!(node_record.info.rpc.is_none());
-    assert_eq!(node_record.info.multiaddrs, vec![peer2.config.primary_address()]);
+    // A pre-upgrade record is signed over the legacy, un-domained encoding, so it no
+    // longer verifies against this node's (chain, role) domain and is rejected on
+    // ingest (GHSA-cc64-wfq5-56ph).
+    assert!(
+        network.peer_record_valid(&kad_record).is_none(),
+        "pre-upgrade record must be rejected: its signature does not cover the (chain, role) domain"
+    );
 
-    // owner is a committee member so the gated discovery path (#827) retains its record;
-    // production applies committee membership from epoch state before processing records.
+    // owner is a committee member, so the committee gate (#827) would retain a valid
+    // record; the rejection is purely the domain-signature gate, which runs first.
     network.swarm.behaviour_mut().peer_manager.update_committees(
         Default::default(),
         std::iter::once(owner_bls).collect(),
         Default::default(),
     );
 
-    // an inbound put request stores the record and promotes it into `known_peers`
+    // an inbound put request for the legacy record is dropped: neither stored nor
+    // promoted into `known_peers`.
     network.process_kad_put_request(owner_peer_id, kad_record.clone())?;
-    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&kad_record.key).is_some());
-
-    let (peer_id, multiaddrs) = network
-        .swarm
-        .behaviour()
-        .peer_manager
-        .auth_to_peer(owner_bls)
-        .expect("legacy record promoted into known_peers");
-    assert_eq!(peer_id, owner_peer_id);
-    assert_eq!(multiaddrs, vec![peer2.config.primary_address()]);
-
-    // no rpc was advertised so lookups return None
-    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner_bls).is_none());
-    assert!(network.swarm.behaviour_mut().peer_manager.current_committee_rpcs().is_empty());
-
-    // honest pre-upgrade sender is not penalized
-    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&owner_peer_id));
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&kad_record.key).is_none());
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(owner_bls).is_none());
 
     Ok(())
 }
@@ -3142,6 +3143,10 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
     let rpc = RpcInfo { http: "ftp://validator.example.com:8545/".parse()?, ws: None };
     let key_config = peer2.config.key_config();
     let node_record = NodeRecord::build(
+        RecordDomain::new(
+            peer2.config.network_config().libp2p_config().chain_id,
+            NetworkType::Primary,
+        ),
         key_config.primary_network_public_key(),
         peer2.config.primary_address(),
         Some(rpc),
@@ -3187,12 +3192,14 @@ async fn test_malformed_rpc_scheme_stripped_on_promotion() -> eyre::Result<()> {
 }
 
 /// Startup over a kad store holding a pre-upgrade record and a corrupt record:
-/// the node constructs cleanly (no panicking decode), the legacy peer is
-/// promoted into `known_peers` with `rpc: None`, and the corrupt record is
-/// purged from the persistent store. The legacy record's original signed bytes
-/// are preserved.
+/// the node constructs cleanly (no panicking decode). The legacy record is
+/// signed over the un-domained legacy encoding, so it no longer verifies against
+/// this node's `(chain, role)` domain (GHSA-cc64-wfq5-56ph): startup scrubs it as
+/// poisoned, exactly like the corrupt record, rather than tolerating it into the
+/// cache. Both records are purged from the persistent store and neither is
+/// promoted into `known_peers`.
 #[tokio::test]
-async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result<()> {
+async fn test_startup_scrubs_legacy_and_corrupt_kad_records() -> eyre::Result<()> {
     use libp2p::kad;
     use serde::{Deserialize, Serialize};
     use tn_types::{BlsKeypair, BlsSignature, Multiaddr, NetworkPublicKey, TimestampSec};
@@ -3282,21 +3289,22 @@ async fn test_startup_tolerates_legacy_and_corrupt_kad_records() -> eyre::Result
     )
     .expect("network constructs over a store holding legacy + corrupt records");
 
-    // the legacy peer was promoted with multiaddrs intact and rpc defaulted
-    let (_, multiaddrs) = network
-        .swarm
-        .behaviour()
-        .peer_manager
-        .auth_to_peer(owner_bls)
-        .expect("legacy peer in known_peers");
-    assert_eq!(multiaddrs, vec![config_2.primary_address()]);
-    assert!(network.swarm.behaviour().peer_manager.get_rpc(&owner_bls).is_none());
+    // the legacy record's signature covers the un-domained legacy encoding, so it no
+    // longer verifies against this node's (chain, role) domain: startup scrubs it as
+    // poisoned rather than promoting it (GHSA-cc64-wfq5-56ph).
+    assert!(
+        network.swarm.behaviour().peer_manager.auth_to_peer(owner_bls).is_none(),
+        "legacy record must NOT be promoted into known_peers after the domain-binding fix"
+    );
 
-    // the corrupt record was purged from the persistent store; the legacy
-    // record's original signed bytes were preserved
+    // both the corrupt record and the domain-mismatched legacy record are purged from
+    // the persistent store on load.
     let store = KadStore::new(db, PeerId::random(), config_1.key_config(), NetworkType::Primary);
     assert!(store.get(&kad::RecordKey::new(&garbage_bls)).is_none(), "corrupt record purged");
-    assert!(store.get(&kad::RecordKey::new(&owner_bls)).is_some(), "legacy record preserved");
+    assert!(
+        store.get(&kad::RecordKey::new(&owner_bls)).is_none(),
+        "legacy record scrubbed as poisoned"
+    );
 
     Ok(())
 }
@@ -3340,7 +3348,15 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
         );
 
         let key_config_2 = config_2.key_config();
+        // Records must be signed for the SAME (chain, role) domain the startup restore path
+        // reconstructs from this node's identity (config_1, Primary), or they are scrubbed as
+        // poisoned on load (GHSA-cc64-wfq5-56ph).
+        let domain = RecordDomain::new(
+            config_1.network_config().libp2p_config().chain_id,
+            NetworkType::Primary,
+        );
         let authority_record = NodeRecord::build(
+            domain,
             key_config_2.primary_network_public_key(),
             config_2.primary_address(),
             None,
@@ -3355,7 +3371,7 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
 
         let outsider_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
         let outsider_record =
-            NodeRecord::build(outsider_netkey, create_multiaddr(None), None, |data| {
+            NodeRecord::build(domain, outsider_netkey, create_multiaddr(None), None, |data| {
                 outsider_keypair.sign(data)
             });
         kad_store.put(kad::Record {
@@ -3443,7 +3459,12 @@ async fn test_restore_skips_own_record() -> eyre::Result<()> {
             NetworkType::Primary,
         );
         let key_config = config_1.key_config();
+        let domain = RecordDomain::new(
+            config_1.network_config().libp2p_config().chain_id,
+            NetworkType::Primary,
+        );
         let own_record = NodeRecord::build(
+            domain,
             key_config.primary_network_public_key(),
             config_1.primary_address(),
             None,
