@@ -88,9 +88,7 @@ pub use reth::{
     chainspec::chain_value_parser, dirs::MaybePlatformPath, payload::BlobSidecars,
     rpc::builder::RpcServerHandle,
 };
-pub use reth_chain_state::{
-    CanonicalInMemoryState, DeferredTrieData, ExecutedBlock, NewCanonicalChain,
-};
+pub use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock, NewCanonicalChain};
 pub use reth_chainspec::ChainSpec as RethChainSpec;
 pub use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
 pub use reth_db::{
