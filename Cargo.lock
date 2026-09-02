@@ -12100,6 +12100,7 @@ dependencies = [
 name = "tn-worker-gateway"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "axum",
  "clap",
  "eyre",
