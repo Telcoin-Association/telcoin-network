@@ -440,27 +440,50 @@ impl MmapDataFile {
         Ok(())
     }
 
-    /// Clone the underlying file handle, first reconciling the physical file to the logical length
-    /// so a consumer that reads to EOF (e.g. `PackIter` via `raw_iter`) sees exactly the written
-    /// bytes with no trailing padding. The next write re-establishes a writable mapping.
-    pub fn try_clone(&self) -> io::Result<File> {
+    /// Clone the underlying file handle, flushing `[0, end)` first so the cloned handle's read
+    /// syscalls observe the current mmap writes. Returns the clone together with the logical `end`
+    /// at the moment of the call.
+    ///
+    /// Unlike a clean close, this does NOT truncate the capacity padding: the physical file may be
+    /// larger than `end` (and a later append re-grows and re-pads it further), so the returned
+    /// `end` is the ONLY reliable data boundary. A consumer that reads to physical EOF would run
+    /// into the padding; readers must stop at `end` instead ([`PackIter`](crate::archive::pack_iter)
+    /// via [`raw_iter`](crate::archive::pack::Pack::raw_iter) does). An external byte consumer that
+    /// cannot be told a length (a raw `std::fs::copy`, a read-to-EOF network stream) must instead
+    /// physically truncate the file first with [`reconcile_to_end`](Self::reconcile_to_end).
+    pub fn try_clone(&self) -> io::Result<(File, u64)> {
+        if !self.read_only && self.end > 0 {
+            if let Backing::Rw(map) = &self.backing {
+                // Flush dirty pages so the cloned handle observes current data.
+                map.flush_range(0, self.end as usize)?;
+            }
+            // The whole `[0, end)` region was just flushed durably.
+            self.flushed_end.store(self.end, Ordering::Relaxed);
+        }
+        Ok((self.file.try_clone()?, self.end))
+    }
+
+    /// Reconcile the physical file to exactly the logical `end`: flush `[0, end)`, then truncate away
+    /// the capacity padding so a consumer that reads the raw bytes to EOF (a `std::fs::copy` of the
+    /// file, a read-to-EOF network stream) sees exactly the written bytes.
+    ///
+    /// `File::set_len` takes `&self`; the existing map still spans the old capacity but
+    /// `[end, capacity)` is never touched (our own reads are bounded by `end`), and the next write
+    /// re-maps first (see `remap_needed` / [`ensure_capacity`](Self::ensure_capacity)). Intended for
+    /// sealed packs (state export, full-epoch serve), so the next-append remap it arms is not on a
+    /// hot path.
+    pub fn reconcile_to_end(&self) -> io::Result<()> {
         if !self.read_only {
             if self.end > 0 {
                 if let Backing::Rw(map) = &self.backing {
-                    // Flush dirty pages so the cloned handle observes current data.
                     map.flush_range(0, self.end as usize)?;
                 }
-                // The whole `[0, end)` region was just flushed durably.
                 self.flushed_end.store(self.end, Ordering::Relaxed);
             }
-            // Truncate away the capacity padding. `File::set_len` takes `&self`; the existing map
-            // still spans the old capacity but `[end, capacity)` is never touched (reads are
-            // bounded by `end`), and the next write re-maps first (see `remap_needed` /
-            // `ensure_capacity`).
             self.file.set_len(self.end)?;
             self.remap_needed.store(true, Ordering::Relaxed);
         }
-        self.file.try_clone()
+        Ok(())
     }
 
     /// `msync` the dirty region to the backing store. For [`WriteMode::Append`] this is only the
@@ -920,21 +943,44 @@ mod tests {
     }
 
     #[test]
-    fn try_clone_reads_to_eof_exact() {
+    fn try_clone_returns_end_without_truncating() {
         let tmp = TempDir::with_prefix("mmap_df_clone").expect("temp dir");
         let path = tmp.path().join("data");
         let data = pattern(200);
         let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
         df.write_all(&data).expect("write");
-        // A raw clone read to EOF must yield exactly the written bytes (the PackIter/raw_iter
-        // path): no trailing zero padding.
-        let mut clone = df.try_clone().expect("clone");
+        // The mmap backend pads the physical file past the logical end.
+        let phys_padded = std::fs::metadata(&path).expect("metadata").len();
+        assert!(phys_padded > data.len() as u64, "precondition: file is padded past the data");
+
+        // try_clone reports the logical end and does NOT truncate the physical padding.
+        let (mut clone, end) = df.try_clone().expect("clone");
+        assert_eq!(end, data.len() as u64, "clone reports the logical end");
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            phys_padded,
+            "try_clone must not shrink the physical file"
+        );
+        // A consumer bounded to `end` (the PackIter/raw_iter path) reads exactly the written bytes.
         clone.seek(SeekFrom::Start(0)).expect("seek clone");
-        let mut all = Vec::new();
-        clone.read_to_end(&mut all).expect("read clone to eof");
-        assert_eq!(all, data, "clone must expose exactly the logical bytes");
-        // Appending after a try_clone still works (re-maps first).
-        df.write_all(&pattern(50)).expect("append after clone");
+        let mut bounded = vec![0u8; end as usize];
+        clone.read_exact(&mut bounded).expect("bounded read");
+        assert_eq!(bounded, data, "bytes [0, end) are exactly the written data");
+        // Reading past `end` to physical EOF would hit the padding (the hazard readers must avoid).
+        let mut rest = Vec::new();
+        clone.read_to_end(&mut rest).expect("read padding");
+        assert!(rest.iter().all(|&b| b == 0), "bytes past end are zero padding");
+
+        // reconcile_to_end truncates the physical file to the logical end (the export/serve path).
+        df.reconcile_to_end().expect("reconcile");
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            data.len() as u64,
+            "reconcile_to_end truncates the padding away"
+        );
+
+        // Appending after reconcile still works (re-maps first).
+        df.write_all(&pattern(50)).expect("append after reconcile");
         assert_eq!(df.len(), 250);
         df.seek(SeekFrom::Start(200)).expect("seek");
         let mut tail = vec![0u8; 50];

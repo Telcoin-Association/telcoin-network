@@ -239,11 +239,11 @@ where
         self.data_file.len()
     }
 
-    /// Reconcile the physical file to the logical length via the data file's `try_clone` (which
-    /// flushes `[0, end)` and truncates any capacity padding, exactly as a clean close does). The
-    /// cloned handle is dropped — only the reconciliation side effect is wanted.
+    /// Reconcile the physical file to the logical length (flush `[0, end)`, then truncate any
+    /// capacity padding, exactly as a clean close does) so an external consumer that reads the raw
+    /// bytes to EOF sees exactly the written bytes.
     fn reconcile_len(&self) -> io::Result<()> {
-        self.data_file.try_clone().map(drop)
+        self.data_file.reconcile_to_end()
     }
 
     /// Fetch the value stored at key.  Will return an error if not found.
@@ -551,8 +551,11 @@ where
     /// Note this iterator only uses the data file not the indexes.
     /// This iterator will not see any data in the write cache.
     fn raw_iter(&self) -> Result<PackIter<V, File>, LoadHeaderError> {
-        let dat_file = { self.data_file.try_clone()? };
-        PackIter::open(dat_file, self.uid_idx)
+        // `try_clone` does NOT truncate the capacity padding, so read to the logical `end` it
+        // returns rather than physical EOF — otherwise a concurrent append that re-grows and
+        // re-pads the file would feed the iterator trailing zeros (a 0-size record → CRC failure).
+        let (dat_file, end) = self.data_file.try_clone()?;
+        PackIter::open(dat_file, self.uid_idx, end)
     }
 }
 
@@ -956,7 +959,10 @@ mod tests {
             .create(false)
             .open(tmp_path.path().join("pack_test_one"))
             .unwrap();
-        let mut iter = PackIter::open(data_file, 0).unwrap().map(|r| r.unwrap());
+        // The pack was cleanly closed (Drop truncated to the logical end), so the physical file
+        // length is the logical end to bound the iterator at.
+        let end = data_file.metadata().unwrap().len();
+        let mut iter = PackIter::open(data_file, 0, end).unwrap().map(|r| r.unwrap());
         let v: TestRec = iter.next().unwrap();
         assert_eq!(v.idx, 1);
         assert_eq!(v.name, "Value One");
@@ -1012,6 +1018,41 @@ mod tests {
         assert_eq!(v.idx, 8);
         assert_eq!(v.name, "Value Three2");
         assert!(iter.next().is_none());
+    }
+
+    /// A `raw_iter` snapshots the pack at its clone-time logical `end`. A concurrent append that
+    /// re-grows and re-pads the physical mmap file underneath the already-cloned reader must not
+    /// feed the snapshot iterator the later records or the trailing zero padding (which would decode
+    /// as a 0-size, CRC-failing record). Regression for the `try_clone` EOF-contract hazard: under
+    /// the old truncate-at-clone behavior the post-clone append re-padded the file and the stale
+    /// reader ran off the end into the padding.
+    #[test]
+    fn raw_iter_stops_at_clone_time_end_despite_concurrent_append() {
+        let tmp_path = TempDir::with_prefix("pack_iter_bound").expect("temp dir");
+        let path = tmp_path.path().join("pack_bound");
+        let mut db: TestPack =
+            Pack::open(&path, 0, false, PackCompression::None, 0).expect("open pack");
+
+        // Append the first three records and snapshot an iterator (captures the logical end now).
+        for i in 1..=3u64 {
+            db.append(&TestRec { idx: i, name: format!("v{i}") }).expect("append");
+        }
+        db.flush().expect("flush");
+        let iter = db.raw_iter().expect("raw_iter");
+
+        // Append three MORE records to the same live pack, re-growing and re-padding the physical
+        // file under the already-cloned reader.
+        for i in 4..=6u64 {
+            db.append(&TestRec { idx: i, name: format!("v{i}") }).expect("append");
+        }
+        db.flush().expect("flush");
+
+        // The snapshot iterator yields EXACTLY the three clone-time records and terminates cleanly,
+        // never decoding the later appends or the mmap padding.
+        let got: Vec<u64> = iter
+            .map(|r| r.expect("no read/CRC error past the logical end").idx)
+            .collect();
+        assert_eq!(got, vec![1, 2, 3], "iterator is bounded to the clone-time end");
     }
 
     #[test]
@@ -1140,7 +1181,8 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_decompression_bomb();
         let path = tmp_dir.path().join("pack_bomb");
         let file = File::open(&path).expect("open file");
-        let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
+        let end = file.metadata().expect("metadata").len();
+        let mut iter = PackIter::<TestRec, _>::open(file, 0, end).expect("iter open");
         match iter.next() {
             Some(Err(FetchError::RequestedDecompressSizeTooLarge(max))) => {
                 assert_eq!(max, MAX_RECORD_SIZE);
@@ -1187,7 +1229,8 @@ mod tests {
         let (tmp_dir, _pos) = build_pack_with_corrupt_zstd_frame();
         let path = tmp_dir.path().join("pack_corrupt");
         let file = File::open(&path).expect("open file");
-        let mut iter = PackIter::<TestRec, _>::open(file, 0).expect("iter open");
+        let end = file.metadata().expect("metadata").len();
+        let mut iter = PackIter::<TestRec, _>::open(file, 0, end).expect("iter open");
         match iter.next() {
             Some(Err(FetchError::IO(_))) | Some(Err(FetchError::DeserializeValue(_))) => {}
             other => panic!("expected IO or DeserializeValue error, got {other:?}"),

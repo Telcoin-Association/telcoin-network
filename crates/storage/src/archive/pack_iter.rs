@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
     error::{fetch::FetchError, load_header::LoadHeaderError},
-    pack::{DataHeader, PackCompression},
+    pack::{DataHeader, PackCompression, DATA_HEADER_BYTES},
 };
 
 /// Provide an upper bound on a record size.
@@ -35,6 +35,13 @@ where
     decompress_buffer: Vec<u8>,
     compression: PackCompression,
     version: u16,
+    /// Logical data length: the sequential scan stops here rather than at physical EOF. The mmap
+    /// backend pads the physical file past the data, and a `try_clone`d handle can see that padding
+    /// re-grow under a concurrent append, so reading to EOF would decode trailing zeros as a
+    /// (CRC-failing) record. `end` is the exact byte length of the header + all complete records.
+    end: u64,
+    /// Absolute file offset of the next record to read, tracked so the scan can stop at `end`.
+    pos: u64,
 }
 
 impl<V, R> PackIter<V, R>
@@ -45,7 +52,10 @@ where
     /// Open the iterator using reader as a data source.
     /// Produces an iterator over all the (key, values).  All and records
     /// are returned in insert order.
-    pub fn open(mut reader: R, uid_idx: u64) -> Result<Self, LoadHeaderError> {
+    ///
+    /// `end` is the logical data length (header + all complete records); the scan stops there
+    /// instead of at physical EOF so mmap capacity padding is never decoded as a record.
+    pub fn open(mut reader: R, uid_idx: u64, end: u64) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header(&mut reader, uid_idx)?;
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
@@ -58,6 +68,9 @@ where
             decompress_buffer: Vec::new(),
             compression: header.compression(),
             version: header.version(),
+            end,
+            // `load_header` consumed exactly the fixed-size header, so the first record starts here.
+            pos: DATA_HEADER_BYTES as u64,
         })
     }
 
@@ -74,17 +87,27 @@ where
     /// Sets the current position of the data file.
     pub fn set_position(&mut self, position: u64) -> io::Result<()> {
         self.reader.seek(io::SeekFrom::Start(position))?;
+        self.pos = position;
         Ok(())
     }
 
     /// Read the next record or return an error if an overflow bucket.
     /// This expects the file cursor to be positioned at the records first byte.
+    ///
+    /// Stops at the logical `end` (returning `NotFound`) before reading past the data into any mmap
+    /// capacity padding; `pos` is advanced by the on-disk frame size of each record read.
     fn read_record_file<R2: Read + Seek>(
         file: &mut R2,
         buffer: &mut Vec<u8>,
         decompress_buffer: &mut Vec<u8>,
         compression: PackCompression,
+        end: u64,
+        pos: &mut u64,
     ) -> Result<V, FetchError> {
+        // At (or past) the logical data end: stop cleanly rather than decode trailing padding.
+        if *pos >= end {
+            return Err(FetchError::NotFound);
+        }
         let mut crc32_hasher = crc32fast::Hasher::new();
         let mut val_size_buf = [0_u8; 4];
         if let Err(err) = file.read_exact(&mut val_size_buf) {
@@ -107,6 +130,8 @@ where
         let calc_crc32 = crc32_hasher.finalize();
         let mut buf_u32 = [0_u8; 4];
         file.read_exact(&mut buf_u32)?;
+        // On-disk frame consumed: 4-byte size prefix + payload + 4-byte CRC.
+        *pos += 4 + val_size as u64 + 4;
         let read_crc32 = u32::from_le_bytes(buf_u32);
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
@@ -142,6 +167,8 @@ where
             &mut self.buffer,
             &mut self.decompress_buffer,
             self.compression,
+            self.end,
+            &mut self.pos,
         ) {
             Ok(val) => Some(Ok(val)),
             Err(err) => match err {
