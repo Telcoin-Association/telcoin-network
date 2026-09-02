@@ -2161,7 +2161,10 @@ impl IndexPositions {
 impl PosIndexValue for IndexPositions {
     fn encode(&self, buffer: &mut [u8]) {
         if buffer.len() != Self::buffer_len() {
-            // Not passing in the exact sized buffer is a coding error so panic vs return error.
+            // Internal invariant: `encode` is only ever handed our own fixed-size scratch buffer
+            // (never on-disk bytes), so a wrong length is a caller coding error, not data
+            // corruption -- panic. (`decode`, which IS fed on-disk bytes, returns an error
+            // instead.)
             panic!("buffer not 28 bytes");
         }
         let mut crc32_hasher = crc32fast::Hasher::new();
@@ -2175,8 +2178,14 @@ impl PosIndexValue for IndexPositions {
 
     fn decode(bytes: &[u8]) -> Result<Self, FetchError> {
         if bytes.len() != Self::buffer_len() {
-            // Not passing in the exact sized bytes is a coding error so panic vs return error.
-            panic!("input not 28 bytes");
+            // A wrong-length slice means the on-disk PDX entry is truncated/malformed. Surface it
+            // as an error rather than panic so a corrupt position index can never take
+            // down the pack's background thread (the append-only-log integrity rule:
+            // corruption is reported, not crashed on).
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "position index entry is not 28 bytes",
+            )));
         }
         let mut crc32_hasher = crc32fast::Hasher::new();
         crc32_hasher.update(&bytes[0..24]);
@@ -3881,6 +3890,118 @@ pub(crate) mod test {
         );
         let len_after = std::fs::metadata(&data_path).expect("metadata").len();
         assert_eq!(len_before, len_after, "failed open must leave the data file untouched");
+    }
+
+    /// A physically sound pack classifies as `None` (run the logical validator for the rest).
+    #[tokio::test]
+    async fn test_classify_physical_corruption_clean_pack() {
+        use crate::pack_validate::classify_physical_corruption;
+        let temp_dir = TempDir::with_prefix("test_classify_clean").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        assert!(
+            classify_physical_corruption(&data_path, 0).expect("classify").is_none(),
+            "a clean pack must classify as physically sound"
+        );
+    }
+
+    /// A torn record with nothing readable after it is a truncatable trailing tail.
+    #[tokio::test]
+    async fn test_classify_physical_corruption_torn_trailing_tail() {
+        use crate::pack_validate::{classify_physical_corruption, CorruptionKind};
+        let temp_dir = TempDir::with_prefix("test_classify_torn_tail").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let output2_end = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(2).await.expect("output 2 end")
+        };
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        // Truncate a few bytes into output 3's header payload: torn record, nothing after.
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.set_len(output2_end + 6).expect("truncate");
+        }
+        let c = classify_physical_corruption(&data_path, 0).expect("classify").expect("corruption");
+        assert_eq!(c.kind, CorruptionKind::TornTrailingTail);
+        assert!(c.kind.is_truncatable(), "a torn trailing tail is truncatable");
+        assert!(!c.decodable_after);
+    }
+
+    /// A CRC-failed interior record with valid records after it is data-losing mid-log corruption.
+    #[tokio::test]
+    async fn test_classify_physical_corruption_mid_log() {
+        use crate::pack_validate::{classify_physical_corruption, CorruptionKind};
+        let temp_dir = TempDir::with_prefix("test_classify_mid_log").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let output1_end = {
+            let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open static");
+            pack.consensus_output_end(1).await.expect("output 1 end")
+        };
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        // Flip a byte inside output 2's header payload (past the size prefix): its CRC fails but
+        // output 3 still decodes after it.
+        let mut bytes = std::fs::read(&data_path).expect("read data");
+        bytes[output1_end as usize + 20] ^= 0xff;
+        std::fs::write(&data_path, &bytes).expect("write data");
+        let c = classify_physical_corruption(&data_path, 0).expect("classify").expect("corruption");
+        assert_eq!(c.kind, CorruptionKind::MidLogCorruption);
+        assert!(!c.kind.is_truncatable(), "mid-log corruption is not truncatable");
+        assert!(c.decodable_after);
+    }
+
+    /// A torn epoch-meta with no outputs behind it is a truncatable, effectively-empty pack.
+    #[tokio::test]
+    async fn test_classify_physical_corruption_torn_meta_empty() {
+        use crate::pack_validate::{classify_physical_corruption, CorruptionKind};
+        let temp_dir = TempDir::with_prefix("test_classify_torn_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        // Meta-only pack (no outputs), then tear the meta within its size prefix.
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 0).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        {
+            let f = OpenOptions::new().read(true).write(true).open(&data_path).expect("open data");
+            f.set_len(DATA_HEADER_BYTES as u64 + 2).expect("truncate");
+        }
+        let c = classify_physical_corruption(&data_path, 0).expect("classify").expect("corruption");
+        assert_eq!(c.kind, CorruptionKind::TornMetaEmpty);
+        assert!(c.kind.is_truncatable(), "an empty torn-meta pack is truncatable");
+    }
+
+    /// An unreadable epoch-meta with outputs behind it is data loss (the outputs are unreachable).
+    #[tokio::test]
+    async fn test_classify_physical_corruption_corrupt_meta_with_data() {
+        use crate::pack_validate::{classify_physical_corruption, CorruptionKind};
+        let temp_dir = TempDir::with_prefix("test_classify_corrupt_meta").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        // Flip a byte inside the (complete) meta record's payload: its CRC fails but the outputs
+        // behind it still decode.
+        let mut bytes = std::fs::read(&data_path).expect("read data");
+        bytes[DATA_HEADER_BYTES + 6] ^= 0xff;
+        std::fs::write(&data_path, &bytes).expect("write data");
+        let c = classify_physical_corruption(&data_path, 0).expect("classify").expect("corruption");
+        assert_eq!(c.kind, CorruptionKind::CorruptMetaWithData);
+        assert!(!c.kind.is_truncatable(), "corrupt meta with data behind it is not truncatable");
+        assert!(c.decodable_after);
     }
 
     /// A pack whose first record is torn (a crash mid meta append left only part of the size

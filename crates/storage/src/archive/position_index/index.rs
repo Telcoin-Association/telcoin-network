@@ -291,16 +291,31 @@ pub struct PositionIter<T> {
 
 impl<T: PosIndexValue> PositionIter<T> {
     /// New position iter over data.
-    fn new(data: Vec<u8>) -> Self {
+    fn new(mut data: Vec<u8>) -> Self {
+        Self::drop_partial_trailing_entry(&mut data);
         let done = data.is_empty();
         Self { data, pos: 0, done, reverse: false, _phantom: PhantomData }
     }
 
     /// New reverse iter over data.
-    fn new_rev(data: Vec<u8>) -> Self {
+    fn new_rev(mut data: Vec<u8>) -> Self {
+        Self::drop_partial_trailing_entry(&mut data);
         let done = data.is_empty();
         let pos = data.len().saturating_sub(T::buffer_len());
         Self { data, pos, done, reverse: true, _phantom: PhantomData }
+    }
+
+    /// Truncate `data` to a whole number of fixed-width entries, so `next`'s unchecked fixed-width
+    /// slice is sound for *any* input. Defense-in-depth: the public `iter`/`rev_iter` already pass
+    /// a whole number of entries (their length is capped to `len()`, and `read_exact` would
+    /// error on a short file first), so a partial trailing entry never reaches here today.
+    /// Normalizing anyway removes the footgun and keeps the iterator self-safe if that ever
+    /// changes. Dropping a partial trailing entry is harmless: it is not a committed position,
+    /// and the position index is rebuilt from the data-log WAL whenever `files_consistent`
+    /// fails.
+    fn drop_partial_trailing_entry(data: &mut Vec<u8>) {
+        let whole = data.len() / T::buffer_len() * T::buffer_len();
+        data.truncate(whole);
     }
 }
 
@@ -354,7 +369,12 @@ impl PosIndexValue for u64 {
 
     fn decode(bytes: &[u8]) -> Result<Self, FetchError> {
         if bytes.len() != 8 {
-            panic!("u64 buffer not 8 bytes");
+            // Fed on-disk bytes: a wrong length means a truncated/corrupt PDX entry -> error, not
+            // a panic (corruption is reported, never crashed on).
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "u64 position index entry is not 8 bytes",
+            )));
         }
         let mut buf = [0_u8; 8];
         buf.copy_from_slice(bytes);
@@ -377,7 +397,12 @@ impl PosIndexValue for (u64, u64) {
 
     fn decode(bytes: &[u8]) -> Result<Self, FetchError> {
         if bytes.len() != 16 {
-            panic!("(u64, u64) buffer not 16 bytes");
+            // Fed on-disk bytes: a wrong length means a truncated/corrupt PDX entry -> error, not
+            // a panic (corruption is reported, never crashed on).
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "(u64, u64) position index entry is not 16 bytes",
+            )));
         }
         let mut buf = [0_u8; 8];
         buf.copy_from_slice(&bytes[..8]);
@@ -399,6 +424,28 @@ mod tests {
     use crate::archive::pack::PackCompression;
 
     use super::*;
+
+    #[test]
+    fn test_position_iter_drops_partial_trailing_entry_no_panic() {
+        // A ragged buffer (not a whole multiple of the 8-byte entry width) must not panic the
+        // fixed-width slicing in `next`; the partial trailing bytes are dropped.
+        let mut data = 1u64.to_le_bytes().to_vec();
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&[0xAB, 0xCD, 0xEF]); // 3 stray bytes = a torn third entry
+        let forward: Vec<u64> =
+            PositionIter::<u64>::new(data.clone()).map(|r| r.expect("decode")).collect();
+        assert_eq!(forward, vec![1, 2], "partial trailing entry must be ignored");
+        let reverse: Vec<u64> =
+            PositionIter::<u64>::new_rev(data).map(|r| r.expect("decode")).collect();
+        assert_eq!(reverse, vec![2, 1], "reverse must also ignore the partial entry");
+    }
+
+    #[test]
+    fn test_pos_index_value_decode_rejects_short_input() {
+        // Wrong-length on-disk bytes must return an error, never panic.
+        assert!(matches!(<u64 as PosIndexValue>::decode(&[0u8; 4]), Err(FetchError::IO(_))));
+        assert!(matches!(<(u64, u64) as PosIndexValue>::decode(&[0u8; 9]), Err(FetchError::IO(_))));
+    }
 
     #[test]
     fn test_archive_pdx_index_single() {

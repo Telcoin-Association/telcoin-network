@@ -30,6 +30,7 @@
 use std::{
     collections::{BTreeSet, HashSet},
     fmt::{self, Display},
+    fs::File,
     path::Path,
 };
 
@@ -39,6 +40,7 @@ use crate::{
     archive::{
         error::fetch::FetchError,
         pack::{Pack, PackCompression},
+        pack_iter::PackIter,
     },
     consensus_pack::{verify_epoch_meta, PackError, PackRecord, PACK_VERSION},
 };
@@ -134,6 +136,92 @@ impl Display for Verdict {
         match self {
             Verdict::Valid => write!(f, "VALID"),
             Verdict::Invalid => write!(f, "INVALID"),
+        }
+    }
+}
+
+/// The physical (record-framing) failure mode of a pack whose `data` stream does not read cleanly —
+/// distinct from the logical [`PackIssue`]s, which assume the stream decodes. Produced by
+/// [`classify_physical_corruption`]. The key distinction is whether the damage is safely
+/// truncatable (an unacked tail / an empty pack) or a data-losing corruption of committed records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorruptionKind {
+    /// The epoch meta (record 0) is incomplete and nothing readable is behind it: the pack holds
+    /// no outputs. Truncatable — `open_append` reinitializes the meta on next start.
+    TornMetaEmpty,
+    /// The epoch meta (record 0) is unreadable but complete records follow it: those outputs are
+    /// unreachable without the meta. Data loss for this epoch.
+    CorruptMetaWithData,
+    /// A record past the meta is unreadable and no complete record follows: a torn trailing tail.
+    /// Truncatable — `recover_pack` drops it automatically on the next append-open.
+    TornTrailingTail,
+    /// A record is unreadable and complete records still follow: mid-log corruption. The damaged
+    /// record and everything after it are lost.
+    MidLogCorruption,
+}
+
+impl CorruptionKind {
+    /// True when recovery can safely drop the damage by truncation, losing no committed data.
+    pub fn is_truncatable(&self) -> bool {
+        matches!(self, CorruptionKind::TornMetaEmpty | CorruptionKind::TornTrailingTail)
+    }
+}
+
+/// A physical corruption found while walking a pack's `data` stream, with enough context for an
+/// operator to decide whether to act (truncatable vs data loss).
+#[derive(Debug, Clone)]
+pub struct PhysicalCorruption {
+    /// How to interpret / act on the damage.
+    pub kind: CorruptionKind,
+    /// Byte offset where the first unreadable record begins.
+    pub offset: u64,
+    /// Complete records read before the damage (record 0 is the epoch meta).
+    pub records_ok_before: u64,
+    /// Whether any complete record was found after the damaged one.
+    pub decodable_after: bool,
+    /// The underlying read error.
+    pub detail: String,
+}
+
+impl Display for PhysicalCorruption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let summary = match self.kind {
+            CorruptionKind::TornMetaEmpty => "torn epoch-meta record, nothing behind it",
+            CorruptionKind::CorruptMetaWithData => {
+                "unreadable epoch-meta record with outputs behind it"
+            }
+            CorruptionKind::TornTrailingTail => "torn trailing record (unacked tail)",
+            CorruptionKind::MidLogCorruption => {
+                "mid-log corruption (readable records follow the damage)"
+            }
+        };
+        writeln!(f, "PHYSICAL CORRUPTION: {summary}")?;
+        writeln!(f, "  first bad record offset:        {} bytes", self.offset)?;
+        writeln!(f, "  complete records before damage: {}", self.records_ok_before)?;
+        writeln!(
+            f,
+            "  readable records after damage:  {}",
+            if self.decodable_after { "yes" } else { "no" }
+        )?;
+        writeln!(f, "  read error:                     {}", self.detail)?;
+        write!(f, "  recommended action:             ")?;
+        match self.kind {
+            CorruptionKind::TornMetaEmpty => writeln!(
+                f,
+                "SAFE — the pack holds no outputs; `open_append` reinitializes the meta on next \
+                 start (or remove this `epoch-N` directory to rebuild)."
+            ),
+            CorruptionKind::TornTrailingTail => writeln!(
+                f,
+                "SAFE — `recover_pack` truncates this unacked tail automatically on the next \
+                 append-open; no action needed."
+            ),
+            CorruptionKind::CorruptMetaWithData | CorruptionKind::MidLogCorruption => writeln!(
+                f,
+                "DATA LOSS — the damaged records cannot be recovered locally. Replace this epoch by \
+                 re-syncing it from peers (state-sync). Do NOT delete the chain-data directories \
+                 (`db`, `static_files`, `consensus-db`)."
+            ),
         }
     }
 }
@@ -240,6 +328,101 @@ pub fn validate_pack_file(
         verify_v0_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)
     } else {
         verify_v1_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)
+    }
+}
+
+/// Walk a pack's `data` stream read-only and classify the first physical (record-framing) failure,
+/// if any.
+///
+/// Returns `Ok(None)` when every record decodes cleanly to EOF — the stream is physically sound, so
+/// run [`validate_pack_file`] for the logical checks. Returns `Ok(Some(_))` classifying the damage
+/// as a truncatable torn tail / empty-meta versus a data-losing mid-log or corrupt-meta failure, so
+/// an operator can tell "restart heals it" from "replace this epoch". Header/open failures
+/// propagate as `Err` (a corrupt 28-byte header is a separate, rarer failure than a corrupt record
+/// stream).
+pub fn classify_physical_corruption(
+    path: &Path,
+    epoch: Epoch,
+) -> Result<Option<PhysicalCorruption>, PackError> {
+    let pack =
+        Pack::<PackRecord>::open(path, epoch as u64, true, PackCompression::ZStd, PACK_VERSION)?;
+    let data_end = pack.file_len();
+    let mut iter = pack.raw_iter().map_err(|e| PackError::ReadError(e.to_string()))?;
+
+    let mut records_ok_before: u64 = 0;
+    loop {
+        let offset = iter.position().map_err(|e| PackError::ReadError(e.to_string()))?;
+        match iter.next() {
+            None => {
+                // No error surfaced. A record torn *within* its 4-byte size prefix reads as EOF
+                // (`NotFound` -> `None`), so bytes remaining past the last complete record mean a
+                // partial trailing record, not a clean boundary. Note: a size prefix corrupted to
+                // claim *past* EOF also lands here or misreads the tail as one record — the same
+                // ambiguity tracked as the deferred size-prefix-checksum item; classification is
+                // best-effort for that case.
+                if offset < data_end {
+                    let kind = if records_ok_before == 0 {
+                        CorruptionKind::TornMetaEmpty
+                    } else {
+                        CorruptionKind::TornTrailingTail
+                    };
+                    return Ok(Some(PhysicalCorruption {
+                        kind,
+                        offset,
+                        records_ok_before,
+                        decodable_after: false,
+                        detail: format!(
+                            "record truncated within its size prefix ({} trailing byte(s))",
+                            data_end - offset
+                        ),
+                    }));
+                }
+                // Clean EOF on a record boundary: physically sound.
+                return Ok(None);
+            }
+            Some(Ok(_)) => records_ok_before += 1,
+            Some(Err(e)) => {
+                let decodable_after = probe_decodable_after(&mut iter);
+                let kind = match (records_ok_before == 0, decodable_after) {
+                    // record 0 is the epoch meta
+                    (true, false) => CorruptionKind::TornMetaEmpty,
+                    (true, true) => CorruptionKind::CorruptMetaWithData,
+                    (false, true) => CorruptionKind::MidLogCorruption,
+                    (false, false) => CorruptionKind::TornTrailingTail,
+                };
+                return Ok(Some(PhysicalCorruption {
+                    kind,
+                    offset,
+                    records_ok_before,
+                    decodable_after,
+                    detail: e.to_string(),
+                }));
+            }
+        }
+    }
+}
+
+/// After the walk hit an unreadable record, scan the rest of the stream: `true` if any later record
+/// still decodes (so the damage was not the final record). Mirrors the recovery `tail_is_torn`
+/// probe — a CRC-failed frame advances past itself, so decoding continues after it, while a
+/// short/torn record leaves the reader at EOF. Guards against a record whose claimed extent runs
+/// past EOF (the iterator's logical position does not advance on that read): if a repeated error
+/// makes no forward progress, stop rather than spin.
+fn probe_decodable_after(iter: &mut PackIter<PackRecord, File>) -> bool {
+    let mut last_pos = iter.position().unwrap_or(u64::MAX);
+    loop {
+        match iter.next() {
+            None => return false,
+            Some(Ok(_)) => return true,
+            Some(Err(_)) => {
+                let pos = iter.position().unwrap_or(u64::MAX);
+                if pos <= last_pos {
+                    // No forward progress (extent-past-EOF): treat as nothing readable after.
+                    return false;
+                }
+                last_pos = pos;
+            }
+        }
     }
 }
 

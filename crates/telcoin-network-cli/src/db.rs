@@ -31,7 +31,7 @@ use tn_storage::{
     consensus_pack::{ConsensusPack, DATA_NAME},
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
-    pack_validate::validate_pack_file,
+    pack_validate::{classify_physical_corruption, validate_pack_file},
 };
 use tn_types::{
     BlockNumHash, BlsPublicKey, Committee, Epoch, EpochCertificate, EpochDigest, EpochRecord,
@@ -112,6 +112,16 @@ impl DbValidateArgs {
     /// Validate the pack and print the report to stdout.
     fn execute(&self) -> eyre::Result<()> {
         let (data_file, epoch) = resolve_data_file_and_epoch(&self.path, self.epoch)?;
+
+        // Physical framing first: a torn/corrupt record stream cannot be walked for logical checks,
+        // so classify the failure mode (truncatable tail vs data-losing corruption) and report the
+        // recommended operator action instead of bailing with a bare read error.
+        if let Some(corruption) = classify_physical_corruption(&data_file, epoch)
+            .map_err(|e| eyre!("failed to open pack {}: {e}", data_file.display()))?
+        {
+            print!("{corruption}");
+            return Ok(());
+        }
 
         let report = validate_pack_file(&data_file, epoch, None)
             .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
