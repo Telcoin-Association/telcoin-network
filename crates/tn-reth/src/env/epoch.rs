@@ -2694,8 +2694,11 @@ mod tests {
         let genesis = test_genesis_with_consensus_registry(5);
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
-        // one payload, cloned across both executions: `new_for_test` randomizes
-        // beneficiary/mix_hash/digest per call, and mix_hash seeds the committee shuffle
+        // one payload, cloned across both executions, so the determinism check compares
+        // byte-identical inputs (`new_for_test` otherwise randomizes
+        // beneficiary/mix_hash/digest per call). The committee-shuffle seed is NOT among
+        // them: it rides `close_epoch`, which `TNPayload::new` derives from
+        // `output.committee_shuffle_seed()`, so it is already fixture-stable.
         let output = consensus_output_for_tests(2, 0, 1, true);
         let payload = TNPayload::new_for_test(chain.sealed_genesis_header(), &output);
 

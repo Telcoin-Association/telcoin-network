@@ -2376,18 +2376,37 @@ async fn test_simple_basefee_penalty() -> eyre::Result<()> {
             assert_ne!(block.number, 1);
         }
 
-        // Independent oracle for the post-fork mix hash (active in this build): recompose
-        // the exact bytes by hand rather than trusting `ConsensusOutput::prev_randao` to
-        // check itself.
-        let expected_mix_hash = keccak256(
-            [
-                b"TN_PREVRANDAO_V1".as_slice(),
-                consensus_output.committee_shuffle_seed().as_slice(),
-                consensus_output.number().to_le_bytes().as_slice(),
-                0u64.to_le_bytes().as_slice(),
-            ]
-            .concat(),
+        // Independent oracle for the mix hash: recompose the exact bytes by hand for whichever
+        // derivation this build's fork schedule selects, rather than trusting
+        // `ConsensusOutput::prev_randao` to check itself. Gated on the same predicate the engine
+        // dispatches on, so the oracle stays correct under `--features adiri` (dormant: legacy
+        // XOR) and default features (active: seeded).
+        //
+        // That shared dispatch is also the oracle's limit: it is independent on byte layout only,
+        // so a regression in the predicate itself moves both sides together. Default builds carry
+        // no dormant period, so pin their arm outright rather than leaving it to the dispatch.
+        #[cfg(not(feature = "adiri"))]
+        assert!(
+            tn_types::forks::prevrandao_seed_active(consensus_output.leader().epoch()),
+            "default builds are seeded from genesis; epoch {} must be post-fork. is \
+             TN_PREVRANDAO_FORK_EPOCH or TN_SEED_SIGNATURE_FORK_EPOCH set in the environment?",
+            consensus_output.leader().epoch(),
         );
+        let expected_mix_hash =
+            if tn_types::forks::prevrandao_seed_active(consensus_output.leader().epoch()) {
+                keccak256(
+                    [
+                        b"TN_PREVRANDAO_V1".as_slice(),
+                        consensus_output.committee_shuffle_seed().as_slice(),
+                        consensus_output.number().to_le_bytes().as_slice(),
+                        0u64.to_le_bytes().as_slice(),
+                    ]
+                    .concat(),
+                )
+            } else {
+                let output_digest: B256 = consensus_output_hash.into();
+                output_digest ^ batch_digest
+            };
         assert_eq!(
             expected_mix_hash,
             consensus_output.prev_randao(0, batch_digest),

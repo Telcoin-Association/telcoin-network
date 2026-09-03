@@ -48,6 +48,9 @@ help:
 	@echo "make test-restarts" ;
 	@echo "    :::> Test restart integration tests." ;
 	@echo ;
+	@echo "make test-e2e-forked" ;
+	@echo "    :::> Run the e2e suite with the seed-signature and PREVRANDAO forks armed from genesis." ;
+	@echo ;
 	@echo "make coverage" ;
 	@echo "    :::> Run tests with coverage using cargo-llvm-cov + nextest." ;
 	@echo "    :::> Requires: cargo install cargo-llvm-cov" ;
@@ -161,19 +164,44 @@ TN_SEED_SIGNATURE_FORK_EPOCH ?= 4294967295
 # multi_workers_override_is_inert_when_unset requires a process WITHOUT the variable.
 TN_MULTI_WORKERS_FORK_EPOCH ?= 4294967295
 
+# PREVRANDAO fork epoch for the e2e lanes (#1247). Same shape as the two variables above.
+# Defaults to u32::MAX so the default lanes run the fork DORMANT (the legacy
+# `output_digest ^ batch_digest` mix hash, what adiri has already executed); non-adiri builds
+# are otherwise active from genesis. NOT independent of the seed-signature variable in the
+# arming direction: `prevrandao_seed_active` requires `seed_signature_active`, so a lane needs
+# BOTH armed to reach the seeded derivation. That invocation is the `test-e2e-forked` target
+# below, which is what keeps the seeded arm from having zero process-level coverage.
+# Pinning it here is also what keeps a `TN_SEED_SIGNATURE_FORK_EPOCH=0` lane from silently
+# arming PREVRANDAO as a side effect on a non-adiri build.
+# Only test-utils builds consult it (tn_types::forks::prevrandao_fork_epoch_override).
+# Set only on name-filtered nextest lines, never a bare --workspace run: tn-types'
+# prevrandao_override_is_inert_when_unset requires a process WITHOUT the variable.
+TN_PREVRANDAO_FORK_EPOCH ?= 4294967295
+
 # run restart integration tests
 test-restarts: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # run epoch integration tests (same filter as the public-tests epoch line). The scheduled
 # Durable e2e lane (#1149) runs this and test-restarts with TN_TEST_MDBX_SYNC=durable
 # exported so every spawned node opens MDBX in Durable.
 test-epochs: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
 
 # run e2e tests
 test-e2e: build-e2e-bin
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run -p e2e-tests --run-ignored ignored-only --all-features ;
+
+# run the e2e tests with the PREVRANDAO fork ARMED, the only invocation that executes the
+# seeded mix hash on spawned nodes. Both variables are required and neither is redundant:
+# `prevrandao_seed_active` is their conjunction, so arming PREVRANDAO alone leaves the legacy
+# XOR in force. Until the arming PR lands this is the post-fork wire format's only
+# process-level coverage; a script still using the older one-variable
+# `TN_SEED_SIGNATURE_FORK_EPOCH=0 make test-e2e` form now exercises the legacy arm.
+# Recursive rather than a second nextest line so the lane cannot drift from `test-e2e`;
+# command-line assignments override the `?=` defaults above.
+test-e2e-forked:
+	$(MAKE) test-e2e TN_SEED_SIGNATURE_FORK_EPOCH=0 TN_PREVRANDAO_FORK_EPOCH=0 ;
 
 # run tests with coverage (using llvm-cov + nextest)
 coverage:
@@ -249,8 +277,8 @@ revert-submodule:
 # workspace tests that don't require faucet credentials
 public-tests: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" cargo nextest run --workspace --no-fail-fast ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
-	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all test_epoch ;
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
 
 # local checks to ensure PR is ready
 pr:

@@ -293,6 +293,16 @@ impl ConsensusOutput {
     /// legacy XOR commit to transaction bytes and let a committing leader enumerate
     /// candidate `PREVRANDAO` values by re-cutting the payload it proposes.
     ///
+    /// What this does NOT close is last-actor bias, the same residual
+    /// [`EpochSeedChainValue`](crate::EpochSeedChainValue) documents and accepts. The seed
+    /// chain value of a commit is computable by that commit's leader before it broadcasts,
+    /// and the block number and batch index are known to it too, so the committing leader
+    /// knows every `PREVRANDAO` its commit will produce and can withhold the proposal if it
+    /// dislikes them, forfeiting the commit. What changes is the cost: the leader gets one
+    /// propose-or-withhold coin flip per commit instead of unbounded free re-draws from
+    /// re-cutting the payload. Contracts requiring unbiasable randomness MUST NOT use
+    /// `PREVRANDAO` alone; use a commit-reveal or an external beacon.
+    ///
     /// Pre-fork, the legacy derivation is preserved byte-identically for replay: the
     /// consensus header digest XOR `batch_digest`. The empty epoch-closing block passes
     /// [`B256::ZERO`], which reduces the XOR to the bare consensus header digest, exactly
@@ -640,6 +650,40 @@ mod tests {
         )
     }
 
+    /// The keeper below derives both grid points from the constant, which only stays meaningful
+    /// while an epoch below it exists.
+    #[cfg(feature = "adiri")]
+    const _: () = assert!(crate::forks::PREVRANDAO_FORK_EPOCH != 0);
+
+    /// The keeper discriminates the PREVRANDAO gate only while a seed-ACTIVE epoch exists below
+    /// the fork point. `forks`' own ordering assert permits equality, and at equality the
+    /// keeper's `pre_fork` probe is seed-dormant: every assertion in it would then pass through
+    /// the seed conjunct alone, so deleting the PREVRANDAO fork point from
+    /// `prevrandao_seed_active` would leave the keeper green. Pin the strict inequality here
+    /// rather than tightening `forks`, which states a rollout contract (`>=`) that is correct on
+    /// its own terms; an arming PR that lands on equality fails to compile its tests and has to
+    /// retarget the keeper deliberately.
+    #[cfg(feature = "adiri")]
+    const _: () = assert!(
+        crate::forks::PREVRANDAO_FORK_EPOCH > crate::forks::SEED_SIGNATURE_FORK_EPOCH,
+        "PREVRANDAO_FORK_EPOCH must be strictly above SEED_SIGNATURE_FORK_EPOCH for \
+         prev_randao_switches_arms_at_the_prevrandao_fork_epoch to discriminate the arms",
+    );
+
+    /// Build an output whose leader header carries `epoch`, so the fork arm is selected by the
+    /// committing leader's epoch rather than by this build's feature set.
+    fn output_at_epoch(epoch: Epoch, number: u64, digests: Vec<BlockHash>) -> ConsensusOutput {
+        let leader = crate::HeaderBuilder::default().epoch(epoch).build();
+        ConsensusOutput::new(
+            CommittedSubDag::new_with_headers_for_test(vec![leader]),
+            ConsensusHeaderDigest::default(),
+            number,
+            false,
+            digests.into(),
+            Vec::new(),
+        )
+    }
+
     /// Pin the exact post-fork byte layout: keccak256 of the versioned domain tag, the seed
     /// chain value, then the consensus block number and batch index as little-endian u64s.
     #[test]
@@ -723,5 +767,76 @@ mod tests {
             let header: B256 = output.digest().into();
             assert_eq!(empty, header, "a zero batch digest must reduce to the header digest");
         }
+    }
+
+    /// THE boundary keeper for #1247: the arm switch must happen AT `PREVRANDAO_FORK_EPOCH`.
+    /// Both epochs derive from the constant, so an arming PR retargets this with no edit here.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn prev_randao_switches_arms_at_the_prevrandao_fork_epoch() {
+        let post_fork = crate::forks::PREVRANDAO_FORK_EPOCH;
+        let pre_fork = post_fork - 1;
+        // anti-vacuity tripwire, mirroring `committee_sweep_tests.rs`: an ambient override or an
+        // armed fork would make both sides land on the same arm and pass for the wrong reason
+        assert!(
+            !crate::forks::prevrandao_seed_active(pre_fork),
+            "epoch {pre_fork} must be pre-fork for this keeper to mean anything; is \
+             TN_PREVRANDAO_FORK_EPOCH set in the environment?"
+        );
+        assert!(
+            crate::forks::prevrandao_seed_active(post_fork),
+            "epoch {post_fork} must be post-fork; is TN_PREVRANDAO_FORK_EPOCH set, or has the \
+             seed fork been ordered after the PREVRANDAO fork?"
+        );
+
+        let digest = BlockHash::repeat_byte(0x55);
+        let legacy = output_at_epoch(pre_fork, 11, vec![digest]);
+        let seeded = output_at_epoch(post_fork, 11, vec![digest]);
+
+        let legacy_header: B256 = legacy.digest().into();
+        assert_eq!(
+            legacy.prev_randao(0, digest),
+            legacy_header ^ digest,
+            "PREVRANDAO_FORK_EPOCH - 1 must replay the legacy XOR byte-identically",
+        );
+        assert_eq!(
+            seeded.prev_randao(0, digest),
+            seeded_prev_randao(seeded.committee_shuffle_seed(), 11, 0),
+            "the gate must fire from PREVRANDAO_FORK_EPOCH onward (`>=`, not `>`)",
+        );
+        // discriminate the arms on ONE output. Comparing `legacy` against `seeded` would pass
+        // through their differing leader headers even if the gate never fired at all, so the
+        // post-fork value is checked against the legacy recomposition of its own output.
+        let seeded_as_legacy: B256 = B256::from(seeded.digest()) ^ digest;
+        assert_ne!(
+            seeded.prev_randao(0, digest),
+            seeded_as_legacy,
+            "at PREVRANDAO_FORK_EPOCH the seeded arm must not reproduce that output's legacy XOR",
+        );
+    }
+
+    /// The always-active counterpart (non-adiri): no dormant epoch exists to switch from, so this
+    /// states that every epoch takes the seeded arm rather than asserting a switch vacuously.
+    ///
+    /// The grid is genesis, two early epochs, a mid-range epoch and the ceiling. Nothing here
+    /// mirrors an adiri fork constant: none of them exist in this build, so a literal epoch
+    /// borrowed from that schedule could only go stale.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn prev_randao_takes_the_seeded_arm_at_every_epoch_without_adiri() {
+        [0u32, 1, 2, Epoch::MAX / 2, Epoch::MAX].into_iter().for_each(|epoch| {
+            let digest = BlockHash::repeat_byte(0x55);
+            let output = output_at_epoch(epoch, 11, vec![digest]);
+            assert!(
+                crate::forks::prevrandao_seed_active(epoch),
+                "non-adiri builds are active from genesis; epoch {epoch} must be post-fork. is \
+                 TN_PREVRANDAO_FORK_EPOCH or TN_SEED_SIGNATURE_FORK_EPOCH set in the environment?"
+            );
+            assert_eq!(
+                output.prev_randao(0, digest),
+                seeded_prev_randao(output.committee_shuffle_seed(), 11, 0),
+                "epoch {epoch} must use the seeded derivation",
+            );
+        });
     }
 }
