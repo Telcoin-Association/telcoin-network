@@ -36,13 +36,20 @@ use std::{
 
 use tn_types::{BlockHash, ConsensusHeader, ConsensusHeaderDigest, Epoch, EpochRecord};
 
+use std::hash::BuildHasherDefault;
+
 use crate::{
     archive::{
+        digest_index::{BucketCrcReport, HdxIndex},
         error::fetch::FetchError,
-        pack::{Pack, PackCompression},
+        fxhasher::FxHasher,
+        pack::{DataHeader, Pack, PackCompression},
         pack_iter::PackIter,
     },
-    consensus_pack::{verify_epoch_meta, PackError, PackRecord, PACK_VERSION},
+    consensus_pack::{
+        verify_epoch_meta, PackError, PackRecord, BATCH_DIGEST_NAME, CONSENSUS_DIGEST_NAME,
+        PACK_VERSION,
+    },
 };
 
 /// Classification of a referenced-but-missing batch digest.
@@ -226,6 +233,32 @@ impl Display for PhysicalCorruption {
     }
 }
 
+/// Bucket-CRC scan of a pack's sidecar digest indexes (the `hash`/`bhash` hdx files), from
+/// [`HdxIndex::bucket_crc_scan`]. `dirty` buckets are written-but-unstamped (a zeroed CRC trailer);
+/// on a cleanly-closed index that should be `0` — a non-zero count means the index was not synced
+/// or a bucket page was lost/zeroed. `corrupt` buckets have a non-zero CRC that fails to verify
+/// (bit rot). Either way the *data log is intact* (the index is rebuildable): the fix is to remove
+/// the `hash`/`bhash` dirs so the index rebuilds from the data WAL on next open.
+///
+/// Note (known residual, not a format change): a fully-zeroed bucket page presents as `dirty`, and
+/// a live node's next `ordered_sync` would stamp a valid CRC over the zeros, "laundering" it into a
+/// valid empty bucket. This scan is the detector for that window; run it (via `db validate`) before
+/// restarting a node whose index is suspect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexBucketScan {
+    /// Bucket-CRC report for the consensus-header digest index (`hash`).
+    pub consensus: BucketCrcReport,
+    /// Bucket-CRC report for the batch digest index (`bhash`).
+    pub batch: BucketCrcReport,
+}
+
+impl IndexBucketScan {
+    /// True when every scanned bucket is CRC-valid (no dirty, no corrupt).
+    pub fn is_clean(&self) -> bool {
+        self.consensus == BucketCrcReport::default() && self.batch == BucketCrcReport::default()
+    }
+}
+
 /// The result of validating a pack `data` file.
 #[derive(Debug, Clone)]
 pub struct PackValidationReport {
@@ -243,7 +276,10 @@ pub struct PackValidationReport {
     pub last_consensus_number: Option<u64>,
     /// Every issue found, in file order.
     pub issues: Vec<PackIssue>,
-    /// `Valid` iff `issues` is empty.
+    /// Bucket-CRC scan of the sidecar digest indexes, if the `hash`/`bhash` dirs were present next
+    /// to the data file. `None` for a bare-data-file validation (data-log integrity only).
+    pub index_scan: Option<IndexBucketScan>,
+    /// `Invalid` if any data-stream issue was found or the index scan was not clean.
     pub verdict: Verdict,
 }
 
@@ -324,10 +360,63 @@ pub fn validate_pack_file(
         previous.map(|p| p.final_consensus.hash)
     };
 
-    if pack.version() == 0 {
-        verify_v0_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)
+    let mut report = if pack.version() == 0 {
+        verify_v0_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)?
     } else {
-        verify_v1_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)
+        verify_v1_data(&mut iter, epoch, expected_parent, start_consensus_number, issues)?
+    };
+    // Best-effort: also scan the sidecar digest indexes' bucket CRCs — the one detector for a
+    // lost/corrupt or zeroed bucket page, which nothing else runs (`files_consistent` only compares
+    // lengths, and the data-stream walk above ignores the indexes entirely).
+    scan_index_buckets(path, pack.header(), &mut report);
+    Ok(report)
+}
+
+/// Scan the pack's sidecar digest indexes (`hash`/`bhash`) for dirty/corrupt buckets and record the
+/// result on `report`. Read-only and non-mutating (it never stamps a CRC, so it cannot launder a
+/// zeroed bucket the way a live node's `ordered_sync` would). Best-effort: absent index dirs leave
+/// `index_scan = None` (bare-data-file validation); an unreadable index becomes an issue. Any dirty
+/// or corrupt bucket flips the verdict to `Invalid` even when the data stream is clean — the data
+/// is intact but the index must be rebuilt.
+fn scan_index_buckets(data_path: &Path, header: &DataHeader, report: &mut PackValidationReport) {
+    let Some(dir) = data_path.parent() else { return };
+    let consensus_dir = dir.join(CONSENSUS_DIGEST_NAME);
+    let batch_dir = dir.join(BATCH_DIGEST_NAME);
+    if !consensus_dir.is_dir() || !batch_dir.is_dir() {
+        // No sidecar indexes next to the data file — validate the data log alone, as before.
+        return;
+    }
+
+    let mut scan = |idx_dir: std::path::PathBuf, which: &str| -> Option<BucketCrcReport> {
+        match HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
+            idx_dir,
+            header,
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        ) {
+            Ok(idx) => Some(idx.bucket_crc_scan()),
+            Err(e) => {
+                report.issues.push(PackIssue::EpochMetaMismatch {
+                    detail: format!("{which} digest index is unreadable: {e}"),
+                });
+                None
+            }
+        }
+    };
+
+    let consensus = scan(consensus_dir, "consensus (hash)");
+    let batch = scan(batch_dir, "batch (bhash)");
+    if let (Some(consensus), Some(batch)) = (consensus, batch) {
+        let index_scan = IndexBucketScan { consensus, batch };
+        if !index_scan.is_clean() {
+            report.verdict = Verdict::Invalid;
+        }
+        report.index_scan = Some(index_scan);
+    }
+    // An unreadable index pushed an issue above, which already forces `Invalid` at Display time;
+    // keep `index_scan = None` so the report shows the read failure rather than partial counts.
+    if !report.issues.is_empty() {
+        report.verdict = Verdict::Invalid;
     }
 }
 
@@ -724,6 +813,9 @@ fn finalize_report(
         first_consensus_number,
         last_consensus_number,
         issues,
+        // Filled in by `validate_pack_file` after the data-stream walk (the builder only sees the
+        // stream); the verdict is refined there too if the index scan is not clean.
+        index_scan: None,
         verdict,
     }
 }
@@ -766,6 +858,29 @@ impl Display for PackValidationReport {
         }
         writeln!(f, "batch records:          {}", self.batch_count)?;
         writeln!(f, "verdict:                {}", self.verdict)?;
+        writeln!(f)?;
+        match &self.index_scan {
+            None => {
+                writeln!(f, "index buckets:          not scanned (no sidecar hash/bhash dirs)")?
+            }
+            Some(scan) => {
+                writeln!(
+                    f,
+                    "index buckets:          consensus (dirty: {}, corrupt: {}), batch (dirty: {}, corrupt: {})",
+                    scan.consensus.dirty,
+                    scan.consensus.corrupt,
+                    scan.batch.dirty,
+                    scan.batch.corrupt
+                )?;
+                if !scan.is_clean() {
+                    writeln!(
+                        f,
+                        "  the data log is intact but a digest index is degraded; remove the \
+                         `hash`/`bhash` dirs to rebuild it from the data log on next open."
+                    )?;
+                }
+            }
+        }
         writeln!(f)?;
         writeln!(f, "issues: {} total", self.issues.len())?;
         writeln!(f, "  chain breaks:           {chain_breaks}")?;

@@ -596,6 +596,10 @@ impl ConsensusPack {
 }
 
 pub const DATA_NAME: &str = Inner::DATA_NAME;
+/// Sidecar directory name of the consensus-header digest index (the `hash` hdx/odx).
+pub const CONSENSUS_DIGEST_NAME: &str = Inner::CONSENSUS_HASH_NAME;
+/// Sidecar directory name of the batch digest index (the `bhash` hdx/odx).
+pub const BATCH_DIGEST_NAME: &str = Inner::BATCH_HASH_NAME;
 
 #[derive(Debug)]
 struct Inner {
@@ -4269,6 +4273,74 @@ pub(crate) mod test {
         );
         drop(imported);
         drop(pack);
+    }
+
+    /// `db validate` (via `validate_pack_file`) must scan the sidecar digest indexes' bucket CRCs —
+    /// the only detector for a lost/corrupt or zeroed hdx bucket, which nothing else runs. A clean
+    /// pack scans clean; a payload flip reports `corrupt` and a whole-bucket zero reports `dirty`
+    /// (the launder-prone lost-page shape), both flipping the verdict to Invalid; a bare data file
+    /// with no sidecar dirs is validated data-only (`index_scan = None`).
+    #[tokio::test]
+    async fn test_validate_scans_index_bucket_crcs() {
+        use crate::pack_validate::{validate_pack_file, Verdict};
+
+        // The on-disk width of one hdx bucket (KSIZE=32): 16 + (32+8)*32. A clean-closed hdx is
+        // `header + bloom + buckets*BUCKET_SIZE` with no trailing bytes, so the final BUCKET_SIZE
+        // bytes are exactly the last bucket — corrupt there without depending on the header/bloom
+        // sizes (the bloom size is feature-gated).
+        const HDX_BUCKET: usize = 16 + (32 + 8) * 32;
+
+        let temp_dir = TempDir::with_prefix("test_validate_index_scan").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        let hdx_path = epoch_dir.join(Inner::CONSENSUS_HASH_NAME).join("index.hdx");
+
+        // Clean pack: the sidecar indexes are scanned and clean; verdict Valid.
+        let report = validate_pack_file(&data_path, 0, None).expect("validate clean pack");
+        let scan = report.index_scan.expect("sidecar indexes must be scanned when present");
+        assert!(scan.is_clean(), "a clean-closed index has no dirty/corrupt buckets: {scan:?}");
+        assert_eq!(report.verdict, Verdict::Valid);
+
+        // A bare data file with no sidecar dirs validates data-only (index_scan None), still Valid.
+        {
+            let bare = TempDir::with_prefix("test_validate_bare").expect("temp dir");
+            let bare_data = bare.path().join(Inner::DATA_NAME);
+            std::fs::copy(&data_path, &bare_data).expect("copy data file");
+            let report = validate_pack_file(&bare_data, 0, None).expect("validate bare data file");
+            assert!(report.index_scan.is_none(), "no sidecar dirs -> data-only validation");
+            assert_eq!(report.verdict, Verdict::Valid);
+        }
+
+        // Flip a byte in the last bucket's payload, leaving its (non-zero) stamped CRC in place ->
+        // a corrupt bucket the scan must surface.
+        {
+            let mut bytes = std::fs::read(&hdx_path).expect("read hdx");
+            let n = bytes.len();
+            bytes[n - HDX_BUCKET + 12] ^= 0xFF; // payload region, not the trailing 4-byte CRC
+            std::fs::write(&hdx_path, &bytes).expect("write hdx");
+        }
+        let report = validate_pack_file(&data_path, 0, None).expect("validate corrupt bucket");
+        let scan = report.index_scan.expect("scanned");
+        assert!(scan.consensus.corrupt >= 1, "a payload flip must report corrupt: {scan:?}");
+        assert_eq!(report.verdict, Verdict::Invalid, "a degraded index makes the pack Invalid");
+
+        // Zero the whole last bucket (payload + CRC): the launder-prone lost-page shape -> dirty.
+        {
+            let mut bytes = std::fs::read(&hdx_path).expect("read hdx");
+            let n = bytes.len();
+            bytes[n - HDX_BUCKET..].fill(0);
+            std::fs::write(&hdx_path, &bytes).expect("write hdx");
+        }
+        let report = validate_pack_file(&data_path, 0, None).expect("validate zeroed bucket");
+        let scan = report.index_scan.expect("scanned");
+        assert!(scan.consensus.dirty >= 1, "a zeroed bucket must report dirty: {scan:?}");
+        assert_eq!(report.verdict, Verdict::Invalid);
     }
 
     /// The heal above must stay narrow.  A first record whose size prefix has been corrupted to
